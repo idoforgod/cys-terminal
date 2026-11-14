@@ -160,31 +160,51 @@ pub struct RecordedVerdict {
 
 /// Runs the protection screen for `candidate` in the lane whose live pack root is `lane`, within
 /// `deadline` (wall time for the whole screen; exceeded → `Err(CheckTimeout)` — callers fail closed).
-/// RELEASED = the copies embedded in this binary. Stub until the body lands (T5b).
+/// RELEASED = the copies embedded in this binary (RULINGS CM1). The scoped after-run comparison is
+/// judged with no difference explained (the library knows no daemon operation — a caller that does
+/// re-judges with [`judge_after_run`]).
 pub fn screen_protections(
     candidate: &ScreenCandidate,
     lane: &Path,
     deadline: Duration,
 ) -> Result<ScreenReport, RepairError> {
-    let _ = (candidate, lane, deadline);
-    Err(RepairError::NotImplemented("screen::screen_protections"))
+    if !cfg!(unix) {
+        // RULINGS AT6: no screen runs on Windows in release 1 (`submit` answers pending there).
+        return Err(RepairError::PlatformPending("screen::screen_protections"));
+    }
+    let cfg = ScreenConfig::production();
+    let mut report = screen_with(&cfg, candidate, lane, deadline)?;
+    judge_after_run(&mut report, &|_| false);
+    Ok(report)
 }
 
 /// The fingerprint of the screen's input STATES as they will be after the apply (BC7): every file
 /// of the generated per-test inputs (G, R, C, I3), the candidate's state for a target, else the
 /// lane's live state — `repair::fingerprint` over those (rel, state) lines.
 pub fn input_fingerprint(candidate: &ScreenCandidate, lane: &Path) -> Result<String, RepairError> {
-    let _ = (candidate, lane);
-    Err(RepairError::NotImplemented("screen::input_fingerprint"))
+    let rels = all_input_rels()?;
+    let mut lines = Vec::with_capacity(rels.len());
+    for rel in rels {
+        let st = match candidate.targets.iter().find(|(r, _)| *r == rel) {
+            Some((_, s)) => s.clone(),
+            None => TargetState::read(&lane.join(&rel))?,
+        };
+        lines.push((rel, st));
+    }
+    Ok(super::types::fingerprint(&lines))
 }
 
 /// The screen's build id (BD5): a recorded verdict with another build id is never reused.
 pub fn screen_build_id() -> String {
+    // the embedded pack's hash ties the id to the RELEASED copies the screen compares against (a
+    // development build whose git id is "unknown" still gets an id of its own)
+    let pack = crate::pack::embedded_pack_hash();
     format!(
-        "{}+{}+screen{}",
+        "{}+{}+screen{}+{}",
         crate::pack::build_id(),
         env!("CARGO_PKG_VERSION"),
-        SCREEN_SCHEMA
+        SCREEN_SCHEMA,
+        pack.get(..16).unwrap_or(&pack)
     )
 }
 
@@ -193,32 +213,2119 @@ pub fn verdict_path_in(root: &Path, id: &RepairId) -> PathBuf {
     super::ledger::repair_dir_in(root, id).join("screen.json")
 }
 
-/// Writes the recorded verdict (durably). Stub until the body lands (T5b).
+/// Writes the recorded verdict atomically (tmp + rename) and durably (RULINGS CM2: written by the
+/// lane's daemon only).
 pub fn write_verdict_in(
     root: &Path,
     id: &RepairId,
     v: &RecordedVerdict,
 ) -> Result<(), RepairError> {
-    let _ = (root, id, v);
-    Err(RepairError::NotImplemented("screen::write_verdict_in"))
+    let p = verdict_path_in(root, id);
+    let mut v = v.clone();
+    v.schema = SCREEN_SCHEMA;
+    crate::atomic_write_json(&p, &v)
+        .map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
+    let f =
+        std::fs::File::open(&p).map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
+    super::ledger::full_flush_file(&f)
+        .map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
+    super::ledger::full_flush_dir(&super::ledger::repair_dir_in(root, id))
 }
 
-/// Reads the recorded verdict; `Ok(None)` when none was recorded. Stub until the body lands (T5b).
+/// Reads the recorded verdict; `Ok(None)` when none was recorded; a file that cannot be read or
+/// has a higher schema → `Err(Corrupt)` (never a verdict that holds).
 pub fn read_verdict_in(root: &Path, id: &RepairId) -> Result<Option<RecordedVerdict>, RepairError> {
-    let _ = (root, id);
-    Err(RepairError::NotImplemented("screen::read_verdict_in"))
+    let p = verdict_path_in(root, id);
+    let bytes = match std::fs::read(&p) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(RepairError::Corrupt(format!("{}: {e}", p.display()))),
+    };
+    let v: RecordedVerdict = serde_json::from_slice(&bytes)
+        .map_err(|e| RepairError::Corrupt(format!("{}: {e}", p.display())))?;
+    if v.schema > SCREEN_SCHEMA {
+        return Err(RepairError::Corrupt(format!(
+            "{}: unknown schema {}",
+            p.display(),
+            v.schema
+        )));
+    }
+    Ok(Some(v))
 }
 
 /// AY5 at apply: the recorded verdict holds — nothing runs — when it is not a refusal, its build id
 /// is this binary's [`screen_build_id`] and its fingerprint equals [`input_fingerprint`] of the
-/// candidate in `lane`. Stub until the body lands (T5b).
+/// candidate in `lane`.
 pub fn recorded_verdict_holds(
     recorded: &RecordedVerdict,
     candidate: &ScreenCandidate,
     lane: &Path,
 ) -> Result<bool, RepairError> {
-    let _ = (recorded, candidate, lane);
-    Err(RepairError::NotImplemented(
-        "screen::recorded_verdict_holds",
-    ))
+    if recorded.verdict == ScreenVerdict::Refused
+        || recorded.schema != SCREEN_SCHEMA
+        || recorded.build_id != screen_build_id()
+    {
+        return Ok(false);
+    }
+    Ok(recorded.input_fingerprint == input_fingerprint(candidate, lane)?)
+}
+
+/// The scoped after-run comparison judged (BK1, BL1): differences `explained` (an operation the
+/// daemon performed and recorded ON THE LIVE INSTALLATION — never a run of a replay, a rehearsal or
+/// the screen, DEFERRED #60) are dropped; an item written again during the repeat → REFUSED; a
+/// difference not written again → a note (the first difference stays on the intake row).
+pub fn judge_after_run(report: &mut ScreenReport, explained: &dyn Fn(&LiveDifference) -> bool) {
+    let first: Vec<&LiveDifference> = report
+        .after_run
+        .first
+        .iter()
+        .filter(|d| !explained(d))
+        .collect();
+    if first.is_empty() {
+        return;
+    }
+    let again: Vec<&LiveDifference> = report
+        .after_run
+        .rewritten_in_repeat
+        .iter()
+        .filter(|d| !explained(d) && first.iter().any(|f| f.item == d.item))
+        .collect();
+    if !again.is_empty() {
+        let items: Vec<&str> = again.iter().map(|d| d.item.as_str()).take(5).collect();
+        report.refusals.push(format!(
+            "예행이 실제 환경의 항목을 다시 썼습니다({}) — 보호장치 시험 밖으로 새는 후보로 보고 거부합니다",
+            items.join(", ")
+        ));
+        report.verdict = ScreenVerdict::Refused;
+    } else {
+        let items: Vec<&str> = first.iter().map(|d| d.item.as_str()).take(5).collect();
+        let line = format!(
+            "예행 동안 실제 환경의 항목이 바뀌었으나 다시 돌렸을 때는 바뀌지 않았습니다({}) — 접수 줄에 남깁니다",
+            items.join(", ")
+        );
+        report.notes.push(line.clone());
+        report.lane_findings.push(line);
+        if report.verdict == ScreenVerdict::Accepted {
+            report.verdict = ScreenVerdict::AcceptedWithNotes;
+        }
+    }
+}
+
+// ═════════════════════════════════════════ the engine ═════════════════════════════════════════
+
+use super::replay::{self, LaidSource, ScratchRoot, ScratchSocket};
+use super::screen_corpus::{
+    self as corpus, Cell, Class, Device, Probe, Setup, BACKSTOP_CLASSES, BACKSTOP_MARKER, CELLS,
+};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+/// The content of a test's input files in one variant (rel → content).
+type Files = BTreeMap<String, LaidSource>;
+
+/// Where the released copies come from (the binary's own in production; injected by tests).
+pub(crate) type ReleasedFn = Arc<dyn Fn(&str) -> Option<LaidSource> + Send + Sync>;
+
+/// How a screen runs. Production values come from [`ScreenConfig::production`]; tests narrow the
+/// corpus and inject the released source and the scratch base.
+#[derive(Clone)]
+pub(crate) struct ScreenConfig {
+    pub scratch_base: PathBuf,
+    pub interpreter: Option<PathBuf>,
+    /// The real HOME whose settings files the after-run comparison watches.
+    pub real_home: PathBuf,
+    pub released: ReleasedFn,
+    /// Only these classes (ids) — `None` = every class (production).
+    pub classes: Option<Vec<&'static str>>,
+    /// Only these cells (ids) — `None` = every cell (production).
+    pub cells: Option<Vec<&'static str>>,
+    pub run_i3: bool,
+    pub threads: usize,
+    /// Cap of one child's wall time.
+    pub child_cap: Duration,
+}
+
+impl ScreenConfig {
+    pub(crate) fn production() -> Self {
+        Self {
+            scratch_base: super::rehearsal::scratch_base(),
+            interpreter: replay::bundled_interpreter(),
+            real_home: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
+            released: Arc::new(|rel: &str| super::rehearsal::released_copy(rel)),
+            classes: None,
+            cells: None,
+            run_i3: true,
+            threads: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2)
+                .clamp(1, 8),
+            child_cap: Duration::from_secs(30),
+        }
+    }
+
+    fn class_on(&self, id: &str) -> bool {
+        self.classes.as_ref().map_or(true, |v| v.contains(&id))
+    }
+
+    fn cell_on(&self, id: &str) -> bool {
+        self.cells.as_ref().map_or(true, |v| v.contains(&id))
+    }
+}
+
+/// The protections, in the owner's words (design §4-12).
+fn protection_of(test: &str) -> &'static str {
+    match test {
+        "G" | "I4" => "외부 발송·영구 삭제 전 주인 승인(hooks/guard.sh)",
+        "R" => "리뷰어는 검토 대상을 못 고침(hooks/role-capability-gate.sh)",
+        "C" => "CSO 파일 쓰기 제한(hooks/role-capability-gate.sh)",
+        _ => "리뷰어·CSO 쓰기 제한 관문의 등록(javis_preflight.py C28)",
+    }
+}
+
+/// Every input file of the generated per-test inputs (AU1, BM5) — exactly G, R, C, I3.
+fn inputs_by_test() -> Result<BTreeMap<&'static str, Vec<String>>, RepairError> {
+    let mut m = BTreeMap::new();
+    for (t, files) in super::boot_critical::protection_inputs() {
+        m.insert(*t, files.iter().map(|f| f.to_string()).collect::<Vec<_>>());
+    }
+    for t in ["G", "R", "C", "I3"] {
+        if m.get(t).map_or(true, |v: &Vec<String>| v.is_empty()) {
+            return Err(RepairError::Precondition(format!(
+                "보호장치 시험 {t} 의 입력 목록이 이 빌드에 없습니다 — 심사를 할 수 없습니다"
+            )));
+        }
+    }
+    if m.len() != 4 {
+        return Err(RepairError::Precondition(format!(
+            "보호장치 시험 입력이 G·R·C·I3 넷이 아닙니다: {:?}",
+            m.keys().collect::<Vec<_>>()
+        )));
+    }
+    Ok(m)
+}
+
+fn all_input_rels() -> Result<Vec<String>, RepairError> {
+    let mut s = BTreeSet::new();
+    for v in inputs_by_test()?.values() {
+        s.extend(v.iter().cloned());
+    }
+    Ok(s.into_iter().collect())
+}
+
+/// A file the I3 layout gives every variant from RELEASED (C4: "THE SAME FOR ALL: the released
+/// directives/CSO_DIRECTIVE.md").
+const SAME_FOR_ALL: &[&str] = &["directives/CSO_DIRECTIVE.md"];
+
+/// The five contents of every input file (AY1, AV3, BD1, BC5).
+#[derive(Debug, Clone)]
+struct Variants {
+    released: Files,
+    lane: Files,
+    candidate: Files,
+    clean: Files,
+    attribution: Files,
+    /// The candidate's targets that are inputs, and whether each is byte-equal to RELEASED (BG1).
+    touched: BTreeMap<String, bool>,
+}
+
+fn group_key(f: &Files) -> String {
+    let lines: Vec<(String, TargetState)> = f.iter().map(|(r, s)| (r.clone(), s.state())).collect();
+    super::types::fingerprint(&lines)
+}
+
+fn plain_rel(rel: &str) -> bool {
+    !rel.is_empty()
+        && !Path::new(rel).is_absolute()
+        && Path::new(rel)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+fn build_variants(
+    cfg: &ScreenConfig,
+    cand: &ScreenCandidate,
+    lane: &Path,
+    rels: &[String],
+) -> Result<Variants, RepairError> {
+    // the candidate's own contents, checked against the states it declares
+    let mut over: BTreeMap<String, LaidSource> = BTreeMap::new();
+    for (rel, st) in &cand.targets {
+        if !plain_rel(rel) {
+            return Err(RepairError::Precondition(format!(
+                "{rel}: 팩 안의 상대 경로가 아닙니다"
+            )));
+        }
+        let content = match st {
+            TargetState::Absent => LaidSource::Absent,
+            TargetState::Link { target } => LaidSource::Link(target.clone()),
+            TargetState::File { .. } => {
+                let c = LaidSource::read(&cand.files.join(rel))?;
+                if c.state() != *st {
+                    return Err(RepairError::Precondition(format!(
+                        "{rel}: 후보의 바이트가 제출된 상태와 다릅니다 — 심사하지 않습니다"
+                    )));
+                }
+                c
+            }
+        };
+        over.insert(rel.clone(), content);
+    }
+    let mut v = Variants {
+        released: Files::new(),
+        lane: Files::new(),
+        candidate: Files::new(),
+        clean: Files::new(),
+        attribution: Files::new(),
+        touched: BTreeMap::new(),
+    };
+    for rel in rels {
+        let released = (cfg.released)(rel).unwrap_or(LaidSource::Absent);
+        let live = LaidSource::read(&lane.join(rel))?;
+        if SAME_FOR_ALL.contains(&rel.as_str()) {
+            for f in [
+                &mut v.released,
+                &mut v.lane,
+                &mut v.candidate,
+                &mut v.clean,
+                &mut v.attribution,
+            ] {
+                f.insert(rel.clone(), released.clone());
+            }
+            continue;
+        }
+        match over.get(rel) {
+            Some(c) => {
+                let eq = match (c, &released) {
+                    (LaidSource::Bytes { bytes: a, .. }, LaidSource::Bytes { bytes: b, .. }) => {
+                        a == b
+                    }
+                    (LaidSource::Absent, LaidSource::Absent) => true,
+                    _ => false,
+                };
+                v.touched.insert(rel.clone(), eq);
+                v.candidate.insert(rel.clone(), c.clone());
+                v.clean.insert(rel.clone(), c.clone());
+                v.attribution.insert(rel.clone(), released.clone());
+            }
+            None => {
+                v.candidate.insert(rel.clone(), live.clone());
+                v.clean.insert(rel.clone(), released.clone());
+                v.attribution.insert(rel.clone(), live.clone());
+            }
+        }
+        v.released.insert(rel.clone(), released);
+        v.lane.insert(rel.clone(), live);
+    }
+    Ok(v)
+}
+
+fn subset(f: &Files, rels: &[String]) -> Files {
+    f.iter()
+        .filter(|(r, _)| rels.contains(r))
+        .map(|(r, c)| (r.clone(), c.clone()))
+        .collect()
+}
+
+/// Which variant an answer came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Var {
+    Released,
+    Clean,
+    Lane,
+    Candidate,
+    Attribution,
+}
+
+/// One judged answer of one run (E-14 / E-15 judge two calls).
+#[derive(Debug, Clone)]
+struct Judged {
+    /// suffix of the cell label (`""`, `"/2nd"`, `"/3rd"`).
+    suffix: &'static str,
+    answer: Answer,
+    detail: String,
+}
+
+/// Shared state of one set of runs.
+struct Runner<'a> {
+    cfg: &'a ScreenConfig,
+    root: PathBuf,
+    until: Instant,
+    counter: AtomicUsize,
+    out_of_time: AtomicBool,
+    leftovers: Mutex<Vec<u32>>,
+    /// `<root>/py` (links to the interpreter) and the /usr/bin view without python (E-18).
+    py_dir: Option<PathBuf>,
+    nopy_usr_bin: PathBuf,
+    /// Answers may come from (and go to) the process-wide cache (false on the BL1 repeat).
+    use_cache: bool,
+}
+
+/// Process-wide answers of hook probes, by (device, the input bytes' group key, interpreter, class,
+/// probe, set-up): RELEASED never changes inside one binary, and a lane's untouched devices answer the
+/// same on every screen — only new bytes are run again. Memory only; bounded.
+type CacheKey = (Device, String, String, &'static str, usize, Setup);
+const CACHE_MAX: usize = 60_000;
+
+fn answer_cache() -> &'static Mutex<HashMap<CacheKey, Vec<Judged>>> {
+    static C: std::sync::OnceLock<Mutex<HashMap<CacheKey, Vec<Judged>>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_get(k: &CacheKey) -> Option<Vec<Judged>> {
+    answer_cache().lock().ok().and_then(|m| m.get(k).cloned())
+}
+
+fn cache_put(k: CacheKey, v: Vec<Judged>) {
+    if let Ok(mut m) = answer_cache().lock() {
+        if m.len() >= CACHE_MAX {
+            m.clear();
+        }
+        m.insert(k, v);
+    }
+}
+
+impl<'a> Runner<'a> {
+    fn interp_key(&self) -> String {
+        self.cfg
+            .interpreter
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    fn new(cfg: &'a ScreenConfig, root: &Path, until: Instant) -> Result<Self, RepairError> {
+        let py_dir = match &cfg.interpreter {
+            Some(p) => Some(replay::interpreter_dir(root, p)?),
+            None => None,
+        };
+        let nopy = root.join("nopy-usr-bin");
+        make_nopy_usr_bin(&nopy)?;
+        Ok(Self {
+            cfg,
+            root: root.to_path_buf(),
+            until,
+            counter: AtomicUsize::new(0),
+            out_of_time: AtomicBool::new(false),
+            leftovers: Mutex::new(Vec::new()),
+            py_dir,
+            nopy_usr_bin: nopy,
+            use_cache: true,
+        })
+    }
+
+    fn fresh_dir(&self) -> Result<PathBuf, RepairError> {
+        let n = self.counter.fetch_add(1, Ordering::SeqCst);
+        let d = self.root.join(format!("r{n}"));
+        std::fs::create_dir_all(&d)
+            .map_err(|e| RepairError::Io(format!("{}: {e}", d.display())))?;
+        Ok(d)
+    }
+
+    fn child_deadline(&self) -> Option<Duration> {
+        let left = replay::left(self.until);
+        if left < replay::MIN_CHILD_SLICE {
+            self.out_of_time.store(true, Ordering::SeqCst);
+            return None;
+        }
+        Some(left.min(self.cfg.child_cap))
+    }
+
+    fn run(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+        cwd: &Path,
+        stdin: &[u8],
+    ) -> replay::ChildOutcome {
+        let Some(d) = self.child_deadline() else {
+            return replay::ChildOutcome {
+                timed_out: true,
+                ..Default::default()
+            };
+        };
+        let o = replay::run_child(argv, env, cwd, stdin, d);
+        if !o.leftovers.is_empty() {
+            if let Ok(mut l) = self.leftovers.lock() {
+                l.extend(o.leftovers.iter().copied());
+            }
+        }
+        o
+    }
+}
+
+/// A view of /usr/bin without any python (C4 E-18: "a PATH holding no python3, python or py").
+fn make_nopy_usr_bin(dst: &Path) -> Result<(), RepairError> {
+    std::fs::create_dir_all(dst).map_err(|e| RepairError::Io(format!("{}: {e}", dst.display())))?;
+    #[cfg(unix)]
+    {
+        if let Ok(rd) = std::fs::read_dir("/usr/bin") {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n.starts_with("python") || n.starts_with("pydoc") || n == "py" || n == "cys" {
+                    continue;
+                }
+                let _ = std::os::unix::fs::symlink(e.path(), dst.join(&n));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lay_files(pack: &Path, files: &Files) -> Result<(), RepairError> {
+    std::fs::create_dir_all(pack)
+        .map_err(|e| RepairError::Io(format!("{}: {e}", pack.display())))?;
+    for (rel, c) in files {
+        replay::lay_out(&pack.join(rel), c)?;
+    }
+    Ok(())
+}
+
+fn touch(p: &Path) -> Result<(), RepairError> {
+    std::fs::write(p, b"").map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))
+}
+
+fn subst(s: &str, map: &[(&str, String)]) -> String {
+    let mut out = s.to_string();
+    for (k, v) in map {
+        out = out.replace(k, v);
+    }
+    out
+}
+
+fn subst_value(v: &mut serde_json::Value, map: &[(&str, String)]) {
+    match v {
+        serde_json::Value::String(s) => *s = subst(s, map),
+        serde_json::Value::Array(a) => a.iter_mut().for_each(|x| subst_value(x, map)),
+        serde_json::Value::Object(o) => o.values_mut().for_each(|x| subst_value(x, map)),
+        _ => {}
+    }
+}
+
+/// The hook input of a probe (stdin of the device).
+fn probe_input(p: &Probe, map: &[(&str, String)], work: &Path) -> Vec<u8> {
+    if p.raw {
+        return p.input.as_bytes().to_vec();
+    }
+    let mut ti: serde_json::Value =
+        serde_json::from_str(p.input).unwrap_or_else(|_| serde_json::json!({}));
+    subst_value(&mut ti, map);
+    if p.pad > 0 {
+        if let Some(o) = ti.as_object_mut() {
+            o.insert(
+                "content".into(),
+                serde_json::Value::String("x".repeat(p.pad)),
+            );
+        }
+    }
+    serde_json::json!({
+        "session_id": "screen-probe",
+        "transcript_path": "",
+        "cwd": work.to_string_lossy(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": p.tool,
+        "tool_input": ti,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// DENY = exit 2, or exit 0 with a deny payload; ALLOW = exit 0; ERROR = anything else (AY1, BD5).
+fn answer_of(o: &replay::ChildOutcome) -> (Answer, String) {
+    if o.timed_out {
+        return (Answer::Error, "timeout".into());
+    }
+    if let Some(e) = &o.spawn_error {
+        return (Answer::Error, format!("spawn: {e}"));
+    }
+    match o.code {
+        Some(2) => (Answer::Deny, "exit 2".into()),
+        Some(0) => {
+            if deny_payload(&o.stdout) {
+                (Answer::Deny, "exit 0 + deny payload".into())
+            } else {
+                (Answer::Allow, "exit 0".into())
+            }
+        }
+        Some(c) => (Answer::Error, format!("exit {c}")),
+        None => (Answer::Error, format!("signal {:?}", o.signal)),
+    }
+}
+
+fn deny_payload(stdout: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(stdout);
+    s.lines().any(|l| {
+        serde_json::from_str::<serde_json::Value>(l.trim())
+            .ok()
+            .map(|v| {
+                v.pointer("/hookSpecificOutput/permissionDecision")
+                    .and_then(|d| d.as_str())
+                    == Some("deny")
+                    || v.get("decision").and_then(|d| d.as_str()) == Some("block")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// The budget counter file the gate keeps for a session (`<state>/capgate/<sha256(sid)[:32]>.calls`,
+/// one byte per call) — C-23 seeds it at the budget.
+fn seed_budget(home: &Path) -> Result<(), RepairError> {
+    use sha2::{Digest, Sha256};
+    let key: String = Sha256::digest(b"screen-probe")
+        .iter()
+        .take(16)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let d = home.join(".cys").join("state").join("capgate");
+    std::fs::create_dir_all(&d).map_err(|e| RepairError::Io(format!("{}: {e}", d.display())))?;
+    std::fs::write(d.join(format!("{key}.calls")), vec![1u8; 2000])
+        .map_err(|e| RepairError::Io(format!("{}: {e}", d.display())))
+}
+
+/// One hook-probe run (a single call, or a sequence for E-13 … E-15) of `class`/`probe` in a cell
+/// set-up, with `files` = the device's test inputs of one variant.
+fn run_hook_probe(
+    r: &Runner<'_>,
+    files: &Files,
+    released_files: &Files,
+    class: &Class,
+    probe: &Probe,
+    setup: Setup,
+) -> Vec<Judged> {
+    match run_hook_probe_inner(r, files, released_files, class, probe, setup) {
+        Ok(j) => j,
+        Err(e) => vec![Judged {
+            suffix: "",
+            answer: Answer::Error,
+            detail: format!("layout: {e:?}"),
+        }],
+    }
+}
+
+fn run_hook_probe_inner(
+    r: &Runner<'_>,
+    files: &Files,
+    released_files: &Files,
+    class: &Class,
+    probe: &Probe,
+    setup: Setup,
+) -> Result<Vec<Judged>, RepairError> {
+    let run = r.fresh_dir()?;
+    let res = (|| -> Result<Vec<Judged>, RepairError> {
+        let home = run.join("h");
+        let tmp = run.join("t");
+        let work = run.join("w");
+        let bin = run.join("bin");
+        for d in [&home, &tmp, &work, &home.join(".claude")] {
+            std::fs::create_dir_all(d)
+                .map_err(|e| RepairError::Io(format!("{}: {e}", d.display())))?;
+        }
+        std::fs::write(home.join(".claude").join("settings.json"), "{}\n")
+            .map_err(|e| RepairError::Io(e.to_string()))?;
+        replay::write_stub(&bin, class.role, false)?;
+        // the variant's pack and, where the cell needs it, a second lane's pack (RELEASED inputs)
+        let (variant, other) = match setup {
+            Setup::PackAtHome => (home.join(".cys").join("pack"), None),
+            Setup::OtherLane
+            | Setup::FromOtherLane
+            | Setup::ActiveOtherLane
+            | Setup::ActiveFromOtherLane => (
+                run.join("p").join("pack"),
+                Some(home.join(".cys").join("pack-dept-x")),
+            ),
+            _ => (run.join("p").join("pack"), None),
+        };
+        lay_files(&variant, files)?;
+        if let Some(o) = &other {
+            lay_files(o, released_files)?;
+        }
+        // flags (in the pack of the hook that decides)
+        match setup {
+            Setup::Active => touch(&variant.join("AUTOPILOT_ACTIVE"))?,
+            Setup::Paused => touch(&variant.join("AUTOPILOT_PAUSED"))?,
+            Setup::ActivePaused => {
+                touch(&variant.join("AUTOPILOT_ACTIVE"))?;
+                touch(&variant.join("AUTOPILOT_PAUSED"))?;
+            }
+            Setup::ActiveOtherLane => {
+                if let Some(o) = &other {
+                    touch(&o.join("AUTOPILOT_ACTIVE"))?;
+                }
+            }
+            Setup::ActiveFromOtherLane => touch(&variant.join("AUTOPILOT_ACTIVE"))?,
+            _ => {}
+        }
+        if probe.seed_budget {
+            seed_budget(&home)?;
+        }
+        // which pack the hook runs from, and which pack CYS_PACK_DIR names
+        let (hook_pack, pack_env): (PathBuf, Option<PathBuf>) = match setup {
+            Setup::PackAtHome => (variant.clone(), None),
+            Setup::OtherLane | Setup::ActiveOtherLane => (variant.clone(), other.clone()),
+            Setup::FromOtherLane | Setup::ActiveFromOtherLane => (
+                other.clone().unwrap_or_else(|| variant.clone()),
+                Some(variant.clone()),
+            ),
+            _ => (variant.clone(), Some(variant.clone())),
+        };
+        let pack_named = pack_env
+            .clone()
+            .unwrap_or_else(|| home.join(".cys").join("pack"));
+        let map: Vec<(&str, String)> = vec![
+            ("{pack}", pack_named.to_string_lossy().into_owned()),
+            ("{w}", work.to_string_lossy().into_owned()),
+            ("{home}", home.to_string_lossy().into_owned()),
+            (
+                "{other}",
+                home.join(".cys")
+                    .join("pack-dept-zz")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ];
+        let sock = ScratchSocket::bind(&run)?;
+        let nosock = run.join("nosock");
+        // PATH: the stub, the interpreter's private folder, the system folders (E-3 no stub; E-18 no
+        // interpreter and /usr/bin seen without python)
+        let mut path: Vec<String> = Vec::new();
+        if setup != Setup::NoCys {
+            path.push(bin.to_string_lossy().into_owned());
+        }
+        if setup != Setup::NoInterpreter {
+            if let Some(p) = &r.py_dir {
+                path.push(p.to_string_lossy().into_owned());
+            }
+            path.push("/usr/bin".into());
+        } else {
+            path.push(r.nopy_usr_bin.to_string_lossy().into_owned());
+        }
+        path.extend(["/bin", "/usr/sbin", "/sbin"].map(String::from));
+        let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+        let role_env = if setup == Setup::CacheEnvDisagree {
+            "worker"
+        } else {
+            class.role
+        };
+        let mut env: Vec<(String, String)> = vec![
+            ("HOME".into(), home.to_string_lossy().into_owned()),
+            ("TMPDIR".into(), format!("{}/", tmp.to_string_lossy())),
+            ("PATH".into(), path.join(":")),
+            ("USER".into(), user.clone()),
+            ("LOGNAME".into(), user),
+            ("SHELL".into(), "/bin/sh".into()),
+            ("LANG".into(), "en_US.UTF-8".into()),
+            ("LC_ALL".into(), "en_US.UTF-8".into()),
+            ("CYS_SURFACE_ID".into(), "7".into()),
+            ("CYS_ROLE".into(), role_env.into()),
+            (
+                "CYS_SOCKET".into(),
+                if setup == Setup::NoSocket {
+                    nosock.to_string_lossy().into_owned()
+                } else {
+                    sock.path().to_string_lossy().into_owned()
+                },
+            ),
+        ];
+        if let Some(p) = &pack_env {
+            env.push(("CYS_PACK_DIR".into(), p.to_string_lossy().into_owned()));
+        }
+        if setup != Setup::NoInterpreter {
+            if let Some(p) = &r.cfg.interpreter {
+                env.push(("CYS_PY".into(), p.to_string_lossy().into_owned()));
+            }
+        }
+        if setup == Setup::TmpReadonly {
+            replay::set_mode(&tmp, 0o555);
+        }
+        let argv = vec![
+            "/bin/sh".to_string(),
+            hook_pack
+                .join(class.device.rel())
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        let input = probe_input(probe, &map, &work);
+        let call = |env: &[(String, String)]| r.run(&argv, env, &work, &input);
+        let judged = match setup {
+            Setup::Warm => {
+                let _ = call(&env);
+                let (a, d) = answer_of(&call(&env));
+                vec![Judged {
+                    suffix: "",
+                    answer: a,
+                    detail: d,
+                }]
+            }
+            Setup::CacheFallback | Setup::CacheEnvDisagree => {
+                // first call answered by the stub (the role is cached), then the socket goes away
+                let first_env: Vec<(String, String)> = env
+                    .iter()
+                    .map(|(k, v)| {
+                        if k == "CYS_ROLE" {
+                            (k.clone(), class.role.to_string())
+                        } else {
+                            (k.clone(), v.clone())
+                        }
+                    })
+                    .collect();
+                let _ = call(&first_env);
+                let _ = std::fs::remove_file(sock.path());
+                let (a2, d2) = answer_of(&call(&env));
+                let (a3, d3) = answer_of(&call(&env));
+                vec![
+                    Judged {
+                        suffix: "/2nd",
+                        answer: a2,
+                        detail: d2,
+                    },
+                    Judged {
+                        suffix: "/3rd",
+                        answer: a3,
+                        detail: d3,
+                    },
+                ]
+            }
+            _ => {
+                let (a, d) = answer_of(&call(&env));
+                vec![Judged {
+                    suffix: "",
+                    answer: a,
+                    detail: d,
+                }]
+            }
+        };
+        drop(sock);
+        // the stub's call log proves the hook reached the screen's own stub (never a real cys)
+        let calls = replay::stub_calls(&bin);
+        let mut judged = judged;
+        if let Some(last) = judged.last_mut() {
+            let shown: Vec<String> = calls
+                .iter()
+                .take(4)
+                .map(|c| c.chars().take(200).collect())
+                .collect();
+            last.detail = format!(
+                "{}; stub calls {}: {}",
+                last.detail,
+                calls.len(),
+                shown.join(" | ")
+            );
+        }
+        Ok(judged)
+    })();
+    replay::remove_tree(&run);
+    res
+}
+
+/// E-21 (BC3, BH1): the RELEASED guard.sh under its own no-Python switch with a variant's other
+/// inputs. MEASURED only when the backstop's marker (G-22, G-23) and the deny reason appear on
+/// standard error; otherwise NOT MEASURABLE (an ERROR answer).
+fn run_backstop_probe(
+    r: &Runner<'_>,
+    files: &Files,
+    released_guard: &LaidSource,
+    probe: &Probe,
+    active: bool,
+    reason: &str,
+) -> Judged {
+    let go = || -> Result<Judged, RepairError> {
+        let run = r.fresh_dir()?;
+        let res = (|| -> Result<Judged, RepairError> {
+            let home = run.join("h");
+            let tmp = run.join("t");
+            let work = run.join("w");
+            let bin = run.join("bin");
+            for d in [&home, &tmp, &work, &home.join(".claude")] {
+                std::fs::create_dir_all(d)
+                    .map_err(|e| RepairError::Io(format!("{}: {e}", d.display())))?;
+            }
+            std::fs::write(home.join(".claude").join("settings.json"), "{}\n")
+                .map_err(|e| RepairError::Io(e.to_string()))?;
+            replay::write_stub(&bin, "worker", false)?;
+            let pack = run.join("p").join("pack");
+            let mut f = files.clone();
+            f.insert(Device::Guard.rel().to_string(), released_guard.clone());
+            lay_files(&pack, &f)?;
+            if active {
+                touch(&pack.join("AUTOPILOT_ACTIVE"))?;
+            }
+            let sock = ScratchSocket::bind(&run)?;
+            let mut path: Vec<String> = vec![bin.to_string_lossy().into_owned()];
+            if let Some(p) = &r.py_dir {
+                path.push(p.to_string_lossy().into_owned());
+            }
+            path.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(String::from));
+            let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+            let mut env: Vec<(String, String)> = vec![
+                ("HOME".into(), home.to_string_lossy().into_owned()),
+                ("TMPDIR".into(), format!("{}/", tmp.to_string_lossy())),
+                ("PATH".into(), path.join(":")),
+                ("USER".into(), user.clone()),
+                ("LOGNAME".into(), user),
+                ("SHELL".into(), "/bin/sh".into()),
+                ("LANG".into(), "en_US.UTF-8".into()),
+                ("LC_ALL".into(), "en_US.UTF-8".into()),
+                ("CYS_SURFACE_ID".into(), "7".into()),
+                ("CYS_ROLE".into(), "worker".into()),
+                (
+                    "CYS_SOCKET".into(),
+                    sock.path().to_string_lossy().into_owned(),
+                ),
+                ("CYS_PACK_DIR".into(), pack.to_string_lossy().into_owned()),
+                // BA1's one exception (BC3): the RELEASED guard.sh's own switches
+                ("GUARD_TEST_MODE".into(), "1".into()),
+                ("GUARD_FORCE_NOPY".into(), "1".into()),
+            ];
+            if let Some(p) = &r.cfg.interpreter {
+                env.push(("CYS_PY".into(), p.to_string_lossy().into_owned()));
+            }
+            let map: Vec<(&str, String)> = vec![
+                ("{pack}", pack.to_string_lossy().into_owned()),
+                ("{w}", work.to_string_lossy().into_owned()),
+                ("{home}", home.to_string_lossy().into_owned()),
+                (
+                    "{other}",
+                    home.join(".cys")
+                        .join("pack-dept-zz")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ];
+            let argv = vec![
+                "/bin/sh".to_string(),
+                pack.join(Device::Guard.rel())
+                    .to_string_lossy()
+                    .into_owned(),
+            ];
+            let o = r.run(&argv, &env, &work, &probe_input(probe, &map, &work));
+            drop(sock);
+            let err = String::from_utf8_lossy(&o.stderr).into_owned();
+            let marker_ok = active || err.lines().any(|l| l.trim_end() == BACKSTOP_MARKER);
+            let reason_ok = err.lines().any(|l| l.trim_end() == reason);
+            let (a, d) = answer_of(&o);
+            Ok(if marker_ok && reason_ok && a == Answer::Deny {
+                Judged {
+                    suffix: "",
+                    answer: Answer::Deny,
+                    detail: "backstop ran (marker + reason)".into(),
+                }
+            } else if !marker_ok || !reason_ok {
+                Judged {
+                    suffix: "",
+                    answer: Answer::Error,
+                    detail: format!(
+                        "backstop not proven ({d}; marker {marker_ok}, reason {reason_ok})"
+                    ),
+                }
+            } else {
+                Judged {
+                    suffix: "",
+                    answer: a,
+                    detail: d,
+                }
+            })
+        })();
+        replay::remove_tree(&run);
+        res
+    };
+    go().unwrap_or_else(|e| Judged {
+        suffix: "",
+        answer: Answer::Error,
+        detail: format!("layout: {e:?}"),
+    })
+}
+
+/// Runs `jobs` on a small pool of threads.
+fn run_pool<J: Send + Sync, R: Send>(
+    threads: usize,
+    jobs: &[J],
+    f: impl Fn(&J) -> R + Sync,
+) -> Vec<R> {
+    let next = AtomicUsize::new(0);
+    let out: Mutex<Vec<(usize, R)>> = Mutex::new(Vec::with_capacity(jobs.len()));
+    std::thread::scope(|s| {
+        for _ in 0..threads.max(1).min(jobs.len().max(1)) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                let Some(j) = jobs.get(i) else { break };
+                let r = f(j);
+                if let Ok(mut o) = out.lock() {
+                    o.push((i, r));
+                }
+            });
+        }
+    });
+    let mut v = out.into_inner().unwrap_or_else(|e| e.into_inner());
+    v.sort_by_key(|(i, _)| *i);
+    v.into_iter().map(|(_, r)| r).collect()
+}
+
+/// The answers of one variant for every (class, probe, setup) asked.
+type AnswerKey = (&'static str, usize, Setup);
+
+/// One device's hook-probe matrix across the variants (AY1 with BD1, BC5, BD5, BG1).
+fn screen_device(
+    r: &Runner<'_>,
+    device: Device,
+    v: &Variants,
+    rels: &[String],
+    results: &mut Vec<ProbeResult>,
+) {
+    let classes: Vec<&'static Class> = corpus::all_classes()
+        .filter(|c| c.device == device && r.cfg.class_on(c.id))
+        .collect();
+    let cells: Vec<&'static Cell> = corpus::cells_of(device)
+        .filter(|c| c.setup != Setup::Backstop && r.cfg.cell_on(c.id))
+        .collect();
+    let setups: BTreeSet<Setup> = cells.iter().map(|c| c.setup).collect();
+    let files = |var: Var| -> Files {
+        subset(
+            match var {
+                Var::Released => &v.released,
+                Var::Clean => &v.clean,
+                Var::Lane => &v.lane,
+                Var::Candidate => &v.candidate,
+                Var::Attribution => &v.attribution,
+            },
+            rels,
+        )
+    };
+    let released_files = files(Var::Released);
+    let released_key = group_key(&released_files);
+    // answers per content group (variants with identical inputs share runs)
+    let mut by_group: HashMap<String, HashMap<AnswerKey, Vec<Judged>>> = HashMap::new();
+    let run_group =
+        |var: Var,
+         wanted: &BTreeSet<AnswerKey>,
+         by_group: &mut HashMap<String, HashMap<AnswerKey, Vec<Judged>>>| {
+            let f = files(var);
+            let key = group_key(&f);
+            let have = by_group.entry(key.clone()).or_default();
+            // answers this process already measured for exactly these input bytes (never on the
+            // after-run repeat — BL1 needs the runs to happen again)
+            if r.use_cache {
+                let missing: Vec<AnswerKey> = wanted
+                    .iter()
+                    .filter(|k| !have.contains_key(*k))
+                    .copied()
+                    .collect();
+                for k in missing.iter() {
+                    if let Some(j) =
+                        cache_get(&(device, key.clone(), r.interp_key(), k.0, k.1, k.2))
+                    {
+                        have.insert(*k, j);
+                    }
+                }
+            }
+            let todo: Vec<AnswerKey> = wanted
+                .iter()
+                .filter(|k| !have.contains_key(*k))
+                .copied()
+                .collect();
+            let got = run_pool(r.cfg.threads, &todo, |(cid, pi, setup)| {
+                let class = classes.iter().find(|c| c.id == *cid).copied();
+                match class.and_then(|c| c.probes.get(*pi).map(|p| (c, p))) {
+                    Some((c, p)) => run_hook_probe(r, &f, &released_files, c, p, *setup),
+                    None => Vec::new(),
+                }
+            });
+            for (k, j) in todo.iter().zip(got.iter()) {
+                if !j
+                    .iter()
+                    .any(|x| x.answer == Answer::Error && x.detail.starts_with("timeout"))
+                {
+                    cache_put(
+                        (device, key.clone(), r.interp_key(), k.0, k.1, k.2),
+                        j.clone(),
+                    );
+                }
+            }
+            let have = by_group.entry(key).or_default();
+            for (k, j) in todo.into_iter().zip(got) {
+                have.insert(k, j);
+            }
+        };
+    // phase 1: RELEASED everywhere
+    let mut all: BTreeSet<AnswerKey> = BTreeSet::new();
+    for c in &classes {
+        for pi in 0..c.probes.len() {
+            for s in &setups {
+                all.insert((c.id, pi, *s));
+            }
+        }
+    }
+    run_group(Var::Released, &all, &mut by_group);
+    let rel_ans = by_group.get(&released_key).cloned().unwrap_or_default();
+    // phase 2: CLEAN, LANE, CANDIDATE where RELEASED denies (a probe binds there)
+    let binding: BTreeSet<AnswerKey> = all
+        .iter()
+        .filter(|k| {
+            rel_ans
+                .get(*k)
+                .map_or(false, |j| j.iter().any(|x| x.answer == Answer::Deny))
+        })
+        .copied()
+        .collect();
+    for var in [Var::Clean, Var::Lane, Var::Candidate] {
+        run_group(var, &binding, &mut by_group);
+    }
+    let get = |var: Var,
+               k: &AnswerKey,
+               by_group: &HashMap<String, HashMap<AnswerKey, Vec<Judged>>>|
+     -> Option<Vec<Judged>> {
+        by_group
+            .get(&group_key(&files(var)))
+            .and_then(|m| m.get(k))
+            .cloned()
+    };
+    // phase 3: attribution where neither LANE nor CANDIDATE denies a binding probe
+    let mut need_attr = BTreeSet::new();
+    for k in &binding {
+        let rj = rel_ans.get(k).cloned().unwrap_or_default();
+        let lj = get(Var::Lane, k, &by_group).unwrap_or_default();
+        let cj = get(Var::Candidate, k, &by_group).unwrap_or_default();
+        let clj = get(Var::Clean, k, &by_group).unwrap_or_default();
+        for (i, x) in rj.iter().enumerate() {
+            if x.answer != Answer::Deny {
+                continue;
+            }
+            let clean_denies = clj.get(i).map_or(false, |j| j.answer == Answer::Deny);
+            let lane_denies = lj.get(i).map_or(false, |j| j.answer == Answer::Deny);
+            let cand_denies = cj.get(i).map_or(false, |j| j.answer == Answer::Deny);
+            if clean_denies && !lane_denies && !cand_denies {
+                need_attr.insert(*k);
+            }
+        }
+    }
+    run_group(Var::Attribution, &need_attr, &mut by_group);
+    // decisions
+    let touched_inputs: Vec<(&String, bool)> = v
+        .touched
+        .iter()
+        .filter(|(r, _)| rels.contains(r))
+        .map(|(r, e)| (r, *e))
+        .collect();
+    let touches = !touched_inputs.is_empty();
+    let all_released_equal = touches && touched_inputs.iter().all(|(_, e)| *e);
+    for class in &classes {
+        for (pi, _) in class.probes.iter().enumerate() {
+            for cell in &cells {
+                let k = (class.id, pi, cell.setup);
+                let rj = rel_ans.get(&k).cloned().unwrap_or_default();
+                for (i, rx) in rj.iter().enumerate() {
+                    let pick =
+                        |var: Var| get(var, &k, &by_group).and_then(|v| v.get(i).map(|j| j.answer));
+                    let (clean, lane, cand, attr) = if rx.answer == Answer::Deny {
+                        (
+                            pick(Var::Clean),
+                            pick(Var::Lane),
+                            pick(Var::Candidate),
+                            pick(Var::Attribution),
+                        )
+                    } else {
+                        (None, None, None, None)
+                    };
+                    let decision = decide(
+                        rx.answer,
+                        clean,
+                        lane,
+                        cand,
+                        attr,
+                        touches,
+                        all_released_equal,
+                    );
+                    results.push(ProbeResult {
+                        test: class.test.to_string(),
+                        class: if class.probes.len() > 1 {
+                            format!("{}#{}", class.id, pi + 1)
+                        } else {
+                            class.id.to_string()
+                        },
+                        cell: format!("{}{}", cell.id, rx.suffix),
+                        protection: protection_of(class.test).to_string(),
+                        released: rx.answer,
+                        clean,
+                        lane,
+                        candidate: cand,
+                        attribution: attr,
+                        decision,
+                        detail: rx.detail.clone(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// AY1 (1)–(5) with BD1, BC5, BD5 and BG1 for one judged probe.
+fn decide(
+    released: Answer,
+    clean: Option<Answer>,
+    lane: Option<Answer>,
+    cand: Option<Answer>,
+    attr: Option<Answer>,
+    touches: bool,
+    all_released_equal: bool,
+) -> ProbeDecision {
+    let denies = |a: Option<Answer>| a == Some(Answer::Deny);
+    let refuse = || {
+        // BG1: a candidate state byte-equal to the RELEASED copy is never a ground for refusal
+        if all_released_equal {
+            ProbeDecision::LaneFinding
+        } else {
+            ProbeDecision::Refused
+        }
+    };
+    match released {
+        Answer::Allow => ProbeDecision::Unbound,
+        Answer::Error => {
+            if touches && !all_released_equal {
+                ProbeDecision::Refused
+            } else {
+                ProbeDecision::NotMeasurable
+            }
+        }
+        Answer::Deny => {
+            if !denies(clean) {
+                return refuse();
+            }
+            if denies(cand) {
+                return ProbeDecision::Held;
+            }
+            if denies(lane) {
+                return refuse();
+            }
+            if denies(attr) {
+                return refuse();
+            }
+            ProbeDecision::LaneFinding
+        }
+    }
+}
+
+/// E-21 for a candidate that touches an input of guard.sh other than guard.sh itself (BC3).
+fn screen_backstop(r: &Runner<'_>, v: &Variants, rels: &[String], results: &mut Vec<ProbeResult>) {
+    let touches_other = v
+        .touched
+        .keys()
+        .any(|t| rels.contains(t) && t != Device::Guard.rel());
+    if !touches_other || !r.cfg.cell_on("E-21") {
+        return;
+    }
+    let Some(released_guard) = v.released.get(Device::Guard.rel()).cloned() else {
+        return;
+    };
+    let sub = |f: &Files| subset(f, rels);
+    let all_released_equal = v
+        .touched
+        .iter()
+        .filter(|(t, _)| rels.contains(t))
+        .all(|(_, e)| *e);
+    for (id, probe, active, reason) in BACKSTOP_CLASSES {
+        if !r.cfg.class_on(id) {
+            continue;
+        }
+        let jobs = [
+            Var::Released,
+            Var::Clean,
+            Var::Lane,
+            Var::Candidate,
+            Var::Attribution,
+        ];
+        let got = run_pool(r.cfg.threads, &jobs, |var| {
+            let f = sub(match var {
+                Var::Released => &v.released,
+                Var::Clean => &v.clean,
+                Var::Lane => &v.lane,
+                Var::Candidate => &v.candidate,
+                Var::Attribution => &v.attribution,
+            });
+            run_backstop_probe(r, &f, &released_guard, probe, *active, reason)
+        });
+        let a = |i: usize| got.get(i).map(|j| j.answer);
+        let released = a(0).unwrap_or(Answer::Error);
+        // BH1: a variant run that does not prove the backstop is NOT MEASURABLE → refused (the cell
+        // only runs for a candidate touching an input of guard.sh)
+        let unproven = [1usize, 3].iter().any(|i| a(*i) == Some(Answer::Error));
+        let mut decision = decide(released, a(1), a(2), a(3), a(4), true, all_released_equal);
+        if released == Answer::Error || unproven {
+            decision = if all_released_equal {
+                ProbeDecision::NotMeasurable
+            } else {
+                ProbeDecision::Refused
+            };
+        }
+        results.push(ProbeResult {
+            test: "I4".into(),
+            class: id.to_string(),
+            cell: format!("E-21{}", if *active { "/active" } else { "" }),
+            protection: protection_of("I4").to_string(),
+            released,
+            clean: a(1),
+            lane: a(2),
+            candidate: a(3),
+            attribution: a(4),
+            decision,
+            detail: got
+                .iter()
+                .map(|j| j.detail.clone())
+                .collect::<Vec<_>>()
+                .join(" | "),
+        });
+    }
+}
+
+/// Invariant I4's regions (AY4, BA4, BD5) — judged only for a candidate that touches guard.sh.
+fn screen_i4(v: &Variants, results: &mut Vec<ProbeResult>) {
+    let rel = Device::Guard.rel();
+    let text_of = |c: Option<&LaidSource>| match c {
+        Some(LaidSource::Bytes { bytes, .. }) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        _ => None,
+    };
+    let released = text_of(v.released.get(rel));
+    let touched = v.touched.contains_key(rel);
+    let probe = if touched {
+        v.candidate.get(rel)
+    } else {
+        v.lane.get(rel)
+    };
+    let other = text_of(probe);
+    for (name, first, last) in corpus::I4_REGIONS {
+        let r = released
+            .as_deref()
+            .and_then(|t| corpus::i4_region(t, first, last));
+        let o = other
+            .as_deref()
+            .and_then(|t| corpus::i4_region(t, first, last));
+        let (decision, detail) = match (&r, &o) {
+            (None, _) => (
+                ProbeDecision::NotMeasurable,
+                "released anchor not found".to_string(),
+            ),
+            (Some(_), None) if touched => (
+                ProbeDecision::Refused,
+                "anchor not found in the candidate's guard.sh".into(),
+            ),
+            (Some(_), None) => (
+                ProbeDecision::LaneFinding,
+                "anchor not found in the lane's guard.sh".into(),
+            ),
+            (Some(a), Some(b)) if a == b => (
+                ProbeDecision::Held,
+                "byte-equal to the released copy".into(),
+            ),
+            (Some(_), Some(_)) if touched => (
+                ProbeDecision::Refused,
+                "region differs from the released copy".into(),
+            ),
+            (Some(_), Some(_)) => (
+                ProbeDecision::LaneFinding,
+                "the lane's region differs from the released copy".into(),
+            ),
+        };
+        results.push(ProbeResult {
+            test: "I4".into(),
+            class: format!("I4:{name}"),
+            cell: (*name).to_string(),
+            protection: protection_of("I4").to_string(),
+            released: if r.is_some() {
+                Answer::Deny
+            } else {
+                Answer::Error
+            },
+            clean: None,
+            lane: None,
+            candidate: None,
+            attribution: None,
+            decision,
+            detail,
+        });
+    }
+}
+
+/// AT4 on the FILE (BD3, BG1): a candidate table file holding a `capgate: deny` entry that the same
+/// file's LANE state does not hold → refused, unless byte-equal to its RELEASED copy.
+fn screen_at4(v: &Variants, results: &mut Vec<ProbeResult>) {
+    for rel in ["state/hook-targets.json", "state/hook-targets.json.example"] {
+        let Some(&released_equal) = v.touched.get(rel) else {
+            continue;
+        };
+        let denies = |c: Option<&LaidSource>| -> BTreeSet<String> {
+            let Some(LaidSource::Bytes { bytes, .. }) = c else {
+                return BTreeSet::new();
+            };
+            let Ok(doc) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+                return BTreeSet::new();
+            };
+            doc.get("profiles")
+                .and_then(|p| p.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter(|e| {
+                            e.pointer("/eligibility/capgate").and_then(|x| x.as_str())
+                                == Some("deny")
+                        })
+                        .map(|e| {
+                            e.get("basename")
+                                .and_then(|b| b.as_str())
+                                .unwrap_or("")
+                                .to_string()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let cand = denies(v.candidate.get(rel));
+        let lane = denies(v.lane.get(rel));
+        let added: Vec<&String> = cand.difference(&lane).collect();
+        let decision = if added.is_empty() || released_equal {
+            ProbeDecision::Held
+        } else {
+            ProbeDecision::Refused
+        };
+        results.push(ProbeResult {
+            test: "I3".into(),
+            class: format!("AT4:{rel}"),
+            cell: "file".into(),
+            protection: protection_of("I3").to_string(),
+            released: Answer::Deny,
+            clean: None,
+            lane: None,
+            candidate: None,
+            attribution: None,
+            decision,
+            detail: if added.is_empty() {
+                "no capgate deny added".into()
+            } else {
+                format!(
+                    "capgate deny added for {added:?}{}",
+                    if released_equal {
+                        " (byte-equal to the released copy — BG1)"
+                    } else {
+                        ""
+                    }
+                )
+            },
+        });
+    }
+}
+
+// ─────────────────────────────── invariant I3 — the registrar itself ───────────────────────────────
+
+const CAPGATE_SCRIPT: &str = "role-capability-gate.sh";
+
+/// The basenames named in a hook-target table (BA3).
+fn table_basenames(c: Option<&LaidSource>) -> BTreeSet<String> {
+    let Some(LaidSource::Bytes { bytes, .. }) = c else {
+        return BTreeSet::new();
+    };
+    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return BTreeSet::new();
+    };
+    doc.get("profiles")
+        .and_then(|p| p.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.get("basename").and_then(|b| b.as_str()))
+                .filter(|b| {
+                    !b.is_empty()
+                        && !b.contains('/')
+                        && !b.contains('\\')
+                        && *b != "."
+                        && *b != ".."
+                })
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// BA3: `.claude` + every `.claude*` basename any variant's tables name.
+fn profile_set(v: &Variants) -> Vec<String> {
+    let mut s: BTreeSet<String> = BTreeSet::new();
+    s.insert(".claude".into());
+    for f in [&v.released, &v.lane, &v.candidate, &v.clean, &v.attribution] {
+        for rel in ["state/hook-targets.json", "state/hook-targets.json.example"] {
+            for b in table_basenames(f.get(rel)) {
+                if b == ".claude" || b.starts_with(".claude-") {
+                    s.insert(b);
+                }
+            }
+        }
+    }
+    s.into_iter().collect()
+}
+
+/// Is the capability gate registered in this settings file (C28's ownership + scope rules)?
+fn gate_registered(settings: &Path, pack: &Path) -> Option<bool> {
+    let text = std::fs::read(settings).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&text).ok()?;
+    let want = format!("{}/hooks/{CAPGATE_SCRIPT}", pack.to_string_lossy());
+    let Some(entries) = v.pointer("/hooks/PreToolUse").and_then(|e| e.as_array()) else {
+        return Some(false);
+    };
+    Some(entries.iter().any(|e| {
+        let matcher_ok = e.get("matcher").map_or(true, |m| m.as_str() == Some(""));
+        matcher_ok
+            && e.get("hooks")
+                .and_then(|h| h.as_array())
+                .map_or(false, |hs| {
+                    hs.iter().any(|h| {
+                        h.get("command")
+                            .and_then(|c| c.as_str())
+                            .map_or(false, |c| c.contains(&want))
+                    })
+                })
+    }))
+}
+
+/// The settings text with every hook command that runs the gate removed ("starts unregistered").
+fn without_gate(template: &str) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(template) else {
+        return template.to_string();
+    };
+    if let Some(hooks) = v.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        for (_, entries) in hooks.iter_mut() {
+            if let Some(arr) = entries.as_array_mut() {
+                for e in arr.iter_mut() {
+                    if let Some(hs) = e.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                        hs.retain(|h| {
+                            !h.get("command")
+                                .and_then(|c| c.as_str())
+                                .map_or(false, |c| c.contains(CAPGATE_SCRIPT))
+                        });
+                    }
+                }
+                arr.retain(|e| {
+                    e.get("hooks")
+                        .and_then(|h| h.as_array())
+                        .map_or(true, |hs| !hs.is_empty())
+                });
+            }
+        }
+    }
+    serde_json::to_string_pretty(&v).unwrap_or_else(|_| template.to_string())
+}
+
+/// The other product hooks of the released product (boot-critical hook rows and their events), as
+/// a settings document — the shape the RELEASED registrar adds the gate to.
+fn other_product_hooks(pack_placeholder: &str) -> String {
+    let mut hooks: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+    for e in super::boot_critical::entries() {
+        if e.category != super::boot_critical::EntryCategory::Hook
+            || e.rel.ends_with(CAPGATE_SCRIPT)
+        {
+            continue;
+        }
+        for ev in e
+            .check_arg
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            hooks.entry(ev.to_string()).or_default().push(serde_json::json!({
+                "hooks": [{"type": "command", "command": format!("sh {pack_placeholder}/{}", e.rel)}]
+            }));
+        }
+    }
+    serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks }))
+        .unwrap_or_else(|_| "{}".into())
+}
+
+const PACK_PLACEHOLDER: &str = "@@SCREEN_PACK@@";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Layout {
+    L1,
+    L2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Scenario {
+    S1,
+    S2,
+    S3,
+}
+
+/// The I3 run of one variant in one (layout, scenario): two registrar runs, the second on the
+/// first's end state. `Some(ended registered)` per (run, target label); `None` = the run errored.
+fn run_i3(
+    r: &Runner<'_>,
+    files: &Files,
+    profiles: &[String],
+    template: &str,
+    layout: Layout,
+    scenario: Scenario,
+) -> Vec<(usize, String, Option<bool>, String)> {
+    let mut out = Vec::new();
+    let go = (|| -> Result<(), RepairError> {
+        let run = r.fresh_dir()?;
+        let res = (|| -> Result<(), RepairError> {
+            let home = run.join("h");
+            let tmp = run.join("t");
+            let work = run.join("w");
+            let bin = run.join("bin");
+            for d in [&home, &tmp, &work] {
+                std::fs::create_dir_all(d)
+                    .map_err(|e| RepairError::Io(format!("{}: {e}", d.display())))?;
+            }
+            let (pack, acct) = match layout {
+                Layout::L1 => (run.join("x").join("pack"), None),
+                Layout::L2 => (
+                    run.join("x").join("pack-dept-x"),
+                    Some(run.join("x").join("acct-dept-x")),
+                ),
+            };
+            lay_files(&pack, files)?;
+            let start = match scenario {
+                Scenario::S3 => without_gate(template),
+                _ => template.to_string(),
+            }
+            .replace(PACK_PLACEHOLDER, &pack.to_string_lossy());
+            let mut targets: Vec<(String, PathBuf)> = Vec::new();
+            for p in profiles {
+                let d = home.join(p);
+                std::fs::create_dir_all(&d)
+                    .map_err(|e| RepairError::Io(format!("{}: {e}", d.display())))?;
+                std::fs::write(d.join("settings.json"), &start)
+                    .map_err(|e| RepairError::Io(e.to_string()))?;
+                if layout == Layout::L1 {
+                    targets.push((p.clone(), d.join("settings.json")));
+                }
+            }
+            match &acct {
+                None => {
+                    let d = run.join("x").join("claude");
+                    std::fs::create_dir_all(&d)
+                        .map_err(|e| RepairError::Io(format!("{}: {e}", d.display())))?;
+                    std::fs::write(d.join("settings.json"), &start)
+                        .map_err(|e| RepairError::Io(e.to_string()))?;
+                    targets.push(("claude".into(), d.join("settings.json")));
+                }
+                Some(a) => {
+                    std::fs::create_dir_all(a)
+                        .map_err(|e| RepairError::Io(format!("{}: {e}", a.display())))?;
+                    std::fs::write(a.join("settings.json"), &start)
+                        .map_err(|e| RepairError::Io(e.to_string()))?;
+                    targets.push(("acct-dept-x".into(), a.join("settings.json")));
+                }
+            }
+            replay::write_stub(&bin, "worker", scenario != Scenario::S2)?;
+            let sock = ScratchSocket::bind(&run)?;
+            let mut path_dirs = vec![bin.clone()];
+            if let Some(p) = &r.py_dir {
+                path_dirs.push(p.clone());
+            }
+            let mut env = replay::base_env(&home, &tmp, &path_dirs);
+            env.push(("CYS_PACK_DIR".into(), pack.to_string_lossy().into_owned()));
+            env.push((
+                "CYS_SOCKET".into(),
+                sock.path().to_string_lossy().into_owned(),
+            ));
+            env.push(("PYTHONDONTWRITEBYTECODE".into(), "1".into()));
+            if let Some(a) = &acct {
+                env.push(("CYS_ACCOUNT_DIR".into(), a.to_string_lossy().into_owned()));
+            }
+            let Some(py) = &r.cfg.interpreter else {
+                for k in 1..=2 {
+                    for (label, _) in &targets {
+                        out.push((k, label.clone(), None, "no interpreter".into()));
+                    }
+                }
+                return Ok(());
+            };
+            env.push(("CYS_PY".into(), py.to_string_lossy().into_owned()));
+            let argv = vec![
+                py.to_string_lossy().into_owned(),
+                pack.join("bin/javis_preflight.py")
+                    .to_string_lossy()
+                    .into_owned(),
+                "--fix".into(),
+                "--only".into(),
+                "C28.self-correction".into(),
+                "--json".into(),
+            ];
+            for k in 1..=2 {
+                let o = r.run(&argv, &env, &work, b"");
+                let completed =
+                    !o.timed_out && o.spawn_error.is_none() && matches!(o.code, Some(0) | Some(1));
+                let why = if completed {
+                    format!("exit {:?}", o.code)
+                } else {
+                    format!(
+                        "registrar did not complete (exit {:?}, signal {:?}, timeout {}): {}",
+                        o.code,
+                        o.signal,
+                        o.timed_out,
+                        String::from_utf8_lossy(&o.stderr)
+                            .chars()
+                            .rev()
+                            .take(300)
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect::<String>()
+                    )
+                };
+                for (label, t) in &targets {
+                    let st = if completed {
+                        gate_registered(t, &pack)
+                    } else {
+                        None
+                    };
+                    out.push((k, label.clone(), st, why.clone()));
+                }
+            }
+            drop(sock);
+            Ok(())
+        })();
+        replay::remove_tree(&run);
+        res
+    })();
+    if let Err(e) = go {
+        out.push((1, "*".into(), None, format!("layout: {e:?}")));
+    }
+    out
+}
+
+/// The "registered" starting shape (BH5): the RELEASED registrar's own registration in an s1 set-up
+/// over the other product hooks, with the pack path replaced by a placeholder. `None` = the RELEASED
+/// registrar did not register the gate there (every I3 probe is then NOT MEASURABLE).
+fn i3_template(r: &Runner<'_>, released: &Files) -> Option<String> {
+    let py = r.cfg.interpreter.as_ref()?;
+    let run = r.fresh_dir().ok()?;
+    let res = (|| -> Option<String> {
+        let home = run.join("h");
+        let tmp = run.join("t");
+        let work = run.join("w");
+        let bin = run.join("bin");
+        for d in [&home, &tmp, &work, &home.join(".claude")] {
+            std::fs::create_dir_all(d).ok()?;
+        }
+        let pack = run.join("x").join("pack");
+        lay_files(&pack, released).ok()?;
+        std::fs::create_dir_all(run.join("x").join("claude")).ok()?;
+        let start = other_product_hooks(&pack.to_string_lossy());
+        std::fs::write(home.join(".claude").join("settings.json"), &start).ok()?;
+        replay::write_stub(&bin, "worker", true).ok()?;
+        let sock = ScratchSocket::bind(&run).ok()?;
+        let mut path_dirs = vec![bin.clone()];
+        if let Some(p) = &r.py_dir {
+            path_dirs.push(p.clone());
+        }
+        let mut env = replay::base_env(&home, &tmp, &path_dirs);
+        env.push(("CYS_PACK_DIR".into(), pack.to_string_lossy().into_owned()));
+        env.push((
+            "CYS_SOCKET".into(),
+            sock.path().to_string_lossy().into_owned(),
+        ));
+        env.push(("CYS_PY".into(), py.to_string_lossy().into_owned()));
+        env.push(("PYTHONDONTWRITEBYTECODE".into(), "1".into()));
+        let argv = vec![
+            py.to_string_lossy().into_owned(),
+            pack.join("bin/javis_preflight.py")
+                .to_string_lossy()
+                .into_owned(),
+            "--fix".into(),
+            "--only".into(),
+            "C28.self-correction".into(),
+            "--json".into(),
+        ];
+        let o = r.run(&argv, &env, &work, b"");
+        drop(sock);
+        if !matches!(o.code, Some(0) | Some(1)) {
+            return None;
+        }
+        let settings = home.join(".claude").join("settings.json");
+        if gate_registered(&settings, &pack) != Some(true) {
+            return None;
+        }
+        let text = std::fs::read_to_string(&settings).ok()?;
+        Some(text.replace(&*pack.to_string_lossy(), PACK_PLACEHOLDER))
+    })();
+    replay::remove_tree(&run);
+    res
+}
+
+type I3Rows = Vec<(usize, String, Option<bool>, String)>;
+
+fn i3_cache() -> &'static Mutex<HashMap<String, I3Rows>> {
+    static C: std::sync::OnceLock<Mutex<HashMap<String, I3Rows>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn screen_i3(r: &Runner<'_>, v: &Variants, rels: &[String], results: &mut Vec<ProbeResult>) {
+    let sub = |f: &Files| subset(f, rels);
+    let released_files = sub(&v.released);
+    let touched: Vec<(&String, bool)> = v
+        .touched
+        .iter()
+        .filter(|(t, _)| rels.contains(t))
+        .map(|(t, e)| (t, *e))
+        .collect();
+    let touches = !touched.is_empty();
+    let all_released_equal = touches && touched.iter().all(|(_, e)| *e);
+    let template = i3_template(r, &released_files);
+    let profiles = profile_set(v);
+    let combos: Vec<(Layout, Scenario)> = [Layout::L1, Layout::L2]
+        .iter()
+        .flat_map(|l| [Scenario::S1, Scenario::S2, Scenario::S3].map(move |s| (*l, s)))
+        .collect();
+    let Some(template) = template else {
+        for (l, s) in &combos {
+            results.push(ProbeResult {
+                test: "I3".into(),
+                class: "I3:*".into(),
+                cell: format!("{l:?}/{s:?}"),
+                protection: protection_of("I3").to_string(),
+                released: Answer::Error,
+                clean: None,
+                lane: None,
+                candidate: None,
+                attribution: None,
+                decision: if touches && !all_released_equal {
+                    ProbeDecision::Refused
+                } else {
+                    ProbeDecision::NotMeasurable
+                },
+                detail: "the released registrar did not produce the registered shape".into(),
+            });
+        }
+        return;
+    };
+    // per distinct content group: every (layout, scenario)
+    let groups: Vec<(Var, Files)> = [
+        Var::Released,
+        Var::Clean,
+        Var::Lane,
+        Var::Candidate,
+        Var::Attribution,
+    ]
+    .iter()
+    .map(|var| {
+        (
+            *var,
+            sub(match var {
+                Var::Released => &v.released,
+                Var::Clean => &v.clean,
+                Var::Lane => &v.lane,
+                Var::Candidate => &v.candidate,
+                Var::Attribution => &v.attribution,
+            }),
+        )
+    })
+    .collect();
+    let mut keys: Vec<(String, Files)> = Vec::new();
+    for (_, f) in &groups {
+        let k = group_key(f);
+        if !keys.iter().any(|(x, _)| *x == k) {
+            keys.push((k, f.clone()));
+        }
+    }
+    let jobs: Vec<(usize, Layout, Scenario)> = (0..keys.len())
+        .flat_map(|g| combos.iter().map(move |(l, s)| (g, *l, *s)))
+        .collect();
+    // the registrar's end states for the same bytes, profile set and starting shape are the same on
+    // every screen of this process (never reused on the BL1 repeat)
+    let ctx_key = format!(
+        "{}|{}|{}",
+        profiles.join(","),
+        group_key(&BTreeMap::from([(
+            "template".to_string(),
+            LaidSource::Bytes {
+                bytes: template.as_bytes().to_vec(),
+                mode: 0
+            }
+        )])),
+        r.interp_key()
+    );
+    let got = run_pool(r.cfg.threads, &jobs, |(g, l, s)| {
+        let ck = format!("{}|{l:?}|{s:?}|{ctx_key}", keys[*g].0);
+        if r.use_cache {
+            if let Some(rows) = i3_cache().lock().ok().and_then(|m| m.get(&ck).cloned()) {
+                return rows;
+            }
+        }
+        let rows = run_i3(r, &keys[*g].1, &profiles, &template, *l, *s);
+        if rows.iter().all(|(_, _, st, _)| st.is_some()) {
+            if let Ok(mut m) = i3_cache().lock() {
+                if m.len() > 2_000 {
+                    m.clear();
+                }
+                m.insert(ck, rows.clone());
+            }
+        }
+        rows
+    });
+    let mut table: HashMap<(String, Layout, Scenario), Vec<(usize, String, Option<bool>, String)>> =
+        HashMap::new();
+    for ((g, l, s), rows) in jobs.iter().zip(got) {
+        table.insert((keys[*g].0.clone(), *l, *s), rows);
+    }
+    let key_of = |var: Var| {
+        group_key(
+            &groups
+                .iter()
+                .find(|(x, _)| *x == var)
+                .map(|(_, f)| f.clone())
+                .unwrap_or_default(),
+        )
+    };
+    let ans = |b: Option<bool>| match b {
+        Some(true) => Answer::Deny, // "registered" plays the part of a deny: the protection holds
+        Some(false) => Answer::Allow,
+        None => Answer::Error,
+    };
+    for (l, s) in &combos {
+        let rows_of = |var: Var| {
+            table
+                .get(&(key_of(var), *l, *s))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let rel_rows = rows_of(Var::Released);
+        for (k, label, st, why) in &rel_rows {
+            let pick = |var: Var| -> Option<Answer> {
+                rows_of(var)
+                    .iter()
+                    .find(|(k2, l2, _, _)| k2 == k && l2 == label)
+                    .map(|(_, _, b, _)| ans(*b))
+            };
+            let released = ans(*st);
+            let (clean, lane, cand, attr) = if released == Answer::Deny {
+                (
+                    pick(Var::Clean),
+                    pick(Var::Lane),
+                    pick(Var::Candidate),
+                    pick(Var::Attribution),
+                )
+            } else {
+                (None, None, None, None)
+            };
+            let decision = decide(
+                released,
+                clean,
+                lane,
+                cand,
+                attr,
+                touches,
+                all_released_equal,
+            );
+            results.push(ProbeResult {
+                test: "I3".into(),
+                class: format!("I3:{label}"),
+                cell: format!("{l:?}/{s:?}/run{k}"),
+                protection: protection_of("I3").to_string(),
+                released,
+                clean,
+                lane,
+                candidate: cand,
+                attribution: attr,
+                decision,
+                detail: why.clone(),
+            });
+        }
+    }
+}
+
+// ─────────────────────────────────────────── the screen ───────────────────────────────────────────
+
+/// The screen with an explicit configuration (production: [`screen_protections`]).
+pub(crate) fn screen_with(
+    cfg: &ScreenConfig,
+    cand: &ScreenCandidate,
+    lane: &Path,
+    deadline: Duration,
+) -> Result<ScreenReport, RepairError> {
+    let started = Instant::now();
+    let until = started + deadline;
+    replay::system_path_has_no_cys()?;
+    if !lane.is_absolute() {
+        return Err(RepairError::Precondition(format!(
+            "{}: 레인의 팩 위치가 절대 경로가 아닙니다",
+            lane.display()
+        )));
+    }
+    let inputs = inputs_by_test()?;
+    let rels = all_input_rels()?;
+    let v = build_variants(cfg, cand, lane, &rels)?;
+    let fingerprint = input_fingerprint(cand, lane)?;
+    // the scoped after-run comparison (BK1): before
+    let settings = replay::real_settings_targets(lane, &cfg.real_home);
+    let before = replay::live_snapshot(lane, &settings);
+    let (mut results, leftovers, out_of_time) = run_all(cfg, &v, &inputs, until, true)?;
+    let after = replay::live_snapshot(lane, &settings);
+    let first: Vec<LiveDifference> = replay::changed_items(&before, &after)
+        .into_iter()
+        .map(|(b, a)| LiveDifference {
+            item: a.item,
+            before: format!("{} [{}]", b.state, b.stamp),
+            after: format!("{} [{}]", a.state, a.stamp),
+        })
+        .collect();
+    let mut rewritten = Vec::new();
+    let mut all_leftovers = leftovers;
+    if !first.is_empty() && !out_of_time {
+        // one repeat on a fresh scratch root; an item written AGAIN in that window is the finding
+        let before2 = replay::live_snapshot(lane, &settings);
+        let (_again, left2, _) = run_all(cfg, &v, &inputs, until, false)?;
+        let after2 = replay::live_snapshot(lane, &settings);
+        all_leftovers.extend(left2);
+        rewritten = replay::changed_items(&before2, &after2)
+            .into_iter()
+            .map(|(b, a)| LiveDifference {
+                item: a.item,
+                before: format!("{} [{}]", b.state, b.stamp),
+                after: format!("{} [{}]", a.state, a.stamp),
+            })
+            .collect();
+    }
+    if out_of_time {
+        return Err(RepairError::CheckTimeout(format!(
+            "보호장치 심사가 시한({}초) 안에 끝나지 않았습니다",
+            deadline.as_secs()
+        )));
+    }
+    let still: Vec<u32> = all_leftovers
+        .into_iter()
+        .filter(|p| replay::group_alive(*p))
+        .collect();
+    results.sort_by(|a, b| {
+        (a.test.as_str(), a.class.as_str(), a.cell.as_str()).cmp(&(
+            b.test.as_str(),
+            b.class.as_str(),
+            b.cell.as_str(),
+        ))
+    });
+    let mut report = summarize(results, fingerprint, started.elapsed());
+    report.after_run = AfterRun {
+        first,
+        rewritten_in_repeat: rewritten,
+        leftover_processes: still,
+    };
+    if !report.after_run.leftover_processes.is_empty() {
+        report.refusals.push(format!(
+            "예행이 끝난 뒤에도 남은 프로세스가 있었습니다(pid {:?}) — 거부합니다",
+            report.after_run.leftover_processes
+        ));
+        report.verdict = ScreenVerdict::Refused;
+    }
+    Ok(report)
+}
+
+type RunAll = (Vec<ProbeResult>, Vec<u32>, bool);
+
+fn run_all(
+    cfg: &ScreenConfig,
+    v: &Variants,
+    inputs: &BTreeMap<&'static str, Vec<String>>,
+    until: Instant,
+    use_cache: bool,
+) -> Result<RunAll, RepairError> {
+    let scratch = ScratchRoot::new(&cfg.scratch_base, "sc-")?;
+    let mut r = Runner::new(cfg, scratch.path(), until)?;
+    r.use_cache = use_cache;
+    let mut results = Vec::new();
+    let empty = Vec::new();
+    let g = inputs.get("G").unwrap_or(&empty);
+    let gate: Vec<String> = {
+        let mut s: BTreeSet<String> = inputs.get("R").unwrap_or(&empty).iter().cloned().collect();
+        s.extend(inputs.get("C").unwrap_or(&empty).iter().cloned());
+        s.into_iter().collect()
+    };
+    screen_device(&r, Device::Guard, v, g, &mut results);
+    screen_backstop(&r, v, g, &mut results);
+    screen_device(&r, Device::Gate, v, &gate, &mut results);
+    if cfg.run_i3 {
+        screen_i3(&r, v, inputs.get("I3").unwrap_or(&empty), &mut results);
+    }
+    screen_i4(v, &mut results);
+    screen_at4(v, &mut results);
+    let leftovers = r.leftovers.lock().map(|l| l.clone()).unwrap_or_default();
+    let oot = r.out_of_time.load(Ordering::SeqCst);
+    drop(r);
+    drop(scratch);
+    Ok((results, leftovers, oot))
+}
+
+fn summarize(probes: Vec<ProbeResult>, input_fingerprint: String, took: Duration) -> ScreenReport {
+    let mut refusals = Vec::new();
+    let mut notes = Vec::new();
+    let mut lane_findings = Vec::new();
+    let mut not_measurable = Vec::new();
+    // refusals grouped by protection (the reason names every protection concerned)
+    let mut by_prot: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    let mut findings: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for p in &probes {
+        let tag = format!("{} {}", p.class, p.cell);
+        match p.decision {
+            ProbeDecision::Refused => by_prot.entry(p.protection.as_str()).or_default().push(tag),
+            ProbeDecision::LaneFinding => {
+                findings.entry(p.protection.as_str()).or_default().push(tag)
+            }
+            ProbeDecision::NotMeasurable => not_measurable.push(format!("{tag} ({})", p.detail)),
+            _ => {}
+        }
+    }
+    for (prot, tags) in &by_prot {
+        refusals.push(format!(
+            "보호장치 '{prot}': 이 후보를 적용하면 시험 {}건을 통과하지 못하거나 잴 수 없습니다(예: {}) — 거부합니다",
+            tags.len(),
+            tags.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    let n_findings: usize = findings.values().map(Vec::len).sum();
+    if n_findings > 0 {
+        notes.push(format!(
+            "보호장치 시험 {n_findings}건이 이 부서의 지금 파일에서 이미 통과되지 않습니다 — 이 후보 때문이 아닙니다(접수 줄에 남깁니다)"
+        ));
+        for (prot, tags) in &findings {
+            lane_findings.push(format!(
+                "보호장치 '{prot}' 시험 {}건이 이 부서의 지금 파일에서 통과되지 않습니다(예: {})",
+                tags.len(),
+                tags.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+    if !not_measurable.is_empty() {
+        notes.push(format!(
+            "보호장치 시험 {}건은 출시본으로 잴 수 없었습니다(후보가 그 장치의 파일을 건드리지 않아 거부 사유는 아닙니다)",
+            not_measurable.len()
+        ));
+    }
+    let verdict = if !refusals.is_empty() {
+        ScreenVerdict::Refused
+    } else if notes.is_empty() {
+        ScreenVerdict::Accepted
+    } else {
+        ScreenVerdict::AcceptedWithNotes
+    };
+    ScreenReport {
+        schema: SCREEN_SCHEMA,
+        verdict,
+        refusals,
+        notes,
+        lane_findings,
+        not_measurable,
+        probes,
+        input_fingerprint,
+        build_id: screen_build_id(),
+        duration_ms: took.as_millis() as u64,
+        after_run: AfterRun::default(),
+    }
+}
+
+#[cfg(test)]
+#[path = "screen_tests.rs"]
+mod tests;
+
+// keep the corpus names used only by the tables reachable from here (census tests)
+#[allow(dead_code)]
+fn _corpus_names() -> (
+    &'static [Cell],
+    &'static [(&'static str, Probe, bool, &'static str)],
+) {
+    (CELLS, BACKSTOP_CLASSES)
 }

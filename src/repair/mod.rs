@@ -26,10 +26,14 @@ pub mod platform;
 pub mod probation;
 pub mod reapply_claim;
 pub mod rehearsal;
+/// Track T5b — the replay rules shared by the rehearsal runner and the screen (C4 BH2, BK1, BL1).
+pub mod replay;
 pub mod roles;
 pub mod rules;
 /// Track T5b — the protection screen beside the rehearsal runner (RULINGS AT9).
 pub mod screen;
+/// Track T5b — the screen's tables (C4 AY2): corpora G / R / C, the cell table, anchors.
+pub mod screen_corpus;
 pub mod tombstones;
 pub mod types;
 /// T6 — the vault's fresh write-once slots and the seal (C2).
