@@ -15462,6 +15462,97 @@ mod m11_tests {
         }
     }
 
+    /// ★T2i(RULINGS FH2): 시작 경로의 판독기는 막히지 않고 상한 없이 읽지 않는다 — **최종 대상이 상한 이하의 일반 파일인 링크는
+    /// 따른다**(출시본이 따르던 곳: `read_start_live` 를 쓰는 곳 — 설정 파일 판독 `settings_read_bounded` · `verify_desired_hooks_registered`
+    /// · 첫기동 관문 시드의 `.claude.json`, 살아 있는 팩 파일의 계획 · 설치 · 스냅샷 · vendor 우선 판독, `ceo_promoted_in`, 부서 soul
+    /// 시드, `byte_backup_user` 의 원본). 그 밖을 가리키는 링크(FIFO · 장치 · 폴더 · 상한 초과)는 '판독 불가' — 그 판독의 기존 안전값
+    /// (설정 = 덮지 않음 · 검증 = 전부 미등록으로 보고 · 시드 = 거부). 끊긴 링크는 출시본과 같이 '없음'(그 판독의 기존 '없음' 갈래).
+    /// `merge_desired_hooks` 는 출시본처럼 링크인 설정 파일을 쓰지 않는다(거부).
+    #[cfg(unix)]
+    #[test]
+    fn fh2_a_link_to_a_regular_file_is_followed_and_a_link_to_anything_else_is_unreadable() {
+        let rig = Rig::new("fh2");
+        let root = rig.base.join("fh2");
+        std::fs::create_dir_all(&root).unwrap();
+        let pk = root.join("pack");
+        // 판독기 자체.
+        std::fs::write(root.join("real.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(root.join("real.json"), root.join("l-real")).unwrap();
+        assert_eq!(read_start_live(&root.join("l-real")), StartRead::Bytes(b"{}".to_vec()), "일반 파일 링크는 따른다");
+        assert!(matches!(read_start_meta(&root.join("l-real")), StartRead::Unreadable(_)), "메타 판독기는 링크를 따르지 않는다");
+        let fifo = root.join("f.fifo");
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        }
+        std::fs::create_dir_all(root.join("adir")).unwrap();
+        std::fs::File::create(root.join("big")).unwrap().set_len(START_LIVE_CAP + 1).unwrap();
+        let others: [(&str, PathBuf); 4] = [
+            ("fifo", fifo.clone()),
+            ("device", PathBuf::from("/dev/zero")),
+            ("dir", root.join("adir")),
+            ("oversized", root.join("big")),
+        ];
+        for (what, target) in &others {
+            let l = root.join(format!("l-{what}"));
+            std::os::unix::fs::symlink(target, &l).unwrap();
+            let l2 = l.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(read_start_live(&l2));
+            });
+            let got = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("link to {what}: the read did not return within its deadline"));
+            assert!(matches!(got, StartRead::Unreadable(_)), "link to {what}: {got:?}");
+        }
+        std::os::unix::fs::symlink(root.join("nowhere"), root.join("l-dangling")).unwrap();
+        assert_eq!(read_start_live(&root.join("l-dangling")), StartRead::Missing, "끊긴 링크 = 출시본과 같은 '없음'");
+        // 설정 파일: 등록이 다 된 일반 파일을 가리키는 링크 → 검증은 그 내용을 읽는다(따름).
+        let cfg = root.join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let full = root.join("full-settings.json");
+        merge_desired_hooks(&full, &pk, &AWAKENING_HOOKS).unwrap();
+        let settings = cfg.join("settings.json");
+        std::os::unix::fs::symlink(&full, &settings).unwrap();
+        assert!(verify_desired_hooks_registered(&settings, &pk, &AWAKENING_HOOKS).is_empty(), "링크를 따라 등록을 읽었다");
+        assert!(merge_desired_hooks(&settings, &pk, &AWAKENING_HOOKS).is_err(), "링크인 설정 파일은 쓰지 않는다(출시본 그대로)");
+        // 그 밖을 가리키는 링크 → 판독 불가의 안전값(검증 = 전부 미등록 · 재조정 = 오류 · 덮지 않음).
+        for (what, target) in &others {
+            std::fs::remove_file(&settings).unwrap();
+            std::os::unix::fs::symlink(target, &settings).unwrap();
+            let (s, pk2) = (settings.clone(), pk.clone());
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let v = verify_desired_hooks_registered(&s, &pk2, &AWAKENING_HOOKS).len();
+                let r = retune_registered_hook_timeouts(&s, &pk2, &AWAKENING_HOOKS).is_err();
+                let _ = tx.send((v, r));
+            });
+            let (missing, retune_err) = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("settings link to {what}: did not return within its deadline"));
+            assert_eq!(missing, AWAKENING_HOOKS.len(), "settings link to {what}: 전부 미등록으로 보고");
+            assert!(retune_err, "settings link to {what}: 재조정은 오류(덮지 않음)");
+        }
+        // 첫기동 관문 시드의 `.claude.json`: 일반 파일 링크는 읽고(판독 거부가 아님), FIFO 링크는 거부.
+        let claude = cfg.join(CLAUDE_CONFIG_FILE);
+        std::fs::write(root.join("claude-real.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(root.join("claude-real.json"), &claude).unwrap();
+        let out = seed_first_run_gates_at(&cfg, &["/w".to_string()], AuthPremise::Unproven);
+        assert!(!matches!(&out, SeedOutcome::Refused(why) if why.contains("읽기 불가")), "일반 파일 링크는 읽는다: {out:?}");
+        let _ = std::fs::remove_file(&claude);
+        let _ = std::fs::remove_file(cfg.join(FIRST_RUN_SEED_BACKUP));
+        std::os::unix::fs::symlink(&fifo, &claude).unwrap();
+        let c2 = cfg.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(seed_first_run_gates_at(&c2, &["/w".to_string()], AuthPremise::Unproven));
+        });
+        let out = rx.recv_timeout(std::time::Duration::from_secs(20)).expect(".claude.json link to fifo: deadline");
+        assert!(matches!(&out, SeedOutcome::Refused(why) if why.contains("읽기 불가")), "{out:?}");
+    }
+
     /// EC5 시험의 형태 심기 — 폴더 · 상한 초과(성긴 파일) · FIFO · FIFO 를 가리키는 링크 · 장치(`/dev/zero`)를 가리키는 링크.
     fn plant_special(p: &Path, form: &str, root: &Path, case: &str) {
         let _ = std::fs::remove_file(p);
