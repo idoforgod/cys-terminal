@@ -4020,3 +4020,108 @@ fn da3_intake_lock_set_is_fixed() {
     drop(intake_lock_for("sig-a"));
     drop(intake_lock_for("sig-a")); // released on drop: taking it twice in a row never blocks
 }
+
+/// RULINGS DA4: one open repair per FILE — `notes/ITEM.txt` beside an open `notes/item.txt` (the
+/// same file on this case-insensitive volume), the same for a file that does not exist yet, one
+/// `begin` naming one file twice, and two hard-linked names of a general file.
+#[test]
+fn da4_one_open_repair_per_file_not_per_spelling() {
+    let r = rig("da4");
+    std::fs::create_dir_all(r.pack.join("notes")).unwrap();
+    std::fs::write(r.pack.join("notes/item.txt"), b"item\n").unwrap();
+    let a = r
+        .call(
+            T0,
+            &seat(3, "worker"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/item.txt"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b = seat(13, "worker-3");
+    let e = r
+        .call(
+            T0 + 1.0,
+            &b,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/ITEM.txt"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    assert!(e.message.contains(&a), "{}", e.message);
+    // a file that does not exist yet: the folded name decides
+    let a2 = r
+        .call(
+            T0,
+            &seat(3, "worker"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/new.txt"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let e = r
+        .call(
+            T0 + 1.0,
+            &b,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/NEW.txt"]}),
+        )
+        .unwrap_err();
+    assert!(e.message.contains(&a2), "{}", e.message);
+    // one begin naming one file twice
+    std::fs::write(r.pack.join("notes/other.txt"), b"o\n").unwrap();
+    let e = r
+        .call(
+            T0 + 1.0,
+            &b,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/other.txt", "notes/OTHER.txt"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "invalid_params", "{}", e.message);
+    // two hard-linked names of a general file: neither name is a second repair
+    std::fs::write(r.pack.join("notes/h1.txt"), b"h\n").unwrap();
+    std::fs::hard_link(r.pack.join("notes/h1.txt"), r.pack.join("notes/h2.txt")).unwrap();
+    for rel in ["notes/h1.txt", "notes/h2.txt"] {
+        let e = r
+            .call(
+                T0 + 1.0,
+                &b,
+                "begin",
+                json!({"trigger": "owner_order", "files": [rel]}),
+            )
+            .unwrap_err();
+        assert_eq!(e.code, "repair_precondition", "{rel}: {}", e.message);
+    }
+    assert_eq!(
+        ledger::list_ids_in(&r.root).len(),
+        2,
+        "a second open repair was made"
+    );
+}
+
+/// RULINGS DA4: `same_target` follows the file's identity when both live files exist (a hard link
+/// is the same file, another file is not) and the folded name when one does not exist yet.
+#[test]
+fn da4_same_target_follows_identity_then_name() {
+    let r = rig("da4-same");
+    std::fs::create_dir_all(r.pack.join("notes")).unwrap();
+    std::fs::write(r.pack.join("notes/one.txt"), b"1\n").unwrap();
+    std::fs::hard_link(r.pack.join("notes/one.txt"), r.pack.join("notes/two.txt")).unwrap();
+    std::fs::write(r.pack.join("notes/three.txt"), b"3\n").unwrap();
+    assert!(
+        same_target(&r.pack, "notes/one.txt", "notes/two.txt"),
+        "a hard link is the same file"
+    );
+    assert!(!same_target(&r.pack, "notes/one.txt", "notes/three.txt"));
+    assert!(same_target(&r.pack, "notes/absent.txt", "NOTES/Absent.TXT"));
+    assert!(!same_target(
+        &r.pack,
+        "notes/absent.txt",
+        "notes/absent2.txt"
+    ));
+}

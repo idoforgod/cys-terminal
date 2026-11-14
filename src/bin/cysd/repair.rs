@@ -1567,6 +1567,17 @@ mod ledger_verbs {
         for rel in &files {
             target_rules(ctx, rel)?;
         }
+        // DA4: one file named twice (another spelling, a hard link) is one target
+        for (i, a) in files.iter().enumerate() {
+            if let Some(b) = files[i + 1..]
+                .iter()
+                .find(|b| super::same_target(&ctx.pack_dir, a, b))
+            {
+                return Err(VerbError::invalid(format!(
+                    "{a} 와 {b} 는 같은 파일입니다 — 한 번만 지정하세요(RULINGS DA4)"
+                )));
+            }
+        }
         // T4 (C10 10.6 · AD6 replaced · AW8): the rule-document branch — a rule document (any
         // spelling that folds to one, also through `--joins`) starts only with a valid owner token.
         if let Some(v) = begin_rule_document(ctx, caller, p, trigger, &files, &hooks, joins, resolves)? {
@@ -1727,7 +1738,12 @@ mod ledger_verbs {
             if r.resolves == resolves && theirs == key {
                 continue; // a pick-up candidate (handled above)
             }
-            if let Some(shared) = key.iter().find(|k| theirs.contains(k)) {
+            // DA4: the same FILE, not the same spelling
+            if let Some(shared) = key.iter().find(|k| {
+                theirs
+                    .iter()
+                    .any(|t| super::same_target(&ctx.pack_dir, k, t))
+            }) {
                 return Err(VerbError::new(
                     cys::repair::types::ERR_PRECONDITION,
                     format!(
@@ -4169,6 +4185,22 @@ fn protected_names(pack: &Path) -> Vec<String> {
         }
     }
     out
+}
+
+/// RULINGS DA4 — whether two pack-relative targets are the SAME file: when both live files exist,
+/// their identity decides (volume + file id — the volume's own name equality, case and
+/// normalisation included, and hard links); when one does not exist yet, the folded spellings
+/// decide (`fold_name`, case; Unicode normalisation is CD1's stated limit), which on a
+/// case-sensitive volume errs on the side of "the same".
+pub(crate) fn same_target(pack: &Path, a: &str, b: &str) -> bool {
+    use cys::repair::boot_critical::file_identity;
+    match (file_identity(&pack.join(a)), file_identity(&pack.join(b))) {
+        (Some(x), Some(y)) => x == y,
+        _ => {
+            cys::repair::types::fold_name(&a.replace('\\', "/"))
+                == cys::repair::types::fold_name(&b.replace('\\', "/"))
+        }
+    }
 }
 
 /// C10's rule-document base names (as `guard.sh:PROTECTED_NAMES`), lower-cased.
