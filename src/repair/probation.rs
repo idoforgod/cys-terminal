@@ -77,10 +77,13 @@ impl Due {
 /// C7 7.2 — the tick's own decision (pure): a new incarnation → the probation checks at once;
 /// otherwise probation when 10 min passed since its last check, the scan when 1 h passed.
 pub fn due(state: Option<&JobState>, incarnation: &str, now: f64) -> Due {
+    // CT10: a BACKWARD clock step (now earlier than the last run) makes the work due at once — it
+    // never waits for the wall clock to catch up; a forward step only makes work due sooner (and the
+    // re-check checks supersession before anything else)
+    let elapsed_at_least = |last: f64, interval: u64| now < last || now - last >= interval as f64;
     let first = state.is_none_or(|s| s.last_incarnation != incarnation);
-    let probation = first
-        || state.is_none_or(|s| now - s.last_probation_check >= ledger::PROBATION_RECHECK_SECS as f64);
-    let sweep = state.is_none_or(|s| now - s.last_sweep >= ledger::SWEEP_SECS as f64);
+    let probation = first || state.is_none_or(|s| elapsed_at_least(s.last_probation_check, ledger::PROBATION_RECHECK_SECS));
+    let sweep = state.is_none_or(|s| elapsed_at_least(s.last_sweep, ledger::SWEEP_SECS));
     Due {
         first_of_incarnation: first,
         probation,
@@ -571,18 +574,6 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, repor
         return Ok(());
     };
     let id = &rec.id;
-    // 24 hours over → 사용 중 (N3: also after only check_timeouts; recorded, one line)
-    if env.op.now - p.applied_at >= ledger::PROBATION_SECS as f64 {
-        close_row(env, id, "사용 중 — 24시간 시험 기간을 마쳤습니다", &[], Some(RepairState::InUse))?;
-        report.ended.push(id.clone());
-        let tail = if p.check_timeouts.is_empty() {
-            String::new()
-        } else {
-            format!(" (검사 시간 초과 {}건 기록 — 실패로 확정된 적은 없음)", p.check_timeouts.len())
-        };
-        report.lines.push(format!("{}: 시험 기간을 마치고 사용 중{tail}", id.as_str()));
-        return Ok(());
-    }
     // the binding: this lane, the pack generation, the expected live states
     let gen = apply::pack_generation(env.op.pack);
     let bound = PackGeneration {
@@ -605,6 +596,20 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, repor
             report.lines.push(format!("{}: {why}", id.as_str()));
             return Ok(());
         }
+    }
+    // 24 hours over → 사용 중 (N3: also after only check_timeouts; recorded, one line). CT10: only
+    // AFTER the supersession checks above — a sleeping machine or a forward clock step never closes
+    // a superseded probation as in use
+    if env.op.now - p.applied_at >= ledger::PROBATION_SECS as f64 {
+        close_row(env, id, "사용 중 — 24시간 시험 기간을 마쳤습니다", &[], Some(RepairState::InUse))?;
+        report.ended.push(id.clone());
+        let tail = if p.check_timeouts.is_empty() {
+            String::new()
+        } else {
+            format!(" (검사 시간 초과 {}건 기록 — 실패로 확정된 적은 없음)", p.check_timeouts.len())
+        };
+        report.lines.push(format!("{}: 시험 기간을 마치고 사용 중{tail}", id.as_str()));
+        return Ok(());
     }
     // the repaired files' own checks — one bounded child at a time
     let mut failure: Option<String> = None;
@@ -931,25 +936,25 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
                 None
             }
             CheckResult::Fail(m) => Some(m),
-            CheckResult::Timeout => match m10_attribute_timeout(env, rel, original.as_deref(), deadline) {
-                Ok(m) => Some(m),
-                Err(m) => {
-                    if !already("check-timeout") {
-                        new_findings.push(Finding {
-                            rel: rel.to_string(),
-                            sha256: sha.clone(),
-                            kind: "check-timeout".into(),
-                            at: env.op.now,
-                            notice: false,
-                            notified: false,
-                            slot: None,
-                            kept_copy: None,
-                            note: m,
-                        });
-                    }
-                    None
+            // CT10: an unapproved file has no commit-time timing evidence — without evidence there is
+            // no put-back: `check_timeout`, nothing moved, checked again next hour (the flagged
+            // "ratio 1" reading was rejected)
+            CheckResult::Timeout => {
+                if !already("check-timeout") {
+                    new_findings.push(Finding {
+                        rel: rel.to_string(),
+                        sha256: sha.clone(),
+                        kind: "check-timeout".into(),
+                        at: env.op.now,
+                        notice: false,
+                        notified: false,
+                        slot: None,
+                        kept_copy: None,
+                        note: format!("{rel}: 검사 시간 초과 — 시간 근거가 없어 실패로 단정하지 않고 아무것도 옮기지 않았습니다(다음 차례에 다시)"),
+                    });
                 }
-            },
+                None
+            }
         };
         let Some(why) = failed else {
             continue;
@@ -1084,42 +1089,6 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
         save_findings(root, lane, &existing)?;
     }
     Ok(new_findings)
-}
-
-/// O3 for the scan (flagged interpretation — see the T6 report): M10 has no commit-time duration,
-/// so the control's own duration measured now stands for it (ratio 1): FAILURE when the control —
-/// the same check, same deadline, on a scratch copy of the content that would be put back — passed
-/// within the deadline ÷ 1.5 AND the file's check timed out again; else `check_timeout`.
-fn m10_attribute_timeout(env: &JobEnv<'_>, rel: &str, original: Option<&[u8]>, deadline: Duration) -> Result<String, String> {
-    let Some(orig) = original else {
-        return Err(format!("{rel}: 검사 시간 초과 — 대조할 지금 세대의 원본이 없어 실패로 단정하지 않습니다"));
-    };
-    let dir = env.op.root.join(".scratch").join(super::wal::new_op_id(env.op.now, "m10-control"));
-    let dst = dir.join(rel);
-    let made = dst
-        .parent()
-        .map(|p| std::fs::create_dir_all(p).is_ok())
-        .unwrap_or(false)
-        && std::fs::write(&dst, orig).is_ok();
-    if !made {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Err(format!("{rel}: 대조 사본을 만들 수 없습니다"));
-    }
-    let control = (env.check)(rel, &dir, deadline);
-    let _ = std::fs::remove_dir_all(&dir);
-    let control_ms = match control {
-        Ok(CheckOutcome { result: CheckResult::Pass, ms }) => ms,
-        _ => return Err(format!("{rel}: 대조 검사(원본)도 제때 끝나지 않았습니다 — 느린 기계로 봅니다")),
-    };
-    if u128::from(control_ms) * u128::from(REFERENCE_SLOWDOWN_PERMILLE) >= deadline.as_millis() * 1000 {
-        return Err(format!("{rel}: 원본의 검사도 시한의 2/3 를 넘게 걸렸습니다 — 느린 기계로 봅니다"));
-    }
-    match (env.check)(rel, env.op.pack, deadline) {
-        Ok(CheckOutcome { result: CheckResult::Timeout, .. }) => Ok(format!("{rel}: 원본은 제때 통과했는데 이 파일의 검사가 두 번 모두 시간 초과")),
-        Ok(CheckOutcome { result: CheckResult::Fail(m), .. }) => Ok(format!("{rel}: {m}")),
-        Ok(CheckOutcome { result: CheckResult::Pass, .. }) => Err(format!("{rel}: 두 번째 검사는 통과 — 일시적인 지연으로 봅니다")),
-        Err(e) => Err(format!("{rel}: 두 번째 검사를 돌릴 수 없습니다({e:?})")),
-    }
 }
 
 /// The resolved restore content of M10 for `rel` in a pack: the binary's embedded copy, only when

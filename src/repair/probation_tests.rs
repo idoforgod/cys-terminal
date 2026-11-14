@@ -393,15 +393,19 @@ fn m10_changed_between_check_and_revert_is_left() {
     assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"#!/bin/bash\nthird\n");
 }
 
-/// M10's flagged O3 reading (D-11-09 / D-11-10): a hang is blamed only when the control (the content
-/// that would be put back) passed in time — within the deadline ÷ 1.5 — and the second run timed out.
+/// M10 and a check that times out (RULINGS CT10 — REWRITTEN; old expectation, from the flagged
+/// "ratio 1" reading the ruling rejected: `[(control_ok=true, second=Timeout) → reverted = true,
+/// (false, Timeout) → false, (true, Pass) → false]`, i.e. a hang was blamed and the file put back
+/// when the control passed in time). Now there is no timing evidence for an unapproved file, so a
+/// timeout is `check_timeout`: nothing is moved in ANY of the three cases and a `check-timeout`
+/// finding (no notice) records it; the next hour checks again.
 #[cfg(target_os = "macos")]
 #[test]
 fn m10_hang_attribution() {
     let Some(rel) = listed() else {
         return;
     };
-    for (control_ok, second, reverted) in [(true, CheckResult::Timeout, true), (false, CheckResult::Timeout, false), (true, CheckResult::Pass, false)] {
+    for (control_ok, second, reverted) in [(true, CheckResult::Timeout, false), (false, CheckResult::Timeout, false), (true, CheckResult::Pass, false)] {
         let r = rig("m10hang");
         r.put(rel, b"#!/bin/bash\nhang\n", 0o755);
         let pack = r.pack.clone();
@@ -417,9 +421,51 @@ fn m10_hang_attribution() {
         let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
         let d = Doubles { check: &check, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
         let lock = r.base.join(".pack-apply.lock");
-        m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+        let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
         assert_eq!(std::fs::read(r.pack.join(rel)).unwrap() == b"#!/bin/bash\necho ok\n", reverted, "control_ok={control_ok} second={second:?}");
+        assert!(f.iter().any(|x| x.rel == rel && x.kind == "check-timeout" && !x.notice), "{f:?}");
     }
+}
+
+// ───────────────────────────── RULINGS CT10 — supersession before expiry; clock steps ─────────────────────────────
+
+/// CT10: at (or past) the 24-hour boundary a probation whose generation changed — or whose live file
+/// is not the applied state — closes 대체됨, never 사용 중 (a sleeping machine / a forward clock step).
+/// Without CT10 the 24-hour close came first.
+#[cfg(target_os = "macos")]
+#[test]
+fn supersession_is_checked_before_the_24_hour_close() {
+    let r = rig("ct10expiry");
+    let a = rid("R-1");
+    committed_general(&r, &a, "hooks/s.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
+    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    let later = NOW + 3.0 * 86_400.0;
+    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, later, &lock), false).unwrap();
+    assert!(rep.superseded.contains(&a) && !rep.ended.contains(&a), "{rep:?}");
+    let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
+    assert!(row.probation.unwrap().closed.unwrap().starts_with("대체됨"));
+}
+
+/// CT10: a BACKWARD clock step never postpones a due check beyond one interval — the work is due at
+/// once (without CT10 it waited until the wall clock caught up with the last run).
+#[test]
+fn a_backward_clock_step_makes_the_work_due() {
+    let st = JobState {
+        schema: 1,
+        lane: LaneKey("base".into()),
+        last_incarnation: "inc-2".into(),
+        last_probation_check: NOW,
+        last_sweep: NOW,
+        initial_catchup_complete: false,
+        pack_instance: None,
+        pack_dir: None,
+        pack_dir_identity: None,
+        pack_generation: None,
+    };
+    let d = due(Some(&st), "inc-2", NOW - 86_400.0);
+    assert!(d.probation && d.sweep, "{d:?}");
 }
 
 /// The job's outputs are the ledger only (F1): no source line of this module or of the engine sends
