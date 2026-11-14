@@ -3815,3 +3815,119 @@ fn bj5_one_open_repair_per_file() {
     assert_eq!(p["begin"], "new");
     assert_ne!(p["repair"], json!(done));
 }
+
+// ───────────────────────────── T3d (RULINGS DA1–DA5; codex J4) ─────────────────────────────
+
+/// RULINGS DA1: a target that is the SAME FILE as a rule document or a system-locked file (a real
+/// hard link) is refused at `begin` naming the protected file; where the rule documents cannot be
+/// enumerated (a `*_DIRECTIVE.md` outside the listed places) a target with more than one name is
+/// refused conservatively; a general file with one name still begins.
+#[test]
+fn da1_hard_link_aliases_refused_at_begin() {
+    let r = rig("da1-begin");
+    let w = seat(3, "worker");
+    std::fs::write(r.pack.join("soul.md"), b"# soul\n").unwrap();
+    std::fs::write(r.pack.join("trusted-keys.json"), b"{}\n").unwrap();
+    std::fs::create_dir_all(r.pack.join("notes")).unwrap();
+    std::fs::create_dir_all(r.pack.join("extra")).unwrap();
+    std::fs::write(r.pack.join("extra/NEW_DIRECTIVE.md"), b"# d\n").unwrap();
+    std::fs::hard_link(r.pack.join("soul.md"), r.pack.join("notes/repair.txt")).unwrap();
+    std::fs::hard_link(
+        r.pack.join("trusted-keys.json"),
+        r.pack.join("notes/k.json"),
+    )
+    .unwrap();
+    std::fs::hard_link(
+        r.pack.join("extra/NEW_DIRECTIVE.md"),
+        r.pack.join("notes/d.txt"),
+    )
+    .unwrap();
+    for (rel, names) in [
+        ("notes/repair.txt", "soul.md"),
+        ("notes/k.json", "trusted-keys.json"),
+        ("notes/d.txt", "하드 링크"),
+    ] {
+        let e = r
+            .call(
+                T0,
+                &w,
+                "begin",
+                json!({"trigger": "owner_order", "files": [rel]}),
+            )
+            .unwrap_err();
+        assert_eq!(e.code, "repair_precondition", "{rel}: {}", e.message);
+        assert!(e.message.contains(names), "{rel}: {}", e.message);
+    }
+    assert!(!r.root.exists(), "a refused begin wrote something");
+    std::fs::write(r.pack.join("notes/plain.txt"), b"plain\n").unwrap();
+    let ok = r
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/plain.txt"]}),
+        )
+        .unwrap();
+    assert_eq!(ok["begin"], "new");
+}
+
+/// RULINGS DA1: a target that BECOMES a second name of a rule document after `begin` is refused at
+/// `record`; nothing is recorded.
+#[test]
+fn da1_alias_made_after_begin_refused_at_record() {
+    let r = rig("da1-record");
+    let w = seat(3, "worker");
+    std::fs::write(r.pack.join("soul.md"), b"# soul\n").unwrap();
+    std::fs::create_dir_all(r.pack.join("notes")).unwrap();
+    std::fs::write(r.pack.join("notes/x.txt"), b"x\n").unwrap();
+    let id = r
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/x.txt"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::remove_file(r.pack.join("notes/x.txt")).unwrap();
+    std::fs::hard_link(r.pack.join("soul.md"), r.pack.join("notes/x.txt")).unwrap();
+    let e = r
+        .call(
+            T0 + 1.0,
+            &w,
+            "record",
+            json!({"repair": id, "note": "edited"}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    assert!(e.message.contains("soul.md"), "{}", e.message);
+    assert!(
+        r.record_of(&id).worker_record.is_none(),
+        "the alias was recorded"
+    );
+}
+
+/// RULINGS DA1 (the link form of "the same file"): an existing leaf link into the pack — here to a
+/// directive in a place the pack does not list — is refused at `begin`.
+#[cfg(unix)]
+#[test]
+fn da1_leaf_link_into_the_pack_refused_at_begin() {
+    let r = rig("da1-link");
+    std::fs::create_dir_all(r.pack.join("extra")).unwrap();
+    std::fs::create_dir_all(r.pack.join("notes")).unwrap();
+    std::fs::write(r.pack.join("extra/BAR_DIRECTIVE.md"), b"# d\n").unwrap();
+    std::os::unix::fs::symlink("../extra/BAR_DIRECTIVE.md", r.pack.join("notes/s.txt")).unwrap();
+    let e = r
+        .call(
+            T0,
+            &seat(3, "worker"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/s.txt"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    assert!(e.message.contains("팩 안의 경로"), "{}", e.message);
+    assert!(!r.root.exists());
+}

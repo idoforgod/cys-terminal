@@ -2078,6 +2078,13 @@ mod ledger_verbs {
             )));
         }
         cys::repair::types::parent_chain_link(&ctx.pack_dir, rel)?;
+        // DA1: the FILE decides — a name that is no rule document must not be another name of one
+        // (or of a locked file); a rule-document name goes through the owner's token (T4's branch).
+        if super::rule_document_name(rel).is_none() {
+            if let Some(why) = super::identity_refusal(&ctx.pack_dir, rel) {
+                return Err(VerbError::new(cys::repair::types::ERR_PRECONDITION, why));
+            }
+        }
         Ok(())
     }
 
@@ -2103,6 +2110,13 @@ mod ledger_verbs {
     ) -> Result<(), VerbError> {
         for f in file_targets(rec) {
             cys::repair::types::parent_chain_link(&ctx.pack_dir, &f.rel)?;
+            // DA1: re-checked at `record` (and `commit`) — a target may have become another name of
+            // a rule document after `begin`; a rule-document repair is the owner's token route.
+            if rec.classification != Classification::RuleDocument {
+                if let Some(why) = super::identity_refusal(&ctx.pack_dir, &f.rel) {
+                    return Err(VerbError::new(cys::repair::types::ERR_PRECONDITION, why));
+                }
+            }
         }
         for (rel, st) in states.unwrap_or(&[]) {
             if let TargetState::Link { target } = st {
@@ -4041,6 +4055,72 @@ pub(crate) fn mark_app_typing(prompts: &Mutex<HashMap<u64, PromptOrigin>>, seat:
         .entry(seat)
         .or_default()
         .typing_mark = Some(at);
+}
+
+/// RULINGS DA1 — what decides a target's class is the FILE, not its spelling. For a target outside
+/// the rule-document route (its name is no rule document — those go through the owner's token,
+/// T4), `Some(reason)` when its live file is: (c) a leaf link whose target lies in a pack or is a
+/// folder (a link is another name of its target — the AW3 (c) rule, applied to the live leaf); (a)
+/// the same file (volume + file id) as one of the pack's protected names it can list — the
+/// `SYSTEM_LOCKED` files and the rule documents of the pack root and `directives/`; (b) a file with
+/// more than one name (hard links): rule documents named `*_DIRECTIVE.md` may lie anywhere in the
+/// pack and cannot all be listed, so a second name is refused conservatively. An absent target
+/// has no identity to compare (`None`). `boot_critical::refuse_identity_alias` (T5a) covers the
+/// two compiled lists in the classification.
+pub(crate) fn identity_refusal(pack: &Path, rel: &str) -> Option<String> {
+    use cys::repair::boot_critical::file_identity;
+    use cys::repair::types::{fold_name, link_count, link_target_refusal};
+    let live = pack.join(rel);
+    let meta = std::fs::symlink_metadata(&live).ok()?;
+    if meta.file_type().is_symlink() {
+        if let Ok(t) = std::fs::read_link(&live) {
+            if let Some(why) = link_target_refusal(pack, rel, &t.to_string_lossy()) {
+                return Some(why);
+            }
+        }
+    }
+    let id = file_identity(&live)?;
+    let key = fold_name(&rel.replace('\\', "/"));
+    for name in protected_names(pack) {
+        if fold_name(&name) != key && file_identity(&pack.join(&name)) == Some(id) {
+            return Some(format!(
+                "{rel}: `{name}` 과 같은 파일입니다(하드 링크 등 같은 파일의 다른 이름) — 규칙 문서·서명 키 파일은 그 이름으로만, 주인 지시 표가 있을 때만 고칩니다(RULINGS DA1)"
+            ));
+        }
+    }
+    if std::fs::metadata(&live).is_ok_and(|m| m.is_file()) {
+        if let Some(n) = link_count(&live).filter(|n| *n > 1) {
+            return Some(format!(
+                "{rel}: 이름이 {n}개인 파일입니다(하드 링크) — 규칙 문서의 다른 이름일 수 있어 수리 대상으로 받지 않습니다(RULINGS DA1)"
+            ));
+        }
+    }
+    None
+}
+
+/// RULINGS DA1: the protected names DA1 can list in a pack — its `SYSTEM_LOCKED` files and the
+/// rule documents (by [`rule_document_name`]) of the pack root and of `directives/`.
+fn protected_names(pack: &Path) -> Vec<String> {
+    let mut out: Vec<String> = cys::repair::types::system_locked_names()
+        .iter()
+        .map(|n| n.to_string())
+        .collect();
+    for dir in ["", "directives"] {
+        let Ok(rd) = std::fs::read_dir(pack.join(dir)) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if rule_document_name(&name).is_some() {
+                out.push(if dir.is_empty() {
+                    name
+                } else {
+                    format!("{dir}/{name}")
+                });
+            }
+        }
+    }
+    out
 }
 
 /// C10's rule-document base names (as `guard.sh:PROTECTED_NAMES`), lower-cased.
