@@ -1575,21 +1575,40 @@ fn cv1_an_answer_older_than_the_current_decision_is_refused() {
 }
 
 /// CV1: while another daemon holds the grant lock (B between its validation and its write),
-/// `grant on` waits at most `GRANT_LOCK_WAIT_MS` and is refused with nothing written and the
-/// question kept; once the lock is free the same request succeeds.
+/// `grant on` is refused with the busy sentence after a BOUNDED wait, writes nothing and keeps the
+/// question; once the lock is free the same request succeeds. (T4d · RULINGS EZ — no wall-clock
+/// premise: the bound is shown by the lock and the wait the code is handed, never by measuring real
+/// time. `lock_grant_in` gives up after the wait it is handed — with a zero wait it refuses on its
+/// first try against a held lock, no clock involved; the verb hands `decide_in` the constant
+/// `GRANT_LOCK_WAIT_MS` (pinned: 2 000 ms, and the verb's source passes exactly that); and the verb
+/// returns its refusal at all — an unbounded wait would never return.)
 #[test]
 fn cv1_a_decision_waits_a_bounded_time_for_the_lock() {
     let r = rig("cv1-wait");
     let t = now0();
     r.call(t, &master(), "grant_ask", json!({})).unwrap();
     r.typed(MASTER, "예", t + 1.0);
-    let held = grant::lock_grant_in(&r.root, std::time::Duration::from_secs(1)).unwrap();
-    let started = std::time::Instant::now();
+    // a free lock is taken on the first try (zero wait)
+    let held = grant::lock_grant_in(&r.root, std::time::Duration::ZERO).unwrap();
+    // the lock's own bound: held elsewhere, a zero wait refuses on its first try
+    let e = grant::lock_grant_in(&r.root, std::time::Duration::ZERO)
+        .err()
+        .expect("the lock is held");
+    assert!(
+        matches!(&e, RepairError::Precondition(m) if m == grant::GRANT_LOCK_BUSY_KO),
+        "{e:?}"
+    );
+    // the verb waits the constant bound, handed to `decide_in` from its own source
+    assert_eq!(grant::GRANT_LOCK_WAIT_MS, 2_000);
+    let src = include_str!("repair.rs");
+    let body = &src[src.find("pub(crate) fn grant(ctx: &Ctx<'_>, caller: &Caller, p: &Value)").unwrap()..];
+    let body = &body[..body.find("\n    }\n").unwrap()];
+    assert!(
+        body.contains("grant::decide_in(\n            &ctx.root,\n            std::time::Duration::from_millis(grant::GRANT_LOCK_WAIT_MS),"),
+        "the grant verb hands decide_in the constant wait"
+    );
     let e = r.call(t + 2.0, &master(), "grant", json!({"mode": "on"})).unwrap_err();
-    let waited = started.elapsed();
     assert_eq!(e.message, format!("repair.grant: {}", grant::GRANT_LOCK_BUSY_KO));
-    assert!(waited >= std::time::Duration::from_millis(grant::GRANT_LOCK_WAIT_MS - 100), "{waited:?}");
-    assert!(waited < std::time::Duration::from_millis(grant::GRANT_LOCK_WAIT_MS + 3_000), "{waited:?}");
     assert_eq!(r.decision(), None, "nothing written");
     assert!(r.prompts.lock().unwrap()[&MASTER].question.is_some(), "the question is kept");
     drop(held);
