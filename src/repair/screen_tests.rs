@@ -268,6 +268,19 @@ fn census_ii_every_class_binds_on_released() {
         "T5b MEASURED: the same screen again (answers cached in this process): {:.1} s wall",
         t1.elapsed().as_secs_f64()
     );
+    // the measurement is also kept in a file beside the test's private folder (a passing test's
+    // standard error is not shown by the runner)
+    let _ = std::fs::write(
+        dirs::home_dir().expect("HOME").join("t5b-screen-measured.txt"),
+        format!(
+            "full screen, released copies, no candidate change: {} probes, {:.1} s wall, {} threads, after-run repeat: {}\nsame screen again (answers cached in this process): {:.1} s wall\n",
+            rep.probes.len(),
+            took.as_secs_f64(),
+            c.threads,
+            !rep.after_run.first.is_empty(),
+            t1.elapsed().as_secs_f64()
+        ),
+    );
     assert_eq!(again.verdict, rep.verdict);
     assert_eq!(
         again

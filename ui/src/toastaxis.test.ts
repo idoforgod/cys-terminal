@@ -243,6 +243,9 @@ const EVENTS: { id: string; ev: Record<string, unknown>; expect: string[] }[] = 
   { id: "feed.created.team", ev: { name: "feed.item.created", category: "feed", payload: { kind: "team-create-request", title: "팀", request_id: "r1" } }, expect: ["refreshFeed", "refreshSidebarStatus"] },
   { id: "feed.created.wait", ev: { name: "feed.item.created", category: "feed", payload: { kind: "formation", title: "편성", request_id: "r2", wait: true } }, expect: ["refreshFeed", "refreshSidebarStatus"] },
   { id: "feed.other", ev: { name: "feed.item.resolved", category: "feed", payload: {} }, expect: ["refreshFeed", "refreshSidebarStatus"] },
+  // T5b (「스스로 해결」 수리 최종 승인 카드 · C5 5.8): repair 사건은 목록만 다시 그린다 — 알림은 daemonToast(가드 래퍼) 한 번, 창·전환은 없다.
+  { id: "repair.approval.created", ev: { name: "repair.approval.created", category: "repair", payload: { request_id: "rq-01", repair: "R-1" } }, expect: ["refreshFeed"] },
+  { id: "repair.approval.resolved", ev: { name: "repair.approval.resolved", category: "repair", payload: { request_id: "rq-01", state: "approved" } }, expect: ["refreshFeed"] },
   { id: "surface.exited", ev: { name: "surface.exited", category: "surface", surface_id: 9, payload: {} }, expect: ["removeDeadPane"] },
   { id: "surface.closed", ev: { name: "surface.closed", category: "surface", surface_id: 9, payload: {} }, expect: ["removeDeadPane"] },
   { id: "surface.reaped", ev: { name: "surface.reaped", category: "surface", surface_id: 9, payload: {} }, expect: ["removeDeadPane"] },
@@ -662,7 +665,7 @@ interface KeptSite {
   pin: string;
 }
 const KEPT_SITES: KeptSite[] = [
-  { id: "feed-wait-banner", kind: "R2", anchor: "if (payload.wait === true && payload.auto_route !== true) osBanner(feedCreatedToastTitle(payload.kind), String(payload.title ?? \"\"));", nth: 0, pin: "095ff275a023d511" },
+  { id: "feed-wait-banner", kind: "R2", anchor: "if (payload.wait === true && payload.auto_route !== true) osBanner(feedCreatedToastTitle(payload.kind), String(payload.title ?? \"\"));", nth: 0, pin: "4a07bc8bb56994a8" }, // T5b (rewrite: was 095ff275a023d511 — the repair branch now opens right before the feed branch; the feed branch's own lines are unchanged)
   { id: "K5-daemon-error", kind: "daemon-info", anchor: "info.textContent = `daemon error: ${e.payload}`;", nth: 0, pin: "1fc56231bf45df6e" },
   { id: "K5-startup-failed", kind: "daemon-info", anchor: "document.getElementById(\"daemon-info\")!.textContent = `startup failed: ${e}`;", nth: 0, pin: "607b4ac9163cc886" },
   { id: "K5-recovery-failed", kind: "daemon-info", anchor: "document.getElementById(\"daemon-info\")!.textContent = `startup failed: ${e} / recovery failed: ${e2}`;", nth: 0, pin: "bd517611b51bc743" },
@@ -787,7 +790,8 @@ describe("TOAST 축 — 출처 핀 · 통짜 가드 금지 · 커버리지", () 
     expect(feed).toContain("if (payload.wait === true && payload.auto_route !== true) osBanner(");
     expect(SRC).not.toContain("function daemonOpenFeed("); // 호출자 0 이 된 죽은 래퍼는 남기지 않는다(실효 0 장치)
     expect(SRC).not.toContain("daemonOpenFeed(");
-    expect((body.match(/daemonToast\(/g) ?? []).length).toBe(10);
+    // T5b (rewrite: was 10 — the repair branch's one card notice goes through the guarded wrapper too)
+    expect((body.match(/daemonToast\(/g) ?? []).length).toBe(11);
     expect((body.match(/daemonStickyToast\(/g) ?? []).length).toBe(1);
     expect((body.match(/daemonOsBanner\(/g) ?? []).length).toBe(4); // approval.request 의 배너가 래퍼로 돌아와 호출자 4(context.threshold · agent.exited · master.deadman · approval.request)
     // 유예 후 자동 전환 예약은 호출부 인라인 가드(probefail 핀 보존): 가드 줄 + 호출 1
