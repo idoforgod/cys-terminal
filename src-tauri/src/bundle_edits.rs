@@ -154,6 +154,9 @@ pub(crate) enum ScanError {
 pub(crate) struct Budget<'a> {
     pub deadline: Instant,
     pub abandon: &'a AtomicBool,
+    /// The clock the deadline is compared with — `Instant::now` in the product; tests inject a clock
+    /// they control (RULINGS EA1, EA2).
+    pub now: fn() -> Instant,
 }
 
 impl Budget<'_> {
@@ -161,7 +164,7 @@ impl Budget<'_> {
         if self.abandon.load(Ordering::SeqCst) {
             return Err(Halt::Abandoned);
         }
-        if Instant::now() >= self.deadline {
+        if (self.now)() >= self.deadline {
             return Err(Halt::Deadline);
         }
         Ok(())
@@ -1362,7 +1365,7 @@ fn gib(n: u64) -> String {
 /// One capture (blocking). Never panics on I/O; every early end is an outcome.
 pub(crate) fn capture(input: &CaptureInput, abandon: &AtomicBool) -> CaptureOutcome {
     let started = Instant::now();
-    let budget = Budget { deadline: started + input.deadline, abandon };
+    let budget = Budget { deadline: started + input.deadline, abandon, now: Instant::now };
     let mut stats = Stats::default();
     let elapsed = |stats: &mut Stats| stats.elapsed_ms = started.elapsed().as_millis() as u64;
 
@@ -2004,7 +2007,7 @@ mod tests {
 
     fn scan(root: &Path) -> BTreeMap<String, Found> {
         let (flag, deadline) = unlimited();
-        walk_entries(root, &Budget { deadline, abandon: &flag }, &mut Stats::default()).expect("scan")
+        walk_entries(root, &Budget { deadline, abandon: &flag, now: Instant::now }, &mut Stats::default()).expect("scan")
     }
 
     /// The manifest JSON shape of a scanned entry (what the Python emitter writes).
@@ -2715,7 +2718,7 @@ mod tests {
             let (flag, deadline) = unlimited();
             let mut st = Stats::default();
             let t0 = Instant::now();
-            let have = walk_entries(&i.runtime, &Budget { deadline, abandon: &flag }, &mut st).expect("scan");
+            let have = walk_entries(&i.runtime, &Budget { deadline, abandon: &flag, now: Instant::now }, &mut st).expect("scan");
             let c = classify(&load_manifest(&i.manifest).expect("manifest"), &have).expect("classify");
             println!(
                 "WIN-04 round {round}: {} files · {} bytes · {} ms · missing {} · added {} · changed {}",
@@ -2930,7 +2933,7 @@ mod tests {
             assert!(make_link(f.to_str().unwrap(), &link));
             assert!(open_no_follow(&link).is_err() && read_capped(&link, 100).is_err(), "a link is not followed");
             let (flag, deadline) = unlimited();
-            let budget = Budget { deadline, abandon: &flag };
+            let budget = Budget { deadline, abandon: &flag, now: Instant::now };
             let into = HeldDir::open_anchor(t.path()).unwrap();
             assert!(copy_exact(&link, &into, "copy", 100, &budget).1.is_err(), "a copy source that is a link is refused");
             assert!(!t.path().join("copy").exists());
@@ -3287,7 +3290,7 @@ mod tests {
     #[test]
     fn db2_the_byte_read_to_detect_growth_is_never_written() {
         let (flag, deadline) = unlimited();
-        let budget = Budget { deadline, abandon: &flag };
+        let budget = Budget { deadline, abandon: &flag, now: Instant::now };
         let mut out = Vec::new();
         let (written, result) = copy_stream(&mut &b"12345"[..], &mut out, 4, &budget);
         assert_eq!(out, b"1234".to_vec(), "only the scanned length is written");
@@ -3320,14 +3323,16 @@ mod tests {
     #[test]
     fn db2_no_chunk_is_written_after_the_timeout() {
         let flag = AtomicBool::new(false);
-        let budget = Budget { deadline: Instant::now() + Duration::from_secs(3_600), abandon: &flag };
+        let budget = Budget { deadline: Instant::now() + Duration::from_secs(3_600), abandon: &flag, now: Instant::now };
         let total = 8 * COPY_CHUNK;
         let mut out = Vec::new();
         let (written, result) = copy_stream(&mut FlagOnFirstRead { flag: &flag, left: total }, &mut out, total as u64, &budget);
         assert_eq!(result, Err(CopyStop::Halted(Halt::Abandoned)));
         assert_eq!((written, out.len()), (0, 0), "the flag set during the read stops the copy before its write");
         let calm = AtomicBool::new(false);
-        let expired = Budget { deadline: Instant::now(), abandon: &calm };
+        let at = Instant::now();
+        TEST_NOW.with(|c| c.set(Some(at)));
+        let expired = Budget { deadline: at, abandon: &calm, now: test_now };
         let mut out = Vec::new();
         let (written, result) = copy_stream(&mut &vec![1u8; total][..], &mut out, total as u64, &expired);
         assert_eq!((written, out.len(), result), (0, 0, Err(CopyStop::Halted(Halt::Deadline))));
@@ -3383,7 +3388,7 @@ mod tests {
         let data = vec![7u8; 2 * COPY_CHUNK];
         for (steps, kept) in [(vec![WriteStep::TakeThenAbandon], 1000usize), (vec![WriteStep::InterruptThenAbandon], 0)] {
             let flag = AtomicBool::new(false);
-            let budget = Budget { deadline: Instant::now() + Duration::from_secs(3_600), abandon: &flag };
+            let budget = Budget { deadline: Instant::now() + Duration::from_secs(3_600), abandon: &flag, now: Instant::now };
             let mut w = ScriptedWriter { flag: &flag, per_call: 1000, steps, calls: 0, out: Vec::new() };
             let (written, result) = copy_stream(&mut &data[..], &mut w, data.len() as u64, &budget);
             assert_eq!(result, Err(CopyStop::Halted(Halt::Abandoned)));
@@ -3398,18 +3403,30 @@ mod tests {
     fn dp1_the_counter_is_the_bytes_really_written() {
         let data = vec![9u8; 2 * COPY_CHUNK];
         let (flag, deadline) = unlimited();
-        let budget = Budget { deadline, abandon: &flag };
+        let budget = Budget { deadline, abandon: &flag, now: Instant::now };
         let mut w = ScriptedWriter { flag: &flag, per_call: 4096, steps: vec![WriteStep::Take, WriteStep::Fail], calls: 0, out: Vec::new() };
         let (written, result) = copy_stream(&mut &data[..], &mut w, data.len() as u64, &budget);
         assert!(matches!(&result, Err(CopyStop::Io(e)) if e.contains("the disk is full")), "{result:?}");
         assert_eq!((written, w.out.len(), w.calls), (4096, 4096, 2));
     }
 
-    /// The test's reader: on its first call it lets the budget run out — sets the abandon flag, or waits
-    /// until the deadline has passed — and returns `Interrupted`; later calls return data. Counts calls.
+    thread_local! {
+        /// The test-controlled clock read by `test_now` (RULINGS EA1, EA2): it stands still until the
+        /// test moves it, so no deadline test depends on the scheduler.
+        static TEST_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// The injected time source of the deadline tests (`Budget::now`).
+    fn test_now() -> Instant {
+        TEST_NOW.with(|c| c.get()).expect("the test clock is set")
+    }
+
+    /// The test's reader: on its first call it lets the budget run out — sets the abandon flag, or moves
+    /// the controlled clock to `advance_to` — and returns `Interrupted`; later calls return data. Counts
+    /// calls.
     struct InterruptedFirstRead<'a> {
         flag: Option<&'a AtomicBool>,
-        until: Option<Instant>,
+        advance_to: Option<Instant>,
         calls: usize,
     }
     impl std::io::Read for InterruptedFirstRead<'_> {
@@ -3422,10 +3439,8 @@ mod tests {
             if let Some(flag) = self.flag {
                 flag.store(true, Ordering::SeqCst);
             }
-            if let Some(until) = self.until {
-                while Instant::now() < until {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+            if let Some(at) = self.advance_to {
+                TEST_NOW.with(|c| c.set(Some(at)));
             }
             Err(std::io::ErrorKind::Interrupted.into())
         }
@@ -3436,21 +3451,24 @@ mod tests {
     #[test]
     fn dw1_no_read_retry_after_the_flag() {
         let flag = AtomicBool::new(false);
-        let budget = Budget { deadline: Instant::now() + Duration::from_secs(3_600), abandon: &flag };
-        let mut r = InterruptedFirstRead { flag: Some(&flag), until: None, calls: 0 };
+        let budget = Budget { deadline: Instant::now() + Duration::from_secs(3_600), abandon: &flag, now: Instant::now };
+        let mut r = InterruptedFirstRead { flag: Some(&flag), advance_to: None, calls: 0 };
         let mut w = ScriptedWriter { flag: &flag, per_call: COPY_CHUNK, steps: Vec::new(), calls: 0, out: Vec::new() };
         let (written, result) = copy_stream(&mut r, &mut w, 1000, &budget);
         assert_eq!((r.calls, w.calls, written), (1, 0, 0), "read calls, write calls, bytes written");
         assert_eq!(result, Err(CopyStop::Halted(Halt::Abandoned)));
     }
 
-    /// DW1 (b): the same when the deadline passes during the first read.
+    /// DW1 (b): the same when the deadline passes during the first read — the controlled clock is moved
+    /// to the deadline from inside that read (RULINGS EA1: no wall-clock margin, no sleep).
     #[test]
     fn dw1_no_read_retry_after_the_deadline() {
         let calm = AtomicBool::new(false);
-        let deadline = Instant::now() + Duration::from_millis(20);
-        let budget = Budget { deadline, abandon: &calm };
-        let mut r = InterruptedFirstRead { flag: None, until: Some(deadline), calls: 0 };
+        let start = Instant::now();
+        TEST_NOW.with(|c| c.set(Some(start)));
+        let deadline = start + Duration::from_secs(30);
+        let budget = Budget { deadline, abandon: &calm, now: test_now };
+        let mut r = InterruptedFirstRead { flag: None, advance_to: Some(deadline), calls: 0 };
         let mut w = ScriptedWriter { flag: &calm, per_call: COPY_CHUNK, steps: Vec::new(), calls: 0, out: Vec::new() };
         let (written, result) = copy_stream(&mut r, &mut w, 1000, &budget);
         assert_eq!((r.calls, w.calls, written), (1, 0, 0), "read calls, write calls, bytes written");
