@@ -843,6 +843,185 @@ class KeptFolder(Rig):
         self.assertFalse(os.path.exists(src))
 
 
+class IntentRecovery(Rig):
+    """★RULINGS EY2·FA2·FA3 — 교체는 복구할 수 있는 한 단위다: 살아 있는 이름이 바뀌기 전에 의도 기록(directives/.ceo-intent.json)
+    이 남고, 조립 경로의 모든 입구가 끝나지 않은 의도를 먼저 마무리한다. 어느 지점에서 멈춰도 다음 실행은 옛 지침이나 (의도와
+    함께) 새 지침을 보고, 빠졌거나 반쪽이거나 낡은 지침을 현행으로 받지 않는다. 멈춤은 실제 ceo_py 의 함수를 감싸 SystemExit 로
+    끼워 넣는다(시간이 아니라)."""
+    SAVE = "USERSAVE-EY2 읽은 뒤에 저장한 줄\n"
+
+    def setUp(self):
+        super().setUp()
+        self.env["CYS_CEO_LOCK_WAIT_S"] = "5"
+
+    def ns_mode(self, mode):
+        ns = ceo_py_module()
+        if mode == "deposit":
+            ns["exchange_fn"] = lambda: None
+        elif ns["exchange_fn"]() is None:
+            self.skipTest("이 플랫폼에는 원자 맞바꾸기가 없다")
+        return ns
+
+    def crash_after(self, ns, name, before=None):
+        orig = ns[name]
+
+        def wrapped(*a, **kw):
+            if before:
+                before()
+            orig(*a, **kw)
+            raise SystemExit("injected crash after %s" % name)
+        ns[name] = wrapped
+
+    def compose(self, ns):
+        return ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), ""])
+
+    def candidates(self):
+        return [f for f in os.listdir(self.dirs) if f.endswith(".candidate")]
+
+    def assert_recovered_composed(self, body):
+        rc, out, err = self.run_dept("promote-ceo")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + body, "다음 실행이 바른 조립에 이르지 않았다")
+        self.assertIsNone(self.read(".ceo-intent.json"), "의도 기록이 남았다")
+        self.assertEqual(self.candidates(), [], "후보 파일이 남았다")
+
+    # ── codex 순서 ② ──
+    def test_crash_after_exchange_before_validation_recovers_the_save(self):
+        """B 를 읽은 뒤 B+E 저장 → 낡은 후보 H+S+B 가 맞바꿔 들어감 → 검사 전에 멈춤. 다음 실행은 낡은 후보를 현행으로 받지
+        않고, 밀려난 파일(B+E)을 새 진실로 보고 그것으로 조립한다(종전: current-fix 가 H+S+B 를 받아 E 를 잃었다)."""
+        ns = ceo_py_module()
+        real = ns["exchange_fn"]()
+        if real is None:
+            self.skipTest("이 플랫폼에는 원자 맞바꾸기가 없다")
+        self.seed()
+
+        def ex_then_crash(a, b):
+            _write(self.p("MASTER_DIRECTIVE.md"), USER + self.SAVE)    # 읽은 뒤 · 맞바꾸기 전의 저장
+            real(a, b)
+            raise SystemExit("crash right after the exchange")
+        ns["exchange_fn"] = lambda: ex_then_crash
+        with self.assertRaises(SystemExit):
+            self.compose(ns)
+        self.assert_recovered_composed(USER + self.SAVE)
+        self.assertIn(HEADER + SEP + USER, [_slurp(k, encoding="utf-8") for k in self.kept()],
+                      "잠깐 살아 있던 낡은 후보를 보관하지 않았다(EY1)")
+
+    def test_second_save_before_the_rollback_is_never_moved_out(self):
+        """맞바꾸기 직후(검사 전) 살아 있는 파일에 두 번째 저장. 되돌리기는 지금 살아 있는 것을 다시 읽는다 — 우리 후보가 아니면
+        그것은 새 편집이라 그대로 두고(보류 · 알림), 앞의 저장은 보관 폴더에 남는다(종전: 무조건 맞바꿔 두 번째 저장을 밀어냈다)."""
+        ns = ceo_py_module()
+        real = ns["exchange_fn"]()
+        if real is None:
+            self.skipTest("이 플랫폼에는 원자 맞바꾸기가 없다")
+        self.seed()
+        second = USER + "SECOND-SAVE 맞바꾸기 직후 두 번째 저장\n"
+        fired = []
+
+        def ex_with_two_saves(a, b):
+            if not fired:
+                fired.append(1)
+                _write(self.p("MASTER_DIRECTIVE.md"), USER + self.SAVE)
+                real(a, b)
+                with open(self.p("MASTER_DIRECTIVE.md"), "w", encoding="utf-8") as f:
+                    f.write(second)
+                return
+            real(a, b)
+        ns["exchange_fn"] = lambda: ex_with_two_saves
+        nf = os.path.join(self.tmp, "nf.txt")
+        rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), nf])
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), second, "되돌리기가 두 번째 저장을 살아 있는 이름에서 밀어냈다")
+        self.assertIn(USER + self.SAVE, [_slurp(k, encoding="utf-8") for k in self.kept()], "앞의 저장이 보관되지 않았다")
+        self.assertEqual(rc, 6, "두 저장이 겹쳤는데 보류가 아니다")
+        self.assertIn("두 저장이 겹침", _slurp(nf, encoding="utf-8"))
+
+    # ── 멈춤 지점 표(보고서 Round 2 (2)) ──
+    def test_crash_points_of_a_promotion(self):
+        steps = [("exchange", "write_candidate"), ("exchange", "write_intent"), ("exchange", "prim_exchange"),
+                 ("exchange", "keep_file"), ("deposit", "write_intent"), ("deposit", "keep_file"),
+                 ("deposit", "place_candidate")]
+        for mode, name in steps:
+            with self.subTest(mode=mode, crash_after=name):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                ns = self.ns_mode(mode)
+                self.assertIn(name, ns, "교체 단계 함수 %s 가 없다" % name)
+                self.crash_after(ns, name)
+                with self.assertRaises(SystemExit):
+                    self.compose(ns)
+                live = self.read("MASTER_DIRECTIVE.md")
+                self.assertIn(live, (None, USER, HEADER + SEP + USER), "멈춘 뒤 반쪽 지침: %r" % live)
+                if live is None:
+                    self.assertIsNotNone(self.read(".ceo-intent.json"), "살아 있는 이름이 빠졌는데 의도 기록이 없다")
+                self.assert_recovered_composed(USER)
+                self.assertIn(USER, [_slurp(k, encoding="utf-8") for k in self.kept()] + [self.read("MASTER_DIRECTIVE.md.pre-ceo")])
+
+    def test_crash_points_of_a_demotion(self):
+        for mode in ("exchange", "deposit"):
+            with self.subTest(mode=mode):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                self.register()
+                self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+                ns = self.ns_mode(mode)
+                self.crash_after(ns, "prim_exchange" if mode == "exchange" else "keep_file")
+                with self.assertRaises(SystemExit):
+                    ns["do_demote"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), ""])
+                rc, out, err = self.run_dept("down", "d0")
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "다음 강등이 중단된 교체를 마무리하지 않았다")
+                self.assertIsNone(self.read(".ceo-intent.json"))
+
+    def test_the_tick_closes_a_gap_without_a_launch(self):
+        """FA3 — 10분 승격 대기 틱(promote-if-pending)이 PENDING 없이도 끝나지 않은 교체를 마무리한다(빠진 살아 있는 이름 포함) ·
+        틱은 알림을 보내지 않는다."""
+        self.seed()
+        ns = self.ns_mode("deposit")
+        self.crash_after(ns, "keep_file")
+        with self.assertRaises(SystemExit):
+            self.compose(ns)
+        self.assertIsNone(self.read("MASTER_DIRECTIVE.md"), "시험 전제: 살아 있는 이름이 빠진 상태")
+        self.assertFalse(os.path.exists(self.pending_path()))
+        n0 = len(self.pushes_prefix("CEO "))
+        rc, out, err = self.run_dept("promote-if-pending")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER, "틱이 빠진 이름을 메우지 않았다")
+        self.assertIsNone(self.read(".ceo-intent.json"))
+        self.assertEqual(len(self.pushes_prefix("CEO ")), n0, "틱이 알림을 보냈다")
+
+    def test_read_only_entries_see_an_open_intent(self):
+        self.seed()
+        ns = self.ns_mode("exchange")
+        self.crash_after(ns, "prim_exchange")
+        with self.assertRaises(SystemExit):
+            self.compose(ns)
+        self.assertEqual(self.run_ceo_py("state", self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"))[1].strip(),
+                         "intent")
+        rc, out, _ = self.run_ceo_py("verify", self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"))
+        self.assertEqual(rc, 1)
+        self.assertIn("끝나지 않았다", out)
+        env0 = dict(os.environ)
+        try:
+            os.environ["HOME"] = self.home
+            for k in pf.PACK_DIR_ENV_KEYS:
+                os.environ.pop(k, None)
+            p = pf.Preflight(fix=False, skips=[])
+            p.c03_content_pins()
+            rows = {r["id"]: r for r in p.results}
+        finally:
+            os.environ.clear()
+            os.environ.update(env0)
+        self.assertEqual(rows["C03.ceo-intent"]["status"], pf.WARN)
+        self.assertIn("끝나지 않은 CEO 지침 교체", rows["C03.ceo-intent"]["detail"])
+
+    def test_orphan_candidate_is_removed_only_without_an_intent(self):
+        """FA2 — 의도가 이름 대지 않는 후보는 살아 있던 적이 없다 → 잠금 안에서, 의도 기록이 없을 때만 지운다."""
+        self.seed()
+        orphan = self.p(".MASTER_DIRECTIVE.md.20260101T000000Z-1-1.candidate")
+        _write(orphan, "never live\n")
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        self.assertFalse(os.path.exists(orphan), "의도 없는 후보를 지우지 않았다")
+
+
 class SaveDuringSwap(Rig):
     """★RULINGS DC1 — 승격·강등은 이제 살아 있는 지침이 아닌 본문을 쓰지 않는다: 원본을 읽은 뒤·교체 전에 사용자 저장이
     끼어들면 그 새 바이트는 살아 있는 파일이나 백업 어딘가에 있다(어느 쪽에도 없는 경우는 없다). 실제 ceo_py 코드를 모듈로
@@ -860,9 +1039,9 @@ class SaveDuringSwap(Rig):
         return out
 
     def hook_first_live_write(self, ns, save):
-        """살아 있는 MASTER 를 처음 건드리는 함수(지금 코드: swap_live · 종전 코드: write_atomic)에 들어가기 직전 save() 1회."""
+        """살아 있는 MASTER 를 처음 건드리는 함수(지금 코드: swap_unit · DC1: swap_live · 종전: write_atomic)에 들어가기 직전 save() 1회."""
         md = self.p("MASTER_DIRECTIVE.md")
-        name = "swap_live" if "swap_live" in ns else "write_atomic"
+        name = next(n for n in ("swap_unit", "swap_live", "write_atomic") if n in ns)
         orig = ns[name]
         fired = []
 
@@ -927,8 +1106,8 @@ class SaveDuringSwap(Rig):
         self.seed()
         ns = ceo_py_module()
         self.force(ns, "rename")
-        self.assertIn("place_new", ns, "교체가 '덮지 않는 자리 놓기'를 쓰지 않는다")
-        orig = ns["place_new"]
+        self.assertIn("place_candidate", ns, "교체가 '덮지 않는 자리 놓기'를 쓰지 않는다")
+        orig = ns["place_candidate"]
         md = self.p("MASTER_DIRECTIVE.md")
         fired = []
 
@@ -937,7 +1116,7 @@ class SaveDuringSwap(Rig):
                 fired.append(1)
                 _write(md, USER + self.EDIT)
             return orig(src, dst)
-        ns["place_new"] = wrapped
+        ns["place_candidate"] = wrapped
         rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), md, sha(TEMPLATE), ""])
         self.assertEqual(fired, [1])
         self.assertEqual(rc, 0, "다시 읽어 저장된 본문으로 승격해야 한다")
@@ -989,8 +1168,7 @@ class SaveDuringSwap(Rig):
             cur = USER.encode()
             for i in range(200):
                 nxt = (USER + "v%d\n" % i).encode()
-                disp = ns["swap_live"](md, nxt, cur)
-                os.unlink(disp)
+                ns["swap_unit"](md, nxt, sha(cur), "compose", "test")   # 밀려난 판은 보관 폴더로(EY1)
                 cur = nxt
         finally:
             stop.set()
@@ -1002,14 +1180,15 @@ class SaveDuringSwap(Rig):
         """원본이 매번 바뀌면 정해진 횟수만 다시 하고 보류한다(아무것도 쓰지 않음 · 알림 1건) — 끝없는 재시도 없음."""
         self.seed()
         ns = ceo_py_module()
-        orig = ns["swap_live"]
+        orig = ns["swap_unit"]
         n = []
 
-        def always_changing(path, *a, **kw):
-            n.append(1)
-            self.save_in_place(USER + "CHANGE %d\n" % len(n))
-            return orig(path, *a, **kw)
-        ns["swap_live"] = always_changing
+        def always_changing(path, data, expect_sha, op, *a, **kw):
+            if op == "compose":                 # 되돌리기(restore)는 끼어들지 않는다 — 조립마다 한 번 저장
+                n.append(1)
+                self.save_in_place(USER + "CHANGE %d\n" % len(n))
+            return orig(path, data, expect_sha, op, *a, **kw)
+        ns["swap_unit"] = always_changing
         nf = os.path.join(self.tmp, "nf.txt")
         rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), nf])
         self.assertEqual(rc, 9, "계속 바뀌는 원본에서 보류(rc 9)가 아니다")
@@ -1091,7 +1270,7 @@ class StaleLegacyReceipt(Rig):
                 _write(self.p("MASTER_DIRECTIVE.md.pre-ceo"), self.USER_OLD)
                 _write(self.p(".ceo-template-applied"), sha(old_copy) + "\n")
                 ns = ceo_py_module()
-                names = {"swap": "swap_live", "legacy": "drop_legacy", "receipt": "write_receipt"}
+                names = {"swap": "swap_unit", "legacy": "drop_legacy", "receipt": "write_receipt"}
                 self.assertIn(names[stop_after], ns)
                 orig = ns[names[stop_after]]
 

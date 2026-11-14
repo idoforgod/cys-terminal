@@ -2239,6 +2239,8 @@ class Preflight:
         self._c03_boot_contract(st)
         # [보관 축] C03.ceo-kept — 조립·강등이 밀어낸 지침 파일의 보관 폴더(EY1 · FA1).
         self._c03_ceo_kept_row()
+        # [교체 축] C03.ceo-intent — 끝나지 않은 본부 지침 교체(EY2).
+        self._c03_ceo_intent_row()
         # [핀 축 — 그 외 역할 + CEO 템플릿] (master 는 위 승격 축 판정이 대체)
         for f, pins in CONTENT_PINS.items():
             if f == "MASTER_DIRECTIVE.md":
@@ -2313,6 +2315,37 @@ class Preflight:
                                 "워커가 본문에 옮긴다 · %s" % (", ".join(fresh), info))
         else:
             self.add(cid, PASS, info + ("" if not told else " · 교체 뒤 저장 %d건은 이미 알림(%s)" % (len(told), ", ".join(told))))
+
+    def _c03_ceo_intent_row(self):
+        """[교체 축] C03.ceo-intent — ★RULINGS EY2. cys-dept 는 본부 지침의 살아 있는 이름을 바꾸기 전에 의도 기록
+        directives/.ceo-intent.json 을 남기고, 조립 경로의 모든 입구(부서 켜기·지명·강등 · base 데몬의 10분 승격 대기 틱)가
+        끝나지 않은 교체를 먼저 마무리한다. 기록이 있으면 WARN 한 줄(무-fix — C03 은 마무리하지 않는다). 살아 있는 이름이 빠져
+        있으면 C02 의 FAIL 이 그대로이고, 이 행이 그 바이트가 어디 있는지 말한다. 기록이 없으면 행이 없다."""
+        cid = "C03.ceo-intent"
+        if self.skipped(cid):
+            return
+        d = os.path.join(pack_dir(), "directives")
+        ip = os.path.join(d, ".ceo-intent.json")
+        if not os.path.lexists(ip):
+            return
+        try:
+            with open(ip, encoding="utf-8") as f:
+                rec = json.load(f)
+            if not isinstance(rec, dict):
+                raise ValueError("not an object")
+        except (OSError, ValueError):
+            self.add(cid, WARN, "끝나지 않은 CEO 지침 교체 기록(%s)을 읽을 수 없다 — 다음 승격 확인이 그 기록을 보관 폴더로 옮기고 "
+                                "알림 1건을 남긴다(지침은 그대로). 살아 있던 판들은 %s 에 있다"
+                     % (ip, os.path.join(d, self._C03_CEO_KEPT_DIR)))
+            return
+        live = os.path.join(d, "MASTER_DIRECTIVE.md")
+        kept = os.path.join(d, self._C03_CEO_KEPT_DIR, str(rec.get("kept", "?")))
+        cand = os.path.join(d, str(rec.get("candidate", "?")))
+        where = kept if os.path.lexists(kept) else cand
+        self.add(cid, WARN, "끝나지 않은 CEO 지침 교체(%s · %s 시작) — 다음 승격 확인(부서 켜기·`cys-dept promote-ceo`)이나 base "
+                            "데몬의 10분 승격 대기 틱이 마무리한다. 살아 있는 이름: %s · 교체 전 판 또는 후보: %s"
+                 % (rec.get("op", "?"), rec.get("created_at", "?"),
+                    "있음" if os.path.lexists(live) else "없음(C02 FAIL — 그 바이트는 오른쪽 파일에 있다)", where))
 
     def _c03_boot_contract(self, st):
         """[배달 축] C03.boot-contract — P0-3 기계 래치(`result.retry_eligible`)의 **소비 권한
