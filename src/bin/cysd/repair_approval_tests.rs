@@ -868,6 +868,34 @@ fn three_resubmissions_then_the_fourth_is_refused_line_once() {
     assert!(r.staged(&id).exists());
 }
 
+/// RULINGS DF3: the report gate's set is the repairs the owner HAS A CARD for — not a request still
+/// in step 3, not one whose step 3 refused (a fix-and-resubmit cycle), not an expired one.
+#[test]
+fn approval_cards_are_only_requests_past_step_3() {
+    let r = rig("cards");
+    r.signed_repair();
+    let t = Mutex::new(ApprovalTable::default());
+    let eff = effects();
+    let lane = r.lane.0.clone();
+    // in step 3: no card
+    let (out, s3) = submit(&r.ctx(T0), &worker(), &json!({"repair": "R-1"}), &t, &eff, Ok(())).unwrap();
+    let rid = out["request_id"].as_str().unwrap().to_string();
+    assert!(approval_cards(&t, &lane).is_empty(), "a request in step 3 has no card");
+    // step 3 refuses: still none, ever
+    *eff.step3_fail.lock().unwrap() = Some("예행 검사 실패".into());
+    run_step3(&r.ctx(T0), &t, &eff, &rid, &s3.unwrap());
+    assert!(approval_cards(&t, &lane).is_empty(), "a refused step 3 offers nothing");
+    // resubmitted, step 3 passes: the card
+    *eff.step3_fail.lock().unwrap() = None;
+    let rid = pending(&r, &t, &eff, T0 + 10.0);
+    assert_eq!(approval_cards(&t, &lane), vec!["R-1".to_string()]);
+    assert!(approval_cards(&t, "dept-other").is_empty(), "another lane's set");
+    // expired: gone, although the record stays 승인 대기
+    sweep(&r.ctx(T0 + 10.0 + 1801.0), &t, &eff);
+    assert_eq!(state_of(&t, &rid), ReqState::Expired);
+    assert!(approval_cards(&t, &lane).is_empty());
+}
+
 /// RULINGS CZ2 / testplan D-20-05: the lane master's one line comes at the expiry E4 of the request
 /// the third resubmission S3 created — none at E1, E2, E3.
 #[test]
