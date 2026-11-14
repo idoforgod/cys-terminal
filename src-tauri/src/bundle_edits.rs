@@ -478,7 +478,13 @@ pub(crate) struct CaptureInput {
     pub free_floor: u64,
     /// Free bytes of the volume holding a folder (`None` = could not be measured).
     pub free_space: fn(&Path) -> Option<u64>,
+    /// Called once between the scan and the copies with the runtime folder — does nothing in the
+    /// product; tests change a file there after the scan (RULINGS DB2).
+    pub between_scan_and_copy: fn(&Path),
 }
+
+/// The product's `between_scan_and_copy`: nothing happens between the scan and the copies.
+fn nothing_between(_: &Path) {}
 
 impl CaptureInput {
     /// The input of a real update of this app: the running version → `to_version`, the store
@@ -498,6 +504,7 @@ impl CaptureInput {
             max_bytes: MAX_CAPTURE_BYTES,
             free_floor: MAX_CAPTURE_BYTES + FREE_SPACE_MARGIN,
             free_space: store_free_space,
+            between_scan_and_copy: nothing_between,
         }
     }
 }
@@ -945,23 +952,55 @@ impl Sha256 {
 /// (RULINGS DB1, DB2).
 pub(crate) const COPY_CHUNK: usize = 64 * 1024;
 
+/// Why a copy stopped early.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CopyStop {
+    /// The deadline passed or the update stopped waiting.
+    Halted(Halt),
+    /// The source holds more bytes than the scan saw (it grew after the scan).
+    Grew,
+    Io(String),
+}
+
+/// RULINGS DB2: copies at most `expected` bytes (the length the scan saw) in chunks of `COPY_CHUNK`,
+/// hashing them as they pass. Before every chunk the deadline and the abandon flag are checked, so a
+/// copy does not go on after the timeout. At `expected` one more byte is read to see whether the
+/// source grew; that byte is never written and the copy ends `Grew`. Returns the bytes written —
+/// counted however the copy ends, so the capture cap holds for what is really on disk — and the
+/// sha256 of the written bytes.
+pub(crate) fn copy_stream(input: &mut impl std::io::Read, output: &mut impl std::io::Write, expected: u64, budget: &Budget) -> (u64, Result<String, CopyStop>) {
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; COPY_CHUNK];
+    let mut written: u64 = 0;
+    loop {
+        if let Err(h) = budget.check() {
+            return (written, Err(CopyStop::Halted(h)));
+        }
+        let room = expected.saturating_sub(written).min(COPY_CHUNK as u64) as usize;
+        let n = match read_some(input, &mut buf[..room.max(1)]) {
+            Ok(n) => n,
+            Err(e) => return (written, Err(CopyStop::Io(e.to_string()))),
+        };
+        if n == 0 {
+            return (written, Ok(hasher.finish_hex()));
+        }
+        if room == 0 {
+            return (written, Err(CopyStop::Grew));
+        }
+        written += n as u64;
+        if let Err(e) = std::io::Write::write_all(output, &buf[..n]) {
+            return (written, Err(CopyStop::Io(e.to_string())));
+        }
+        hasher.update(&buf[..n]);
+    }
+}
+
 /// The sha256 of an open file, read in chunks under the budget — `None` past `cap` bytes, on a read
 /// error or when the budget stops it (RULINGS DB1).
 fn hash_bounded(file: &mut std::fs::File, cap: u64, budget: &Budget) -> Option<String> {
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; COPY_CHUNK];
-    let mut seen: u64 = 0;
-    loop {
-        budget.check().ok()?;
-        let n = read_some(file, &mut buf).ok()?;
-        if n == 0 {
-            return Some(hasher.finish_hex());
-        }
-        seen += n as u64;
-        if seen > cap {
-            return None;
-        }
-        hasher.update(&buf[..n]);
+    match copy_stream(file, &mut std::io::sink(), cap, budget) {
+        (_, Ok(sha256)) => Some(sha256),
+        _ => None,
     }
 }
 
@@ -995,30 +1034,30 @@ fn kept_copy_matches(capture: &HeldDir, rel: &str, kind: &str, sha256: Option<&s
     }
 }
 
-/// Copies one regular file byte for byte into a NEW file and returns the sha256 of the stored
-/// copy. The source is opened without following links and re-checked through the handle.
-fn copy_exact(src: &Path, dst: &Path) -> Result<String, String> {
-    use cys::repair::types::TargetState;
-    let mut input = open_no_follow(src).map_err(|e| format!("{}: {e}", src.display()))?;
-    let permissions = input.metadata().map_err(|e| format!("{}: {e}", src.display()))?.permissions();
+/// Copies one regular file into a NEW file — at most `expected` bytes, under the budget
+/// (`copy_stream`, RULINGS DB2) — and returns the bytes written with the sha256 of the stored copy.
+/// The source is opened without following links and re-checked through the handle.
+fn copy_exact(src: &Path, dst: &Path, expected: u64, budget: &Budget) -> (u64, Result<String, CopyStop>) {
+    let mut written = 0;
+    let result = copy_counted(src, dst, expected, budget, &mut written);
+    (written, result)
+}
+
+/// `copy_exact` with the bytes written reported through `written` (set however the copy ends).
+fn copy_counted(src: &Path, dst: &Path, expected: u64, budget: &Budget, written: &mut u64) -> Result<String, CopyStop> {
+    let fail = |p: &Path, e: std::io::Error| CopyStop::Io(format!("{}: {e}", p.display()));
+    let mut input = open_no_follow(src).map_err(|e| fail(src, e))?;
+    let permissions = input.metadata().map_err(|e| fail(src, e))?.permissions();
     if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| fail(parent, e))?;
     }
-    let mut output = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dst)
-        .map_err(|e| format!("{}: {e}", dst.display()))?;
-    std::io::copy(&mut input, &mut output).map_err(|e| format!("{}: {e}", dst.display()))?;
-    output.sync_all().map_err(|e| format!("{}: {e}", dst.display()))?;
-    drop(output);
-    drop(input);
-    let _ = std::fs::set_permissions(dst, permissions);
-    match TargetState::read(dst) {
-        Ok(TargetState::File { sha256, .. }) => Ok(sha256),
-        Ok(_) => Err(format!("{}: 복사본이 일반 파일이 아님", dst.display())),
-        Err(e) => Err(format!("{}: {e:?}", dst.display())),
-    }
+    let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(dst).map_err(|e| fail(dst, e))?;
+    let (n, copied) = copy_stream(&mut input, &mut output, expected, budget);
+    *written = n;
+    let sha256 = copied?;
+    output.sync_all().map_err(|e| fail(dst, e))?;
+    let _ = output.set_permissions(permissions);
+    Ok(sha256)
 }
 
 /// Keeps a link as a link (Unix). Windows does not store links (making one needs a privilege the
@@ -1219,6 +1258,7 @@ pub(crate) fn capture(input: &CaptureInput, abandon: &AtomicBool) -> CaptureOutc
             return CaptureOutcome::Undecidable { reason, stats };
         }
     };
+    (input.between_scan_and_copy)(&install.runtime);
     let want = manifest_entries(&manifest).unwrap_or_default();
     let mut edits: Vec<&String> = classes
         .changed
@@ -1336,13 +1376,19 @@ pub(crate) fn capture(input: &CaptureInput, abandon: &AtomicBool) -> CaptureOutc
                         if copied.saturating_add(found.len) > input.max_bytes {
                             Err(format!("한 번에 보관하는 크기 상한({} MiB)을 넘음", input.max_bytes / (1024 * 1024)))
                         } else {
-                            match copy_exact(&found.path, &dst) {
-                                Ok(copy_sha) if &copy_sha == sha256 => {
-                                    copied = copied.saturating_add(found.len);
-                                    Ok(())
-                                }
+                            // RULINGS DB2: the cap counts the bytes really written (at most the scanned
+                            // length), whatever the end of the copy.
+                            let (written, copy) = copy_exact(&found.path, &dst, found.len, &budget);
+                            copied = copied.saturating_add(written);
+                            match copy {
+                                Ok(copy_sha) if &copy_sha == sha256 => Ok(()),
                                 Ok(_) => Err(format!("검사한 뒤에 바뀌어 검사한 내용과 다름: {rel}")),
-                                Err(e) => Err(e),
+                                Err(CopyStop::Grew) => Err(format!("검사한 뒤에 커져서 보관하지 않음: {rel}")),
+                                Err(CopyStop::Halted(h)) => {
+                                    halted = Some(h);
+                                    Err(halt_reason_ko(h, input.deadline))
+                                }
+                                Err(CopyStop::Io(e)) => Err(e),
                             }
                         }
                     }
@@ -2027,6 +2073,7 @@ mod tests {
             max_bytes: MAX_CAPTURE_BYTES,
             free_floor: MAX_CAPTURE_BYTES + FREE_SPACE_MARGIN,
             free_space: plenty, // AG4: a stub by default — no test depends on the temp volume's real free space
+            between_scan_and_copy: nothing_between,
         }
     }
 
@@ -2705,7 +2752,9 @@ mod tests {
             let link = t.path().join("link.json");
             assert!(make_link(f.to_str().unwrap(), &link));
             assert!(open_no_follow(&link).is_err() && read_capped(&link, 100).is_err(), "a link is not followed");
-            assert!(copy_exact(&link, &t.path().join("copy")).is_err(), "a copy source that is a link is refused");
+            let (flag, deadline) = unlimited();
+            let budget = Budget { deadline, abandon: &flag };
+            assert!(copy_exact(&link, &t.path().join("copy"), 100, &budget).1.is_err(), "a copy source that is a link is refused");
             assert!(!t.path().join("copy").exists());
             let fifo = t.path().join("fifo");
             assert!(make_fifo(&fifo, 0o644));
@@ -3050,5 +3099,86 @@ mod tests {
         let changed = capture(&with_leaf("0.15.0-20261113T030000000000Z"), &AtomicBool::new(false));
         let CaptureOutcome::Captured { dir, .. } = &changed else { panic!("a kept link with another target was reused: {changed:?}") };
         assert_eq!(std::fs::read_link(join_rel(dir, "runtime/dangling")).unwrap(), PathBuf::from("nowhere"));
+    }
+
+    // ───────── RULINGS DB2: the limits hold for the bytes actually copied ─────────
+
+    /// DB2: one byte is read past the scanned length to see whether the file grew — it is never
+    /// written; the copy stops there.
+    #[test]
+    fn db2_the_byte_read_to_detect_growth_is_never_written() {
+        let (flag, deadline) = unlimited();
+        let budget = Budget { deadline, abandon: &flag };
+        let mut out = Vec::new();
+        let (written, result) = copy_stream(&mut &b"12345"[..], &mut out, 4, &budget);
+        assert_eq!(out, b"1234".to_vec(), "only the scanned length is written");
+        assert_eq!((written, result), (4, Err(CopyStop::Grew)));
+        let mut out = Vec::new();
+        let (written, result) = copy_stream(&mut &b"1234"[..], &mut out, 4, &budget);
+        assert_eq!((out.as_slice(), written), (&b"1234"[..], 4));
+        assert_eq!(result, Ok(sha256_hex_of(b"1234")));
+    }
+
+    /// The test's reader: sets the abandon flag (the outer timeout) during its first read.
+    struct FlagOnFirstRead<'a> {
+        flag: &'a AtomicBool,
+        left: usize,
+    }
+    impl std::io::Read for FlagOnFirstRead<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.flag.store(true, Ordering::SeqCst);
+            let n = buf.len().min(self.left);
+            buf[..n].fill(0xAB);
+            self.left -= n;
+            Ok(n)
+        }
+    }
+
+    /// DB2: the deadline and the abandon flag are checked before every chunk — after the outer timeout
+    /// set the flag at most the chunk already read is written, and past the deadline nothing is.
+    #[test]
+    fn db2_no_chunk_is_written_after_the_timeout() {
+        let flag = AtomicBool::new(false);
+        let budget = Budget { deadline: Instant::now() + Duration::from_secs(3_600), abandon: &flag };
+        let total = 8 * COPY_CHUNK;
+        let mut out = Vec::new();
+        let (written, result) = copy_stream(&mut FlagOnFirstRead { flag: &flag, left: total }, &mut out, total as u64, &budget);
+        assert_eq!(result, Err(CopyStop::Halted(Halt::Abandoned)));
+        assert_eq!((written, out.len()), (COPY_CHUNK as u64, COPY_CHUNK), "one chunk, then the flag stops the copy");
+        let calm = AtomicBool::new(false);
+        let expired = Budget { deadline: Instant::now(), abandon: &calm };
+        let mut out = Vec::new();
+        let (written, result) = copy_stream(&mut &vec![1u8; total][..], &mut out, total as u64, &expired);
+        assert_eq!((written, out.len(), result), (0, 0, Err(CopyStop::Halted(Halt::Deadline))));
+    }
+
+    /// Between the scan and the copies the edited `site.py` grows by 3 MiB.
+    fn grow_site_by_3_mib(runtime: &Path) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(join_rel(runtime, "python/lib/site.py")).unwrap();
+        f.write_all(&vec![b'#'; 3 << 20]).unwrap();
+    }
+
+    /// DB2 / verdict J8 B2: a file that grew between the scan and the copy cannot push the store past
+    /// the capture cap — the store holds no more than the cap, the grown file is not kept, the user is
+    /// told, and the capture still answers.
+    #[test]
+    fn db2_a_file_that_grew_after_the_scan_cannot_fill_the_store() {
+        let t = Tmp::new("db2-grew");
+        let (exe, _res, _top) = fixture_install(t.path(), "mac");
+        let mut input = input_for(&exe, &t.path().join("store"));
+        input.max_bytes = 1 << 20;
+        input.between_scan_and_copy = grow_site_by_3_mib;
+        let o = capture(&input, &AtomicBool::new(false));
+        let CaptureOutcome::Incomplete { dir: Some(dir), not_stored: 1, reason, .. } = &o else { panic!("{o:?}") };
+        let stored: u64 = listing(dir)
+            .iter()
+            .filter(|r| r.starts_with("runtime/"))
+            .map(|r| std::fs::symlink_metadata(join_rel(dir, r)).unwrap().len())
+            .sum();
+        assert!(stored <= input.max_bytes, "the store holds {stored} bytes, more than the cap {}", input.max_bytes);
+        assert!(reason.contains("커져서"), "{reason}");
+        assert!(!kept_files(dir).contains(&"runtime/python/lib/site.py".to_string()));
+        assert!(notice_ko(&o).unwrap().body.contains("업데이트는 그대로 진행합니다"));
     }
 }
