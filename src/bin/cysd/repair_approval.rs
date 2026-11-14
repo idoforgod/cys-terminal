@@ -281,6 +281,10 @@ thread_local! {
     /// the write that follows a claim, inside the repair lock.
     pub(crate) static BEFORE_RECORD_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    /// Test seam of RULINGS GR5: runs ONCE right before this thread's next candidate read in
+    /// `submit` — a reader made slow by a test double (no real time).
+    pub(crate) static BEFORE_CANDIDATE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 fn write(ctx: &Ctx<'_>, rec: &RepairRecord) -> Result<(), VerbError> {
@@ -420,6 +424,14 @@ pub(crate) fn submit(
                 format!("{}: 이 수리의 잠금을 쥔 워커만 제출합니다", id.as_str()),
             ));
         }
+        // U2 / V2(a): the candidate is read through the ONE reader (RULINGS GR5: with a size limit) —
+        // BEFORE the approval table is taken, so no read of a worker's file ever holds the table that
+        // the approval list and the sweep need (only this repair's own lock is held)
+        #[cfg(test)]
+        if let Some(f) = BEFORE_CANDIDATE_READ.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+        let states = ledger::candidate_states_in(&ctx.root, &id).map_err(VerbError::from)?;
         let mut tbl = table.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(live) = tbl.live_for(id.as_str()) {
             return Err(precondition(format!(
@@ -462,8 +474,7 @@ pub(crate) fn submit(
         let worker = rec.worker_record.clone().ok_or_else(|| {
             precondition(format!("{}: 워커의 기록(`record`)이 아직 없습니다", id.as_str()))
         })?;
-        // U2 / V2(a): the candidate is read through the ONE reader and fingerprinted over states
-        let states = ledger::candidate_states_in(&ctx.root, &id).map_err(VerbError::from)?;
+        // … and fingerprinted over its states
         if states.is_empty() {
             return Err(precondition(format!("{}: 제출할 파일 대상이 없습니다", id.as_str())));
         }
