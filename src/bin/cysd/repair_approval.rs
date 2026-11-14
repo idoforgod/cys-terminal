@@ -125,6 +125,8 @@ pub(crate) struct ApprovalTable {
     /// The first sweep of this daemon incarnation resolved the requests a previous one left in the
     /// records (V2(d): expired if their time had passed, else voided by the restart).
     pub(crate) restart_resolved: bool,
+    /// RULINGS EL5: the repairs whose unknown approval was already reported (one finding each).
+    pub(crate) unknown_reported: std::collections::BTreeSet<String>,
 }
 
 impl ApprovalTable {
@@ -164,6 +166,13 @@ pub(crate) trait Effects: Send + Sync {
     fn step3(&self, s3: &Step3Input) -> Result<Step3Ok, Step3Err>;
     /// Files one intake row (a lane finding of the screen).
     fn intake(&self, file: &str, error: &str);
+    /// RULINGS EL5 / EP — the seam: was the approval `approval_ref` consumed by an apply?
+    fn approval_consumed(
+        &self,
+        root: &std::path::Path,
+        lane: &LaneKey,
+        approval_ref: &str,
+    ) -> cys::repair::consumed::ApprovalUse;
 }
 
 /// What step 3 is given.
@@ -359,7 +368,10 @@ pub(crate) fn submit(
     let sid = caller
         .seat()
         .ok_or_else(|| VerbError::refused("제출은 수리 잠금을 쥔 워커 좌석만 합니다"))?;
-    ctx.locked(id.as_str(), || {
+    // RULINGS EL5: a finding is filed after every lock is released (the report verb takes locks)
+    let mut found: Option<(String, String)> = None;
+    let finding = &mut found;
+    let out = ctx.locked(id.as_str(), || {
         let mut rec = load(ctx, &id)?;
         if rec.origin_lane != ctx.lane {
             return Err(precondition(format!(
@@ -408,11 +420,21 @@ pub(crate) fn submit(
         // CZ2: a previous durable pending request no request of this table serves (a restart not yet
         // reconciled by the first sweep, an end not written) is settled BEFORE it is replaced — its
         // expiry counted once, never lost
-        let (changed, count) = reconcile_stale_pending(ctx.now, &tbl, id.as_str(), &mut rec);
-        if changed {
-            write(ctx, &rec)?;
-            if count == Some(MAX_RESUBMITS + 1) {
-                eff.tell_master(budget_line(id.as_str(), &ctx.lane.0));
+        let consumed = |r: &str| eff.approval_consumed(&ctx.root, &ctx.lane, r);
+        match reconcile_stale_pending(ctx.now, &tbl, id.as_str(), &mut rec, &consumed) {
+            Reconciled::Nothing => {}
+            Reconciled::Settled(count) => {
+                write(ctx, &rec)?;
+                if count == Some(MAX_RESUBMITS + 1) {
+                    eff.tell_master(budget_line(id.as_str(), &ctx.lane.0));
+                }
+            }
+            Reconciled::Unknown(why) => {
+                *finding = unknown_finding(&mut tbl, id.as_str(), &rec, &why);
+                return Err(precondition(format!(
+                    "{}: 이전 승인이 적용에 쓰였는지 알 수 없어 다시 제출을 받지 않습니다({why}) — 접수 줄에 남겼습니다",
+                    id.as_str()
+                )));
             }
         }
         match rec.state {
@@ -506,7 +528,11 @@ pub(crate) fn submit(
         };
         tbl.requests.push(req);
         Ok((out, Some(s3)))
-    })
+    });
+    if let Some((file, line)) = found {
+        eff.intake(&file, &line);
+    }
+    out
 }
 
 /// RULINGS CZ2: is the record's durable pending request THIS request (identity = fingerprint +
@@ -681,44 +707,97 @@ fn settle_owned(
     res
 }
 
-/// RULINGS CZ2 — a durable pending request that no request of this table is serving (a previous
+/// What the reconciliation of a stale pending request decided (RULINGS CZ2 / EL5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Reconciled {
+    /// No stale pending request (none, or this table still serves it).
+    Nothing,
+    /// The record was changed (write it); the new expiry count when one was counted.
+    Settled(Option<u32>),
+    /// RULINGS EL5: whether the request's approval was consumed by an apply is UNKNOWN — the record
+    /// is left untouched (the approval neither deleted nor usable); the caller files ONE finding.
+    Unknown(String),
+}
+
+/// RULINGS CZ2 / EL5 — a durable pending request that no request of this table is serving (a previous
 /// daemon's, or one whose end could not be written) is reconciled under the repair lock (the caller
-/// holds it and the table lock) BEFORE anything replaces it: ended in this table → settled as it
-/// ended (counted when it expired); unknown here (a restart — D-18-01, V2(d)) → counted as expired
-/// when its time had passed, else voided by the restart (not counted — U4(c)). An `approved`
-/// approval result of that request was never consumed (a crash between its write and the apply —
-/// RULINGS DF5) and is cleared. Returns (record changed, the new expiry count when one was counted).
+/// holds it and the table lock) BEFORE anything replaces it. When the record holds an `approved`
+/// approval of that request, whether an apply CONSUMED it is decided by the apply's durable evidence —
+/// the seam `consumed` (`cys::repair::consumed::approval_consumed_in`, T6's), or this table's own
+/// `Approved` end: CONSUMED → kept as applied (never deleted, never counted as an expiry, never usable
+/// again — no request names it); NOT CONSUMED → the approval is cleared and the request reconciled;
+/// UNKNOWN → nothing is touched (`Reconciled::Unknown`). The reconciliation itself: ended in this
+/// table → settled as it ended (counted when it expired); unknown here (a restart — D-18-01, V2(d)) →
+/// counted as expired when its time had passed, else voided by the restart (not counted — U4(c)).
 fn reconcile_stale_pending(
     now: f64,
     tbl: &ApprovalTable,
     repair: &str,
     rec: &mut RepairRecord,
-) -> (bool, Option<u32>) {
+    consumed: &dyn Fn(&str) -> cys::repair::consumed::ApprovalUse,
+) -> Reconciled {
+    use cys::repair::consumed::ApprovalUse;
     let Some((fp, exp)) = rec.pending_request.clone() else {
-        return (false, None);
+        return Reconciled::Nothing;
     };
     let serving = tbl
         .requests
         .iter()
         .find(|r| r.repair == repair && r.fingerprint_sha256 == fp && r.expires_at == exp);
     let expired = match serving {
-        Some(r) if r.state.live() => return (false, None),
+        Some(r) if r.state.live() => return Reconciled::Nothing,
         Some(r) => r.state == ReqState::Expired,
         None => now >= exp,
     };
-    rec.pending_request = None;
-    // an approval that was applied (its request ended `Approved` here) is consumed, not stale
-    let applied = serving.is_some_and(|r| r.state == ReqState::Approved);
-    if !applied
-        && rec
-            .approval
-            .as_ref()
-            .is_some_and(|a| a.approved && a.fingerprint_sha256 == fp)
+    if let Some(a) = rec
+        .approval
+        .clone()
+        .filter(|a| a.approved && a.fingerprint_sha256 == fp)
     {
-        rec.approval = None;
+        let used = if serving.is_some_and(|r| r.state == ReqState::Approved) {
+            ApprovalUse::Consumed
+        } else {
+            consumed(&a.request_id)
+        };
+        match used {
+            ApprovalUse::Consumed => {
+                rec.pending_request = None;
+                return Reconciled::Settled(None);
+            }
+            ApprovalUse::NotConsumed => rec.approval = None,
+            ApprovalUse::Unknown(why) => return Reconciled::Unknown(why),
+        }
     }
-    let count = expired.then(|| bump_expired(rec, &fp));
-    (true, count)
+    rec.pending_request = None;
+    Reconciled::Settled(expired.then(|| bump_expired(rec, &fp)))
+}
+
+/// RULINGS EL5: the ONE finding of an approval whose consumption is unknown (once per repair per daemon
+/// incarnation — never one per sweep or per submit). `None` when it was already filed.
+fn unknown_finding(
+    tbl: &mut ApprovalTable,
+    repair: &str,
+    rec: &RepairRecord,
+    why: &str,
+) -> Option<(String, String)> {
+    if !tbl.unknown_reported.insert(repair.to_string()) {
+        return None;
+    }
+    let rel = ledger::file_targets(rec)
+        .next()
+        .map(|f| f.rel.clone())
+        .unwrap_or_default();
+    let rq = rec
+        .approval
+        .as_ref()
+        .map(|a| a.request_id.clone())
+        .unwrap_or_default();
+    Some((
+        rel,
+        format!(
+            "수리 {repair}: 이전 승인({rq})이 적용에 쓰였는지 알 수 없습니다({why}) — 승인을 지우지도 다시 쓰지도 않습니다"
+        ),
+    ))
 }
 
 // ═══════════════════════════════════════════ step 3 ═══════════════════════════════════════════
@@ -1525,8 +1604,10 @@ pub(crate) fn sweep(ctx: &Ctx<'_>, table: &Mutex<ApprovalTable>, eff: &dyn Effec
 /// had passed (counted), else voided by the restart (not counted — D-18-01). The lock is released by
 /// the restart itself (lease incarnation).
 fn resolve_after_restart(ctx: &Ctx<'_>, table: &Mutex<ApprovalTable>, eff: &dyn Effects) {
+    let consumed = |r: &str| eff.approval_consumed(&ctx.root, &ctx.lane, r);
     for id in ledger::list_ids_in(&ctx.root) {
         let mut count = None;
+        let mut found: Option<(String, String)> = None;
         let res = ctx.locked(id.as_str(), || -> Result<bool, VerbError> {
             let Ok(Some(mut rec)) = ledger::read_record_in(&ctx.root, &id) else {
                 return Ok(false);
@@ -1534,17 +1615,25 @@ fn resolve_after_restart(ctx: &Ctx<'_>, table: &Mutex<ApprovalTable>, eff: &dyn 
             if rec.origin_lane != ctx.lane {
                 return Ok(false);
             }
-            let (changed, c) = {
-                let tbl = table.lock().unwrap_or_else(|e| e.into_inner());
-                reconcile_stale_pending(ctx.now, &tbl, id.as_str(), &mut rec)
+            let decided = {
+                let mut tbl = table.lock().unwrap_or_else(|e| e.into_inner());
+                let d = reconcile_stale_pending(ctx.now, &tbl, id.as_str(), &mut rec, &consumed);
+                if let Reconciled::Unknown(why) = &d {
+                    found = unknown_finding(&mut tbl, id.as_str(), &rec, why);
+                }
+                d
             };
-            if !changed {
+            let Reconciled::Settled(c) = decided else {
                 return Ok(false);
-            }
+            };
             write(ctx, &rec)?;
             count = c;
             Ok(true)
         });
+        // after every lock (the report verb takes its own)
+        if let Some((file, line)) = found {
+            eff.intake(&file, &line);
+        }
         if matches!(res, Ok(true)) && count == Some(MAX_RESUBMITS + 1) {
             eff.tell_master(budget_line(id.as_str(), &ctx.lane.0));
         }
@@ -1689,6 +1778,16 @@ impl Effects for DaemonEffects {
 
     fn intake(&self, file: &str, error: &str) {
         crate::repair::file_intake(&self.daemon, file, error);
+    }
+
+    fn approval_consumed(
+        &self,
+        root: &std::path::Path,
+        lane: &LaneKey,
+        approval_ref: &str,
+    ) -> cys::repair::consumed::ApprovalUse {
+        // the seam's body is T6's; until it is merged it answers Unknown (the safe answer)
+        cys::repair::consumed::approval_consumed_in(root, lane, approval_ref)
     }
 }
 

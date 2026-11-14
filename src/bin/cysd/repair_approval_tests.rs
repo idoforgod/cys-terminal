@@ -209,6 +209,8 @@ struct Rec {
     apply_answer: Mutex<Option<cys::repair::apply::ApplyOutcome>>,
     /// DE4: the table and request whose state the apply observes while it runs
     probe: Mutex<Option<(Arc<Mutex<ApprovalTable>>, String)>>,
+    /// RULINGS EL5: the test double of the seam (None = NotConsumed)
+    consumed_answer: Mutex<Option<cys::repair::consumed::ApprovalUse>>,
     seen_during_apply: Mutex<Vec<ReqState>>,
 }
 
@@ -285,6 +287,18 @@ impl Effects for Rec {
             .lock()
             .unwrap()
             .push((file.into(), error.into()));
+    }
+    fn approval_consumed(
+        &self,
+        _root: &Path,
+        _lane: &LaneKey,
+        _approval_ref: &str,
+    ) -> cys::repair::consumed::ApprovalUse {
+        self.consumed_answer
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(cys::repair::consumed::ApprovalUse::NotConsumed)
     }
 }
 
@@ -1110,11 +1124,96 @@ fn reconciliation_keeps_an_applied_approval() {
         approved: true,
     });
     t.lock().unwrap().find_mut(&rid).unwrap().state = ReqState::Approved;
-    let (changed, count) =
-        reconcile_stale_pending(T0 + 30.0, &t.lock().unwrap(), "R-1", &mut rec);
-    assert_eq!((changed, count), (true, None));
+    let decided = reconcile_stale_pending(T0 + 30.0, &t.lock().unwrap(), "R-1", &mut rec, &|_| {
+        cys::repair::consumed::ApprovalUse::Unknown("the table's own end decides".into())
+    });
+    assert_eq!(decided, Reconciled::Settled(None));
     assert_eq!(rec.pending_request, None);
     assert_eq!(rec.approval.map(|a| a.approved), Some(true), "the applied approval stays");
+}
+
+/// RULINGS EL5 — the record of a request whose approval was written, then a restart: the NEW table is
+/// empty. Sets up R-1 with its pending request and an `approved` approval, and returns the fresh table.
+fn approved_then_restart(r: &Rig, eff: &Rec) -> (RepairId, String, Mutex<ApprovalTable>) {
+    let id = r.signed_repair();
+    let t = Mutex::new(ApprovalTable::default());
+    let rid = pending(r, &t, eff, T0);
+    let mut rec = r.rec(&id);
+    rec.approval = Some(ApprovalResult {
+        request_id: rid.clone(),
+        fingerprint_sha256: fp_of(r, &id),
+        decided_at: T0 + 20.0,
+        approved: true,
+    });
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    drop(t); // the crash
+    (id, rid, Mutex::new(ApprovalTable::default()))
+}
+
+/// EL5 boundary 1 — crash BEFORE the apply: the seam answers NOT CONSUMED → CZ2's reconciliation (the
+/// approval cleared; voided by the restart in time, not counted).
+#[test]
+fn crash_before_the_apply_is_reconciled_when_not_consumed() {
+    let r = rig("el5-before");
+    let eff = effects();
+    *eff.consumed_answer.lock().unwrap() = Some(cys::repair::consumed::ApprovalUse::NotConsumed);
+    let (id, _rid, t) = approved_then_restart(&r, &eff);
+    sweep(&r.ctx(T0 + 60.0), &t, &eff);
+    let rec = r.rec(&id);
+    assert_eq!((rec.pending_request, rec.approval, rec.resubmits), (None, None, vec![]));
+}
+
+/// EL5 boundary 2 — crash AFTER the apply, before the settlement (past the request's deadline): the
+/// seam answers CONSUMED → kept as applied: never deleted, never counted as an expiry, never usable
+/// again (no request names it). (The old reconciliation, its table empty, deleted it and counted an
+/// expiry.)
+#[test]
+fn crash_after_the_apply_keeps_the_consumed_approval() {
+    let r = rig("el5-after");
+    let eff = effects();
+    *eff.consumed_answer.lock().unwrap() = Some(cys::repair::consumed::ApprovalUse::Consumed);
+    let (id, rid, t) = approved_then_restart(&r, &eff);
+    sweep(&r.ctx(T0 + 1900.0), &t, &eff);
+    let rec = r.rec(&id);
+    assert_eq!(rec.pending_request, None);
+    assert_eq!(rec.resubmits, vec![], "never counted as an expiry");
+    let a = rec.approval.expect("kept as applied");
+    assert!(a.approved && a.request_id == rid);
+    assert!(t.lock().unwrap().find(&rid).is_none(), "no request can use it again");
+}
+
+/// EL5 — UNKNOWN (the production answer until T6's body is merged): neither deleted nor usable, and
+/// ONE finding — not one per sweep or per submit; a submit is refused meanwhile.
+#[test]
+fn unknown_consumption_is_neither_deleted_nor_usable_one_finding() {
+    let r = rig("el5-unknown");
+    let eff = effects();
+    *eff.consumed_answer.lock().unwrap() =
+        Some(cys::repair::consumed::ApprovalUse::Unknown("no evidence".into()));
+    let (id, _rid, t) = approved_then_restart(&r, &eff);
+    let before = r.rec(&id);
+    let n0 = eff.intake.lock().unwrap().len();
+    sweep(&r.ctx(T0 + 60.0), &t, &eff);
+    let after = r.rec(&id);
+    assert_eq!((after.pending_request.clone(), after.approval.clone()), (before.pending_request.clone(), before.approval.clone()));
+    assert_eq!(eff.intake.lock().unwrap().len(), n0 + 1, "one finding");
+    for k in 0..2 {
+        let e = submit(&r.ctx(T0 + 70.0 + f64::from(k)), &worker(), &json!({"repair": "R-1"}), &t, &eff, Ok(())).unwrap_err();
+        assert!(e.message.contains("알 수 없어"), "{}", e.message);
+    }
+    sweep(&r.ctx(T0 + 2000.0), &t, &eff);
+    assert_eq!(eff.intake.lock().unwrap().len(), n0 + 1, "never one per sweep or submit");
+    assert_eq!(r.rec(&id).approval, before.approval);
+}
+
+/// EL5 / EP: until T6's body is merged the seam's production answer is UNKNOWN.
+#[test]
+fn the_seam_answers_unknown_until_t6_fills_it() {
+    let r = rig("el5-seam");
+    assert!(matches!(
+        cys::repair::consumed::approval_consumed_in(&r.root, &r.lane, "rq-0"),
+        cys::repair::consumed::ApprovalUse::Unknown(_)
+    ));
 }
 
 /// RULINGS CZ2 — deterministic interleaving: `first` runs on this thread; at its record write (after
