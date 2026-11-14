@@ -4397,15 +4397,35 @@ pub(crate) fn identity_now(path: &Path) -> Lookup {
     }
     #[cfg(windows)]
     {
-        // a path that is not there is ABSENT; one whose identity cannot be read is UNKNOWN
-        match std::fs::metadata(path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Lookup::Absent,
-            Err(_) => Lookup::Unknown,
-            Ok(_) => match cys::repair::boot_critical::file_identity(path) {
-                Some(id) => Lookup::Exists(id),
-                None => Lookup::Unknown,
-            },
+        // RULINGS EG2: an open that permits DIRECTORIES (FILE_FLAG_BACKUP_SEMANTICS, no data
+        // access), then the same by-handle facts as `boot_critical::file_identity` (volume serial,
+        // 64-bit file index) — so a folder's identity is read and the usual case is decided.
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let f = match std::fs::OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Lookup::Absent,
+            Err(_) => return Lookup::Unknown,
+        };
+        // SAFETY: a zeroed BY_HANDLE_FILE_INFORMATION is a valid out-parameter; the handle is
+        // owned by `f`, which outlives the call.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) } == 0 {
+            return Lookup::Unknown;
         }
+        Lookup::Exists((
+            u64::from(info.dwVolumeSerialNumber),
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ))
     }
     #[cfg(not(any(unix, windows)))]
     {
