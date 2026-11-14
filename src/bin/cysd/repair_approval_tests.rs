@@ -1006,10 +1006,10 @@ fn restart_clears_an_unconsumed_approval() {
 /// 300 ms each before the write goes on — exactly the window the old check-then-act let a second end
 /// through.
 fn interleave<'a>(first: &dyn Fn(), others: Vec<Box<dyn Fn() + Send + Sync + 'a>>) {
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let go_rx = Mutex::new(go_rx);
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     std::thread::scope(|s| {
-        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-        let go_rx = Mutex::new(go_rx);
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let n = others.len();
         for o in &others {
             let done_tx = done_tx.clone();
