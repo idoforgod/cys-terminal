@@ -6262,6 +6262,9 @@ pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
 // ★pack-update는 이미 journal 트랜잭션(apply_pack_transactional)으로 all-or-nothing +
 // minisign·sha256 검증을 수행하므로 이 경로를 타지 않는다(중복 래핑=heavily-reviewed 트랜잭션
 // 재작성 위험 → 외과성 원칙 준수). run_init_pack(비원자 in-place write)만 이 경로로 승격한다.
+// ★T9a (RULINGS GH1 · TW1 run 1 · design §4-15 라): 위 승격은 이제 **첫 설치(팩 폴더 없음)에만** 남는다. 살아 있는 팩을
+// 폴더째 바꾸는 교체가 결함 라 자체였다(윈도우: 쥐어진 파일 하나가 rename 을 거부 → 복사 후 삭제가 팩을 반쯤 지웠다).
+// 있는 팩은 제자리 파일별 설치로 갱신한다 — 파일별이므로 중단된 실행은 다음 실행이 마저 끝낸다.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// init-pack staging 디렉터리(pack_dir 형제·pid로 격리). pack-update의 고정 `.pack-staging`과
@@ -6271,7 +6274,8 @@ pub fn init_staging_dir(dir: &Path) -> PathBuf {
     parent.join(format!(".pack-staging-init-{}", std::process::id()))
 }
 
-/// 1세대 롤백 보존 디렉터리(pack_dir 형제 `<pack_dir>.prev` — 즉시 롤백 근거).
+/// pack_dir 형제 `<pack_dir>.prev` 의 이름. ★T9a (RULINGS GH1 · GJ1 · GJ3): 0.15.0 은 이 폴더를 만들지도, 읽지도, 옮기지도,
+/// 지우지도 않는다 — 있다면 0.15.0 이전 버전의 통째 교체가 남긴 것이다(되돌리기의 원천은 업데이트 전 스냅샷뿐 — 설계 §7 13행).
 pub fn pack_prev_dir(dir: &Path) -> PathBuf {
     PathBuf::from(format!("{}.prev", dir.display()))
 }
@@ -6282,8 +6286,14 @@ pub fn pack_prev_dir(dir: &Path) -> PathBuf {
 /// 복사한다 — 종전 `fs::copy` 는 링크를 따라가 파일 링크를 사본으로 바꾸고, 대상이 없는 링크에서는
 /// 실패해 `init-pack` 이 exit 1 로 멈췄다(조사 손실 시나리오 20). 윈도우는 개발자 모드 없이 링크를 만들 수
 /// 없으므로 지금 동작 그대로다(운영체제 제약).
+/// ★T9a (RULINGS GN1 · S3): 폴더와 파일을 전부 **배타적으로** 만든다 — 대상(또는 그 안의 무엇이든)이 이미 있으면
+/// `AlreadyExists` 로 즉시 멈추고 아무것도 바꾸지 않는다(덮어쓰기 0). 호출자(첫 설치의 게시)는 그때 이미 있는 팩을
+/// 제자리 설치로 갱신한다. `dst` 의 상위 폴더는 필요하면 만든다.
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let ft = entry.file_type()?;
@@ -6297,50 +6307,126 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         if ft.is_dir() {
             copy_dir_all(&from, &to)?;
         } else {
-            std::fs::copy(&from, &to)?;
+            copy_file_new(&from, &to)?;
         }
     }
     Ok(())
 }
 
+/// ★T9a (RULINGS GN1): 결코 바꾸지 않는 파일 복사 — 대상은 `create_new`(있으면 `AlreadyExists`)로 만들고, 원본의 권한을
+/// 입힌다(`fs::copy` 가 하던 대로).
+fn copy_file_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut input = std::fs::File::open(from)?;
+    let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(to)?;
+    std::io::copy(&mut input, &mut output)?;
+    std::fs::set_permissions(to, input.metadata()?.permissions())
+}
+
+/// The rename every move of the pack swap goes through ([`publish_staging_with`]). Production passes `std::fs::rename`;
+/// tests install a refusing one through [`swap_seam`] (RULINGS FS5).
+type SwapRename = dyn Fn(&Path, &Path) -> std::io::Result<()>;
+
+/// Test-only seam for [`atomic_swap`] (RULINGS FS5): a rename installed here replaces `std::fs::rename` for every move
+/// of the swap on THIS thread until the guard drops — so a test can drive the real `install_staged` → `atomic_swap`
+/// path with a refused rename. Thread-local: parallel tests never see each other's seam.
+#[cfg(test)]
+mod swap_seam {
+    use std::cell::RefCell;
+    use std::path::Path;
+    use std::rc::Rc;
+
+    thread_local! {
+        static RENAME: RefCell<Option<Rc<super::SwapRename>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn current() -> Option<Rc<super::SwapRename>> {
+        RENAME.with(|r| r.borrow().clone())
+    }
+
+    /// Removes the installed rename when dropped (also on panic unwinding).
+    pub(super) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            RENAME.with(|r| *r.borrow_mut() = None);
+        }
+    }
+
+    #[must_use]
+    pub(super) fn install(rename: impl Fn(&Path, &Path) -> std::io::Result<()> + 'static) -> Guard {
+        RENAME.with(|r| *r.borrow_mut() = Some(Rc::new(rename)));
+        Guard
+    }
+}
+
 /// cross-device 대비 rename(§3.1-5) — 같은 볼륨이면 원자 rename, 실패 시 copy 후 원본 삭제
 /// fallback(EXDEV 등). staging은 pack_dir 형제라 정상 경로는 원자 rename이다(Windows도 동일 볼륨 전제).
-fn rename_dir_or_move(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if std::fs::rename(src, dst).is_ok() {
+/// ★T9a (RULINGS FS2 · GH1): `src` is ONLY ever the staging folder this install itself just wrote (a first install's
+/// publish) — the one place the copy-then-delete fallback remains. A live pack is never its source: an existing pack is
+/// updated in place by [`install_staged`] and never moved as a folder.
+/// ★T9a (RULINGS GN1 · S3): rename 이 실패했을 때 대상이 **그사이 생겼으면** 아무것도 복사하지 않고 `AlreadyExists` 를
+/// 돌려준다(다른 설치기 — 데몬의 기동 설치·다른 init-pack — 가 만든 팩 위에 분류 없이 덮어쓰지 않는다). 복사 fallback 은
+/// 대상이 아직 없을 때만이고, 그 복사도 배타적이다([`copy_dir_all`]).
+fn rename_dir_or_move(src: &Path, dst: &Path, rename: &SwapRename) -> std::io::Result<()> {
+    if rename(src, dst).is_ok() {
         return Ok(());
     }
-    // rename 불가(cross-device 등) — copy 후 원본 삭제 fallback(src 부재면 여기서 loud Err).
+    if std::fs::symlink_metadata(dst).is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} 가 그사이 생겼습니다 — 복사하지 않습니다", dst.display()),
+        ));
+    }
+    // rename 불가(cross-device 등) — 아직 없는 대상에 배타적 copy 후 원본 삭제 fallback(src 부재면 여기서 loud Err).
     copy_dir_all(src, dst)?;
     std::fs::remove_dir_all(src)
 }
 
-/// 원자 교체(§3.1-3): pack_dir→pack_dir.prev, staging→pack_dir. 2번째 rename 실패 시 역rename으로
-/// pre-state 복구. pack_dir.prev는 1세대만 보존. 반환 Err = 교체 안 됨(기존 팩 온전).
+/// 첫 설치의 게시(§3.1): staging → pack_dir, rename 하나(staging 의 copy fallback 만 허용).
 ///
-/// L6 전제 명문화: 두 rename 사이엔 pack_dir가 잠깐 **부재하는 창**이 있다(원자 교체지만 순간 공백).
-/// 이는 **데몬 미가동/init 시점**(팩을 읽는 상주 소비자가 없는 때)을 전제로 안전하다 — 무중단
-/// 업데이트 경로(deploy_gate --execute)는 이 함수를 데몬이 팩을 읽지 않는 시점에만 호출한다.
-/// 상주 데몬이 그 창에 팩을 읽으면 일시적 not-found가 날 수 있으므로, 라이브 교체는 이 전제를
-/// 지키는 호출자 책임이다(코드 변경 불요·전제 고지).
+/// ★T9a (RULINGS GH1 · design §4-15 라 "살아 있는 … 팩 폴더의 이름을 바꾸지 않고, 제자리에서 … 적용"): pack_dir 자리에
+/// 무엇이든 이미 있으면 거부한다 — 살아 있는 팩은 폴더째 바꾸지 않는다(기존 팩의 갱신은 [`install_staged`] 의 제자리
+/// 파일별 설치). 그래서 이 함수는 살아 있는 팩도 `pack.prev` 도 결코 건드리지 않는다(옮기기·지우기·만들기 0).
+/// 반환 Err = 아무것도 바꾸지 않았거나(자리에 항목이 있음 · staging rename/copy 가 시작 전에 실패), staging 의 copy
+/// fallback 이 도중에 멈춰 pack_dir 자리에 staging 의 일부 사본이 남았다 — 그 폴더는 다음 실행이 제자리 설치로 채운다.
 pub fn atomic_swap(dir: &Path, staging: &Path) -> Result<(), String> {
-    let prev = pack_prev_dir(dir);
-    // 직전 세대 정리(1세대 보존).
-    let _ = std::fs::remove_dir_all(&prev);
-    let had_old = dir.exists();
-    if had_old {
-        rename_dir_or_move(dir, &prev)
-            .map_err(|e| format!("pack_dir→prev rename 실패(교체 안 함): {e}"))?;
+    publish_staging(dir, staging).map_err(|r| match r {
+        PublishRefused::Occupied => format!(
+            "팩 자리에 이미 항목이 있습니다({}) — 살아 있는 팩은 폴더째 바꾸지 않습니다(기존 팩은 파일별 제자리 갱신) · \
+             아무것도 바꾸지 않았습니다",
+            dir.display()
+        ),
+        PublishRefused::Failed(e) => e,
+    })
+}
+
+/// 첫 설치 게시가 일어나지 않은 이유.
+enum PublishRefused {
+    /// 팩 자리에 무엇이 있다(처음부터, 또는 rename 사이에 다른 설치기가 만들었다) — 아무것도 복사하지 않았다.
+    Occupied,
+    /// 그 밖의 실패(rename·배타 복사의 IO 오류).
+    Failed(String),
+}
+
+/// [`atomic_swap`] 의 본체 — 테스트 이음새(swap_seam)를 거친 rename 으로 게시한다.
+fn publish_staging(dir: &Path, staging: &Path) -> Result<(), PublishRefused> {
+    #[cfg(test)]
+    if let Some(rename) = swap_seam::current() {
+        return publish_staging_with(dir, staging, &*rename);
     }
-    match rename_dir_or_move(staging, dir) {
+    publish_staging_with(dir, staging, &|src: &Path, dst: &Path| std::fs::rename(src, dst))
+}
+
+/// [`publish_staging`] with the rename it uses — the test seam of RULINGS FS5 / GH2 / GN1 (tests count the folder renames
+/// and create the pack between the absence check and the rename).
+fn publish_staging_with(dir: &Path, staging: &Path, rename: &SwapRename) -> Result<(), PublishRefused> {
+    if std::fs::symlink_metadata(dir).is_ok() {
+        return Err(PublishRefused::Occupied);
+    }
+    match rename_dir_or_move(staging, dir, rename) {
         Ok(()) => Ok(()),
-        Err(e) => {
-            // 역rename 복구: (실패한 fallback이 만든 부분/빈 dir 정리 후) prev→pack_dir 복원.
-            if had_old {
-                let _ = std::fs::remove_dir_all(dir);
-                let _ = rename_dir_or_move(&prev, dir);
-            }
-            Err(format!("staging→pack_dir rename 실패(pre-state 복구 시도): {e}"))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(PublishRefused::Occupied),
+        Err(e) => Err(PublishRefused::Failed(format!("staging→pack_dir rename 실패: {e}"))),
     }
 }
 
@@ -6385,9 +6471,16 @@ pub fn verify_staging_with(
     }
 }
 
-/// 원자 교체 기반 init-pack 설치(§3.1). 현재 pack_dir을 staging에 전량 복사→install_into로 임베드
-/// 반영(preserve-gate·prune·.pack-version)→검증→원자 rename 교체→실 pack_dir에 config 격리 셋업.
-/// 중단(카피·반영·검증 중 abort)은 기존 pack_dir을 건드리지 않는다(원자성). 반환: (written, kept).
+/// init-pack 설치(§3.1). 반환: (written, kept).
+/// ★T9a (RULINGS GH1 · design §4-15 라 "살아 있는 … 팩 폴더의 이름을 바꾸지 않고, 제자리에서 … 적용"):
+/// - pack_dir 이 **있으면** 제자리 갱신 — 데몬의 기동 설치가 팩에 돌리는 것과 같은 파일별 설치(`install_into_with`:
+///   같은 규칙·입력원·스코프·캡처 레인·버전 · 업데이트 전 스냅샷은 첫 쓰기 전)를 팩 자체에 돌리고, 같은 존재 검증과
+///   같은 config 격리 셋업을 한다. 팩 사본·staging·팩 폴더 rename·`pack.prev` 없음. 파일별이지 전부-아니면-전무가
+///   아니다: 바꿀 수 없는 파일 하나(윈도우에서 쥐어진 파일)가 그 자리에서 실행을 Err 로 멈추고(앞 파일은 갱신됨 ·
+///   `.pack-version` 은 그대로라 데몬의 설치 관문도 열린 채), 다음 실행이 마저 끝낸다. 지우는 것은 없다.
+/// - pack_dir 이 **없으면**(첫 설치) staging 전개 → install_into 반영 → 검증 → rename 하나로 게시([`atomic_swap`]) →
+///   config 격리 셋업. 게시 전 중단은 pack_dir 을 만들지 않는다. ★RULINGS GN1: 그사이 다른 설치기가 팩을 만들었으면
+///   (rename 이 거부되고 대상이 이제 있다) 그 위에 아무것도 복사하지 않고 staging 을 버린 뒤 위의 제자리 갱신을 돈다.
 /// ★G3: `install_hooks=false`(init-pack --no-install-hook)면 마지막 config 격리 셋업에서 훅
 /// 병합·검증·개인 프로필 병합을 생략한다(라우터 시드는 유지) — 훅 억제의 의미론을 '모든 계급의
 /// 훅 등록 억제'로 통일(종전엔 ~/.claude 만 막고 격리 config dir 병합은 못 막던 비일관 해소).
@@ -6408,17 +6501,37 @@ pub fn install_staged(
     // ★W0-d: 최종 commit/rename(atomic_swap)이 라이브 기본 경로를 원자 교체하므로, 어떤 staging
     // 작업보다 먼저 인가를 검사한다(비라이브 대상·인가 보유는 통과 — 테스트는 temp 대상이라 무영향).
     authorize_pack_write(&dir, auth)?;
+    // ★T9a (RULINGS GH1): 있는 팩 = 제자리 파일별 설치(데몬의 기동 설치와 같은 호출 — 차이는 force·config 셋업 시점·
+    // 존재 검증뿐) → 같은 존재 검증 → 같은 config 셋업. 폴더째 교체는 없다.
+    let in_place = || -> Result<(usize, usize), String> {
+        let items: Vec<(&str, &str)> = PACK_ALL.iter().map(|(r, c)| (*r, *c)).collect();
+        let sources = UpdateSources::for_live_pack(&dir);
+        let (written, kept) = install_into_with(
+            dir.clone(),
+            items.iter().copied(),
+            force,
+            env!("CARGO_PKG_VERSION"),
+            false,
+            false,
+            scope,
+            auth, // 라이브 팩에 직접 쓴다 — 데몬의 기동 설치처럼 인가를 그대로 넘긴다.
+            capture_ns.as_deref(),
+            &sources,
+        )?;
+        verify_staging_with(&dir, &items, &sources.authorised_absent())
+            .map_err(|e| format!("제자리 갱신 뒤 팩 검사 — {e}"))?;
+        setup_isolated_config_dir(install_hooks);
+        Ok((written, kept))
+    };
+    if dir.is_dir() {
+        return in_place();
+    }
     let staging = init_staging_dir(&dir);
     // 잔여 staging(같은 pid 재사용·직전 실패) 선정리.
     let _ = std::fs::remove_dir_all(&staging);
-    // ① 기존 팩 전량을 staging에 복사(상태파일·user-edit·비임베드·디렉티브 전부 보존 — 완전 교체 대상).
-    if dir.exists() {
-        copy_dir_all(&dir, &staging)
-            .map_err(|e| format!("staging 복사 실패 {}: {e}", staging.display()))?;
-    } else {
-        std::fs::create_dir_all(&staging)
-            .map_err(|e| format!("staging 생성 실패 {}: {e}", staging.display()))?;
-    }
+    // ① 첫 설치 — 빈 staging(있는 팩은 위에서 제자리 갱신했다 · 여기 오는 것은 팩 폴더가 없을 때뿐).
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| format!("staging 생성 실패 {}: {e}", staging.display()))?;
     // ② 임베드 반영을 staging에(config 격리 셋업은 교체 후 실 dir에 — setup_config=false).
     let items: Vec<(&str, &str)> = PACK_ALL.iter().map(|(r, c)| (*r, *c)).collect();
     // ★0.15.0 M11: 입력원은 **논리 대상**(pack_dir)에서 — 레인(묘비)·스냅샷은 staging 이 아니라 그 팩의 것.
@@ -6447,10 +6560,25 @@ pub fn install_staged(
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
     }
-    // ④ 원자 교체(실패 시 pre-state 복구·staging 정리).
-    if let Err(e) = atomic_swap(&dir, &staging) {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(e);
+    // ④ 게시(rename 하나 · 실패 시 staging 정리). ★T9a (RULINGS GN1 · S3): 그사이 다른 설치기가 팩을 만들었으면 그 위에
+    //   아무것도 복사하지 않는다 — staging 을 버리고, 이제 있는 팩을 제자리 설치로 갱신한다(그 안의 모든 파일이 갱신
+    //   규칙을 거친다).
+    match publish_staging(&dir, &staging) {
+        Ok(()) => {}
+        Err(PublishRefused::Occupied) if dir.is_dir() => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return in_place();
+        }
+        Err(refused) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(match refused {
+                PublishRefused::Occupied => format!(
+                    "팩 자리에 폴더가 아닌 항목이 있습니다({}) — 아무것도 바꾸지 않았습니다",
+                    dir.display()
+                ),
+                PublishRefused::Failed(e) => e,
+            });
+        }
     }
     // ⑤ 교체 후 실 pack_dir 기준 config 격리 셋업(pack_dir 형제 — staging 대상이 아니었다).
     setup_isolated_config_dir(install_hooks);
@@ -12336,15 +12464,15 @@ mod tests {
 
     // ─── §3.1 팩 atomic swap ───
 
-    /// 성공 교체: staging→pack_dir, 기존 pack_dir→.prev(1세대 보존), staging 소진.
+    /// ★T9a (RULINGS GH1) 재작성(종전 `atomic_swap_success_creates_prev`: "성공 교체: staging→pack_dir, 기존 pack_dir→.prev
+    /// (1세대 보존), staging 소진"): 게시는 pack_dir 이 없을 때만 — staging 이 rename 하나로 pack_dir 이 되고 .prev 는 생기지
+    /// 않는다. 있는 pack_dir 로의 게시는 거부되고 아무것도 바뀌지 않는다(살아 있는 팩은 폴더째 바꾸지 않는다).
     #[test]
-    fn atomic_swap_success_creates_prev() {
+    fn atomic_swap_publishes_only_into_an_absent_pack() {
         let base = std::env::temp_dir().join(format!("cys-swap-ok-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let dir = base.join("pack");
         let staging = base.join("staging");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.txt"), "old").unwrap();
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::write(staging.join("a.txt"), "new").unwrap();
         std::fs::write(staging.join("b.txt"), "b").unwrap();
@@ -12353,10 +12481,16 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "new");
         assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b");
-        let prev = pack_prev_dir(&dir);
-        assert!(prev.exists(), ".prev 1세대 보존");
-        assert_eq!(std::fs::read_to_string(prev.join("a.txt")).unwrap(), "old");
-        assert!(!staging.exists(), "staging은 교체로 소진");
+        assert!(!pack_prev_dir(&dir).exists(), ".prev 는 만들지 않는다");
+        assert!(!staging.exists(), "staging은 게시로 소진");
+
+        // 있는 pack_dir 로의 게시 → 거부 · 무변경.
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("a.txt"), "newer").unwrap();
+        assert!(atomic_swap(&dir, &staging).is_err(), "있는 팩으로의 게시는 거부");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "new", "팩 무변경");
+        assert_eq!(std::fs::read_to_string(staging.join("a.txt")).unwrap(), "newer", "staging 무변경");
+        assert!(!pack_prev_dir(&dir).exists(), ".prev 없음");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -12382,6 +12516,674 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// ─── T9a (RULINGS FS · GH1–GH5 · design §4-15 라 · TW1 run 1 report §10): an EXISTING pack is updated in place — no
+    /// folder rename, no staging, no `pack.prev`; only a first install (no pack folder) is staged and published by one
+    /// rename. The swap's folder renames go through `swap_seam`, so a test can count them.
+    mod t9a {
+        use super::*;
+        use crate::pack::swap_seam;
+        use std::cell::RefCell;
+        use std::collections::BTreeMap;
+        use std::rc::Rc;
+
+        type CallLog = Rc<RefCell<Vec<(PathBuf, PathBuf)>>>;
+
+        const LISTED: &str = "bin/javis_bootstrap.py";
+        const USER_OWNED: &str = "agents.json";
+        const RETIRED: &str = "bin/javis_retired_tool_t9a.py";
+        const MINE: &str = "notes/my-own-notes.txt";
+        const USER_BOOT: &str = "# the user's repair of the boot-critical file\n";
+        const USER_AGENTS: &str = "{\"user\":\"my seats\"}\n";
+
+        fn scratch(tag: &str) -> PathBuf {
+            let base = std::env::temp_dir().join(format!(
+                "cys-t9a-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            base
+        }
+
+        fn write_tree(root: &Path, files: &[(&str, &str)]) {
+            for (rel, body) in files {
+                let p = root.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, body).unwrap();
+            }
+        }
+
+        fn embed_of(rel: &str) -> &'static str {
+            PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c).unwrap()
+        }
+
+        /// Tree manifest: relative path → kind + sha256 of the bytes (+ permission bits on Unix). Absent root = empty.
+        fn manifest(root: &Path) -> BTreeMap<String, String> {
+            fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
+                for e in std::fs::read_dir(dir).unwrap() {
+                    let p = e.unwrap().path();
+                    let rel = p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+                    let meta = std::fs::symlink_metadata(&p).unwrap();
+                    #[cfg(unix)]
+                    let mode = {
+                        use std::os::unix::fs::PermissionsExt;
+                        format!(":{:o}", meta.permissions().mode() & 0o7777)
+                    };
+                    #[cfg(not(unix))]
+                    let mode = String::new();
+                    if meta.file_type().is_symlink() {
+                        out.insert(rel, format!("link:{}", std::fs::read_link(&p).unwrap().display()));
+                    } else if meta.is_dir() {
+                        out.insert(rel, format!("dir{mode}"));
+                        walk(root, &p, out);
+                    } else {
+                        out.insert(rel, format!("file:{}{mode}", sha256_hex(&std::fs::read(&p).unwrap())));
+                    }
+                }
+            }
+            let mut out = BTreeMap::new();
+            if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
+                walk(root, root, &mut out);
+            }
+            out
+        }
+
+        /// [`manifest`] with the ledger compared by content minus its clock fields (`ts`, `parked_at` — seconds of the
+        /// run that wrote the entry); every other byte of the tree is compared as is.
+        fn tree(root: &Path) -> BTreeMap<String, String> {
+            let mut m = manifest(root);
+            if let Ok(s) = std::fs::read_to_string(root.join(MERGE_PENDING_FILE)) {
+                let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+                let mut entries: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+                for (rel, e) in v.as_object().into_iter().flatten() {
+                    let fields = e
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .filter(|(k, _)| k.as_str() != "ts" && k.as_str() != "parked_at")
+                        .map(|(k, x)| (k.clone(), x.to_string()))
+                        .collect();
+                    entries.insert(rel.clone(), fields);
+                }
+                m.insert(MERGE_PENDING_FILE.to_string(), format!("ledger:{entries:?}"));
+            }
+            m
+        }
+
+        /// Entry names directly under `base`, sorted — every leftover an install could leave beside the pack.
+        fn entries(base: &Path) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(base)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        }
+
+        /// Installs, on this thread, a rename for the swap that records every folder move and performs it.
+        fn counting() -> (swap_seam::Guard, CallLog) {
+            let log: CallLog = Rc::new(RefCell::new(Vec::new()));
+            let seen = log.clone();
+            let guard = swap_seam::install(move |src: &Path, dst: &Path| {
+                seen.borrow_mut().push((src.to_path_buf(), dst.to_path_buf()));
+                std::fs::rename(src, dst)
+            });
+            (guard, log)
+        }
+
+        /// Runs `f` with the pack env (pack dir, config dir, capture root) pointed at `pd` and its siblings.
+        fn with_pack<T>(pd: &Path, f: impl FnOnce() -> T) -> T {
+            let base = pd.parent().unwrap();
+            let _env = set_pack_env(pd, base.join("claude"));
+            let _cap = EnvGuard::set("CYS_PACK_CAPTURES_DIR", base.join("captures"));
+            let _loc = EnvGuard::remove("CYS_LOCAL_DIR");
+            f()
+        }
+
+        /// The state an older release leaves at the env's pack dir: a first install (staged, published), then an older
+        /// `.pack-version`; six unedited system files spread over the item order whose recorded vendor base (manifest +
+        /// `.pristine`) is an older vendor text that is still on disk (→ rewritten); the boot-critical listed file with an
+        /// older vendor base and the user's edit (→ vendor-first); the user-owned `agents.json` edited (→ kept); one
+        /// embedded file missing (→ re-created); a retired tool the manifest still lists, unedited (→ pruned); a file of
+        /// the user's own that no manifest lists (→ untouched). Returns the six rewritten files and the missing one.
+        fn older_pack(pd: &Path) -> (Vec<&'static str>, &'static str) {
+            crate::pack::install_staged(false, None, false).unwrap();
+            assert!(boot_critical_rel(LISTED), "premise: {LISTED} is on the compiled boot-critical list");
+            assert!(is_user_owned(USER_OWNED), "premise: {USER_OWNED} is user-owned");
+            std::fs::write(pd.join(PACK_VERSION_FILE), "0.1.0").unwrap();
+            let mpath = pd.join(INSTALL_MANIFEST);
+            let mut m: BTreeMap<String, String> =
+                serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+            let mut set_base = |rel: &str, old: &str| {
+                m.insert(rel.to_string(), content_hash(old));
+                let p = pd.join(PRISTINE_DIR).join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, old).unwrap();
+            };
+            let sys: Vec<&'static str> = PACK_ALL
+                .iter()
+                .map(|(r, _)| *r)
+                .filter(|r| {
+                    r.contains('/')
+                        && ownership_name_scoped(r, pd) == "system"
+                        && !system_locked(r)
+                        && !boot_critical_rel(r)
+                })
+                .collect();
+            assert!(sys.len() >= 12, "premise: enough unlisted system files ({})", sys.len());
+            let updates: Vec<&'static str> = (0..6).map(|i| sys[i * (sys.len() - 1) / 5]).collect();
+            for rel in &updates {
+                let old = format!("# older vendor bytes of {rel}\n");
+                std::fs::write(pd.join(rel), &old).unwrap();
+                set_base(rel, &old);
+            }
+            set_base(LISTED, "# older vendor bytes of the boot-critical file\n");
+            let missing = sys[sys.len() / 2 + 1];
+            assert!(!updates.contains(&missing));
+            drop(set_base);
+            std::fs::write(pd.join(LISTED), USER_BOOT).unwrap();
+            std::fs::write(pd.join(USER_OWNED), USER_AGENTS).unwrap();
+            std::fs::remove_file(pd.join(missing)).unwrap();
+            let retired = "# a tool an older release shipped\n";
+            std::fs::write(pd.join(RETIRED), retired).unwrap();
+            m.insert(RETIRED.to_string(), content_hash(retired));
+            write_tree(pd, &[(MINE, "my own notes\n")]);
+            std::fs::write(&mpath, serde_json::to_string(&m).unwrap()).unwrap();
+            (updates, missing)
+        }
+
+        /// What the update rules must have produced from [`older_pack`] (the end state of one complete run).
+        fn assert_updated(pd: &Path, updates: &[&str], missing: &str) {
+            for rel in updates {
+                assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), embed_of(rel), "{rel} rewritten");
+            }
+            assert_eq!(std::fs::read_to_string(pd.join(LISTED)).unwrap(), embed_of(LISTED), "vendor-first: vendor bytes live");
+            assert_eq!(
+                std::fs::read_to_string(pd.join(format!("{LISTED}.user"))).unwrap(),
+                USER_BOOT,
+                "vendor-first: the user's bytes parked in <rel>.user"
+            );
+            assert_eq!(
+                load_merge_pending(pd).get(LISTED).and_then(|e| e["kind"].as_str()),
+                Some("vendor-first"),
+                "vendor-first: the record"
+            );
+            assert_eq!(std::fs::read_to_string(pd.join(USER_OWNED)).unwrap(), USER_AGENTS, "user-owned edit kept");
+            assert_eq!(std::fs::read_to_string(pd.join(missing)).unwrap(), embed_of(missing), "missing file re-created");
+            assert!(!pd.join(RETIRED).exists(), "retired unedited tool pruned");
+            assert_eq!(std::fs::read_to_string(pd.join(MINE)).unwrap(), "my own notes\n", "the user's own file untouched");
+            assert_eq!(
+                std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap().trim(),
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+
+        /// GH1 / GH2: `cys init-pack` on an EXISTING pack updates it in place — the swap's seam records ZERO folder
+        /// renames (so none touches the pack or `pack.prev`), a `pack.prev` left by an older version stays byte-identical,
+        /// no staging is left, and the update rules meet every user edit (the listed file parked vendor-first, the
+        /// user-owned file kept). On d01d9188 the staged swap renamed the pack and replaced `pack.prev`.
+        #[test]
+        fn existing_pack_is_updated_in_place_with_no_folder_rename() {
+            let _g = PACK_ENV_LOCK.lock().unwrap();
+            let base = scratch("inplace");
+            let pd = base.join("pack");
+            with_pack(&pd, || {
+                let (updates, missing) = older_pack(&pd);
+                let prev = pack_prev_dir(&pd);
+                write_tree(
+                    &prev,
+                    &[(LISTED, "# the only copy of an edit an older failed update displaced\n"), (".pack-version", "0.14.56\n")],
+                );
+                let m_prev = manifest(&prev);
+
+                let (seam, log) = counting();
+                let r = crate::pack::install_staged(false, None, false);
+                drop(seam);
+
+                r.expect("in-place update of an existing pack");
+                assert!(log.borrow().is_empty(), "GH2: no folder rename for an existing pack: {:?}", log.borrow());
+                assert_eq!(manifest(&prev), m_prev, "GH2: a pre-existing pack.prev is byte-identical");
+                let left: Vec<String> =
+                    entries(&base).into_iter().filter(|n| n.starts_with(".pack-staging")).collect();
+                assert!(left.is_empty(), "no staging: {left:?}");
+                assert_updated(&pd, &updates, missing);
+            });
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// GH2 / GH4: an update of an existing pack is per file, not all-or-nothing. A run stopped part-way (the stop is
+        /// the run's own failure exit — the first file of a folder cannot be created, the same `?` a held file takes on
+        /// Windows) has updated exactly the files before that point, deleted nothing and left `.pack-version` old (so the
+        /// daemon's install gate stays open); the next run completes it, and the final tree equals one uninterrupted run
+        /// — for stops at several points of the item order. On d01d9188 a stopped staged run changed nothing in the pack.
+        #[test]
+        fn interrupted_in_place_run_is_completed_by_the_next() {
+            let _g = PACK_ENV_LOCK.lock().unwrap();
+            let base = scratch("interrupt");
+            let input = base.join("input").join("pack");
+            let (updates, missing) = with_pack(&input, || older_pack(&input));
+            let input_paths: Vec<String> = manifest(&input).into_keys().collect();
+            let pos = |rel: &str| PACK_ALL.iter().position(|(r, _)| *r == rel).unwrap();
+
+            let reference = base.join("reference").join("pack");
+            copy_dir_all(&input, &reference).unwrap();
+            with_pack(&reference, || crate::pack::install_staged(false, None, false)).expect("uninterrupted run");
+            assert_updated(&reference, &updates, missing);
+            let want = tree(&reference);
+
+            for (k, stop_at) in updates.iter().enumerate().skip(1) {
+                let folder = Path::new(stop_at).parent().unwrap().to_string_lossy().replace('\\', "/");
+                let first = PACK_ALL
+                    .iter()
+                    .position(|(r, _)| r.starts_with(&format!("{folder}/")))
+                    .unwrap();
+                let pd = base.join(format!("stop-{k}")).join("pack");
+                copy_dir_all(&input, &pd).unwrap();
+                // The stop: the folder is moved out of the pack and a plain file takes its name.
+                let aside = base.join(format!("aside-{k}"));
+                std::fs::rename(pd.join(&folder), &aside).unwrap();
+                std::fs::write(pd.join(&folder), "obstacle\n").unwrap();
+                let r = with_pack(&pd, || crate::pack::install_staged(false, None, false));
+                let err = r.expect_err("the run stops at the first file of the blocked folder");
+                assert!(err.contains("cannot create"), "[{folder}] {err}");
+                std::fs::remove_file(pd.join(&folder)).unwrap();
+                std::fs::rename(&aside, pd.join(&folder)).unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap().trim(),
+                    "0.1.0",
+                    "[{folder}] .pack-version not advanced by a stopped run"
+                );
+                for rel in &updates {
+                    let now = std::fs::read_to_string(pd.join(rel)).unwrap();
+                    if pos(rel) < first {
+                        assert_eq!(now, embed_of(rel), "[{folder}] {rel} before the stop is updated (in place)");
+                    } else {
+                        assert_eq!(now, format!("# older vendor bytes of {rel}\n"), "[{folder}] {rel} after the stop untouched");
+                    }
+                }
+                for p in &input_paths {
+                    assert!(std::fs::symlink_metadata(pd.join(p)).is_ok(), "[{folder}] nothing deleted by a stopped run: {p}");
+                }
+                with_pack(&pd, || crate::pack::install_staged(false, None, false)).expect("the next run completes it");
+                assert_eq!(tree(&pd), want, "[{folder}] stopped + completed = one uninterrupted run");
+            }
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// GH3 (1): for the same input, the in-place result equals the old staged result file for file. The old staged
+        /// pass (d01d9188 `install_staged` ①–③) is reproduced here — copy of the pack, the per-file install on the copy
+        /// with the staged arguments (no authorisation, no config set-up, the pack's capture lane, the pack's sources),
+        /// the presence check — and its staging tree (what the swap published) is compared with the in-place tree.
+        #[test]
+        fn in_place_result_equals_the_old_staged_result() {
+            let _g = PACK_ENV_LOCK.lock().unwrap();
+            let base = scratch("equal");
+            let input = base.join("input").join("pack");
+            let (updates, missing) = with_pack(&input, || older_pack(&input));
+
+            let staged_pack = base.join("staged").join("pack");
+            copy_dir_all(&input, &staged_pack).unwrap();
+            let staging = base.join("staged").join(".pack-staging-init-old");
+            with_pack(&staged_pack, || {
+                copy_dir_all(&staged_pack, &staging).unwrap();
+                let items: Vec<(&str, &str)> = PACK_ALL.iter().map(|(r, c)| (*r, *c)).collect();
+                let sources = UpdateSources::for_live_pack(&staged_pack);
+                install_into_with(
+                    staging.clone(),
+                    items.iter().copied(),
+                    false,
+                    env!("CARGO_PKG_VERSION"),
+                    false,
+                    false,
+                    pack_scope_of(&staged_pack),
+                    None,
+                    Some("pack"),
+                    &sources,
+                )
+                .unwrap();
+                verify_staging_with(&staging, &items, &sources.authorised_absent()).unwrap();
+            });
+
+            let in_place = base.join("inplace").join("pack");
+            copy_dir_all(&input, &in_place).unwrap();
+            with_pack(&in_place, || crate::pack::install_staged(false, None, false)).expect("in place");
+            assert_updated(&in_place, &updates, missing);
+            assert_eq!(tree(&in_place), tree(&staging), "in-place tree = old staged tree, file for file");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// GH1: a first install (no pack folder) is staged and published by ONE rename staging → pack; no `pack.prev`.
+        #[test]
+        fn first_install_is_published_by_one_rename() {
+            let _g = PACK_ENV_LOCK.lock().unwrap();
+            let base = scratch("first");
+            let pd = base.join("pack");
+            with_pack(&pd, || {
+                let (seam, log) = counting();
+                let r = crate::pack::install_staged(false, None, false);
+                drop(seam);
+                r.expect("first install");
+                let log = log.borrow();
+                assert_eq!(log.len(), 1, "one folder rename: {log:?}");
+                assert!(
+                    log[0].0.file_name().unwrap().to_string_lossy().starts_with(".pack-staging-init-") && log[0].1 == pd,
+                    "staging → pack: {log:?}"
+                );
+                assert!(pd.join(PACK_VERSION_FILE).is_file());
+                assert!(!pack_prev_dir(&pd).exists(), "no pack.prev");
+            });
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// GN1 (S3): a first install whose publishing rename fails because someone else created the pack meanwhile (the
+        /// daemon's start install, another init-pack) copies NOTHING over it — it discards its staging and runs the
+        /// in-place branch on the pack that now exists, so every file there meets the update rules: a user's edits made
+        /// in it survive and are classified. On 4c75b42e the copy fallback overwrote them with the staging's bytes.
+        #[test]
+        fn first_install_meeting_a_pack_created_meanwhile_copies_nothing_over_it() {
+            let _g = PACK_ENV_LOCK.lock().unwrap();
+            let base = scratch("raced");
+            let pd = base.join("pack");
+            with_pack(&pd, || {
+                let user_boot = "# edited in the pack another installer created\n";
+                let target = pd.clone();
+                let log: CallLog = Rc::new(RefCell::new(Vec::new()));
+                let seen = log.clone();
+                let seam = swap_seam::install(move |src: &Path, dst: &Path| {
+                    seen.borrow_mut().push((src.to_path_buf(), dst.to_path_buf()));
+                    if dst == target && std::fs::symlink_metadata(dst).is_err() {
+                        // Between the absence check and the rename: another installer publishes the pack in place,
+                        // and the user edits two files in it.
+                        crate::pack::install(false, None).unwrap();
+                        std::fs::write(dst.join(USER_OWNED), USER_AGENTS).unwrap();
+                        std::fs::write(dst.join(LISTED), user_boot).unwrap();
+                    }
+                    std::fs::rename(src, dst)
+                });
+                let r = crate::pack::install_staged(false, None, false);
+                drop(seam);
+                r.expect("the raced first install ends as an in-place update of the pack that now exists");
+                assert_eq!(std::fs::read_to_string(pd.join(USER_OWNED)).unwrap(), USER_AGENTS, "user-owned edit survives");
+                assert_eq!(std::fs::read_to_string(pd.join(LISTED)).unwrap(), user_boot, "listed edit survives");
+                assert_eq!(
+                    load_merge_pending(&pd).get(LISTED).and_then(|e| e["kind"].as_str()),
+                    Some("kept-drift"),
+                    "the listed edit met the update rules (vendor not advanced → kept in place, recorded)"
+                );
+                assert_eq!(log.borrow().len(), 1, "one publishing rename attempt, nothing else: {:?}", log.borrow());
+                let left: Vec<String> =
+                    entries(&base).into_iter().filter(|n| n.starts_with(".pack-staging")).collect();
+                assert!(left.is_empty(), "the staging was discarded: {left:?}");
+                assert!(!pack_prev_dir(&pd).exists());
+            });
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// GN1: the copy fallback (a cross-device staging) onto a destination that is still absent still publishes.
+        #[test]
+        fn first_install_cross_device_fallback_onto_an_absent_pack_still_publishes() {
+            let _g = PACK_ENV_LOCK.lock().unwrap();
+            let base = scratch("xdev");
+            let pd = base.join("pack");
+            with_pack(&pd, || {
+                let target = pd.clone();
+                let seam = swap_seam::install(move |src: &Path, dst: &Path| {
+                    if dst == target {
+                        return Err(std::io::Error::other("Invalid cross-device link (os error 18 — injected)"));
+                    }
+                    std::fs::rename(src, dst)
+                });
+                let r = crate::pack::install_staged(false, None, false);
+                drop(seam);
+                r.expect("the copy fallback publishes onto an absent pack");
+                for (rel, content) in PACK_ALL.iter().take(40) {
+                    assert_eq!(std::fs::read(pd.join(rel)).unwrap(), content.as_bytes(), "{rel}");
+                }
+                assert_eq!(
+                    std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap().trim(),
+                    env!("CARGO_PKG_VERSION")
+                );
+                let left: Vec<String> =
+                    entries(&base).into_iter().filter(|n| n.starts_with(".pack-staging")).collect();
+                assert!(left.is_empty(), "the staging was consumed: {left:?}");
+            });
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// GN1: the copy creates every folder and file exclusively — onto an existing destination it stops at once
+        /// with `AlreadyExists` and replaces nothing. On 4c75b42e it overwrote the existing file.
+        #[test]
+        fn the_publish_copy_never_replaces_an_existing_file() {
+            let base = scratch("excl");
+            let src = base.join("src");
+            let dst = base.join("dst");
+            write_tree(&src, &[("agents.json", "{\"vendor\":1}"), ("bin/x.py", "x")]);
+            write_tree(&dst, &[("agents.json", "{\"user\":1}")]);
+            let err = copy_dir_all(&src, &dst).expect_err("an existing destination stops the copy");
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+            assert_eq!(std::fs::read_to_string(dst.join("agents.json")).unwrap(), "{\"user\":1}", "nothing replaced");
+            assert!(!dst.join("bin").exists(), "nothing copied");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        // ─── GN2 — M1, M2, M3: MEASURED properties of the shared per-file install (`install_into_with` — the daemon's
+        // start install runs it in place at every update). OUT of T9a's scope (GN0); each test records the state after
+        // the sequence, after ONE further install and after ONE further version (printed with `[M#]`), and asserts only
+        // the safe outcome it measured: no user byte lost (live, parked or captured). What is not safe-but-wanted (a
+        // lost record, a vendor change not applied) is described in the report, not pinned here.
+
+        fn m_install(pd: &Path, items: &[(&str, &str)], version: &str, src: &UpdateSources) {
+            install_into_with(
+                pd.to_path_buf(), items.iter().copied(), false, version, false, false, PackScope::Base, None, None, src,
+            )
+            .unwrap();
+        }
+
+        fn read_opt(p: &Path) -> Option<String> {
+            std::fs::read_to_string(p).ok()
+        }
+
+        fn ledger_kind(pd: &Path, rel: &str) -> Option<String> {
+            load_merge_pending(pd).get(rel).and_then(|e| e["kind"].as_str()).map(str::to_string)
+        }
+
+        fn manifest_hash_of(pd: &Path, rel: &str) -> Option<String> {
+            let m: BTreeMap<String, String> =
+                serde_json::from_str(&std::fs::read_to_string(pd.join(INSTALL_MANIFEST)).ok()?).ok()?;
+            m.get(rel).cloned()
+        }
+
+        /// M1: a stop between a merge's writes (the merged bytes on disk, `.pristine` advanced) and its record (ledger
+        /// entry, manifest, `.pack-version` — saved after the loop). The stop is reproduced by putting the record files
+        /// back as they were before the run (what a stop at that point leaves).
+        #[test]
+        fn m1_stop_between_a_merge_write_and_its_record_loses_no_user_byte() {
+            let _g = PACK_ENV_LOCK.lock().unwrap();
+            let base = scratch("m1");
+            let pd = base.join("pack");
+            std::fs::create_dir_all(&pd).unwrap();
+            let cap_root = base.join("captures");
+            let _cap = EnvGuard::set("CYS_PACK_CAPTURES_DIR", &cap_root);
+            let src = UpdateSources::none();
+            let rel = "skills/m1/SKILL.md";
+            let e0 = "head-old\ncommon body\n";
+            let e1 = "head-new\ncommon body\n";
+            let e2 = "head-v2\ncommon body\n";
+            let ours = "head-old\ncommon body\nuser-tail-delta\n";
+            let merged = "head-new\ncommon body\nuser-tail-delta\n";
+            m_install(&pd, &[(rel, e0)], "1.0.0", &src);
+            std::fs::write(pd.join(rel), ours).unwrap();
+            let record = [INSTALL_MANIFEST, MERGE_PENDING_FILE, PACK_VERSION_FILE];
+            let before: Vec<Option<Vec<u8>>> = record.iter().map(|f| std::fs::read(pd.join(f)).ok()).collect();
+            m_install(&pd, &[(rel, e1)], "1.1.0", &src);
+            assert_eq!(read_opt(&pd.join(rel)).as_deref(), Some(merged), "premise: a clean merge");
+            for (f, b) in record.iter().zip(&before) {
+                match b {
+                    Some(bytes) => std::fs::write(pd.join(f), bytes).unwrap(),
+                    None => {
+                        let _ = std::fs::remove_file(pd.join(f));
+                    }
+                }
+            }
+            let state = |stage: &str| {
+                eprintln!(
+                    "[M1] {stage}: disk={:?} .new={:?} .user={:?} pristine={:?} manifest_is_e0={} manifest_is_e1={} \
+                     manifest_is_e2={} ledger={:?} capture={:?}",
+                    read_opt(&pd.join(rel)),
+                    read_opt(&pd.join(format!("{rel}.new"))),
+                    read_opt(&pd.join(format!("{rel}.user"))),
+                    read_opt(&pd.join(PRISTINE_DIR).join(rel)),
+                    manifest_hash_of(&pd, rel) == Some(content_hash(e0)),
+                    manifest_hash_of(&pd, rel) == Some(content_hash(e1)),
+                    manifest_hash_of(&pd, rel) == Some(content_hash(e2)),
+                    ledger_kind(&pd, rel),
+                    find_capture(&cap_root, rel),
+                );
+                let live_or_parked = [rel.to_string(), format!("{rel}.user")]
+                    .iter()
+                    .any(|r| read_opt(&pd.join(r)).is_some_and(|s| s.contains("user-tail-delta")));
+                assert!(live_or_parked, "[M1 {stage}] the user's change is live or parked");
+                assert_eq!(find_capture(&cap_root, rel).as_deref(), Some(ours), "[M1 {stage}] pre-merge bytes captured");
+            };
+            state("after the stop");
+            m_install(&pd, &[(rel, e1)], "1.1.0", &src);
+            state("after one further install");
+            m_install(&pd, &[(rel, e2)], "1.2.0", &src);
+            state("after one further version");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// M2: two installers with a stale pending map. A parks the user's copy of a boot-critical file (vendor-first)
+        /// and records it; B loaded the ledger (and manifest) before A saved them, sees the vendor bytes A wrote, and
+        /// saves its own map because another edited file dirtied it. The interleaving is reproduced by running B on
+        /// A's files with the ledger and manifest put back as B loaded them.
+        #[test]
+        fn m2_a_stale_pending_map_keeps_the_parked_user_copy() {
+            let _g = PACK_ENV_LOCK.lock().unwrap();
+            let base = scratch("m2");
+            let pd = base.join("pack");
+            std::fs::create_dir_all(&pd).unwrap();
+            let _cap = EnvGuard::set("CYS_PACK_CAPTURES_DIR", base.join("captures"));
+            let x = "bin/m2-boot.py";
+            let y = "skills/m2/y.md";
+            let src = UpdateSources::none().with_boot_critical(move |r: &str| r == x);
+            let (x0, x1, x2, y0) = ("# x vendor 0\n", "# x vendor 1\n", "# x vendor 2\n", "y vendor 0\n");
+            let (ux, uy) = ("# x: the user's repair\n", "y: the user's edit\n");
+            m_install(&pd, &[(x, x0), (y, y0)], "1.0.0", &src);
+            std::fs::write(pd.join(x), ux).unwrap();
+            std::fs::write(pd.join(y), uy).unwrap();
+            let stale: Vec<Option<Vec<u8>>> =
+                [INSTALL_MANIFEST, MERGE_PENDING_FILE].iter().map(|f| std::fs::read(pd.join(f)).ok()).collect();
+            m_install(&pd, &[(x, x1), (y, y0)], "1.1.0", &src); // A
+            assert_eq!(ledger_kind(&pd, x).as_deref(), Some("vendor-first"), "premise: A parked and recorded");
+            for (f, b) in [INSTALL_MANIFEST, MERGE_PENDING_FILE].iter().zip(&stale) {
+                match b {
+                    Some(bytes) => std::fs::write(pd.join(f), bytes).unwrap(),
+                    None => {
+                        let _ = std::fs::remove_file(pd.join(f));
+                    }
+                }
+            }
+            m_install(&pd, &[(x, x1), (y, y0)], "1.1.0", &src); // B
+            let state = |stage: &str| {
+                eprintln!(
+                    "[M2] {stage}: x={:?} x.user={:?} ledger(x)={:?} y={:?} ledger(y)={:?}",
+                    read_opt(&pd.join(x)),
+                    read_opt(&pd.join(format!("{x}.user"))),
+                    ledger_kind(&pd, x),
+                    read_opt(&pd.join(y)),
+                    ledger_kind(&pd, y),
+                );
+                assert_eq!(read_opt(&pd.join(format!("{x}.user"))).as_deref(), Some(ux), "[M2 {stage}] parked copy on disk");
+                assert_eq!(read_opt(&pd.join(y)).as_deref(), Some(uy), "[M2 {stage}] the other edit kept");
+            };
+            state("after the interleaving");
+            m_install(&pd, &[(x, x1), (y, y0)], "1.1.0", &src);
+            state("after one further install");
+            m_install(&pd, &[(x, x2), (y, y0)], "1.2.0", &src);
+            state("after one further version");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// M3: a refused manifest write (Windows: a reader holds `.install-manifest.json`). The non-transactional install
+        /// ignores it ("best effort … the next decision falls to PRESERVE") and still writes `.pack-version`. Reproduced by
+        /// putting the manifest back as it was before the run. Then the user edits another updated file. Measured: one
+        /// further install at the same version (what `cys init-pack` does — the daemon's gate is closed); one further
+        /// version from that state (the daemon's path, no init-pack in between). The stale-entry rule reads this binary's
+        /// static past-release table, which never lists the bytes this binary itself shipped — so the "next version" leg
+        /// here measures the case where the next binary's table does not know them; the case where it does (`Repaired` →
+        /// normal update) is the pure branch pinned by `c07_classify_stale_entry_six_branches`.
+        #[test]
+        fn m3_a_refused_manifest_write_preserves_or_converges() {
+            let _g = PACK_ENV_LOCK.lock().unwrap();
+            let base = scratch("m3");
+            let pd = base.join("pack");
+            std::fs::create_dir_all(&pd).unwrap();
+            let _cap = EnvGuard::set("CYS_PACK_CAPTURES_DIR", base.join("captures"));
+            let src = UpdateSources::none();
+            let (a, b) = ("skills/m3/a.md", "skills/m3/b.md");
+            let (a0, a1, a2, b0, b1, b2) = ("a0\n", "a1\n", "a2\n", "b0\n", "b1\n", "b2\n");
+            let ub = "b: the user's edit after the update\n";
+            m_install(&pd, &[(a, a0), (b, b0)], "1.0.0", &src);
+            let manifest_before = std::fs::read(pd.join(INSTALL_MANIFEST)).unwrap();
+            m_install(&pd, &[(a, a1), (b, b1)], "1.1.0", &src);
+            std::fs::write(pd.join(INSTALL_MANIFEST), &manifest_before).unwrap(); // the refused write
+            assert!(pack_current_in(&pd, "1.1.0"), "measured: the daemon's install gate is closed after the refusal");
+            std::fs::write(pd.join(b), ub).unwrap();
+            let after_stop = base.join("after-stop");
+            copy_dir_all(&pd, &after_stop).unwrap();
+            let state = |pd: &Path, stage: &str| {
+                eprintln!(
+                    "[M3] {stage}: a={:?} b={:?} b.new={:?} b.user={:?} manifest(a)=a0:{}/a1:{}/a2:{} ledger(b)={:?}",
+                    read_opt(&pd.join(a)),
+                    read_opt(&pd.join(b)),
+                    read_opt(&pd.join(format!("{b}.new"))),
+                    read_opt(&pd.join(format!("{b}.user"))),
+                    manifest_hash_of(pd, a) == Some(content_hash(a0)),
+                    manifest_hash_of(pd, a) == Some(content_hash(a1)),
+                    manifest_hash_of(pd, a) == Some(content_hash(a2)),
+                    ledger_kind(pd, b),
+                );
+                let kept = [b.to_string(), format!("{b}.user")].iter().any(|r| read_opt(&pd.join(r)).as_deref() == Some(ub));
+                assert!(kept, "[M3 {stage}] the user's edit is live or parked");
+            };
+            state(&pd, "after the refused write");
+            m_install(&pd, &[(a, a1), (b, b1)], "1.1.0", &src);
+            state(&pd, "after one further install");
+            let next = base.join("next-version");
+            copy_dir_all(&after_stop, &next).unwrap();
+            m_install(&next, &[(a, a2), (b, b2)], "1.2.0", &src);
+            state(&next, "after one further version (from the refused state)");
+            assert!(
+                [Some(a1), Some(a2)].contains(&read_opt(&next.join(a)).as_deref()),
+                "[M3] the unedited file holds a vendor text (kept in place or updated) — nothing else written over it"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// GH1: the swap refuses a destination that exists — nothing is renamed, moved or deleted (the pack, a
+        /// `pack.prev` and the staging stay byte-identical). On d01d9188 it moved the pack to `pack.prev` and published.
+        #[test]
+        fn swap_refuses_an_existing_destination() {
+            let base = scratch("refuse");
+            let dir = base.join("pack");
+            let prev = pack_prev_dir(&dir);
+            let staging = base.join(".pack-staging-init-t9a");
+            write_tree(&dir, &[("agents.json", "{\"u\":1}"), ("bin/javis_bootstrap.py", "# user\n")]);
+            write_tree(&prev, &[("old.txt", "older generation")]);
+            write_tree(&staging, &[("bin/javis_bootstrap.py", "# vendor\n")]);
+            let (m_dir, m_prev, m_staging) = (manifest(&dir), manifest(&prev), manifest(&staging));
+            let (seam, log) = counting();
+            let r = atomic_swap(&dir, &staging);
+            drop(seam);
+            assert!(r.is_err(), "an existing destination is refused: {r:?}");
+            assert!(log.borrow().is_empty(), "no rename: {:?}", log.borrow());
+            assert_eq!((manifest(&dir), manifest(&prev), manifest(&staging)), (m_dir, m_prev, m_staging));
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
     /// 검증 실패 = 임베드 파일 누락 시 Err(교체 전 차단 방어선).
     #[test]
     fn verify_staging_detects_missing_file() {
@@ -12400,9 +13202,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// 신설 → written>0·임베드 반영·.prev 부재. 멱등 재설치 → written=0·pack 온전·.prev 1세대 생성.
+    /// 신설 → written>0·임베드 반영·.prev 부재. 멱등 재설치 → written=0·pack 온전.
+    /// ★T9a (RULINGS GH1) 재작성(종전 이름 `install_staged_fresh_then_idempotent_with_prev`, 종전 단언 "재설치는 .prev 1세대
+    /// 보존"): 재설치는 있는 팩의 제자리 갱신이라 .prev 를 만들지 않는다.
     #[test]
-    fn install_staged_fresh_then_idempotent_with_prev() {
+    fn install_staged_fresh_then_idempotent_in_place() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
         let base = std::env::temp_dir().join(format!("cys-staged-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -12419,7 +13223,7 @@ mod tests {
 
         let (w2, _k2) = install_staged(false, None).unwrap();
         assert_eq!(w2, 0, "멱등 재설치 written=0");
-        assert!(pack_prev_dir(&pd).exists(), "재설치는 .prev 1세대 보존");
+        assert!(!pack_prev_dir(&pd).exists(), "재설치는 제자리 갱신 — .prev 를 만들지 않는다(T9a GH1)");
         assert!(pd.join(rel0).is_file(), "재설치 후 임베드 온전");
 
         let _ = std::fs::remove_dir_all(&base);
