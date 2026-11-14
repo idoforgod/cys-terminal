@@ -2376,6 +2376,10 @@ pub struct ApplyIntent {
     /// undo ever puts bytes back across a different generation.
     #[serde(default)]
     pub pack_generation: Option<PackGeneration>,
+    /// EN8 / EL5: the reference of the approval this apply uses — the durable evidence that it was
+    /// CONSUMED (`consumed::approval_consumed`), written before the first exchange.
+    #[serde(default)]
+    pub approval_ref: Option<String>,
     pub created_at: f64,
     pub updated_at: f64,
 }
@@ -2776,6 +2780,7 @@ pub fn apply_candidate_in(
             .collect(),
         note: String::new(),
         pack_generation: apply_bound.known(),
+        approval_ref: Some(approval.request_id.clone()),
         created_at: env.now,
         updated_at: env.now,
     };

@@ -11,6 +11,7 @@
 
 pub mod apply;
 pub mod boot_critical;
+pub mod consumed;
 pub mod durable;
 pub mod exchange;
 pub mod grant;
