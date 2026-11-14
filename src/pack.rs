@@ -6303,10 +6303,47 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The rename every move of the pack swap goes through ([`atomic_swap_with`]). Production passes `std::fs::rename`;
+/// tests install a refusing one through [`swap_seam`] (RULINGS FS5).
+type SwapRename = dyn Fn(&Path, &Path) -> std::io::Result<()>;
+
+/// Test-only seam for [`atomic_swap`] (RULINGS FS5): a rename installed here replaces `std::fs::rename` for every move
+/// of the swap on THIS thread until the guard drops — so a test can drive the real `install_staged` → `atomic_swap`
+/// path with a refused rename. Thread-local: parallel tests never see each other's seam.
+#[cfg(test)]
+mod swap_seam {
+    use std::cell::RefCell;
+    use std::path::Path;
+    use std::rc::Rc;
+
+    thread_local! {
+        static RENAME: RefCell<Option<Rc<super::SwapRename>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn current() -> Option<Rc<super::SwapRename>> {
+        RENAME.with(|r| r.borrow().clone())
+    }
+
+    /// Removes the installed rename when dropped (also on panic unwinding).
+    pub(super) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            RENAME.with(|r| *r.borrow_mut() = None);
+        }
+    }
+
+    #[must_use]
+    pub(super) fn install(rename: impl Fn(&Path, &Path) -> std::io::Result<()> + 'static) -> Guard {
+        RENAME.with(|r| *r.borrow_mut() = Some(Rc::new(rename)));
+        Guard
+    }
+}
+
 /// cross-device 대비 rename(§3.1-5) — 같은 볼륨이면 원자 rename, 실패 시 copy 후 원본 삭제
 /// fallback(EXDEV 등). staging은 pack_dir 형제라 정상 경로는 원자 rename이다(Windows도 동일 볼륨 전제).
-fn rename_dir_or_move(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if std::fs::rename(src, dst).is_ok() {
+fn rename_dir_or_move(src: &Path, dst: &Path, rename: &SwapRename) -> std::io::Result<()> {
+    if rename(src, dst).is_ok() {
         return Ok(());
     }
     // rename 불가(cross-device 등) — copy 후 원본 삭제 fallback(src 부재면 여기서 loud Err).
@@ -6323,21 +6360,31 @@ fn rename_dir_or_move(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// 상주 데몬이 그 창에 팩을 읽으면 일시적 not-found가 날 수 있으므로, 라이브 교체는 이 전제를
 /// 지키는 호출자 책임이다(코드 변경 불요·전제 고지).
 pub fn atomic_swap(dir: &Path, staging: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(rename) = swap_seam::current() {
+        return atomic_swap_with(dir, staging, &*rename);
+    }
+    atomic_swap_with(dir, staging, &|src: &Path, dst: &Path| std::fs::rename(src, dst))
+}
+
+/// [`atomic_swap`] with the rename it uses for every move — the test seam of RULINGS FS5 (the real refusal, a file
+/// held open on Windows, os error 32, cannot be produced on macOS/Linux, where a folder with open files renames fine).
+fn atomic_swap_with(dir: &Path, staging: &Path, rename: &SwapRename) -> Result<(), String> {
     let prev = pack_prev_dir(dir);
     // 직전 세대 정리(1세대 보존).
     let _ = std::fs::remove_dir_all(&prev);
     let had_old = dir.exists();
     if had_old {
-        rename_dir_or_move(dir, &prev)
+        rename_dir_or_move(dir, &prev, rename)
             .map_err(|e| format!("pack_dir→prev rename 실패(교체 안 함): {e}"))?;
     }
-    match rename_dir_or_move(staging, dir) {
+    match rename_dir_or_move(staging, dir, rename) {
         Ok(()) => Ok(()),
         Err(e) => {
             // 역rename 복구: (실패한 fallback이 만든 부분/빈 dir 정리 후) prev→pack_dir 복원.
             if had_old {
                 let _ = std::fs::remove_dir_all(dir);
-                let _ = rename_dir_or_move(&prev, dir);
+                let _ = rename_dir_or_move(&prev, dir, rename);
             }
             Err(format!("staging→pack_dir rename 실패(pre-state 복구 시도): {e}"))
         }
