@@ -725,22 +725,16 @@ for _role in _ROLE_CONST:  # every role key, incl. the longest fallback name rev
     check("23a %s: 블록이 읽기 안내 뒤·지침 본문 앞에 상수 그대로 실린다 · exit 0" % _role,
           code == 0 and 0 <= _ig < _ib < _id and out.count("■ 「스스로 해결」") == 1,
           "ig=%d ib=%d id=%d" % (_ig, _ib, _id))
-    # 23b — O-C6-6 상한: 머리줄 + 읽기 안내 줄 + 블록 < 1,800자(경로 두 개는 보통 설치 길이로 정규화 — 상한의
-    #   200자 여유가 역할 이름·경로 변동 몫이다), 그리고 실제 출력에서 블록 끝이 앞 2,000자 안이다.
+    # 23b — O-C6-6 상한, ★T1d(RULINGS CX2)부터 정규화 없이 **실제 출력**으로 잰다: 안내 줄은 경로를 싣지 않고(팩 기준 상대
+    #   이름만) 전체 경로는 블록 뒤로 갔으므로, 출력 첫 글자부터 블록 끝까지가 경로 길이와 무관하다 — 그 길이 < 1,800자.
+    #   (종전: 안내 줄의 두 경로를 "홈 23자 + 팩 안 경로" 길이로 바꿔 친 머리줄+안내 줄+블록 < 1,800 — 긴 경로를 놓쳤다.)
     _lines = out.split("\n")
-    _head = next((l for l in _lines if l.startswith("■ CYSJavis 역할 각성")), "")
     _guid = next((l for l in _lines if "Read 도구로 끝까지" in l), "")
-    _m = _re.search(r"지침 전문 (.+) 과 (.+) 를 Read 도구로", _guid)
-    #   정규화 길이 = 보통 설치의 두 경로 길이: 홈 폴더 23자(맥 홈 접두 7자 + 16자 사용자 이름) + 팩 안 경로.
-    _home_len = 23
-    _canon_len = (_home_len + len("/.cys/pack/directives/%s_DIRECTIVE.md" % _ROLE_BODY[_role].split("-")[-1])
-                  + _home_len + len("/.cys/pack/soul.md"))
-    _guid_norm = len(_guid) - (len(_m.group(1)) + len(_m.group(2)) if _m else 0) + _canon_len
-    _total = (len(_head) + 1) + (_guid_norm + 1) + len(_block(_role))
-    check("23b %s: 머리줄+안내 줄+블록 = %d자 < 1,800(정규화) · 블록 끝 %d ≤ 2,000(실측)"
-          % (_role, _total, _ib + len(_block(_role))),
-          bool(_head) and _m is not None and _total < 1800 and 0 <= _ib and _ib + len(_block(_role)) <= 2000,
-          "head=%r" % _head[:60])
+    _end = _ib + len(_block(_role)) if _ib >= 0 else -1
+    check("23b %s: 출력 처음~블록 끝 = %d자 < 1,800(실측 · 정규화 없음) · 안내 줄에 절대 경로 없음" % (_role, _end),
+          0 <= _ib and _end < 1800 and env["CYS_PACK_DIR"] not in _guid
+          and ("directives/%s_DIRECTIVE.md" % _ROLE_BODY[_role].split("-")[-1]) in _guid,
+          "guid=%r" % _guid[:200])
 # 23c — 호출 형태: `cys repair rules --role <역할>` · CYS_NO_AUTOSTART=1 안에서(부록 A-1 #17)
 _c = calls_of(tmp)
 check("23c-1 훅이 `cys repair rules --role <역할>` 을 부른다", "cys repair rules --role reviewer-codex" in _c, _c[-300:])
@@ -818,6 +812,191 @@ code, out, _ = run_hook(setup_rules(tmp, "crlf"), role="worker-2")
 shutil.rmtree(tmp)
 check("23f-2 CRLF 출력 cys → 훅 출력에 CR 0 · 블록은 실린다", code == 0 and "\r" not in out and _block("worker-2") in out,
       repr(out[:120]))
+
+# ── 24. ★(T1d · RULINGS CX2 + DQ1 · reviewer1 codex M1) 블록이 먼저 — 그 뒤에 무엇이 오든 ──
+#   닫힌 규칙: 지침을 주입하는 모든 길에서 출력은 머리줄 → 읽기 안내 → 역할 블록 전체로 **시작**하고, 고지(전부)와 경로 줄은 그 뒤다.
+#   제품이 받아들이는 가장 긴 팩 폴더(PATH_MAX − 팩 안 가장 긴 상대 경로 − 구분자·NUL)를 실제로 만들고, 훅이 낼 수 있는 고지의
+#   **모든 조합**(역할 복구·교정·레지스트리 이상 3종 동시·축 미확정 × 재대조 고지 × 작업 폴더 고지) × 새 설치 / 수동 clear 뒤의
+#   기존 설치(옛 지침 — 컴파일 블록 없음)에서 **출력 전체**로 잰다(길이 치환 없음).
+import json
+_PACK_SRC = os.path.normpath(os.path.join(SELF, "..", ".."))
+_LONGEST_REL = max((len(os.path.relpath(os.path.join(d, f), _PACK_SRC))
+                    for d, _, fs in os.walk(_PACK_SRC) if "__pycache__" not in d for f in fs), default=80)
+try:
+    _PATH_MAX = os.pathconf("/", "PC_PATH_MAX")
+except (AttributeError, OSError, ValueError):
+    _PATH_MAX = 260
+_PACK_MAX = _PATH_MAX - 2 - _LONGEST_REL  # '/' + NUL — a longer pack folder cannot hold the pack's longest file
+
+
+def _long_pack(base):
+    """base 아래에 길이가 정확히 _PACK_MAX 인 팩 폴더 경로를 만든다(구성요소 ≤ 200자 · ASCII)."""
+    p = base
+    while len(p) < _PACK_MAX:
+        p = os.path.join(p, "p" * min(200, _PACK_MAX - len(p) - 1))
+    os.makedirs(os.path.join(p, "directives"), exist_ok=True)
+    return p
+
+
+_R24 = dict(_ROLE_CONST, cso="RULES_CSO")
+_FILE_OF = {"master": "MASTER", "worker": "WORKER", "worker-2": "WORKER", "cso-1": "CSO", "cso": "CSO",
+            "reviewer-codex": "REVIEWER", "reviewer-claude-1": "REVIEWER"}
+# reclaim 응답(role, reason, env_role, detail) — "ROLE" 은 그 레그의 역할로 바뀐다.
+_RECLAIM = {"none": ("", "no_candidate", "unknown", ""),
+            "recovery": ("ROLE", "bound", "unknown", ""),
+            "correction": ("ROLE", "bound", "vacant", ""),
+            "anomalies": ("", "privileged_needs_optin", "vacant", "reported_cwd_conflict"),
+            "axes": ("", "caller_axes_unknown", "unknown", "")}
+_CLAIM = {"ok": "exit 0", "rc6": "exit 6", "dead": "echo 'connect error' >&2; exit 1"}
+_CWD_FMT = '■ 고지(작업 폴더): 이 좌석이 시작될 때 작업 폴더 %s 를 읽을 수 없었다(macOS 폴더 접근 권한 — 사람에게는 앱 화면 알림이 따로 뜬다). 그 폴더가 필요한 지시를 받으면 착수 전에 ls 로 지금 읽히는지 확인하고, 안 되면 그 지시의 회신에만 적어라 — 자발 보고·push 금지, 다른 폴더에 대신 저장 금지.'
+_FIXED = "■ 아래에 이 좌석에 대한 고지가 있다 — 미리보기에서 잘려 보이면 전체 출력(파일로 빠진 부분)에서 끝까지 읽어라."
+
+
+def _expected_notices(reclaim, claim, cwd, role, blocked):
+    want = []
+    if reclaim == "recovery":
+        want.append("■ 고지: 역할 자동 복구 — 이 좌석의 데몬 권위 역할은 '%s' 이다(env 유실 복구)." % role)
+    if reclaim == "correction":
+        want.append("■ 고지: 역할 교정 — env CYS_ROLE 은 '%s' 이지만 데몬 권위 역할은 '%s' 이다." % (_env_role_for(reclaim, role), role))
+    if reclaim == "anomalies":
+        if role not in ("master", "cso"):
+            want.append("■ 고지: 데몬 레지스트리에 이 좌석의 역할 등록이 없다(env CYS_ROLE=%s · 그 역할은 비어 있다)." % role)
+        want.append("■ 고지: 같은 계정·같은 폴더에 **특권 역할(master·cso)의 빈 좌석**이 있다.")
+        want.append("■ 고지: 이 세션이 신고한 폴더와 좌석의 실제 작업 폴더가 달라 자동 역할 복구를 건너뛴다.")
+    if reclaim == "axes":
+        want.append("■ 고지: 데몬이 이 좌석의 계정 dir·작업 디렉터리를 확정하지 못해 자동 역할 복구를 건너뛴다.")
+    if role in ("master", "cso"):
+        if claim == "rc6":
+            want.append("■ 고지: 발신 신원 미확정(pane 밖·세션 분리 실행) — 역할 재대조를 건너뛴다. 현행 각성 유지(fail-open).")
+        if claim in ("rc6", "dead"):
+            want.append("■ 고지: 역할 재확인 불가(데몬 미응답 — cys 밖 실행일 수 있음). 현행 각성 유지(fail-open).")
+    if cwd:
+        want.append(_CWD_FMT % blocked)
+    return want
+
+
+def _env_role_for(reclaim, role):
+    if reclaim == "recovery":
+        return ""
+    if reclaim == "correction":
+        return "worker" if not role.startswith("worker") else "reviewer-codex"
+    return role
+
+
+def setup_long(tmp, existing, reclaim, claim, role):
+    env = setup(tmp, "ok")
+    pack = _long_pack(os.path.join(tmp, "L"))
+    for name in ("MASTER", "WORKER", "CSO", "REVIEWER"):
+        if existing:
+            body = "# %s 절대지침 (0.14.56 의 사용자 소유 사본)\nDIRECTIVE-BODY-%s\n" % (name, name) + "옛 본문 줄\n" * 400
+        else:
+            body = open(os.path.join(_PACK_SRC, "directives", "%s_DIRECTIVE.md" % name), encoding="utf-8").read()
+            body += "\nDIRECTIVE-BODY-%s\n" % name
+        with open(os.path.join(pack, "directives", "%s_DIRECTIVE.md" % name), "w", encoding="utf-8", newline="\n") as f:
+            f.write(body)
+    with open(os.path.join(pack, "soul.md"), "w", encoding="utf-8", newline="\n") as f:
+        f.write("# soul\n")
+    with open(os.path.join(tmp, "block.txt"), "w", encoding="utf-8", newline="\n") as f:
+        f.write(_RR.get("RULES_COMMON", "") + _RR.get(_R24[role], ""))
+    r, why, er, det = _RECLAIM[reclaim]
+    rc_line = "printf 'role=%s\\nreason=%s\\nenv_role=%s\\ndetail=%s\\n' '%s' '%s' '%s' '%s'; exit 0" % (
+        "%s", "%s", "%s", "%s", role if r == "ROLE" else r, why, er, det)
+    with open(os.path.join(tmp, "stubbin", "cys"), "w", encoding="utf-8", newline="\n") as f:
+        f.write("#!/bin/sh\necho \"cys $@\" >> \"%s/calls.log\"\n"
+                "case \"$1\" in\n"
+                "  claim-role) %s;;\n"
+                "  surface-role) exit 0;;\n"
+                "  reclaim-role) %s;;\n"
+                "  repair) [ \"$2\" = rules ] && [ \"$3\" = --role ] || exit 2\n"
+                "    cat \"%s/block.txt\"; exit 0;;\n"
+                "esac\nexit 0\n" % (tmp, _CLAIM[claim], rc_line, tmp))
+    env["CYS_PACK_DIR"] = pack
+    return env, pack
+
+
+def run_hook_at(env, role, clear, cwd=None):
+    e = dict(env)
+    e.pop("CYS_ROLE", None)
+    if role:
+        e["CYS_ROLE"] = role
+    payload = json.dumps({"source": "clear" if clear else "startup", "transcript_path": "/x/t.jsonl"}) + "\n"
+    r = subprocess.run(["sh", HOOK], capture_output=True, text=True, encoding="utf-8",
+                       env=e, input=payload, timeout=30, cwd=cwd)
+    return r.returncode, r.stdout
+
+
+check("24-0 가장 긴 팩 폴더를 실제로 만든다(PATH_MAX %d − 가장 긴 상대 경로 %d → %d자)" % (_PATH_MAX, _LONGEST_REL, _PACK_MAX),
+      _PACK_MAX > 150, "PATH_MAX=%d" % _PATH_MAX)
+_legs = 0
+_bad = []
+_worst = 0
+for _role in _R24:
+    for _existing in (False, True):
+        for _reclaim in _RECLAIM:
+            for _claim in (_CLAIM if _role in ("master", "cso") else ("ok",)):
+                for _cwd in (False, True):
+                    tmp = tempfile.mkdtemp(prefix="hook-t24-")
+                    env, pack = setup_long(tmp, _existing, _reclaim, _claim, _role)
+                    blocked = os.path.join(pack, "blocked-at-creation")
+                    if _cwd:
+                        env["CYS_CWD_BLOCKED"] = blocked
+                    code, out = run_hook_at(env, _env_role_for(_reclaim, _role), _existing)
+                    shutil.rmtree(tmp)
+                    _legs += 1
+                    leg = "%s·%s·%s·claim=%s·cwd=%s" % ("기존(clear)" if _existing else "새 설치", _role, _reclaim, _claim, _cwd)
+                    blk = _RR.get("RULES_COMMON", "") + _RR.get(_R24[_role], "")
+                    lines = out.split("\n")
+                    head = "■ CYSJavis 역할 각성 (CYS_ROLE=%s)" % _role
+                    instr = lines[1] if len(lines) > 1 else ""
+                    start = head + "\n" + instr + "\n" + blk
+                    end = len(start)
+                    want = _expected_notices(_reclaim, _claim, _cwd, _role, blocked)
+                    rest = out[end:]
+                    d_abs = os.path.join(pack, "directives", "%s_DIRECTIVE.md" % _FILE_OF[_role])
+                    problems = []
+                    if code != 0:
+                        problems.append("rc=%s" % code)
+                    if not out.startswith(start):
+                        problems.append("output does not BEGIN with head + instruction + complete block")
+                    if "Read 도구로 끝까지" not in instr or "CYS_PACK_DIR" not in instr:
+                        problems.append("line 2 is not the read instruction")
+                    if end > 2000:
+                        problems.append("block ends at %d > 2000" % end)
+                    if want and not rest.startswith(_FIXED + "\n"):
+                        problems.append("fixed notice line missing directly after the block")
+                    if not want and not rest.startswith("■ 지침 경로: "):
+                        problems.append("paths line not directly after the block (no notice)")
+                    if want and _FIXED not in out:
+                        problems.append("fixed line absent")
+                    pos = 0
+                    for w in want:
+                        k = rest.find(w + "\n")
+                        if k < 0:
+                            problems.append("notice missing or altered after the block: %r" % w[:60])
+                        pos = max(pos, k)
+                    pi = rest.find("■ 지침 경로: ")
+                    if pi < 0 or d_abs not in rest[pi:pi + len(d_abs) + 40] or rest.find("DIRECTIVE-BODY-%s" % _FILE_OF[_role]) < pi:
+                        problems.append("paths line missing / not before the directive body")
+                    if want and pi < pos:
+                        problems.append("paths line before a notice")
+                    _worst = max(_worst, end)
+                    if problems:
+                        _bad.append((leg, problems))
+check("24a 모든 조합 %d 레그: 출력이 머리줄+읽기 안내+역할 블록 전체로 시작(끝 ≤ 2,000 · 최대 %d) · 고지는 전부 블록 뒤(문구 그대로, 고정 한 줄 뒤) · 경로 줄은 그 뒤 · 지침 본문 앞"
+      % (_legs, _worst), _legs >= 200 and not _bad, repr(_bad[:3]))
+
+# DQ2 — 작업 폴더 고지의 값은 좌석이 만들어질 때 막혔던 폴더다: cd 뒤에 시작한 좌석에도 그 값 그대로(현재 폴더·pwd 가 아니다).
+tmp = tempfile.mkdtemp(prefix="hook-t24e-")
+env, pack = setup_long(tmp, True, "none", "ok", "worker")
+other = os.path.join(tmp, "elsewhere")
+os.makedirs(other)
+env["CYS_CWD_BLOCKED"] = os.path.join(pack, "blocked-at-creation")
+code, out = run_hook_at(env, "worker", True, cwd=other)
+shutil.rmtree(tmp)
+_cw = [l for l in out.split("\n") if "고지(작업 폴더)" in l]
+check("24e cd 뒤 좌석: 작업 폴더 고지는 1줄 · 만들어질 때의 값(%d자) 그대로 · 현재 폴더·pwd 로 바꾸지 않는다" % len(env["CYS_CWD_BLOCKED"]),
+      code == 0 and len(_cw) == 1 and _cw[0] == _CWD_FMT % env["CYS_CWD_BLOCKED"] and other not in _cw[0] and "pwd" not in _cw[0],
+      repr(_cw)[:200])
 
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
 sys.exit(1 if fails else 0)

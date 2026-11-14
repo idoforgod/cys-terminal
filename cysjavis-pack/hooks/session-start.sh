@@ -18,7 +18,15 @@ JARVIS_DIR="${CYS_PACK_DIR:-$HOME/.cys/pack}"
 #     되고, master 좌석에게 "보고하라"는 자기 참조다(반박 D8-b·c).
 #   · stderr 에 쓰지 않는다: 종료코드 0 훅의 stderr 는 사람에게도 모델에게도 보이지 않는다(R13).
 #   · 경로 줄은 printf 만(G8 — macOS /bin/sh 의 xpg_echo 가 윈도우 백슬래시 경로를 먹는다).
+# ★(0.15.0 · T1d · RULINGS DQ1) 고지 버퍼 — 지침을 주입하는 길에서는 읽기 안내·역할 블록 **뒤**에 찍는다: 고지가 몇 개이든·
+#   경로가 얼마나 길든 블록을 2,000자 미리보기 밖으로 밀지 못한다. 주입 없이 끝나는 길(무역할 안내·모르는 역할·강등·재대조 거부·
+#   지침 부재)에서는 그 출력 **앞**에서 비운다(종전 순서). 문구는 바이트 그대로 · 새 프로세스 0(셸 변수와 함수뿐).
+CYS_SS_NOTES=""
+cys_ss_note() { CYS_SS_NOTES="${CYS_SS_NOTES}${1:-}
+"; }
+cys_ss_flush_notes() { [ -n "$CYS_SS_NOTES" ] && printf '%s' "$CYS_SS_NOTES"; CYS_SS_NOTES=""; }
 cys_ss_directive_absent() {   # $1=지침 위치 · $2=사유
+  cys_ss_flush_notes
   printf '■ 고지: 역할 지침을 주입하지 못했다(CYS_ROLE=%s) — 이 세션은 역할 지침 없이 시작됐다.\n' "${CYS_ROLE:-}"
   printf '  지침 위치: %s (%s)\n' "$1" "$2"
   echo "  팩 설치 상태는 preflight C01(팩 폴더)·C02(지침 4종)가 판정한다."
@@ -167,7 +175,7 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
   # 조회를 시도하지 않는다 — 두 번째 왕복으로 훅을 또 12초 붙잡지도 않는다(사람의 프롬프트 앞이다).
   if [ "$CYS_SR_RC" -eq 2 ] || [ "$CYS_SR_RC" -eq 124 ]; then
     if [ -z "$CYS_ROLE" ]; then
-      echo "■ 고지: 역할 판정 불가(데몬 미응답·응답 파손·데드라인) — 자동 역할 복구를 건너뛴다."
+      cys_ss_note "■ 고지: 역할 판정 불가(데몬 미응답·응답 파손·데드라인) — 자동 역할 복구를 건너뛴다."
     fi
   else
     # ★(독립 재유도 · codex major #7) **종료 코드를 파이프 밖에서 받는다.** 종전은
@@ -180,7 +188,7 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
       CYS_RECLAIM_OUT=""
       CYS_RECLAIM_RC=124
       if [ -z "$CYS_ROLE" ]; then
-        echo "■ 고지: 데몬 응답이 느려 역할 자동 복구를 건너뛴다(역할 조회 예산 ${CYS_SS_ROLE_BUDGET_S}s 중 ${CYS_SS_ELAPSED}s 소진 · reclaim 최소 ${CYS_SS_RECLAIM_MIN_S}s 미확보) — 다음 세션 시작에서 다시 시도한다."
+        cys_ss_note "■ 고지: 데몬 응답이 느려 역할 자동 복구를 건너뛴다(역할 조회 예산 ${CYS_SS_ROLE_BUDGET_S}s 중 ${CYS_SS_ELAPSED}s 소진 · reclaim 최소 ${CYS_SS_RECLAIM_MIN_S}s 미확보) — 다음 세션 시작에서 다시 시도한다."
       fi
     else
     CYS_RECLAIM_OUT="$( CYS_NO_AUTOSTART=1; export CYS_NO_AUTOSTART
@@ -264,12 +272,12 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
       if [ -z "$CYS_ROLE" ]; then
         CYS_ROLE="$CYS_RECLAIMED"
         export CYS_ROLE
-        echo "■ 고지: 역할 자동 복구 — 이 좌석의 데몬 권위 역할은 '$CYS_ROLE' 이다(env 유실 복구)."
-        echo "  근거: cysd 가 발신 pid 로 이 pane 을 확인했다. 아래 지침은 그 역할의 것이다."
+        cys_ss_note "■ 고지: 역할 자동 복구 — 이 좌석의 데몬 권위 역할은 '$CYS_ROLE' 이다(env 유실 복구)."
+        cys_ss_note "  근거: cysd 가 발신 pid 로 이 pane 을 확인했다. 아래 지침은 그 역할의 것이다."
       elif [ "$CYS_RECLAIMED" != "$CYS_ROLE" ]; then
-        echo "■ 고지: 역할 교정 — env CYS_ROLE 은 '$CYS_ROLE' 이지만 데몬 권위 역할은 '$CYS_RECLAIMED' 이다."
-        echo "  근거: cysd 가 발신 pid 로 이 pane 을 확인했다(env 는 승계·중복제거 뒤 갱신되지 않는다)."
-        echo "  아래 지침은 '$CYS_RECLAIMED' 의 것이다 — env 값이 아니라 이 값으로 행동하라."
+        cys_ss_note "■ 고지: 역할 교정 — env CYS_ROLE 은 '$CYS_ROLE' 이지만 데몬 권위 역할은 '$CYS_RECLAIMED' 이다."
+        cys_ss_note "  근거: cysd 가 발신 pid 로 이 pane 을 확인했다(env 는 승계·중복제거 뒤 갱신되지 않는다)."
+        cys_ss_note "  아래 지침은 '$CYS_RECLAIMED' 의 것이다 — env 값이 아니라 이 값으로 행동하라."
         CYS_ROLE="$CYS_RECLAIMED"
         export CYS_ROLE
       fi
@@ -294,9 +302,9 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
           case "$CYS_ROLE" in
             master|cso) ;;
             *)
-              echo "■ 고지: 데몬 레지스트리에 이 좌석의 역할 등록이 없다(env CYS_ROLE=$CYS_ROLE · 그 역할은 비어 있다)."
-              echo "  지침은 아래에 주입하지만, 역할 권한·역할 배달은 등록 전까지 이 좌석에 오지 않는다 —"
-              echo "  역할로 행동하려면 \`cys claim-role $CYS_ROLE\` 로 등록하라."
+              cys_ss_note "■ 고지: 데몬 레지스트리에 이 좌석의 역할 등록이 없다(env CYS_ROLE=$CYS_ROLE · 그 역할은 비어 있다)."
+              cys_ss_note "  지침은 아래에 주입하지만, 역할 권한·역할 배달은 등록 전까지 이 좌석에 오지 않는다 —"
+              cys_ss_note "  역할로 행동하려면 \`cys claim-role $CYS_ROLE\` 로 등록하라."
               ;;
           esac
           ;;
@@ -304,27 +312,28 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
     fi
     case "$CYS_RC_REASON" in
       privileged_needs_optin)
-        echo "■ 고지: 같은 계정·같은 폴더에 **특권 역할(master·cso)의 빈 좌석**이 있다."
-        echo "  자동 복구는 특권 역할을 옮기지 않는다(사람의 명시가 필요하다)."
-        echo "  이 좌석이 그 역할을 이어받아야 한다면: \`cys reclaim-role --auto --takeover-empty-seat\`"
+        cys_ss_note "■ 고지: 같은 계정·같은 폴더에 **특권 역할(master·cso)의 빈 좌석**이 있다."
+        cys_ss_note "  자동 복구는 특권 역할을 옮기지 않는다(사람의 명시가 필요하다)."
+        cys_ss_note "  이 좌석이 그 역할을 이어받아야 한다면: \`cys reclaim-role --auto --takeover-empty-seat\`"
         ;;
       caller_axes_unknown)
-        echo "■ 고지: 데몬이 이 좌석의 계정 dir·작업 디렉터리를 확정하지 못해 자동 역할 복구를 건너뛴다."
-        echo "  역할이 필요하면 \`cys claim-role <역할>\` 로 직접 등록하라."
+        cys_ss_note "■ 고지: 데몬이 이 좌석의 계정 dir·작업 디렉터리를 확정하지 못해 자동 역할 복구를 건너뛴다."
+        cys_ss_note "  역할이 필요하면 \`cys claim-role <역할>\` 로 직접 등록하라."
         ;;
     esac
     # ★(수렴 R2) 신고한 `$PWD` 와 이 좌석의 **실제** 작업 폴더가 다른 곳이다. 신고는 좁히기만
     #   하므로 두 조건을 함께 만족하는 좌석이 없다 — 사실은 `no_candidate` 가 맞고(사유 코드는
     #   건드리지 않는다), 처방만 다르다. 그래서 사유가 아니라 **진단 축**으로 가른다.
     if [ "$CYS_RC_DETAIL" = "reported_cwd_conflict" ]; then
-      echo "■ 고지: 이 세션이 신고한 폴더와 좌석의 실제 작업 폴더가 달라 자동 역할 복구를 건너뛴다."
-      echo "  신고로 다른 폴더의 역할을 가져오지는 않는다(그것이 이 장치의 계약이다)."
-      echo "  그 역할이 필요하면 해당 폴더에서 세션을 시작하거나 \`cys claim-role <역할>\` 로 등록하라."
+      cys_ss_note "■ 고지: 이 세션이 신고한 폴더와 좌석의 실제 작업 폴더가 달라 자동 역할 복구를 건너뛴다."
+      cys_ss_note "  신고로 다른 폴더의 역할을 가져오지는 않는다(그것이 이 장치의 계약이다)."
+      cys_ss_note "  그 역할이 필요하면 해당 폴더에서 세션을 시작하거나 \`cys claim-role <역할>\` 로 등록하라."
     fi
   fi
 fi
 
 if [ -z "$CYS_ROLE" ]; then
+  cys_ss_flush_notes
   # ── ★A안 채택(2026-08-01 ONBOARDING_REFUSAL_FIX §4-1 [A]·§7-2 + A-1~A-6) ───────────────
   # 구 문안은 신규 사용자(빈 홈·프로젝트 CLAUDE.md 0바이트)의 모델에게 **프롬프트 인젝션으로
   # 판정돼 거부**당했다. 거부 사유 5종이 전부 이 블록에 있었다: ①출처 은닉(in-band provenance 0건)
@@ -449,7 +458,7 @@ case "$CYS_ROLE" in
   worker*)     D="$JARVIS_DIR/directives/WORKER_DIRECTIVE.md" ;;
   cso*)        D="$JARVIS_DIR/directives/CSO_DIRECTIVE.md" ;;
   reviewer*)   D="$JARVIS_DIR/directives/REVIEWER_DIRECTIVE.md" ;;
-  *) exit 0 ;;
+  *) cys_ss_flush_notes; exit 0 ;;
 esac
 # ★(0.14.41 U4 C2 ①) 지침 판독 가능성은 **강등 판정 뒤**에 본다(반박 D8-d): 강등 대상 좌석에게
 #   '지침 부재' 고지가 나가면 안 되고(그 좌석은 역할이 아니다), 강등 문안은 지침 파일이 없어도
@@ -460,6 +469,7 @@ esac
 #    `CYS_ROLE` 을 지울 수 없어서, 이 문이 없으면 두 세션이 같은 역할로 행동한다(적대검증 major).
 #    문안은 master|cso 재대조의 self-demote 와 같은 규약이고, **지침은 주입하지 않는다**.
 if [ -n "$CYS_DEMOTE_ROLE" ]; then
+cys_ss_flush_notes
 echo "■ 역할 주소 상실 (CYS_ROLE=$CYS_DEMOTE_ROLE — 데몬 레지스트리의 살아있는 보유자가 우위)"
 echo "이 surface는 더 이상 $CYS_DEMOTE_ROLE 역할이 아니다. 역할 지휘·역할 행동을 중단하고,"
 echo "레지스트리의 $CYS_DEMOTE_ROLE 노드에 인계하라(\`cys send --to $CYS_DEMOTE_ROLE\`). 이 세션은 일반 세션으로 동작한다."
@@ -490,15 +500,16 @@ case "$CYS_ROLE" in
       #   걸리지 않아 **동작은 이미 안전**하지만, 마지막 fail-open 문안이 "데몬 미응답"이라고
       #   말해 사실과 다르다 — 전용 팔로 정확히 고지한다(오진 문구가 오너 보고로 중계되지 않게).
       if [ "$CLAIM_RC" -eq 6 ]; then
-        echo "■ 고지: 발신 신원 미확정(pane 밖·세션 분리 실행) — 역할 재대조를 건너뛴다. 현행 각성 유지(fail-open)."
+        cys_ss_note "■ 고지: 발신 신원 미확정(pane 밖·세션 분리 실행) — 역할 재대조를 건너뛴다. 현행 각성 유지(fail-open)."
       elif [ "$CLAIM_RC" -ne 0 ] && printf '%s' "$CLAIM_OUT" | grep -qi 'claim_denied\|privileged role held'; then
+        cys_ss_flush_notes
         echo "■ 역할 주소 상실 (CYS_ROLE=$CYS_ROLE — 레지스트리의 살아있는 보유자가 우위)"
         echo "이 surface는 더 이상 $CYS_ROLE 역할이 아니다. 역할 지휘·역할 행동을 중단하고,"
         echo "레지스트리의 $CYS_ROLE 노드에 인계하라(\`cys send --to $CYS_ROLE\`). 이 세션은 일반 세션으로 동작한다."
         exit 0
       fi
       if [ "$CLAIM_RC" -ne 0 ]; then
-        echo "■ 고지: 역할 재확인 불가(데몬 미응답 — cys 밖 실행일 수 있음). 현행 각성 유지(fail-open)."
+        cys_ss_note "■ 고지: 역할 재확인 불가(데몬 미응답 — cys 밖 실행일 수 있음). 현행 각성 유지(fail-open)."
       fi
     fi
     ;;
@@ -515,7 +526,8 @@ esac
 #    파일이 없거나 못 읽어도 작업 폴더 막힘은 독립된 사실이라 좌석에 알려야 한다 — 아래 게이트의
 #    exit 0 이 이 고지를 삼키지 않게 순서를 이렇게 고정한다.
 if [ -n "${CYS_CWD_BLOCKED:-}" ]; then
-  printf '■ 고지(작업 폴더): 이 좌석이 시작될 때 작업 폴더 %s 를 읽을 수 없었다(macOS 폴더 접근 권한 — 사람에게는 앱 화면 알림이 따로 뜬다). 그 폴더가 필요한 지시를 받으면 착수 전에 ls 로 지금 읽히는지 확인하고, 안 되면 그 지시의 회신에만 적어라 — 자발 보고·push 금지, 다른 폴더에 대신 저장 금지.\n' "$CYS_CWD_BLOCKED"
+  # ★(T1d · DQ1·DQ2) 블록 뒤로 가는 고지 — 값은 데몬이 이 좌석을 만들 때 막혔던 폴더 그대로(pwd 가 아니다: cd 뒤 좌석의 현재 폴더와 다를 수 있다).
+  cys_ss_note "■ 고지(작업 폴더): 이 좌석이 시작될 때 작업 폴더 ${CYS_CWD_BLOCKED} 를 읽을 수 없었다(macOS 폴더 접근 권한 — 사람에게는 앱 화면 알림이 따로 뜬다). 그 폴더가 필요한 지시를 받으면 착수 전에 ls 로 지금 읽히는지 확인하고, 안 되면 그 지시의 회신에만 적어라 — 자발 보고·push 금지, 다른 폴더에 대신 저장 금지."
 fi
 # ★(0.14.41 U4 C2 ①) 지침 판독 가능성 — 강등(위 두 문)이 먼저 판정된 뒤에만 본다.
 if [ ! -f "$D" ]; then
@@ -539,7 +551,12 @@ echo "■ CYSJavis 역할 각성 (CYS_ROLE=$CYS_ROLE)"
 #   전문을 첫 제출로 붙여 넣는다)에서도 참이 되어, 모델이 같은 지침(~9.5만 B)·soul.md 를 한 번 더 Read 해 매 부트·사이클 컨텍스트가
 #   두 배로 든다(② · test_session_start_hook 22b). 줄 전체가 미리보기 창(앞 2,000자) 안에서 끝나야 한다.
 #   경로 줄은 printf(G8 — macOS /bin/sh 의 xpg_echo 가 윈도우 백슬래시 경로를 먹는다).
-printf '■ 이 출력이 길어 앞부분 미리보기만 보이고(나머지는 파일로 빠짐) 역할 지침 전문이 이 대화에 따로 없으면, 지침 전문 %s 과 %s 를 Read 도구로 끝까지(offset·limit 로 나눠) 읽은 뒤에 행동하라 — 전문이 이 대화에 이미 있으면(부트·사이클은 CLI 가 붙여 넣는다) 다시 읽지 않는다(같은 지침 중복 적재 금지) · 지침 없이 추측으로 움직이지 않는다.\n' "$(cys_native_path "$D" 2>/dev/null || printf '%s' "$D")" "$(cys_native_path "$JARVIS_DIR/soul.md" 2>/dev/null || printf '%s' "$JARVIS_DIR/soul.md")"
+#   ★(0.15.0 · T1d · RULINGS CX2) 이 줄과 아래 역할 블록 앞에는 **길이가 정해지지 않은 것을 두지 않는다**: 안내 줄은 팩 기준
+#   상대 이름(directives/<역할>_DIRECTIVE.md)만 싣고, 전체 경로(팩 폴더가 길면 수백 자 — macOS PATH_MAX 1,024)는 블록 **뒤**의
+#   '■ 지침 경로' 줄로 보낸다. 그래서 안내 줄·블록의 위치는 팩 경로 길이와 무관하다(머리줄 + 안내 줄 + 블록 < 1,800자 ·
+#   test_session_start_hook 23b · 24 — 실제로 만든 가장 긴 팩 경로로 잰다). 미리보기 밖이어도 안내 줄의 'CYS_PACK_DIR, 없으면
+#   ~/.cys/pack' 이 위 JARVIS_DIR 규칙 그대로라 좌석이 경로를 스스로 잇는다. 새 프로세스 0 — `${D#…}` 는 셸 확장이다.
+printf '■ 앞부분만 보이고(나머지는 파일로 빠짐) 역할 지침 전문이 이 대화에 따로 없으면 팩 폴더(CYS_PACK_DIR, 없으면 ~/.cys/pack)의 %s 와 soul.md 를 Read 도구로 끝까지(offset·limit 로 나눠) 읽은 뒤에 행동하라(전체 경로: 블록 뒤 ■ 지침 경로 줄) — 전문이 이 대화에 이미 있으면(부트·사이클은 CLI 가 붙여 넣는다) 다시 읽지 않는다(같은 지침 중복 적재 금지) · 지침 없이 추측으로 움직이지 않는다.\n' "${D#"$JARVIS_DIR"/}"
 # ★(0.15.0 · 「스스로 해결」 M1 · RULINGS B10 · C6 6.7) 역할별 규칙 블록 — 읽기 안내 줄 **뒤**·지침 본문 **앞**
 #   (앞 2,000자 미리보기 안 · 안내 줄의 위치는 그대로다 — 부록 A-1 #23). 문구는 프로그램 본체의 컴파일 상수
 #   하나뿐이고 여기에 사본을 두지 않는다 — LOCAL 동사 `cys repair rules` 가 찍는다(데몬 무접촉 · 레인 탐색 전 종료).
@@ -553,6 +570,13 @@ fi
 if [ -n "$CYS_RULES_OUT" ]; then
   printf '%s\n' "$CYS_RULES_OUT" | tr -d '\r'
 fi
+# ★(T1d · RULINGS DQ1) 고지는 전부 블록 **뒤** — 있으면 고정된 한 줄이 먼저 알린다(미리보기에서 잘렸으면 전체 출력에서 읽게).
+if [ -n "$CYS_SS_NOTES" ]; then
+  echo "■ 아래에 이 좌석에 대한 고지가 있다 — 미리보기에서 잘려 보이면 전체 출력(파일로 빠진 부분)에서 끝까지 읽어라."
+  cys_ss_flush_notes
+fi
+# ★(T1d · CX2) 전체 경로는 블록 **뒤** — 길이가 얼마든 안내 줄·블록을 미리보기 밖으로 밀지 않는다. 경로 줄은 printf(G8).
+printf '■ 지침 경로: %s · %s\n' "$(cys_native_path "$D" 2>/dev/null || printf '%s' "$D")" "$(cys_native_path "$JARVIS_DIR/soul.md" 2>/dev/null || printf '%s' "$JARVIS_DIR/soul.md")"
 cat "$D"
 # ★R13 부트 브리지(T2b 전 임시 — hook=system층이라 디렉티브(user-owned) 미개정 기계에도 전파):
 # 구 산문 §0만 아는 master는 부트 스크립트를 몰라 완료 마커가 안 생기고 CEO 승격이 영구
