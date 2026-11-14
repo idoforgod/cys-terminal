@@ -4357,7 +4357,9 @@ pub fn beneath_move_no_replace(root: &Path, from_rel: &str, to_rel: &str) -> std
     }
     #[cfg(windows)]
     {
-        sidecar_path_gate(root, &fp[..fp.len() - 1].join("/")).map_err(std::io::Error::other)?;
+        // 경로 규칙은 **이름 전체**에(부모 폴더만 재면 그 폴더 자체가 '폴더입니다'로 거부되고, 팩 루트의 파일은 빈 경로로 거부된다).
+        sidecar_path_gate(root, from_rel).map_err(std::io::Error::other)?;
+        sidecar_path_gate(root, to_rel).map_err(std::io::Error::other)?;
         let base = fp[..fp.len() - 1].iter().fold(root.to_path_buf(), |p, c| p.join(c));
         windows_move_no_replace(&base.join(fp[fp.len() - 1]), &base.join(tp[tp.len() - 1]))
     }
@@ -4423,7 +4425,8 @@ fn beneath_occupant(root: &Path, rel_path: &str) -> Occupant {
     }
     #[cfg(not(unix))]
     {
-        if let Err(e) = sidecar_path_gate(root, &parts[..parts.len() - 1].join("/")) {
+        // 경로 규칙은 이름 전체에(링크 · 폴더인 자리는 장애물 · 없으면 통과).
+        if let Err(e) = sidecar_path_gate(root, rel_path) {
             return Occupant::Obstacle(e);
         }
         let p = parts.iter().fold(root.to_path_buf(), |p, c| p.join(c));
