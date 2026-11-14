@@ -4297,84 +4297,123 @@ fn protected_names(pack: &Path) -> Vec<String> {
     out
 }
 
-/// RULINGS DA4 — whether two pack-relative targets are the SAME file: when both live files exist,
-/// their identity decides (volume + file id — the volume's own name equality, case and
-/// normalisation included, and hard links); when one does not exist yet, the folded spellings
-/// decide (`fold_name`, case; Unicode normalisation is CD1's stated limit), which on a
-/// case-sensitive volume errs on the side of "the same".
-pub(crate) fn same_target(pack: &Path, a: &str, b: &str) -> bool {
-    use cys::repair::boot_critical::file_identity;
-    match (file_identity(&pack.join(a)), file_identity(&pack.join(b))) {
-        (Some(x), Some(y)) => x == y,
-        _ => {
-            cys::repair::types::fold_name(&a.replace('\\', "/"))
-                == cys::repair::types::fold_name(&b.replace('\\', "/"))
-        }
-    }
+/// How two targets are one file (RULINGS DA4 / ED1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Same {
+    /// both live files exist and have one identity (volume + file id)
+    Identity,
+    /// the same spelling
+    Spelling,
+    /// not-yet-existing tails under one existing folder, equal after ASCII case folding
+    CaseFold,
+    /// not-yet-existing tails under one existing folder, one of them holding a non-ASCII character
+    NonAscii,
 }
 
-/// RULINGS DA4 / DJ1 — the refusal sentence when the new target `new` overlaps a being-worked
-/// repair `rec` of this lane, or `None`:
-/// - both live files exist → their identity decides (the volume's own equality: case,
-///   normalisation, hard links) — the same file → refused (BJ5's sentence);
-/// - the same spelling → refused (BJ5's sentence);
-/// - otherwise, when one name does not exist yet (no identity to compare — the crate has no
-///   Unicode normalisation, RULINGS CD1): (a) two names equal after case folding → one target even
-///   on a case-sensitive volume (the safe direction), said truthfully; (b) a new name with a
-///   non-ASCII character that does not exist yet, beside an open repair CREATING such a name in the
-///   same folder → refused until that repair closes (the volume may treat differently composed
-///   names as one file). An ASCII creation beside a non-ASCII one, and two different ASCII names,
-///   are allowed.
-pub(crate) fn open_overlap(
-    pack: &Path,
-    new: &str,
-    rec: &cys::repair::ledger::RepairRecord,
-) -> Option<String> {
+/// RULINGS ED1: a target resolved against the file system NOW — the identity of its deepest
+/// EXISTING ancestor (the target itself when it exists) and the not-yet-existing tail below it
+/// (empty = the target exists). `None` only when not even the pack root can be read.
+fn resolve_now(pack: &Path, rel: &str) -> Option<((u64, u64), Vec<String>)> {
     use cys::repair::boot_critical::file_identity;
-    use cys::repair::types::fold_name;
-    let id = rec.id.as_str();
-    let theirs: Vec<&str> = rec.files.iter().map(|f| f.rel.as_str()).collect();
-    let same_file = || {
-        format!(
-            "{new}: 이 파일을 고치는 수리 {id} 가 이미 열려 있습니다(대상 파일 묶음 또는 --resolves 가 다릅니다) — `--joins {id}` 로 합류하거나, 같은 파일들({})로 `cys repair begin` 해서 그 수리를 이어받으세요. 한 파일에 열린 수리는 하나뿐입니다(RULINGS BJ5)",
-            theirs.join(", ")
-        )
-    };
-    let norm = |s: &str| fold_name(&s.replace('\\', "/"));
-    let new_id = file_identity(&pack.join(new));
-    for f in &rec.files {
-        let t = f.rel.as_str();
-        match (new_id, file_identity(&pack.join(t))) {
-            (Some(x), Some(y)) if x == y => return Some(same_file()),
-            (Some(_), Some(_)) => continue, // two live files, two files
-            _ => {}
-        }
-        if new == t {
-            return Some(same_file());
-        }
-        if norm(new) == norm(t) {
-            return Some(format!(
-                "{new}: 수리 {id} 가 연 `{t}` 와 대소문자만 다른 이름입니다 — 대소문자만 다른 이름은 볼륨에 따라 같은 파일이라 동시에 열지 않습니다. 먼저 열린 수리 {id} 가 끝난 뒤 다시 하세요(RULINGS DJ1)"
-            ));
-        }
-        let creating = f.pre == cys::repair::ledger::PreImage::Absent;
-        if new_id.is_none()
-            && !new.is_ascii()
-            && creating
-            && !t.is_ascii()
-            && same_target(pack, parent_rel(new), parent_rel(t))
-        {
-            return Some(format!(
-                "{new}: 이 폴더에는 ASCII 가 아닌 새 이름(`{t}`)을 만드는 열린 수리 {id} 가 있습니다 — 볼륨이 다르게 조합된 이름(정규화 형식만 다른 이름 등)을 같은 파일로 볼 수 있어, 이런 새 이름은 한 폴더에 한 수리만 엽니다. {id} 가 끝난 뒤 다시 하세요(RULINGS DJ1)"
-            ));
+    let parts: Vec<&str> = rel
+        .split(['/', '\\'])
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    for k in (0..=parts.len()).rev() {
+        let path = parts[..k]
+            .iter()
+            .fold(pack.to_path_buf(), |acc, c| acc.join(c));
+        if let Some(id) = file_identity(&path) {
+            return Some((id, parts[k..].iter().map(|s| s.to_string()).collect()));
         }
     }
     None
 }
 
-/// The folder part of a pack-relative rel (`""` for the pack root).
-fn parent_rel(rel: &str) -> &str {
-    rel.rfind(['/', '\\']).map_or("", |i| &rel[..i])
+/// RULINGS DA4 / ED1 — ONE comparison, made NOW, for both targets: the same file when (i) both
+/// exist and have one identity, or (ii) they share the deepest existing ancestor (by identity)
+/// and their not-yet-existing tails are equal after ASCII case folding; a tail holding ANY
+/// non-ASCII character equals every other tail under that ancestor (no normalisation library —
+/// RULINGS CD1 — so the daemon cannot know better: an over-refusal in the safe direction, lasting
+/// until the first repair is finished). Hook lines (`settings:…`) compare only with hook lines.
+/// No key computed at an earlier moment is compared.
+pub(crate) fn same_now(pack: &Path, a: &str, b: &str) -> Option<Same> {
+    let hook = |s: &str| s.starts_with("settings:");
+    if hook(a) || hook(b) {
+        if !(hook(a) && hook(b) && a.eq_ignore_ascii_case(b)) {
+            return None;
+        }
+        return Some(if a == b {
+            Same::Spelling
+        } else {
+            Same::CaseFold
+        });
+    }
+    if a == b {
+        return Some(Same::Spelling);
+    }
+    let (ra, rb) = (resolve_now(pack, a)?, resolve_now(pack, b)?);
+    match (ra.1.is_empty(), rb.1.is_empty()) {
+        (true, true) => (ra.0 == rb.0).then_some(Same::Identity),
+        (false, false) if ra.0 == rb.0 => {
+            if ra.1.iter().chain(rb.1.iter()).any(|c| !c.is_ascii()) {
+                Some(Same::NonAscii)
+            } else if ra.1.len() == rb.1.len()
+                && ra
+                    .1
+                    .iter()
+                    .zip(&rb.1)
+                    .all(|(x, y)| x.eq_ignore_ascii_case(y))
+            {
+                Some(Same::CaseFold)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// [`same_now`] as a yes / no.
+pub(crate) fn same_target(pack: &Path, a: &str, b: &str) -> bool {
+    same_now(pack, a, b).is_some()
+}
+
+/// RULINGS DA4 / ED1 — the refusal sentence when the new target `new` is, NOW, the same file as a
+/// target of the being-worked repair `rec` of this lane ([`same_now`]), or `None`. The sentence
+/// says what is known: one identity / one spelling → BJ5's sentence; the conservative rule →
+/// a conditional sentence (one file on some volumes).
+pub(crate) fn open_overlap(
+    pack: &Path,
+    new: &str,
+    rec: &cys::repair::ledger::RepairRecord,
+) -> Option<String> {
+    let id = rec.id.as_str();
+    let theirs: Vec<&str> = rec.files.iter().map(|f| f.rel.as_str()).collect();
+    for t in &theirs {
+        let Some(how) = same_now(pack, new, t) else {
+            continue;
+        };
+        match how {
+            Same::Identity | Same::Spelling => {
+                return Some(format!(
+                    "{new}: 이 파일을 고치는 수리 {id} 가 이미 열려 있습니다(대상 파일 묶음 또는 --resolves 가 다릅니다) — `--joins {id}` 로 합류하거나, 같은 파일들({})로 `cys repair begin` 해서 그 수리를 이어받으세요. 한 파일에 열린 수리는 하나뿐입니다(RULINGS BJ5)",
+                    theirs.join(", ")
+                ))
+            }
+            Same::CaseFold => {
+                return Some(format!(
+                    "{new}: 수리 {id} 가 연 `{t}` 와 대소문자만 다른 이름입니다 — 대소문자만 다른 이름은 볼륨에 따라 같은 파일이라 동시에 열지 않습니다. 먼저 열린 수리 {id} 가 끝난 뒤 다시 하세요(RULINGS DJ1 · ED1)"
+                ))
+            }
+            Same::NonAscii => {
+                return Some(format!(
+                    "{new}: 아직 없는 이름이 ASCII 가 아닌 글자를 담고 있어, 같은 폴더 아래의 수리 {id} 대상 `{t}` 와 볼륨에 따라 같은 파일일 수 있습니다(정규화 형식만 다른 이름을 가릴 수 없음) — {id} 가 끝난 뒤 다시 하세요(RULINGS ED1)"
+                ))
+            }
+        }
+    }
+    None
 }
 
 /// C10's rule-document base names (as `guard.sh:PROTECTED_NAMES`), lower-cased.

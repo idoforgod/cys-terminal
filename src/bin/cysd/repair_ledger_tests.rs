@@ -4235,15 +4235,20 @@ fn da5_unreadable_lane_row_never_overwritten() {
     }
 }
 
-/// RULINGS DJ1: the key of a name that does not exist yet is conservative and the sentence true —
-/// the NFC / NFD pair of one name → the second refused (one creating repair per folder for
-/// non-ASCII names); `a.txt` / `A.txt` → the second refused saying that names differing only in
-/// case are one file on some volumes; two different ASCII names → both allowed; a non-ASCII
-/// creation beside an ASCII creation in the same folder → both allowed.
+/// RULINGS DJ1, rewritten for RULINGS ED1 (one comparison, made now): the NFC / NFD pair of one
+/// name → the second refused; `a.txt` / `A.txt` → the second refused saying that names
+/// differing only in case are one file on some volumes; two different ASCII names → both
+/// allowed. REWRITTEN EXPECTATION (ED1): the old last case read "a non-ASCII creation beside an
+/// ASCII creation in the same folder → both allowed" (`assert!(begin(13, "other/plain.md").is_ok())`);
+/// under ED1 a not-yet-existing tail holding a non-ASCII character equals every other tail under
+/// its deepest existing folder, so the ASCII creation is refused with the conditional sentence
+/// until the first repair is finished. Each case has its own folder.
 #[test]
 fn dj1_names_that_do_not_exist_yet() {
     let r = rig("dj1");
-    std::fs::create_dir_all(r.pack.join("notes")).unwrap();
+    for d in ["n1", "n2", "n3", "n4"] {
+        std::fs::create_dir_all(r.pack.join(d)).unwrap();
+    }
     let begin = |sid: u64, rel: &str| {
         r.call(
             T0,
@@ -4253,18 +4258,16 @@ fn dj1_names_that_do_not_exist_yet() {
         )
     };
     let id_of = |v: Value| v["repair"].as_str().unwrap().to_string();
-    // NFC then NFD of "café.txt"
-    let nfc = id_of(begin(3, "notes/caf\u{e9}.txt").unwrap());
-    let e = begin(13, "notes/cafe\u{301}.txt").unwrap_err();
+    let nfc = id_of(begin(3, "n1/caf\u{e9}.txt").unwrap());
+    let e = begin(13, "n1/cafe\u{301}.txt").unwrap_err();
     assert_eq!(e.code, "repair_precondition", "{}", e.message);
     assert!(
         e.message.contains(&nfc) && e.message.contains("ASCII"),
         "{}",
         e.message
     );
-    // a.txt then A.txt
-    let a = id_of(begin(3, "notes/a.txt").unwrap());
-    let e = begin(13, "notes/A.txt").unwrap_err();
+    let a = id_of(begin(3, "n2/a.txt").unwrap());
+    let e = begin(13, "n2/A.txt").unwrap_err();
     assert!(
         e.message.contains(&a)
             && e.message
@@ -4272,12 +4275,15 @@ fn dj1_names_that_do_not_exist_yet() {
         "{}",
         e.message
     );
-    // two different ASCII names; a non-ASCII creation beside an ASCII one
-    assert!(begin(3, "notes/x1.txt").is_ok());
-    assert!(begin(13, "notes/x2.txt").is_ok());
-    std::fs::create_dir_all(r.pack.join("other")).unwrap();
-    assert!(begin(3, "other/\u{c0c8}.md").is_ok());
-    assert!(begin(13, "other/plain.md").is_ok());
+    assert!(begin(3, "n3/x1.txt").is_ok());
+    assert!(begin(13, "n3/x2.txt").is_ok());
+    let k = id_of(begin(3, "n4/\u{c0c8}.md").unwrap());
+    let e = begin(13, "n4/plain.md").unwrap_err();
+    assert!(
+        e.message.contains(&k) && e.message.contains("볼륨에 따라 같은 파일일 수 있습니다"),
+        "{}",
+        e.message
+    );
 }
 
 /// RULINGS DJ2 — the race of DA2, made deterministic: report X (a new signature, at 199 of 200) is
@@ -4426,4 +4432,116 @@ fn dj3_key_file_alias_names_the_canonical_file_and_pack_heal() {
         "the owner-token route was offered: {}",
         e.message
     );
+}
+
+/// RULINGS ED1, codex's sequence (a): on a volume that may treat composed and decomposed names as
+/// one, the PARENT does not exist yet either — `p/caf\u{e9}/x.txt` then `p/cafe\u{301}/x.txt`:
+/// one existing ancestor (`p`), tails with a non-ASCII character → the second is refused.
+#[test]
+fn ed1_parent_absent_composed_and_decomposed() {
+    let r = rig("ed1-a");
+    std::fs::create_dir_all(r.pack.join("p")).unwrap();
+    let first = r
+        .call(
+            T0,
+            &seat(3, "worker"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["p/caf\u{e9}/x.txt"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let e = r
+        .call(
+            T0,
+            &seat(13, "worker-3"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["p/cafe\u{301}/x.txt"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    assert!(e.message.contains(&first), "{}", e.message);
+}
+
+/// RULINGS ED1, codex's sequence (b): a repair opened on an EXISTING `q/caf\u{e9}.txt` deletes it;
+/// `begin` under the decomposed name is compared with the recorded target AS IT IS NOW (both
+/// absent, one ancestor, non-ASCII tails) → refused.
+#[test]
+fn ed1_existing_file_deleted_then_other_composition() {
+    let r = rig("ed1-b");
+    std::fs::create_dir_all(r.pack.join("q")).unwrap();
+    std::fs::write(r.pack.join("q/caf\u{e9}.txt"), b"c\n").unwrap();
+    let first = r
+        .call(
+            T0,
+            &seat(3, "worker"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["q/caf\u{e9}.txt"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::remove_file(r.pack.join("q/caf\u{e9}.txt")).unwrap();
+    let e = r
+        .call(
+            T0,
+            &seat(13, "worker-3"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["q/cafe\u{301}.txt"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    assert!(e.message.contains(&first), "{}", e.message);
+}
+
+/// RULINGS ED1: the conservative refusal lasts only while the first repair is open — once it is
+/// committed (in force, no longer being worked) the case-twin name begins.
+#[test]
+fn ed1_finished_repair_no_longer_refuses() {
+    let r = rig("ed1-done");
+    std::fs::create_dir_all(r.pack.join("f")).unwrap();
+    let w = seat(3, "worker");
+    let other = seat(13, "worker-3");
+    let id = r
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["f/a.txt"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(r
+        .call(
+            T0,
+            &other,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["f/A.txt"]})
+        )
+        .is_err());
+    std::fs::write(r.pack.join("f/a.txt"), b"a\n").unwrap();
+    r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "n"}))
+        .unwrap();
+    r.call(
+        T0 + 2.0,
+        &seat(7, "reviewer-codex"),
+        "attest_verify",
+        json!({"repair": id, "verdict": "pass", "note": "ok"}),
+    )
+    .unwrap();
+    r.call(T0 + 3.0, &w, "commit", json!({"repair": id}))
+        .unwrap();
+    let p = r
+        .call(
+            T0 + 4.0,
+            &other,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["f/A.txt"]}),
+        )
+        .unwrap();
+    assert_eq!(p["begin"], "new", "{p}");
 }
