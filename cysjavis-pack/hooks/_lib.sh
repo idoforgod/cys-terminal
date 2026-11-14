@@ -350,7 +350,7 @@ cys_timeout_run() {
     # sitecustomize, usercustomize), -B (no bytecode), -X utf8 (the UTF-8 mode PYTHONUTF8=1 gave, given
     # back explicitly; it replaces the PKG-3A M1 reason for not using -I). Bootstrap and leaf import the
     # standard library only; the command the leaf runs gets this process's environment unchanged — with
-    # one repair: on a C / POSIX locale CPython rewrites LC_CTYPE in its own environment (PEP 538), and
+    # one hand-back: on a C / POSIX locale CPython rewrites LC_CTYPE in its own environment (PEP 538), and
     # -I also ignores a PYTHONCOERCECLOCALE=0 that would have stopped it, so the first statement puts
     # LC_CTYPE back exactly as the command would have inherited it (`_cys_lc_handback`). An interpreter
     # that cannot start: its exit code with no records — the caller's existing "phase owner ended without
