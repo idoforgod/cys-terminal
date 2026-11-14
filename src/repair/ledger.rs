@@ -420,7 +420,8 @@ pub fn candidate_states_in(
 
 /// RULINGS GR5 (CCR-T5b-1) — the most bytes the ONE candidate reader reads of one staged target:
 /// 8 MiB = 8,388,608 bytes, more than eight times the largest file the two compiled lists name
-/// (`bin/javis_preflight.py`, 780,355 bytes when measured — eight times is 6,242,840). A larger
+/// (`bin/javis_preflight.py`: 780,355 bytes at round 5, 812,411 bytes on the tree with T6 — eight times
+/// is 6,499,288; `screen::tests::candidate_read_is_capped` measures it at every run). A larger
 /// candidate is refused at once ("over the size limit"); `submit`, `finish_verification` and the
 /// apply all read through [`candidate_states_in`].
 pub const MAX_CANDIDATE_BYTES: u64 = 8 * 1024 * 1024;
