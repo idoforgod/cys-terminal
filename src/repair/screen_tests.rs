@@ -147,6 +147,59 @@ fn wait_site_census_no_blocking_wait() {
     assert!(bad.is_empty(), "blocking wait sites: {bad:?}");
 }
 
+/// RULINGS EL3 / EO4 — a census of the READ sites of the screen / replay modules: a file a candidate
+/// could have produced is read only through the bounded reader; the only other opens are the bounded
+/// reader itself, `/dev/urandom` and Linux's `/proc` files.
+#[test]
+fn read_site_census_only_the_bounded_reader() {
+    let allowed: &[&str] = &[
+        "std::fs::File::open(\"/dev/urandom\")",
+        "std::fs::read_to_string(format!(\"/proc/{pid}/stat\"))",
+        "std::fs::read(e.path().join(\"environ\"))",
+        "std::fs::OpenOptions::new()",
+        "    std::fs::File::open(p)",
+    ];
+    let files = [
+        ("screen.rs", include_str!("screen.rs")),
+        ("replay.rs", include_str!("replay.rs")),
+        ("rehearsal.rs", include_str!("rehearsal.rs")),
+        ("screen_corpus.rs", include_str!("screen_corpus.rs")),
+    ];
+    let mut bad = Vec::new();
+    for (name, src) in files {
+        for (i, l) in src.lines().enumerate() {
+            let code = l.split("//").next().unwrap_or("");
+            let opens = ["fs::read(", "read_to_string(", "File::open(", "OpenOptions::new("];
+            if opens.iter().any(|o| code.contains(o)) && !allowed.iter().any(|a| l.contains(a)) {
+                bad.push(format!("{name}:{}: {}", i + 1, l.trim()));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "unbounded read sites: {bad:#?}");
+}
+
+/// RULINGS EL3: a candidate registrar that leaves a writer-less FIFO where `settings.json` was cannot
+/// hang the screen — the read refuses at once and the I3 rows are not measurable (→ refused).
+#[test]
+fn registrar_leaving_a_fifo_cannot_hang_the_screen() {
+    let root = test_root("el3-fifo");
+    let lane = lane_of(&root, &[]);
+    let pf = released("bin/javis_preflight.py");
+    let at = "        cmd = _cys_hook_cmd(script_name)\n        refused = []\n";
+    assert_eq!(pf.matches(at).count(), 1);
+    let fifo = "        try:\n            os.remove(settings_path)\n        except OSError:\n            pass\n        os.mkfifo(settings_path)\n        return None\n";
+    let cand = candidate_of(
+        &root,
+        &[("bin/javis_preflight.py", Some(pf.replacen(at, &format!("{fifo}{at}"), 1)))],
+    );
+    let c = cfg(&root, Some(vec![]), Some(vec![]), true);
+    let t0 = std::time::Instant::now();
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    assert!(t0.elapsed() < LONG, "{:?}", t0.elapsed());
+    assert_eq!(rep.verdict, ScreenVerdict::Refused, "{:?}", rep.refusals);
+    cleanup(&root);
+}
+
 // ───────────────────────────── parity, census (i) and (iii) ─────────────────────────────
 
 /// RULINGS AU1 / BM5: the screen's inputs ARE the generated per-test inputs — exactly G, R, C, I3,
