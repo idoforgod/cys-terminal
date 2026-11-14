@@ -22,6 +22,13 @@
   4  Bash 로 규칙 문서를 쓰는 경로(tee·sed -i·리다이렉트)는 표가 있어도 막힌다.
   5  corpus G 의 대표 호출(외부 발행·외부 전송·영구 삭제)은 표가 있든 없든 막힌다(AT9).
   6  규칙 문서가 아닌 쓰기는 조회 없이 통과한다(평시 동작 무변화).
+ 11  수리 장부(RULINGS HP1 · T4e): 데몬의 수리 장부(이 훅이 놓인 팩의 부모 아래 `local/repairs`)를 좌석이 파일 도구나
+     이 가드가 이미 알아보는 셸 쓰기 형태로 쓰면 역할과 상관없이 한 문장으로 막힌다 — 기록 · 레인 줄 · 작업 기록 ·
+     주인 지시 표 · grant.json · 일시정지 표시 · 차례 번호 · 묘비 · 보관소 · 점검 작업 상태 · 결함 신고 · 뿌리의 파일.
+     역할(master · worker · 리뷰어 두 자리 · CSO) 마다 Write 와 셸 리다이렉트를 시험하고, 다른 쓰기 형태(Edit ·
+     MultiEdit · NotebookEdit · tee · cp · sed -i · >> · cd 뒤의 상대 경로 · 심링크 너머)도 시험한다. 좌석이 쓰는
+     자리는 수리의 작업 사본 `R-<번호>/staging/`(U3) 하나뿐이라 그곳은 통과하고, 장부를 읽기만 하는 명령도 통과한다.
+     장부의 자리는 훅의 환경 변수(CYS_LOCAL_DIR · CYS_PACK_DIR · HOME)로 옮겨지지 않는다.
 밀폐: 가짜 `cys` 스텁(PATH 선두) · 임시 디렉터리의 진짜 unix 소켓 파일 · GUARD_TEST_MODE 로 자율주행 깃발을
 임시 경로에 둔다 · HOME 임시. 데몬·라이브 팩 무접촉.
 시간(RULINGS FV1 · FZ3): 어떤 경과 시간도 한도와 비교하지 않는다 — 한도에 대한 판정은 가드가 밝힌 값만 읽는다.
@@ -378,6 +385,80 @@ def main():
         # 6 — non-rule writes: no query, allowed as before
         p, calls = run({"file_path": os.path.join(pack, "bin", "a.py"), "content": "x"}, rc=95)
         check("6 규칙 문서가 아닌 쓰기 — 조회 없이 통과", p.returncode == 0 and not calls, repr((p.returncode, calls)))
+        # 11 — RULINGS HP1 (T4e): no seat writes the daemon's repair ledger with a plain tool
+        ledger = os.path.join(os.path.dirname(PACK), "local", "repairs")   # the root of THIS hook's pack
+        sha = "a" * 64
+        stores = [
+            ("기록", "R-7/record.json", "cys repair begin"),
+            ("레인 줄", "R-7/lanes/base.json", "cys repair begin"),
+            ("작업 기록", "R-7/ops/op-1.json", "cys repair begin"),
+            ("주인 지시 표", "owner-tokens/%s.json" % sha, "cys repair owner-token ask --path"),
+            ("자동 수리 허락", "grant.json", "cys repair grant ask"),
+            ("일시정지 표시", "grant-pause/base.json", "cys repair grant ask"),
+            ("차례 번호", "grant-seq/1.json", "cys repair grant ask"),
+            ("묘비", "tombstones/base.json", "cys repair commit"),
+            ("보관소", "displaced/R-7/20261115T000000Z/sealed/guard.sh", "cys repair revert"),
+            ("점검 작업 상태", "lanes/base.job.json", "cys repair sweep"),
+            ("결함 신고", "intake/base/abcd.json", "`report` 동사"),
+            ("뿌리의 파일", "lanes-at-upgrade.json", "cys repair begin"),
+        ]
+        roles = ("master", "worker", "reviewer-codex", "reviewer-gemini", "cso")
+
+        def ledger_refused(p, verb):
+            return (p.returncode == 2 and "수리 장부" in p.stderr and "cys repair" in p.stderr and verb in p.stderr)
+
+        for label, rel, verb in stores:
+            target = os.path.join(ledger, rel)
+            bad = []
+            for role in roles:
+                for tool, ti in (("Write", {"file_path": target, "content": "{}"}),
+                                 ("Bash", {"command": "echo '{}' > %s" % target})):
+                    p, calls = run(ti, tool=tool, rc=0, extra={"CYS_ROLE": role})
+                    if not ledger_refused(p, verb) or calls:
+                        bad.append("%s/%s rc=%d %r" % (role, tool, p.returncode, p.stderr[-160:]))
+            check("11 장부의 %s(%s) — 역할 %d개 × Write·셸 리다이렉트 모두 한 문장으로 차단, 할 일의 동사(%s) 안내"
+                  % (label, rel, len(roles), verb), not bad, "; ".join(bad[:3]))
+        token = os.path.join(ledger, "owner-tokens", "%s.json" % sha)
+        os.makedirs(os.path.join(root, "src"), exist_ok=True)
+        link = os.path.join(root, "ledger-link")
+        os.symlink(ledger, link)
+        for label, tool, ti in (
+                ("Edit", "Edit", {"file_path": token, "old_string": "a", "new_string": "b"}),
+                ("MultiEdit", "MultiEdit", {"file_path": token, "edits": []}),
+                ("NotebookEdit", "NotebookEdit", {"notebook_path": token, "new_source": "x"}),
+                ("tee", "Bash", {"command": "printf x | tee %s" % token}),
+                ("cp", "Bash", {"command": "cp %s %s" % (os.path.join(root, "src", "t.json"), token)}),
+                ("sed -i", "Bash", {"command": "sed -i 's/a/b/' %s" % token}),
+                ("덧붙이기 >>", "Bash", {"command": "echo x >> %s" % token}),
+                ("붙여 쓴 >경로", "Bash", {"command": "echo x >%s" % token}),
+                ("cd 뒤 상대 경로", "Bash", {"command": "cd %s && echo x > b.json" % os.path.dirname(token)}),
+                ("심링크 너머 Write", "Write", {"file_path": os.path.join(link, "grant.json"), "content": "{}"}),
+                ("심링크 너머 리다이렉트", "Bash", {"command": "echo x > %s" % os.path.join(link, "owner-tokens", "x.json")})):
+            p, _ = run(ti, tool=tool, rc=0)
+            ok = ledger_refused(p, "cys repair")
+            check("11 다른 쓰기 형태도 차단: %s" % label, ok, "" if ok else "rc=%d %r" % (p.returncode, p.stderr[-200:]))
+        staging = os.path.join(ledger, "R-7", "staging", "hooks", "guard.sh")
+        for label, tool, ti in (
+                ("작업 사본 Write", "Write", {"file_path": staging, "content": "x"}),
+                ("작업 사본 cp", "Bash", {"command": "cp %s %s" % (os.path.join(root, "src", "g.sh"), staging)}),
+                ("작업 사본 sed -i", "Bash", {"command": "sed -i 's/a/b/' %s" % staging}),
+                ("장부 읽기 cat", "Bash", {"command": "cat %s" % os.path.join(ledger, "grant.json")}),
+                ("장부 읽기 ls", "Bash", {"command": "ls -la %s" % ledger})):
+            p, _ = run(ti, tool=tool, rc=0)
+            check("11 통과: %s" % label, p.returncode == 0,
+                  "" if p.returncode == 0 else "rc=%d %r" % (p.returncode, p.stderr[-200:]))
+        # the root is THIS hook's — the hook's environment does not move it
+        elsewhere = os.path.join(root, "elsewhere")
+        moved = {"CYS_LOCAL_DIR": elsewhere, "CYS_PACK_DIR": os.path.join(elsewhere, "pack"),
+                 "HOME": os.path.join(elsewhere, "home")}
+        p, _ = run({"file_path": os.path.join(ledger, "grant.json"), "content": "{}"}, rc=0, extra=moved)
+        ok = ledger_refused(p, "cys repair grant ask")
+        check("11 훅의 환경 변수(CYS_LOCAL_DIR · CYS_PACK_DIR · HOME)를 옮겨도 데몬의 장부는 그대로 막힌다", ok,
+              "" if ok else "rc=%d %r" % (p.returncode, p.stderr[-200:]))
+        p, _ = run({"file_path": os.path.join(elsewhere, "repairs", "grant.json"), "content": "{}"}, rc=0, extra=moved)
+        check("11 환경 변수가 가리키는 다른 자리는 장부가 아니다(막는 자리는 훅이 놓인 팩에서 정해진다)",
+              p.returncode == 0, "" if p.returncode == 0 else "rc=%d %r" % (p.returncode, p.stderr[-200:]))
+
         # 10 — RULINGS FZ2: every stub this test started is gone at its end
         left = [pid for pid in stub_pids if not gone_soon(pid)]
         check("10 테스트가 띄운 스텁 %d개가 끝에 모두 사라졌다" % len(stub_pids), not left, "" if not left else repr(left))

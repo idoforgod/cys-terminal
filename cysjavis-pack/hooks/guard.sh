@@ -947,6 +947,106 @@ def loose_deny(n, n_slash=""):
             return "헌법파일 쓰기/덮어쓰기 차단(soul·CLAUDE·*_DIRECTIVE) — 규칙 문서는 오너 지시로만 고친다"
     return None
 
+# ================= 수리 장부 (RULINGS HP1 · T4e) =================
+# ★0.15.0 「스스로 해결」: 수리 장부는 데몬이 `cys repair …` 동사로만 쓴다. 좌석이 파일 도구나 이 가드가 이미 알아보는
+#   셸 쓰기 형태(리다이렉트 · tee/cp/dd/mv/install/ln/truncate/patch/편집기 · sed -i · rm/rmdir/chmod/chown)로 장부 아래를
+#   쓰면 역할과 모드에 상관없이 막는다. 좌석이 쓰는 자리는 계약이 준 하나 — 수리의 고정 작업 사본 `R-<n>/staging/`
+#   (RULINGS U3) — 뿐이다. 장부의 자리(GUARD_LEDGER_ROOTS)는 bash 부분이 **이 훅 파일이 놓인 자리**에서 구해 넘긴다:
+#   데몬이 쓰는 `<팩의 부모>/local/repairs`(pack.rs local_dir() 의 기본값 · paths.rs repairs_root()). 훅의 환경 변수
+#   (CYS_LOCAL_DIR · CYS_PACK_DIR · HOME)는 그 자리를 정하지 않는다. 셸 명령은 새로 해석하지 않는다 — 규칙 문서 검사와
+#   같은 굵은 판정(장부를 가리키는 낱말 하나 + 쓰기 형태 하나)이다.
+LEDGER_ROOTS = []          # compared case-folded (a case-insensitive volume reaches the same files)
+LEDGER_SHOWN = ""          # the first root as it is spelled, for the sentence
+for _r in os.environ.get("GUARD_LEDGER_ROOTS", "").split("\n"):
+    if _r.strip():
+        try:
+            _rr = os.path.realpath(_r.strip())
+        except Exception:
+            _rr = os.path.normpath(_r.strip())
+        LEDGER_SHOWN = LEDGER_SHOWN or _rr
+        if _rr.casefold() not in LEDGER_ROOTS:
+            LEDGER_ROOTS.append(_rr.casefold())
+LEDGER_WRITERS = {"tee", "cp", "dd", "mv", "install", "ln", "truncate", "patch", "vim", "vi", "nano", "emacs", "ex",
+                  "rm", "rmdir", "chmod", "chown"}
+LEDGER_DENY = ("수리 장부(%s)는 데몬이 `cys repair …` 동사로만 쓴다 — 좌석이 파일 도구나 셸 쓰기로 장부를 쓰는 것은 역할과 "
+               "상관없이 막는다(좌석이 쓰는 자리는 수리의 작업 사본 `R-<번호>/staging/` 하나). %s")
+LEDGER_HINTS = {
+    "owner-tokens": "주인 지시 표는 주인이 직접 답한 뒤 데몬이 발급한다: 마스터가 `cys repair owner-token ask --path "
+                    "<문서>` 로 묻고, 주인이 답하면 `cys repair owner-token --path <문서>`.",
+    "grant": "자동 수리 허락은 주인의 답으로만 켜고 끈다: 마스터가 `cys repair grant ask` 로 묻고, 주인이 답하면 "
+             "`cys repair grant on` 또는 `cys repair grant off` — 지금 상태는 `cys repair grant status`.",
+    "tombstones": "지운 파일의 묘비는 그 수리의 `cys repair commit` 이 남기고 `cys repair revert <R-번호>` 가 지운다.",
+    "displaced": "보관 사본은 데몬이 `cys repair begin` 과 적용 때 만든다 — 되돌리기는 `cys repair revert <R-번호>`.",
+    "intake": "결함 신고는 `cys repair` 의 `report` 동사로 한다(--file <팩 기준 상대 경로> --error <줄>).",
+    "lanes": "점검 작업의 상태는 데몬의 작업이 쓴다 — 점검을 청하려면 `cys repair sweep`.",
+    "record": "수리 기록은 `cys repair begin` · `cys repair record` · `cys repair commit` 이 쓴다.",
+}
+
+def _ledger_abs(p, cwd):
+    """A path as the seat's shell would reach it: `~` and `$HOME` with the HOME the shell expands them with, a
+    relative path against the tool call's working directory; links resolved."""
+    home = os.environ.get("HOME", "")
+    if p == "~" or p.startswith("~/"):
+        p = home + p[1:]
+    for pre in ("${HOME}", "$HOME"):
+        if p == pre or p.startswith(pre + "/"):
+            p = home + p[len(pre):]
+            break
+    if not os.path.isabs(p):
+        p = os.path.join(cwd or os.getcwd(), p)
+    try:
+        return os.path.realpath(p)
+    except Exception:
+        return os.path.normpath(p)
+
+def ledger_place(path, cwd):
+    """None = not under the daemon's repair ledger; "staging" = the repair's working copy (U3 — the seat's place);
+    otherwise the store's key for the sentence."""
+    if not path or not LEDGER_ROOTS:
+        return None
+    rp = _ledger_abs(path, cwd).casefold()
+    for root in LEDGER_ROOTS:
+        if rp == root or rp.startswith(root.rstrip(os.sep) + os.sep):
+            parts = [x for x in rp[len(root):].split(os.sep) if x]
+            if len(parts) >= 2 and re.fullmatch(r"r-[0-9]+", parts[0]) and parts[1] == "staging":
+                return "staging"
+            if not parts:
+                return "record"
+            head = parts[0]
+            if head in ("grant.json", "grant-pause", "grant-seq"):
+                return "grant"
+            if head in ("owner-tokens", "tombstones", "displaced", "intake", "lanes"):
+                return head
+            return "record"
+    return None
+
+def ledger_deny(place):
+    return LEDGER_DENY % (LEDGER_SHOWN or "local/repairs", LEDGER_HINTS.get(place, LEDGER_HINTS["record"]))
+
+def ledger_shell_write(n, n_slash, cwd):
+    """The store a shell command writes into, or None — the rule-document scan's coarse judgment over the ledger: a word
+    that names a place in the ledger (not the working copy) and one write form this guard already recognises."""
+    toks = n.split() + (n_slash.split() if n_slash else [])
+    places = []
+    for t in toks:
+        cands = [t.lstrip(">")]
+        if "=" in t:
+            cands.append(t.split("=", 1)[1])
+        for c in cands:
+            pl = ledger_place(c, cwd) if c else None
+            if pl is not None and pl != "staging" and pl not in places:
+                places.append(pl)
+    if not places:
+        return None
+    seg_progs = set(); sed_inplace = False
+    for seg in l_segments(n):
+        p, a = l_cmd_word(seg); seg_progs.add(p)
+        if p == "sed" and any(x == "-i" or x.startswith("-i") for x in a):
+            sed_inplace = True
+    if (">" in toks) or (seg_progs & LEDGER_WRITERS) or sed_inplace:
+        return places[0]
+    return None
+
 # ================= 메인 =================
 def out_deny(reason):
     print("DENY\t" + reason); sys.exit(2)
@@ -959,6 +1059,19 @@ def out_deny(reason):
 def owner_token_allows(fp):
     r = _cys_exec(["repair", "rule-doc-allowed", "--path", fp], soft=True)
     return r is not None and r[0] == 0
+
+# RULINGS HP1 (T4e): the daemon's repair ledger — before every other rule, in every mode, for every role
+_ledger_cwd = data.get("cwd") if isinstance(data.get("cwd"), str) else ""
+if tool in WRITE_TOOLS:
+    _nb = ti.get("notebook_path") if isinstance(ti.get("notebook_path"), str) else ""
+    for _lp in (file_path, _nb):
+        _place = ledger_place(_lp, _ledger_cwd)
+        if _place is not None and _place != "staging":
+            out_deny(ledger_deny(_place))
+if tool == "Bash" and command:
+    _place = ledger_shell_write(norm_loose(command), norm_loose_slash(command), _ledger_cwd)
+    if _place is not None:
+        out_deny(ledger_deny(_place))
 
 if PAUSED and not PREFLIGHT:
     if tool in WRITE_TOOLS:
@@ -1041,6 +1154,12 @@ sys.exit(0)
 PY
 
 # ===== 실행 =====
+# ★RULINGS HP1 (T4e): 수리 장부의 자리 = 데몬이 쓰는 자리 `<팩의 부모>/local/repairs`. 이 훅 파일 자신의 자리에서 구한다
+#   (실제 경로 ROUND_DIR 와 이 훅이 불린 논리 경로 둘 다) — 훅의 환경 변수(CYS_LOCAL_DIR · CYS_PACK_DIR · HOME)는 읽지 않는다.
+GUARD_LEDGER_ROOTS="$(dirname "$ROUND_DIR")/local/repairs"
+_GL_PACK="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd -L)"
+[ -n "$_GL_PACK" ] && GUARD_LEDGER_ROOTS="$GUARD_LEDGER_ROOTS
+$(dirname "$_GL_PACK")/local/repairs"
 GUARD_PAUSED=0; [ -e "$PAUSED_FILE" ] && GUARD_PAUSED=1
 GUARD_ACTIVE=0; [ -e "$ACTIVE_FILE" ] && GUARD_ACTIVE=1
 
@@ -1095,12 +1214,12 @@ fi
 #   인터프리터는 종전처럼 아래 '파서 크래시' 갈래(STRICT deny · LOOSE 백스톱)로 간다.
 GUARD_PYFILE="$(mktemp "${TMPDIR:-/tmp}/.guard_pysrc.XXXXXX" 2>/dev/null || printf '%s' '')"
 if [ -n "$GUARD_PYFILE" ] && printf '%s' "$PYSRC" > "$GUARD_PYFILE" 2>/dev/null; then
-  PYOUT="$(printf '%s' "$INPUT" | GUARD_PAUSED="$GUARD_PAUSED" GUARD_ACTIVE="$GUARD_ACTIVE" GUARD_CONST_AUTH="$GUARD_CONST_AUTH" GUARD_CONST_SCOPE="$GUARD_CONST_SCOPE" GUARD_PREFLIGHT="$PREFLIGHT" "$PYBIN" -I -S -B -X utf8 "$(cys_native_path "$GUARD_PYFILE")" 2>/tmp/.guard_py_err.$$)"
+  PYOUT="$(printf '%s' "$INPUT" | GUARD_PAUSED="$GUARD_PAUSED" GUARD_ACTIVE="$GUARD_ACTIVE" GUARD_CONST_AUTH="$GUARD_CONST_AUTH" GUARD_CONST_SCOPE="$GUARD_CONST_SCOPE" GUARD_PREFLIGHT="$PREFLIGHT" GUARD_LEDGER_ROOTS="$GUARD_LEDGER_ROOTS" "$PYBIN" -I -S -B -X utf8 "$(cys_native_path "$GUARD_PYFILE")" 2>/tmp/.guard_py_err.$$)"
   RC=$?
   rm -f "$GUARD_PYFILE" 2>/dev/null
 else
   [ -n "$GUARD_PYFILE" ] && rm -f "$GUARD_PYFILE" 2>/dev/null
-  PYOUT="$(printf '%s' "$INPUT" | GUARD_PAUSED="$GUARD_PAUSED" GUARD_ACTIVE="$GUARD_ACTIVE" GUARD_CONST_AUTH="$GUARD_CONST_AUTH" GUARD_CONST_SCOPE="$GUARD_CONST_SCOPE" GUARD_PREFLIGHT="$PREFLIGHT" "$PYBIN" -I -S -B -X utf8 -c "$PYSRC" 2>/tmp/.guard_py_err.$$)"
+  PYOUT="$(printf '%s' "$INPUT" | GUARD_PAUSED="$GUARD_PAUSED" GUARD_ACTIVE="$GUARD_ACTIVE" GUARD_CONST_AUTH="$GUARD_CONST_AUTH" GUARD_CONST_SCOPE="$GUARD_CONST_SCOPE" GUARD_PREFLIGHT="$PREFLIGHT" GUARD_LEDGER_ROOTS="$GUARD_LEDGER_ROOTS" "$PYBIN" -I -S -B -X utf8 -c "$PYSRC" 2>/tmp/.guard_py_err.$$)"
   RC=$?
 fi
 # RULINGS FV1 / FZ1 (T4c): with GUARD_TEST_REPORT_LIMITS=1 forward the parser's ONE limits line from the existing

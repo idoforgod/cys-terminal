@@ -1891,3 +1891,120 @@ fn dg3_after_a_daemon_start_autonomous_starts_wait_owner_orders_do_not() {
         .unwrap();
     assert!(v["repair"].is_string(), "after 30 minutes the hold is over: {v}");
 }
+
+// ───────────────────────────── RULINGS HP1 (T4e) ─────────────────────────────
+
+/// Runs a copy of the product's `hooks/guard.sh` placed in `pack/hooks/` (so the ledger it protects is
+/// `<pack's parent>/local/repairs` — this rig's root) on one tool call; returns (exit status, stderr).
+#[cfg(unix)]
+fn guard_in_pack(pack: &Path, call: Value) -> (i32, String) {
+    use std::io::Write as _;
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("cysjavis-pack").join("hooks");
+    std::fs::create_dir_all(pack.join("hooks")).unwrap();
+    for f in ["guard.sh", "_lib.sh"] {
+        std::fs::copy(src.join(f), pack.join("hooks").join(f)).unwrap();
+    }
+    let flags = pack.join("flags");
+    std::fs::create_dir_all(&flags).unwrap();
+    let mut child = std::process::Command::new("bash")
+        .arg(pack.join("hooks").join("guard.sh"))
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()))
+        .env("HOME", pack.join("home"))
+        .env("GUARD_TEST_MODE", "1")
+        .env("AUTOPILOT_PAUSED_FILE", flags.join("AUTOPILOT_PAUSED"))
+        .env("AUTOPILOT_ACTIVE_FILE", flags.join("AUTOPILOT_ACTIVE"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(call.to_string().as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// RULINGS HP1 (T4e) — the reviewer's route F1, end to end. A seat writes an owner token for its lane and
+/// a rule document into the ledger with its file tool (and with a shell redirection): the guard refuses
+/// both with the ledger sentence, so no token file exists; `begin --owner-token` with that token then
+/// finds none and `rule-doc-allowed` answers no. Control — the same file WRITTEN, which is what the tool
+/// call did before HP1: `begin` accepts the token and `rule-doc-allowed` answers yes, so the refusal is
+/// what closes the route.
+#[cfg(unix)]
+#[test]
+fn hp1_route_f1_the_token_write_is_refused_and_begin_finds_none() {
+    let r = rig("hp1-f1");
+    let t = now0();
+    let token = oo::token_from_bytes(&[7u8; 16]);
+    let sha = oo::token_sha256(&token);
+    let forged = oo::OwnerToken {
+        schema: 1,
+        token_sha256: sha.clone(),
+        lane_key: r.lane.clone(),
+        issued_to_seat: 3,
+        paths: vec!["soul.md".into()],
+        repair: None,
+        prompt_digest: "d".into(),
+        prompt_excerpt: "예".into(),
+        issued_at: t,
+        expires_at: t + 3_600.0,
+        used_by_repair: None,
+    };
+    let body = serde_json::to_string(&forged).unwrap();
+    let target = oo::token_path_in(&r.root, &sha);
+    let (rc, err) = guard_in_pack(
+        &r.pack,
+        json!({"tool_name": "Write", "tool_input": {"file_path": target, "content": body}}),
+    );
+    assert_eq!(rc, 2, "{err}");
+    assert!(err.contains("수리 장부") && err.contains("cys repair owner-token ask --path"), "{err}");
+    let (rc, err) = guard_in_pack(
+        &r.pack,
+        json!({"tool_name": "Bash", "tool_input": {"command": format!("printf '%s' '{body}' > {}", target.display())}}),
+    );
+    assert_eq!(rc, 2, "{err}");
+    assert!(err.contains("수리 장부"), "{err}");
+    // the refused call wrote nothing: begin with that token finds none, rule-doc-allowed answers no
+    assert!(!target.exists());
+    let w = seat(3, "worker");
+    let begin = json!({"trigger": "owner_order", "files": ["soul.md"], "owner_token": token});
+    let e = r.call(t + 1.0, &w, "begin", begin.clone()).unwrap_err();
+    assert!(e.message.contains("발급된 적이 없습니다"), "{}", e.message);
+    let allowed = |at: f64| r.call(at, &w, "rule_doc_allowed", json!({"path": "soul.md"})).unwrap()["allowed"].clone();
+    assert_eq!(allowed(t + 2.0), json!(false));
+    assert!(r.ids().is_empty(), "nothing was begun");
+    // control: the write the guard refuses, done anyway (the world before HP1) — the route was real
+    oo::create_token_in(&r.root, &forged).unwrap();
+    assert!(r.call(t + 3.0, &w, "begin", begin).is_ok());
+    assert_eq!(allowed(t + 4.0), json!(true));
+}
+
+/// RULINGS HP1 (T4e) — the reviewer's F2 (`grant.json`), a tombstone and a vault file: each write is refused
+/// by the guard with the ledger sentence; the repair's working copy (`R-<n>/staging/`, U3) stays the seat's.
+#[cfg(unix)]
+#[test]
+fn hp1_grant_tombstone_and_vault_writes_are_refused_staging_is_not() {
+    let r = rig("hp1-stores");
+    let lane = r.lane.0.clone();
+    for (rel, hint) in [
+        ("grant.json".to_string(), "cys repair grant ask"),
+        (format!("tombstones/{lane}.json"), "cys repair commit"),
+        ("displaced/R-1/20261115T000000Z/sealed/guard.sh".to_string(), "cys repair revert"),
+    ] {
+        let p = r.root.join(&rel);
+        for call in [
+            json!({"tool_name": "Write", "tool_input": {"file_path": p, "content": "{}"}}),
+            json!({"tool_name": "Bash", "tool_input": {"command": format!("echo '{{}}' > {}", p.display())}}),
+        ] {
+            let (rc, err) = guard_in_pack(&r.pack, call);
+            assert_eq!(rc, 2, "{rel}: {err}");
+            assert!(err.contains("수리 장부") && err.contains(hint), "{rel}: {err}");
+        }
+    }
+    let staged = r.root.join("R-1/staging/hooks/guard.sh");
+    let (rc, err) = guard_in_pack(
+        &r.pack,
+        json!({"tool_name": "Write", "tool_input": {"file_path": staged, "content": "x"}}),
+    );
+    assert_eq!(rc, 0, "the working copy is the seat's (U3): {err}");
+}
