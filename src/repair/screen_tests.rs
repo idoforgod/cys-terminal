@@ -1090,6 +1090,77 @@ fn deny_is_read_as_strictly_as_the_harness() {
     }
 }
 
+/// RULINGS EO1: the deny object is a byte grammar — only JSON white space around exactly the
+/// released devices' shape; every other white space, a second object, another key, another value
+/// type, a missing or doubled key is "not shown". (Rust's `str::trim` took U+0085 / U+00A0 / U+FEFF
+/// as white space and the old reading accepted any object with a deny decision.)
+#[test]
+fn deny_is_a_byte_grammar() {
+    let deny = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"x"}}"#;
+    let mut rows: Vec<(Vec<u8>, bool)> = vec![(deny.as_bytes().to_vec(), true)];
+    rows.push((format!(" \t\r\n{deny}\r\n ").into_bytes(), true));
+    for ws in ["\u{0085}", "\u{00A0}", "\u{FEFF}"] {
+        rows.push((format!("{ws}{deny}").into_bytes(), false));
+        rows.push((format!("{deny}{ws}").into_bytes(), false));
+    }
+    rows.push((format!("{deny}{deny}").into_bytes(), false));
+    rows.push((deny.replacen("{\"hookSpecificOutput\"", "{\"extra\":\"1\",\"hookSpecificOutput\"", 1).into_bytes(), false));
+    rows.push((deny.replace("\"permissionDecisionReason\":\"x\"", "\"permissionDecisionReason\":1").into_bytes(), false));
+    rows.push((deny.replace(",\"permissionDecisionReason\":\"x\"", "").into_bytes(), false));
+    rows.push((deny.replace("\"deny\",", "\"deny\",\"permissionDecision\":\"deny\",").into_bytes(), false));
+    rows.push((deny.replace("\"x\"}", "\"x\",\"more\":\"y\"}").into_bytes(), false));
+    for (out, want) in rows {
+        assert_eq!(deny_payload(&out), want, "{:?}", String::from_utf8_lossy(&out));
+    }
+}
+
+/// RULINGS EL1, through the real runner: a deny object followed by white space up to past the capture
+/// limit and then plain text, exit 0 — the kept prefix parses, the WHOLE output does not: the answer
+/// is "not shown" (ERROR), never DENY.
+#[test]
+fn output_behind_the_capture_limit_is_not_a_deny() {
+    let root = test_root("el1-cap");
+    let deny = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"x"}}"#;
+    let script = format!(
+        "printf '%s' '{deny}'; head -c {} /dev/zero | tr '\\000' ' '; printf 'not json'; exit 0",
+        replay::MAX_CAPTURE + 4096
+    );
+    let env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
+    let o = replay::run_child(&["/bin/sh".into(), "-c".into(), script], &env, &root, b"", Duration::from_secs(20));
+    assert_eq!(o.code, Some(0), "{:?}", o.stderr_state);
+    assert!(o.stdout_state.dropped > 0 && !o.stdout_whole());
+    assert!(deny_payload(&o.stdout), "the kept prefix alone would read as a deny");
+    let (a, d) = answer_of(&o);
+    assert_eq!(a, Answer::Error, "{d}");
+    cleanup(&root);
+}
+
+/// RULINGS EL1: a repeat is complete only when every planned execution ran to a result — ONE spawn
+/// failure in the repeat with plenty of time left makes it incomplete, and the screen refuses. (The
+/// old completeness was "time was left" and accepted with a note.)
+#[test]
+fn repeat_with_one_spawn_failure_is_incomplete() {
+    let root = test_root("el1-spawn");
+    let lane = lane_of(&root, &[]);
+    let cand = candidate_of(&root, &[]);
+    let mut c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-1"]), false);
+    let lib = lane.join("hooks/_lib.sh");
+    c.between_snapshots = Some(Arc::new(move |pass| {
+        if pass == 1 {
+            let mut t = std::fs::read_to_string(&lib).unwrap();
+            t.push_str("\n# written during the first pass\n");
+            std::fs::write(&lib, t).unwrap();
+        }
+    }));
+    c.fail_first_spawn_in_repeat = true;
+    let mut rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    assert!(!rep.after_run.first.is_empty());
+    assert!(rep.after_run.repeat_incomplete, "{:?}", rep.after_run);
+    judge_after_run(&mut rep, &|_| false);
+    assert_eq!(rep.verdict, ScreenVerdict::Refused, "{:?}", rep.refusals);
+    cleanup(&root);
+}
+
 /// RULINGS DF1 regression: a candidate `hooks/_lib.sh` that makes every hook print ONE extra stdout
 /// line keeps a deny object in the output — the loose reading still saw DENY; the strict one sees no
 /// decision, so every R / C class the released gate denies here is REFUSED.
