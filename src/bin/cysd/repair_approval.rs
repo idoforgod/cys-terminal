@@ -798,7 +798,9 @@ pub(crate) fn production_step3(s3: &Step3Input) -> Result<Step3Ok, Step3Err> {
 }
 
 /// One rehearsal pass: a fresh scratch copy of the lane's pack with the candidate's states laid in,
-/// every target checked. `Err((why, completed))` — `completed` is false when a check ran out of time.
+/// every target checked. `Err((why, completed))` — RULINGS EL1: `completed` is true only when every
+/// planned check ran to a result (a check that FAILED is a result); a layout error, a check that could
+/// not run or ran out of time, a scratch that could not be removed — an early return — is not.
 fn rehearse_once(
     s3: &Step3Input,
     staging: &std::path::Path,
@@ -806,7 +808,7 @@ fn rehearse_once(
 ) -> Result<Vec<String>, (String, bool)> {
     use cys::repair::rehearsal::{self, CheckRequest, CheckResult};
     use cys::repair::replay::{self, ScratchRoot};
-    let done = |why: String| (why, true);
+    let done = |why: String| (why, false);
     let scratch =
         ScratchRoot::new(&rehearsal::scratch_base(), "s3-").map_err(|e| done(format!("{e:?}")))?;
     let layout = scratch.path().join("pack");
@@ -851,7 +853,7 @@ fn rehearse_once(
             } else {
                 format!("{rel}: {}", rehearsal::NOT_REHEARSABLE_KO)
             }),
-            CheckResult::Fail(m) => return Err(done(format!("예행 검사 실패 — {m}"))),
+            CheckResult::Fail(m) => return Err((format!("예행 검사 실패 — {m}"), true)),
             CheckResult::Timeout => return Err((format!("{rel}: 예행 검사 시간 초과"), false)),
         }
     }

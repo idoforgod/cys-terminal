@@ -1044,7 +1044,8 @@ fn production_check(
     };
     let (r, cmp) = cys::repair::rehearsal::compared_runs(&pack_root, &home, || {
         let r = run_check(&req);
-        let completed = !matches!(r, Ok(CheckResult::Timeout));
+        // RULINGS EL1: complete only when the check ran to a result (pass or fail)
+        let completed = matches!(r, Ok(CheckResult::Pass) | Ok(CheckResult::Fail(_)));
         (r, completed)
     });
     let r = match cmp {

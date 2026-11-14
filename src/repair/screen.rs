@@ -423,6 +423,8 @@ pub(crate) struct ScreenConfig {
     /// Test seam (RULINGS CZ6): runs with 1 right after the first "before" snapshot and with 2 right
     /// after the repeat's "before" snapshot.
     pub between_snapshots: Option<Arc<dyn Fn(u32) + Send + Sync>>,
+    /// Test seam (RULINGS EL1): the first execution of the repeat fails to start.
+    pub fail_first_spawn_in_repeat: bool,
 }
 
 impl ScreenConfig {
@@ -442,6 +444,7 @@ impl ScreenConfig {
             child_cap: Duration::from_secs(30),
             after_inputs_read: None,
             between_snapshots: None,
+            fail_first_spawn_in_repeat: false,
         }
     }
 
@@ -648,6 +651,14 @@ struct Runner<'a> {
     nopy_usr_bin: PathBuf,
     /// Answers may come from (and go to) the process-wide cache (false on the BL1 repeat).
     use_cache: bool,
+    /// RULINGS EL1 — the PLAN of this pass and how much of it ran to a result: every planned
+    /// execution (`planned`), those that ran to an exit status within their time (`finished`), and
+    /// early returns of a probe / I3 run before or after its executions (`broken`).
+    planned: AtomicUsize,
+    finished: AtomicUsize,
+    broken: AtomicUsize,
+    /// Test seam (EL1): the next execution of this pass fails to start.
+    inject_spawn_failure: AtomicBool,
 }
 
 /// Process-wide answers of hook probes, by (device, the input bytes' group key, interpreter, class,
@@ -676,6 +687,18 @@ fn cache_put(k: CacheKey, v: Vec<Judged>) {
 }
 
 impl<'a> Runner<'a> {
+    /// RULINGS EL1: every planned execution of this pass ran to a result, nothing returned early,
+    /// nothing ran out of time — computed from the plan, never from "time was left".
+    fn complete(&self) -> bool {
+        self.planned.load(Ordering::SeqCst) == self.finished.load(Ordering::SeqCst)
+            && self.broken.load(Ordering::SeqCst) == 0
+            && !self.out_of_time.load(Ordering::SeqCst)
+    }
+
+    fn mark_broken(&self) {
+        self.broken.fetch_add(1, Ordering::SeqCst);
+    }
+
     fn interp_key(&self) -> String {
         self.cfg
             .interpreter
@@ -701,6 +724,10 @@ impl<'a> Runner<'a> {
             py_dir,
             nopy_usr_bin: nopy,
             use_cache: true,
+            planned: AtomicUsize::new(0),
+            finished: AtomicUsize::new(0),
+            broken: AtomicUsize::new(0),
+            inject_spawn_failure: AtomicBool::new(false),
         })
     }
 
@@ -728,13 +755,23 @@ impl<'a> Runner<'a> {
         cwd: &Path,
         stdin: &[u8],
     ) -> replay::ChildOutcome {
+        self.planned.fetch_add(1, Ordering::SeqCst);
         let Some(d) = self.child_deadline() else {
             return replay::ChildOutcome {
                 timed_out: true,
                 ..Default::default()
             };
         };
+        if self.inject_spawn_failure.swap(false, Ordering::SeqCst) {
+            return replay::ChildOutcome {
+                spawn_error: Some("injected spawn failure (test)".into()),
+                ..Default::default()
+            };
+        }
         let o = replay::run_child(argv, env, cwd, stdin, d);
+        if !o.timed_out && o.spawn_error.is_none() && (o.code.is_some() || o.signal.is_some()) {
+            self.finished.fetch_add(1, Ordering::SeqCst);
+        }
         if !o.leftovers.is_empty() {
             if let Ok(mut l) = self.leftovers.lock() {
                 l.extend(o.leftovers.iter().copied());
@@ -835,7 +872,11 @@ fn answer_of(o: &replay::ChildOutcome) -> (Answer, String) {
     match o.code {
         Some(2) => (Answer::Deny, "exit 2".into()),
         Some(0) => {
-            if deny_payload(&o.stdout) {
+            // RULINGS EL1: an answer is judged only when it was observed WHOLE — an output that hit
+            // the cap or whose read failed is never a DENY-by-JSON, and it is no ALLOW either
+            if !o.stdout_whole() {
+                (Answer::Error, format!("exit 0, output not observed whole ({:?})", o.stdout_state))
+            } else if deny_payload(&o.stdout) {
                 (Answer::Deny, "exit 0 + deny payload".into())
             } else {
                 (Answer::Allow, "exit 0".into())
@@ -846,26 +887,47 @@ fn answer_of(o: &replay::ChildOutcome) -> (Answer, String) {
     }
 }
 
-/// RULINGS DF1 — the screen reads a hook's answer at least as strictly as the harness: exit 0 is a
-/// DENY only when the WHOLE trimmed standard output is exactly ONE JSON object carrying the devices'
-/// deny decision (`hookSpecificOutput.permissionDecision` = `deny`, `hookEventName` = `PreToolUse`
-/// — the form both devices print). A deny object on one line among other output, two objects, or
-/// any other shape is no deny (a harness that parses the whole output sees no decision there).
+/// RULINGS DF1 / EO1 — DENY-by-JSON is a BYTE GRAMMAR, not a trim: the output must be, byte for
+/// byte, optional JSON white space (0x20 0x09 0x0A 0x0D) + ONE object of exactly the shape the
+/// released devices print — the only top-level key `hookSpecificOutput`, an object whose keys are
+/// exactly `hookEventName` = `PreToolUse`, `permissionDecision` = `deny` and
+/// `permissionDecisionReason`, every value a string, no key twice — + optional JSON white space.
+/// Anything else (another white space such as U+0085, U+00A0 or U+FEFF, a second object, another
+/// key, another value type) is "not shown".
 pub(crate) fn deny_payload(stdout: &[u8]) -> bool {
-    let Ok(s) = std::str::from_utf8(stdout) else {
+    let json_ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r');
+    let start = stdout.iter().position(|b| !json_ws(b)).unwrap_or(stdout.len());
+    let end = stdout.iter().rposition(|b| !json_ws(b)).map_or(start, |i| i + 1);
+    let body = &stdout[start..end];
+    if body.first() != Some(&b'{') {
+        return false;
+    }
+    // a key twice is a shape the devices never print (a parser would keep one of them)
+    let text = String::from_utf8_lossy(body);
+    for key in [
+        "\"hookSpecificOutput\"",
+        "\"hookEventName\"",
+        "\"permissionDecision\"",
+        "\"permissionDecisionReason\"",
+    ] {
+        if text.matches(key).count() > 1 {
+            return false;
+        }
+    }
+    let Ok(serde_json::Value::Object(top)) = serde_json::from_slice::<serde_json::Value>(body) else {
         return false;
     };
-    // `from_str` refuses anything after the one value (trailing characters)
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(s.trim()) else {
+    if top.len() != 1 {
+        return false;
+    }
+    let Some(serde_json::Value::Object(h)) = top.get("hookSpecificOutput") else {
         return false;
     };
-    v.is_object()
-        && v.pointer("/hookSpecificOutput/permissionDecision")
-            .and_then(|d| d.as_str())
-            == Some("deny")
-        && v.pointer("/hookSpecificOutput/hookEventName")
-            .and_then(|d| d.as_str())
-            == Some("PreToolUse")
+    let keys: BTreeSet<&str> = h.keys().map(String::as_str).collect();
+    keys == BTreeSet::from(["hookEventName", "permissionDecision", "permissionDecisionReason"])
+        && h.values().all(|v| v.is_string())
+        && h.get("hookEventName").and_then(|v| v.as_str()) == Some("PreToolUse")
+        && h.get("permissionDecision").and_then(|v| v.as_str()) == Some("deny")
 }
 
 /// The budget counter file the gate keeps for a session (`<state>/capgate/<sha256(sid)[:32]>.calls`,
@@ -895,11 +957,14 @@ fn run_hook_probe(
 ) -> Vec<Judged> {
     match run_hook_probe_inner(r, files, released_files, class, probe, setup) {
         Ok(j) => j,
-        Err(e) => vec![Judged {
+        Err(e) => {
+            r.mark_broken();
+            vec![Judged {
             suffix: "",
             answer: Answer::Error,
             detail: format!("layout: {e:?}"),
-        }],
+        }]
+        }
     }
 }
 
@@ -1233,10 +1298,13 @@ fn run_backstop_probe(
         let cleaned = replay::remove_tree(&run);
         res.and_then(|j| cleaned.map(|()| j))
     };
-    go().unwrap_or_else(|e| Judged {
-        suffix: "",
-        answer: Answer::Error,
-        detail: format!("layout: {e:?}"),
+    go().unwrap_or_else(|e| {
+        r.mark_broken();
+        Judged {
+            suffix: "",
+            answer: Answer::Error,
+            detail: format!("layout: {e:?}"),
+        }
     })
 }
 
@@ -2250,6 +2318,7 @@ fn run_i3(
         res.and(cleaned)
     })();
     if let Err(e) = go {
+        r.mark_broken();
         for row in out.iter_mut() {
             row.2 = None;
             row.3 = format!("{} — run not clean: {e:?}", row.3);
@@ -2358,6 +2427,7 @@ fn screen_i3(r: &Runner<'_>, v: &Variants, rels: &[String], results: &mut Vec<Pr
         .flat_map(|l| [Scenario::S1, Scenario::S2, Scenario::S3].map(move |s| (*l, s)))
         .collect();
     let Some(template) = template else {
+        r.mark_broken();
         for (l, s) in &combos {
             results.push(ProbeResult {
                 test: "I3".into(),
@@ -2546,7 +2616,8 @@ pub(crate) fn screen_with(
     if let Some(hook) = &cfg.between_snapshots {
         hook(1);
     }
-    let (mut results, leftovers, out_of_time) = run_all(cfg, &v, &inputs, until, true)?;
+    let (mut results, leftovers, out_of_time, _first_complete) =
+        run_all(cfg, &v, &inputs, until, true)?;
     let after = replay::live_snapshot(lane, &settings);
     let first: Vec<LiveDifference> = replay::changed_items(&before, &after)
         .into_iter()
@@ -2565,12 +2636,14 @@ pub(crate) fn screen_with(
         if let Some(hook) = &cfg.between_snapshots {
             hook(2);
         }
-        // RULINGS CZ6: a repeat that ran out of time or failed is incomplete — it proves nothing
-        let (left2, oot2) = match run_all(cfg, &v, &inputs, until, false) {
-            Ok((_again, left2, oot2)) => (left2, oot2),
-            Err(_) => (Vec::new(), true),
+        // RULINGS CZ6 / EL1: the repeat is complete only when EVERY planned execution ran to a
+        // result (computed from the plan) — a spawn failure, one child's time-out, an early return
+        // or a failed pass make it incomplete, and an incomplete repeat proves nothing
+        let (left2, complete2) = match run_all(cfg, &v, &inputs, until, false) {
+            Ok((_again, left2, _oot2, complete2)) => (left2, complete2),
+            Err(_) => (Vec::new(), false),
         };
-        repeat_incomplete = oot2;
+        repeat_incomplete = !complete2;
         let after2 = replay::live_snapshot(lane, &settings);
         all_leftovers.extend(left2);
         rewritten = replay::changed_items(&before2, &after2)
@@ -2616,7 +2689,8 @@ pub(crate) fn screen_with(
     Ok(report)
 }
 
-type RunAll = (Vec<ProbeResult>, Vec<u32>, bool);
+/// (results, leftover processes, out of time, the pass COMPLETE — RULINGS EL1).
+type RunAll = (Vec<ProbeResult>, Vec<u32>, bool, bool);
 
 fn run_all(
     cfg: &ScreenConfig,
@@ -2628,6 +2702,9 @@ fn run_all(
     let scratch = ScratchRoot::new(&cfg.scratch_base, "sc-")?;
     let mut r = Runner::new(cfg, scratch.path(), until)?;
     r.use_cache = use_cache;
+    if !use_cache && cfg.fail_first_spawn_in_repeat {
+        r.inject_spawn_failure.store(true, Ordering::SeqCst);
+    }
     let mut results = Vec::new();
     let empty = Vec::new();
     let g = inputs.get("G").unwrap_or(&empty);
@@ -2646,10 +2723,11 @@ fn run_all(
     screen_at4(v, &mut results);
     let leftovers = r.leftovers.lock().map(|l| l.clone()).unwrap_or_default();
     let oot = r.out_of_time.load(Ordering::SeqCst);
+    let complete = r.complete();
     drop(r);
     // RULINGS CZ4: a pass whose scratch root cannot be removed is no measured pass
     scratch.close()?;
-    Ok((results, leftovers, oot))
+    Ok((results, leftovers, oot, complete))
 }
 
 fn summarize(probes: Vec<ProbeResult>, input_fingerprint: String, took: Duration) -> ScreenReport {
