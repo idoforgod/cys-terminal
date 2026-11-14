@@ -450,3 +450,31 @@ fn revert_latest_is_chosen_by_this_lanes_application_time() {
     let v = r.call(T0 + 600.0, &human(), "revert", json!({"latest": true})).unwrap();
     assert_eq!(v["repair"], json!(lo), "the one applied here last, not the highest number: {v}");
 }
+
+/// DX1: "revertible" has ONE definition — the latest repair applied here failed and was closed
+/// `실패 — …` (CU1): the button reverts IT (not an older healthy one); with nothing revertible the
+/// answer is an honest "nothing to revert". Without DX1 the picker's own state list skipped the
+/// failed repair.
+#[test]
+fn revert_latest_takes_a_failed_repair_and_says_nothing_honestly() {
+    let r = rig("dx1failed");
+    let older = committed(&r, "hooks/o.sh", b"#!/bin/sh\necho o\n");
+    let failed = committed(&r, "hooks/f.sh", b"#!/bin/sh\necho f\n");
+    for (id, t, closed) in [(&older, T0 + 100.0, None), (&failed, T0 + 500.0, Some("실패 — 재검사 실패, 되돌리지 못했습니다"))] {
+        let rid = cys::repair::types::RepairId::parse(id).unwrap();
+        let mut row = ledger::read_lane_in(&r.root, &rid, &r.lane).unwrap().unwrap();
+        let p = row.probation.as_mut().unwrap();
+        p.applied_at = t;
+        p.closed = closed.map(str::to_string);
+        if closed.is_some() {
+            row.state = cys::repair::types::LaneState::Conflict;
+        }
+        ledger::write_lane_in(&r.root, &row).unwrap();
+    }
+    let v = r.call(T0 + 600.0, &human(), "revert", json!({"latest": true})).unwrap();
+    assert_eq!(v["repair"], json!(failed), "the failed repair applied last: {v}");
+    // nothing revertible any more → honest refusal
+    let empty = rig("dx1empty");
+    let e = empty.call(T0, &human(), "revert", json!({"latest": true})).unwrap_err();
+    assert!(e.message.contains("되돌릴 수리가 없습니다"), "{}", e.message);
+}

@@ -3702,31 +3702,24 @@ mod apply_verbs {
         }))
     }
 
-    /// CT11: the repair whose apply in THIS lane is the most recent (its row's `applied_at`) among
-    /// those revertible here — the row still applies something (a file state or a hook line) and its
-    /// probation is open, 사용 중, or left 충돌 by an unfinished apply / revert.
+    /// CT11 / DX1: the repair whose apply in THIS lane is the most recent (its row's `applied_at`)
+    /// among those `revert_in` accepts — asked of THE predicate `cys::repair::apply::revertible_here`
+    /// (a probation closed 실패 included); no state list of its own.
     pub(crate) fn latest_applied_here(ctx: &Ctx<'_>) -> Option<RepairId> {
         let mut best: Option<(f64, RepairId)> = None;
         for id in ledger::list_ids_in(&ctx.root) {
             let Ok(Some(row)) = ledger::read_lane_in(&ctx.root, &id, &ctx.lane) else {
                 continue;
             };
-            let Some(p) = row.probation.as_ref() else {
-                continue;
-            };
-            let open = match p.closed.as_deref() {
-                None => true,
-                Some(c) => c.starts_with("사용 중") || c.starts_with("충돌"),
-            };
             let Ok(Some(rec)) = ledger::read_record_in(&ctx.root, &id) else {
                 continue;
             };
-            let applies = !row.applied.is_empty() || ledger::hook_lines(&rec).next().is_some();
-            if !open || !applies {
+            if !cys::repair::apply::revertible_here(&rec, &row, &ctx.lane) {
                 continue;
             }
-            if best.as_ref().is_none_or(|(t, _)| p.applied_at > *t) {
-                best = Some((p.applied_at, id));
+            let at = row.probation.as_ref().map(|p| p.applied_at).unwrap_or(row.updated_at);
+            if best.as_ref().is_none_or(|(t, _)| at > *t) {
+                best = Some((at, id));
             }
         }
         best.map(|(_, id)| id)
