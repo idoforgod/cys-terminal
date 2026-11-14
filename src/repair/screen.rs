@@ -2037,6 +2037,10 @@ enum SettingsDoc {
     Link(String),
     Json(serde_json::Value),
     NotJson(Vec<u8>),
+    /// RULINGS GR2: a document that already holds the screen's reserved normalisation token in a
+    /// key or a string — refused before any normalisation (it could otherwise be made equal by
+    /// writing the token)
+    Reserved,
 }
 
 const RUN_PLACEHOLDER: &str = "@@SCREEN_RUN@@";
@@ -2053,6 +2057,21 @@ fn settings_doc(path: &Path, run: &Path) -> Option<SettingsDoc> {
     let Some(mut v) = replay::parse_unique(&bytes) else {
         return Some(SettingsDoc::NotJson(bytes));
     };
+    // RULINGS GR2: the reserved token in any DECODED key or string (an escaped spelling included) —
+    // refused before the run's root is replaced by it
+    fn holds_token(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::String(t) => t.contains(RUN_PLACEHOLDER),
+            serde_json::Value::Array(a) => a.iter().any(holds_token),
+            serde_json::Value::Object(m) => m
+                .iter()
+                .any(|(k, x)| k.contains(RUN_PLACEHOLDER) || holds_token(x)),
+            _ => false,
+        }
+    }
+    if holds_token(&v) {
+        return Some(SettingsDoc::Reserved);
+    }
     let mut roots = vec![run.to_string_lossy().into_owned()];
     if let Ok(c) = run.canonicalize() {
         roots.push(c.to_string_lossy().into_owned());
@@ -2123,6 +2142,10 @@ fn doc_difference(reference: &SettingsDoc, got: &SettingsDoc) -> Option<String> 
     }
     match (reference, got) {
         (SettingsDoc::Json(x), SettingsDoc::Json(y)) => at(x, y, ""),
+        // RULINGS GR2: never equal, not even to another such document
+        (_, SettingsDoc::Reserved) | (SettingsDoc::Reserved, _) => {
+            Some("the whole file (it holds the screen's reserved normalisation token)".into())
+        }
         _ if reference == got => None,
         _ => Some("the whole file".into()),
     }
