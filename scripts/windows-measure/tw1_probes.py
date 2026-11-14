@@ -798,13 +798,14 @@ def remove_hook_registration(settings_file, token):
     return changed
 
 
-def wait_ready(cys_exe, limit_s):
-    t0 = time.monotonic()
+def wait_ready(cys_exe, limit_s, t0=None):
+    """Poll `cys list` (never autostarting) until it answers. -> (ready, seconds since t0, last result)."""
+    t0 = time.monotonic() if t0 is None else t0
     while time.monotonic() - t0 < limit_s:
         r = run([cys_exe, "list"], 15, env=clean_env({"CYS_NO_AUTOSTART": "1"}))
         if r["code"] == 0:
             return True, round(time.monotonic() - t0, 2), r
-        time.sleep(1)
+        time.sleep(0.25)
     return False, round(time.monotonic() - t0, 2), None
 
 
@@ -2040,6 +2041,27 @@ def _start_holder(pr, kind, pack, tag):
     raise ValueError(kind)
 
 
+def _first_start(pr, installer, tag):
+    """RULINGS FW3: from a clean state (no installation, no ~/.cys), install with /S and launch cysd.exe with NO pack
+    folder - seconds from the launch to its first answer on the pipe (it installs the whole pack before it listens)."""
+    out = {"reset_clean": _reset_installation(pr)["clean"]}
+    r = run([installer, "/S"], 900)
+    time.sleep(2)
+    _kill_product(pr.install_dir)
+    out["install_exit"] = r["code"]
+    out["pack_absent_before"] = not os.path.exists(pr.pack_dir)
+    t0 = time.monotonic()
+    pid = start_detached([pr.exe("cysd.exe")], env=clean_env(), stdout_path=os.path.join(pr.ev_dir, tag + "-cysd.out"))
+    pr.register_pid(pid, tag + " daemon")
+    ok, secs, _ = wait_ready(pr.exe("cys.exe"), 180, t0=t0)
+    out["first_answer_s"] = secs if ok else None
+    m = pack_manifest(pr.pack_dir)
+    out["pack_files_after"] = None if m is None else len(m)
+    _kill_product(pr.install_dir)
+    pr.unregister_pid(pid)
+    return out
+
+
 def probe_s6_variants(pr):
     """G01 variants (RULINGS FS5): for each holder set, a fresh v0.14.56 base with the L1 edit, the candidate installed
     with /S, then the app's exact `cys init-pack --no-install-hook` WITH the holders, then the daemon's install - the
@@ -2056,6 +2078,20 @@ def probe_s6_variants(pr):
     if not (base_inst and cand and rel):
         return
     vendor = read_bytes(os.path.join(REPO, "cysjavis-pack", *rel.split("/")))
+    # ── RULINGS FW3: the daemon's first start with an empty pack, base and candidate, each from a clean state ──
+    fs_base = _first_start(pr, base_inst, "firststart-base")
+    fs_cand = _first_start(pr, cand, "firststart-candidate")
+    pr.ev("first-start.json", {"base": fs_base, "candidate": fs_cand})
+    f["first_start_base_s"] = fs_base["first_answer_s"]
+    f["first_start_candidate_s"] = fs_cand["first_answer_s"]
+    f["first_start_base_clean"] = fs_base["reset_clean"] and fs_base["pack_absent_before"] and fs_base["install_exit"] == 0
+    f["first_start_candidate_clean"] = fs_cand["reset_clean"] and fs_cand["pack_absent_before"] and fs_cand["install_exit"] == 0
+    f["first_start_base_pack_files"] = fs_base["pack_files_after"]
+    f["first_start_candidate_pack_files"] = fs_cand["pack_files_after"]
+    f["first_start_ratio"] = (round(f["first_start_candidate_s"] / f["first_start_base_s"], 2)
+                              if f["first_start_base_s"] and f["first_start_candidate_s"] else None)
+    s2f = (_load(os.path.join(pr.work, "obs", "s2_update.json")) or {}).get("facts") or {}
+    f["start_after_update_s"] = s2f.get("new_daemon_ready_s")
     for name, kinds in sc["g01_variants"]:
         tag = "v_" + name
         rs = _reset_installation(pr)

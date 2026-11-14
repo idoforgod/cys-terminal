@@ -262,7 +262,7 @@
   },
   "s6_variants": {
    "stage": "S6",
-   "time_limit_s": 2700,
+   "time_limit_s": 3300,
    "requires_state": "any",
    "leaves_state": "unknown",
    "read_only": false,
@@ -2467,6 +2467,54 @@
      ],
      "class": "YES",
      "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "I-LISTEN.firststart",
+     "kind": "record",
+     "probe": "s6_variants",
+     "title": "the daemon's first start with an empty pack (base and candidate, each from a clean state) and the start right after the update - seconds from launch to the first answer on the pipe (RULINGS FW3)",
+     "checks": [
+      {
+       "id": "base-clean",
+       "role": "complete",
+       "fact": "first_start_base_clean",
+       "op": "true"
+      },
+      {
+       "id": "cand-clean",
+       "role": "complete",
+       "fact": "first_start_candidate_clean",
+       "op": "true"
+      },
+      {
+       "id": "base-s",
+       "role": "check",
+       "fact": "first_start_base_s",
+       "op": "not_none"
+      },
+      {
+       "id": "cand-s",
+       "role": "check",
+       "fact": "first_start_candidate_s",
+       "op": "not_none"
+      },
+      {
+       "id": "after-update-s",
+       "role": "check",
+       "fact": "start_after_update_s",
+       "op": "not_none"
+      },
+      {
+       "id": "ratio",
+       "role": "assumption",
+       "fact": "first_start_ratio",
+       "op": "le",
+       "value": 2.0,
+       "assumption": "RULINGS FW3: the candidate's first start is not more than twice the base's (pass condition I: the app's start and checks must not time out)"
+      }
+     ],
+     "class": "YES",
      "phase": 1
     },
     {
