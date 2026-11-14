@@ -789,7 +789,9 @@ class KeptFolder(Rig):
         self.assertEqual(len(holders), 1, "교체 뒤 옛 핸들의 저장이 어디에도 없다(지워진 파일에 들어갔다) — %r" % self.kept())
         return holders[0]
 
-    def test_late_save_into_the_displaced_file_survives_demotion_and_is_reported_once(self):
+    def test_late_save_into_the_displaced_file_survives_demotion_and_is_reported_until_handled(self):
+        """★FY2a(FL6 의 '파일마다 한 번' 을 대신한다) — 경고는 조건이 서 있는 동안 매번 나오고, 사람이 다 본 사본을 handled/ 로
+        옮기면 끝난다(이 행은 그 폴더를 보지 않고, 행의 문장이 그 폴더를 말한다)."""
         self.seed()
         self.assertEqual(self.run_dept("promote-ceo")[0], 0)
         holder = self.late_save_through_an_old_handle("demote")
@@ -798,9 +800,15 @@ class KeptFolder(Rig):
         self.assertEqual(rows["C03.ceo-kept"]["status"], pf.WARN, rows.get("C03.ceo-kept"))
         self.assertIn(holder, rows["C03.ceo-kept"]["detail"])
         self.assertIn("살아 있는 지침에는 없다", rows["C03.ceo-kept"]["detail"])
+        handled = os.path.join(self.dirs, ".ceo-kept", "handled")
+        self.assertIn(handled, rows["C03.ceo-kept"]["detail"], "행이 경고를 끝내는 폴더를 말하지 않는다")
         again = self.c03()["C03.ceo-kept"]
-        self.assertEqual(again["status"], pf.PASS, "같은 파일을 두 번 경고했다(파일마다 한 번)")
-        self.assertIn("이미 알림", again["detail"])
+        self.assertEqual(again["status"], pf.WARN, "조건이 그대로인데 두 번째 확인이 경고하지 않았다(기억으로 끝냈다)")
+        os.makedirs(handled)
+        for f in (holder, holder + ".kept"):
+            os.rename(f, os.path.join(handled, os.path.basename(f)))
+        done = self.c03()["C03.ceo-kept"]
+        self.assertEqual(done["status"], pf.PASS, "handled/ 로 옮긴 뒤에도 경고했다 — %r" % done)
 
     def test_late_save_into_the_displaced_file_survives_recomposition(self):
         self.seed()
@@ -890,7 +898,7 @@ class KeptFolder(Rig):
             self.assertEqual(json.loads(raw)["sha256"], sha("보관할 바이트\n"))
 
     def test_a_kept_file_without_a_readable_sidecar_is_unresolved_not_skipped(self):
-        """곁 파일이 없거나 형식이 틀린 사본은 C03 이 건너뛰지 않는다 — '미확인'으로 보인다(처음엔 WARN, 그 뒤로도 이름이 남는다)."""
+        """곁 파일이 없거나 형식이 틀린 사본은 C03 이 건너뛰지 않는다 — '미확인'으로 보이고, 그대로인 동안 매번 WARN(FY2)."""
         self.seed()
         kd = os.path.join(self.dirs, ".ceo-kept")
         os.makedirs(kd)
@@ -907,12 +915,13 @@ class KeptFolder(Rig):
         self.assertIn("미확인", row["detail"])
         self.assertIn("보관 사본 2개", row["detail"], "임시 파일을 사본으로 셌다")
         again = self.c03()["C03.ceo-kept"]
-        self.assertEqual(again["status"], pf.PASS, "같은 미확인 사본을 매번 경고했다")
+        self.assertEqual(again["status"], pf.WARN, "미확인 사본이 그대로인데 경고가 멈췄다(★FY2a — 기억 없음)")
         for k in (bare, bad):
             self.assertIn(k, again["detail"], "미확인 사본이 다음 확인에서 사라졌다")
 
-    def test_the_warned_mark_follows_the_warning(self):
-        """'알렸다' 표지는 WARN 행을 남긴 뒤에 만든다(codex B6: 표지를 먼저 만들고 멈추면 그 저장은 영영 알려지지 않았다)."""
+    def test_nothing_is_acknowledged_so_a_lost_output_loses_no_warning(self):
+        """codex R2 — 종전: WARN 행을 메모리에 남긴 뒤 '알렸다' 표지를 만들어, 출력 전에 멈추면 그 경고는 영영 나오지 않았다. 이제
+        이 행은 아무것도 기억하지 않는다(FY2a): 출력되지 못한 실행 뒤의 다음 실행도 WARN 이고, 표지 폴더는 생기지 않는다."""
         self.seed()
         self.assertEqual(self.run_dept("promote-ceo")[0], 0)
         holder = self.late_save_through_an_old_handle("demote")
@@ -920,7 +929,7 @@ class KeptFolder(Rig):
 
         def failing_add(p, cid, status, *a, **kw):
             if cid == "C03.ceo-kept" and status == pf.WARN:
-                raise RuntimeError("the WARN row was never emitted (crash)")
+                raise RuntimeError("the WARN row was never printed (crash)")
             return orig(p, cid, status, *a, **kw)
         pf.Preflight.add = failing_add
         try:
@@ -928,9 +937,46 @@ class KeptFolder(Rig):
                 self.c03()
         finally:
             pf.Preflight.add = orig
+        self.c03()                                  # 결과를 내지 못하고 끝난 또 한 번의 실행(출력 전에 멈춤)
         row = self.c03()["C03.ceo-kept"]
-        self.assertEqual(row["status"], pf.WARN, "알리지 못한 저장을 '이미 알림'으로 넘겼다(표지가 알림보다 먼저 생겼다)")
+        self.assertEqual(row["status"], pf.WARN, "출력되지 못한 경고를 '이미 알림'으로 넘겼다(codex R2)")
         self.assertIn(holder, row["detail"])
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".cys", "state", "preflight-c03-kept-warned")),
+                         "'알렸다' 표지 폴더가 생겼다")
+
+    def test_every_unusable_sidecar_is_unresolved(self):
+        """★FY2b·c — 기준을 세울 수 없는 곁 파일은 모두 '미확인'(WARN): {} · {"sha256": null} · 종류 없음 · 일반 파일인데 해시 없음 ·
+        읽지 못했다(unread) · 객체가 아님 · 해시 형식이 틀림 · 일반 파일이 아니라는데 지금은 일반 파일. 폴더로 보관된 것은
+        '비교하지 않음'으로 이름이 나온다(조용히 건너뛰지 않는다)."""
+        good = sha("보관 때의 바이트\n")
+        cases = [("empty object", {}, "file"), ("null hash only", {"sha256": None}, "file"),
+                 ("regular without hash", {"kind": "regular", "sha256": None}, "file"),
+                 ("unread", {"kind": "regular", "sha256": None, "unread": True}, "file"),
+                 ("not an object", [good], "file"), ("bad hash", {"kind": "regular", "sha256": "xyz"}, "file"),
+                 ("link but now a file", {"kind": "link", "sha256": None}, "file"),
+                 ("no kind with a hash", {"sha256": good}, "file")]
+        for label, side, what in cases:
+            with self.subTest(sidecar=label):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                kd = os.path.join(self.dirs, ".ceo-kept")
+                os.makedirs(kd)
+                k = os.path.join(kd, "20260101T000000Z-1-1.compose")
+                _write(k, "보관 때의 바이트\n")
+                _write(k + ".kept", json.dumps(side))
+                row = self.c03()["C03.ceo-kept"]
+                self.assertEqual(row["status"], pf.WARN, "%s 곁 파일을 미확인으로 보지 않았다: %r" % (label, row))
+                self.assertIn("미확인", row["detail"])
+                self.assertIn(k, row["detail"])
+        shutil.rmtree(self.dirs, ignore_errors=True)
+        self.seed()
+        kd = os.path.join(self.dirs, ".ceo-kept")
+        os.makedirs(os.path.join(kd, "20260101T000000Z-1-1.backup"))
+        _write(os.path.join(kd, "20260101T000000Z-1-1.backup.kept"), json.dumps({"kind": "dir", "sha256": None}))
+        row = self.c03()["C03.ceo-kept"]
+        self.assertEqual(row["status"], pf.PASS, row)
+        self.assertIn("비교하지 않음", row["detail"])
+        self.assertIn("20260101T000000Z-1-1.backup", row["detail"])
 
     def test_the_warning_claims_only_what_it_measured(self):
         """경고는 잰 것을 말한다 — 사본의 바이트가 보관 뒤에 바뀌었다. '살아 있는 지침에는 없다'는 살아 있는 지침과 비교했을 때만:
@@ -939,22 +985,22 @@ class KeptFolder(Rig):
         kd = os.path.join(self.dirs, ".ceo-kept")
         os.makedirs(kd)
         k1 = os.path.join(kd, "20260101T000000Z-1-1.compose")
-        _write(k1, HEADER + SEP + USER)                                   # 바뀐 사본 — 그 본문은 살아 있는 지침(USER)과 같다
-        _write(k1 + ".kept", json.dumps({"schema": 1, "sha256": sha("보관 때의 바이트\n")}))
+        _write(k1, USER)                                                  # 바뀐 사본 — 그 내용은 살아 있는 지침(USER)에 있다
+        _write(k1 + ".kept", json.dumps({"schema": 2, "kind": "regular", "sha256": sha("보관 때의 바이트\n")}))
         row = self.c03()["C03.ceo-kept"]
-        self.assertEqual(row["status"], pf.WARN, row)
-        self.assertIn("보관 뒤에 바뀌었다", row["detail"])
+        self.assertEqual(row["status"], pf.PASS, "바뀐 내용이 살아 있는 지침에 있는데 경고했다(★FY2a): %r" % row)
         self.assertIn("살아 있는 지침에도 있다", row["detail"])
         self.assertNotIn("살아 있는 지침에는 없다", row["detail"], "비교해 보면 있는데 없다고 말했다")
         k2 = os.path.join(kd, "20260101T000000Z-1-2.compose")
         _write(k2, USER + "다른 줄\n")
-        _write(k2 + ".kept", json.dumps({"schema": 1, "sha256": sha("보관 때의 바이트\n")}))
+        _write(k2 + ".kept", json.dumps({"schema": 2, "kind": "regular", "sha256": sha("보관 때의 바이트\n")}))
         aside = self.p("MASTER_DIRECTIVE.md.aside")
         os.rename(self.p("MASTER_DIRECTIVE.md"), aside)                   # 살아 있는 지침을 읽을 수 없다
         try:
             row = self.c03()["C03.ceo-kept"]
         finally:
             os.rename(aside, self.p("MASTER_DIRECTIVE.md"))
+        self.assertEqual(row["status"], pf.WARN, row)
         self.assertIn(k2, row["detail"])
         self.assertIn("비교하지 못했다", row["detail"])
         self.assertNotIn("살아 있는 지침에는 없다", row["detail"], "비교하지 않고 '없다'고 말했다")

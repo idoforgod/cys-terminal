@@ -1047,12 +1047,6 @@ def gate_state_dir_for_pack(pack=None):
         else os.path.join(root, "report_gate")
 
 
-def c03_kept_warned_dir():
-    """★RULINGS FA1 — C03 이 '보관 뒤 저장'을 이미 알린 보관 사본마다 하나씩 단독 생성하는 표지 파일의 폴더(관측 원장 —
-    지문 원장과 같은 ~/.cys/state 관용 · 공유 파일을 다시 쓰지 않는다)."""
-    return os.path.join(os.path.expanduser("~"), ".cys", "state", "preflight-c03-kept-warned")
-
-
 def c03_fingerprint_path():
     """C03 상태 지문 원장 위치(스펙 v4 A6) — 기존 state 관용(~/.cys/state ·
     gate_state_dir_for_pack 과 동일 루트)을 따른다. base 팩 전용이다 — dept/CEO 팩은
@@ -2263,92 +2257,138 @@ class Preflight:
 
     _C03_CEO_KEPT_DIR = ".ceo-kept"
 
+    _C03_CEO_KEPT_HANDLED = "handled"
+
     def _c03_ceo_kept_row(self):
-        """[보관 축] C03.ceo-kept — ★RULINGS EY1·FA1·FL6. cys-dept 는 살아 있던 지침 파일(교체로 밀려난 것 · 되돌린 후보 · 쓰이지
-        않은 후보 · 강등 뒤의 .pre-ceo)을 지우지 않고 directives/.ceo-kept/ 로 옮기며, 사본마다 보관 시각의 해시를 곁 파일
-        <이름>.kept 에 통째로 게시한다. 이 행은 사본 수·합계 크기·최신 이름을 보이고(정보 · PASS), 보관 뒤에 사본의 바이트가
-        바뀐 것(교체 전에 열린 편집기 핸들의 저장 — codex 순서 ①)을 **파일마다 한 번** WARN 으로 알린다. ★FL6: 곁 파일이 없거나
-        형식이 틀린 사본은 건너뛰지 않는다 — '미확인'으로 이름을 보인다(파일마다 처음 한 번 WARN, 그 뒤로는 PASS 행에 늘 나온다).
-        한 번은 c03_kept_warned_dir() 아래 표지 파일을 단독 생성(O_EXCL)해 기억하고, 그 표지는 WARN 행을 남긴 **뒤에** 만든다
-        (먼저 만들고 멈추면 알림 없이 표지만 남는다 · 못 만들면 다시 알린다 — 안전한 쪽). 문장은 잰 것만 말한다: '보관 뒤에
-        사본의 바이트가 바뀌었다(곁 파일의 보관 시각 해시와 다르다)'. '살아 있는 지침에는 없다'는 살아 있는 지침과 비교했을 때만
-        말한다(조립된 판이면 구분선 뒤 본문을 비교 — 머리말은 제품이 다시 만든다). 점으로 시작하는 이름(멈춘 게시의 임시 파일)은
-        사본이 아니다. 보관 폴더가 없거나 비었으면 행이 없다. C03 은 사본을 지우지 않는다(무-fix · 지우는 것은 오너나 워커의 몫)."""
+        """[보관 축] C03.ceo-kept — ★RULINGS EY1·FA1·FY2. 이 행은 **디스크의 함수**다 — '이미 알렸다'는 기억을 두지 않는다(FY2a:
+        표지 폴더·표지 없음 — 알린 것을 기억하지 않으니 알림이 출력되기 전에 멈춰도 잃는 것이 없다). cys-dept 는 살아 있던 지침
+        파일을 지우지 않고 directives/.ceo-kept/ 로 옮기며, 곁 파일 <이름>.kept 에 보관한 것의 종류(regular · link · dir · other)와
+        일반 파일이면 보관 시각 바이트의 sha256 을 통째로 게시한다(그 순간 읽지 못했으면 unread). WARN — 조건이 서 있는 동안 늘:
+        ① 보관 뒤 바이트가 바뀐 사본(곁 파일의 해시와 다르다) 중 그 내용이 살아 있는 지침에 없거나 있다고 보일 수 없는 것 ②
+        미확인 사본 — 기준을 세울 수 없다(FY2b·c): 곁 파일 없음 · 읽을 수 없음 · 객체가 아님 · 종류(kind)가 없거나 틀림 · 해시
+        형식이 틀림 · 일반 파일인데 해시가 없음(unread 포함) · 곁 파일은 일반 파일이 아니라는데 지금은 일반 파일 · 사본을 읽을 수
+        없음. PASS — 바뀐 사본이 모두 살아 있는 지침에 들어 있을 때(수·크기 줄과 함께). 경고는 **사람의 행동**으로 끝난다: 그 내용을
+        살아 있는 본문에 옮기거나, 다 본 사본을 하위 폴더 handled/ 로 옮긴다 — 이 행은 handled/ 를 보지 않고, 행의 문장이 그 폴더를
+        말한다. 링크·폴더 등으로 보관된 것은 '비교하지 않음'으로 이름을 보인다(조용히 건너뛰지 않는다). 점으로 시작하는 이름(멈춘
+        게시의 임시 파일)은 사본이 아니다. 보관 폴더가 없거나 비었으면 행이 없다. C03 은 사본을 지우거나 옮기지 않는다(무-fix)."""
         cid = "C03.ceo-kept"
         if self.skipped(cid):
             return
         d = os.path.join(pack_dir(), "directives")
         kd = os.path.join(d, self._C03_CEO_KEPT_DIR)
+        handled = os.path.join(kd, self._C03_CEO_KEPT_HANDLED)
         try:
-            names = sorted(n for n in os.listdir(kd) if not n.endswith(".kept") and not n.startswith("."))
-        except OSError:
+            names = sorted(n for n in os.listdir(kd) if not n.endswith(".kept") and not n.startswith(".")
+                           and n != self._C03_CEO_KEPT_HANDLED)
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            self.add(cid, WARN, "보관 폴더 %s 를 읽지 못했다(%s) — 보관 사본의 상태를 잴 수 없다(통과가 아니다)" % (kd, e))
             return
         if not names:
             return
         live = self._c03_read_bytes(os.path.join(d, "MASTER_DIRECTIVE.md"))
-        total, changed, unresolved = 0, [], []
+        total, unresolved, outside, inside, notcmp = 0, [], [], [], []
         for n in names:
             path = os.path.join(kd, n)
-            try:
-                with open(path, "rb") as f:
-                    b = f.read()
-                total += len(b)
-            except OSError:
-                b = None
-            try:
-                with open(path + ".kept", encoding="utf-8") as f:
-                    side = json.load(f)
-                want = side.get("sha256") if isinstance(side, dict) else ""
-                if want is not None and not (isinstance(want, str) and re.fullmatch(r"[0-9a-f]{64}", want)):
-                    raise ValueError("sha256")
-            except FileNotFoundError:
-                unresolved.append((path, "곁 파일 없음"))
+            kind = self._c03_kind(path)
+            b = None
+            if kind == "regular":
+                try:
+                    with open(path, "rb") as f:
+                        b = f.read()
+                    total += len(b)
+                except OSError:
+                    b = None
+            side, why = self._c03_sidecar(path + ".kept")
+            if side is None:
+                unresolved.append((path, why))
                 continue
-            except (OSError, ValueError):
-                unresolved.append((path, "곁 파일을 읽을 수 없거나 형식이 틀림"))
+            if side["kind"] != "regular":
+                if kind == "regular":
+                    unresolved.append((path, "곁 파일은 %s 라는데 지금은 일반 파일이다" % side["kind"]))
+                else:
+                    notcmp.append((path, side["kind"]))
                 continue
-            if want is None:        # 보관 때 일반 파일이 아니었다(곁 파일이 그렇게 적었다 — 링크·폴더): 바이트를 비교하지 않는다
+            if side.get("unread") is True:
+                unresolved.append((path, "보관할 때 읽지 못했다(기준 해시 없음)"))
                 continue
             if b is None:
-                unresolved.append((path, "사본을 읽을 수 없음"))
+                unresolved.append((path, "사본을 읽을 수 없다" if kind == "regular"
+                                   else "곁 파일은 일반 파일이라는데 지금은 %s" % (kind or "알 수 없음")))
                 continue
-            if hashlib.sha256(b).hexdigest() != want:
-                changed.append((path, self._c03_kept_in_live(b, live)))
-        wd = c03_kept_warned_dir()
-        seen = lambda key: os.path.lexists(os.path.join(wd, key))
-        fresh = [(p, inlive) for p, inlive in changed if not seen(os.path.basename(p))]
-        told = [p for p, _ in changed if seen(os.path.basename(p))]
-        ufresh = [(p, why) for p, why in unresolved if not seen(os.path.basename(p) + ".unresolved")]
+            if hashlib.sha256(b).hexdigest() == side["sha256"]:
+                continue
+            verdict, said = self._c03_kept_in_live(b, live)
+            (inside if verdict is True else outside).append((path, said))
         info = ("보관 사본 %d개 · 합계 %.1f KB · 최신 %s — %s 에 있다. 승격·강등은 보관 사본을 지우지 않는다(지우는 것은 오너나 "
-                "워커의 몫)" % (len(names), total / 1024.0, names[-1], kd))
-        if unresolved:
-            info += (" · 미확인 %d개(보관 뒤에 바뀌었는지 잴 수 없다): %s"
-                     % (len(unresolved), ", ".join("%s(%s)" % (p, why) for p, why in unresolved)))
-        if fresh or ufresh:
-            where = {None: "살아 있는 지침을 읽지 못해 비교하지 못했다", True: "그 내용은 살아 있는 지침에도 있다",
-                     False: "살아 있는 지침에는 없다"}
+                "워커의 몫). 다 본 사본은 %s 로 옮기면 이 행이 더 보지 않는다" % (len(names), total / 1024.0, names[-1], kd, handled))
+        if notcmp:
+            info += " · 비교하지 않음(일반 파일이 아님) %d개: %s" % (
+                len(notcmp), ", ".join("%s(%s)" % (p, k) for p, k in notcmp))
+        if inside:
+            info += " · 보관 뒤 바뀌었지만 살아 있는 지침에 들어 있는 사본 %d개: %s" % (
+                len(inside), ", ".join("%s(%s)" % (p, t) for p, t in inside))
+        if outside or unresolved:
             parts = ["보관 사본 %s 의 바이트가 보관 뒤에 바뀌었다(곁 파일에 적힌 보관 시각의 해시와 다르다 — 교체 전에 열린 "
-                     "편집기가 그 사본에 저장했을 수 있다) — %s" % (p, where[inlive]) for p, inlive in fresh]
-            parts += ["보관 사본 %s 은(는) 미확인이다(%s — 보관 뒤에 바뀌었는지 잴 수 없다)" % (p, why) for p, why in ufresh]
-            self.add(cid, WARN, "%s. 그 내용이 필요하면 오너 지시로 워커가 본문에 옮긴다 · %s" % (" · ".join(parts), info))
-            # ★FL6: 표지는 알린 **뒤에** 만든다.
-            for key in ([os.path.basename(p) for p, _ in fresh]
-                        + [os.path.basename(p) + ".unresolved" for p, _ in ufresh]):
-                try:
-                    os.makedirs(wd, exist_ok=True)
-                    os.close(os.open(os.path.join(wd, key), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))
-                except OSError:
-                    pass                # 이미 있다(다른 실행) · 못 만든다 → 다음에 다시 알린다(안전한 쪽)
+                     "편집기가 그 사본에 저장했을 수 있다) — %s" % (p, t) for p, t in outside]
+            parts += ["보관 사본 %s 은(는) 미확인이다(%s — 보관 뒤에 바뀌었는지 잴 수 없다)" % (p, why) for p, why in unresolved]
+            self.add(cid, WARN, "%s. 그 내용이 필요하면 오너 지시로 워커가 본문에 옮기고, 다 본 사본은 %s 로 옮긴다(그때까지 이 행은 "
+                                "매번 WARN 이다) · %s" % (" · ".join(parts), handled, info))
         else:
-            self.add(cid, PASS, info + ("" if not told else " · 교체 뒤 저장 %d건은 이미 알림(%s)" % (len(told), ", ".join(told))))
+            self.add(cid, PASS, info)
+
+    @staticmethod
+    def _c03_kind(path):
+        """이름 하나의 종류(링크를 따라가지 않는다): regular · link · dir · other · absent · None(잴 수 없음)."""
+        try:
+            m = os.lstat(path).st_mode
+        except FileNotFoundError:
+            return "absent"
+        except OSError:
+            return None
+        return ("regular" if stat.S_ISREG(m) else "link" if stat.S_ISLNK(m) else "dir" if stat.S_ISDIR(m)
+                else "other")
+
+    @staticmethod
+    def _c03_sidecar(path):
+        """★FY2b·c — 곁 파일 → (내용, None) | (None, 미확인 이유). 종류(kind)가 regular·link·dir·other 중 하나여야 하고, sha256 은
+        regular(unread 아님)일 때 64자리 hex, 그 밖(일반 파일이 아님·unread)일 때만 null 이다. {} 와 {"sha256": null} 은 미확인."""
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            return None, "곁 파일 없음"
+        except OSError as e:
+            return None, "곁 파일을 읽을 수 없음(%s)" % e
+        try:
+            side = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return None, "곁 파일이 JSON 이 아니다"
+        if not isinstance(side, dict):
+            return None, "곁 파일이 객체가 아니다"
+        kind, digest, unread = side.get("kind"), side.get("sha256"), side.get("unread", False)
+        if kind not in ("regular", "link", "dir", "other"):
+            return None, "곁 파일에 종류(kind)가 없거나 틀렸다"
+        if not isinstance(unread, bool):
+            return None, "곁 파일의 unread 형식이 틀렸다"
+        if digest is not None and not (isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)):
+            return None, "곁 파일의 sha256 형식이 틀렸다"
+        if digest is None and kind == "regular" and not unread:
+            return None, "일반 파일인데 해시가 없다"
+        if digest is not None and (kind != "regular" or unread):
+            return None, "해시가 종류·unread 와 맞지 않는다"
+        return side, None
 
     def _c03_kept_in_live(self, b, live):
-        """보관 사본의 지금 바이트가 살아 있는 지침에 들어 있는가 — None(살아 있는 지침을 읽지 못해 비교 못 함) · True · False.
-        조립된 판(머리말 + 구분선 + 본문)이면 본문만 본다(★FL6 — 비교했을 때만 '없다'고 말한다)."""
+        """보관 사본의 지금 바이트가 살아 있는 지침에 들어 있는가 — (True | False | None(비교 못 함), 그 문장). 조립된 판이면
+        본문을 본다(★FL6 — 비교했을 때만 '없다'고 말한다)."""
         if live is None:
-            return None
+            return None, "살아 있는 지침을 읽지 못해 비교하지 못했다"
         c = self._c03_ceo_split(b)
-        return (c[2] if c is not None else b) in live
+        if (c[2] if c is not None else b) in live:
+            return True, "그 내용은 살아 있는 지침에도 있다"
+        return False, "살아 있는 지침에는 없다"
 
     def _c03_ceo_intent_row(self):
         """[교체 축] C03.ceo-intent — ★RULINGS EY2. cys-dept 는 본부 지침의 살아 있는 이름을 바꾸기 전에 의도 기록
