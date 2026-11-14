@@ -1140,8 +1140,21 @@ pub(crate) fn wait_helper_for(mut child: std::process::Child, limit: Duration) -
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    // RULINGS DR3 (the same rule as the replay runner): killed, its exit polled for a short fixed
+    // grace, never waited for — a helper stuck in the kernel is left to a detached reap
     let _ = child.kill();
-    let _ = child.wait();
+    let grace = std::time::Instant::now();
+    while grace.elapsed() < Duration::from_millis(500) {
+        if let Ok(Some(_)) = child.try_wait() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = std::thread::Builder::new()
+        .name("repair-helper-reap".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
     false
 }
 
