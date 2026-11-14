@@ -65,3 +65,50 @@ fn production_check_finds_a_check_writing_the_live_pack() {
     assert!(!r.passed);
     assert!(r.failure.contains("다시 썼습니다"), "{}", r.failure);
 }
+
+/// RULINGS GR6 — through the production wrapper: a one-off finding (the check's replay writes a live
+/// listed file in its first run only — the repeat does not write it again → "noted") whose intake row
+/// could not be written is NOT passed; the answer says the finding could not be recorded and carries
+/// the finding. The same finding with its row written (new, or the existing row of its signature)
+/// passes. (The old wrapper discarded the intake's answer and answered "passed".)
+#[test]
+fn a_finding_that_could_not_be_recorded_is_not_passed() {
+    use super::Filed;
+    let one_off = |name: &str| {
+        let p = pack(name);
+        let live = p.join("hooks/guard.sh");
+        std::fs::write(&live, "#!/bin/sh\nexit 0\n").unwrap();
+        let marker = p.parent().unwrap().join("wrote-once");
+        std::fs::write(
+            p.join("hooks/appbuild-gate.sh"),
+            format!(
+                "#!/bin/sh\nif [ ! -f '{m}' ]; then : > '{m}'; printf 'x\\n' >> '{l}'; fi\nexit 0\n",
+                m = marker.display(),
+                l = live.display()
+            ),
+        )
+        .unwrap();
+        p
+    };
+    let check = |p: &std::path::Path, answer: Filed| {
+        super::production_check_with(
+            "hooks/appbuild-gate.sh",
+            &p.join("hooks/appbuild-gate.sh"),
+            std::time::Duration::from_secs(30),
+            &|_| Some(answer.clone()),
+        )
+        .expect("the runner answers")
+    };
+    let p = one_off("gr6-failed");
+    let r = check(&p, Filed::Failed("injected: the ledger cannot be written".into()));
+    assert!(!r.passed, "a finding that could not be recorded passed");
+    assert!(r.failure.contains(super::UNRECORDED_FINDING), "{}", r.failure);
+    assert!(r.failure.contains("바뀌었으나"), "the finding travels in the answer: {}", r.failure);
+    let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    for (name, answer) in [("gr6-new", Filed::New), ("gr6-exists", Filed::Exists)] {
+        let p = one_off(name);
+        let r = check(&p, answer);
+        assert!(r.passed, "{name}: a recorded finding refused: {}", r.failure);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+}

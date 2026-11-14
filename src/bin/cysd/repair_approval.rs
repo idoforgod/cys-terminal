@@ -224,6 +224,12 @@ impl Step3Err {
     /// intake row naming the candidate's first target was already written (`filed` = the ledger's
     /// answer): the reason, that row, and the master's pointer only for a NEW row.
     fn escaped(repair: &RepairId, rel: &str, line: String, filed: &crate::repair::Filed) -> Self {
+        let why = match filed {
+            crate::repair::Filed::Failed(w) => {
+                format!("{line} — {}({w})", crate::repair::UNRECORDED_FINDING)
+            }
+            _ => line.clone(),
+        };
         Self {
             owner_line: (*filed == crate::repair::Filed::New).then(|| {
                 format!(
@@ -231,8 +237,8 @@ impl Step3Err {
                     repair.as_str()
                 )
             }),
-            intake: vec![(rel.to_string(), line.clone())],
-            why: line,
+            intake: vec![(rel.to_string(), line)],
+            why,
         }
     }
 }
@@ -562,7 +568,7 @@ pub(crate) fn submit(
 /// only AFTER the ledger answered for the row (a failed write marks nothing; the next sweep or
 /// submit files it again).
 fn report_unknown(table: &Mutex<ApprovalTable>, eff: &dyn Effects, repair: &str, file: &str, line: &str) {
-    if eff.intake(file, line).settled() {
+    if eff.intake(file, line).recorded() {
         table
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1037,6 +1043,16 @@ pub(crate) fn production_step3_with(
         rehearse_once(s3, &staging, started)
     });
     let mut found: Vec<(String, String)> = Vec::new();
+    // RULINGS GR6: a finding whose row could not be written stops step 3 here — no approval follows
+    let unrecorded = |filed: &crate::repair::Filed, line: &str| -> Result<(), Step3Err> {
+        match filed {
+            crate::repair::Filed::Failed(why) => Err(Step3Err::from(format!(
+                "{}({why}) — 기록하지 못한 발견이 있으므로 승인으로 넘기지 않습니다: {line}",
+                crate::repair::UNRECORDED_FINDING
+            ))),
+            _ => Ok(()),
+        }
+    };
     let result = (|| -> Result<Step3Ok, Step3Err> {
         let mut notes: Vec<String> = Vec::new();
         match cmp {
@@ -1045,8 +1061,9 @@ pub(crate) fn production_step3_with(
                 return Err(Step3Err::escaped(&s3.repair, &first_rel, line, &filed));
             }
             Comparison::Noted(line) => {
-                file(&first_rel, &line);
+                let filed = file(&first_rel, &line);
                 found.push((first_rel.clone(), line.clone()));
+                unrecorded(&filed, &line)?;
                 notes.push(line);
             }
             Comparison::Clean => {}
@@ -1068,8 +1085,9 @@ pub(crate) fn production_step3_with(
         // … and its noted difference is written now, whatever the screen's verdict
         let noted = screen::after_run_note(&rep);
         if let Some(line) = &noted {
-            file(&first_rel, line);
+            let filed = file(&first_rel, line);
             found.push((first_rel.clone(), line.clone()));
+            unrecorded(&filed, line)?;
         }
         if rep.verdict == ScreenVerdict::Refused {
             return Err(format!("보호장치 심사 거부 — {}", rep.refusals.join(" / ")).into());
@@ -2196,13 +2214,14 @@ pub(crate) fn comparison_consequence(
     daemon: &Arc<Daemon>,
     rel: &str,
     c: &cys::repair::rehearsal::Comparison,
-) {
+) -> Option<crate::repair::Filed> {
+    // RULINGS GR6: the ledger's answer goes back to the check (a finding not recorded refuses)
     check_consequence(
         rel,
         c,
         &|f, l| crate::repair::file_intake(daemon, f, l),
         &|text| point_master_now(daemon, text),
-    );
+    )
 }
 
 /// [`comparison_consequence`]'s body over a given intake filing and pointer (the ledger's answer).

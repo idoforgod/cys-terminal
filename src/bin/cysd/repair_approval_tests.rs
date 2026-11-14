@@ -1056,7 +1056,9 @@ fn escape_line_once_per_candidate() {
     assert!(again.owner_line.is_none(), "the ledger says not new: no second line — {again:?}");
     assert_eq!(
         *rows.lock().unwrap(),
-        vec![crate::repair::Filed::New, crate::repair::Filed::NotNew],
+        // RULINGS GR6 renamed the existing row's answer (`NotNew` → `Exists`; quota / excluded are
+        // `Failed` now)
+        vec![crate::repair::Filed::New, crate::repair::Filed::Exists],
         "the row is written each time"
     );
 }
@@ -1100,6 +1102,49 @@ fn step3_writes_the_row_first_and_a_failed_write_marks_nothing() {
     assert!(next.owner_line.is_some(), "nothing was marked by the failure: {next:?}");
 }
 
+/// RULINGS GR6 — step 3: a one-off finding (written in the first pass only → "noted") whose intake row
+/// could not be written stops step 3 — no approval follows; the answer says so and the found list
+/// travels in it. (The old step 3 discarded the intake's answer and went on to the screen and the
+/// card.)
+#[test]
+fn step3_refuses_a_finding_that_could_not_be_recorded() {
+    let r = rig("gr6-s3");
+    let id = RepairId::parse("R-1").unwrap();
+    let live = r.pack.join("hooks/guard.sh");
+    std::fs::write(&live, b"#!/bin/sh\nexit 0\n").unwrap();
+    let marker = r.dir.join("wrote-once");
+    let rel = "hooks/appbuild-gate.sh";
+    let staged = ledger::staging_dir_in(&r.root, &id).join(rel);
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::write(
+        &staged,
+        format!(
+            "#!/bin/sh\nif [ ! -f '{m}' ]; then : > '{m}'; printf 'x\\n' >> '{l}'; fi\nexit 0\n",
+            m = marker.display(),
+            l = live.display()
+        ),
+    )
+    .unwrap();
+    cys::repair::replay::set_mode(&staged, 0o755);
+    let s3 = Step3Input {
+        root: r.root.clone(),
+        repair: id,
+        pack: r.pack.clone(),
+        states: vec![(rel.to_string(), TargetState::read(&staged).unwrap())],
+        windows: false,
+    };
+    let home = r.dir.join("realhome");
+    std::fs::create_dir_all(&home).unwrap();
+    let e = production_step3_with(&s3, &home, &|_, _| {
+        crate::repair::Filed::Failed("injected: the ledger cannot be written".into())
+    })
+    .unwrap_err();
+    assert!(e.why.contains(crate::repair::UNRECORDED_FINDING), "{}", e.why);
+    assert!(e.why.contains("바뀌었으나"), "{}", e.why);
+    assert_eq!(e.intake.len(), 1, "the found list travels in the answer: {e:?}");
+    assert!(e.owner_line.is_none());
+}
+
 /// RULINGS GA8 — the worker's `check`: the comparison's row is written within the call (no helper
 /// thread), the pointer follows only a NEW row and is sent once; a failed write sends nothing and
 /// marks nothing; a noted difference is a row and never a pointer.
@@ -1119,7 +1164,7 @@ fn check_comparison_writes_the_row_and_points_once() {
     );
     assert!(pointed.lock().unwrap().is_empty(), "a failed write sends nothing");
     assert_eq!(check_consequence(rel, &refused, &ledger, &point), Some(crate::repair::Filed::New));
-    assert_eq!(check_consequence(rel, &refused, &ledger, &point), Some(crate::repair::Filed::NotNew));
+    assert_eq!(check_consequence(rel, &refused, &ledger, &point), Some(crate::repair::Filed::Exists));
     assert_eq!(pointed.lock().unwrap().len(), 1, "one pointer for one new row");
     let noted = Comparison::Noted("예행 동안 실제 환경의 항목이 바뀌었으나 다시 돌렸을 때는 바뀌지 않았습니다(x)".into());
     assert_eq!(check_consequence(rel, &noted, &ledger, &point), Some(crate::repair::Filed::New));

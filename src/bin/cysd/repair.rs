@@ -547,20 +547,23 @@ pub(crate) fn with_daemon_ctx<T>(daemon: &Arc<Daemon>, f: impl FnOnce(&Ctx<'_>) 
 pub(crate) enum Filed {
     /// a NEW row (the ledger's first count) — the only answer a pointer to the master may follow
     New,
-    /// the ledger already held the row (counted again) or declined it by its own rule (its hourly
-    /// quota, an excluded file)
-    NotNew,
-    /// the row could not be written — nothing is marked; the next identical check files it again
+    /// a row with this signature already exists — counted again; that IS the durable row (GR6)
+    Exists,
+    /// the row was NOT written: an error, the ledger's hourly quota, an excluded class — nothing is
+    /// marked, and a finding that could not be recorded refuses (RULINGS GR6)
     Failed(String),
 }
 
 impl Filed {
-    /// The ledger has answered for the row (durable, or deliberately not kept) — a cache in memory may
-    /// follow only then (GA8 (2)).
-    pub(crate) fn settled(&self) -> bool {
-        !matches!(self, Filed::Failed(_))
+    /// The finding is in the ledger (a new row, or the existing row of its signature) — a cache in
+    /// memory may follow only then (GA8 (2)); anything else refuses (GR6).
+    pub(crate) fn recorded(&self) -> bool {
+        matches!(self, Filed::New | Filed::Exists)
     }
 }
+
+/// RULINGS GR6: the sentence of a finding that could not be recorded.
+pub(crate) const UNRECORDED_FINDING: &str = "찾은 것을 접수 장부에 남기지 못했습니다";
 
 /// Track T5b — one intake row filed by the daemon itself (a lane finding of the protection screen,
 /// C4 AY1: "one intake row naming the protection"; a comparison's finding — GA8), through the
@@ -583,10 +586,18 @@ pub(crate) fn file_intake_in(ctx: &Ctx<'_>, file: &str, error: &str) -> Filed {
             if v.get("count").and_then(Value::as_u64) == Some(1) {
                 Filed::New
             } else {
-                Filed::NotNew
+                Filed::Exists
             }
         }
-        Ok(_) => Filed::NotNew,
+        // RULINGS GR6: declined by the ledger's own rule — NOT recorded
+        Ok(v) => Filed::Failed(if v.get("over_quota").and_then(Value::as_bool) == Some(true) {
+            "the intake ledger's hourly quota is used up".to_string()
+        } else {
+            format!(
+                "an excluded class ({})",
+                v.get("excluded").and_then(Value::as_str).unwrap_or("?")
+            )
+        }),
         Err(e) => Filed::Failed(e.message),
     }
 }
@@ -1072,7 +1083,10 @@ fn production_check(
     live: &Path,
     deadline: std::time::Duration,
 ) -> Result<CheckReport, RepairError> {
-    production_check_with(rel, live, deadline, &|_| {})
+    // no daemon here: no intake ledger — a finding cannot be recorded (RULINGS GR6: it refuses)
+    production_check_with(rel, live, deadline, &|_| {
+        Some(Filed::Failed("no intake ledger in this context".into()))
+    })
 }
 
 /// [`production_check`] telling `compared` what the scoped after-run comparison found (RULINGS EO5 (a):
@@ -1082,7 +1096,7 @@ pub(crate) fn production_check_with(
     rel: &str,
     live: &Path,
     deadline: std::time::Duration,
-    compared: &dyn Fn(&cys::repair::rehearsal::Comparison),
+    compared: &dyn Fn(&cys::repair::rehearsal::Comparison) -> Option<Filed>,
 ) -> Result<CheckReport, RepairError> {
     use cys::repair::rehearsal::{run_reference_check, CheckRequest, CheckResult};
     let kind = check_kind_for(rel);
@@ -1105,11 +1119,23 @@ pub(crate) fn production_check_with(
         // RULINGS GA3: complete only when the check ran to a result observed whole
         cys::repair::rehearsal::run_check_observed(&req)
     });
-    if cmp != cys::repair::rehearsal::Comparison::Clean {
-        compared(&cmp);
-    }
-    let r = match cmp {
-        cys::repair::rehearsal::Comparison::Refused(line) => CheckResult::Fail(line),
+    // RULINGS GR6: what the comparison found is written first; a finding whose row could not be
+    // written is never "passed" — the answer names the finding and why it was not recorded
+    let filed = if cmp != cys::repair::rehearsal::Comparison::Clean {
+        compared(&cmp)
+    } else {
+        None
+    };
+    let unrecorded = match &filed {
+        Some(Filed::Failed(why)) => Some(why.clone()),
+        _ => None,
+    };
+    let r = match (cmp, unrecorded) {
+        (cys::repair::rehearsal::Comparison::Refused(line), None) => CheckResult::Fail(line),
+        (cys::repair::rehearsal::Comparison::Refused(line), Some(why))
+        | (cys::repair::rehearsal::Comparison::Noted(line), Some(why)) => CheckResult::Fail(format!(
+            "{UNRECORDED_FINDING}({why}) — 기록하지 못한 발견이 있으므로 통과가 아닙니다: {line}"
+        )),
         _ => r?,
     };
     let check_ms = started.elapsed().as_millis() as u64;
