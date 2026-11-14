@@ -11,6 +11,9 @@
   · 판정은 selector 를 재구현하지 않고 version-check.sh **자기 출력의 8행 표**를 파싱한다.
     (재구현하면 스크립트가 바뀔 때 검사기가 조용히 갈라진다.)
   · 각 변조는 '정확히 1개 SOT 만 구버전'이어야 유효하다 — 그 조건까지 단언한다.
+  · ★'구버전'은 실트리의 현재 버전에서 **유도**하고, 유도값이 현재값과 다르다는 것을 먼저 단언한다(RULINGS EU1 ·
+    2026-11-14). 종전엔 패치 자리를 max(0, p-1) 로 내려 x.y.0 에서 자기 자신이 나왔다 — 0.15.0 에서 변조 8종이
+    무변조가 되어 이 파일이 exit 1 이었고, release.yml 태그 빌드는 이 파일을 version-check.sh 보다 먼저 돈다.
   · 양성 대조(무변조 사본은 통과)를 함께 돌린다. 없으면 '검사기가 항상 빨간' 경우를 못 본다.
 
 실행: python3 scripts/tests/test_version_sot_mutation.py     (stdlib 전용 · 네트워크 무접촉)
@@ -52,12 +55,24 @@ def current_version():
 
 
 def older(ver):
-    """같은 형식의 '이전' 버전 문자열 하나 — 패치 자리를 1 내린다(실재 릴리스일 필요 없다)."""
+    """같은 형식의 '다른' 버전 문자열 하나 — 되도록 이전 버전(구버전 잔류를 흉내 · 실재 릴리스일 필요 없다).
+
+    ★RULINGS EU1(2026-11-14): 모든 버전에서 입력과 **다른** 값을 돌려준다. 숫자 자리 중 **마지막의 0 아닌 자리**를
+    1 내린다 — 0.14.56 → 0.14.55 · 0.15.0 → 0.14.0 · 0.15.1 → 0.15.0 · 1.0.0 → 0.0.0. 이전 버전이 없는 0.0.0 만
+    마지막 자리를 1 올린다(0.0.0 → 0.0.1 — 이때는 '구버전'이 아니라 '다른 버전'이지만 게이트가 잡는 것은 같다:
+    8곳 중 한 곳만 갈림). 접미(-rc1 등)가 붙어 숫자 자리로 끝나지 않는 형식은 종전대로 '-old' 를 덧붙인다.
+    종전 구현은 패치만 max(0, p-1) 로 내려 x.y.0 에서 입력 그대로를 돌려줬다(변조 8종이 조용히 무변조)."""
     parts = ver.split(".")
-    if len(parts) < 3 or not parts[-1].isdigit():
+    if len(parts) < 3 or not all(p.isdigit() for p in parts):
         return ver + "-old"
-    parts[-1] = str(max(0, int(parts[-1]) - 1))
-    return ".".join(parts)
+    nums = [int(p) for p in parts]
+    for i in range(len(nums) - 1, -1, -1):
+        if nums[i] > 0:
+            nums[i] -= 1
+            break
+    else:
+        nums[-1] = 1
+    return ".".join(str(n) for n in nums)
 
 
 def seed(dst):
@@ -115,6 +130,20 @@ def main():
     old = older(new)
     fails = []
     print("버전 SOT mutation 음성 대조 — NEW=%s OLD=%s" % (new, old))
+
+    # ── ★전제 단언(RULINGS EU1): 유도한 '구버전'이 현재 버전과 다르지 않으면 변조 8종이 조용히 무변조가 된다 —
+    #   그때는 아무것도 재지 않고 큰 소리로 죽는다. 유도 규칙 자체도 대표 버전(x.y.0 · x.0.0 · 0.0.0 · 4자리 ·
+    #   접미)에서 매번 확인한다 — 다음 ".0" 릴리스가 태그 전에 이 파일에서 걸리게.
+    if old == new:
+        print("FAIL 전제 붕괴 — 유도한 구버전(%s)이 현재 버전(%s)과 같다: 변조가 무변조가 된다(RULINGS EU1)" % (old, new))
+        print("=== 전제 붕괴로 중단 ===")
+        return 1
+    for probe in ("0.14.56", "0.15.0", "0.15.1", "1.0.0", "0.0.0", "0.15.0.0", "0.15.0-rc1"):
+        derived = older(probe)
+        ok = derived != probe and re.fullmatch(r"[0-9]+(\.[0-9]+){2,3}([-+][0-9A-Za-z.+-]+)?", derived) is not None
+        print("  [전제] older(%s) = %s → %s" % (probe, derived, "ok" if ok else "FAIL"))
+        if not ok:
+            fails.append("전제: older(%r) = %r — 입력과 같거나 버전 형식이 아니다" % (probe, derived))
 
     with tempfile.TemporaryDirectory(prefix="cys-vsot-") as tmp:
         # ── 양성 대조: 무변조 사본은 반드시 통과 (검사기가 무조건 빨갛지 않음을 먼저 증명) ──
