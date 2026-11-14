@@ -1569,6 +1569,29 @@ fn an_unreadable_boot_critical_file_is_a_finding() {
     assert!(again.is_ok());
 }
 
+/// FI2: an apply intent that cannot be read is a REPORTED fault — ONE intake row
+/// (`<id>:recovery-error`) until acknowledged, not only a line.
+#[test]
+fn an_unreadable_intent_is_a_reported_fault() {
+    let r = rig("fi2fault");
+    let a = rid("R-1");
+    committed_general(&r, &a, "hooks/u.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let p = crate::repair::apply::intent_path_in(&r.root, &a, &r.lane);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, b"{ broken").unwrap();
+    let pass = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Pass, 5);
+    let filed = RefCell::new(Vec::<String>::new());
+    let intake = |_: &str, line: &str| {
+        filed.borrow_mut().push(line.to_string());
+        true
+    };
+    let d = Doubles { check: &pass, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &intake, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    assert!(filed.borrow().iter().any(|l| l.contains("적용 의도를 읽을 수 없습니다")), "{:?}", filed.borrow());
+    assert!(load_acks_checked(&r.root, &r.lane).unwrap().contains_key("R-1:recovery-error"));
+}
+
 // ───────────────────────────── RULINGS EK2 — a failed re-check is a fact from the moment it is measured ─────────────────────────────
 
 /// EK2: a re-check fails while another apply / update holds the pack-apply lock — the failure is made

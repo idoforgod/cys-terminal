@@ -2939,6 +2939,40 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("wal.rs", "read_in", "conservative", 1, "a record without its schema is refused"),
 ];
 
+// ───────────────────────────── RULINGS FI2 — an applying intent is a claim ─────────────────────────────
+
+/// FI2 (= FG1): an approved apply of this lane still `applying` (interrupted, its recovery not done)
+/// that names the file is a CLAIM — the resolution answers UNKNOWN, never NO APPROVAL; an intent that
+/// cannot be read makes the ledger unreadable (EN4). Without FI2 the resolution read only rows: the
+/// half-applied repair had no row yet and the answer was NO APPROVAL (the vendor original went back).
+#[test]
+fn an_applying_intent_naming_the_file_is_a_claim() {
+    let r = rig("fi2claim");
+    let id = rid("R-31");
+    r.put("hooks/i.sh", b"X\n", 0o755);
+    let rec = record(&r, &id, Classification::BootCritical, Vec::new(), RepairState::AwaitingApproval);
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let intent = ApplyIntent {
+        schema: 1,
+        repair: id.clone(),
+        lane_key: r.lane.clone(),
+        op_tag: "t".into(),
+        state: "applying".into(),
+        targets: vec![IntentTarget { rel: "hooks/i.sh".into(), pre: "absent".into(), incoming: "absent".into() }],
+        note: String::new(),
+        pack_generation: None,
+        approval_ref: Some("rqr-1".into()),
+        created_at: 1.0,
+        updated_at: 1.0,
+    };
+    write_intent(&r.root, &intent).unwrap();
+    assert!(matches!(resolve_approved_copy_in(&r.root, &r.pack, &r.lane, "hooks/i.sh"), ApprovedCopy::Unknown(_)));
+    assert!(matches!(resolve_approved_copy_in(&r.root, &r.pack, &r.lane, "hooks/other.sh"), ApprovedCopy::NoApproval), "only the named file");
+    std::fs::write(intent_path_in(&r.root, &id, &r.lane), b"{ broken").unwrap();
+    assert!(matches!(resolve_approved_copy_in(&r.root, &r.pack, &r.lane, "hooks/other.sh"), ApprovedCopy::LedgerUnreadable { .. }));
+    assert_eq!(unreadable_intents_in(&r.root, &r.lane).len(), 1);
+}
+
 // ───────────────────────────── RULINGS EJ4 — one ownership per repair ─────────────────────────────
 
 /// EJ4 through the real entry points: a revert (the owner) paused in its hook phase holds the

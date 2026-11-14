@@ -2210,6 +2210,19 @@ pub fn resolve_approved_copy_in(root: &Path, pack: &Path, lane: &LaneKey, rel: &
         Err(e) => return ApprovedCopy::LedgerUnreadable { cause: format!("수리 장부 목록({e:?})") },
     };
     for id in ids.into_iter().rev() {
+        // RULINGS FI2: an apply of this lane still `applying` that names the file is a CLAIM on it (an
+        // interrupted apply its recovery has not finished) → UNKNOWN; an intent that cannot be read is
+        // an unreadable member of the ledger (EN4: suspended, reported)
+        match read_intent_checked_in(root, &id, lane) {
+            Ok(Some(i)) if i.state == "applying" && i.targets.iter().any(|t| t.rel == rel) => {
+                return ApprovedCopy::Unknown(format!(
+                    "{}: 끝나지 않은 적용이 이 파일을 말합니다(끊긴 적용 — 복구가 마칠 때까지 아무것도 되돌리지 않음)",
+                    id.as_str()
+                ));
+            }
+            Ok(_) => {}
+            Err(_) => return ApprovedCopy::LedgerUnreadable { cause: format!("{}의 적용 의도", id.as_str()) },
+        }
         let (Ok(row), Ok(rec)) = (ledger::read_lane_in(root, &id, lane), ledger::read_record_in(root, &id)) else {
             return ApprovedCopy::LedgerUnreadable { cause: id.as_str().to_string() };
         };
@@ -2573,6 +2586,24 @@ pub fn intent_path_in(root: &Path, id: &RepairId, lane: &LaneKey) -> PathBuf {
 
 /// FG1: the apply intent with three answers — `Ok(Some)`, `Ok(None)` only when the file does not exist
 /// AND the repair's folder could be read, `Err` for everything else.
+/// RULINGS FI2 — every apply / revert intent of this lane that cannot be read: (repair, why). The job
+/// files each as a REPORTED fault (the recovery's own line says it too).
+pub fn unreadable_intents_in(root: &Path, lane: &LaneKey) -> Vec<(RepairId, String)> {
+    let Ok(ids) = ledger::list_ids_checked_in(root) else {
+        return Vec::new(); // an unlistable root is reported by the recovery and the passes
+    };
+    let mut out = Vec::new();
+    for id in ids {
+        if let Err(e) = read_intent_checked_in(root, &id, lane) {
+            out.push((id.clone(), format!("적용 의도를 읽을 수 없습니다({e})")));
+        }
+        if let Err(e) = read_revert_intent_checked_in(root, &id, lane) {
+            out.push((id.clone(), format!("되돌리기 의도를 읽을 수 없습니다({e})")));
+        }
+    }
+    out
+}
+
 pub fn read_intent_checked_in(root: &Path, id: &RepairId, lane: &LaneKey) -> Result<Option<ApplyIntent>, String> {
     read_checked(&intent_path_in(root, id, lane), &ledger::repair_dir_in(root, id))
 }
