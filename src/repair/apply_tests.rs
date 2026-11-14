@@ -927,6 +927,50 @@ fn apply_time_screen_declines_and_sees_the_slot_bytes() {
     assert!(ledger::read_record_in(&r.root, &id).unwrap().unwrap().approval.is_none());
 }
 
+/// The slots are fingerprinted BEFORE the screen, which may run for minutes: bytes written into a
+/// slot during the screen are never applied — the exchange re-reads the slot and declines, the live
+/// file keeps its bytes and the approval is void.
+#[cfg(target_os = "macos")]
+#[test]
+fn slot_changed_during_the_screen_is_never_applied() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = rig("screentamper");
+    let id = rid("R-19");
+    r.put("hooks/t.sh", b"PRE\n", 0o755);
+    let pre_img = ledger::copy_preimage_in(&r.root, &id, &r.lane, "hooks/t.sh", &r.pack.join("hooks/t.sh"), 1.0).unwrap();
+    let staging = ledger::staging_dir_in(&r.root, &id).join("hooks/t.sh");
+    std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
+    std::fs::write(&staging, b"APPROVED\n").unwrap();
+    let st = TargetState::read(&staging).unwrap();
+    let fp = crate::repair::types::fingerprint(&[("hooks/t.sh".into(), st.clone())]);
+    let mut rec = record(&r, &id, Classification::ProtectionRelated, vec![FileChange { rel: "hooks/t.sh".into(), kind: ChangeKind::Edit, pre: pre_img, post: st, diff: None }], RepairState::AwaitingApproval);
+    rec.approval = Some(approval(&fp));
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let tampered = RefCell::new(0usize);
+    // the screen double passes, but meanwhile another writer rewrites every slot's payload
+    let screen = |_: &RepairId, c: &crate::repair::screen::ScreenCandidate, _: &Path| -> Result<(), String> {
+        let vault_dir = c.files.parent().unwrap().to_path_buf();
+        for e in std::fs::read_dir(&vault_dir).unwrap().flatten() {
+            if e.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let payload = e.path().join("payload").join("t.sh");
+            if payload.is_file() {
+                std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o644)).unwrap();
+                std::fs::write(&payload, b"UNAPPROVED\n").unwrap();
+                *tampered.borrow_mut() += 1;
+            }
+        }
+        Ok(())
+    };
+    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let rep = apply_candidate_in(&env, &id, &[CandidateFile { rel: "hooks/t.sh".into(), staged: staging, mode: 0o644 }], &screen, &pass_check, &pass_ref, &no_repair_lock).unwrap();
+    assert!(*tampered.borrow() >= 1, "the double reached the slot");
+    assert!(matches!(rep.outcome, ApplyOutcome::Declined(ref m) if m.contains("바뀌었습니다")), "{:?}", rep.outcome);
+    assert_eq!(std::fs::read(r.pack.join("hooks/t.sh")).unwrap(), b"PRE\n", "the live file keeps its bytes");
+    assert!(ledger::read_record_in(&r.root, &id).unwrap().unwrap().approval.is_none(), "the approval is void");
+}
+
 /// The production screen step: a recorded verdict that holds is reused (nothing runs); otherwise the
 /// screen runs and its error / refusal declines. Until T5b's bodies land the read is "not built" →
 /// declined (fail closed).

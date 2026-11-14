@@ -2061,6 +2061,17 @@ fn exchange_prepared(
             None,
         ));
     }
+    // the slot was fingerprinted before the screen (which may run for minutes): it must still hold
+    // exactly the approved state at the exchange — bytes written into it since are never applied
+    if TargetState::read(&slot.payload())? != spec.incoming {
+        return Ok(done(
+            ApplyOutcome::Declined(format!(
+                "{}: 보관소의 후보가 승인된 지문을 확인한 뒤에 바뀌었습니다 — 적용하지 않습니다",
+                spec.rel
+            )),
+            None,
+        ));
+    }
     let gen = pack_generation(env.pack);
     let (slot_identity, live_identity) = match (identity_of(&slot.payload()), identity_of(&live)) {
         (Ok(a), Ok(b)) => (a, b),
