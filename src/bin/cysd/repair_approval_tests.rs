@@ -951,6 +951,35 @@ fn step3_finds_a_rehearsal_writing_the_live_lane() {
     assert!(e.owner_line.as_deref().is_some_and(|l| l.contains("R-1")));
 }
 
+/// RULINGS EL4: a thread that cannot be made AND a helper slow to die, injected together — the
+/// fallback reaps without blocking (WNOHANG + a fixed grace) and reports the pid it could not reap;
+/// with the kill delivered the helper is reaped.
+#[test]
+fn thread_failure_and_a_slow_helper_never_block() {
+    use cys::SpawnPolicy;
+    let spawn = || {
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .stdin(std::process::Stdio::null())
+            .spawn_policy(cys::ChildLifetime::Attached)
+            .spawn()
+            .unwrap()
+    };
+    FAIL_SPAWN_FOR_TEST.with(|f| f.set(true));
+    let child = spawn();
+    let pid = child.id();
+    let t0 = std::time::Instant::now();
+    let r = start_waiter_or_reap(move || drop(child), pid, false);
+    assert!(t0.elapsed() < Duration::from_secs(3), "blocked {:?}", t0.elapsed());
+    assert_eq!(r, Err(Some(pid)), "the slow helper is reported, not waited for");
+    // the test's own clean-up: kill and reap that pid without blocking
+    assert_eq!(kill_and_reap(pid, true), None);
+    let child = spawn();
+    let pid = child.id();
+    assert_eq!(start_waiter_or_reap(move || drop(child), pid, true), Err(None));
+    FAIL_SPAWN_FOR_TEST.with(|f| f.set(false));
+}
+
 /// RULINGS DF3: the report gate's set is the repairs the owner HAS A CARD for — not a request still
 /// in step 3, not one whose step 3 refused (a fix-and-resubmit cycle), not an expired one.
 #[test]
