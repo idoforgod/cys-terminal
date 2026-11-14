@@ -854,6 +854,104 @@ class SaveDuringSwap(Rig):
         self.assertIn("CEO 승격 보류(본부 지침이 조립 중에 계속 바뀜)", _slurp(nf, encoding="utf-8"))
 
 
+class StaleLegacyReceipt(Rig):
+    """★RULINGS DC2 — 남은 0.14 영수증(.ceo-template-applied)은 조립된 지침을 0.14.x 승격으로 다시 분류하지 못한다: 0.14 영수증은
+    그 해시가 살아 있는 파일과 같을 때만 증거다. 이전이 끝나는 쓰기들 사이에서 멈춰도 다음 승격 확인이 바르게 이어 가고,
+    빠른 경로도 남은 0.14 영수증을 치운다."""
+    OLD_HEADER = "# CEO 옛 머리말 (master of master · 단일소유 강제 · exit 7)\n"
+    OLD_VENDOR = master_text("OLD-STANDARD-MASTER")
+    USER_OLD = OLD_VENDOR + "USERFIX-OLD 승격 전에 고친 줄\n"
+    EDIT = "CEO-EDIT-DC2 CEO 동안 고친 본문 줄\n"
+
+    def migrated(self):
+        old_copy = self.OLD_HEADER + SEP + self.OLD_VENDOR
+        self.seed(md=old_copy)
+        _write(self.p("MASTER_DIRECTIVE.md.pre-ceo"), self.USER_OLD)
+        _write(self.p(".ceo-template-applied"), sha(old_copy) + "\n")
+        rc, out, err = self.run_dept("promote-ceo")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + self.USER_OLD)
+        return old_copy
+
+    def test_crash_residue_then_edit_then_lost_receipt_keeps_the_edit(self):
+        old_copy = self.migrated()
+        _write(self.p(".ceo-template-applied"), sha(old_copy) + "\n")      # 이전의 마지막 쓰기 앞에서 멈춘 흔적
+        edited = HEADER + SEP + self.USER_OLD + self.EDIT
+        _write(self.p("MASTER_DIRECTIVE.md"), edited)                       # CEO 동안 고친 본문
+        os.remove(self.p(".ceo-receipt.json"))                              # 새 영수증 유실
+        rc, out, err = self.run_dept("promote-ceo")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), edited, "남은 0.14 영수증이 조립된 지침을 다시 분류했다(DC2)")
+        self.assertIsNone(self.read(".ceo-template-applied"), "남은 0.14 영수증을 치우지 않았다")
+        self.assert_receipt_for(HEADER, self.USER_OLD + self.EDIT, edited)
+        rc, out, err = self.run_dept("down", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.USER_OLD + self.EDIT, "강등이 CEO 동안 고친 본문을 잃었다")
+
+    def test_demotion_with_residue_and_no_receipt_keeps_the_edit(self):
+        old_copy = self.migrated()
+        _write(self.p(".ceo-template-applied"), sha(old_copy) + "\n")
+        edited = HEADER + SEP + self.USER_OLD + self.EDIT
+        _write(self.p("MASTER_DIRECTIVE.md"), edited)
+        os.remove(self.p(".ceo-receipt.json"))
+        rc, out, err = self.run_dept("down", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.USER_OLD + self.EDIT, "강등이 낡은 .pre-ceo 를 돌려줬다(DC2)")
+
+    def test_fast_path_cleans_legacy_residue(self):
+        old_copy = self.migrated()
+        _write(self.p(".ceo-template-applied"), sha(old_copy) + "\n")
+        rc, out, err = self.run_dept("launch", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIsNone(self.read(".ceo-template-applied"), "빠른 경로가 남은 0.14 영수증을 치우지 않았다")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + self.USER_OLD)
+
+    def test_matching_legacy_receipt_is_still_evidence(self):
+        """대조: 해시가 살아 있는 파일과 같은 0.14 영수증은 여전히 0.14.x 승격의 증거다(배포 표 밖 머리말이어도)."""
+        old_copy = self.OLD_HEADER + SEP + self.OLD_VENDOR
+        self.seed(md=old_copy)
+        _write(self.p("MASTER_DIRECTIVE.md.pre-ceo"), self.USER_OLD)
+        _write(self.p(".ceo-template-applied"), sha(old_copy) + "\n")
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + self.USER_OLD)
+
+    def test_interrupted_migration_at_every_write_recovers(self):
+        """이전의 쓰기마다(지침 교체 · 0.14 영수증 정리 · 새 영수증) 그 뒤에서 멈춘 상태 → CEO 동안 고친 본문 → 다음 승격 확인과
+        강등이 그 본문을 지킨다. 실제 ceo_py 를 모듈로 싣고 n 번째 쓰기에서 멈춘다(SystemExit)."""
+        for stop_after in ("swap", "legacy", "receipt"):
+            with self.subTest(stop_after=stop_after):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                old_copy = self.OLD_HEADER + SEP + self.OLD_VENDOR
+                self.seed(md=old_copy)
+                _write(self.p("MASTER_DIRECTIVE.md.pre-ceo"), self.USER_OLD)
+                _write(self.p(".ceo-template-applied"), sha(old_copy) + "\n")
+                ns = ceo_py_module()
+                names = {"swap": "swap_live", "legacy": "drop_legacy", "receipt": "write_receipt"}
+                self.assertIn(names[stop_after], ns)
+                orig = ns[names[stop_after]]
+
+                def stop(*a, _orig=orig, **kw):
+                    _orig(*a, **kw)
+                    raise SystemExit("crash after %s" % stop_after)
+                ns[names[stop_after]] = stop
+                with self.assertRaises(SystemExit):
+                    ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), ""])
+                live = self.read("MASTER_DIRECTIVE.md")
+                self.assertEqual(live, HEADER + SEP + self.USER_OLD, "멈춘 뒤 지침이 이전 결과가 아니다")
+                _write(self.p("MASTER_DIRECTIVE.md"), live + self.EDIT)
+                rec = self.p(".ceo-receipt.json")
+                if os.path.exists(rec):
+                    os.remove(rec)
+                rc, out, err = self.run_dept("promote-ceo")
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(self.read("MASTER_DIRECTIVE.md"), live + self.EDIT)
+                self.assertIsNone(self.read(".ceo-template-applied"))
+                rc, out, err = self.run_dept("down", "d0")
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.USER_OLD + self.EDIT)
+                self.register()
+
+
 class LockIsReal(Rig):
     """★RULINGS DC1 — 승격·강등은 진짜 잠금(POSIX: 잠금 파일의 flock(2) · 윈도우: msvcrt.locking)을 상한 있는 대기로 잡는다.
     시간 안에 못 잡으면 '잠금 없이 진행'하지 않고 보류한다(알림 1건 · 지침 무변경) — 스크립트는 그래도 0 으로 끝난다."""
@@ -1052,20 +1150,27 @@ class LegacyShapes(Rig):
         self.assertIsNone(self.read("MASTER_DIRECTIVE.md.pre-ceo"))
         self.assertEqual(self.captures("before-demote"), [])
 
-    def test_edited_while_ceo_body_is_the_backup_and_the_copy_is_kept(self):
+    def test_edited_copy_with_a_stale_legacy_receipt_is_a_composition(self):
+        """★RULINGS DC2 로 다시 씀(종전: 'CEO 동안 고친 복사본 + 0.14 영수증 → 본문 = .pre-ceo'): 0.14 영수증은 그 해시가 살아
+        있는 파일과 같을 때만 증거다. 고친 복사본은 해시가 다르고 머리말도 배포 표 밖이라 0.14.x 증거가 없다 → 조립(본문 =
+        구분선 뒤 · 고친 줄 그대로) + 지금 지침 통째 사본 + 알림 1건(.pre-ceo 가 다른 MASTER 임과 그 경로). 배포된 머리말의 고친
+        복사본은 여전히 .pre-ceo 를 본문으로 쓴다(test_released_header_with_ceo_edits_keeps_the_old_directive)."""
         original = self.OLD_HEADER + SEP + self.OLD_VENDOR
         edited = original + self.EDIT.decode()
+        tail = self.OLD_VENDOR + self.EDIT.decode()
         self.migrate(edited, legacy_hash=sha(original))
-        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + self.USER_OLD, "본문이 승격 전 본부 지침이 아니다")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + tail, "해시가 안 맞는 0.14 영수증이 증거로 쓰였다(DC2)")
         caps = self.captures("before-compose")
-        self.assertEqual([_slurp(c, encoding="utf-8") for c in caps], [edited], "옛 CEO 지침을 통째로 보관하지 않았다")
-        lines = self.pushes_prefix(self.MIGRATION)
-        self.assertEqual(len(lines), 1)
-        self.assertIn("— %s --body" % os.path.basename(caps[0]), lines[0], "알림이 보관 사본을 이름으로 가리키지 않는다")
+        self.assertEqual([_slurp(c, encoding="utf-8") for c in caps], [edited], "지금 지침을 통째로 보관하지 않았다")
+        lines = self.pushes_prefix("CEO ")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("cys feed push --title " + self.HEADER_COPY + os.path.basename(caps[0])))
+        self.assertIn(self.p("MASTER_DIRECTIVE.md.pre-ceo"), lines[0])
         self.assertEqual(self.read("MASTER_DIRECTIVE.md.pre-ceo"), self.USER_OLD, "백업을 덮었다")
-        self.assertEqual(self.run_dept("promote-ceo")[0], 0)             # 이전 뒤에는 현행 — 알림 없음
-        self.assertEqual(len(self.pushes_prefix(self.MIGRATION)), 1)
-        self.demote_to(self.USER_OLD)
+        self.assertIsNone(self.read(".ceo-template-applied"), "0.14 영수증을 치우지 않았다")
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)             # 조립 뒤에는 현행 — 알림 없음
+        self.assertEqual(len(self.pushes_prefix("CEO ")), 1)
+        self.demote_to(tail)
 
     # ── ★CG1: 양성 증거 없는 구분선 지침 = 조립 ──
     def test_edited_v014_header_without_legacy_receipt_is_a_composition(self):

@@ -2203,16 +2203,29 @@ def pre_unusable(pstate, pb):
     return None
 
 
-def evidence(mh, rs, leg, pexist):
-    """CB2 — 승격된 적이 있다는 증거: 유효한 영수증 · 0.14.x 영수증 · .pre-ceo(사전적 실재) · 구분선 앞이 CEO 머리말 표지 3핀."""
-    return (rs == "valid" or leg is not None or pexist
+def legacy_matches(leg, mb):
+    """★RULINGS DC2 — 0.14 영수증(.ceo-template-applied)은 그것이 적은 해시가 **살아 있는 파일**과 같을 때만 증거다. 0.14.x 이전이
+    끝나기 직전에 멈춰 남은 영수증·.pristine 에서 되살린 지침 옆에 남은 영수증은 조립된 지침을 다시 분류하지 못한다."""
+    return leg is not None and mb is not None and leg == sha(mb)
+
+
+def drop_legacy(p):
+    """0.14 영수증 정리 — 없으면 아무것도 안 한다(멱등). 이전·조립·빠른 경로의 보정이 부른다."""
+    return drop(p)
+
+
+def evidence(mh, rs, legm, pexist):
+    """CB2 — 승격된 적이 있다는 증거: 유효한 영수증 · 살아 있는 파일과 해시가 같은 0.14 영수증(DC2) · .pre-ceo(사전적 실재)
+    · 구분선 앞이 CEO 머리말 표지 3핀."""
+    return (rs == "valid" or legm or pexist
             or all(p in mh.decode("utf-8", "replace") for p in MARKER_PINS))
 
 
-def is_v014(mh, rs, leg):
-    """★CG1 — 0.14.x 통째 복사 승격의 양성 증거: 유효한 조립 영수증이 없고(0.15.0 의 조립만 그것을 쓰고, 쓸 때 0.14 영수증을
-    지운다 — I-T8-6), 0.14 영수증이 있거나 구분선 앞이 배포된 v0.14.x 머리말과 바이트까지 같다. 그 밖은 모두 조립이다."""
-    return rs != "valid" and (leg is not None or sha(mh) in V014_HEADER_SHA256)
+def is_v014(mh, rs, legm):
+    """★CG1·DC2 — 0.14.x 통째 복사 승격의 양성 증거: 유효한 조립 영수증이 없고(0.15.0 의 조립만 그것을 쓰고 0.14 영수증을
+    지운다 — I-T8-6), 살아 있는 파일과 해시가 같은 0.14 영수증이 있거나 구분선 앞이 배포된 v0.14.x 머리말과 바이트까지 같다.
+    그 밖은 모두 조립이다(본문 = 구분선 뒤)."""
+    return rs != "valid" and (legm or sha(mh) in V014_HEADER_SHA256)
 
 
 def v014_whole_copy(mb, leg):
@@ -2277,19 +2290,21 @@ def do_state(a):
         print("uncomposed")
         return 0
     rs, rd = receipt_load(os.path.join(d, RECEIPT))
-    leg = legacy_hash(os.path.join(d, LEGACY_RECEIPT))
+    leg_p = os.path.join(d, LEGACY_RECEIPT)
+    legm = legacy_matches(legacy_hash(leg_p), mb)
     pexist = pre_present(md + ".pre-ceo")
-    if not evidence(mc[0], rs, leg, pexist):
+    if not evidence(mc[0], rs, legm, pexist):
         print("unproven")
         return 0
-    if is_v014(mc[0], rs, leg):
+    if is_v014(mc[0], rs, legm):
         print("legacy")
         return 0
     tc = split(tb)
     if tc is None or mc[0] != tc[0]:
         print("drift")
         return 0
-    ok = (rs == "valid" and rd["header_sha256"] == sha(tc[0]) and rd["separator"].encode("utf-8") == mc[1] and pexist)
+    ok = (rs == "valid" and rd["header_sha256"] == sha(tc[0]) and rd["separator"].encode("utf-8") == mc[1] and pexist
+          and not os.path.lexists(leg_p))      # ★DC2: 남은 0.14 영수증이 있으면 현행이 아니다 — 보정 갈래가 치운다
     print("current" if ok else "current-fix")
     return 0
 
@@ -2359,13 +2374,14 @@ def compose_once(tmpl, md, tsha, nf):
     H, S, _ = split(tb)
     rs, rd = receipt_load(rec_p)
     leg = legacy_hash(leg_p)        # CB5 — 0.14.x 영수증은 머리말 갈래보다 먼저 읽는다
+    legm = legacy_matches(leg, mb)  # ★DC2 — 살아 있는 파일과 해시가 같을 때만 증거
     mc = split(mb)
     new = False
     keep = None                     # None | "header"(고친 머리말) | "migration"(0.14.x 옛 CEO 지침) | "migration-nobackup"
     differs_check = False
     if mc is not None:
         mh, ms, tail = mc
-        if not evidence(mh, rs, leg, pstate != "absent"):
+        if not evidence(mh, rs, legm, pstate != "absent"):
             # CB2 — 구분선 줄은 있는데 승격된 적이 있다는 증거가 하나도 없다. 바이트 무이동.
             err("CEO 조립 보류: 본부 지침에 조립 구분선 줄이 있지만 승격 기록(영수증·0.14 영수증·.pre-ceo·CEO 머리말 표지)이 "
                 "없다 — 아무것도 바꾸지 않는다")
@@ -2377,7 +2393,7 @@ def compose_once(tmpl, md, tsha, nf):
                  "② 본부 지침에 그 줄이 우연히 들어간 것이라면 그 줄과 바로 위의 '---' 줄만 지우고 다시 승격하십시오. "
                  "지침은 한 바이트도 바뀌지 않았습니다." % SEP_LINE)
             return 6
-        if is_v014(mh, rs, leg):
+        if is_v014(mh, rs, legm):
             # CB3 / CG1 — 양성 증거가 있는 0.14.x 통째 복사 승격: 사용자 본부 지침은 .pre-ceo 에 있다.
             if pstate == "absent":
                 body, keep = tail, "migration-nobackup"
@@ -2400,8 +2416,8 @@ def compose_once(tmpl, md, tsha, nf):
                     wrote.append("영수증")
                 if pstate == "absent" and best_effort(write_new, pre_p, tail) is not None:
                     wrote.append(".pre-ceo")    # 승격 중 .pre-ceo = 지금 본문(덮지 않는다 — 그 사이 생긴 것은 그대로)
-                if wrote and best_effort(drop, leg_p):
-                    wrote.append("옛 영수증 정리")
+                if os.path.lexists(leg_p) and best_effort(drop_legacy, leg_p):
+                    wrote.append("옛 영수증 정리")   # ★DC2: 남은 0.14 영수증은 언제나 치운다(빠른 경로가 여기로 보낸다)
                 # 현행 머리말 = 이 0.15.0 조립 자신의 결과다 — .pre-ceo 는 그때의 백업이고 CEO 동안 고친 본문과 다른 것이
                 #   정상이다(알림 없음 · 바이트 무이동 — CG1 "stale .pre-ceo changes nothing").
                 if wrote:
@@ -2439,8 +2455,8 @@ def compose_once(tmpl, md, tsha, nf):
         # 살아 있는 파일이 이미 그 조립 결과다 — 바이트를 옮기지 않고 영수증·백업만 맞춘다(rc 11 · 재주입 없음).
         if pstate == "absent":
             best_effort(write_new, pre_p, body)
+        best_effort(drop_legacy, leg_p)     # ★DC2 순서: 0.14 영수증 정리 → 새 영수증(사이에서 멈춰도 다음 확인이 조립으로 이어 간다)
         write_receipt(rec_p, H, S, body, cand)
-        best_effort(drop, leg_p)
         print("[cys-dept] CEO 지침은 그대로(이미 그 조립 결과) — 영수증 기록")
         return 11
     # ★DC1: 교체 순간의 파일이 읽은 mb 와 같을 때만 남는다(아니면 SourceChanged → 다시 읽어 처음부터). 옮겨 둔 파일이 곧
@@ -2455,9 +2471,12 @@ def compose_once(tmpl, md, tsha, nf):
         best_effort(os.unlink, disp)    # 머리말이 증명된 다시 조립 · 배포본 그대로인 옛 사본 — 남길 사용자 바이트가 없다
     if pstate == "absent" and not pre_present(pre_p):
         best_effort(write_new, pre_p, body)   # 백업 = 이 조립에 쓴 사용자 본부 지침(덮지 않는다)
+    # ★DC2 — 이전을 끝내는 쓰기의 순서: 지침 교체(위) → 0.14 영수증 정리 → 새 영수증. 어느 쓰기 뒤에서 멈춰도 다음 승격 확인이
+    #   바르게 이어 간다: 교체 뒤 = 현행 머리말 + (해시가 안 맞는) 0.14 영수증 → 조립으로 영수증 기록·정리 · 정리 뒤 = 영수증만
+    #   없는 조립 → 기록. 남은 0.14 영수증은 해시가 살아 있는 파일과 다르므로 증거가 아니다(legacy_matches).
+    best_effort(drop_legacy, leg_p)
     write_receipt(rec_p, H, S, body, cand)
     # ── 여기부터는 교체가 끝났다: 정리·알림의 실패는 결과(rc)를 바꾸지 않는다(CG2) ──
-    best_effort(drop, leg_p)
     differs = differs_check and pre_differs(pstate, pb, body, rs)
     if kept:
         print("[cys-dept] 조립 전 지침 사본 보관: %s" % kept)
@@ -2519,18 +2538,19 @@ def demote_once(tmpl, md, nf):
         return 2
     rs, rd = receipt_load(rec_p)
     leg = legacy_hash(leg_p)
+    legm = legacy_matches(leg, mb)  # ★DC2
     mc = split(mb)
     keep = None
     if mc is not None:
         mh, _ms, tail = mc
-        if not evidence(mh, rs, leg, pstate != "absent"):
+        if not evidence(mh, rs, legm, pstate != "absent"):
             # CB2 — 승격된 적 없는 파일에 구분선 줄이 있을 뿐이다: 잘라 내지 않는다.
             err("CEO 강등 보류: 본부 지침에 조립 구분선 줄이 있지만 승격 기록이 없다 — 잘라 내지 않는다")
             note(nf, T_DEMOTE_HOLD, "부서 0개 도달로 CEO 강등을 하려 했으나, 본부 지침(directives/MASTER_DIRECTIVE.md)에 CEO 조립 "
                                     "구분선 줄('%s')만 있고 승격된 적이 있다는 기록이 없어 아무것도 바꾸지 않았습니다. 그 줄이 본부 "
                                     "지침의 일부라면 그대로 두어도 됩니다." % SEP_LINE)
             return 6
-        if is_v014(mh, rs, leg):
+        if is_v014(mh, rs, legm):
             # CB3 / CG1 — 0.14.x 승격: 0.14.x 처럼 승격 전 본부 지침(.pre-ceo)으로 되돌린다.
             if pstate == "absent":
                 new_md, via, keep = tail, "구분선 뒤 본문 — 0.14.x 승격인데 .pre-ceo 없음", "migration-nobackup"
@@ -2570,7 +2590,7 @@ def demote_once(tmpl, md, nf):
         # 조립되지 않은 MASTER — 강등할 것이 없다. 남은 백업·영수증만 정리한다(승격 중에만 .pre-ceo 가 있게).
         moved = best_effort(dispose_backup, pre_p, mb)
         best_effort(drop, rec_p)
-        best_effort(drop, leg_p)
+        best_effort(drop_legacy, leg_p)
         if moved:
             print("[cys-dept] 승격 백업 정리(지침은 이미 표준 MASTER): .pre-ceo %s" % moved)
         return 10
@@ -2583,7 +2603,7 @@ def demote_once(tmpl, md, nf):
         best_effort(os.unlink, disp)
     moved = best_effort(dispose_backup, pre_p, new_md)
     best_effort(drop, rec_p)   # ★승격 영수증 삭제(G0 D3) — 강등=승격 사실 소멸. 강등 불능(rc 7)·보류(rc 6)에선 지우지 않는다.
-    best_effort(drop, leg_p)
+    best_effort(drop_legacy, leg_p)
     print("[cys-dept] CEO 강등 원본: %s%s%s" % (via, " · CEO 지침 사본 %s" % kept if kept else "",
                                              " · .pre-ceo %s" % moved if moved else ""))
     if kept:

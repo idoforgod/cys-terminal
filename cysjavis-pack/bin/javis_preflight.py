@@ -1935,13 +1935,14 @@ class Preflight:
         st["promoted"] = self._c03_ceo_promoted(md_b, st["pre_exists"])
         # CB2 — 승격된 적이 있다는 증거(cys-dept 와 같은 규칙): 유효한 영수증 · 0.14.x 영수증 · .pre-ceo · 구분선 앞이
         #   CEO 머리말 표지 3핀. 구분선만 있고 증거가 없는 파일은 cys-dept 가 승격도 강등도 하지 않는다(보류).
-        st["evidence"] = (rstate == "valid" or receipt is not None or st["pre_exists"]
+        # ★DC2: 0.14 영수증은 그 해시가 살아 있는 파일과 같을 때만 증거다(receipt_equal — cys-dept `legacy_matches`).
+        st["evidence"] = (rstate == "valid" or receipt_equal or st["pre_exists"]
                           or (comp is not None and all(
                               p in comp[0].decode("utf-8", "replace") for p in MARKER_PINS)))
-        # ★CG1 — 0.14.x 통째 복사 승격의 양성 증거(cys-dept `is_v014` 와 같은 규칙): 유효한 조립 영수증이 없고, 0.14 영수증이
-        #   있거나 구분선 앞이 배포된 v0.14.x 머리말과 같다. 그 밖의 구분선 있는 지침은 조립이다(본문 = 구분선 뒤).
+        # ★CG1·DC2 — 0.14.x 통째 복사 승격의 양성 증거(cys-dept `is_v014` 와 같은 규칙): 유효한 조립 영수증이 없고, 살아 있는
+        #   파일과 해시가 같은 0.14 영수증이 있거나 구분선 앞이 배포된 v0.14.x 머리말과 같다. 그 밖의 구분선 있는 지침은 조립이다.
         st["v014"] = (comp is not None and rstate != "valid"
-                      and (receipt is not None
+                      and (receipt_equal
                            or hashlib.sha256(comp[0]).hexdigest() in self._C03_V014_HEADER_SHA256))
         # 구분선 없는 옛 형상의 표지는 읽을 수 있는 .pre-ceo 를 요구한다(검사 표면이 그 백업이다). 읽을 수 없는 백업만 있는
         #   지침은 아래 ③ 비정형 승격 상태로 간다(역시 술어상 승격).
