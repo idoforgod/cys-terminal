@@ -111,6 +111,42 @@ fn t5b_tests_write_only_inside_their_scratch_base() {
     }
 }
 
+/// RULINGS EL4 — a census of the WAIT sites of this unit: no process wait blocks. Every `waitpid` /
+/// `waitid` asks for WNOHANG; every `.wait()` is the body of a detached reaper thread (a child that
+/// would not die is never waited for by the caller); no `wait_with_output`.
+#[test]
+fn wait_site_census_no_blocking_wait() {
+    let files = [
+        ("replay.rs", include_str!("replay.rs")),
+        ("rehearsal.rs", include_str!("rehearsal.rs")),
+        ("screen.rs", include_str!("screen.rs")),
+        ("repair_approval.rs", include_str!("../bin/cysd/repair_approval.rs")),
+    ];
+    let mut bad = Vec::new();
+    for (name, src) in files {
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, l) in lines.iter().enumerate() {
+            let code = l.split("//").next().unwrap_or("");
+            if code.contains(concat!("wait_with", "_output(")) {
+                bad.push(format!("{name}:{} wait_with_output", i + 1));
+            }
+            if code.contains("waitpid(") || code.contains("waitid(") {
+                let window = lines[i..(i + 6).min(lines.len())].join(" ");
+                if !window.contains("WNOHANG") {
+                    bad.push(format!("{name}:{} wait without WNOHANG", i + 1));
+                }
+            }
+            if code.contains(".wait()") {
+                let before = lines[i.saturating_sub(2)..i].join(" ");
+                if !before.contains("spawn(move ||") {
+                    bad.push(format!("{name}:{} a blocking .wait() outside a detached reaper", i + 1));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "blocking wait sites: {bad:?}");
+}
+
 // ───────────────────────────── parity, census (i) and (iii) ─────────────────────────────
 
 /// RULINGS AU1 / BM5: the screen's inputs ARE the generated per-test inputs — exactly G, R, C, I3,

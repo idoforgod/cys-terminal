@@ -382,6 +382,54 @@ fn child_slow_to_die_is_reported_and_never_waited_for() {
     replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
+/// RULINGS EJ2 / EL4 — every step is bounded: a child (and its descendant) that writes WITHOUT PAUSE on
+/// stdout and stderr cannot keep the pump reading — the runner returns at its deadline, keeps at most
+/// the cap and says the output was not observed whole. (The old pump read until the pipe was empty —
+/// which it never was — and never looked at the clock.)
+#[test]
+#[cfg(unix)]
+fn continuous_writer_does_not_hold_the_runner() {
+    let r = root("el4-flood");
+    let env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
+    let t0 = std::time::Instant::now();
+    let o = replay::run_child(
+        &["/bin/sh".into(), "-c".into(), "yes out & exec yes err 1>&2".into()],
+        &env,
+        &r,
+        b"",
+        Duration::from_secs(1),
+    );
+    assert!(t0.elapsed() < Duration::from_secs(4), "held for {:?}", t0.elapsed());
+    assert!(o.timed_out, "{:?}", (o.code, o.signal));
+    assert!(o.stdout.len() <= replay::MAX_CAPTURE && o.stderr.len() <= replay::MAX_CAPTURE);
+    assert!(!o.stdout_whole(), "a flooded output is not whole");
+    assert!(!o.stderr_state.whole());
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
+/// RULINGS EJ2 / EL4: a pipe that cannot be made non-blocking means the child is not run — killed at
+/// once, the runner returns saying so (fail closed).
+#[test]
+#[cfg(unix)]
+fn nonblocking_setup_failure_runs_nothing() {
+    let r = root("el4-setup");
+    let env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
+    replay::FAIL_NONBLOCK_FOR_TEST.with(|f| f.set(true));
+    let t0 = std::time::Instant::now();
+    let o = replay::run_child(
+        &["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+        &env,
+        &r,
+        b"",
+        Duration::from_secs(10),
+    );
+    replay::FAIL_NONBLOCK_FOR_TEST.with(|f| f.set(false));
+    assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+    assert!(o.spawn_error.as_deref().is_some_and(|e| e.contains("non-blocking")), "{o:?}");
+    assert!(!o.unreaped, "{o:?}");
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
 /// RULINGS CZ4: a cleanup error or a leftover scratch tree is RETURNED, never swallowed.
 #[test]
 fn cleanup_errors_are_returned() {
