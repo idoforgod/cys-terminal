@@ -318,7 +318,7 @@ fn rule_one_property_every_op_every_point() {
                         id: rid("R-5"),
                         rel: case.rel.to_string(),
                         kind: "revert".into(),
-                        expected: expected.clone(),
+                        expected: Recorded::for_test(expected.clone()),
                         incoming: incoming.clone(),
                         source: source.clone().map(Source::Fresh).unwrap_or(Source::None),
                         bound: Bound::now(&r.pack),
@@ -478,7 +478,7 @@ fn every_form_applies_with_mode_and_fresh_mtime() {
         id: rid("R-1"),
         rel: "hooks/a.sh".into(),
         kind: "apply".into(),
-        expected: r.live("hooks/a.sh"),
+        expected: Recorded::for_test(r.live("hooks/a.sh")),
         incoming: st.clone(),
         source: Source::Fresh(src),
         bound: Bound::now(&r.pack),
@@ -498,7 +498,7 @@ fn every_form_applies_with_mode_and_fresh_mtime() {
         id: rid("R-1"),
         rel: "hooks/c.sh".into(),
         kind: "revert".into(),
-        expected: r.live("hooks/c.sh"),
+        expected: Recorded::for_test(r.live("hooks/c.sh")),
         incoming: TargetState::Absent,
         source: Source::None,
         bound: Bound::now(&r.pack),
@@ -514,7 +514,7 @@ fn every_form_applies_with_mode_and_fresh_mtime() {
         id: rid("R-1"),
         rel: "hooks/p.sh".into(),
         kind: "revert".into(),
-        expected: TargetState::Absent,
+        expected: Recorded::for_test(TargetState::Absent),
         incoming: st,
         source: Source::Fresh(src),
         bound: Bound::now(&r.pack),
@@ -594,7 +594,7 @@ fn displaced_garbage_is_never_relived() {
             id: rid("R-2"),
             rel: "schedule.json".into(),
             kind: "apply".into(),
-            expected: r.live("schedule.json"),
+            expected: Recorded::for_test(r.live("schedule.json")),
             incoming: st,
             source: Source::Fresh(src),
             bound: Bound::now(&r.pack),
@@ -812,7 +812,7 @@ fn windows_interruption_between_the_two_moves_resume_or_abandon() {
         let (src, st) = r.source("w.py", b"NEW\n", 0o644);
         let inj = Inject::new(Point::AfterFirstMove, Action::Stop, None, &r.pack);
         let env = r.env(&inj, ApplyForm::DepositFirst);
-        let first = run_op(&env, &OpSpec { id: rid("R-9"), rel: "bin/w.py".into(), kind: "revert".into(), expected: r.live("bin/w.py"), incoming: st, source: Source::Fresh(src), bound: Bound::now(&r.pack) });
+        let first = run_op(&env, &OpSpec { id: rid("R-9"), rel: "bin/w.py".into(), kind: "revert".into(), expected: Recorded::for_test(r.live("bin/w.py")), incoming: st, source: Source::Fresh(src), bound: Bound::now(&r.pack) });
         assert!(first.is_err());
         assert_eq!(r.live("bin/w.py"), TargetState::Absent, "the path is empty between the two moves");
         if bump {
@@ -854,7 +854,7 @@ fn staged_pack_swap_during_an_operation_then_second_install() {
     }
     let f = Swap(&r, Cell::new(false));
     let env = r.env(&f, ApplyForm::Exchange);
-    let d = run_op(&env, &OpSpec { id: rid("R-10"), rel: "hooks/a.sh".into(), kind: "apply".into(), expected: r.live("hooks/a.sh"), incoming: st, source: Source::Fresh(src), bound: Bound::now(&r.pack) }).unwrap();
+    let d = run_op(&env, &OpSpec { id: rid("R-10"), rel: "hooks/a.sh".into(), kind: "apply".into(), expected: Recorded::for_test(r.live("hooks/a.sh")), incoming: st, source: Source::Fresh(src), bound: Bound::now(&r.pack) }).unwrap();
     assert!(matches!(d.outcome, ApplyOutcome::Superseded(_)), "{:?}", d.outcome);
     // second install: the pack swapped again (pack.prev deleted by the installer)
     let _ = std::fs::remove_dir_all(r.base.join("pack.prev"));
@@ -1366,7 +1366,7 @@ fn failing_exchange_declines_and_closes_the_record() {
     r.put("hooks/z.sh", b"LIVE\n", 0o755);
     let (src, st) = r.source("z.sh", b"NEW\n", 0o755);
     let env = r.env(&Vanish, ApplyForm::Exchange);
-    let d = run_op(&env, &OpSpec { id: rid("R-34"), rel: "hooks/z.sh".into(), kind: "apply".into(), expected: r.live("hooks/z.sh"), incoming: st, source: Source::Fresh(src), bound: Bound::now(&r.pack) }).unwrap();
+    let d = run_op(&env, &OpSpec { id: rid("R-34"), rel: "hooks/z.sh".into(), kind: "apply".into(), expected: Recorded::for_test(r.live("hooks/z.sh")), incoming: st, source: Source::Fresh(src), bound: Bound::now(&r.pack) }).unwrap();
     assert!(matches!(d.outcome, ApplyOutcome::Declined(ref m) if m.contains("ENOENT")), "{:?}", d.outcome);
     assert_eq!(std::fs::read(r.pack.join("hooks/z.sh")).unwrap(), b"LIVE\n");
     let (ops, _) = wal::list_in(&r.root, &rid("R-34"));
@@ -1393,7 +1393,7 @@ fn flush_failure_after_the_exchange_keeps_the_evidence() {
     let r = rig("ct2op");
     let before = r.put("hooks/f.sh", b"OLD\n", 0o755);
     let (src, incoming) = r.source("f-new", b"NEW\n", 0o755);
-    let spec = OpSpec { id: rid("R-6"), rel: "hooks/f.sh".into(), kind: "revert".into(), expected: before, incoming: incoming.clone(), source: Source::Fresh(src), bound: Bound::now(&r.pack) };
+    let spec = OpSpec { id: rid("R-6"), rel: "hooks/f.sh".into(), kind: "revert".into(), expected: Recorded::for_test(before), incoming: incoming.clone(), source: Source::Fresh(src), bound: Bound::now(&r.pack) };
     let faults = FailFlushAfterExchange;
     let res = run_op(&r.env(&faults, ApplyForm::Exchange), &spec);
     crate::repair::durable::INJECT_FLUSH_ERRNO.with(|c| c.set((0, 0)));
@@ -2062,7 +2062,7 @@ fn recovery_never_touches_a_live_operation() {
     // a file operation stopped after its record, still owned
     let before = r.put("hooks/l2.sh", b"OLD\n", 0o755);
     let (src, incoming) = r.source("l2-new", b"NEW\n", 0o755);
-    let spec = OpSpec { id: rid("R-39"), rel: "hooks/l2.sh".into(), kind: "revert".into(), expected: before, incoming, source: Source::Fresh(src), bound: Bound::now(&r.pack) };
+    let spec = OpSpec { id: rid("R-39"), rel: "hooks/l2.sh".into(), kind: "revert".into(), expected: Recorded::for_test(before), incoming, source: Source::Fresh(src), bound: Bound::now(&r.pack) };
     let stop = StopOn { rel: "hooks/l2.sh", point: Point::AfterRecord, fired: Cell::new(false) };
     assert!(run_op(&r.env(&stop, ApplyForm::Exchange), &spec).is_err());
     let rec = wal::unfinished_for_lane(&r.root, &r.lane).into_iter().next().unwrap();
@@ -2217,7 +2217,7 @@ fn an_abandonment_never_places_g1_bytes_into_g2() {
     let r = rig("ej1abandon");
     let before = r.put("bin/w2.py", b"G1-LIVE\n", 0o644);
     let (src, st) = r.source("w2-new", b"G1-NEW\n", 0o644);
-    let spec = OpSpec { id: rid("R-50"), rel: "bin/w2.py".into(), kind: "revert".into(), expected: before, incoming: st, source: Source::Fresh(src), bound: Bound::now(&r.pack) };
+    let spec = OpSpec { id: rid("R-50"), rel: "bin/w2.py".into(), kind: "revert".into(), expected: Recorded::for_test(before), incoming: st, source: Source::Fresh(src), bound: Bound::now(&r.pack) };
     let stop = StopOn { rel: "bin/w2.py", point: Point::AfterFirstMove, fired: Cell::new(false) };
     assert!(run_op(&r.env(&stop, ApplyForm::DepositFirst), &spec).is_err());
     assert_eq!(r.live("bin/w2.py"), TargetState::Absent, "the first move happened");
@@ -2959,6 +2959,7 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("apply.rs", "parse_canon", "not-a-read", 1, "a mode digit string; a bad one fails the whole parse (canon_req: Err)"),
     ("apply.rs", "parse_reconcile", "not-a-read", 5, "fields of the registrar's output; completeness is judged by dry_run_measurement / the judge"),
     ("apply.rs", "pre_image_slot_for", "not-a-read", 1, "no slot named → an empty path → deposit_of fails (Err)"),
+    ("apply.rs", "pre_of", "not-a-read", 1, "GK2: a lookup in the record already read (no such target = absent)"),
     ("apply.rs", "pump", "not-a-read", 1, "a child's pipe; an unended output is said"),
     ("apply.rs", "put_back_bound", "evidence", 1, "unreadable slot metadata → Unknown binding: never put back (FI1)"),
     ("apply.rs", "read_intent_in", "test", 2, "read by tests only; decisions use read_intent_checked_in"),
@@ -2974,7 +2975,7 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("apply.rs", "second_move", "conservative", 1, "an unreadable deposit → not resumed: abandoned, only bytes the record vouches for go back"),
     ("apply.rs", "second_move", "not-a-read", 1, "the copy path, present when copy_ok"),
     ("apply.rs", "slot_binding", "evidence", 1, "GK1: unreadable slot metadata → Unknown binding: never put back"),
-    ("apply.rs", "step4", "conservative", 2, "sealed copy if present else payload — either is verified against the expected state before use"),
+    ("apply.rs", "step4", "conservative", 1, "sealed copy if present else payload — verified against the expected state before use"),
     ("apply.rs", "unreadable_intents_in", "reported", 1, "an unlistable root is reported by the recovery and the passes"),
     ("apply.rs", "unreadable_ledger_member", "display", 1, "a path shown relative when it can be"),
     ("boot_critical.rs", "canonical_form", "outside", 2, "another track's file, not changed by T6"),
@@ -3202,6 +3203,37 @@ fn a_pending_revert_never_puts_back_a_slot_without_its_generation_or_with_anothe
         let _ = recover_revert_intents_in(&env, &no_hooks, &no_repair_lock);
         assert_eq!(std::fs::read(r.pack.join("hooks/v.sh")).unwrap(), b"POST\n", "{tag}: nothing put back");
     }
+}
+
+// ───────────────────────────── RULINGS GK2 — only what the engine placed is ever replaced ─────────────────────────────
+
+/// GK2 (codex r5 B2) on an ordinary file: another writer writes the file right AFTER the automatic
+/// return's exchange (before its own re-read) — the other writer's bytes STAY live, nothing is
+/// exchanged back, the return closes 충돌 (its report is owed — FG3) and the vault keeps the
+/// repaired copy. Without GK2 the engine took "what is live now" as the expected state and
+/// exchanged the old bytes back over the other writer's.
+#[cfg(target_os = "macos")]
+#[test]
+fn another_writers_bytes_after_our_exchange_stay_live() {
+    struct WriterAfterExchange;
+    impl Faults for WriterAfterExchange {
+        fn at(&self, p: Point, live: &Path, _: Option<&Slot>) -> bool {
+            if p == Point::AfterSeal {
+                std::fs::write(live, b"OTHER WRITER\n").unwrap();
+            }
+            false
+        }
+    }
+    let r = rig("gk2file");
+    let id = rid("R-81");
+    committed_general(&r, &id, "hooks/o.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let env = r.env(&WriterAfterExchange, ApplyForm::Exchange);
+    let rep = revert_in(&env, &id, RevertCaller::DaemonAuto, &no_hooks, &no_repair_lock).unwrap();
+    assert!(matches!(rep.outcome, ApplyOutcome::Declined(_)), "{rep:?}");
+    assert_eq!(std::fs::read(r.pack.join("hooks/o.sh")).unwrap(), b"OTHER WRITER\n", "the other writer's bytes stay");
+    let closed = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
+    assert!(closed.starts_with("충돌") && closure_owes_intake(&closed), "closed as conflict, its report owed: {closed}");
+    assert!(r.vault_bytes().contains(&b"POST\n".to_vec()), "the vault keeps the repaired copy");
 }
 
 // ───────────────────────────── RULINGS EJ4 — one ownership per repair ─────────────────────────────

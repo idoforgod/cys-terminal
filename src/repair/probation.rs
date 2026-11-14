@@ -1769,7 +1769,9 @@ fn m10_sweep_full(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
             id: m10_bucket(),
             rel: rel.to_string(),
             kind: "m10-revert".into(),
-            expected: sampled_live.clone(),
+            // GK2: M10 replaces bytes it did not place (F9 / M10) — ONLY the exact state its check
+            // sampled, revalidated under the lock below; a later write by anyone is never replaced
+            expected: apply::Recorded::sampled_by_scan(sampled_live.clone()),
             incoming: TargetState::File { sha256: source_sha.clone(), mode },
             source,
             bound: bound.clone(),

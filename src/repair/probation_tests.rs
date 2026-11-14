@@ -664,7 +664,7 @@ fn recovery_waits_for_an_active_writer() {
             p == crate::repair::apply::Point::AfterRecord
         }
     }
-    let spec = crate::repair::apply::OpSpec { id: rid("R-7"), rel: "hooks/w.sh".into(), kind: "revert".into(), expected: before, incoming, source: crate::repair::apply::Source::Fresh(src), bound: crate::repair::apply::Bound::now(&r.pack) };
+    let spec = crate::repair::apply::OpSpec { id: rid("R-7"), rel: "hooks/w.sh".into(), kind: "revert".into(), expected: crate::repair::apply::Recorded::for_test(before), incoming, source: crate::repair::apply::Source::Fresh(src), bound: crate::repair::apply::Bound::now(&r.pack) };
     assert!(crate::repair::apply::run_op(&r.env(&StopAfterRecord, ApplyForm::Exchange), &spec).is_err());
     assert_eq!(crate::repair::wal::unfinished_for_lane(&r.root, &r.lane).len(), 1);
     let lock = r.base.join(".pack-apply.lock");

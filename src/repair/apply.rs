@@ -131,8 +131,10 @@ pub struct OpSpec {
     pub rel: String,
     /// `apply` | `revert` | `undo-superseded` | `m10-revert`
     pub kind: String,
-    /// The live state expected at step 0 (what is displaced).
-    pub expected: TargetState,
+    /// The live state expected at step 0 (what is displaced) — RULINGS GK2: a RECORDED state only
+    /// (what an operation's durable record says it placed or found, the recorded pre-state of a first
+    /// apply, a lane row's or an intent's recorded state); never a read made by the caller.
+    pub expected: Recorded,
     /// The state put live.
     pub incoming: TargetState,
     /// Where the incoming bytes come from (RULINGS GK1: bytes held in a vault slot are bound by the
@@ -141,6 +143,96 @@ pub struct OpSpec {
     /// The generation this operation is bound to (EJ1: required — Known or Unknown; Unknown places
     /// nothing).
     pub bound: Bound,
+}
+
+pub use recorded::Recorded;
+
+/// RULINGS GK2 — the engine replaces live bytes ONLY when they are exactly what a durable record says.
+pub mod recorded {
+    use super::super::ledger::{LaneRecord, RepairRecord};
+    use super::super::types::{RepairError, TargetState};
+    use super::super::wal::OpRecord;
+    use super::{IntentTarget, RevertTarget};
+
+    /// A RECORDED state. No constructor takes a state a caller read from the live file, so "expected
+    /// from a fresh read" cannot be written; every constructor reads a durable record.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Recorded(TargetState);
+
+    impl Recorded {
+        /// What this operation's durable record says it placed.
+        pub fn placed_by(rec: &OpRecord) -> Result<Recorded, RepairError> {
+            super::canon_req(&rec.incoming, &rec.rel).map(Recorded)
+        }
+        /// What this operation's durable record says was live at its step 0.
+        pub fn found_by(rec: &OpRecord) -> Result<Recorded, RepairError> {
+            super::canon_req(&rec.expected, &rec.rel).map(Recorded)
+        }
+        /// The path a deposit-first operation's first move vacated (its record says so).
+        pub fn vacated_by(rec: &OpRecord) -> Result<Recorded, RepairError> {
+            if rec.form == "deposit-first" {
+                Ok(Recorded(TargetState::Absent))
+            } else {
+                Err(RepairError::Corrupt(format!("{}: 이 동작의 기록은 자리를 비운 적이 없습니다({})", rec.rel, rec.form)))
+            }
+        }
+        /// The pre-state `begin` recorded for `rel` (a first apply; absent when the record has no such
+        /// target).
+        pub fn pre_of(rec: &RepairRecord, rel: &str) -> Recorded {
+            Recorded(super::ledger::file_targets(rec).find(|f| f.rel == rel).map(|f| f.pre.state()).unwrap_or(TargetState::Absent))
+        }
+        /// A lane row's recorded state of `rel` (what the apply left live).
+        pub fn applied_in(row: &LaneRecord, rel: &str) -> Result<Recorded, RepairError> {
+            let canon = row
+                .applied
+                .iter()
+                .find(|(r, _)| r == rel)
+                .map(|(_, c)| c.clone())
+                .ok_or_else(|| RepairError::Corrupt(format!("{rel}: 이 부서의 행이 이 파일을 말하지 않습니다")))?;
+            super::canon_req(&canon, rel).map(Recorded)
+        }
+        /// A revert intent's recorded applied state of its target.
+        pub fn applied_by_intent(t: &RevertTarget) -> Result<Recorded, RepairError> {
+            super::canon_req(&t.applied, &t.rel).map(Recorded)
+        }
+        /// An apply intent's recorded pre-state of its target.
+        pub fn pre_by_intent(t: &IntentTarget) -> Result<Recorded, RepairError> {
+            super::canon_req(&t.pre, &t.rel).map(Recorded)
+        }
+        /// M10 only (F9 / M10 — the one deliberate replacement of bytes the engine did not place): the
+        /// state the scan sampled, revalidated under the pack-apply lock right before the put-back and
+        /// written as the operation's step-0 state before anything changes.
+        pub(crate) fn sampled_by_scan(st: TargetState) -> Recorded {
+            Recorded(st)
+        }
+        /// Tests only.
+        #[cfg(test)]
+        pub(crate) fn for_test(st: TargetState) -> Recorded {
+            Recorded(st)
+        }
+        pub fn state(&self) -> &TargetState {
+            &self.0
+        }
+    }
+
+    impl std::ops::Deref for Recorded {
+        type Target = TargetState;
+        fn deref(&self) -> &TargetState {
+            &self.0
+        }
+    }
+
+    impl PartialEq<TargetState> for Recorded {
+        fn eq(&self, other: &TargetState) -> bool {
+            self.0 == *other
+        }
+    }
+
+    impl PartialEq<Recorded> for TargetState {
+        fn eq(&self, other: &Recorded) -> bool {
+            *self == other.0
+        }
+    }
 }
 
 /// RULINGS GK1 — where an operation's incoming bytes come from.
@@ -359,13 +451,23 @@ impl Bound {
 #[derive(Debug, Clone, Copy)]
 enum DoorAct<'a> {
     /// `renamex_np(RENAME_SWAP)` of the live entry with a slot payload.
-    Exchange { payload: &'a Path },
+    Exchange { payload: &'a Path, expected: &'a Recorded },
     /// A no-replace placement of a non-slot copy at the (absent) live path.
-    Place { copy: &'a Path },
+    Place { copy: &'a Path, expected: &'a Recorded },
     /// The live entry moved into a fresh slot payload (no replace).
-    MoveOut { into: &'a Path },
+    MoveOut { into: &'a Path, expected: &'a Recorded },
     /// The missing live parent folders of a placement.
     MakeParents,
+}
+
+impl DoorAct<'_> {
+    /// GK2: the recorded state the live path must hold for this act (none for parent folders).
+    fn expected(&self) -> Option<&Recorded> {
+        match self {
+            DoorAct::Exchange { expected, .. } | DoorAct::Place { expected, .. } | DoorAct::MoveOut { expected, .. } => Some(expected),
+            DoorAct::MakeParents => None,
+        }
+    }
 }
 
 /// RULINGS EJ1 — THE door into a live pack path: every rename, exchange, placement or folder
@@ -374,6 +476,18 @@ enum DoorAct<'a> {
 /// only when the operation's bound generation is Known and equal; otherwise `Superseded`, nothing
 /// touched.
 fn door(env: &OpEnv<'_>, binding: &Binding, live: &Path, act: DoorAct<'_>) -> Result<(), RepairError> {
+    // GK2: the live path holds EXACTLY the recorded state at this moment, or nothing is touched
+    if let Some(expected) = act.expected() {
+        let now = TargetState::read(live)?;
+        if now != *expected.state() {
+            return Err(RepairError::Superseded(format!(
+                "{}: 살아 있는 것이 기록된 상태가 아닙니다(지금 {} · 기록 {}) — 다른 작성자의 바이트를 그대로 둡니다",
+                live.display(),
+                now.canon(),
+                expected.canon()
+            )));
+        }
+    }
     // GK1: the operation's binding AND the generation of the slot whose bytes go live
     if !binding.holds_now(env.pack) {
         return Err(RepairError::Superseded(format!(
@@ -382,9 +496,9 @@ fn door(env: &OpEnv<'_>, binding: &Binding, live: &Path, act: DoorAct<'_>) -> Re
         )));
     }
     match act {
-        DoorAct::Exchange { payload } => exchange(live, payload),
-        DoorAct::Place { copy } => place_no_replace(copy, live),
-        DoorAct::MoveOut { into } => place_no_replace(live, into),
+        DoorAct::Exchange { payload, .. } => exchange(live, payload),
+        DoorAct::Place { copy, .. } => place_no_replace(copy, live),
+        DoorAct::MoveOut { into, .. } => place_no_replace(live, into),
         DoorAct::MakeParents => std::fs::create_dir_all(live).map_err(|e| RepairError::Io(format!("{}: {e}", live.display()))),
     }
 }
@@ -655,7 +769,7 @@ fn run_op_depth(env: &OpEnv<'_>, spec: &OpSpec, depth: u8) -> Result<OpDone, Rep
         return Ok(done(ApplyOutcome::Applied, None));
     }
     let op = wal::new_op_id(env.now, &spec.kind);
-    match (&spec.expected, &spec.incoming, env.form) {
+    match (spec.expected.state(), &spec.incoming, env.form) {
         (TargetState::Absent, _, _) => op_place(env, spec, &op, &live, &gen),
         (_, TargetState::Absent, _) => op_move_in(env, spec, &op, &live, &gen, depth),
         (_, _, ApplyForm::Exchange) => op_exchange(env, spec, &op, &live, &gen, depth),
@@ -727,7 +841,7 @@ fn op_exchange(
         return Err(stop(Point::AfterRecord));
     }
     // step 3: the exchange; the seal is the very next filesystem operation (M2)
-    if let Err(e) = door(env, &Binding::of_spec(spec), live, DoorAct::Exchange { payload: &slot.payload() }) {
+    if let Err(e) = door(env, &Binding::of_spec(spec), live, DoorAct::Exchange { payload: &slot.payload(), expected: &spec.expected }) {
         return door_refused(env, &mut rec, spec, e);
     }
     seal_now(env, &slot, live)?;
@@ -769,8 +883,7 @@ fn step4(
     let expected = canon_req(&rec.expected, &rec.rel)?;
     if *deposit == expected && gen_ok {
         // CT3 — the outcome reported is the outcome measured: what is NOW live must be the state
-        // this operation was to put live; otherwise that entry goes into a fresh slot by a CHECKED
-        // operation (expected = what is actually live) and the previous bytes return
+        // this operation was to put live; otherwise it is another writer's (GK2, below)
         let incoming = canon_req(&rec.incoming, &rec.rel)?;
         let live_now = TargetState::read(live)?;
         if live_now != incoming {
@@ -780,30 +893,11 @@ fn step4(
                 live_now.canon(),
                 incoming.canon()
             );
-            if depth == 0 {
-                let holder = if std::fs::symlink_metadata(slot.sealed()).is_ok() {
-                    slot.sealed()
-                } else {
-                    slot.payload()
-                };
-                let back = OpSpec {
-                    id: spec.id.clone(),
-                    rel: spec.rel.clone(),
-                    kind: "undo-mismatch".into(),
-                    expected: live_now,
-                    incoming: deposit.clone(),
-                    source: Source::Slot { holder },
-                    bound: Bound::of(rec.pack_generation.clone()),
-                };
-                let r = run_op_depth(env, &back, depth + 1)?;
-                if r.outcome == ApplyOutcome::Applied {
-                    note.push_str(" — 그것을 새 보관 칸에 두고 이전 바이트를 되돌렸습니다");
-                } else {
-                    note.push_str(&format!(" — 이전 바이트를 되돌리지 못했습니다(충돌 · {:?})", r.outcome));
-                }
-            } else {
-                note.push_str(" — 겹친 동작이라 더 바꾸지 않습니다(워커 검토)");
-            }
+            // RULINGS GK2: the exchange is atomic — a difference from what this operation placed is
+            // ANOTHER writer's work (e.g. a job the schedule writer just added): it STAYS live, nothing
+            // is exchanged back, the operation closes as conflict; the vault keeps what it holds
+            let _ = depth;
+            note.push_str(" — 그 사이 다른 작성자가 쓴 것으로 보고 그 바이트를 그대로 두었습니다(충돌 · 보관 칸의 바이트는 그대로 · 워커 검토)");
             if env.faults.at(Point::BeforeDone, live, Some(slot)) {
                 return Err(stop(Point::BeforeDone));
             }
@@ -852,7 +946,8 @@ fn step4(
                 id: spec.id.clone(),
                 rel: spec.rel.clone(),
                 kind: "undo-superseded".into(),
-                expected: TargetState::read(live)?,
+                // GK2: what THIS operation placed (its record) — never a fresh read
+                expected: Recorded::placed_by(rec)?,
                 incoming: deposit.clone(),
                 source: Source::Slot { holder },
                 bound: Bound::of(rec.pack_generation.clone()),
@@ -919,7 +1014,7 @@ fn op_move_in(
     if env.faults.at(Point::AfterRecord, live, Some(&slot)) {
         return Err(stop(Point::AfterRecord));
     }
-    if let Err(e) = door(env, &Binding::of_spec(spec), live, DoorAct::MoveOut { into: &slot.payload() }) {
+    if let Err(e) = door(env, &Binding::of_spec(spec), live, DoorAct::MoveOut { into: &slot.payload(), expected: &spec.expected }) {
         return door_refused(env, &mut rec, spec, e);
     }
     seal_now(env, &slot, live)?;
@@ -972,7 +1067,8 @@ fn after_seal_move_in(
                 id: spec.id.clone(),
                 rel: spec.rel.clone(),
                 kind: "undo-superseded".into(),
-                expected: TargetState::Absent,
+                // GK2: what this move-in operation left (its record: absent)
+                expected: Recorded::placed_by(rec)?,
                 incoming: facts.sealed_state.clone(),
                 source: Source::Slot { holder },
                 bound: Bound::of(rec.pack_generation.clone()),
@@ -991,18 +1087,12 @@ fn after_seal_move_in(
     Ok(done(ApplyOutcome::Superseded(note), Some(rec)))
 }
 
-/// CT3 for a placement (place form, the Windows second move): what is NOW live must be the state
-/// the placement was to put there; otherwise that entry goes into a fresh slot by a CHECKED
-/// operation (expected = what is actually live) and the PREVIOUS state returns — absent for the
-/// place form, the deposited bytes (`previous`) for the deposit-first form. `None` = the measured
-/// state is the incoming one.
-fn verify_placed(
-    env: &OpEnv<'_>,
-    rec: &OpRecord,
-    live: &Path,
-    previous: (TargetState, Option<PathBuf>),
-    depth: u8,
-) -> Result<Option<String>, RepairError> {
+/// CT3 / GK2 for a placement (place form, the Windows second move): what is NOW live must be the
+/// state the placement was to put there; otherwise it is ANOTHER writer's (the placement is a
+/// single no-replace move) — it stays live and the operation closes as conflict. `None` = the
+/// measured state is the incoming one.
+fn verify_placed(env: &OpEnv<'_>, rec: &OpRecord, live: &Path) -> Result<Option<String>, RepairError> {
+    let _ = env;
     let incoming = canon_req(&rec.incoming, &rec.rel)?;
     let live_now = TargetState::read(live)?;
     if live_now == incoming {
@@ -1014,23 +1104,8 @@ fn verify_placed(
         live_now.canon(),
         incoming.canon()
     );
-    if depth == 0 && live_now != previous.0 {
-        let back = OpSpec {
-            id: rec.repair.clone(),
-            rel: rec.rel.clone(),
-            kind: "undo-mismatch".into(),
-            expected: live_now,
-            incoming: previous.0,
-            source: Source::of_slot(previous.1),
-            bound: Bound::of(rec.pack_generation.clone()),
-        };
-        let r = run_op_depth(env, &back, depth + 1)?;
-        if r.outcome == ApplyOutcome::Applied {
-            note.push_str(" — 그것을 새 보관 칸에 두고 그 자리를 이전 상태로 되돌렸습니다");
-        } else {
-            note.push_str(&format!(" — 그 자리를 되돌리지 못했습니다(충돌 · {:?})", r.outcome));
-        }
-    }
+    // RULINGS GK2: another writer's bytes after OUR placement stay live (conflict)
+    note.push_str(" — 그 사이 다른 작성자가 쓴 것으로 보고 그 바이트를 그대로 두었습니다(충돌 · 워커 검토)");
     Ok(Some(note))
 }
 
@@ -1075,7 +1150,7 @@ fn op_place(
     if env.faults.at(Point::AfterRecord, live, None) {
         return Err(stop(Point::AfterRecord));
     }
-    match door(env, &Binding::of_spec(spec), live, DoorAct::Place { copy: &copy }) {
+    match door(env, &Binding::of_spec(spec), live, DoorAct::Place { copy: &copy, expected: &spec.expected }) {
         Ok(()) => {}
         Err(RepairError::Superseded(m)) => {
             drop_copy(&copy);
@@ -1095,7 +1170,7 @@ fn op_place(
     if env.faults.at(Point::BeforeDone, live, None) {
         return Err(stop(Point::BeforeDone));
     }
-    if let Some(note) = verify_placed(env, &rec, live, (TargetState::Absent, None), 0)? {
+    if let Some(note) = verify_placed(env, &rec, live)? {
         wal::finish(env.root, &mut rec, "declined", &note, env.now)?;
         return Ok(done(ApplyOutcome::Declined(note), Some(&rec)));
     }
@@ -1154,7 +1229,7 @@ fn op_deposit_first(
         return Err(stop(Point::AfterRecord));
     }
     // first move: the live file into the slot (a held file fails here → stop, delete nothing)
-    if let Err(e) = door(env, &Binding::of_spec(spec), live, DoorAct::MoveOut { into: &slot.payload() }) {
+    if let Err(e) = door(env, &Binding::of_spec(spec), live, DoorAct::MoveOut { into: &slot.payload(), expected: &spec.expected }) {
         let _ = std::fs::remove_file(&copy);
         return door_refused(env, &mut rec, spec, e);
     }
@@ -1187,7 +1262,8 @@ fn second_move(
     if copy_ok && gen_ok && deposit_ok {
         // RESUME (OQ-D8): the staged copy still matches and the generation is unchanged
         let copy = rec.incoming_copy.clone().unwrap_or_default();
-        match door(env, &Binding::of_record(rec), live, DoorAct::Place { copy: &copy }) {
+        let vacated = Recorded::vacated_by(rec)?;
+        match door(env, &Binding::of_record(rec), live, DoorAct::Place { copy: &copy, expected: &vacated }) {
             Ok(()) => {
                 if let Some(p) = live.parent() {
                     super::durable::full_flush_dir(p)?;
@@ -1196,9 +1272,7 @@ fn second_move(
                 if env.faults.at(Point::BeforeDone, live, Some(slot)) {
                     return Err(stop(Point::BeforeDone));
                 }
-                // FG1: an unreadable deposit is an error — never "nothing to put back"
-                let previous = vault::deposit_of(slot).map(|(st, h)| (st, Some(h)))?;
-                if let Some(note) = verify_placed(env, rec, live, previous, 0)? {
+                if let Some(note) = verify_placed(env, rec, live)? {
                     wal::finish(env.root, rec, "declined", &note, env.now)?;
                     return Ok(done(ApplyOutcome::Declined(note), Some(rec)));
                 }
@@ -1241,7 +1315,7 @@ fn second_move(
                 id: rec.repair.clone(),
                 rel: rel.clone(),
                 kind: "undo-superseded".into(),
-                expected: TargetState::Absent,
+                expected: Recorded::vacated_by(rec)?,
                 incoming: st,
                 source: Source::Slot { holder },
                 bound: Bound::of(rec.pack_generation.clone()),
@@ -1270,7 +1344,7 @@ pub fn resume_op(env: &OpEnv<'_>, mut rec: OpRecord) -> Result<OpDone, RepairErr
         id: rec.repair.clone(),
         rel: rec.rel.clone(),
         kind: rec.kind.clone(),
-        expected: canon_req(&rec.expected, &rec.rel)?,
+        expected: Recorded::found_by(&rec)?,
         incoming: canon_req(&rec.incoming, &rec.rel)?,
         source: Source::None,
         bound: Bound::of(rec.pack_generation.clone()),
@@ -1392,11 +1466,7 @@ pub fn resume_op(env: &OpEnv<'_>, mut rec: OpRecord) -> Result<OpDone, RepairErr
         ("place", "staged") | ("deposit-first", "placed") | ("place", "placed") => {
             let want = rec.incoming_copy_identity.clone();
             if want.as_ref().is_some_and(|w| live_entry.as_ref().is_some_and(|e| same_entry(w, e))) {
-                let previous = match (&rec.form[..], &slot) {
-                    ("deposit-first", Some(sl)) => vault::deposit_of(sl).map(|(st, h)| (st, Some(h)))?,
-                    _ => (TargetState::Absent, None),
-                };
-                if let Some(note) = verify_placed(env, &rec, &live, previous, 0)? {
+                if let Some(note) = verify_placed(env, &rec, &live)? {
                     wal::finish(env.root, &mut rec, "declined", &note, env.now)?;
                     return Ok(done(ApplyOutcome::Declined(note), Some(&rec)));
                 }
@@ -1865,7 +1935,7 @@ fn recover_one_revert(
                     id: rec.id.clone(),
                     rel: t.rel.clone(),
                     kind: "revert".into(),
-                    expected: applied,
+                    expected: Recorded::applied_by_intent(t)?,
                     incoming: pre,
                     // GK1: the pre-image's OWN slot binds the put-back (the intent's generation is
                     // never a substitute)
@@ -1989,7 +2059,7 @@ pub fn revert_in(
             id: id.clone(),
             rel: rel.clone(),
             kind: "revert".into(),
-            expected,
+            expected: Recorded::applied_in(&row, rel)?,
             incoming: pre,
             source: Source::of_slot(holder),
             bound,
@@ -2841,11 +2911,12 @@ fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &Repair
     for t in &intent.targets {
         let pre = parse_canon(&t.pre).ok_or_else(|| RepairError::Corrupt(format!("{}: 의도의 상태를 읽을 수 없습니다", t.rel)))?;
         let incoming = parse_canon(&t.incoming).ok_or_else(|| RepairError::Corrupt(format!("{}: 의도의 상태를 읽을 수 없습니다", t.rel)))?;
+        let _ = pre;
         specs.push(OpSpec {
             id: id.clone(),
             rel: t.rel.clone(),
             kind: "apply".into(),
-            expected: pre,
+            expected: Recorded::pre_by_intent(t)?,
             incoming,
             source: Source::None,
             bound: Bound::of(intent.pack_generation.clone()),
@@ -3097,7 +3168,7 @@ pub fn apply_candidate_in(
                 id: id.clone(),
                 rel: rel.clone(),
                 kind: "apply".into(),
-                expected: pre,
+                expected: Recorded::pre_of(&rec, rel),
                 incoming,
                 // GK1: the fingerprinted slot holds the candidate — its own generation binds it
                 source: Source::of_slot(slot.as_ref().map(|s| s.payload())),
@@ -3132,7 +3203,7 @@ pub fn apply_candidate_in(
     let mut applied: Vec<OpSpec> = Vec::new();
     let mut failed: Option<String> = None;
     for (spec, slot) in &plan {
-        let r = match (&spec.expected, &spec.incoming, slot) {
+        let r = match (spec.expected.state(), &spec.incoming, slot) {
             (TargetState::Absent, _, _) | (_, TargetState::Absent, _) | (_, _, None) => run_op(env, spec)?,
             (_, _, Some(s)) => {
                 let copy = vault::build_slot(
@@ -3405,7 +3476,7 @@ fn exchange_prepared(
     if env.faults.at(Point::AfterRecord, &live, Some(slot)) {
         return Err(stop(Point::AfterRecord));
     }
-    if let Err(e) = door(env, &Binding::of_spec(spec), &live, DoorAct::Exchange { payload: &slot.payload() }) {
+    if let Err(e) = door(env, &Binding::of_spec(spec), &live, DoorAct::Exchange { payload: &slot.payload(), expected: &spec.expected }) {
         return door_refused(env, &mut rec, spec, e);
     }
     seal_now(env, slot, &live)?;
@@ -3421,12 +3492,23 @@ fn undo_applied(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord) -> Resu
 
 /// [`undo_applied`]; `only_ours` (CT4 recovery): a target whose live state is neither the pre-image
 /// nor the apply's state is left alone and reported (someone else wrote it after the crash).
-fn undo_applied_with(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord, only_ours: bool) -> Result<Vec<(String, String)>, RepairError> {
+fn undo_applied_with(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord, _only_ours: bool) -> Result<Vec<(String, String)>, RepairError> {
     let mut left = Vec::new();
     for spec in applied.iter().rev() {
         if TargetState::read(&env.pack.join(&spec.rel))? == spec.expected {
             continue; // nothing of this target was changed (its pre-image is live)
         }
+        // RULINGS GK2: the state THIS apply's own operation record says it placed — the only state
+        // ever replaced; anything else live is another writer's and stays (always — the in-apply undo
+        // and the recovery alike)
+        let placed = match latest_apply_op_for(env.root, &spec.id, env.lane, &spec.rel) {
+            Ok(Some(op)) => Recorded::placed_by(&op)?,
+            Ok(None) => continue, // never recorded: nothing of this target was placed
+            Err(e) => {
+                left.push((spec.rel.clone(), format!("동작 기록을 읽을 수 없습니다({e:?})")));
+                continue;
+            }
+        };
         let (pre, holder, slot) = match pre_image_slot_for(env.root, rec, env.lane, &spec.rel) {
             Ok(x) => x,
             Err(e) => {
@@ -3438,15 +3520,15 @@ fn undo_applied_with(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord, on
         if live_now == pre {
             continue; // already the pre-image (e.g. undone by the operation's own CT3 check)
         }
-        if only_ours && live_now != spec.incoming {
-            left.push((spec.rel.clone(), format!("살아 있는 것이 적용 전도 적용 결과도 아닙니다({}) — 그대로 둠", live_now.canon())));
+        if live_now != placed {
+            left.push((spec.rel.clone(), format!("살아 있는 것이 이 적용이 놓은 것이 아닙니다({}) — 다른 작성자의 바이트를 그대로 둠(충돌)", live_now.canon())));
             continue;
         }
         let back = OpSpec {
             id: spec.id.clone(),
             rel: spec.rel.clone(),
             kind: "revert".into(),
-            expected: live_now,
+            expected: placed,
             incoming: pre,
             source: Source::of_slot(holder),
             // FI1: the binding of the bytes put back (a removal: the apply's binding — DR1)
@@ -3458,6 +3540,15 @@ fn undo_applied_with(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord, on
         }
     }
     Ok(left)
+}
+
+/// GK2: this lane's LAST apply operation on `rel` (any state) — what the apply placed is read from it.
+fn latest_apply_op_for(root: &Path, id: &RepairId, lane: &LaneKey, rel: &str) -> Result<Option<OpRecord>, RepairError> {
+    let ops = wal::list_checked_in(root, id).map_err(RepairError::Corrupt)?;
+    Ok(ops
+        .into_iter()
+        .filter(|r| r.lane_key == *lane && r.rel == rel && matches!(r.kind.as_str(), "apply" | "propagate"))
+        .last())
 }
 
 /// CT3 / CT4: an approved apply that could not be completed NOR fully undone — the lane row says

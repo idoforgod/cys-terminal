@@ -143,6 +143,78 @@ fn committed(r: &Rig, rel: &str, post: &[u8]) -> String {
     id
 }
 
+/// RULINGS GK2 (codex r5 B2) with the REAL schedule writer: right after the repair engine's
+/// exchange of `schedule.json` (a return of the pre-image), the daemon's own writer adds its
+/// built-in jobs (`schedule::ensure_builtin_jobs_at` — among them the periodic self-heal job) — the
+/// added jobs are in the final live schedule and the operation closes as conflict; nothing is
+/// exchanged back over them. Without GK2 the engine exchanged the old schedule back: the added
+/// jobs were live nowhere.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_schedule_writers_jobs_after_our_exchange_stay_live() {
+    struct ScheduleWriterAfterExchange;
+    impl cys::repair::apply::Faults for ScheduleWriterAfterExchange {
+        fn at(&self, p: cys::repair::apply::Point, live: &Path, _: Option<&cys::repair::vault::Slot>) -> bool {
+            if p == cys::repair::apply::Point::AfterSeal {
+                crate::schedule::ensure_builtin_jobs_at(live);
+            }
+            false
+        }
+    }
+    let r = rig("gk2sched");
+    let id = RepairId::parse("R-82").unwrap();
+    let live = r.pack.join("schedule.json");
+    std::fs::write(&live, b"{\"jobs\": []}\n").unwrap();
+    let pre = ledger::copy_preimage_in(&r.root, &id, &r.lane, "schedule.json", &live, T0).unwrap();
+    let holder = match &pre {
+        ledger::PreImage::Slot { slot_dir, .. } => cys::repair::vault::deposit_of(&cys::repair::vault::Slot::at(slot_dir, "schedule.json")).unwrap().1,
+        ledger::PreImage::Absent => panic!("a pre-image"),
+    };
+    // the repair's applied schedule (what the lane row records)
+    std::fs::write(&live, b"{\n \"jobs\": []\n}\n").unwrap();
+    let applied = cys::repair::types::TargetState::read(&live).unwrap();
+    let row = ledger::LaneRecord {
+        schema: 1,
+        repair: id.clone(),
+        lane: r.lane.clone(),
+        state: cys::repair::types::LaneState::Verified,
+        probation: None,
+        merge: None,
+        merge_history: Vec::new(),
+        approval_ref: None,
+        conflict_live: Vec::new(),
+        applied: vec![("schedule.json".into(), applied.canon())],
+        applied_history: Vec::new(),
+        merge_base: Vec::new(),
+        merge_lock: None,
+        merge_attempt: 0,
+        updated_at: T0,
+    };
+    let faults = ScheduleWriterAfterExchange;
+    let env = cys::repair::apply::OpEnv {
+        root: &r.root,
+        pack: &r.pack,
+        lane: &r.lane,
+        now: T0 + 1.0,
+        form: cys::repair::platform::ApplyForm::Exchange,
+        faults: &faults,
+        own_check: &|_, _| None,
+    };
+    let spec = cys::repair::apply::OpSpec {
+        id: id.clone(),
+        rel: "schedule.json".into(),
+        kind: "revert".into(),
+        expected: cys::repair::apply::Recorded::applied_in(&row, "schedule.json").unwrap(),
+        incoming: pre.state(),
+        source: cys::repair::apply::Source::Slot { holder },
+        bound: cys::repair::apply::Bound::now(&r.pack),
+    };
+    let done = cys::repair::apply::run_op(&env, &spec).unwrap();
+    assert!(matches!(done.outcome, cys::repair::apply::ApplyOutcome::Declined(_)), "closed as conflict: {:?}", done.outcome);
+    let jobs: serde_json::Value = serde_json::from_slice(&std::fs::read(&live).unwrap()).unwrap();
+    assert!(jobs["jobs"].as_array().is_some_and(|a| !a.is_empty()), "the writer's jobs are live: {jobs}");
+}
+
 /// RULINGS GK3: a notice closed "not confirmed" (handed out three times without its receiver's
 /// confirmation) stays visible in `cys repair status`.
 #[test]
