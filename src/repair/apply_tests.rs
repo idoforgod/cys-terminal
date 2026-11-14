@@ -364,10 +364,13 @@ fn rule_one_property_every_op_every_point() {
                         late.extend_from_slice(b"+late");
                         let p = r.src.join("late-version");
                         std::fs::write(&p, &late).unwrap();
+                        #[cfg(unix)]
                         {
                             use std::os::unix::fs::PermissionsExt;
                             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
                         }
+                        #[cfg(not(unix))]
+                        let _ = mode;
                         legit.push(TargetState::read(&p).unwrap());
                     }
                     if let Some(w) = inj.wrote_live.borrow().as_ref() {
@@ -1640,6 +1643,7 @@ fn unrecoverable_target_leaves_a_revertible_conflict_row() {
 
 // ───────────────────────────── RULINGS CT6 — the job thread always returns ─────────────────────────────
 
+#[cfg(unix)]
 fn pid_gone(pid: i32) -> bool {
     // a killed orphan is reaped by the system shortly; wait for it, bounded
     for _ in 0..200 {
@@ -1774,9 +1778,17 @@ fn f9_is_an_agreement_of_its_members() {
     let slot = Slot::at(op.slot.as_ref().unwrap(), rel);
     let mut pre: serde_json::Value = serde_json::from_slice(&std::fs::read(slot.meta_pre()).unwrap()).unwrap();
     pre["sha256"] = serde_json::json!("f".repeat(64));
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(slot.meta_pre(), std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    #[cfg(not(unix))]
+    {
+        let mut perm = std::fs::metadata(slot.meta_pre()).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(false);
+        std::fs::set_permissions(slot.meta_pre(), perm).unwrap();
     }
     std::fs::write(slot.meta_pre(), serde_json::to_vec(&pre).unwrap()).unwrap();
     assert!(!approved_copy_of_current_generation_in(&r.root, &r.pack, &r.lane, rel).unwrap(), "(c)");
