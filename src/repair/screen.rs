@@ -1660,26 +1660,171 @@ fn profile_set(v: &Variants) -> Vec<String> {
     s.into_iter().collect()
 }
 
-/// Is the capability gate registered in this settings file (C28's ownership + scope rules)?
+/// The interpreters the gate (a `.sh` script) may be named after (RULINGS CZ1): the registrar
+/// writes `sh <abs>` on Unix (`cysjavis-pack/bin/javis_preflight.py:_cys_hook_cmd`); a literal
+/// absolute path of the same two programs is the same program. Nothing else — no flag, no wrapper.
+const GATE_INTERPRETERS: &[&str] = &[
+    "sh",
+    "bash",
+    "/bin/sh",
+    "/bin/bash",
+    "/usr/bin/sh",
+    "/usr/bin/bash",
+];
+
+/// The least hook timeout (seconds) that lets the gate answer: the released registrar's declared
+/// capgate timeout (`javis_preflight.py` `("role-capability-gate.sh", "PreToolUse"): 15`) — a
+/// shorter one ends the hook before the gate decides, and an ended hook blocks nothing (CZ1).
+pub(crate) const GATE_TIMEOUT_FLOOR_S: f64 = 15.0;
+
+/// A character of a bare part of a hook command (the set of T3b's grammar,
+/// `src/bin/cysd/alerts.rs:is_bare_char`, without `~`).
+fn gate_bare_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '@' | '%' | '+' | '=' | ':' | ',' | '.' | '/' | '-')
+}
+
+/// The words of a hook command when the WHOLE text is made of the closed grammar's words (RULINGS
+/// CZ1 — the form of T3b's detector, `src/bin/cysd/alerts.rs:grammar_tokens`): bare characters, or
+/// single / double quoted parts without `$`, a backquote, a backslash, `!` or a control character.
+/// `None` at the first character or form outside it: a comment (`#`), an operator (`;` `&` `|`), a
+/// redirection, a subshell, a glob, an expansion, a newline. Each word: (text, every part bare).
+pub(crate) fn hook_command_words(src: &str) -> Option<Vec<(String, bool)>> {
+    let cs: Vec<char> = src.chars().collect();
+    let n = cs.len();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        if cs[i] == ' ' || cs[i] == '\t' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let (mut text, mut bare) = (String::new(), true);
+        while i < n && cs[i] != ' ' && cs[i] != '\t' {
+            match cs[i] {
+                '\'' => {
+                    bare = false;
+                    i += 1;
+                    while i < n && cs[i] != '\'' {
+                        if cs[i].is_control() {
+                            return None;
+                        }
+                        text.push(cs[i]);
+                        i += 1;
+                    }
+                    if i >= n {
+                        return None;
+                    }
+                    i += 1;
+                }
+                '"' => {
+                    bare = false;
+                    i += 1;
+                    while i < n && cs[i] != '"' {
+                        if matches!(cs[i], '$' | '`' | '\\' | '!') || cs[i].is_control() {
+                            return None;
+                        }
+                        text.push(cs[i]);
+                        i += 1;
+                    }
+                    if i >= n {
+                        return None;
+                    }
+                    i += 1;
+                }
+                c if gate_bare_char(c) && !(c == '=' && i == start) => {
+                    text.push(c);
+                    i += 1;
+                }
+                _ => return None,
+            }
+        }
+        out.push((text, bare));
+    }
+    Some(out)
+}
+
+fn executable_file(m: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        m.is_file() && m.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = m;
+        false
+    }
+}
+
+/// Does this hook object EXECUTE the gate at `gate` (RULINGS CZ1 — "registered" means the protection
+/// runs)? An executable command hook: `type` exactly `command`, no key the registrar does not write
+/// (`type`, `command`, `timeout`), a timeout (when given) a number of at least
+/// [`GATE_TIMEOUT_FLOOR_S`]; its command ONE simple command of the closed grammar — the gate by its
+/// literal path, alone (then the file must be executable) or after one interpreter of
+/// [`GATE_INTERPRETERS`] (bare) — and the gate a regular file. Every other form (a comment, a no-op
+/// wrapper, a conditional, an argument, a redirection, another hook type) does not run it.
+pub(crate) fn hook_runs_gate(h: &serde_json::Value, gate: &Path) -> bool {
+    let Some(o) = h.as_object() else {
+        return false;
+    };
+    if o
+        .keys()
+        .any(|k| !matches!(k.as_str(), "type" | "command" | "timeout"))
+    {
+        return false;
+    }
+    if o.get("type").and_then(|t| t.as_str()) != Some("command") {
+        return false;
+    }
+    if let Some(t) = o.get("timeout") {
+        if !t.as_f64().is_some_and(|s| s >= GATE_TIMEOUT_FLOOR_S) {
+            return false;
+        }
+    }
+    let Some(words) = o
+        .get("command")
+        .and_then(|c| c.as_str())
+        .and_then(hook_command_words)
+    else {
+        return false;
+    };
+    let want = gate.to_string_lossy();
+    let meta = std::fs::metadata(gate).ok();
+    let is_file = meta.as_ref().is_some_and(|m| m.is_file());
+    match words.as_slice() {
+        [(p, _)] => *p == *want && meta.as_ref().is_some_and(executable_file),
+        [(interp, true), (p, _)] => {
+            GATE_INTERPRETERS.contains(&interp.as_str()) && *p == *want && is_file
+        }
+        _ => false,
+    }
+}
+
+/// Is the capability gate registered in this settings file — does a `PreToolUse` entry for every
+/// tool (no matcher, or the empty one — C28's scope rule) hold a hook that EXECUTES it (RULINGS CZ1,
+/// [`hook_runs_gate`])? `disableAllHooks: true` runs no hook at all. `None` = the file is not
+/// readable JSON.
 fn gate_registered(settings: &Path, pack: &Path) -> Option<bool> {
     let text = std::fs::read(settings).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&text).ok()?;
-    let want = format!("{}/hooks/{CAPGATE_SCRIPT}", pack.to_string_lossy());
+    if v.get("disableAllHooks").and_then(|d| d.as_bool()) == Some(true) {
+        return Some(false);
+    }
+    let gate = pack.join("hooks").join(CAPGATE_SCRIPT);
     let Some(entries) = v.pointer("/hooks/PreToolUse").and_then(|e| e.as_array()) else {
         return Some(false);
     };
     Some(entries.iter().any(|e| {
-        let matcher_ok = e.get("matcher").map_or(true, |m| m.as_str() == Some(""));
-        matcher_ok
-            && e.get("hooks")
+        let Some(eo) = e.as_object() else {
+            return false;
+        };
+        eo.keys().all(|k| matches!(k.as_str(), "matcher" | "hooks"))
+            && eo.get("matcher").map_or(true, |m| m.as_str() == Some(""))
+            && eo
+                .get("hooks")
                 .and_then(|h| h.as_array())
-                .map_or(false, |hs| {
-                    hs.iter().any(|h| {
-                        h.get("command")
-                            .and_then(|c| c.as_str())
-                            .map_or(false, |c| c.contains(&want))
-                    })
-                })
+                .is_some_and(|hs| hs.iter().any(|h| hook_runs_gate(h, &gate)))
     }))
 }
 
