@@ -1797,6 +1797,7 @@ fn approved_apply_property_every_file_every_point() {
         Point::InMetaWritten,
         Point::AfterSeal,
         Point::BeforeDone,
+        Point::AfterRecordCommit,
     ];
     let mut fired = 0;
     for target in ["hooks/a1.sh", "hooks/a2.sh"] {
@@ -1822,7 +1823,12 @@ fn approved_apply_property_every_file_every_point() {
                 let tag = format!("{target} at {point:?}{}", if byte_copy { " (byte-copy seal)" } else { "" });
                 let a1 = std::fs::read(r.pack.join("hooks/a1.sh")).unwrap();
                 let a2 = std::fs::read(r.pack.join("hooks/a2.sh")).unwrap();
-                if crashed {
+                if crashed && point == Point::AfterRecordCommit {
+                    // DX2: the record was committed — the recovery completes forward
+                    assert_eq!((a1.as_slice(), a2.as_slice()), (&b"NEW-1\n"[..], &b"NEW-2\n"[..]), "P0 {tag}: completed forward");
+                    assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "applied", "{tag}");
+                    assert!(ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().is_some(), "{tag}: the lane row was written");
+                } else if crashed {
                     assert_eq!((a1.as_slice(), a2.as_slice()), (&b"PRE-1\n"[..], &b"PRE-2\n"[..]), "P0 {tag}: the whole set undone");
                     assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "undone", "{tag}");
                 } else {
@@ -2039,4 +2045,52 @@ fn recovery_never_touches_a_live_operation() {
     assert_eq!(resume_interrupted_in(&r.env(&NoFaults, ApplyForm::Exchange)).unwrap(), 0);
     drop(owner);
     assert_eq!(resume_interrupted_in(&r.env(&NoFaults, ApplyForm::Exchange)).unwrap(), 1);
+}
+
+// ───────────────────────────── RULINGS DR1 / DX2 — bindings and the commit point ─────────────────────────────
+
+/// DR1 (blocking I1): an apply interrupted after its first target, then an UPDATE installs a new
+/// generation — the recovery puts NOTHING back (the intent carried the generation it was bound to),
+/// closes the intent superseded and voids the approval. Without DR1 the G1 pre-image was restored
+/// into G2.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_interrupted_apply_is_never_undone_across_a_generation_change() {
+    let r = rig("dr1gen");
+    let id = rid("R-45");
+    let files = two_target_candidate(&r, &id);
+    let stop = StopOn { rel: "hooks/a2.sh", point: Point::AfterRecord, fired: Cell::new(false) };
+    assert!(apply_candidate_in(&r.env(&stop, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
+    std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
+    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    resume_interrupted_in(&calm).unwrap();
+    let lines = recover_apply_intents_in(&calm, &no_repair_lock);
+    assert!(lines[0].contains("세대"), "{lines:?}");
+    assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"NEW-1\n", "nothing put back across the generation change");
+    assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "superseded");
+    assert!(ledger::read_record_in(&r.root, &id).unwrap().unwrap().approval.is_none(), "the approval is void");
+}
+
+/// DX2: a crash between the record's durable transition to 시험 기간 and the lane row — the record is
+/// the commit point: the recovery completes FORWARD (row written, intent applied), never an undo of a
+/// committed apply, never "intent undone while the record keeps its approval".
+#[cfg(target_os = "macos")]
+#[test]
+fn a_committed_apply_is_completed_forward() {
+    let r = rig("dx2commit");
+    let id = rid("R-46");
+    let files = two_target_candidate(&r, &id);
+    let stop = StopOn { rel: "hooks/a1.sh", point: Point::AfterRecordCommit, fired: Cell::new(false) };
+    assert!(apply_candidate_in(&r.env(&stop, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
+    assert!(stop.fired.get());
+    assert!(ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().is_none(), "the window: no row yet");
+    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    let lines = recover_apply_intents_in(&calm, &no_repair_lock);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"NEW-1\n");
+    assert_eq!(std::fs::read(r.pack.join("hooks/a2.sh")).unwrap(), b"NEW-2\n");
+    assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "applied");
+    let row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+    assert!(row.probation.is_some() && row.applied.len() == 2);
+    assert_eq!(ledger::read_record_in(&r.root, &id).unwrap().unwrap().state, RepairState::Probation);
 }

@@ -721,24 +721,27 @@ fn hook_only_commit_interrupted_before_its_hook_record_is_recovered() {
     assert!(ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().is_some(), "the origin's row is written");
 }
 
-/// CU4: the reconstructed origin row records the commit's generation only when it can be confirmed
-/// (the pack's generation files are older than the commit's durable record write); otherwise it is
-/// written closed 대체됨 — nothing is re-checked against a generation nobody can confirm.
+/// CU4 / DR1: the reconstructed origin row is written CLOSED 대체됨 — the record holds no field naming
+/// the commit's generation and no modification time decides anything — whether or not an update
+/// rewrote the generation files since. (REWRITTEN with DR1 — old expectation: a row "confirmed" by
+/// the generation files' mtimes being older than `record.json` stayed open; only an update after
+/// the commit closed it.)
 #[test]
 fn reconstructed_origin_row_is_closed_when_the_generation_cannot_be_confirmed() {
-    let r = rig("cu4row");
-    let id = rid("R-36");
-    let rec = committed_general(&r, &id, "hooks/g.sh", Some(b"PRE\n"), Some(b"POST\n"));
-    std::fs::remove_file(ledger::lane_path_in(&r.root, &id, &r.lane)).unwrap();
-    // an update rewrote the generation AFTER the commit's record
-    std::thread::sleep(Duration::from_millis(1100)); // wallclock: guard mtime granularity of the filesystem (1 s on some volumes)
-    std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
-    let _ = rec;
-    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
-    let lock = r.base.join(".pack-apply.lock");
-    start_time_pass(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
-    let row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
-    assert!(row.probation.as_ref().unwrap().closed.as_deref().is_some_and(|c| c.starts_with("대체됨")), "{:?}", row.probation);
+    for updated_since in [false, true] {
+        let r = rig("cu4row");
+        let id = rid("R-36");
+        committed_general(&r, &id, "hooks/g.sh", Some(b"PRE\n"), Some(b"POST\n"));
+        std::fs::remove_file(ledger::lane_path_in(&r.root, &id, &r.lane)).unwrap();
+        if updated_since {
+            std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
+        }
+        let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
+        let lock = r.base.join(".pack-apply.lock");
+        start_time_pass(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+        let row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+        assert!(row.probation.as_ref().unwrap().closed.as_deref().is_some_and(|c| c.starts_with("대체됨")), "updated_since={updated_since}: {:?}", row.probation);
+    }
 }
 
 // ───────────────────────────── RULINGS CT9 — the scan's three gaps ─────────────────────────────

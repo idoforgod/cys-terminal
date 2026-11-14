@@ -374,12 +374,12 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
             continue;
         }
         // (b3) the origin's own row FIRST (the hook step below marks it 충돌 when it cannot finish).
-        // CU4: it records the COMMIT's generation — confirmed when the pack's generation files are
-        // older than the record's durable commit write — else it is written closed 대체됨 (nothing is
-        // re-checked or reverted against bytes of a generation nobody can confirm)
+        // DR1 / CU4: the record holds no field naming the commit's generation, and a file's
+        // modification time never decides anything — so the reconstructed row is written CLOSED 대체됨:
+        // nothing is re-checked or put back against a generation nobody can confirm
         if row.is_none() {
             let gen = apply::pack_generation(env.op.pack);
-            let confirmed = generation_unchanged_since_commit(root, env.op.pack, &rec.id);
+            let confirmed = false;
             let new_row = LaneRecord {
                 schema: super::REPAIR_SCHEMA,
                 repair: rec.id.clone(),
@@ -390,7 +390,7 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
                     pro_revision: gen.pro_revision,
                     applied_at: env.op.now,
                     expected: rec.committed.clone(),
-                    closed: (!confirmed).then(|| "대체됨 — 확정 때의 팩 세대를 확인할 수 없어 시험 기간을 다시 열지 않습니다(워커 검토)".to_string()),
+                    closed: (!confirmed).then(|| "대체됨 — 기록에 확정 때의 팩 세대가 없어 시험 기간을 다시 열지 않습니다(워커 검토)".to_string()),
                     check_timings: Vec::new(),
                     check_timeouts: Vec::new(),
                 }),
@@ -449,22 +449,6 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
         }
     }
     Ok(lines)
-}
-
-/// CU4: the pack generation is confirmed unchanged since a commit when the files that define it
-/// (`.pack-version`, the pack state) were last written BEFORE the record's durable commit write.
-fn generation_unchanged_since_commit(root: &Path, pack: &Path, id: &RepairId) -> bool {
-    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    let Some(committed_at) = mtime(&ledger::record_path_in(root, id)) else {
-        return false;
-    };
-    [pack.join(".pack-version"), pack.join(crate::pack::PACK_STATE_FILE)]
-        .iter()
-        .all(|p| match std::fs::symlink_metadata(p) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-            Err(_) => false,
-            Ok(_) => mtime(p).is_some_and(|t| t <= committed_at),
-        })
 }
 
 fn supersede_older(
