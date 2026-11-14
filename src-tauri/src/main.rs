@@ -5212,19 +5212,51 @@ async fn feed_reply(request_id: String, decision: String, socket: Option<String>
     }
 }
 
-// 「스스로 해결」(0.15.0 · TRACKS §6.4) 앱 명령 세 개 — T0 골격(본문: 승인 둘은 T5b, 되돌리기는 T6).
-//   지금은 아무 일도 하지 않고 "이 빌드에는 아직 구현되지 않았습니다" 로 거절한다(데몬·파일·프로세스 무접촉).
+// 「스스로 해결」(0.15.0 · TRACKS §6.4) 앱 명령 세 개 — 승인 둘(목록 · 결정)은 T5b(C5 O-C5-3), 되돌리기는 T6.
 //   위의 `repair_office_assets`(화면 자산 복구)와는 무관하다.
+//   ★승인 둘은 `feed_reply` 와 같은 두 장치를 그대로 다시 쓴다(새로 만들지 않는다): 부서 소켓 관문
+//   (`feed_reply_socket_allowed`) · 그 소켓의 조작자 토큰을 **매번 새로** 읽어 붙인다(`read_operator_token_for`).
+//   토큰은 '그 클릭이 주인의 앱에서 왔다'는 증거가 아니다(C5 5.10) — 승인을 만드는 것은 데몬이 띄운 도우미의
+//   운영체제 본인 확인이다. `approve` 는 도우미를 **시작만** 하고 곧바로 돌아온다(결과는 사건으로 온다 — 기다리지 않는다).
+
+/// 데몬 응답 → 결과 값 또는 `코드: 문장`(UI 가 사유를 분류·표시할 수 있게 코드를 보존한다).
+fn repair_rpc_result(resp: Value) -> Result<Value, String> {
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(resp["result"].clone())
+    } else {
+        Err(format!(
+            "{}: {}",
+            resp["error"]["code"].as_str().unwrap_or("error"),
+            resp["error"]["message"].as_str().unwrap_or("unknown error")
+        ))
+    }
+}
+
+/// 수리 최종 승인 요청 RPC 하나 — 소켓 관문 → 그 소켓의 조작자 토큰(매번 새로) → 호출.
+async fn repair_approval_rpc(socket: &Option<String>, method: &str, mut params: Value) -> Result<Value, String> {
+    let sock = resolve_socket(socket);
+    if socket.is_some() && !feed_reply_socket_allowed(&sock) {
+        return Err("socket_not_allowed: 이 소켓의 수리 승인 요청은 앱에서 처리할 수 없습니다(부서 등록부에 없거나 토큰 폴더가 본부와 같습니다)".to_string());
+    }
+    if let Some(tok) = read_operator_token_for(&sock) {
+        params["operator_token"] = json!(tok);
+    }
+    repair_rpc_result(rpc_full(&sock, method, params).await?)
+}
+
 #[tauri::command]
 async fn repair_approval_list(socket: Option<String>) -> Result<Value, String> {
-    let _ = socket;
-    Err(cys::repair::NOT_IMPLEMENTED_KO.to_string())
+    repair_approval_rpc(&socket, "repair.approval_list", json!({})).await
 }
 
 #[tauri::command]
 async fn repair_approval_decide(request_id: String, decision: String, socket: Option<String>) -> Result<(), String> {
-    let _ = (request_id, decision, socket);
-    Err(cys::repair::NOT_IMPLEMENTED_KO.to_string())
+    let method = match decision.as_str() {
+        "approve" => "repair.approval_start",
+        "reject" => "repair.approval_reject",
+        _ => return Err("invalid_decision: decision 은 approve 또는 reject 입니다".to_string()),
+    };
+    repair_approval_rpc(&socket, method, json!({ "request_id": request_id })).await.map(|_| ())
 }
 
 /// 「스스로 해결」 T6 — 앱의 '직전 수리 되돌리기'(설계 §4-9 · §6-9 (7)): 이 레인에서 가장 최근의 시험 기간·사용 중
@@ -19128,8 +19160,16 @@ mod repair_stub_tests {
         }
         let nyi = cys::repair::NOT_IMPLEMENTED_KO.to_string();
         tauri::async_runtime::block_on(async {
-            assert_eq!(repair_approval_list(None).await, Err(nyi.clone()));
-            assert_eq!(repair_approval_decide("rq-1".into(), "approve".into(), Some("/x.sock".into())).await, Err(nyi.clone()));
+            // T5b (rewrite: the two approval commands were "not implemented" stubs — their bodies are
+            // in now): a socket the lane-socket gate does not allow is refused BEFORE any request or
+            // token read; an unknown decision word is refused before any request. No call here reaches
+            // a daemon (none of these sockets exists).
+            let gate = repair_approval_list(Some("/x.sock".into())).await.unwrap_err();
+            assert!(gate.starts_with("socket_not_allowed:"), "{gate}");
+            let gate = repair_approval_decide("rq-1".into(), "approve".into(), Some("/x.sock".into())).await.unwrap_err();
+            assert!(gate.starts_with("socket_not_allowed:"), "{gate}");
+            let bad = repair_approval_decide("rq-1".into(), "allow".into(), Some("/x.sock".into())).await.unwrap_err();
+            assert!(bad.starts_with("invalid_decision:"), "{bad}");
             // T6 (rewrite — old expectation `Err(nyi)`): the body exists; with no daemon at the given
             // socket it answers a sentence and never starts a daemon (appendix A 1-16)
             let r = repair_revert_last(Some("/nonexistent-dir-t6/cys.sock".into())).await;
@@ -19188,5 +19228,24 @@ mod repair_stub_tests {
             assert!(!body.contains(forbidden), "{forbidden} in repair_revert_last");
         }
         assert!(body.contains("rpc_full(&sock, \"repair.revert\""));
+    }
+
+    /// T5b (C5 O-C5-3 · guard rails "운영자 표를 매번 다시 읽기" and the lane-socket gate): the
+    /// approval commands reuse `feed_reply`'s two devices — the gate first, then the token read
+    /// FRESH on every call (no cache) — and `approve` maps to `repair.approval_start` (which only
+    /// starts the helper), `reject` to `repair.approval_reject`.
+    #[test]
+    fn repair_approval_commands_reuse_gate_and_fresh_token() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let body = &prod[prod.find("async fn repair_approval_rpc(").expect("repair_approval_rpc")..];
+        let body = &body[..body.find("\n}\n").expect("end")];
+        let gate = body.find("feed_reply_socket_allowed(&sock)").expect("lane-socket gate");
+        let token = body.find("read_operator_token_for(&sock)").expect("fresh token read");
+        let call = body.find("rpc_full(&sock, method, params)").expect("the request");
+        assert!(gate < token && token < call, "gate → token → request order");
+        assert!(!prod.contains("static REPAIR_TOKEN") && !prod.contains("OnceLock<String>"), "a cached token");
+        assert!(prod.contains("\"approve\" => \"repair.approval_start\""));
+        assert!(prod.contains("\"reject\" => \"repair.approval_reject\""));
     }
 }
