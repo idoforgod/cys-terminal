@@ -361,7 +361,15 @@ else
   fi
 fi
 
-exec "$CYS_PY" - <<'PYEOF'
+# ★RULINGS CX1(0.15.0 · T5c): 판정기는 좌석이 쓸 수 있는 자리에서 아무것도 import 하지 않는다 — `-` 는 sys.path
+#   맨 앞에 ''(= 좌석의 작업 폴더)를 넣으므로 그곳의 `json.py` 가 표준 모듈을 가린다(리뷰어가 허용된 임시
+#   폴더에 심은 코드가 자기를 제한하는 판정기 안에서 돈다). 첫 문장이 상대 경로 항목을 지우고(어떤 import 보다
+#   먼저), `-s` 가 사용자 site-packages 를, `-B` 가 바이트코드 쓰기를 끈다. `-I`/`-E` 는 쓰지 않는다:
+#   PYTHONUTF8(한국어 윈도우 cp949 즉사 방지 · src/lib.rs W-B2)·PYTHONIOENCODING 을 버린다(측정 — 보고서).
+#   `-P` 는 3.11+ 전용이라 3.9(맥 CLT python3)에서 판정기가 뜨지 못한다.
+exec "$CYS_PY" -B -s - <<'PYEOF'
+import sys
+sys.path[:] = [p for p in sys.path if p and (p[0] in "/\\" or p[1:3] in (":\\", ":/"))]
 import hashlib, json, os, re, shlex, subprocess, sys, tempfile, time
 
 # ── reviewer/planner 정책(종전 · 무변경) ─────────────────────────────────────

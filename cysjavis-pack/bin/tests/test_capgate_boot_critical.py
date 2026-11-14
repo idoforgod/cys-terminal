@@ -467,5 +467,83 @@ class GateWithBuiltBinary(_Env):
         self.assertNotEqual(self.decision(r)[0], "deny", "작업 사본 쓰기가 막혔다")
 
 
+class JudgeIsolation(_Env):
+    """RULINGS CX1 — the judge never imports from the seat's working directory: a module planted in an
+    allowed (temporary) working directory is NOT executed, while a legitimate verdict / own-TODO / temp
+    write still passes and a forbidden write is still refused — in the base lane, a department lane and
+    a custom pack dir. Negative control: the old start (`exec "$CYS_PY" -` without the path clean-up)
+    DOES execute it — the test sees the fault it guards against."""
+
+    def plant(self):
+        cwd = self.tmpdir / "review-ws"
+        cwd.mkdir(exist_ok=True)
+        marker = self.root / "PLANTED-RAN"
+        for mod in ("json", "hashlib", "tempfile"):
+            (cwd / ("%s.py" % mod)).write_text(
+                "open(%r, 'a').write(%r)\nraise SystemExit(0)\n" % (str(marker), mod + "\n"), encoding="utf-8")
+        return cwd, marker
+
+    def reviewer(self, tool_input, cwd, pack, hook=None):
+        return self.run_hook("Write", tool_input, cwd=cwd, hook=hook, CYS_ROLE="reviewer-codex",
+                             CYS_PACK_DIR=str(pack))
+
+    def test_planted_module_is_not_executed_and_writes_still_pass(self):
+        cwd, marker = self.plant()
+        custom = self.root / "custom-pack"
+        for name, pack in (("base", self.pack), ("department", self.dept), ("custom", custom)):
+            (pack / "round" / "_reviews").mkdir(parents=True, exist_ok=True)
+            for target in (pack / "round" / "_reviews" / "verdict-x.md",
+                           pack / "round" / "REVIEWER_CODEX_TODO.md", cwd / "notes.md"):
+                r, _ = self.reviewer({"file_path": str(target), "content": "x"}, cwd, pack)
+                self.assertFalse(marker.exists(), "%s: a planted module ran inside the judge: %r"
+                                 % (name, marker.read_text(encoding="utf-8") if marker.exists() else ""))
+                self.assertEqual(r.returncode, 0, "%s %s: %r" % (name, target, r.stderr[-300:]))
+                self.assertNotEqual(self.decision(r)[0], "deny", "%s %s: %r" % (name, target, r.stdout))
+            # the judge really judged: a write the reviewer may not make is still refused
+            r, _ = self.reviewer({"file_path": str(pack / "hooks" / "x.sh"), "content": "x"}, cwd, pack)
+            self.assertTrue(r.returncode == 2 or self.decision(r)[0] == "deny",
+                            "%s: a forbidden reviewer write passed: %r %r" % (name, r.stdout, r.stderr[-200:]))
+            self.assertFalse(marker.exists())
+
+    def test_the_judge_starts_on_every_interpreter_the_hook_can_pick(self):
+        """CX1 — the isolated start (`-B -s -` + the path clean-up) starts and passes the built-in
+        self-test on every CPython 3 the hook can pick here (this interpreter, the system `python3`,
+        a Homebrew one); the self-test runs from the planted working directory and nothing planted runs."""
+        cwd, marker = self.plant()
+        seen = set()
+        for py in (sys.executable, "/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+                   shutil.which("python3", path=self.env["PATH"])):
+            if not py or not os.path.isfile(py) or os.path.realpath(py) in seen:
+                continue
+            ver = subprocess.run([py, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+                                 capture_output=True, text=True, timeout=30)
+            if ver.returncode != 0:
+                continue            # a stub that cannot run (macOS CLT shim) is not a pick of the hook
+            seen.add(os.path.realpath(py))
+            env = dict(self.env, CYS_PY=py)
+            r = subprocess.run([SH, str(HOOK), "--self-test"], env=env, cwd=str(cwd),
+                               capture_output=True, text=True, timeout=180)
+            self.assertEqual(r.returncode, 0, "%s (%s): %s" % (py, ver.stdout.strip(), r.stderr[-400:]))
+            self.assertIn("self-test OK", r.stdout, py)
+            self.assertFalse(marker.exists(), "%s: a planted module ran" % py)
+        self.assertTrue(seen, "no interpreter to measure")
+
+    def test_negative_control_old_start_executes_the_planted_module(self):
+        cwd, marker = self.plant()
+        src = HOOK.read_text(encoding="utf-8")
+        start = src.index("exec \"$CYS_PY\" ")
+        body = src.index("import hashlib, json", start)
+        old = src[:start] + "exec \"$CYS_PY\" - <<'PYEOF'\n" + src[body:]
+        self.assertNotEqual(old, src, "the isolated start is not in the hook")
+        copy = self.root / "hooks-copy"
+        copy.mkdir()
+        (copy / "role-capability-gate.sh").write_text(old, encoding="utf-8")
+        shutil.copy(str(LIB), str(copy / "_lib.sh"))
+        r, _ = self.reviewer({"file_path": str(cwd / "notes.md"), "content": "x"}, cwd, self.pack,
+                             hook=copy / "role-capability-gate.sh")
+        self.assertTrue(marker.exists(), "the old start did not execute the planted module — the "
+                        "regression above would not see the fault: %r %r" % (r.stdout, r.stderr[-300:]))
+
+
 if __name__ == "__main__":
     unittest.main()
