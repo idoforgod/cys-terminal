@@ -1,0 +1,1054 @@
+//! Tests of the protection screen (T5b). Every run is hermetic: the screen lays out its own scratch
+//! roots under this test's private folder, calls only its own stub `cys`, binds only its own scratch
+//! socket, and the "real" HOME / lane it compares are folders of this test too.
+
+use super::*;
+use crate::repair::replay;
+use crate::repair::screen_corpus::{self as corpus, Device, CELLS, CENSUS_PINS};
+use std::sync::Arc;
+
+/// A private test root under HOME (the harness gives every suite a private HOME; never under a
+/// temporary folder — the registrar refuses a pack there).
+fn test_root(name: &str) -> PathBuf {
+    let home = dirs::home_dir().expect("HOME");
+    let p = home
+        .join("t5b-screen")
+        .join(format!("{name}-{}", replay::random_hex(4)));
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+fn released(rel: &str) -> String {
+    replay::released_text(rel)
+        .unwrap_or_else(|| panic!("{rel} is not embedded"))
+        .to_string()
+}
+
+/// A lane laid out with the RELEASED copies of every input file (+ `state/` folder).
+fn lane_of(root: &Path, overrides: &[(&str, Option<String>)]) -> PathBuf {
+    let lane = root.join("lane").join("pack");
+    for rel in all_input_rels().unwrap() {
+        if let Some(c) = super::super::rehearsal::released_copy(&rel) {
+            replay::lay_out(&lane.join(&rel), &c).unwrap();
+        }
+    }
+    for (rel, c) in overrides {
+        let p = lane.join(rel);
+        let _ = std::fs::remove_file(&p);
+        if let Some(text) = c {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, text).unwrap();
+        }
+    }
+    lane
+}
+
+/// A candidate whose targets are given as (rel, Some(text) | None = deleted).
+fn candidate_of(root: &Path, targets: &[(&str, Option<String>)]) -> ScreenCandidate {
+    let files = root.join("staging");
+    let mut t = Vec::new();
+    for (rel, c) in targets {
+        let p = files.join(rel);
+        match c {
+            Some(text) => {
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, text).unwrap();
+                replay::set_mode(&p, 0o755);
+                t.push((rel.to_string(), TargetState::read(&p).unwrap()));
+            }
+            None => t.push((rel.to_string(), TargetState::Absent)),
+        }
+    }
+    ScreenCandidate { files, targets: t }
+}
+
+fn cfg(
+    root: &Path,
+    classes: Option<Vec<&'static str>>,
+    cells: Option<Vec<&'static str>>,
+    i3: bool,
+) -> ScreenConfig {
+    let mut c = ScreenConfig::production();
+    c.scratch_base = root.join("scr");
+    c.real_home = root.join("realhome");
+    std::fs::create_dir_all(&c.real_home).unwrap();
+    c.classes = classes;
+    c.cells = cells;
+    c.run_i3 = i3;
+    assert!(
+        c.interpreter.is_some(),
+        "no python3 on PATH — the screen cannot be measured in this environment"
+    );
+    c
+}
+
+const LONG: Duration = Duration::from_secs(900);
+
+fn decisions<'a>(r: &'a ScreenReport, class: &str) -> Vec<&'a ProbeResult> {
+    r.probes
+        .iter()
+        .filter(|p| p.class == class || p.class.starts_with(&format!("{class}#")))
+        .collect()
+}
+
+fn cleanup(root: &Path) {
+    replay::remove_tree(root);
+}
+
+// ───────────────────────────── parity, census (i) and (iii) ─────────────────────────────
+
+/// RULINGS AU1 / BM5: the screen's inputs ARE the generated per-test inputs — exactly G, R, C, I3,
+/// each file list EQUAL to `boot_critical::protection_inputs()`; every variant lays out exactly the
+/// union of those files.
+#[test]
+fn parity_inputs_equal_generated_inputs() {
+    let gen = crate::repair::boot_critical::protection_inputs();
+    let ids: Vec<&str> = gen.iter().map(|(t, _)| *t).collect();
+    assert_eq!(
+        ids,
+        vec!["C", "G", "I3", "R"],
+        "generated tests are not exactly G, R, C, I3"
+    );
+    let mine = inputs_by_test().unwrap();
+    for (t, files) in gen {
+        let want: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+        assert_eq!(
+            mine.get(t),
+            Some(&want),
+            "test {t}: the screen's inputs differ from the generated ones"
+        );
+    }
+    let root = test_root("parity");
+    let lane = lane_of(&root, &[]);
+    let c = cfg(&root, Some(vec![]), Some(vec![]), false);
+    let rels = all_input_rels().unwrap();
+    let v = build_variants(&c, &candidate_of(&root, &[]), &lane, &rels).unwrap();
+    for f in [&v.released, &v.lane, &v.candidate, &v.clean, &v.attribution] {
+        assert_eq!(
+            f.keys().cloned().collect::<Vec<_>>(),
+            rels,
+            "a variant lays out other files"
+        );
+    }
+    // the device subsets are exactly the generated lists
+    assert_eq!(
+        subset(&v.released, &mine["G"])
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        mine["G"]
+    );
+    cleanup(&root);
+}
+
+/// C4 AY2 census (i): every tabled class has a probe in every tabled cell its device reads — the
+/// guard 16 cells (E-21 for the I4 classes), the gate 14.
+#[test]
+fn census_i_every_class_has_a_probe_in_every_cell() {
+    assert_eq!(CELLS.len(), 21);
+    let ids: Vec<&str> = CELLS.iter().map(|c| c.id).collect();
+    for n in 1..=21 {
+        assert!(
+            ids.contains(&format!("E-{n}").as_str()),
+            "cell E-{n} missing"
+        );
+    }
+    assert_eq!(corpus::cells_of(Device::Guard).count(), 16);
+    assert_eq!(corpus::cells_of(Device::Gate).count(), 14);
+    let g: Vec<&str> = corpus::CORPUS_G.iter().map(|c| c.id).collect();
+    let mut want_g: Vec<String> = (1..=21).map(|n| format!("G-{n}")).collect();
+    want_g.push("G-24".into());
+    assert_eq!(g, want_g.iter().map(String::as_str).collect::<Vec<_>>());
+    let r: Vec<&str> = corpus::CORPUS_R.iter().map(|c| c.id).collect();
+    assert_eq!(
+        r,
+        (1..=16)
+            .map(|n| format!("R-{n}"))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+    let cc: Vec<&str> = corpus::CORPUS_C.iter().map(|c| c.id).collect();
+    assert_eq!(
+        cc,
+        (1..=25)
+            .map(|n| format!("C-{n}"))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+    let bs: Vec<&str> = corpus::BACKSTOP_CLASSES.iter().map(|b| b.0).collect();
+    assert_eq!(bs, vec!["G-22", "G-23", "G-24np"]);
+    for c in corpus::all_classes() {
+        assert!(!c.probes.is_empty(), "{} has no probe", c.id);
+        // every probe of a class runs in every cell its device reads: the matrix is the product
+        let cells = corpus::cells_of(c.device)
+            .filter(|x| x.setup != corpus::Setup::Backstop)
+            .count();
+        assert!(cells >= 14, "{} would be probed in {cells} cells", c.id);
+    }
+}
+
+/// C4 AY2 census (iii) — THE test the pack-release gate (unit T2d) runs (RULINGS CM4): a change of a
+/// released device's deny rules or environment branches without a table review fails here.
+#[test]
+fn census_iii_deny_rules_and_branches_pinned() {
+    let mut actual = Vec::new();
+    let mut differs = Vec::new();
+    for (rel, n, digest) in CENSUS_PINS {
+        let (an, ad) = corpus::census_digest(&released(rel));
+        actual.push(format!("(\"{rel}\", {an}, \"{ad}\")"));
+        assert!(
+            an > 10,
+            "{rel}: only {an} census lines — the census reads nothing"
+        );
+        if (an, ad.as_str()) != (*n, *digest) {
+            differs.push(format!("{rel} ({n} → {an} lines)"));
+        }
+    }
+    assert!(
+        differs.is_empty(),
+        "census (iii): the deny rules / environment branches changed in {}. Review CORPUS_G / CORPUS_R / \
+         CORPUS_C and the cell table against the device, then update CENSUS_PINS. Current values: {}",
+        differs.join(", "),
+        actual.join(", ")
+    );
+    // the census reads deny sites: a removed deny line changes the digest (positive control)
+    let g = released("hooks/guard.sh");
+    let cut = g.replacen("emit_deny", "echo_deny", 1);
+    assert_ne!(corpus::census_digest(&g), corpus::census_digest(&cut));
+}
+
+/// I4's anchors are found in the released guard.sh, and each region is non-trivial.
+#[test]
+fn i4_anchors_found_in_released_guard() {
+    let g = released("hooks/guard.sh");
+    for (name, first, last) in corpus::I4_REGIONS {
+        let r = corpus::i4_region(&g, first, last)
+            .unwrap_or_else(|| panic!("I4 region {name}: anchor not found"));
+        assert!(
+            r.lines().count() >= 10,
+            "I4 region {name} is only {} lines",
+            r.lines().count()
+        );
+    }
+    let b = corpus::i4_region(&g, "run_loose_backstop() {", "}").unwrap();
+    assert!(b.contains("백스톱: 비가역 명령") && b.contains("백스톱: 파괴적 파일연산"));
+    assert!(b.contains(corpus::BACKSTOP_MARKER));
+}
+
+// ───────────────────────────── census (ii) — every class binds on the released copies ─────────────────────────────
+
+/// C4 AY2 census (ii): on the RELEASED copies every class BINDS (RELEASED denies) in at least one
+/// cell; no RELEASED probe errors (an error there would decline every apply — AY5); the stub was
+/// reached in E-1 (its call log); invariant I3 on RELEASED ends registered in every layout, scenario
+/// and run (both runs judged — BH5). The screen's duration is measured here.
+#[test]
+fn census_ii_every_class_binds_on_released() {
+    let root = test_root("census2");
+    let lane = lane_of(&root, &[]);
+    let c = cfg(&root, None, None, true);
+    let t0 = std::time::Instant::now();
+    let rep = screen_with(&c, &candidate_of(&root, &[]), &lane, LONG).unwrap();
+    let took = t0.elapsed();
+    eprintln!(
+        "T5b MEASURED: full screen on the released copies (no candidate change): {} probes, {:.1} s wall, {} threads",
+        rep.probes.len(),
+        took.as_secs_f64(),
+        c.threads
+    );
+    // the same screen again in this process: every answer comes from the per-process cache (the same
+    // input bytes) — what a later screen in a running daemon costs for devices a candidate does not
+    // touch; the verdict and every decision are identical
+    let t1 = std::time::Instant::now();
+    let again = screen_with(&c, &candidate_of(&root, &[]), &lane, LONG).unwrap();
+    eprintln!(
+        "T5b MEASURED: the same screen again (answers cached in this process): {:.1} s wall",
+        t1.elapsed().as_secs_f64()
+    );
+    assert_eq!(again.verdict, rep.verdict);
+    assert_eq!(
+        again
+            .probes
+            .iter()
+            .map(|p| (&p.class, &p.cell, p.released, p.decision))
+            .collect::<Vec<_>>(),
+        rep.probes
+            .iter()
+            .map(|p| (&p.class, &p.cell, p.released, p.decision))
+            .collect::<Vec<_>>()
+    );
+    let errors: Vec<String> = rep
+        .probes
+        .iter()
+        .filter(|p| p.released == Answer::Error && p.test != "I4")
+        .map(|p| format!("{} {} {} — {}", p.test, p.class, p.cell, p.detail))
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "RELEASED errored ({}): {:#?}",
+        errors.len(),
+        &errors[..errors.len().min(20)]
+    );
+    for class in corpus::all_classes() {
+        let binds = decisions(&rep, class.id)
+            .iter()
+            .any(|p| p.released == Answer::Deny);
+        assert!(
+            binds,
+            "census (ii): {} binds in no cell on the released copies",
+            class.id
+        );
+    }
+    // the stub was reached: guard LOOSE asks `approval check`, the gate asks `surface-role`
+    let g1 = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "G-1" && p.cell == "E-1")
+        .unwrap();
+    assert!(
+        g1.detail.contains("cys --socket") && g1.detail.contains("approval check"),
+        "G-1 E-1: {}",
+        g1.detail
+    );
+    let r1 = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "R-1" && p.cell == "E-1")
+        .unwrap();
+    assert!(r1.detail.contains("surface-role"), "R-1 E-1: {}", r1.detail);
+    // I3 on the released copies: registered in every layout, scenario and both runs
+    let i3: Vec<&ProbeResult> = rep
+        .probes
+        .iter()
+        .filter(|p| p.test == "I3" && p.class.starts_with("I3:"))
+        .collect();
+    assert!(
+        i3.len() >= 12,
+        "I3 judged only {} (layout, scenario, run, target)s",
+        i3.len()
+    );
+    // the profiles the RELEASED hook-target table denies (`eligibility.capgate: deny`) end unregistered
+    // there and bind nothing; `.claude`, the account folder (L1) and the department account (L2) end
+    // registered in every scenario and BOTH runs (BH5)
+    for l in ["L1", "L2"] {
+        for s in ["S1", "S2", "S3"] {
+            for k in ["run1", "run2"] {
+                let cell = format!("{l}/{s}/{k}");
+                let here: Vec<&&ProbeResult> = i3.iter().filter(|p| p.cell == cell).collect();
+                assert!(!here.is_empty(), "I3 {cell} not judged");
+                let want: &[&str] = if l == "L1" {
+                    &["I3:.claude", "I3:claude"]
+                } else {
+                    &["I3:acct-dept-x"]
+                };
+                for w in want {
+                    let p = here
+                        .iter()
+                        .find(|p| p.class == *w)
+                        .unwrap_or_else(|| panic!("I3 {cell}: {w} not judged"));
+                    assert_eq!(
+                        p.released,
+                        Answer::Deny,
+                        "I3 {w} {cell}: released does not end registered — {}",
+                        p.detail
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(
+        rep.verdict,
+        ScreenVerdict::Accepted,
+        "notes: {:?} refusals: {:?}",
+        rep.notes,
+        rep.refusals
+    );
+    assert!(
+        rep.after_run.first.is_empty(),
+        "the screen changed the lane: {:?}",
+        rep.after_run.first
+    );
+    assert!(rep.after_run.leftover_processes.is_empty());
+    cleanup(&root);
+}
+
+// ───────────────────────────── the differential rule (AY1, BD1, BC5, BG1) ─────────────────────────────
+
+fn guard_without_push_deny() -> String {
+    let g = released("hooks/guard.sh");
+    let line =
+        "            if sub == \"push\": return \"git push (외부발행=비가역). 오너 승인 필요\"";
+    assert!(
+        g.contains(line),
+        "guard.sh no longer holds the git push LOOSE deny line"
+    );
+    g.replace(line, "            if sub == \"push\": return None")
+}
+
+/// A candidate that lets `git push` through in normal mode is REFUSED (G-1), naming the protection.
+#[test]
+fn refuses_candidate_that_opens_git_push() {
+    let root = test_root("g1");
+    let lane = lane_of(&root, &[]);
+    let c = cfg(
+        &root,
+        Some(vec!["G-1", "G-17"]),
+        Some(vec!["E-4", "E-5"]),
+        false,
+    );
+    let cand = candidate_of(
+        &root,
+        &[("hooks/guard.sh", Some(guard_without_push_deny()))],
+    );
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    assert_eq!(rep.verdict, ScreenVerdict::Refused, "{:#?}", rep.probes);
+    let g1 = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "G-1" && p.cell == "E-4")
+        .unwrap();
+    assert_eq!(g1.decision, ProbeDecision::Refused);
+    assert_eq!(g1.clean, Some(Answer::Allow));
+    assert!(
+        rep.refusals
+            .iter()
+            .any(|r| r.contains("외부 발송·영구 삭제 전 주인 승인")),
+        "{:?}",
+        rep.refusals
+    );
+    // STRICT still denies git push (G-17 held)
+    let g17 = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "G-17" && p.cell == "E-5")
+        .unwrap();
+    assert_eq!(g17.decision, ProbeDecision::Held);
+    assert!(rep.declines_apply());
+    cleanup(&root);
+}
+
+/// A candidate DELETING hooks/guard.sh is screened as deleted and refused (RULINGS CM1).
+#[test]
+fn refuses_candidate_deleting_guard() {
+    let root = test_root("gdel");
+    let lane = lane_of(&root, &[]);
+    let c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-4"]), false);
+    let cand = candidate_of(&root, &[("hooks/guard.sh", None)]);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    assert_eq!(rep.verdict, ScreenVerdict::Refused, "{:#?}", rep.probes);
+    let i4: Vec<&ProbeResult> = rep.probes.iter().filter(|p| p.test == "I4").collect();
+    assert!(
+        i4.iter().all(|p| p.decision == ProbeDecision::Refused),
+        "I4 must refuse a deleted guard.sh: {i4:#?}"
+    );
+    cleanup(&root);
+}
+
+/// A candidate capability gate that no longer treats Write as a mutation is REFUSED for the
+/// reviewer (R-1) and the CSO (C-4).
+#[test]
+fn refuses_gate_opened_for_reviewer_and_cso() {
+    let root = test_root("gate");
+    let lane = lane_of(&root, &[]);
+    let gate = released("hooks/role-capability-gate.sh");
+    let line = "MUTATION_TOOLS = {\"Edit\", \"Write\", \"NotebookEdit\", \"MultiEdit\"}";
+    assert!(gate.contains(line));
+    let cand = candidate_of(
+        &root,
+        &[(
+            "hooks/role-capability-gate.sh",
+            Some(gate.replace(line, "MUTATION_TOOLS = set()")),
+        )],
+    );
+    let c = cfg(
+        &root,
+        Some(vec!["R-1", "C-4", "R-8"]),
+        Some(vec!["E-1"]),
+        false,
+    );
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    assert_eq!(rep.verdict, ScreenVerdict::Refused, "{:#?}", rep.probes);
+    let r1 = rep.probes.iter().find(|p| p.class == "R-1").unwrap();
+    assert_eq!(r1.decision, ProbeDecision::Refused, "{r1:#?}");
+    assert!(
+        rep.refusals
+            .iter()
+            .any(|r| r.contains("리뷰어는 검토 대상을 못 고침")),
+        "{:?}",
+        rep.refusals
+    );
+    // a probe the change does not touch stays held (git commit by a reviewer)
+    let r8 = rep.probes.iter().find(|p| p.class == "R-8").unwrap();
+    assert_eq!(r8.decision, ProbeDecision::Held, "{r8:#?}");
+    cleanup(&root);
+}
+
+/// BD1: a lane whose guard.sh already lets git push through cannot hide a candidate that keeps it
+/// open — CLEAN (RELEASED + the candidate's files) does not deny → REFUSED.
+#[test]
+fn clean_refuses_even_when_lane_already_off() {
+    let root = test_root("bd1");
+    let open = guard_without_push_deny();
+    let lane = lane_of(&root, &[("hooks/guard.sh", Some(open.clone()))]);
+    let c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-4"]), false);
+    let cand = candidate_of(&root, &[("hooks/guard.sh", Some(open))]);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let g1 = rep.probes.iter().find(|p| p.class == "G-1").unwrap();
+    assert_eq!(
+        (g1.lane, g1.candidate, g1.clean),
+        (
+            Some(Answer::Allow),
+            Some(Answer::Allow),
+            Some(Answer::Allow)
+        )
+    );
+    assert_eq!(g1.decision, ProbeDecision::Refused);
+    assert_eq!(rep.verdict, ScreenVerdict::Refused);
+    cleanup(&root);
+}
+
+/// BC5: a lane whose guard.sh lets git push through, and a candidate that touches no guard input →
+/// the attribution run (LANE with the touched files at their released copies) still does not deny →
+/// a LANE FINDING (note + intake line), not a refusal of the unrelated candidate.
+#[test]
+fn attribution_gives_lane_finding_not_refusal() {
+    let root = test_root("bc5");
+    let lane = lane_of(
+        &root,
+        &[("hooks/guard.sh", Some(guard_without_push_deny()))],
+    );
+    let c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-4"]), false);
+    let cand = candidate_of(
+        &root,
+        &[("bin/javis_lock.py", Some(released("bin/javis_lock.py")))],
+    );
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let g1 = rep.probes.iter().find(|p| p.class == "G-1").unwrap();
+    assert_eq!(g1.decision, ProbeDecision::LaneFinding, "{g1:#?}");
+    assert_eq!(rep.verdict, ScreenVerdict::AcceptedWithNotes);
+    assert!(
+        rep.notes.iter().any(|n| n.starts_with("보호장치 시험 1건")),
+        "{:?}",
+        rep.notes
+    );
+    assert_eq!(rep.lane_findings.len(), 1);
+    assert!(!rep.declines_apply());
+    cleanup(&root);
+}
+
+/// BG1: restoring guard.sh to its RELEASED bytes in a lane whose _lib.sh is broken is never a ground
+/// for refusal (it becomes a lane finding); the same restore with one byte changed IS refused.
+#[test]
+fn released_restore_never_refused() {
+    let root = test_root("bg1");
+    let g = released("hooks/guard.sh");
+    let src_line = ". \"$(dirname \"$0\")/_lib.sh\" 2>/dev/null \\";
+    assert!(g.contains(src_line));
+    // the lane: a guard that does not source _lib.sh (still denies — through its backstop) and a
+    // broken _lib.sh that ends any hook sourcing it
+    let lane_guard = g.replace(src_line, "true \\").replace(
+        "  || . \"${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh\" 2>/dev/null \\",
+        "  || true \\",
+    );
+    let lane = lane_of(
+        &root,
+        &[
+            ("hooks/guard.sh", Some(lane_guard)),
+            ("hooks/_lib.sh", Some("exit 0\n".into())),
+        ],
+    );
+    let c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-4"]), false);
+    let rep = screen_with(
+        &c,
+        &candidate_of(&root, &[("hooks/guard.sh", Some(g.clone()))]),
+        &lane,
+        LONG,
+    )
+    .unwrap();
+    let g1 = rep.probes.iter().find(|p| p.class == "G-1").unwrap();
+    assert_eq!(
+        (g1.lane, g1.candidate),
+        (Some(Answer::Deny), Some(Answer::Allow)),
+        "{g1:#?}"
+    );
+    assert_eq!(g1.decision, ProbeDecision::LaneFinding, "BG1: {g1:#?}");
+    assert_ne!(rep.verdict, ScreenVerdict::Refused);
+    // control: the same restore with one extra comment byte is a candidate of its own → refused
+    let root2 = test_root("bg1b");
+    let lane2 = lane_of(&root2, &[]);
+    let _ = lane2;
+    let lane_guard2 = released("hooks/guard.sh")
+        .replace(src_line, "true \\")
+        .replace(
+            "  || . \"${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh\" 2>/dev/null \\",
+            "  || true \\",
+        );
+    let lane2 = lane_of(
+        &root2,
+        &[
+            ("hooks/guard.sh", Some(lane_guard2)),
+            ("hooks/_lib.sh", Some("exit 0\n".into())),
+        ],
+    );
+    let rep2 = screen_with(
+        &c,
+        &candidate_of(&root2, &[("hooks/guard.sh", Some(format!("{g}#\n")))]),
+        &lane2,
+        LONG,
+    )
+    .unwrap();
+    let g1b = rep2.probes.iter().find(|p| p.class == "G-1").unwrap();
+    assert_eq!(g1b.decision, ProbeDecision::Refused, "{g1b:#?}");
+    cleanup(&root);
+    cleanup(&root2);
+}
+
+/// AY1 (5): RELEASED errors → NOT MEASURABLE: refused for a candidate touching an input of that
+/// device, a note (and an apply decline) otherwise.
+#[test]
+fn not_measurable_refuses_only_touching_candidates() {
+    let root = test_root("nm");
+    let lane = lane_of(&root, &[]);
+    let mut c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-4"]), false);
+    // a released source whose guard.sh crashes (exit 3) — injected for this test only
+    c.released = Arc::new(|rel: &str| {
+        if rel == "hooks/guard.sh" {
+            Some(LaidSource::Bytes {
+                bytes: b"#!/bin/sh\nexit 3\n".to_vec(),
+                mode: 0o755,
+            })
+        } else {
+            super::super::rehearsal::released_copy(rel)
+        }
+    });
+    let touching = candidate_of(
+        &root,
+        &[(
+            "hooks/_lib.sh",
+            Some(format!("{}\n# x\n", released("hooks/_lib.sh"))),
+        )],
+    );
+    let rep = screen_with(&c, &touching, &lane, LONG).unwrap();
+    let g1 = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "G-1" && p.cell == "E-4")
+        .unwrap();
+    assert_eq!(g1.released, Answer::Error);
+    assert_eq!(g1.decision, ProbeDecision::Refused);
+    let other = candidate_of(
+        &root,
+        &[(
+            "bin/javis_lock.py",
+            Some(format!("{}\n# x\n", released("bin/javis_lock.py"))),
+        )],
+    );
+    let rep2 = screen_with(&c, &other, &lane, LONG).unwrap();
+    let g1 = rep2
+        .probes
+        .iter()
+        .find(|p| p.class == "G-1" && p.cell == "E-4")
+        .unwrap();
+    assert_eq!(g1.decision, ProbeDecision::NotMeasurable);
+    assert_eq!(rep2.verdict, ScreenVerdict::AcceptedWithNotes);
+    assert!(
+        rep2.declines_apply(),
+        "AY5: at apply a not-measurable probe declines"
+    );
+    cleanup(&root);
+}
+
+// ───────────────────────────── I3, I4, E-21, AT4 ─────────────────────────────
+
+/// I3 (BC1): a candidate registrar whose condition is always "off" ends the gate unregistered where
+/// the released one keeps it registered → REFUSED.
+#[test]
+fn i3_refuses_registrar_that_unregisters() {
+    let root = test_root("i3");
+    let lane = lane_of(&root, &[]);
+    let pf = released("bin/javis_preflight.py");
+    let line = "        state = capgate_registration_state(a, b)";
+    assert!(pf.contains(line));
+    let cand = candidate_of(
+        &root,
+        &[(
+            "bin/javis_preflight.py",
+            Some(pf.replace(line, "        state = CAPGATE_OFF")),
+        )],
+    );
+    let c = cfg(&root, Some(vec![]), Some(vec![]), true);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    assert_eq!(
+        rep.verdict,
+        ScreenVerdict::Refused,
+        "{:#?}",
+        rep.probes
+            .iter()
+            .filter(|p| p.test == "I3")
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        rep.refusals.iter().any(|r| r.contains("관문의 등록")),
+        "{:?}",
+        rep.refusals
+    );
+    let s1 = rep
+        .probes
+        .iter()
+        .find(|p| p.test == "I3" && p.cell == "L1/S1/run1" && p.class == "I3:.claude")
+        .unwrap();
+    assert_eq!(
+        (s1.released, s1.clean),
+        (Answer::Deny, Some(Answer::Allow)),
+        "{s1:#?}"
+    );
+    cleanup(&root);
+}
+
+/// I4: a candidate guard.sh whose backstop region differs from the released copy → REFUSED; a
+/// candidate whose region anchor is gone → REFUSED; a lane whose own copy differs and a candidate
+/// that does not touch guard.sh → a lane finding (BA4).
+#[test]
+fn i4_regions_judged() {
+    let root = test_root("i4");
+    let lane = lane_of(&root, &[]);
+    let c = cfg(&root, Some(vec![]), Some(vec![]), false);
+    let g = released("hooks/guard.sh");
+    let changed = g.replace("백스톱: 비가역 명령. 오너 승인 필요", "백스톱: 비가역 명령");
+    let rep = screen_with(
+        &c,
+        &candidate_of(&root, &[("hooks/guard.sh", Some(changed.clone()))]),
+        &lane,
+        LONG,
+    )
+    .unwrap();
+    let b = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "I4:bash-backstop")
+        .unwrap();
+    assert_eq!(b.decision, ProbeDecision::Refused, "{b:#?}");
+    let renamed = g.replace("run_loose_backstop", "run_backstop_loose");
+    let rep = screen_with(
+        &c,
+        &candidate_of(&root, &[("hooks/guard.sh", Some(renamed))]),
+        &lane,
+        LONG,
+    )
+    .unwrap();
+    let b = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "I4:bash-backstop")
+        .unwrap();
+    assert_eq!(b.decision, ProbeDecision::Refused);
+    assert!(b.detail.contains("anchor not found"));
+    // not touching guard.sh in a lane whose copy differs → lane finding
+    let root2 = test_root("i4b");
+    let lane2 = lane_of(&root2, &[("hooks/guard.sh", Some(changed))]);
+    let rep = screen_with(
+        &c,
+        &candidate_of(
+            &root2,
+            &[("bin/javis_lock.py", Some(released("bin/javis_lock.py")))],
+        ),
+        &lane2,
+        LONG,
+    )
+    .unwrap();
+    let b = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "I4:bash-backstop")
+        .unwrap();
+    assert_eq!(b.decision, ProbeDecision::LaneFinding);
+    assert_ne!(rep.verdict, ScreenVerdict::Refused);
+    cleanup(&root);
+    cleanup(&root2);
+}
+
+/// E-21 (BC3, BH1): a candidate _lib.sh that switches the released device's own no-Python switch off
+/// cannot turn the backstop cell into a normal run that passes — the marker is missing → REFUSED. A
+/// harmless _lib.sh change keeps the backstop proven.
+#[test]
+fn e21_backstop_marker_required() {
+    let root = test_root("e21");
+    let lane = lane_of(&root, &[]);
+    let c = cfg(
+        &root,
+        Some(vec!["G-22", "G-23", "G-24np"]),
+        Some(vec!["E-21"]),
+        false,
+    );
+    let lib = released("hooks/_lib.sh");
+    let rep = screen_with(
+        &c,
+        &candidate_of(
+            &root,
+            &[("hooks/_lib.sh", Some(format!("{lib}\n# harmless\n")))],
+        ),
+        &lane,
+        LONG,
+    )
+    .unwrap();
+    for id in ["G-22", "G-23", "G-24np"] {
+        let p = rep
+            .probes
+            .iter()
+            .find(|p| p.class == id)
+            .unwrap_or_else(|| panic!("{id} not probed"));
+        assert_eq!(p.decision, ProbeDecision::Held, "{p:#?}");
+    }
+    let evasive = format!("{lib}\nunset GUARD_TEST_MODE GUARD_FORCE_NOPY\n");
+    let rep = screen_with(
+        &c,
+        &candidate_of(&root, &[("hooks/_lib.sh", Some(evasive))]),
+        &lane,
+        LONG,
+    )
+    .unwrap();
+    let p = rep.probes.iter().find(|p| p.class == "G-22").unwrap();
+    assert_eq!(p.decision, ProbeDecision::Refused, "{p:#?}");
+    assert_eq!(rep.verdict, ScreenVerdict::Refused);
+    cleanup(&root);
+}
+
+/// AT4 on the FILE (BD3) with BG1: a table that gains a `capgate: deny` the lane's file does not hold
+/// is refused; restoring the shipped `.example` to its released bytes is not.
+#[test]
+fn at4_capgate_deny_added_refused() {
+    let root = test_root("at4");
+    let ex = released("state/hook-targets.json.example");
+    let mut doc: serde_json::Value = serde_json::from_str(&ex).unwrap();
+    let profiles = doc["profiles"].as_array_mut().unwrap();
+    profiles.push(serde_json::json!({"basename": ".claude", "eligibility": {"capgate": "deny"}}));
+    let with_deny = serde_json::to_string_pretty(&doc).unwrap();
+    let lane = lane_of(&root, &[]);
+    let c = cfg(&root, Some(vec![]), Some(vec![]), false);
+    let rep = screen_with(
+        &c,
+        &candidate_of(
+            &root,
+            &[("state/hook-targets.json.example", Some(with_deny.clone()))],
+        ),
+        &lane,
+        LONG,
+    )
+    .unwrap();
+    let a = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "AT4:state/hook-targets.json.example")
+        .unwrap();
+    assert_eq!(a.decision, ProbeDecision::Refused, "{a:#?}");
+    // BG1: the lane's .example had its denies removed; the candidate restores the released bytes
+    let mut stripped: serde_json::Value = serde_json::from_str(&ex).unwrap();
+    for p in stripped["profiles"].as_array_mut().unwrap() {
+        if let Some(e) = p.get_mut("eligibility").and_then(|e| e.as_object_mut()) {
+            e.remove("capgate");
+        }
+    }
+    let root2 = test_root("at4b");
+    let lane2 = lane_of(
+        &root2,
+        &[(
+            "state/hook-targets.json.example",
+            Some(serde_json::to_string_pretty(&stripped).unwrap()),
+        )],
+    );
+    let rep = screen_with(
+        &c,
+        &candidate_of(&root2, &[("state/hook-targets.json.example", Some(ex))]),
+        &lane2,
+        LONG,
+    )
+    .unwrap();
+    let a = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "AT4:state/hook-targets.json.example")
+        .unwrap();
+    assert_eq!(a.decision, ProbeDecision::Held, "BG1: {a:#?}");
+    cleanup(&root);
+    cleanup(&root2);
+}
+
+// ───────────────────────────── replay rules: socket, after-run comparison ─────────────────────────────
+
+/// BH2 (b): the only cys a probe reaches is the screen's own stub on its own scratch socket —
+/// never the socket of the process running the screen.
+#[test]
+fn screen_never_reaches_a_real_socket() {
+    let root = test_root("sock");
+    let lane = lane_of(&root, &[]);
+    let c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-1"]), false);
+    let rep = screen_with(&c, &candidate_of(&root, &[]), &lane, LONG).unwrap();
+    let g1 = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "G-1" && p.cell == "E-1")
+        .unwrap();
+    let sock_arg = g1
+        .detail
+        .split("cys --socket ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .unwrap_or("");
+    assert!(
+        sock_arg.starts_with(&*c.scratch_base.to_string_lossy())
+            || sock_arg.starts_with("/private/tmp/cys-rs-")
+            || sock_arg.starts_with("/tmp/cys-rs-"),
+        "the probe asked a socket outside the screen's scratch: {sock_arg:?} ({})",
+        g1.detail
+    );
+    if let Ok(own) = std::env::var("CYS_SOCKET") {
+        assert_ne!(sock_arg, own);
+    }
+    assert!(
+        !std::path::Path::new(sock_arg).exists(),
+        "the scratch socket was not removed"
+    );
+    cleanup(&root);
+}
+
+/// BK1 / BL1: a candidate guard.sh that writes a live listed file of the lane on every run is caught
+/// by the after-run comparison — written again during the repeat → REFUSED.
+#[test]
+fn after_run_rewrite_refused() {
+    let root = test_root("bl1");
+    let lane = lane_of(&root, &[]);
+    let target = lane.join("hooks/_lib.sh");
+    let g = released("hooks/guard.sh");
+    let escaping = g.replacen(
+        "set -u\n",
+        &format!("set -u\ntouch '{}' 2>/dev/null\n", target.display()),
+        1,
+    );
+    let c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-4"]), false);
+    let mut rep = screen_with(
+        &c,
+        &candidate_of(&root, &[("hooks/guard.sh", Some(escaping))]),
+        &lane,
+        LONG,
+    )
+    .unwrap();
+    assert!(
+        rep.after_run
+            .first
+            .iter()
+            .any(|d| d.item.ends_with("hooks/_lib.sh")),
+        "{:?}",
+        rep.after_run
+    );
+    assert!(rep
+        .after_run
+        .rewritten_in_repeat
+        .iter()
+        .any(|d| d.item.ends_with("hooks/_lib.sh")));
+    judge_after_run(&mut rep, &|_| false);
+    assert_eq!(rep.verdict, ScreenVerdict::Refused);
+    assert!(rep.refusals.iter().any(|r| r.contains("다시 썼습니다")));
+    cleanup(&root);
+}
+
+/// BL1: a difference that is not written again in the repeat is a note, not a refusal; a difference
+/// the daemon's own recorded live operation explains is no finding at all.
+#[test]
+fn after_run_single_difference_noted() {
+    let d = LiveDifference {
+        item: "/x/pack/hooks/_lib.sh".into(),
+        before: "a".into(),
+        after: "b".into(),
+    };
+    let mut rep = summarize(Vec::new(), "fp".into(), Duration::from_millis(1));
+    rep.after_run.first = vec![d.clone()];
+    let mut once = rep.clone();
+    judge_after_run(&mut once, &|_| false);
+    assert_eq!(once.verdict, ScreenVerdict::AcceptedWithNotes);
+    assert_eq!(once.lane_findings.len(), 1);
+    let mut explained = rep.clone();
+    judge_after_run(&mut explained, &|_| true);
+    assert_eq!(explained.verdict, ScreenVerdict::Accepted);
+    let mut again = rep;
+    again.after_run.rewritten_in_repeat = vec![d];
+    judge_after_run(&mut again, &|_| false);
+    assert_eq!(again.verdict, ScreenVerdict::Refused);
+}
+
+// ───────────────────────────── the verdict travels with what was screened (AY5, BC7, BD5) ─────────────────────────────
+
+#[test]
+fn verdict_record_roundtrip_and_holds() {
+    let root = test_root("verdict");
+    let lane = lane_of(&root, &[]);
+    let cand = candidate_of(
+        &root,
+        &[(
+            "bin/javis_lock.py",
+            Some(format!("{}\n# x\n", released("bin/javis_lock.py"))),
+        )],
+    );
+    let fp = input_fingerprint(&cand, &lane).unwrap();
+    let ledger = root.join("repairs");
+    let id = RepairId::parse("R-7").unwrap();
+    std::fs::create_dir_all(super::super::ledger::repair_dir_in(&ledger, &id)).unwrap();
+    assert_eq!(read_verdict_in(&ledger, &id).unwrap(), None);
+    let v = RecordedVerdict {
+        schema: SCREEN_SCHEMA,
+        verdict: ScreenVerdict::Accepted,
+        input_fingerprint: fp.clone(),
+        build_id: screen_build_id(),
+        notes: vec![],
+        at: 1.0,
+    };
+    write_verdict_in(&ledger, &id, &v).unwrap();
+    let back = read_verdict_in(&ledger, &id).unwrap().unwrap();
+    assert_eq!(back, v);
+    assert!(recorded_verdict_holds(&back, &cand, &lane).unwrap());
+    // another build id → never reused (BD5)
+    let mut other = back.clone();
+    other.build_id = "elsewhere".into();
+    assert!(!recorded_verdict_holds(&other, &cand, &lane).unwrap());
+    // a refused verdict never holds
+    let mut refused = back.clone();
+    refused.verdict = ScreenVerdict::Refused;
+    assert!(!recorded_verdict_holds(&refused, &cand, &lane).unwrap());
+    // the lane's inputs differ (another lane) → does not hold
+    std::fs::write(lane.join("hooks/_lib.sh"), "# other lane\n").unwrap();
+    assert!(!recorded_verdict_holds(&back, &cand, &lane).unwrap());
+    // a file outside the inputs does not move the fingerprint
+    let fp2 = input_fingerprint(&cand, &lane).unwrap();
+    std::fs::write(lane.join("README.md"), "x").unwrap();
+    assert_eq!(fp2, input_fingerprint(&cand, &lane).unwrap());
+    // a higher schema on disk is corrupt, not a verdict
+    std::fs::write(verdict_path_in(&ledger, &id), r#"{"schema": 99, "verdict": "accepted", "input_fingerprint": "x", "build_id": "y", "notes": [], "at": 1.0}"#).unwrap();
+    assert!(matches!(
+        read_verdict_in(&ledger, &id),
+        Err(RepairError::Corrupt(_))
+    ));
+    cleanup(&root);
+}
+
+/// The candidate's bytes must be the bytes it declares (a swap after the states were read is not
+/// screened).
+#[test]
+fn candidate_bytes_must_match_declared_states() {
+    let root = test_root("swap");
+    let lane = lane_of(&root, &[]);
+    let mut cand = candidate_of(
+        &root,
+        &[("hooks/guard.sh", Some(released("hooks/guard.sh")))],
+    );
+    std::fs::write(cand.files.join("hooks/guard.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    let c = cfg(&root, Some(vec![]), Some(vec![]), false);
+    assert!(matches!(
+        screen_with(&c, &cand, &lane, LONG),
+        Err(RepairError::Precondition(_))
+    ));
+    cand.targets[0].0 = "../escape".into();
+    assert!(screen_with(&c, &cand, &lane, LONG).is_err());
+    cleanup(&root);
+}
