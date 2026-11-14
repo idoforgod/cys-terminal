@@ -952,6 +952,44 @@ class StaleLegacyReceipt(Rig):
                 self.register()
 
 
+class ReportingFailureKeepsTheLifeCycle(Rig):
+    """★RULINGS DC3 — 보고 자체가 실패해도 생명주기 규칙은 선다: PENDING 쓰기 실패는 치명이 아니다(stderr 1줄), 조립과 그 상태
+    파일 쓰기가 둘 다 실패해도 `launch` 는 0 으로 끝나고 티켓 발급·편성 단계에 닿는다(합성 레인 — 실제 설치 무접촉)."""
+
+    def unwritable(self, path):
+        os.makedirs(path, exist_ok=True)
+        os.chmod(path, 0o555)
+        self.addCleanup(os.chmod, path, 0o755)
+        try:
+            open(os.path.join(path, ".probe"), "w").close()
+        except PermissionError:
+            return
+        os.remove(os.path.join(path, ".probe"))
+        self.skipTest("읽기 전용 폴더에도 쓸 수 있는 실행 계정(root) — 측정 불가")
+
+    def assert_life_cycle_reached(self, rc, out, err):
+        self.assertEqual(rc, 0, "launch 가 생명주기를 깼다\n" + out + err)
+        self.assertIn("CEO 티켓 자동 발급 생략", err, "티켓 발급 단계에 닿지 않았다\n" + err)
+        self.assertIn("편성 ensure 생략", err, "편성 단계에 닿지 않았다\n" + err)
+        self.assertIn("가동 완료", out, out + err)
+
+    def test_composition_and_pending_write_both_fail(self):
+        self.seed()
+        self.unwritable(os.path.join(self.home, ".cys", "state"))     # PENDING(ceo-pending) 쓰기 실패
+        self.unwritable(self.dirs)                                     # 조립(잠금·지침·영수증) 실패
+        rc, out, err = self.run_dept("launch", "d0")
+        self.assert_life_cycle_reached(rc, out, err)
+        self.assertIn("PENDING 기록 실패", err, "PENDING 쓰기 실패가 보이지 않는다(무음)")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER)
+
+    def test_boot_gate_pending_write_fails(self):
+        self.seed(marker=False)
+        self.unwritable(os.path.join(self.home, ".cys", "state"))
+        rc, out, err = self.run_dept("launch", "d0")
+        self.assert_life_cycle_reached(rc, out, err)
+        self.assertIn("PENDING 기록 실패", err)
+
+
 class LockIsReal(Rig):
     """★RULINGS DC1 — 승격·강등은 진짜 잠금(POSIX: 잠금 파일의 flock(2) · 윈도우: msvcrt.locking)을 상한 있는 대기로 잡는다.
     시간 안에 못 잡으면 '잠금 없이 진행'하지 않고 보류한다(알림 1건 · 지침 무변경) — 스크립트는 그래도 0 으로 끝난다."""
