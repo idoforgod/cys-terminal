@@ -4234,3 +4234,48 @@ fn da5_unreadable_lane_row_never_overwritten() {
         assert_eq!(after.committed, before.committed, "{tag}");
     }
 }
+
+/// RULINGS DJ1: the key of a name that does not exist yet is conservative and the sentence true —
+/// the NFC / NFD pair of one name → the second refused (one creating repair per folder for
+/// non-ASCII names); `a.txt` / `A.txt` → the second refused saying that names differing only in
+/// case are one file on some volumes; two different ASCII names → both allowed; a non-ASCII
+/// creation beside an ASCII creation in the same folder → both allowed.
+#[test]
+fn dj1_names_that_do_not_exist_yet() {
+    let r = rig("dj1");
+    std::fs::create_dir_all(r.pack.join("notes")).unwrap();
+    let begin = |sid: u64, rel: &str| {
+        r.call(
+            T0,
+            &seat(sid, if sid == 3 { "worker" } else { "worker-3" }),
+            "begin",
+            json!({"trigger": "owner_order", "files": [rel]}),
+        )
+    };
+    let id_of = |v: Value| v["repair"].as_str().unwrap().to_string();
+    // NFC then NFD of "café.txt"
+    let nfc = id_of(begin(3, "notes/caf\u{e9}.txt").unwrap());
+    let e = begin(13, "notes/cafe\u{301}.txt").unwrap_err();
+    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    assert!(
+        e.message.contains(&nfc) && e.message.contains("ASCII"),
+        "{}",
+        e.message
+    );
+    // a.txt then A.txt
+    let a = id_of(begin(3, "notes/a.txt").unwrap());
+    let e = begin(13, "notes/A.txt").unwrap_err();
+    assert!(
+        e.message.contains(&a)
+            && e.message
+                .contains("대소문자만 다른 이름은 볼륨에 따라 같은 파일"),
+        "{}",
+        e.message
+    );
+    // two different ASCII names; a non-ASCII creation beside an ASCII one
+    assert!(begin(3, "notes/x1.txt").is_ok());
+    assert!(begin(13, "notes/x2.txt").is_ok());
+    std::fs::create_dir_all(r.pack.join("other")).unwrap();
+    assert!(begin(3, "other/\u{c0c8}.md").is_ok());
+    assert!(begin(13, "other/plain.md").is_ok());
+}

@@ -1738,20 +1738,12 @@ mod ledger_verbs {
             if r.resolves == resolves && theirs == key {
                 continue; // a pick-up candidate (handled above)
             }
-            // DA4: the same FILE, not the same spelling
-            if let Some(shared) = key.iter().find(|k| {
-                theirs
-                    .iter()
-                    .any(|t| super::same_target(&ctx.pack_dir, k, t))
-            }) {
-                return Err(VerbError::new(
-                    cys::repair::types::ERR_PRECONDITION,
-                    format!(
-                        "{shared}: 이 파일을 고치는 수리 {id} 가 이미 열려 있습니다(대상 파일 묶음 또는 --resolves 가 다릅니다) — `--joins {id}` 로 합류하거나, 같은 파일들({})로 `cys repair begin` 해서 그 수리를 이어받으세요. 한 파일에 열린 수리는 하나뿐입니다(RULINGS BJ5)",
-                        theirs.join(", "),
-                        id = r.id.as_str()
-                    ),
-                ));
+            // DA4 / DJ1: the same FILE, not the same spelling; for a name that does not exist yet
+            // the conservative key (ASCII case fold; one creating repair per folder for non-ASCII)
+            for k in key {
+                if let Some(why) = super::open_overlap(&ctx.pack_dir, k, &r) {
+                    return Err(VerbError::new(cys::repair::types::ERR_PRECONDITION, why));
+                }
             }
         }
         // A new repair — created ALREADY LOCKED through the ledger's seam (AD9 S1 / G1 "lock first"):
@@ -4239,6 +4231,70 @@ pub(crate) fn same_target(pack: &Path, a: &str, b: &str) -> bool {
                 == cys::repair::types::fold_name(&b.replace('\\', "/"))
         }
     }
+}
+
+/// RULINGS DA4 / DJ1 — the refusal sentence when the new target `new` overlaps a being-worked
+/// repair `rec` of this lane, or `None`:
+/// - both live files exist → their identity decides (the volume's own equality: case,
+///   normalisation, hard links) — the same file → refused (BJ5's sentence);
+/// - the same spelling → refused (BJ5's sentence);
+/// - otherwise, when one name does not exist yet (no identity to compare — the crate has no
+///   Unicode normalisation, RULINGS CD1): (a) two names equal after case folding → one target even
+///   on a case-sensitive volume (the safe direction), said truthfully; (b) a new name with a
+///   non-ASCII character that does not exist yet, beside an open repair CREATING such a name in the
+///   same folder → refused until that repair closes (the volume may treat differently composed
+///   names as one file). An ASCII creation beside a non-ASCII one, and two different ASCII names,
+///   are allowed.
+pub(crate) fn open_overlap(
+    pack: &Path,
+    new: &str,
+    rec: &cys::repair::ledger::RepairRecord,
+) -> Option<String> {
+    use cys::repair::boot_critical::file_identity;
+    use cys::repair::types::fold_name;
+    let id = rec.id.as_str();
+    let theirs: Vec<&str> = rec.files.iter().map(|f| f.rel.as_str()).collect();
+    let same_file = || {
+        format!(
+            "{new}: 이 파일을 고치는 수리 {id} 가 이미 열려 있습니다(대상 파일 묶음 또는 --resolves 가 다릅니다) — `--joins {id}` 로 합류하거나, 같은 파일들({})로 `cys repair begin` 해서 그 수리를 이어받으세요. 한 파일에 열린 수리는 하나뿐입니다(RULINGS BJ5)",
+            theirs.join(", ")
+        )
+    };
+    let norm = |s: &str| fold_name(&s.replace('\\', "/"));
+    let new_id = file_identity(&pack.join(new));
+    for f in &rec.files {
+        let t = f.rel.as_str();
+        match (new_id, file_identity(&pack.join(t))) {
+            (Some(x), Some(y)) if x == y => return Some(same_file()),
+            (Some(_), Some(_)) => continue, // two live files, two files
+            _ => {}
+        }
+        if new == t {
+            return Some(same_file());
+        }
+        if norm(new) == norm(t) {
+            return Some(format!(
+                "{new}: 수리 {id} 가 연 `{t}` 와 대소문자만 다른 이름입니다 — 대소문자만 다른 이름은 볼륨에 따라 같은 파일이라 동시에 열지 않습니다. 먼저 열린 수리 {id} 가 끝난 뒤 다시 하세요(RULINGS DJ1)"
+            ));
+        }
+        let creating = f.pre == cys::repair::ledger::PreImage::Absent;
+        if new_id.is_none()
+            && !new.is_ascii()
+            && creating
+            && !t.is_ascii()
+            && same_target(pack, parent_rel(new), parent_rel(t))
+        {
+            return Some(format!(
+                "{new}: 이 폴더에는 ASCII 가 아닌 새 이름(`{t}`)을 만드는 열린 수리 {id} 가 있습니다 — 볼륨이 다르게 조합된 이름(정규화 형식만 다른 이름 등)을 같은 파일로 볼 수 있어, 이런 새 이름은 한 폴더에 한 수리만 엽니다. {id} 가 끝난 뒤 다시 하세요(RULINGS DJ1)"
+            ));
+        }
+    }
+    None
+}
+
+/// The folder part of a pack-relative rel (`""` for the pack root).
+fn parent_rel(rel: &str) -> &str {
+    rel.rfind(['/', '\\']).map_or("", |i| &rel[..i])
 }
 
 /// C10's rule-document base names (as `guard.sh:PROTECTED_NAMES`), lower-cased.
