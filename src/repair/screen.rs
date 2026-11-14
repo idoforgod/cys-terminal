@@ -364,6 +364,26 @@ pub fn judge_after_run(report: &mut ScreenReport, explained: &dyn Fn(&LiveDiffer
     }
 }
 
+/// RULINGS DE1: the refusal the scoped after-run comparison gave this report — an item written again
+/// in the repeat, an incomplete repeat, a process left behind — or `None`. The caller files ONE intake
+/// row and the owner's one line for it (BK1), nothing more.
+pub fn after_run_refusal(report: &ScreenReport) -> Option<String> {
+    if !report.after_run.leftover_processes.is_empty() {
+        return Some(format!(
+            "예행이 끝난 뒤에도 남은 프로세스가 있었습니다(pid {:?})",
+            report.after_run.leftover_processes
+        ));
+    }
+    let mut only = report.clone();
+    only.verdict = ScreenVerdict::Accepted;
+    only.refusals.clear();
+    only.notes.clear();
+    only.lane_findings.clear();
+    only.not_measurable.clear();
+    judge_after_run(&mut only, &|_| false);
+    (only.verdict == ScreenVerdict::Refused).then(|| only.refusals.join(" / "))
+}
+
 // ═════════════════════════════════════════ the engine ═════════════════════════════════════════
 
 use super::replay::{self, LaidSource, ScratchRoot, ScratchSocket};

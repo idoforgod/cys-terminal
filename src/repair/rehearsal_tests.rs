@@ -275,6 +275,53 @@ fn stamp_holds_inode_ctime_and_mtime() {
     replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
+/// RULINGS CZ3 / DE1 / CZ6: the comparison around rehearsal runs — a run that writes a live listed
+/// file on every call is refused; one that wrote only in the first call is noted; a repeat that did
+/// not complete is refused; nothing written is clean; the first run's value is returned in each case.
+#[test]
+fn compared_runs_find_a_write_to_a_live_listed_file() {
+    let r = root("cz3");
+    let lane = r.join("lane").join("pack");
+    put(&lane, "hooks/guard.sh", "#!/bin/sh\nexit 0\n");
+    let home = r.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let live = lane.join("hooks/guard.sh");
+    let write = |p: &Path| {
+        let mut t = std::fs::read_to_string(p).unwrap();
+        t.push('x');
+        std::fs::write(p, t).unwrap();
+    };
+    let calls = std::cell::Cell::new(0u32);
+    let (v, c) = compared_runs(&lane, &home, || {
+        calls.set(calls.get() + 1);
+        write(&live);
+        (calls.get(), true)
+    });
+    assert_eq!(v, 1, "the first run's value");
+    assert!(matches!(c, Comparison::Refused(ref l) if l.contains("guard.sh")), "{c:?}");
+    calls.set(0);
+    let (_, c) = compared_runs(&lane, &home, || {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            write(&live);
+        }
+        ((), true)
+    });
+    assert!(matches!(c, Comparison::Noted(_)), "{c:?}");
+    calls.set(0);
+    let (_, c) = compared_runs(&lane, &home, || {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            write(&live);
+        }
+        ((), calls.get() == 1)
+    });
+    assert!(matches!(c, Comparison::Refused(_)), "an incomplete repeat: {c:?}");
+    let (_, c) = compared_runs(&lane, &home, || ((), true));
+    assert_eq!(c, Comparison::Clean);
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
 /// RULINGS CZ4: a cleanup error or a leftover scratch tree is RETURNED, never swallowed.
 #[test]
 fn cleanup_errors_are_returned() {

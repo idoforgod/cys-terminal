@@ -1034,12 +1034,23 @@ fn production_check(
     for _ in Path::new(rel).components() {
         pack_root.pop();
     }
-    let r = run_check(&CheckRequest {
+    // RULINGS CZ3 / DE1: the check runs inside the scoped after-run comparison of the live pack
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+    let req = CheckRequest {
         entry_rel: rel.to_string(),
-        scratch_root: pack_root,
+        scratch_root: pack_root.clone(),
         recorded_input: None,
         deadline,
-    })?;
+    };
+    let (r, cmp) = cys::repair::rehearsal::compared_runs(&pack_root, &home, || {
+        let r = run_check(&req);
+        let completed = !matches!(r, Ok(CheckResult::Timeout));
+        (r, completed)
+    });
+    let r = match cmp {
+        cys::repair::rehearsal::Comparison::Refused(line) => CheckResult::Fail(line),
+        _ => r?,
+    };
     let check_ms = started.elapsed().as_millis() as u64;
     let started = std::time::Instant::now();
     let reference = run_reference_check(kind, deadline)?;

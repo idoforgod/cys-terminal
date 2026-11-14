@@ -605,6 +605,84 @@ pub fn run_reference_check(
     run_kind(kind, arg, name, scratch.path(), &file, &req)
 }
 
+// ───────────────────────── the after-run comparison around rehearsal runs ─────────────────────────
+
+/// What the scoped after-run comparison around a set of rehearsal runs found (RULINGS CZ3 / DE1;
+/// contract C4 BH2 / BK1 / BL1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Comparison {
+    /// No compared item changed.
+    Clean,
+    /// An item changed during the first runs but was not written again in the repeat: the candidate
+    /// goes on; the line stays on ONE intake row.
+    Noted(String),
+    /// The same item was written again in the repeat, or the repeat did not complete: the candidate
+    /// is refused — ONE intake row and the owner's one line.
+    Refused(String),
+}
+
+/// RULINGS CZ3 / DE1 — runs `run` (the rehearsal's checks; each call lays out its own fresh scratch
+/// roots) INSIDE the scoped after-run comparison of `lane`: its live listed files and the `hooks` /
+/// `statusLine` sections of every real settings file under `real_home` are snapshot before and after.
+/// An unexplained difference → `run` once more inside a second pair of snapshots: an item written
+/// again (state or stamp — BL1) → `Refused`; the repeat not completed (`run` answers `false`) →
+/// `Refused` (CZ6); otherwise `Noted`. The FIRST run's value is returned whatever it was — a failing
+/// check is inside the comparison too. No difference is explained (the daemon keeps no journal of its
+/// live operations — DEFERRED #60).
+pub fn compared_runs<T>(
+    lane: &Path,
+    real_home: &Path,
+    mut run: impl FnMut() -> (T, bool),
+) -> (T, Comparison) {
+    let settings = replay::real_settings_targets(lane, real_home);
+    let before = replay::live_snapshot(lane, &settings);
+    let (value, _) = run();
+    let after = replay::live_snapshot(lane, &settings);
+    let first = replay::changed_items(&before, &after);
+    if first.is_empty() {
+        return (value, Comparison::Clean);
+    }
+    let names = |d: &[(replay::LiveItem, replay::LiveItem)]| {
+        d.iter()
+            .map(|(_, a)| a.item.clone())
+            .take(5)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let before2 = replay::live_snapshot(lane, &settings);
+    let (_, completed) = run();
+    let after2 = replay::live_snapshot(lane, &settings);
+    if !completed {
+        return (
+            value,
+            Comparison::Refused(format!(
+                "예행 동안 실제 환경의 항목이 바뀌었고({}) 다시 돌린 예행이 끝나지 않아 다시 썼는지 잴 수 없습니다 — 잴 수 없는 것은 통과가 아니므로 돌려보냅니다",
+                names(&first)
+            )),
+        );
+    }
+    let again: Vec<(replay::LiveItem, replay::LiveItem)> = replay::changed_items(&before2, &after2)
+        .into_iter()
+        .filter(|(_, a)| first.iter().any(|(_, f)| f.item == a.item))
+        .collect();
+    if !again.is_empty() {
+        return (
+            value,
+            Comparison::Refused(format!(
+                "예행이 실제 환경의 항목을 다시 썼습니다({}) — 예행 밖으로 새는 후보로 보고 돌려보냅니다",
+                names(&again)
+            )),
+        );
+    }
+    (
+        value,
+        Comparison::Noted(format!(
+            "예행 동안 실제 환경의 항목이 바뀌었으나 다시 돌렸을 때는 바뀌지 않았습니다({}) — 접수 줄에 남깁니다",
+            names(&first)
+        )),
+    )
+}
+
 #[cfg(test)]
 #[path = "rehearsal_tests.rs"]
 mod tests;

@@ -161,7 +161,7 @@ pub(crate) trait Effects: Send + Sync {
         files: &[cys::repair::apply::CandidateFile],
     ) -> Result<cys::repair::apply::ApplyOutcome, RepairError>;
     /// Step 3: the rehearsal re-run and the protection screen (`Err` = returned to the worker).
-    fn step3(&self, s3: &Step3Input) -> Result<Step3Ok, String>;
+    fn step3(&self, s3: &Step3Input) -> Result<Step3Ok, Step3Err>;
     /// Files one intake row (a lane finding of the screen).
     fn intake(&self, file: &str, error: &str);
 }
@@ -174,6 +174,46 @@ pub(crate) struct Step3Input {
     pub pack: PathBuf,
     pub states: Vec<(String, TargetState)>,
     pub windows: bool,
+}
+
+/// Why step 3 returned the candidate (no card).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Step3Err {
+    pub why: String,
+    /// RULINGS DE1 / BK1: a refusal by the after-run comparison files ONE intake row (file, line) …
+    pub intake: Option<(String, String)>,
+    /// … and the owner's one line, through the lane master — nothing more, never per tick.
+    pub owner_line: Option<String>,
+}
+
+impl From<String> for Step3Err {
+    fn from(why: String) -> Self {
+        Self {
+            why,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<&str> for Step3Err {
+    fn from(why: &str) -> Self {
+        why.to_string().into()
+    }
+}
+
+impl Step3Err {
+    /// A refusal by the scoped after-run comparison (the rehearsal's or the screen's): the reason,
+    /// ONE intake row naming the candidate's first target, the owner's one line.
+    fn escaped(repair: &RepairId, rel: &str, line: String) -> Self {
+        Self {
+            owner_line: Some(format!(
+                "수리 {} 의 제출 검사에서 예행이 실제 환경을 건드려 후보를 돌려보냈습니다 — {line}",
+                repair.as_str()
+            )),
+            intake: Some((rel.to_string(), line.clone())),
+            why: line,
+        }
+    }
 }
 
 /// What a passing step 3 found.
@@ -691,7 +731,7 @@ pub(crate) fn run_step3(
 ) {
     let outcome = eff.step3(s3);
     match outcome {
-        Err(why) => {
+        Err(err) => {
             let _ = end_request(
                 ctx,
                 table,
@@ -699,10 +739,20 @@ pub(crate) fn run_step3(
                 request_id,
                 &[ReqState::Checking],
                 ReqState::Voided,
-                format!("제출 검사에서 돌려보냈습니다(주인에게 올리지 않았습니다): {why}"),
+                format!(
+                    "제출 검사에서 돌려보냈습니다(주인에게 올리지 않았습니다): {}",
+                    err.why
+                ),
                 RepairState::InProgress,
                 RecApproval::Keep,
             );
+            // RULINGS DE1: the comparison's refusal — ONE intake row and the owner's one line
+            if let Some((file, line)) = &err.intake {
+                eff.intake(file, line);
+            }
+            if let Some(line) = err.owner_line {
+                eff.tell_master(line);
+            }
         }
         Ok(ok) => {
             // the card appears only for a request still in step 3 (never over an end that came first)
@@ -736,37 +786,42 @@ pub(crate) fn run_step3(
 }
 
 /// The production step 3: every FILE target checked by the rehearsal runner in a scratch copy of
-/// the lane's pack with the candidate laid in, then the protection screen (both under the replay
-/// rules). The screen's verdict is recorded (`screen.json`) when it accepts.
-pub(crate) fn production_step3(s3: &Step3Input) -> Result<Step3Ok, String> {
+/// the lane's pack with the candidate laid in — INSIDE the scoped after-run comparison (RULINGS CZ3 /
+/// DE1) — then the protection screen (its own comparison). The screen's verdict is recorded
+/// (`screen.json`) when it accepts and the live inputs still match (CZ5).
+pub(crate) fn production_step3(s3: &Step3Input) -> Result<Step3Ok, Step3Err> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    production_step3_with(s3, &home)
+}
+
+/// One rehearsal pass: a fresh scratch copy of the lane's pack with the candidate's states laid in,
+/// every target checked. `Err((why, completed))` — `completed` is false when a check ran out of time.
+fn rehearse_once(
+    s3: &Step3Input,
+    staging: &std::path::Path,
+    started: std::time::Instant,
+) -> Result<Vec<String>, (String, bool)> {
     use cys::repair::rehearsal::{self, CheckRequest, CheckResult};
     use cys::repair::replay::{self, ScratchRoot};
-    use cys::repair::screen::{self, ScreenCandidate, ScreenVerdict};
-    if s3.windows {
-        return Err("윈도우에서는 1차 출시에서 이 검사를 하지 않습니다".into());
-    }
-    let started = std::time::Instant::now();
-    let staging = ledger::staging_dir_in(&s3.root, &s3.repair);
-    // (a) the rehearsal: a scratch copy of the lane's pack with the candidate's states laid in
+    let done = |why: String| (why, true);
     let scratch =
-        ScratchRoot::new(&rehearsal::scratch_base(), "s3-").map_err(|e| format!("{e:?}"))?;
+        ScratchRoot::new(&rehearsal::scratch_base(), "s3-").map_err(|e| done(format!("{e:?}")))?;
     let layout = scratch.path().join("pack");
     rehearsal::copy_layout(&s3.pack, &layout)
-        .map_err(|e| format!("예행 사본을 만들지 못했습니다 — {e:?}"))?;
+        .map_err(|e| done(format!("예행 사본을 만들지 못했습니다 — {e:?}")))?;
     for (rel, st) in &s3.states {
         let dst = layout.join(rel);
-        replay::remove_tree(&dst).map_err(|e| format!("{rel}: {e:?}"))?;
+        replay::remove_tree(&dst).map_err(|e| done(format!("{rel}: {e:?}")))?;
         let src = match st {
             TargetState::Absent => replay::LaidSource::Absent,
             TargetState::Link { target } => replay::LaidSource::Link(target.clone()),
-            TargetState::File { .. } => {
-                replay::LaidSource::read(&staging.join(rel)).map_err(|e| format!("{rel}: {e:?}"))?
-            }
+            TargetState::File { .. } => replay::LaidSource::read(&staging.join(rel))
+                .map_err(|e| done(format!("{rel}: {e:?}")))?,
         };
         if src.state() != *st {
-            return Err(format!("{rel}: 작업 사본이 제출 뒤에 바뀌었습니다"));
+            return Err(done(format!("{rel}: 작업 사본이 제출 뒤에 바뀌었습니다")));
         }
-        replay::lay_out(&dst, &src).map_err(|e| format!("{rel}: {e:?}"))?;
+        replay::lay_out(&dst, &src).map_err(|e| done(format!("{rel}: {e:?}")))?;
     }
     let mut summary = Vec::new();
     for (rel, st) in &s3.states {
@@ -786,20 +841,58 @@ pub(crate) fn production_step3(s3: &Step3Input) -> Result<Step3Ok, String> {
             recorded_input: None,
             deadline: own.min(left),
         })
-        .map_err(|e| format!("{rel}: 예행 검사를 돌리지 못했습니다 — {e:?}"))?;
+        .map_err(|e| done(format!("{rel}: 예행 검사를 돌리지 못했습니다 — {e:?}")))?;
         match r {
             CheckResult::Pass => summary.push(if rehearsal::prerehearsal_possible(rel) {
                 format!("{rel}: 통과")
             } else {
                 format!("{rel}: {}", rehearsal::NOT_REHEARSABLE_KO)
             }),
-            CheckResult::Fail(m) => return Err(format!("예행 검사 실패 — {m}")),
-            CheckResult::Timeout => return Err(format!("{rel}: 예행 검사 시간 초과")),
+            CheckResult::Fail(m) => return Err(done(format!("예행 검사 실패 — {m}"))),
+            CheckResult::Timeout => return Err((format!("{rel}: 예행 검사 시간 초과"), false)),
         }
     }
     scratch
         .close()
-        .map_err(|e| format!("예행 사본을 지우지 못했습니다 — {e:?}"))?;
+        .map_err(|e| done(format!("예행 사본을 지우지 못했습니다 — {e:?}")))?;
+    Ok(summary)
+}
+
+/// [`production_step3`] with the HOME whose real settings files the comparisons watch.
+pub(crate) fn production_step3_with(
+    s3: &Step3Input,
+    real_home: &std::path::Path,
+) -> Result<Step3Ok, Step3Err> {
+    use cys::repair::rehearsal::{self, Comparison};
+    use cys::repair::screen::{self, ScreenCandidate, ScreenVerdict};
+    if s3.windows {
+        return Err("윈도우에서는 1차 출시에서 이 검사를 하지 않습니다".into());
+    }
+    let started = std::time::Instant::now();
+    let staging = ledger::staging_dir_in(&s3.root, &s3.repair);
+    let first_rel = s3
+        .states
+        .first()
+        .map(|(r, _)| r.clone())
+        .unwrap_or_default();
+    // (a) the rehearsal, INSIDE the scoped after-run comparison (snapshot → run → repeat on a
+    // difference; its failure paths included — RULINGS CZ3 / DE1)
+    let (rehearsed, cmp) = rehearsal::compared_runs(&s3.pack, real_home, || {
+        let r = rehearse_once(s3, &staging, started);
+        let completed = !matches!(&r, Err((_, false)));
+        (r, completed)
+    });
+    let mut notes: Vec<String> = Vec::new();
+    let mut found: Vec<(String, String)> = Vec::new();
+    match cmp {
+        Comparison::Refused(line) => return Err(Step3Err::escaped(&s3.repair, &first_rel, line)),
+        Comparison::Noted(line) => {
+            found.push((first_rel.clone(), line.clone()));
+            notes.push(line);
+        }
+        Comparison::Clean => {}
+    }
+    let mut summary = rehearsed.map_err(|(why, _)| Step3Err::from(why))?;
     // (b) the protection screen (C4 — every boot-critical and protection-related submit, AT2)
     let cand = ScreenCandidate {
         files: staging.clone(),
@@ -807,17 +900,21 @@ pub(crate) fn production_step3(s3: &Step3Input) -> Result<Step3Ok, String> {
     };
     let left = STEP3_DEADLINE.saturating_sub(started.elapsed());
     let rep = screen::screen_protections(&cand, &s3.pack, left)
-        .map_err(|e| format!("보호장치 심사를 끝내지 못했습니다 — {e:?}"))?;
+        .map_err(|e| Step3Err::from(format!("보호장치 심사를 끝내지 못했습니다 — {e:?}")))?;
+    // RULINGS DE1: a refusal by the screen's own after-run comparison has the same consequences
+    if let Some(line) = screen::after_run_refusal(&rep) {
+        return Err(Step3Err::escaped(&s3.repair, &first_rel, line));
+    }
     if rep.verdict == ScreenVerdict::Refused {
-        return Err(format!("보호장치 심사 거부 — {}", rep.refusals.join(" / ")));
+        return Err(format!("보호장치 심사 거부 — {}", rep.refusals.join(" / ")).into());
     }
     // RULINGS CZ5: recorded only while the live inputs still match what the screen tested
-    let mut notes = rep.notes.clone();
+    notes.extend(rep.notes.iter().cloned());
     match screen::recordable_verdict(&rep, &cand, &s3.pack)
-        .map_err(|e| format!("심사 결과를 기록할지 판단하지 못했습니다 — {e:?}"))?
+        .map_err(|e| Step3Err::from(format!("심사 결과를 기록할지 판단하지 못했습니다 — {e:?}")))?
     {
         Some(verdict) => screen::write_verdict_in(&s3.root, &s3.repair, &verdict)
-            .map_err(|e| format!("심사 결과를 기록하지 못했습니다 — {e:?}"))?,
+            .map_err(|e| Step3Err::from(format!("심사 결과를 기록하지 못했습니다 — {e:?}")))?,
         None => notes.push(
             "심사하는 동안 레인의 입력이 바뀌어 심사 결과를 기록하지 않았습니다 — 적용할 때 다시 심사합니다".into(),
         ),
@@ -835,10 +932,9 @@ pub(crate) fn production_step3(s3: &Step3Input) -> Result<Step3Ok, String> {
     Ok(Step3Ok {
         rehearsal_summary: summary.join(" · "),
         screen_notes: notes,
-        lane_findings: rep
-            .lane_findings
-            .iter()
-            .map(|l| (device_of(l), l.clone()))
+        lane_findings: found
+            .into_iter()
+            .chain(rep.lane_findings.iter().map(|l| (device_of(l), l.clone())))
             .collect(),
     })
 }
@@ -1558,7 +1654,7 @@ impl Effects for DaemonEffects {
         cys::repair::apply::apply_candidate(id, lane, files)
     }
 
-    fn step3(&self, s3: &Step3Input) -> Result<Step3Ok, String> {
+    fn step3(&self, s3: &Step3Input) -> Result<Step3Ok, Step3Err> {
         production_step3(s3)
     }
 
