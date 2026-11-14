@@ -26790,10 +26790,27 @@ fn run_pack_merge_with(
         matches!(line.trim(), "y" | "Y" | "yes")
     };
     // 원장·병치 파일 해소 공통부.
-    let resolve = |pending: &mut serde_json::Map<String, serde_json::Value>, side_suffix: &str| {
+    // ★T2i(RULINGS FP5 m7): 보관본은 이 실행이 처음 본(읽거나 확인한) 그 사본일 때만 지운다 — 그 사이에 바뀌었으면(다른 쓰는 쪽의
+    //   보관 · 사용자의 수정) 원장도 사본도 건드리지 않고 다시 실행하라고 말한다.
+    let seen_user = cys::pack::side_identity(&dir.join(format!("{rel}.user")));
+    let seen_new = cys::pack::side_identity(&dir.join(format!("{rel}.new")));
+    let resolve = |pending: &mut serde_json::Map<String, serde_json::Value>, side_suffix: &str| -> bool {
+        let side = dir.join(format!("{rel}{side_suffix}"));
+        #[cfg(test)]
+        BEFORE_RESOLVE.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f(&side)
+            }
+        });
+        let seen = if side_suffix == ".user" { &seen_user } else { &seen_new };
+        if cys::pack::side_identity(&side) != *seen {
+            eprintln!("{}", side_changed_refusal(&rel, side_suffix));
+            return false;
+        }
         pending.remove(&rel);
         let _ = cys::pack::save_merge_pending(&dir, pending);
-        let _ = std::fs::remove_file(dir.join(format!("{rel}{side_suffix}")));
+        let _ = std::fs::remove_file(&side);
+        true
     };
     // ★G3-축3 감사 원장 — 해소·거부 사실의 append 기록. 기록 실패는 loud 경고 후 계속
     //   (감사는 관측이지 검증 게이트가 아니다 — 기록 불능이 해소 자체를 봉쇄하면 병합 원장이
@@ -26834,7 +26851,9 @@ fn run_pack_merge_with(
                     Some(c) => c.to_string(),
                     None => {
                         eprintln!("{rel}.new 부재 + 임베드에도 없음 — 원장만 정리");
-                        resolve(&mut pending, ".new");
+                        if !resolve(&mut pending, ".new") {
+                            return 1;
+                        }
                         return 0;
                     }
                 },
@@ -26907,7 +26926,9 @@ fn run_pack_merge_with(
                         return 1;
                     }
                     advance_manifest_base(&theirs);
-                    resolve(&mut pending, ".new");
+                    if !resolve(&mut pending, ".new") {
+                            return 1;
+                        }
                     audit(&merge_audit_entry(
                         &rel, "take-new", &ours, &theirs, &verify_label, &flag_list(&[]),
                     ));
@@ -26923,7 +26944,9 @@ fn run_pack_merge_with(
                 // ★RULINGS BV1(BO3 의 기준선 문장 철회): 설치 매니페스트는 '출시본'의 근거가 아니므로(BO3) 전진시켜도 세탁할
                 // 것이 없다 — 등재 파일도 종전대로 기준선을 보관본으로 옮기고 닫는다(안 옮기면 매 스윕이 같은 .new 를 다시 보관).
                 advance_manifest_base(&theirs); // 이번 신버전은 '본 것'으로 — vendor 재전진 시에만 재병치
-                resolve(&mut pending, ".new");
+                if !resolve(&mut pending, ".new") {
+                            return 1;
+                        }
                 audit(&merge_audit_entry(&rel, "keep-mine", &ours, &ours, "n/a", &flag_list(&[])));
                 println!("✅ {rel} — 내 수정 유지(이번 vendor 신버전 해소)");
                 return 0;
@@ -26948,7 +26971,9 @@ fn run_pack_merge_with(
                     // ★RULINGS BO5: 살아 있는 바이트를 바꾸지 않는 병합은 등재 파일에도 허용(무변경 --keep-mine 과 같다).
                     println!("병합 결과 = 현재 내 수정본과 동일(vendor 변경이 이미 반영됨) — 해소만 수행");
                     advance_manifest_base(&theirs); // ★RULINGS BV1: 무변경 해소도 종전대로 기준선을 옮긴다.
-                    resolve(&mut pending, ".new");
+                    if !resolve(&mut pending, ".new") {
+                            return 1;
+                        }
                     0
                 }
                 // ★T2f(RULINGS BD4): 살아 있는 바이트를 바꾸는 병합 결과는 출시본이 아니다 — 등재 파일에는 쓰지 않는다.
@@ -26983,7 +27008,9 @@ fn run_pack_merge_with(
                             return 1;
                         }
                         advance_manifest_base(&theirs); // 병합본의 새 조상 = 이번 vendor 본(pristine 동반 전진)
-                        resolve(&mut pending, ".new");
+                        if !resolve(&mut pending, ".new") {
+                            return 1;
+                        }
                         println!("✅ {rel} ← 3-way 병합 적용");
                     } else {
                         println!("보류 — 원장 유지. --take-new/--keep-mine 또는 수동 편집 후 재실행");
@@ -27064,7 +27091,9 @@ fn run_pack_merge_with(
                                 }
                             }
                         }
-                        resolve(&mut pending, ".user");
+                        if !resolve(&mut pending, ".user") {
+                            return 1;
+                        }
                         // ★T4: 소비 채널 실증 경고 — local 오버레이의 실소비는 skills(shadowing)뿐
                         // (디렉티브는 .local.md·훅은 .d 채널만 실소비 — vibe-regression.sh 실증).
                         if !rel.starts_with("skills/") && sources.is_listed(&rel) {
@@ -27132,7 +27161,9 @@ fn run_pack_merge_with(
                     )
                 };
                 if confirm(&prompt) {
-                    resolve(&mut pending, ".user");
+                    if !resolve(&mut pending, ".user") {
+                            return 1;
+                        }
                     if kind == "conflicted" {
                         // 충돌 조상 사이드카 동반 정리(정리 확정 시에만 — 복권 경로는 .base 유지).
                         let _ = std::fs::remove_file(dir.join(format!("{rel}.base")));
@@ -27334,6 +27365,20 @@ fn heal_prompt_line(kind: Option<&str>, ts: Option<u64>, rel: &str) -> String {
     } else {
         format!("'{rel}' 을 vendor 본으로 복원(내 수정분은 {rel}.user 보존)?")
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// ★T2i(RULINGS FP5 m7) 시험 끼어들기: `resolve` 가 보관본을 대조하기 직전(그 사이에 다른 쓰기가 보관본을 바꾼 것을 흉내).
+    static BEFORE_RESOLVE: std::cell::RefCell<Option<Box<dyn Fn(&std::path::Path)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// ★T2i(RULINGS FP5 m7): 보관본이 이 실행이 본 것과 달라졌을 때의 거부 문장.
+fn side_changed_refusal(rel: &str, side_suffix: &str) -> String {
+    format!(
+        "⛔ '{rel}{side_suffix}' 가 이 명령이 확인한 뒤에 바뀌었습니다(다른 쓰기가 보관했거나 누가 고쳤습니다) — 그 보관본과 병합 대기 \
+         기록을 지우지 않았습니다. 바뀐 내용을 확인한 뒤 같은 명령을 다시 실행하십시오."
+    )
 }
 
 /// ★T2i(RULINGS EC2): 보관 결과의 사람용 줄 — 자리의 다른 사본을 옮긴 세대 자리 · 겹침.
@@ -42603,6 +42648,40 @@ mod tests {
         std::fs::write(td.join(&urel), "AFTER\n").unwrap();
         assert_eq!(run_pack_rollback_with(Some(urel.clone()), true, false, false, &lu), 1, "색인의 released 를 믿지 않는다");
         assert_eq!(std::fs::read_to_string(td.join(&urel)).unwrap(), "AFTER\n");
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T2i(RULINGS FP5 m7): `pack-merge` 는 보관본을 이 실행이 처음 본 그 사본일 때만 지운다 — 확인과 지우기 사이에 바뀌었으면
+    /// (다른 쓰기의 새 보관) 보관본도 원장 기록도 그대로 두고 다시 실행하라고 말한다. 바뀌지 않았으면 종전대로 정리.
+    #[test]
+    fn fp5_resolve_deletes_only_the_copy_it_saw() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, _env) = t4_system_fixture("fp5m7");
+        let src = cys::pack::UpdateSources::none().with_listed(|_| false);
+        let take = MergeFlags { yes: true, take_new: true, ..MergeFlags::default() };
+        let park = || {
+            std::fs::write(td.join(&rel), "MY LIVE COPY\n").unwrap();
+            std::fs::write(td.join(format!("{rel}.new")), &embed).unwrap();
+            t4_write_ledger(&td, &rel, serde_json::json!({"kind": "user-kept", "side": format!("{rel}.new"), "version": "x", "ts": 0}));
+        };
+        park();
+        BEFORE_RESOLVE.with(|h| {
+            *h.borrow_mut() = Some(Box::new(|side: &std::path::Path| std::fs::write(side, "A NEWER PARKED COPY\n").unwrap()))
+        });
+        let rc = run_pack_merge_with(Some(rel.clone()), take, None, &src);
+        BEFORE_RESOLVE.with(|h| *h.borrow_mut() = None);
+        assert_eq!(rc, 1, "바뀐 보관본 → 거부");
+        assert_eq!(std::fs::read_to_string(td.join(format!("{rel}.new"))).unwrap(), "A NEWER PARKED COPY\n", "바뀐 보관본은 남는다");
+        assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("user-kept"), "원장 기록도 남는다");
+        assert_eq!(
+            side_changed_refusal("bin/x.py", ".user"),
+            "⛔ 'bin/x.py.user' 가 이 명령이 확인한 뒤에 바뀌었습니다(다른 쓰기가 보관했거나 누가 고쳤습니다) — 그 보관본과 병합 대기 \
+             기록을 지우지 않았습니다. 바뀐 내용을 확인한 뒤 같은 명령을 다시 실행하십시오."
+        );
+        park();
+        assert_eq!(run_pack_merge_with(Some(rel.clone()), take, None, &src), 0, "바뀌지 않았으면 정리");
+        assert!(!td.join(format!("{rel}.new")).exists());
+        assert_eq!(t4_ledger_kind(&td, &rel), None);
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
     }
 

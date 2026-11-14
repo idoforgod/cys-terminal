@@ -4226,14 +4226,34 @@ fn windows_handle_sits_at(f: &std::fs::File, root: &Path, comps: &[&str], name: 
     Ok(())
 }
 
+/// ★T2i(RULINGS FP5 m6): 절대 경로를 verbatim(`\\?\` · UNC 는 `\\?\UNC\`) 넓은 문자열로 — 이미 붙었거나 상대 경로면 그대로 ·
+/// `/` 는 `\` 로(verbatim 경로는 정규화되지 않는다 · 구성 요소는 `rel_parts` 가 이미 정규형으로 만들었다).
+#[cfg(windows)]
+fn windows_verbatim(p: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut w: Vec<u16> = p.as_os_str().encode_wide().map(|c| if c == u16::from(b'/') { u16::from(b'\\') } else { c }).collect();
+    let bs = u16::from(b'\\');
+    let starts = |w: &[u16], s: &str| w.len() >= s.len() && w.iter().zip(s.encode_utf16()).all(|(a, b)| *a == b);
+    if !starts(&w, r"\\?\") && p.is_absolute() {
+        if starts(&w, r"\\") {
+            let rest: Vec<u16> = w[2..].to_vec();
+            w = r"\\?\UNC\".encode_utf16().chain(rest).collect();
+        } else {
+            w = r"\\?\".encode_utf16().chain(w).collect();
+        }
+    }
+    let _ = bs;
+    w.push(0);
+    w
+}
+
 /// ★T2i(RULINGS EC2 · 윈도우): `MoveFileExW` 덮지 않는 이동(`MOVEFILE_REPLACE_EXISTING` 없음 · `MOVEFILE_WRITE_THROUGH`) — 차 있으면
 /// `AlreadyExists`(ERROR_FILE_EXISTS 80 · ERROR_ALREADY_EXISTS 183).
 #[cfg(windows)]
 fn windows_move_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
-    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(std::iter::once(0)).collect() };
-    let (a, b) = (wide(from), wide(to));
+    // ★T2i(RULINGS FP5 m6): 긴 경로 — std 의 이름 바꾸기처럼 절대 경로에 `\\?\` (UNC 는 `\\?\UNC\`) 를 붙인다.
+    let (a, b) = (windows_verbatim(from), windows_verbatim(to));
     let ok = unsafe { MoveFileExW(a.as_ptr(), b.as_ptr(), MOVEFILE_WRITE_THROUGH) };
     if ok != 0 {
         return Ok(());
@@ -4439,6 +4459,26 @@ pub fn beneath_move_no_replace(root: &Path, from_rel: &str, to_rel: &str) -> std
     }
 }
 
+/// ★T2i(RULINGS FP5 m7): 보관본(`<rel>.user` · `<rel>.new`)의 정체 — 링크를 따르지 않는 메타데이터의 (장치 · 아이노드 · 크기 ·
+/// 수정 시각 · 바뀐 시각). 윈도우는 (크기 · 마지막 쓰기 · 만든 시각 · 속성). 지울 때 읽거나 확인한 그 사본인지 대조한다.
+pub fn side_identity(path: &Path) -> Option<(u64, u64, u64, i64, i64)> {
+    let m = std::fs::symlink_metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((m.dev(), m.ino(), m.size(), m.mtime() * 1_000_000_000 + m.mtime_nsec(), m.ctime() * 1_000_000_000 + m.ctime_nsec()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Some((u64::from(m.file_attributes()), 0, m.file_size(), m.last_write_time() as i64, m.creation_time() as i64))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Some((0, 0, m.len(), 0, 0))
+    }
+}
+
 /// ★T2i(RULINGS EC2): 보관 자리(`<rel>.user`)에 지금 있는 것 — 닻 내린 판독(링크 비추종 · 막히지 않음 · 일반 파일 · 상한).
 #[derive(Debug)]
 enum Occupant {
@@ -4472,16 +4512,29 @@ fn beneath_occupant(root: &Path, rel_path: &str) -> Occupant {
         };
         if fd < 0 {
             let e = std::io::Error::last_os_error();
-            return if e.raw_os_error() == Some(libc::ENOENT) {
-                Occupant::Missing
-            } else {
-                Occupant::Obstacle(e.to_string())
-            };
+            if e.raw_os_error() == Some(libc::ENOENT) {
+                return Occupant::Missing;
+            }
+            // ★T2i(RULINGS FP5 m8): 열지 못한 이유를 닻 내린 lstat 으로 가른다 — 읽을 수 없는 **일반 파일**은 '파일이 아님'이 아니라
+            //   '판독 불가 사본'(비교할 수 없으니 다른 사본으로 다뤄 세대 자리로 옮긴다 · 옮기기는 읽기 권한이 필요 없다).
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstatat(d.0, leaf_c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } == 0 {
+                return match st.st_mode & libc::S_IFMT {
+                    libc::S_IFREG => Occupant::File(None),
+                    libc::S_IFLNK => Occupant::Obstacle("링크".into()),
+                    libc::S_IFDIR => Occupant::Obstacle("폴더".into()),
+                    _ => Occupant::Obstacle(format!("특수 파일({e})")),
+                };
+            }
+            return Occupant::Obstacle(e.to_string());
         }
         let f = unsafe { std::fs::File::from_raw_fd(fd) };
         let Ok(m) = f.metadata() else { return Occupant::Obstacle("상태 확인 실패".into()) };
+        if m.is_dir() {
+            return Occupant::Obstacle("폴더".into());
+        }
         if !m.is_file() {
-            return Occupant::Obstacle("일반 파일이 아님".into());
+            return Occupant::Obstacle("특수 파일(FIFO · 장치 · 소켓)".into());
         }
         if m.len() > START_META_CAP {
             return Occupant::File(None);
@@ -5201,7 +5254,7 @@ fn park_copy_at(
             }
             Occupant::File(_) => {}
             Occupant::Obstacle(why) => {
-                return Err(format!("{user_rel} 자리에 파일이 아닌 항목이 있어 세대 보존·백업을 할 수 없습니다({why})"))
+                return Err(format!("{user_rel} 자리에 일반 파일이 아닌 항목({why})이 있어 세대 보존·백업을 할 수 없습니다"))
             }
         }
         // 마지막 시도에서도 차 있으면 그 사본은 이름에 두고(옮기지 않는다) 자기 사본을 세대 자리로.
@@ -15315,11 +15368,26 @@ mod m11_tests {
         assert!(out.overlap_record_error.as_deref().is_some_and(|e| e.contains("감사 원장")), "{out:?}");
         assert_eq!(std::fs::read_to_string(rig.pack.join(&out.at)).unwrap(), "W\n", "사본은 안전하다");
         std::fs::remove_dir_all(rig.pack.join(MERGE_AUDIT_FILE)).unwrap();
+        // ★T2i(RULINGS FP5 m8): 읽을 수 없는 일반 파일인 사본 = '판독 불가 사본' — 장애물이 아니라 세대 자리로 옮기고 새 사본을 놓는다.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            reset(&rig);
+            let up = rig.pack.join(format!("{rel}.user"));
+            std::fs::set_permissions(&up, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let out = park_copy_at(&rig.pack, rel, b"W\n", false, 400, &mut |_| {}).unwrap();
+            assert_eq!((out.at.as_str(), out.overlap, out.moved.len()), ("hooks/x.sh.user", false, 1), "{out:?}");
+            let slot = rig.pack.join(&out.moved[0]);
+            std::fs::set_permissions(&slot, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(std::fs::read_to_string(&slot).unwrap(), "U\n", "판독 불가였던 사본은 세대 자리에 그대로");
+            assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some("W\n"));
+        }
         // 파일이 아닌 자리(폴더) = 장애물 → 보관하지 않는다(호출부의 격리 갈래).
         reset(&rig);
         std::fs::remove_file(rig.pack.join(format!("{rel}.user"))).unwrap();
         std::fs::create_dir_all(rig.pack.join(format!("{rel}.user"))).unwrap();
-        assert!(park_copy_at(&rig.pack, rel, b"W\n", false, 100, &mut |_| {}).is_err());
+        let e = park_copy_at(&rig.pack, rel, b"W\n", false, 100, &mut |_| {}).unwrap_err();
+        assert!(e.contains("일반 파일이 아닌 항목(폴더)"), "{e}");
     }
 
     /// ★T2i(RULINGS EC4): 팩 동사는 이미 있는 경로를 쓰려고 열지 않는다 — 검토자의 두 순서: (a) 미리 심은 `<rel>.user.tmp-<pid>`
@@ -15471,14 +15539,18 @@ mod m11_tests {
         assert_eq!(rig.read(rel).as_deref(), Some(mine), "원장이 영속하지 않으면 바꾸지 않는다");
         assert_eq!(rig.kind(rel).as_deref(), Some("quarantined"));
         assert_eq!(rig.entry(rel).unwrap()["reason"], "ledger-write-failed");
-        // ② 보관본 쓰기의 폴더 fsync 실패 → 무변경.
+        // ② 보관본 쓰기의 폴더 fsync 실패 → 무변경. ★T2i(RULINGS FP5 m5): unix 만 — 윈도우에서는 폴더 내림이 '지원하지 않음'이라
+        //   보관본 쓰기의 주입 지점에 닿지 않는다(TW1 에서 잴 것: 윈도우의 본문 내림 · NTFS 의 이름 영속).
         let _ = std::fs::remove_file(rig.pack.join(MERGE_PENDING_FILE));
         let _ = std::fs::remove_file(rig.pack.join(format!("{rel}.user")));
-        inject(Some("inject.sh.user"));
-        rig.install(&[(rel, v1)], false, &src());
-        inject(None);
-        assert_eq!(rig.read(rel).as_deref(), Some(mine), "보관본이 영속하지 않으면 바꾸지 않는다");
-        assert_eq!(rig.entry(rel).unwrap()["reason"], "user-backup-failed");
+        #[cfg(unix)]
+        {
+            inject(Some("inject.sh.user"));
+            rig.install(&[(rel, v1)], false, &src());
+            inject(None);
+            assert_eq!(rig.read(rel).as_deref(), Some(mine), "보관본이 영속하지 않으면 바꾸지 않는다");
+            assert_eq!(rig.entry(rel).unwrap()["reason"], "user-backup-failed");
+        }
         // ③ 주입 없음 → 수렴.
         rig.install(&[(rel, v1)], false, &src());
         assert_eq!(rig.read(rel).as_deref(), Some(v1), "기동 필수 = vendor 먼저");
