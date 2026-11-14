@@ -854,10 +854,14 @@ impl PackRoots {
     }
 
     /// The rel of a LITERAL path inside this lane's pack that names a hook / script. Linear in the path.
+    /// RULINGS DD2: the operand must already be in canonical form — the normalised rel equals the operand as
+    /// written (no empty, `.` or trailing component), so the file looked up is exactly the operand the
+    /// interpreter receives (`…/javis_task.py/` and `…/javis_task.py/.` are directories to it).
     fn literal_rel(&self, path: &str, steps: &mut usize) -> Option<String> {
         *steps += path.len();
         let p = self.prefixes.iter().find(|p| path.starts_with(p.as_str()))?;
-        let rel = cys::repair::intake::normalize_rel(&path[p.len()..]).ok()?;
+        let raw = &path[p.len()..];
+        let rel = cys::repair::intake::normalize_rel(raw).ok().filter(|rel| rel == raw)?;
         is_script_rel(&rel).then_some(rel)
     }
 
@@ -924,7 +928,11 @@ fn is_script_rel(rel: &str) -> bool {
 //              two characters `~/`
 //   '…'     := single-quoted, no `'` and no control character (newline, CR, NUL, ESC …) inside
 //   "…"     := double-quoted, none of `$` backtick `\` `!` `"` and no control character inside
-// script    := a word of bare parts only: a LITERAL path in THIS lane's pack (`PackRoots`)
+// script    := a word of bare parts only: a LITERAL path in THIS lane's pack (`PackRoots`), written in
+//              canonical form — no empty, `.` or trailing component (RULINGS DD2: the operand as given)
+// words     := none of them `--`, and after a FORWARDING script (`FORWARDERS` — it executes its arguments
+//              as a command) the first one is one of that script's own verbs (RULINGS DD2: only a failure
+//              that is the script's own; a call that hands its tail to another program is a miss)
 // interpreter := python | python3 | py | bash | node | pwsh — bare, or a literal absolute path ending
 //              in one of them; its flags only from its fixed list; it runs only its own script types:
 //              `.py` ← python / python3 / py · `.sh` `.bash` ← bash · `.js` `.mjs` `.cjs` ← node ·
@@ -971,6 +979,31 @@ impl Interpreter {
     fn runs(&self, rel: &str) -> bool {
         let file = rel.rsplit('/').next().unwrap_or(rel);
         file.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && self.scripts.contains(&ext))
+    }
+}
+
+/// RULINGS DD2 — the pack's FORWARDING scripts and their OWN verbs: called with anything else as the first
+/// argument they execute their arguments as a command, so the exit is the child's — `cys-dept <dept> [--]
+/// <command>` (`exec "$@"`, `cysjavis-pack/bin/cys-dept:4111–4147`; its verbs are its `case` arms
+/// `:3571–4110`), `_owned_process.py <command…>` (argparse `REMAINDER`, `bin/_owned_process.py:639` — no verb of
+/// its own). A forwarder gets an identity only with one of its own verbs as the first argument.
+pub const FORWARDERS: &[(&str, &[&str])] = &[
+    (
+        "bin/cys-dept",
+        &["launch", "allocate", "create", "down", "down-sock", "rotate", "reap", "promote-ceo", "promote-if-pending", "list", "cwd", "sock"],
+    ),
+    ("bin/_owned_process.py", &[]),
+];
+
+/// RULINGS DD2 — the call's failure is the script's OWN: no argument word `--` (it hands the rest of the call to
+/// another program), and a forwarder only with one of its own verbs first.
+fn owns_its_failure(rel: &str, args: &[(&str, bool)]) -> bool {
+    if args.iter().any(|(t, _)| *t == "--") {
+        return false;
+    }
+    match FORWARDERS.iter().find(|(r, _)| *r == rel) {
+        Some((_, verbs)) => args.first().is_some_and(|(t, _)| verbs.contains(t)),
+        None => true,
     }
 }
 
@@ -1153,6 +1186,9 @@ fn parse_call(toks: &[Tok], roots: &PackRoots, steps: &mut usize) -> Option<Pack
     // neither — it is no pack path and no interpreter name, so the call gets no identity
     let (prog, prog_bare) = *words.first()?;
     if let Some(rel) = script(words.first(), steps) {
+        if !owns_its_failure(&rel, &words[1..]) {
+            return None; // RULINGS DD2: the tail goes to another program
+        }
         return Some(PackCall::One { rel, sub: sub(1) });
     }
     let interp = prog_bare.then(|| interpreter_of(prog)).flatten()?;
@@ -1166,6 +1202,9 @@ fn parse_call(toks: &[Tok], roots: &PackRoots, steps: &mut usize) -> Option<Pack
     let rel = script(words.get(j), steps)?;
     if !interp.runs(&rel) {
         return None; // not the script's own interpreter (RULINGS BY1): the caller's choice
+    }
+    if !owns_its_failure(&rel, words.get(j + 1..).unwrap_or(&[])) {
+        return None; // RULINGS DD2: the tail goes to another program
     }
     Some(PackCall::One { rel, sub: sub(j + 1) })
 }
@@ -1222,6 +1261,19 @@ pub fn rejected_arguments(rel: &str, error: &str) -> bool {
                 .and_then(|rest| rest.find(": error: ").map(|k| &rest[..k]))
                 .is_some_and(|between| !between.contains(':') && (between.is_empty() || between.starts_with(' ')))
         })
+}
+
+/// RULINGS DO2 (completes DD3) — the hook CLI's elision marker: the line `src/bin/cys.rs` puts between the head
+/// and the tail of a cut `error` (`HOOK_FAILURE_ERROR_ELISION`, pinned to the CLI's source by
+/// `dd3_the_cut_text_gives_the_whole_texts_signature_or_none`). A failure text that holds it — cut by the transport,
+/// or holding it by coincidence — may have lost its canonical line, so the detector gives it NO row (a stated miss;
+/// a manual `cys repair report` reads the whole text and is unaffected). No length arithmetic: no UTF-8 boundary
+/// can make a cut text look whole, and one defect never gets a second signature.
+const CLI_ELISION_MARKER: &str = "\n…\n";
+
+/// The text holds the hook CLI's elision marker (RULINGS DO2).
+fn holds_cli_elision(error: &str) -> bool {
+    error.contains(CLI_ELISION_MARKER)
 }
 
 /// A post-call event that says the call did not end well (the shapes the CLI forwards — RULINGS BE1).
@@ -1291,6 +1343,9 @@ pub fn classify(o: &ToolObservation<'_>, roots: &PackRoots, windows: bool) -> Cl
     let raw = bounded_error(o.error.unwrap_or_default());
     if rejected_arguments(&rel, &raw) {
         return Classified::NotCounted { rel }; // RULINGS CF1: the script refused the caller's arguments
+    }
+    if holds_cli_elision(o.error.unwrap_or_default()) {
+        return Classified::NotCounted { rel }; // RULINGS DO2: cut (or holding the CLI's marker) — no detector row
     }
     if let Some(reason) = detector_excluded(&rel, sub.as_deref(), &raw, windows) {
         return Classified::Excluded { reason };
@@ -1621,16 +1676,68 @@ fn detector_enabled() -> bool {
     *E.get_or_init(|| crate::alert_route::enabled_from(std::env::var(DEFECT_INTAKE_ENV).ok().as_deref()))
 }
 
-/// How the flusher is started: once per process (`once`), by `start` (RULINGS BF6 — injectable).
+/// The longest wait between two attempts to start the flusher thread (seconds — RULINGS DD5).
+pub const FLUSHER_RETRY_MAX_SECS: f64 = 300.0;
+
+/// RULINGS DD5 (J7 I6) — the flusher's start, as observed: `started` is set ONLY when the thread was created;
+/// a failed creation counts in `attempts`, keeps its message in `last_error` and is retried on a later identified
+/// failure once `next_try_mono` is reached (1 s, doubling, at most [`FLUSHER_RETRY_MAX_SECS`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FlusherState {
+    pub started: bool,
+    pub attempts: u64,
+    pub next_try_mono: f64,
+    pub last_error: Option<String>,
+}
+
+/// The process's flusher start state (one flusher thread per process).
+static FLUSHER_STATE: Mutex<FlusherState> =
+    Mutex::new(FlusherState { started: false, attempts: 0, next_try_mono: 0.0, last_error: None });
+
+/// How the flusher is started (RULINGS BF6, DD5 — injectable): its state, the start itself (Err = the thread
+/// was not created) and the current monotonic time in seconds.
 pub struct FlusherStart<'a> {
-    pub once: &'a OnceLock<()>,
-    pub start: &'a dyn Fn(),
+    pub state: &'a Mutex<FlusherState>,
+    pub start: &'a dyn Fn() -> Result<(), String>,
+    pub now: f64,
+}
+
+impl FlusherStart<'_> {
+    /// Starts the flusher unless it runs or a retry is not yet due; true when it runs after the call.
+    fn ensure(&self) -> bool {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.started {
+            return true;
+        }
+        if st.attempts > 0 && self.now < st.next_try_mono {
+            return false;
+        }
+        st.attempts += 1;
+        match (self.start)() {
+            Ok(()) => {
+                st.started = true;
+                st.last_error = None;
+                true
+            }
+            Err(e) => {
+                let exp = (st.attempts - 1).min(16) as i32;
+                st.next_try_mono = self.now + 2f64.powi(exp).min(FLUSHER_RETRY_MAX_SECS);
+                st.last_error = Some(e);
+                false
+            }
+        }
+    }
+}
+
+/// The process's monotonic seconds (the flusher start's clock).
+fn process_mono() -> f64 {
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
 }
 
 /// ① The `usage.event` arm's call — never fails the request, never panics out.
 pub fn observe_tool_event(daemon: &Arc<Daemon>, o: &ToolObservation<'_>) {
-    static FLUSHER: OnceLock<()> = OnceLock::new();
-    observe_tool_event_with(daemon, o, &FlusherStart { once: &FLUSHER, start: &start_flusher_thread });
+    observe_tool_event_with(daemon, o, &FlusherStart { state: &FLUSHER_STATE, start: &start_flusher_thread, now: process_mono() });
 }
 
 /// [`observe_tool_event`] with the flusher's start injected. The command is classified BEFORE the
@@ -1651,7 +1758,7 @@ pub fn observe_tool_event_with(daemon: &Arc<Daemon>, o: &ToolObservation<'_>, fl
             record(&mut d, c, now)
         };
         if r == Observed::Failure {
-            flusher.once.get_or_init(|| (flusher.start)());
+            flusher.ensure(); // RULINGS DD5: recorded as started only when it started; retried with a backoff
         }
     }));
 }
@@ -1675,17 +1782,11 @@ enum RowOutcome {
     Failed,
 }
 
-/// T3's per-file mutex for intake rows (`ledger_verbs::report` takes the same key in the same map):
-/// one writer per row file inside this daemon.
-fn with_row_mutex<T>(daemon: &Daemon, sig: &str, f: impl FnOnce() -> T) -> T {
-    let m = {
-        let mut map = daemon.repair_mutexes.lock().unwrap_or_else(|e| e.into_inner());
-        Arc::clone(
-            map.entry(format!("intake:{sig}"))
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        )
-    };
-    let _g = m.lock().unwrap_or_else(|e| e.into_inner());
+/// The row lock of one intake row (RULINGS DO3 / DD4 / DA3): the SAME bounded lock set as `repair.report`
+/// — `repair::intake_lock_for(signature)`, one of `INTAKE_LOCK_SHARDS` (16) process-wide mutexes chosen by
+/// the signature. One writer per row file across both intake sources; no state per signature anywhere.
+fn with_row_mutex<T>(sig: &str, f: impl FnOnce() -> T) -> T {
+    let _row_lock = crate::repair::intake_lock_for(sig);
     f()
 }
 
@@ -1709,12 +1810,12 @@ pub fn flush_defect_intake(daemon: &Arc<Daemon>, root: &std::path::Path, cfg: &A
     };
     for row in due {
         let path = row_path_in(root, &lane, &row.signature);
-        let outcome = with_row_mutex(daemon, &row.signature, || {
+        let outcome = with_row_mutex(&row.signature, || {
             let existing = match load_row(&path) {
                 Ok(x) => x,
                 Err(_) => return RowOutcome::Corrupt,
             };
-            let new_row = existing.is_none();
+            let new_row = existing.is_none(); #[cfg(test)] defect_intake_tests::row_section_hook(&row.signature);
             let verdict = intake
                 .share
                 .lock()
@@ -1788,6 +1889,11 @@ pub fn flush_defect_intake(daemon: &Arc<Daemon>, root: &std::path::Path, cfg: &A
     rep
 }
 
+/// RULINGS DD5 — the flusher's start state as data (the snapshot and the daemon log line).
+fn flusher_state_json(st: &FlusherState) -> Value {
+    json!({"started": st.started, "attempts": st.attempts, "last_error": st.last_error})
+}
+
 /// The detector's and the share's counters (the daemon log line; tests).
 pub fn defect_intake_snapshot(daemon: &Arc<Daemon>, mono: f64) -> Value {
     let intake = intake_for(daemon);
@@ -1807,6 +1913,7 @@ pub fn defect_intake_snapshot(daemon: &Arc<Daemon>, mono: f64) -> Value {
         "corrupt_rows": c.corrupt_rows, "write_failed": c.write_failed,
         "tracked_rels": tracked.0, "tracked_signatures": tracked.1, "pending_signatures": tracked.2,
         "share": share,
+        "flusher": flusher_state_json(&FLUSHER_STATE.lock().unwrap_or_else(|e| e.into_inner())),
     })
 }
 
@@ -1878,7 +1985,7 @@ fn log_flush(daemon: &Arc<Daemon>, rep: &FlushReport, mono: f64) -> bool {
 /// The production start of the flusher thread (`cysd-defect-intake`): a loop of [`flusher_pass`] every
 /// [`FLUSH_TICK_SECS`]. Started lazily by the first identified failure — the daemon's start order is
 /// untouched. In this binary's tests it starts nothing (they drive [`flusher_pass`] directly).
-fn start_flusher_thread() {
+fn start_flusher_thread() -> Result<(), String> {
     #[cfg(not(test))]
     {
         let spawned = std::thread::Builder::new()
@@ -1888,9 +1995,11 @@ fn start_flusher_thread() {
                 let _ = flusher_pass(&registered_lanes, &AlertConfig::load, &intake_root);
             });
         if let Err(e) = spawned {
-            eprintln!("[cysd] defect-intake: flusher thread not started ({e}) — rows are not written");
+            eprintln!("[cysd] defect-intake: flusher thread not started ({e}) — rows are not written until a later attempt starts it");
+            return Err(e.to_string());
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2297,7 +2406,7 @@ mod defect_intake_tests {
         ("/Users/x/.cys/pack/bin/x.cjs", "bin/x.cjs", Some("cjs")),
         ("~/.cys/pack/bin/x.ps1", "bin/x.ps1", Some("ps1")),
         ("/Users/x/.cys/pack/hooks/h.ps1", "hooks/h.ps1", Some("ps1")),
-        ("~/.cys/pack/bin/cys-dept", "bin/cys-dept", None),
+        ("~/.cys/pack/bin/cys-helper", "bin/cys-helper", None),
         ("/Users/x/.cys/pack/bin/tool", "bin/tool", None),
     ];
 
@@ -2483,6 +2592,9 @@ mod defect_intake_tests {
                 "node ~/.cys/pack/bin/a.py".to_string(),
                 "python3 ~/.cys/pack/hooks/x.sh".to_string(),
                 "bash ~/.cys/pack/bin/cys-dept".to_string(),
+                // RULINGS DD2 — the J7 verdict's two sequences, verbatim
+                "python3 ~/.cys/pack/bin/javis_task.py/".to_string(),
+                "~/.cys/pack/bin/cys-dept dept-1 -- /usr/bin/false".to_string(),
             ]
             .into_iter(),
         );
@@ -2503,7 +2615,7 @@ mod defect_intake_tests {
             assert_eq!(pack_call(&bash(c), &base()), PackCall::None, "outside the grammar but identified: {c:?}");
             assert_eq!(classify(&pre(&bash(c)), &base(), false), Classified::Ignored { failure: false }, "counted as a call: {c:?}");
         }
-        assert_eq!(negatives.len(), 22 + 65 + 26 + 1);
+        assert_eq!(negatives.len(), 22 + 67 + 26 + 1);
     }
 
     /// RULINGS CC2 — the named script must be a REAL file of this lane's pack when the call is
@@ -2526,7 +2638,7 @@ mod defect_intake_tests {
         let x = bash("python3 ~/.cys/pack/bin/javis_x.py check");
         assert_eq!(pack_call(&x, &roots), one("bin/javis_x.py", Some("check")));
         assert_eq!(pack_call(&bash(&format!("python3 {p}/bin/javis_x.py check")), &roots), one("bin/javis_x.py", Some("check")));
-        assert_eq!(pack_call(&bash(&format!("{p}/bin/cys-dept status")), &roots), one("bin/cys-dept", Some("status")));
+        assert_eq!(pack_call(&bash(&format!("{p}/bin/cys-dept list")), &roots), one("bin/cys-dept", Some("list")));
         assert_eq!(pack_call(&bash("bash ~/.cys/pack/hooks/guard.sh"), &roots), one("hooks/guard.sh", None));
         assert_eq!(classify(&pre(&x), &roots, false), Classified::Call { rel: "bin/javis_x.py".into() });
         assert!(matches!(classify(&fail(&x, Some("Exit code 1\nKeyError: 'k'")), &roots, false), Classified::Failure { .. }));
@@ -2558,6 +2670,364 @@ mod defect_intake_tests {
         assert_eq!(pack_call(&x, &roots), PackCall::None);
         assert_eq!(classify(&pre(&x), &roots, false), Classified::Ignored { failure: false });
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// RULINGS DD2 (J7 I1, I2) — an identity only for the operand AS GIVEN, and never for a command that hands its
+    /// tail to another program: the verdict's two sequences verbatim (`python3 <pack>/bin/javis_task.py/`,
+    /// `<pack>/bin/cys-dept dept-1 -- /usr/bin/false`), the `/.` spelling, other non-canonical spellings, a `--`
+    /// passthrough of any script, `cys-dept <dept> <command>` without `--`, the pack's other forwarder; each also
+    /// with the production `PackRoots::new` on a temp pack where every named file EXISTS. Still identified:
+    /// `cys-dept`'s own verbs and the canonical operand.
+    #[test]
+    fn dd2_an_identity_only_for_the_operand_as_given_and_never_for_a_forwarded_command() {
+        let home = tmp_root("dd2");
+        let pack = home.join(".cys").join("pack");
+        for rel in ["bin/javis_task.py", "bin/cys-dept", "bin/javis_x.py", "bin/_owned_process.py"] {
+            let f = pack.join(rel);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, b"#\n").unwrap();
+        }
+        let roots = PackRoots::new(Some(&pack.to_string_lossy()), Some(&home.to_string_lossy()));
+        let p = pack.to_string_lossy().to_string();
+        let negatives = [
+            // the verdict's two sequences, verbatim
+            format!("python3 {p}/bin/javis_task.py/"),
+            format!("{p}/bin/cys-dept dept-1 -- /usr/bin/false"),
+            // directory-forcing and other non-canonical spellings of an existing script
+            format!("python3 {p}/bin/javis_task.py/."),
+            "python3 ~/.cys/pack/bin/javis_task.py/".to_string(),
+            format!("python3 {p}/bin//javis_x.py"),
+            format!("python3 {p}/bin/./javis_x.py"),
+            // a command that hands its tail to another program
+            format!("{p}/bin/cys-dept dept-1 /usr/bin/false"),
+            format!("~/.cys/pack/bin/cys-dept dept-1 -- python3 {p}/bin/javis_x.py"),
+            format!("python3 {p}/bin/javis_x.py run -- x"),
+            format!("python3 {p}/bin/javis_x.py run '--'"),
+            format!("python3 {p}/bin/_owned_process.py --budget 5 /usr/bin/false"),
+        ];
+        for c in &negatives {
+            let input = bash(c);
+            assert_eq!(pack_call(&input, &roots), PackCall::None, "identified: {c:?}");
+            assert_eq!(classify(&pre(&input), &roots, false), Classified::Ignored { failure: false }, "counted as a call: {c:?}");
+            assert_eq!(classify(&fail(&input, Some("Exit code 1\nE: x")), &roots, false), Classified::Ignored { failure: true }, "{c:?}");
+        }
+        // with the fictional base lane (scripts taken as present) the spelling alone refuses
+        for c in ["python3 ~/.cys/pack/bin/javis_task.py/", "python3 ~/.cys/pack/bin/javis_task.py/.", "~/.cys/pack/bin/cys-dept dept-1 -- /usr/bin/false", "~/.cys/pack/bin/cys-dept dept-1 /usr/bin/false"] {
+            assert_eq!(pack_call(&bash(c), &base()), PackCall::None, "identified: {c:?}");
+        }
+        // still identified: the wrapper's own verbs, the canonical operand
+        assert_eq!(pack_call(&bash(&format!("{p}/bin/cys-dept list")), &roots), one("bin/cys-dept", Some("list")));
+        assert_eq!(pack_call(&bash("~/.cys/pack/bin/cys-dept create team-x"), &roots), one("bin/cys-dept", Some("create")));
+        assert_eq!(pack_call(&bash(&format!("python3 {p}/bin/javis_task.py checkout 7")), &roots), one("bin/javis_task.py", Some("checkout")));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// RULINGS DO2 / DD3 (J7 I3, T3e round-2 I2) — one signature per defect from both intake sources: the hook CLI
+    /// forwards a failure text longer than 10 KiB as its head + "\n…\n" + its tail (`bounded_hook_error` — the copy
+    /// below is checked line for line against `src/bin/cys.rs`, with its constants, its marker and the line that
+    /// applies it to `error`); the manual report reads the whole text. A text holding the marker — every cut text,
+    /// the verdict's two-boundary UTF-8 case (2,045 head + 5 + 8,189 tail = 10,239 bytes, i.e. NOT longer than 10 KiB),
+    /// the reviewer's first sequence, a text holding the marker by coincidence — gets NO detector row; a whole text
+    /// gets the manual report's signature.
+    #[test]
+    fn dd3_the_cut_text_gives_the_whole_texts_signature_or_none() {
+        const HOOK_FAILURE_ERROR_HEAD_BYTES: usize = 2 * 1024;
+        const HOOK_FAILURE_ERROR_TAIL_BYTES: usize = 8 * 1024;
+        const HOOK_FAILURE_ERROR_ELISION: &str = "\n…\n";
+        fn bounded_hook_error(e: &str) -> String {
+            if e.len() <= HOOK_FAILURE_ERROR_HEAD_BYTES + HOOK_FAILURE_ERROR_TAIL_BYTES {
+                return e.to_string();
+            }
+            let mut head_end = HOOK_FAILURE_ERROR_HEAD_BYTES;
+            while !e.is_char_boundary(head_end) {
+                head_end -= 1;
+            }
+            let mut tail_start = e.len() - HOOK_FAILURE_ERROR_TAIL_BYTES;
+            while !e.is_char_boundary(tail_start) {
+                tail_start += 1;
+            }
+            format!("{}{HOOK_FAILURE_ERROR_ELISION}{}", &e[..head_end], &e[tail_start..])
+        }
+        // the copy IS the CLI's conversion: its function, constants, marker and its use on `error`, line for line
+        let cli = include_str!("../cys.rs");
+        let me = include_str!("alerts.rs");
+        let func = |src: &str, end: &str| -> String {
+            let from = src.find("fn bounded_hook_error(e: &str) -> String {").expect("bounded_hook_error");
+            let body = &src[from..];
+            body[..body.find(end).expect("end of bounded_hook_error")].lines().map(str::trim).collect::<Vec<_>>().join("\n")
+        };
+        assert_eq!(func(me, "\n        }\n"), func(cli, "\n}\n"), "the hook CLI's cut changed — this test's copy no longer matches");
+        for pin in [
+            "const HOOK_FAILURE_ERROR_HEAD_BYTES: usize = 2 * 1024;",
+            "const HOOK_FAILURE_ERROR_TAIL_BYTES: usize = 8 * 1024;",
+            "const HOOK_FAILURE_ERROR_ELISION: &str = \"\\n…\\n\";",
+            "p[\"error\"] = json!(bounded_hook_error(e));",
+        ] {
+            assert!(cli.contains(pin), "the hook CLI's forwarding of `error` changed: {pin}");
+        }
+        assert_eq!(CLI_ELISION_MARKER, HOOK_FAILURE_ERROR_ELISION, "the detector's marker is not the CLI's");
+        let x = bash("python3 ~/.cys/pack/bin/javis_x.py run");
+        let frames = |n: usize| -> String {
+            (0..n).map(|i| format!("  File \"/Users/x/.cys/pack/bin/javis_x.py\", line {i}, in step\n    run_step({i})\n")).collect()
+        };
+        let output = |n: usize| -> String { (0..n).map(|i| format!("step {i:04} ok\n")).collect() };
+        let no_row = |text: &str, why: &str| {
+            assert!(matches!(classify(&fail(&x, Some(text)), &base(), false), Classified::NotCounted { .. }), "{why}: a detector row");
+        };
+        // ① the verdict's two-boundary UTF-8 case: a 4-byte char from byte 2,045, the header in the omitted middle,
+        //   another 4-byte char at len − 8,193, an ending KeyError
+        let head = format!("Exit code 1\nloading config\n{}", "a".repeat(2045 - "Exit code 1\nloading config\n".len()));
+        let middle = format!("𝄞\n{}Traceback (most recent call last):\n{}", output(200), frames(60));
+        let end = "KeyError: 'k'";
+        let mut tail = String::new();
+        while tail.len() + 64 < 8189 - end.len() {
+            tail.push_str("  File \"/x/javis_x.py\", line 9, in f\n");
+        }
+        tail.push_str(&" ".repeat(8189 - end.len() - tail.len() - 1));
+        tail.push('\n');
+        tail.push_str(end);
+        assert_eq!(tail.len(), 8189);
+        let raw = format!("{head}{middle}𝄞{tail}");
+        assert!(raw.len() < 32 * 1024);
+        assert_eq!((head.len(), raw.len() - 8193), (2045, raw.find('𝄞').map(|_| raw.rfind('𝄞').unwrap()).unwrap()));
+        let cut = bounded_hook_error(&raw);
+        assert_eq!(cut.len(), 2045 + 5 + 8189, "the verdict's arithmetic");
+        assert!(cut.len() <= 10 * 1024 && !cut.contains("Traceback (most recent call last)"), "precondition: looks whole by length, header gone");
+        assert_eq!(intake::parse_report("bin/javis_x.py", &raw).unwrap().first_line, end);
+        no_row(&cut, "the two-boundary UTF-8 cut");
+        // ② the reviewer's first sequence and every other cut text
+        let mut texts = vec![format!("Exit code 1\nloading config\n{}Traceback (most recent call last):\n{}KeyError: 'k'", output(230), frames(130))];
+        for (pre_lines, frames_n, post) in [(0, 2, ""), (230, 130, ""), (40, 130, ""), (230, 2, ""), (900, 2, ""), (900, 0, ""), (10, 5, "\n  trailing indented"), (900, 130, "\nValueError: second"), (900, 20, "")] {
+            let tb = if frames_n == 0 { String::new() } else { format!("Traceback (most recent call last):\n{}KeyError: 'k{frames_n}'", frames(frames_n)) };
+            texts.push(format!("Exit code 1\nloading config\n{}{tb}{post}", output(pre_lines)));
+            texts.push(format!("Exit code 1\n{}\n{tb}{post}", "w".repeat(3000)));
+        }
+        let (mut whole, mut cut_n) = (0, 0);
+        for t in &texts {
+            let forwarded = bounded_hook_error(t);
+            if forwarded.contains(HOOK_FAILURE_ERROR_ELISION) {
+                // (was, DD3: a cut text whose traceback ends in the tail kept its row — RULINGS DO2: no cut text gets one)
+                no_row(&forwarded, "a cut text");
+                cut_n += 1;
+            } else {
+                let manual = intake::parse_report("bin/javis_x.py", t).unwrap();
+                match classify(&fail(&x, Some(&forwarded)), &base(), false) {
+                    Classified::Failure { report } => assert_eq!(report.signature, manual.signature, "two signatures for one failure"),
+                    other => panic!("a whole text lost its row: {other:?}"),
+                }
+                whole += 1;
+            }
+        }
+        // ③ a short whole text → the same signature as `repair.report`; ④ the marker by coincidence → no row
+        let short = format!("Exit code 1\nloading config\n{}Traceback (most recent call last):\n{}KeyError: 'k'", output(10), frames(5));
+        assert_eq!(bounded_hook_error(&short), short);
+        match classify(&fail(&x, Some(&short)), &base(), false) {
+            Classified::Failure { report } => assert_eq!(report.signature, intake::parse_report("bin/javis_x.py", &short).unwrap().signature),
+            other => panic!("{other:?}"),
+        }
+        no_row("Exit code 1\nprinted an ellipsis\n…\nKeyError: 'k'", "the marker by coincidence");
+        eprintln!("[t3e-dd3] {} texts: {whole} whole (same signature), {cut_n} cut (no row) + the two-boundary UTF-8 case", texts.len());
+    }
+
+    /// RULINGS FE1 / FF2 — the test seam INSIDE the detector's row critical section. `flush_defect_intake` calls it from
+    /// ONE `#[cfg(test)]` statement appended to the line right after the row's read (`let new_row =
+    /// existing.is_none();`), before the quota decision and the write: it runs on the detector's own thread while the
+    /// row lock must be held. It acts only on a thread where a test installed a probe (thread-local) — no other test,
+    /// and no other thread, sees it; the product never compiles it.
+    pub(super) fn row_section_hook(sig: &str) {
+        ROW_PROBE.with(|p| {
+            if let Some(probe) = p.borrow().as_ref() {
+                probe(sig);
+            }
+        });
+    }
+
+    thread_local! {
+        static ROW_PROBE: std::cell::RefCell<Option<Box<dyn Fn(&str)>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// One cycle of the two-writer regression (RULINGS EZ, FE1, FE2) — NO clock, NO effect polling. Two fresh
+    /// signatures of one qualifying script on different lock shards; the contended row exists (count 1, written by
+    /// the manual report's own writer `intake::record_in`). The detector's flush runs on its own thread with the probe
+    /// installed there; inside each row section the probe records whether the shared lock of THAT signature is held
+    /// (`repair::intake_lock_is_held`, a try on the same mutex) and what the row holds, then waits for the test's go.
+    /// While the detector waits inside the FREE row's section, a reporter thread really updates the contended row with
+    /// `record_in` under `intake_lock_for` and releases; then the detector goes on to the contended row.
+    /// (a) inside both of the detector's sections the lock of the same signature is HELD — a missing lock, a wrong
+    /// lock and a guard dropped early fail here; (b) the detector read the reporter's update (2) and the row ends at
+    /// 1 + 1 + 5 = 7 — both increments preserved. Failure-aware (FE2): every wait ends with a failure if a worker dies
+    /// (channels whose only sender is the worker's thread-local probe close; workers are joined).
+    fn two_writer_cycle(daemon: &Arc<Daemon>, root: &std::path::Path, cycle: usize) {
+        use std::hash::{Hash, Hasher};
+        let lane = LaneKey::of_socket(&daemon.socket_path);
+        let x = bash("python3 ~/.cys/pack/bin/javis_x.py run");
+        let report_of = |t: &str| intake::parse_report("bin/javis_x.py", t).unwrap();
+        let shard_of = |sig: &str| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            sig.hash(&mut h);
+            (h.finish() % crate::repair::INTAKE_LOCK_SHARDS as u64) as usize
+        };
+        let texts: Vec<String> = (0..64).map(|i| format!("Exit code 1\nC{cycle}-E{i}: x")).collect();
+        let a = texts[0].clone();
+        let b = texts.iter().find(|t| shard_of(&report_of(t).signature) != shard_of(&report_of(&a).signature)).expect("a second shard").clone();
+        let (free, contended) = if report_of(&a).signature < report_of(&b).signature { (a, b) } else { (b, a) };
+        let (free_rep, cont_rep) = (report_of(&free), report_of(&contended));
+        let cont_path = intake::row_path_in(root, &lane, &cont_rep.signature);
+        assert!(matches!(intake::record_in(root, &lane, &cont_rep, "worker", 100.0, 0, false, &contended).unwrap(), intake::Recorded::New(_)));
+        for t in [&free, &contended] {
+            for _ in 0..5 {
+                observe_tool_event(daemon, &pre(&x));
+                observe_tool_event(daemon, &fail(&x, Some(t.as_str())));
+            }
+        }
+        // the detector, with the in-section probe on ITS thread
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel::<(String, bool, Option<u64>)>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (d, f_root, p_root, p_lane) = (Arc::clone(daemon), root.to_path_buf(), root.to_path_buf(), lane.clone());
+        let flusher = std::thread::spawn(move || {
+            ROW_PROBE.with(|p| {
+                *p.borrow_mut() = Some(Box::new(move |sig: &str| {
+                    let held = crate::repair::intake_lock_is_held(sig);
+                    let count = intake::load_row(&intake::row_path_in(&p_root, &p_lane, sig)).ok().flatten().map(|r| r.count);
+                    if probe_tx.send((sig.to_string(), held, count)).is_ok() {
+                        let _ = go_rx.recv(); // the test's go (Err: the test is gone — go on, never hang)
+                    }
+                }));
+            });
+            flush_defect_intake(&d, &f_root, &AlertConfig::default(), crate::alert_route::Now::at(10.0 + cycle as f64))
+        });
+        // ① the detector is inside the FREE row's section and waits there
+        let first = match probe_rx.recv() {
+            Ok(m) => m,
+            Err(_) => panic!("cycle {cycle}: the flush ended before its first row section: {:?}", flusher.join().map(|r| format!("{r:?}"))),
+        };
+        // (#106) decide on the first probe BEFORE a reporter exists: a detector inside the free row's section without
+        // that row's lock — or holding the contended row's lock there — fails now, so no reporter can block on a
+        // shard the waiting detector holds (the go-channel is closed first, so the detector never waits for ever)
+        let early = if first.0 != free_rep.signature || !first.1 {
+            Some(format!("cycle {cycle}: the detector was inside the free row's section WITHOUT that row's lock ({first:?})"))
+        } else if crate::repair::intake_lock_is_held(&cont_rep.signature) {
+            Some(format!("cycle {cycle}: the detector held the contended row's lock inside the free row's section"))
+        } else {
+            None
+        };
+        if let Some(why) = early {
+            drop(go_tx);
+            let _ = flusher.join();
+            panic!("{why}");
+        }
+        // ② meanwhile the reporter really updates the contended row under the shared lock, and releases it
+        let (r_root, r_lane, r_rep, r_raw, r_path) = (root.to_path_buf(), lane.clone(), cont_rep.clone(), contended.clone(), cont_path.clone());
+        let reporter = std::thread::spawn(move || {
+            let _row_lock = crate::repair::intake_lock_for(&r_rep.signature);
+            intake::record_in(&r_root, &r_lane, &r_rep, "worker", 200.0, 0, false, &r_raw).unwrap();
+            intake::load_row(&r_path).unwrap().map(|r| r.count)
+        });
+        let reporter_count = reporter.join().unwrap_or_else(|_| panic!("cycle {cycle}: the reporter failed"));
+        // ③ the detector goes on to the contended row and is probed inside that section too
+        let _ = go_tx.send(());
+        let second = match probe_rx.recv() {
+            Ok(m) => m,
+            Err(_) => panic!("cycle {cycle}: the flush ended before the contended row's section: {:?}", flusher.join().map(|r| format!("{r:?}"))),
+        };
+        let _ = go_tx.send(());
+        drop(go_tx);
+        let rep = flusher.join().unwrap_or_else(|_| panic!("cycle {cycle}: the flush failed"));
+        let row = intake::load_row(&cont_path).unwrap().expect("the contended row");
+        assert_eq!(reporter_count, Some(2), "cycle {cycle}: the reporter's update");
+        // (a) exclusion, seen from INSIDE the detector's critical sections
+        assert_eq!((first.0.as_str(), first.1), (free_rep.signature.as_str(), true), "cycle {cycle}: the detector was inside the free row's section WITHOUT that row's lock");
+        assert_eq!((second.0.as_str(), second.1), (cont_rep.signature.as_str(), true), "cycle {cycle}: the detector was inside the contended row's section WITHOUT that row's lock");
+        // (b) both increments preserved
+        assert_eq!(second.2, Some(2), "cycle {cycle}: the detector read the row without the reporter's update");
+        assert_eq!(row.count, 7, "cycle {cycle}: an increment was lost — 1 + 1 (reporter) + 5 (detector) ({rep:?})");
+        assert!(row.reporters.iter().any(|r| r == "worker") && row.reporters.iter().any(|r| r == DETECTOR_REPORTER));
+        assert_eq!((rep.written_new, rep.updated), (1, 1), "cycle {cycle}: {rep:?}");
+    }
+
+    /// RULINGS FE1 / FF2 / EZ / DO3 / DD4 (J7 I5, T3e round-2 I3, round-3) — ONE bounded lock set for both intake
+    /// writers, proved from inside the detector's critical section (`two_writer_cycle`, 3 cycles with fresh
+    /// signatures); no per-signature lock state is left; the set stays 16; the seam sits between the row's read and
+    /// its write; the detector's lock is the report verb's set, chosen as this test chooses the shards.
+    #[test]
+    fn dd4_the_detector_retains_no_lock_per_signature() {
+        let daemon = crate::team_gate_tests::tmp_daemon("t3e-dd4", false);
+        let root = tmp_root("dd4");
+        for cycle in 0..3 {
+            two_writer_cycle(&daemon, &root, cycle);
+            let retained = daemon.repair_mutexes.lock().unwrap().keys().filter(|k| k.starts_with("intake:")).count();
+            assert_eq!(retained, 0, "cycle {cycle}: per-signature lock state retained");
+        }
+        assert_eq!(crate::repair::INTAKE_LOCK_SHARDS, 16);
+        let src = include_str!("alerts.rs");
+        let flush = src.split("pub fn flush_defect_intake(").nth(1).expect("flush_defect_intake");
+        let flush = &flush[..flush.find("\n}\n").expect("end")];
+        let (read, seam, write) = (
+            flush.find("load_row(&path)").expect("the row's read"),
+            flush.find("let new_row = existing.is_none(); #[cfg(test)] defect_intake_tests::row_section_hook(&row.signature);").expect("the seam"),
+            flush.find("cys::atomic_write_json(&path, &out)").expect("the row's write"),
+        );
+        assert!(read < seam && seam < write, "the seam is not between the row's read and its write");
+        let wrm = src.split("fn with_row_mutex<").nth(1).expect("with_row_mutex");
+        assert!(wrm[..wrm.find("\n}\n").expect("end")].contains("crate::repair::intake_lock_for(sig)"), "the detector left the bounded lock set");
+        let repair = include_str!("repair.rs");
+        for pin in ["super::intake_lock_for(&rep.signature)", "signature.hash(&mut h);", "h.finish() % INTAKE_LOCK_SHARDS as u64"] {
+            assert!(repair.contains(pin), "repair.rs changed: {pin}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RULINGS DD5 (J7 I6) — the flusher's start is recorded only when it started: an injected failed start
+    /// (the thread was not created) is observable (`attempts`, `last_error`), is NOT retried inside its backoff,
+    /// IS retried on a later identified failure once the backoff passed, and succeeds — only then `started`;
+    /// later failures start nothing more. The backoff doubles and is bounded by `FLUSHER_RETRY_MAX_SECS`.
+    #[test]
+    fn dd5_a_failed_flusher_start_is_retried() {
+        let daemon = crate::team_gate_tests::tmp_daemon("t3e-dd5", false);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let state = Mutex::new(FlusherState::default());
+        let start = || -> Result<(), String> {
+            match calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Err("Resource temporarily unavailable (os error 35)".into()),
+                _ => Ok(()),
+            }
+        };
+        let at = |now: f64| FlusherStart { state: &state, start: &start, now };
+        let x = bash("python3 ~/.cys/pack/bin/a.py");
+        let failure = |now: f64| {
+            observe_tool_event_with(&daemon, &pre(&x), &at(now));
+            observe_tool_event_with(&daemon, &fail(&x, Some("Exit code 1\nE: a")), &at(now));
+        };
+        failure(100.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        {
+            let st = state.lock().unwrap();
+            assert_eq!((st.started, st.attempts, st.next_try_mono), (false, 1, 101.0), "a failed start was latched: {st:?}");
+            assert!(st.last_error.as_deref().is_some_and(|e| e.contains("os error 35")));
+            assert_eq!(flusher_state_json(&st)["attempts"], 1, "the failed start is not observable");
+        }
+        failure(100.5);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "retried inside the backoff");
+        failure(101.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "a failed start was latched as started — no retry");
+        assert_eq!(*state.lock().unwrap(), FlusherState { started: true, attempts: 2, next_try_mono: 101.0, last_error: None });
+        failure(500.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "a running flusher was started again");
+        // the backoff doubles and is bounded
+        let st2 = Mutex::new(FlusherState::default());
+        let never = || -> Result<(), String> { Err("no thread".into()) };
+        let mut now = 0.0;
+        let mut delays = Vec::new();
+        for _ in 0..12 {
+            let f = FlusherStart { state: &st2, start: &never, now };
+            assert!(!f.ensure());
+            let next = st2.lock().unwrap().next_try_mono;
+            delays.push(next - now);
+            now = next;
+        }
+        assert_eq!(&delays[..10], &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, FLUSHER_RETRY_MAX_SECS]);
+        assert!(delays.iter().all(|d| *d <= FLUSHER_RETRY_MAX_SECS));
+        assert_eq!(st2.lock().unwrap().attempts, 12);
     }
 
     /// RULINGS BY1 — the interpreter must be the script's own: every interpreter head (bare, with its
@@ -2726,7 +3196,11 @@ mod defect_intake_tests {
                 return None;
             }
             let p = prefixes.iter().find(|p| w.0.starts_with(p.as_str()))?;
-            let rel = cys::repair::intake::normalize_rel(&w.0[p.len()..]).ok()?;
+            let raw = &w.0[p.len()..];
+            let rel = cys::repair::intake::normalize_rel(raw).ok()?;
+            if rel != raw {
+                return None; // DD2: the operand as given
+            }
             let file = rel.rsplit('/').next()?;
             let ok = match file.rsplit_once('.') {
                 Some((stem, ext)) => !stem.is_empty() && ["py", "sh", "bash", "js", "mjs", "cjs", "ps1"].contains(&ext),
@@ -2735,9 +3209,15 @@ mod defect_intake_tests {
             ok.then_some(rel)
         };
         let sub = |j: usize| words.get(j).filter(|w| !w.0.is_empty() && !w.0.starts_with('-')).map(|w| w.0.chars().take(64).collect::<String>());
+        // DD2: no `--` among the script's arguments; a forwarder only with one of its own verbs first
+        let owned = |rel: &str, from: usize| -> bool {
+            let args = words.get(from..).unwrap_or(&[]);
+            !args.iter().any(|w| w.0 == "--")
+                && FORWARDERS.iter().find(|(r, _)| *r == rel).is_none_or(|(_, verbs)| args.first().is_some_and(|w| verbs.contains(&w.0.as_str())))
+        };
         let prog = words.get(i)?;
         if let Some(rel) = script_rel(prog) {
-            return Some((rel, sub(i + 1)));
+            return owned(&rel, i + 1).then(|| (rel.clone(), sub(i + 1)));
         }
         if !prog.1 {
             return None;
@@ -2753,7 +3233,7 @@ mod defect_intake_tests {
         }
         let rel = script_rel(words.get(j)?)?;
         let ext = rel.rsplit('/').next()?.rsplit_once('.').map(|(_, e)| e);
-        if !own(name, ext) {
+        if !own(name, ext) || !owned(&rel, j + 1) {
             return None;
         }
         Some((rel, sub(j + 1)))
@@ -2794,6 +3274,7 @@ mod defect_intake_tests {
             "$CYS_PACK_DIR/bin/a.py", "A=1", "B='x y'", "C=\"z\"", "'quoted arg'", "\"dq arg\"", "arg", "--flag=v", "2>&1",
             ">/dev/null", ">", "/dev/null", "2>/dev/null", "&>/dev/null", "1>/dev/null", "check", "日本", "é", "~/x", "=x",
             "'tab\there'", "\"nl\nhere\"", "UID=0", "PATH=/x", "~/.cys/pack/bin/x.js", "~/.cys/pack/bin/x.ps1",
+            "--", "list", "create", "~/.cys/pack/bin/a.py/", "~/.cys/pack/bin/./a.py",
         ];
         let assigns = ["", "", "", "", "", "A=1", "UID=0", "B='x y'", "PATH=/x", "1A=x", "A=$x"];
         let heads = ["", "", "python3", "python3 -u -B", "/usr/bin/python3", "bash", "bash -x", "zsh -f", "node", "node --no-warnings", "pwsh -NoProfile", "py -u", "py -3", "py -u -3", "python3 -c", "sh", "sh -s", "env"];
@@ -2801,7 +3282,7 @@ mod defect_intake_tests {
             "~/.cys/pack/bin/a.py", "/Users/x/.cys/pack/bin/javis_x.py", "/Users/x/.cys/pack/hooks/g.sh", "~/.cys/pack/bin/b.bash",
             "~/.cys/pack/bin/x.js", "/Users/x/.cys/pack/bin/x.mjs", "~/.cys/pack/bin/x.ps1", "~/.cys/pack/bin/cys-dept",
             "~/.cys/pack-dept-a/bin/a.py", "/tmp/x.py", "$CYS_PACK_DIR/bin/a.py", "\"~/.cys/pack/bin/a.py\"",
-            "~/.cys/pack/bin/gone.py",
+            "~/.cys/pack/bin/gone.py", "~/.cys/pack/bin/a.py/", "/Users/x/.cys/pack/bin//javis_x.py",
         ];
         let redirs = ["", "", "2>&1", ">/dev/null", "> /dev/null", "2>/dev/null", "&>/dev/null", ">&2", "> out"];
         let seps = [" ", " ", "\t", "  "];
@@ -3380,13 +3861,16 @@ mod defect_intake_tests {
             "fn withdraw_call(",
             "fn bounded_error(",
             "pub fn rejected_arguments(",
+            "fn holds_cli_elision(",
+            "fn owns_its_failure(",
+            "fn ensure(",
         ] {
             let b = body(head);
             for n in io.iter().chain(send.iter()) {
                 assert!(!b.contains(n), "{head} reaches `{n}` — the hook path must stay memory-only");
             }
         }
-        assert!(body("pub fn observe_tool_event_with(").contains("flusher.once.get_or_init("), "the flusher must start once, through the injected hook");
+        assert!(body("pub fn observe_tool_event_with(").contains("flusher.ensure()"), "the flusher must start through the injected hook (RULINGS DD5)");
         // RULINGS CC2: the hook path's ONLY file-system access is ONE lstat of the named script
         let fsb = body("fn is_pack_file(");
         assert_eq!(fsb.matches("std::fs::").count(), 1, "is_pack_file does more than one file-system call");
@@ -3398,9 +3882,13 @@ mod defect_intake_tests {
                 assert!(!b.contains(n), "{head} sends through `{n}` — intake is data, never a message");
             }
         }
-        // the per-file mutex key is T3's (`ledger_verbs::report`) — one writer per row file
-        assert!(src.contains("map.entry(format!(\"intake:{sig}\"))"));
-        assert!(include_str!("repair.rs").contains("ctx.locked(&format!(\"intake:{}\", rep.signature)"), "T3's report verb changed its row mutex key");
+        // RULINGS DO3: both intake writers take the row lock from ONE bounded set (T3d's `intake_lock_for`) —
+        // was: `src.contains("map.entry(format!(\"intake:{sig}\"))")` and repair.rs
+        // `contains("ctx.locked(&format!(\"intake:{}\", rep.signature)")` (the per-signature map, removed by T3d / T3e)
+        assert!(body("fn with_row_mutex<").contains("crate::repair::intake_lock_for(sig)"), "the detector left the bounded lock set");
+        let production = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or(src);
+        assert!(!production.contains("repair_mutexes"), "the detector touches the per-signature mutex map again");
+        assert!(include_str!("repair.rs").contains("super::intake_lock_for(&rep.signature)"), "the report verb left the bounded lock set");
         // the `usage.event` arm feeds the detector once
         let h = include_str!("handlers.rs");
         let arm = h.split("\"usage.event\" => {").nth(1).expect("usage.event arm");
@@ -3743,11 +4231,12 @@ mod defect_intake_tests {
     fn first_failure_starts_the_flusher_once_and_a_pass_writes_the_row() {
         let daemon = crate::team_gate_tests::tmp_daemon("t3b-pass", false);
         let starts = std::sync::atomic::AtomicUsize::new(0);
-        let once = OnceLock::new();
-        let start = || {
+        let state = Mutex::new(FlusherState::default());
+        let start = || -> Result<(), String> {
             starts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         };
-        let fl = FlusherStart { once: &once, start: &start };
+        let fl = FlusherStart { state: &state, start: &start, now: 100.0 };
         let x = bash("python3 ~/.cys/pack/bin/a.py");
         let g = bash("grep a ~/.cys/pack/bin/a.py");
         observe_tool_event_with(&daemon, &pre(&x), &fl);

@@ -103,6 +103,8 @@ pub const HOURLY_CAP: usize = 20;
 pub const CLEAR_RESERVE: usize = 26;
 /// clear 개시 신호를 내는 좌석 역할(정확 일치) — master clear 의 개시 신호는 이 좌석들의 `context.threshold` 다.
 pub const CLEAR_SIGNAL_ROLES: [&str; 2] = ["master", "ceo"];
+/// ★(0.15.0 · RULINGS DO1) the alert engine's per-tool repeated-failure alert — published on the bus, never routed.
+pub const REPEATED_FAILURE_ALERT_NAME: &str = "alert.repeated_failure";
 /// 상한 창(초).
 pub const WINDOW_SECS: f64 = 3600.0;
 /// 데몬 부트 유예(초) — 기동 폭풍(복원·재조정 이벤트)이 CSO 좌석을 덮지 않게.
@@ -360,6 +362,15 @@ impl Now {
 pub fn routable(name: &str) -> bool {
     // ★(0.15.0 · RULINGS AD8) 결함 접수용 예약 이름은 어떤 몫으로도 라우팅하지 않는다(자기 몫 = 장부 · 위 IntakeShare).
     if is_defect_intake_name(name) {
+        return false;
+    }
+    // ★(0.15.0 · RULINGS DO1 · J7 I4) nothing of failure detection goes to a seat's queue in release 1: the alert engine's
+    //   per-tool repeated-failure alert stays an event the daemon records and publishes on its bus (status / analytics /
+    //   `cys events`), exactly as the detector's rows are ledger rows. It never enters the CSO pending set, so it can
+    //   take no share, no queue room and no clear traffic's place (a share inside the same physical queue cannot be
+    //   isolated from backlog without touching queue limits or auto-submit). A later release that registers the failure
+    //   hook decides its delivery with its own measured capacity.
+    if name == REPEATED_FAILURE_ALERT_NAME {
         return false;
     }
     name == OVERFLOW_NAME
@@ -6650,8 +6661,8 @@ mod drills {
     /// does not delay a seat-death alert or the master / CEO clear signals: in the baseline run and in the
     /// flood run all three reach the CSO queue in the SAME tick they arise (0 extra ticks — measured below),
     /// the general share and the clear reserve count exactly the same, the CSO queue holds exactly the same,
-    /// and the event bus carried nothing from the detector. Control (else the drill is void): the same 31
-    /// defects pushed as routable `alert.repeated_failure` keys (= "intake routed through the general share")
+    /// and the event bus carried nothing from the detector. Control (else the drill is void): 31 routable
+    /// general-share keys (`health.alert` rules — since RULINGS DO1 `alert.repeated_failure` is not delivered)
     /// fill the general share and HOLD the seat-death alert. And the reserved intake names never enter the router.
     #[test]
     fn drill_defect_flood_does_not_delay_seat_death_or_clear_signals() {
@@ -6714,7 +6725,7 @@ mod drills {
                 }
                 Arm::ControlGeneralShare => {
                     for i in 0..31 {
-                        handle_event(&daemon, &ev("alert.repeated_failure", None, json!({"key": format!("repeated_failure:sig{i:02}"), "severity": "warn", "message": "x"})), t0);
+                        handle_event(&daemon, &ev("health.alert", None, json!({"rule": format!("rule{i:02}"), "severity": "warn", "message": "x"})), t0);
                     }
                 }
                 Arm::ReservedNames => {
@@ -6767,11 +6778,99 @@ mod drills {
         );
         assert_eq!(flood.master_depth, 0, "a defect reached the master's queue");
         // control: the drill CAN see a flood that shares the general share — seat death is held
-        assert!(!control.exited_routed, "control void: 31 routable defect keys did not hold the seat-death alert");
+        assert!(!control.exited_routed, "control void: 31 routable general-share keys did not hold the seat-death alert");
         assert_eq!(control.general_1h, HOURLY_CAP);
         assert!(control.routed_same_tick < base.routed_same_tick);
         // reserved names: nothing entered, nothing held
         assert_eq!((reserved.routed_same_tick, reserved.exited_routed, reserved.general_1h), (3, true, 1));
+    }
+
+    /// ★(0.15.0 · RULINGS DD1 · J7 I4) THE FULL PATH of a per-tool failure storm: 20 distinct tool names × 5
+    /// PRE_TOOL / failed POST_TOOL pairs through the real `usage.event` request (analytics on, boot grace over) →
+    /// the watchdog's alert engine (`governance::check_alerts_with`) publishes one `alert.repeated_failure` per tool
+    /// on the bus → the router. RULINGS DO1: none of them is delivered or kept pending (published on the bus only), the
+    /// general share stays 0, and a following `surface.exited` reaches the CSO queue AT ONCE, the master / CEO clear
+    /// signals too; nothing of this feature reaches a master's queue.
+    #[test]
+    fn drill_repeated_tool_failures_never_hold_seat_death() {
+        let daemon = drill_daemon("dd1-fullpath");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let ceo = seat(&daemon, "ceo");
+        let worker = seat(&daemon, "worker");
+        let t0 = after_grace(&daemon);
+        assert!(daemon.analytics.lock().unwrap().is_some(), "precondition: analytics on");
+        let usage = |params: Value| {
+            let req = cys::Request { id: json!(1), method: "usage.event".into(), params };
+            match crate::handlers::dispatch(&daemon, req, None) {
+                crate::handlers::Reply::Single(v) => assert_eq!(v["ok"], true, "{v}"),
+                _ => panic!("single reply"),
+            }
+        };
+        for i in 0..20 {
+            let tool = format!("Tool{i:02}");
+            for _ in 0..5 {
+                usage(json!({"surface_id": worker, "event_type": "PRE_TOOL", "raw_hook_event": "PreToolUse", "tool_name": tool, "tool_input": {}}));
+                usage(json!({"surface_id": worker, "event_type": "POST_TOOL", "raw_hook_event": "PostToolUseFailure", "tool_name": tool,
+                             "tool_input": {}, "exit_code": 1, "error": "Exit code 1\nE: x", "is_interrupt": false}));
+            }
+        }
+        let seq0 = daemon.bus.latest_seq();
+        let mut fired = HashMap::new();
+        crate::governance::check_alerts_with(&daemon, &mut fired, &crate::alerts::AlertConfig::default(), now_epoch());
+        let storm: Vec<Value> = daemon.bus.replay_after(seq0).into_iter().filter(|e| e["name"] == "alert.repeated_failure").collect();
+        assert_eq!(storm.len(), 20, "precondition: the alert engine raised one alert per tool");
+        for e in &storm {
+            handle_event(&daemon, e, t0);
+        }
+        let routed_failures = depth(&daemon, cso);
+        let (general, routed, pending) = {
+            let st = daemon.alert_route.lock().unwrap();
+            (st.general_1h(t0.mono), st.routed_1h(t0.mono), st.pending.keys().filter(|k| k.name == REPEATED_FAILURE_ALERT_NAME).count())
+        };
+        // (was, DD1's own share: 3 delivered, 17 held — RULINGS DO1 makes the alert ledger-only)
+        assert_eq!((routed_failures, routed, general, pending), (0, 0, 0, 0), "a per-tool failure alert entered a seat's queue path");
+        let before = depth(&daemon, cso);
+        handle_event(&daemon, &ev("surface.exited", Some(worker), json!({"role": "worker", "agent": "claude"})), t0);
+        assert_eq!(depth(&daemon, cso), before + 1, "the seat-death alert was not delivered at once");
+        for (sid, role) in [(master, "master"), (ceo, "ceo")] {
+            handle_event(&daemon, &ev("context.threshold", Some(sid), json!({"role": role, "context_pct": 86, "threshold": 85})), t0);
+        }
+        assert_eq!(depth(&daemon, cso), before + 3, "a master / CEO clear signal was not delivered at once");
+        assert_eq!(depth(&daemon, master), 0, "an alert reached a master's queue");
+        eprintln!("[t3e-dd1] 20 tools × 5 failures → {} alerts on the bus, {routed_failures} delivered to the CSO, general share {general}; seat death + 2 clear signals delivered in the same tick", storm.len());
+    }
+
+    /// ★(RULINGS DO1 · T3e round-2 I1) the verdict's sequence, verbatim: after boot grace, 29 UNDRAINED messages in the
+    /// CSO queue from an expired hourly window (fresh counters), then one `alert.repeated_failure`, one clear signal and
+    /// 19 distinct general alerts, then `surface.exited` (the 20th general admission) — delivered at once. With DD1's
+    /// own share the failure alert took one queue place (depth 30 → … → 50) and the seat-death alert was HELD by the
+    /// queue headroom; ledger-only, it takes none (depth 49 before `surface.exited`).
+    #[test]
+    fn drill_backlog_failure_alert_never_takes_seat_recovery_room() {
+        let daemon = drill_daemon("do1-backlog");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let worker = seat(&daemon, "worker");
+        // the backlog comes from earlier hours (the general share admits 20 an hour): 20, then 9 an hour later
+        let at = |k: f64| Now { mono: 10_000.0 + k * (WINDOW_SECS + 1.0), epoch: 1_800_000_000.0 + k * (WINDOW_SECS + 1.0) };
+        for i in 0..29 {
+            handle_event(&daemon, &ev("health.alert", None, json!({"rule": format!("backlog{i:02}"), "severity": "warn", "message": "x"})), at(if i < 20 { 0.0 } else { 1.0 }));
+        }
+        assert_eq!(depth(&daemon, cso), 29, "precondition: 29 undrained messages");
+        let now = at(2.0);
+        assert_eq!(daemon.alert_route.lock().unwrap().routed_1h(now.mono), 0, "precondition: fresh hourly counters");
+        handle_event(&daemon, &ev(REPEATED_FAILURE_ALERT_NAME, None, json!({"key": "repeated_failure:Bash", "severity": "crit", "message": "Bash 반복 실패"})), now);
+        assert_eq!(depth(&daemon, cso), 29, "the failure alert took a queue place");
+        handle_event(&daemon, &ev("context.threshold", Some(master), json!({"role": "master", "context_pct": 86, "threshold": 85})), now);
+        assert_eq!(depth(&daemon, cso), 30);
+        for i in 0..19 {
+            handle_event(&daemon, &ev("health.alert", None, json!({"rule": format!("fresh{i:02}"), "severity": "warn", "message": "x"})), now);
+        }
+        assert_eq!((depth(&daemon, cso), daemon.alert_route.lock().unwrap().general_1h(now.mono)), (49, 19));
+        handle_event(&daemon, &ev("surface.exited", Some(worker), json!({"role": "worker", "agent": "claude"})), now);
+        assert_eq!(depth(&daemon, cso), 50, "the seat-death alert was not delivered at once");
+        assert_eq!(depth(&daemon, master), 0);
     }
 }
 
@@ -6799,6 +6898,24 @@ mod pure_tests {
 
     fn key() -> AlertKey {
         AlertKey::new("health.alert", Some(8))
+    }
+
+    /// ★(RULINGS DO1 · J7 I4) the per-tool repeated-failure alert is never delivered: not routable, `summarize`
+    /// takes nothing, `decide` ignores it (it is discardable — the engine re-publishes an active key every 1,800 s);
+    /// the other alert-engine names still route. (Replaces DD1's `failure_alerts_have_their_own_share`.)
+    #[test]
+    fn repeated_failure_alerts_are_never_delivered() {
+        let now = BOOT_GRACE_SECS + 100.0;
+        assert!(!routable(REPEATED_FAILURE_ALERT_NAME));
+        let ev = json!({"type": "event", "seq": 1, "name": REPEATED_FAILURE_ALERT_NAME, "category": "alert", "surface_id": null,
+                        "payload": {"key": "repeated_failure:Bash", "severity": "crit", "message": "Bash 반복 실패 5/5 (100%)"}});
+        assert!(summarize(&ev).is_none(), "the router took a repeated-failure alert");
+        let k = AlertKey::with_detail(REPEATED_FAILURE_ALERT_NAME, None, Some("repeated_failure:Bash".into()));
+        assert_eq!(decide(&RouteState::default(), &k, &ctx(now)), Verdict::Ignore(IgnoreReason::NotRoutable));
+        assert!(is_discardable(REPEATED_FAILURE_ALERT_NAME), "an old daemon's pending copy is dropped, not archived forever");
+        for name in ["alert.rate_limit", "alert.account_rate", "alert.weekly_budget", "alert.node_liveness"] {
+            assert!(routable(name), "{name} stopped routing");
+        }
     }
 
     fn gate_fixture(gates: [bool; 6]) -> (RouteState, RouteCtx) {
@@ -6898,14 +7015,15 @@ mod pure_tests {
     fn routable_names_follow_the_allowlist() {
         for name in ["health.alert", "surface.exited", "writer.claim_escalated", "context.threshold", "queue.starved",
             "queue.depth_high", "watchdog.load_high", "watchdog.custom", OVERFLOW_NAME,
-            // ★(성찰 A9) 데몬 경보 엔진 5종 — crit 경보의 독자가 CSO 큐다.
+            // ★(성찰 A9) 데몬 경보 엔진 — crit 경보의 독자가 CSO 큐다. (was 5종 incl. "alert.repeated_failure" —
+            // RULINGS DO1: that one is published only, never routed; it is in the second list below)
             "alert.rate_limit", "alert.account_rate", "alert.weekly_budget",
-            "alert.repeated_failure", "alert.node_liveness"] {
+            "alert.node_liveness"] {
             assert!(routable(name), "허용 목록의 경보 {name}이 차단됐다");
         }
         for name in ["", "watchdog", "watchdogs.load_high", "health.alert.extra",
             // 이 모듈 자신의 관측 이름은 `alert.` 접두에 걸리지 않는다(되먹임 금지).
-            "alert_route.routed", "alert_route.replay_gap", "alert", "alerts.x"] {
+            "alert_route.routed", "alert_route.replay_gap", "alert", "alerts.x", REPEATED_FAILURE_ALERT_NAME] {
             assert!(!routable(name), "허용 목록 밖 이름 {name}이 라우팅된다");
         }
         // 경보 엔진은 발행부가 활성 키를 30분마다 다시 내므로 버려도 되는 등급이다(A1 의 정의).
@@ -10717,8 +10835,9 @@ mod defect_intake_share {
             decide(&st, &AlertKey::with_detail(DEFECT_INTAKE_ALERT_NAME, None, Some("k".into())), &ctx),
             Verdict::Ignore(IgnoreReason::NotRoutable)
         );
-        // unchanged: the engine's own names, edge facts, the summary keys
-        for name in ["alert.repeated_failure", "alert.rate_limit", "alert.node_liveness", "surface.exited", "context.threshold", "health.alert", OVERFLOW_NAME, GAP_NAME] {
+        // unchanged: the engine's own names, edge facts, the summary keys (was incl. "alert.repeated_failure" — RULINGS DO1:
+        // published only, never routed — `pure_tests::repeated_failure_alerts_are_never_delivered`)
+        for name in ["alert.rate_limit", "alert.node_liveness", "surface.exited", "context.threshold", "health.alert", OVERFLOW_NAME, GAP_NAME] {
             assert!(routable(name), "{name} stopped routing");
         }
         assert!(!is_defect_intake_name("alert.repeated_failure"));
