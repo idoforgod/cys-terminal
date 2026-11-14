@@ -470,7 +470,13 @@ pub(crate) fn handle(
         });
     }
     let classify = |rel: &str| production_classify(rel, &cys::pack::pack_dir());
-    let check = production_check;
+    // RULINGS EO5 (a): the comparison around the worker's check has the step-3 consequences
+    let d = daemon.clone();
+    let check = move |rel: &str, live: &Path, dl: std::time::Duration| {
+        production_check_with(rel, live, dl, &|c| {
+            crate::repair_approval::comparison_consequence(&d, rel, live, c)
+        })
+    };
     let product_pause = || product_pause_in_force(daemon, &cys::pack::pack_dir());
     let ctx = Ctx {
         root: production_root(daemon),
@@ -510,7 +516,12 @@ pub(crate) fn handle(
 /// helper's result, the watchdog's expiry sweep), built exactly as [`handle`] builds it.
 pub(crate) fn with_daemon_ctx<T>(daemon: &Arc<Daemon>, f: impl FnOnce(&Ctx<'_>) -> T) -> T {
     let classify = |rel: &str| production_classify(rel, &cys::pack::pack_dir());
-    let check = production_check;
+    let d = daemon.clone();
+    let check = move |rel: &str, live: &Path, dl: std::time::Duration| {
+        production_check_with(rel, live, dl, &|c| {
+            crate::repair_approval::comparison_consequence(&d, rel, live, c)
+        })
+    };
     let ctx = Ctx {
         root: production_root(daemon),
         lane: LaneKey::of_socket(&daemon.socket_path),
@@ -1025,6 +1036,18 @@ fn production_check(
     live: &Path,
     deadline: std::time::Duration,
 ) -> Result<CheckReport, RepairError> {
+    production_check_with(rel, live, deadline, &|_| {})
+}
+
+/// [`production_check`] telling `compared` what the scoped after-run comparison found (RULINGS EO5 (a):
+/// a refusal — and a noted difference — has the same consequences wherever the comparison runs; the
+/// daemon's closure files them, `repair_approval::comparison_consequence`).
+pub(crate) fn production_check_with(
+    rel: &str,
+    live: &Path,
+    deadline: std::time::Duration,
+    compared: &dyn Fn(&cys::repair::rehearsal::Comparison),
+) -> Result<CheckReport, RepairError> {
     use cys::repair::rehearsal::{run_check, run_reference_check, CheckRequest, CheckResult};
     let kind = check_kind_for(rel);
     let started = std::time::Instant::now();
@@ -1048,6 +1071,9 @@ fn production_check(
         let completed = matches!(r, Ok(CheckResult::Pass) | Ok(CheckResult::Fail(_)));
         (r, completed)
     });
+    if cmp != cys::repair::rehearsal::Comparison::Clean {
+        compared(&cmp);
+    }
     let r = match cmp {
         cys::repair::rehearsal::Comparison::Refused(line) => CheckResult::Fail(line),
         _ => r?,
