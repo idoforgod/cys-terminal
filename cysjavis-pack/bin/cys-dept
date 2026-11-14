@@ -1634,13 +1634,17 @@ CEO_PENDING="$HOME/.cys/state/ceo-pending"
 #   · 영수증 = directives/.ceo-receipt.json(src/repair/paths.rs:ceo_receipt_path) — {schema, header_sha256,
 #     master_sha256_at_compose, composed_sha256, separator, composed_at}. 종전 .ceo-template-applied 는 더 쓰지 않는다
 #     (조립·강등이 지운다 — 0.14.x 승격 기계의 판독 근거로만 읽는다).
-#   · 생성되지 않은 바이트(사용자가 고친 머리말 · 0.14.x 의 정체 모를 머리말 · 구분선 없는 옛 CEO 사본)가 살아 있는 파일에서
-#     빠질 때는 그 파일 전체를 시각을 붙여 먼저 보관한다(MASTER_DIRECTIVE.md.before-compose.<UTC> · before-demote.<UTC>).
-#   · 모든 쓰기는 같은 폴더 임시 파일 → flush·fsync → 다시 읽어 확인 → 원자 교체(반쪽 파일 없음 · 윈도우 공유 위반은 짧게 재시도).
+#   · ★RULINGS EY1: 살아 있던 지침 파일은 지우지도 덮지도 않는다 — 교체로 밀려난 파일·되돌린 후보·강등 뒤의 .pre-ceo 는
+#     directives/.ceo-kept/<UTC>-<pid>-<n>.<사유> 로 옮겨져 남고(곁 파일 <이름>.kept = 보관 시각의 해시, 단독 생성), 지우는
+#     것은 오너나 워커의 몫이다(preflight C03.ceo-kept 가 수·크기·보관 뒤 저장을 보인다).
+#   · ★EY2: 교체는 한 단위다 — 다 쓴 후보 → 의도 기록 directives/.ceo-intent.json(읽은 바이트의 해시·후보·보관 이름) →
+#     살아 있는 이름 바꾸기 → 밀려난 파일 보관 → 기록 지우기. 조립 경로의 모든 입구(승격·강등·base 데몬의 10분 틱)가
+#     끝나지 않은 기록을 먼저 마무리한다. ★EY3: 이름은 맞바꾸기(맥·리눅스) 또는 맡기고 먼저(다 쓴 후보의 덮지 않는 이동 ·
+#     윈도우)로만 바뀌고, 둘 다 안 되면 보류한다 — 살아 있는 경로에 직접 쓰지 않는다. ★EY4: 잠금 대기는 늘 유한하다.
 #   · 실패는 전부 rc 로 돌려 호출부가 보류한다 — 이 도구는 늘 0 으로 끝나 부서 생명주기를 깨지 않는다(아래 1767–1772행 규칙).
 #   ceo_py 의 인자는 전부 경로다 — 윈도우(MSYS)의 경로 변환은 argv 에서만 일어나므로 파이썬 안에서 HOME 으로 경로를 만들지 않는다.
 CEO_RECEIPT_NAME=".ceo-receipt.json"
-ceo_py(){  # $1 = superset | state | compose | demote | verify | promoted
+ceo_py(){  # $1 = superset | state | compose | demote | verify | promoted | recover
   python3 - "$@" <<'PY'
 import errno, hashlib, json, math, os, re, sys, tempfile, time
 
@@ -2702,10 +2706,11 @@ def locked_attempts(md, nf, once, busy_title, changing_title, action):
                 return 6
             except SourceChanged as e:
                 err("CEO %s: %s — 다시 읽어 처음부터 한다(%d/%d)" % (action, e, n + 1, SWAP_ATTEMPTS))
-        err("CEO %s 보류: 본부 지침이 %d번 연달아 읽은 뒤에 바뀌었다 — 아무것도 쓰지 않았다" % (action, SWAP_ATTEMPTS))
-        note(nf, changing_title, "본부 지침의 CEO %s을(를) 하는 동안 지침이 %d번 연달아 저장되어(편집 중) 아무것도 바꾸지 않고 "
-                                 "보류했습니다. 저장한 내용은 그대로 살아 있습니다. 편집을 마치면 다음 승격 확인 때 다시 "
-                                 "합니다." % (action, SWAP_ATTEMPTS))
+        err("CEO %s 보류: 본부 지침이 %d번 연달아 읽은 뒤에 바뀌었다 — %s 을(를) 마치지 않았다" % (action, SWAP_ATTEMPTS, action))
+        note(nf, changing_title, "본부 지침의 CEO %s을(를) 하는 동안 지침이 %d번 연달아 저장되어(편집 중) %s을(를) 마치지 않고 "
+                                 "보류했습니다. 살아 있는 지침은 마지막으로 저장된 판이고, 그 사이 살아 있던 판들은 보관 폴더 %s 에 "
+                                 "있습니다(지우지 않았습니다). 편집을 마치면 다음 승격 확인 때 다시 합니다."
+                                 % (action, SWAP_ATTEMPTS, action, kept_dir(md)))
         return 9
     finally:
         lk.close()
@@ -3041,7 +3046,8 @@ def main(argv):
     try:
         return acts[cmd](rest)
     except Exception as e:   # 어떤 예외도 부서 생명주기를 깨지 않는다 — 호출부가 rc 로 보류한다(쓰기는 원자 교체뿐)
-        err("CEO %s 실패(%s: %s) — 살아 있는 지침은 원자 교체로만 바뀌므로 반쪽 파일은 없다" % (cmd, type(e).__name__, e))
+        err("CEO %s 실패(%s: %s) — 지침 이름은 맞바꾸기나 다 쓴 후보의 덮지 않는 이동으로만 바뀌고, 중간에 멈춘 교체는 의도 기록"
+            "(%s)으로 다음 입구가 마무리한다" % (cmd, type(e).__name__, e, INTENT))
         return 2
 
 
@@ -3149,7 +3155,7 @@ ceo_pre_present(){ [ -e "$1" ] || [ -L "$1" ]; }
 #   `set -e` 아래에서 mkdir·리다이렉트 실패가 스크립트를 죽이지 않도록 한 묶음으로 감싸고, 실패는 stderr 한 줄로 보인다.
 ceo_pending_write(){  # $1=PENDING 파일에 남길 한 줄
   if ! { mkdir -p "$(dirname "$CEO_PENDING")" && printf '%s\n' "$1" > "$CEO_PENDING"; } 2>/dev/null; then
-    echo "[cys-dept] WARN: CEO 승격 대기 PENDING 기록 실패($CEO_PENDING — 쓰기 불가) — 보류 사실은 이 줄과 위 stderr 가 유일한 흔적이다. 부서 흐름은 계속한다" >&2
+    echo "[cys-dept] WARN: CEO 승격 대기 PENDING 기록 실패($CEO_PENDING — 쓰기 불가) — 보류 사실은 이 줄과 위 stderr(알림이 올라갔다면 그 알림도)에 남는다. 부서 흐름은 계속한다" >&2
   fi
   return 0
 }
@@ -3240,7 +3246,7 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
           --body "CEO_TEMPLATE.md 가 '생성된 머리말 + 조립 구분선 + 표준 MASTER 전문'이 아니어서(스텁·반쪽 틀) 승격을 보류했습니다 — 반쪽마스터 재발 경로 차단. 승격은 이 틀의 머리말에 사용자 본부 지침을 그대로 붙이는 조립이라, 본부 지침을 고친 것은 보류 사유가 아닙니다. 해소: 팩 갱신(cys init-pack) 또는 gen_ceo_template.py 재합성으로 틀을 되살린 뒤 재시도. 본부 지침은 바뀌지 않았고 승격 대기(PENDING)는 유지됩니다." --kind ceo-notice >/dev/null 2>&1 || true
       fi
     else
-      echo "[cys-dept] WARN: CEO 조립 미완(rc=$_swap_rc) — 승격 보류·PENDING 유지. 위 stderr 의 이유(판독·쓰기 오류, 승격 기록 없는 구분선 줄, 심볼릭 링크, 사용자 본부 지침 불명 · rc 8 = 다른 승격·강등이 잠금을 쥐고 있어 대기 상한 초과 · rc 9 = 지침이 조립 중에 계속 저장됨 — rc 6·8·9 는 알림 1건도 남긴다)를 점검한 뒤 재시도. 지침은 교체 순간의 파일이 읽은 바이트일 때만 바뀌므로 반쪽 파일도, 사라진 저장도 없다." >&2
+      echo "[cys-dept] WARN: CEO 조립 미완(rc=$_swap_rc) — 승격 보류·PENDING 유지. 위 stderr 의 이유(판독·쓰기 오류, 승격 기록 없는 구분선 줄, 심볼릭 링크, 사용자 본부 지침 불명 · rc 8 = 다른 승격·강등이 잠금을 쥐고 있어 대기 상한 초과 · rc 9 = 지침이 조립 중에 계속 저장됨 — rc 6·8·9 는 알림 1건도 남긴다)를 점검한 뒤 재시도. 지침 이름은 맞바꾸기나 다 쓴 후보의 덮지 않는 이동으로만 바뀌고, 그 자리에서 밀려난 판은 directives/.ceo-kept/ 에 남는다(지우지 않는다)." >&2
     fi
     return 0
   fi
