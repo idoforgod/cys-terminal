@@ -1676,16 +1676,23 @@ mod ledger_verbs {
         // DA4 / ED3: one file named twice is one target; the sentence says what is known — one
         // identity ("같은 파일입니다") or only the conservative rule (one file on some volumes)
         for (i, a) in files.iter().enumerate() {
-            if let Some((b, how)) = files[i + 1..]
-                .iter()
-                .find_map(|b| super::same_now(&ctx.pack_dir, a, b).map(|h| (b, h)))
+            if let Some((b, how)) =
+                files[i + 1..]
+                    .iter()
+                    .find_map(|b| match super::same_now(&ctx.pack_dir, a, b) {
+                        super::Verdict::Different => None,
+                        v => Some((b, v)),
+                    })
             {
                 return Err(VerbError::invalid(match how {
-                    super::Same::Identity | super::Same::Spelling => {
+                    super::Verdict::Same(super::Same::Identity | super::Same::Spelling) => {
                         format!("{a} 와 {b} 는 같은 파일입니다 — 한 번만 지정하세요(RULINGS DA4)")
                     }
-                    super::Same::CaseFold | super::Same::NonAscii => format!(
+                    super::Verdict::Same(_) => format!(
                         "{a} 와 {b} 는 볼륨에 따라 같은 파일일 수 있습니다(대소문자만 다르거나 ASCII 가 아닌 아직 없는 이름) — 한 수리에 함께 지정하지 마세요(RULINGS DJ1 · ED3)"
+                    ),
+                    super::Verdict::Different | super::Verdict::Unknown => format!(
+                        "{a} 와 {b} 가 같은 파일인지 확인할 수 없습니다(파일 시스템 조회 실패) — 한 수리에 함께 지정하지 마세요(RULINGS EG1)"
                     ),
                 }));
             }
@@ -4354,11 +4361,94 @@ pub(crate) enum Same {
     NonAscii,
 }
 
-/// RULINGS ED1: a target resolved against the file system NOW — the identity of its deepest
-/// EXISTING ancestor (the target itself when it exists) and the not-yet-existing tail below it
-/// (empty = the target exists). `None` only when not even the pack root can be read.
+/// RULINGS EG1 — the answer of comparing two targets: SAME (how), DIFFERENT (only on positive
+/// evidence), or UNKNOWN (a lookup failed or could not be made) — and UNKNOWN refuses like SAME.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    Same(Same),
+    Different,
+    Unknown,
+}
+
+/// RULINGS EG1 — one file-system lookup with three answers: the path EXISTS (its identity:
+/// volume + file id, links followed), is ABSENT (the system said it is not there), or UNKNOWN
+/// (any other failure — never evidence of anything).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lookup {
+    Exists((u64, u64)),
+    Absent,
+    Unknown,
+}
+
+/// RULINGS EG1 — the identity of `path` now ([`Lookup`]); directories included.
+pub(crate) fn identity_now(path: &Path) -> Lookup {
+    #[cfg(test)]
+    if lookup_fails(path) {
+        return Lookup::Unknown;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(path) {
+            Ok(m) => Lookup::Exists((m.dev(), m.ino())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Lookup::Absent,
+            Err(_) => Lookup::Unknown,
+        }
+    }
+    #[cfg(windows)]
+    {
+        // a path that is not there is ABSENT; one whose identity cannot be read is UNKNOWN
+        match std::fs::metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Lookup::Absent,
+            Err(_) => Lookup::Unknown,
+            Ok(_) => match cys::repair::boot_critical::file_identity(path) {
+                Some(id) => Lookup::Exists(id),
+                None => Lookup::Unknown,
+            },
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Lookup::Unknown
+    }
+}
+
+/// Test builds only: paths whose lookup a test makes FAIL (an injected failure — no platform
+/// trick), exact paths as the daemon builds them.
+#[cfg(test)]
+static LOOKUP_FAILS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn lookup_fail_install(path: &Path) {
+    LOOKUP_FAILS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(path.to_path_buf());
+}
+
+#[cfg(test)]
+pub(crate) fn lookup_fail_clear(path: &Path) {
+    LOOKUP_FAILS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|p| p != path);
+}
+
+#[cfg(test)]
+fn lookup_fails(path: &Path) -> bool {
+    LOOKUP_FAILS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|p| p == path)
+}
+
+/// RULINGS ED1 / EG1: a target resolved against the file system NOW — `Some((identity of its
+/// deepest EXISTING ancestor — the target itself when it exists, not-yet-existing tail))`; walking
+/// up passes only paths the system says are ABSENT. `None` = UNKNOWN: a lookup failed (or not
+/// even the pack root exists) — never "absent".
 fn resolve_now(pack: &Path, rel: &str) -> Option<((u64, u64), Vec<String>)> {
-    use cys::repair::boot_critical::file_identity;
     let parts: Vec<&str> = rel
         .split(['/', '\\'])
         .filter(|p| !p.is_empty() && *p != ".")
@@ -4367,41 +4457,49 @@ fn resolve_now(pack: &Path, rel: &str) -> Option<((u64, u64), Vec<String>)> {
         let path = parts[..k]
             .iter()
             .fold(pack.to_path_buf(), |acc, c| acc.join(c));
-        if let Some(id) = file_identity(&path) {
-            return Some((id, parts[k..].iter().map(|s| s.to_string()).collect()));
+        match identity_now(&path) {
+            Lookup::Exists(id) => {
+                return Some((id, parts[k..].iter().map(|s| s.to_string()).collect()))
+            }
+            Lookup::Absent => continue,
+            Lookup::Unknown => return None,
         }
     }
     None
 }
 
-/// RULINGS DA4 / ED1 — ONE comparison, made NOW, for both targets: the same file when (i) both
-/// exist and have one identity, or (ii) they share the deepest existing ancestor (by identity)
-/// and their not-yet-existing tails are equal after ASCII case folding; a tail holding ANY
-/// non-ASCII character equals every other tail under that ancestor (no normalisation library —
-/// RULINGS CD1 — so the daemon cannot know better: an over-refusal in the safe direction, lasting
-/// until the first repair is finished). Hook lines (`settings:…`) compare only with hook lines.
-/// No key computed at an earlier moment is compared.
-pub(crate) fn same_now(pack: &Path, a: &str, b: &str) -> Option<Same> {
+/// RULINGS DA4 / ED1 / EG1 — ONE comparison, made NOW, for both targets. SAME when (i) both exist
+/// and have one identity, or (ii) they share the deepest existing ancestor and their
+/// not-yet-existing tails are equal after ASCII case folding — a tail holding ANY non-ASCII
+/// character equals every other tail under that ancestor (no normalisation library — RULINGS
+/// CD1). DIFFERENT only on positive evidence: two identities read and unequal; one target exists
+/// and the other does not; two different deepest ancestors read; one ancestor and unequal ASCII
+/// tails. Every failed lookup → UNKNOWN. Hook lines (`settings:…`) compare only with hook lines.
+pub(crate) fn same_now(pack: &Path, a: &str, b: &str) -> Verdict {
     let hook = |s: &str| s.starts_with("settings:");
     if hook(a) || hook(b) {
-        if !(hook(a) && hook(b) && a.eq_ignore_ascii_case(b)) {
-            return None;
-        }
-        return Some(if a == b {
-            Same::Spelling
+        return if !(hook(a) && hook(b) && a.eq_ignore_ascii_case(b)) {
+            Verdict::Different
+        } else if a == b {
+            Verdict::Same(Same::Spelling)
         } else {
-            Same::CaseFold
-        });
+            Verdict::Same(Same::CaseFold)
+        };
     }
     if a == b {
-        return Some(Same::Spelling);
+        return Verdict::Same(Same::Spelling);
     }
-    let (ra, rb) = (resolve_now(pack, a)?, resolve_now(pack, b)?);
+    let (Some(ra), Some(rb)) = (resolve_now(pack, a), resolve_now(pack, b)) else {
+        return Verdict::Unknown;
+    };
     match (ra.1.is_empty(), rb.1.is_empty()) {
-        (true, true) => (ra.0 == rb.0).then_some(Same::Identity),
-        (false, false) if ra.0 == rb.0 => {
+        (true, true) if ra.0 == rb.0 => Verdict::Same(Same::Identity),
+        (true, true) => Verdict::Different,
+        (true, false) | (false, true) => Verdict::Different,
+        (false, false) if ra.0 != rb.0 => Verdict::Different,
+        (false, false) => {
             if ra.1.iter().chain(rb.1.iter()).any(|c| !c.is_ascii()) {
-                Some(Same::NonAscii)
+                Verdict::Same(Same::NonAscii)
             } else if ra.1.len() == rb.1.len()
                 && ra
                     .1
@@ -4409,25 +4507,26 @@ pub(crate) fn same_now(pack: &Path, a: &str, b: &str) -> Option<Same> {
                     .zip(&rb.1)
                     .all(|(x, y)| x.eq_ignore_ascii_case(y))
             {
-                Some(Same::CaseFold)
+                Verdict::Same(Same::CaseFold)
             } else {
-                None
+                Verdict::Different
             }
         }
-        _ => None,
     }
 }
 
-/// [`same_now`] as a yes / no (the tests' shorthand; the verbs use `same_now` for its sentence).
+/// [`same_now`] as a yes / no (the tests' shorthand; the verbs use `same_now` for its sentence):
+/// `true` for SAME and for UNKNOWN (both refuse).
 #[cfg(test)]
 pub(crate) fn same_target(pack: &Path, a: &str, b: &str) -> bool {
-    same_now(pack, a, b).is_some()
+    same_now(pack, a, b) != Verdict::Different
 }
 
-/// RULINGS DA4 / ED1 — the refusal sentence when the new target `new` is, NOW, the same file as a
-/// target of the being-worked repair `rec` of this lane ([`same_now`]), or `None`. The sentence
-/// says what is known: one identity / one spelling → BJ5's sentence; the conservative rule →
-/// a conditional sentence (one file on some volumes).
+/// RULINGS DA4 / ED1 / EG1 — the refusal sentence when the new target `new` may be, NOW, the
+/// same file as a target of the being-worked repair `rec` of this lane ([`same_now`]), or
+/// `None` (DIFFERENT for every target). The sentence says what is known: one identity / one
+/// spelling → BJ5's sentence; the conservative rule → a conditional sentence; UNKNOWN → it
+/// could not be determined.
 pub(crate) fn open_overlap(
     pack: &Path,
     new: &str,
@@ -4436,24 +4535,27 @@ pub(crate) fn open_overlap(
     let id = rec.id.as_str();
     let theirs: Vec<&str> = rec.files.iter().map(|f| f.rel.as_str()).collect();
     for t in &theirs {
-        let Some(how) = same_now(pack, new, t) else {
-            continue;
-        };
-        match how {
-            Same::Identity | Same::Spelling => {
+        match same_now(pack, new, t) {
+            Verdict::Different => continue,
+            Verdict::Same(Same::Identity | Same::Spelling) => {
                 return Some(format!(
                     "{new}: 이 파일을 고치는 수리 {id} 가 이미 열려 있습니다(대상 파일 묶음 또는 --resolves 가 다릅니다) — `--joins {id}` 로 합류하거나, 같은 파일들({})로 `cys repair begin` 해서 그 수리를 이어받으세요. 한 파일에 열린 수리는 하나뿐입니다(RULINGS BJ5)",
                     theirs.join(", ")
                 ))
             }
-            Same::CaseFold => {
+            Verdict::Same(Same::CaseFold) => {
                 return Some(format!(
                     "{new}: 수리 {id} 가 연 `{t}` 와 대소문자만 다른 이름입니다 — 대소문자만 다른 이름은 볼륨에 따라 같은 파일이라 동시에 열지 않습니다. 먼저 열린 수리 {id} 가 끝난 뒤 다시 하세요(RULINGS DJ1 · ED1)"
                 ))
             }
-            Same::NonAscii => {
+            Verdict::Same(Same::NonAscii) => {
                 return Some(format!(
                     "{new}: 아직 없는 이름이 ASCII 가 아닌 글자를 담고 있어, 같은 폴더 아래의 수리 {id} 대상 `{t}` 와 볼륨에 따라 같은 파일일 수 있습니다(정규화 형식만 다른 이름을 가릴 수 없음) — {id} 가 끝난 뒤 다시 하세요(RULINGS ED1)"
+                ))
+            }
+            Verdict::Unknown => {
+                return Some(format!(
+                    "{new}: 수리 {id} 의 대상 `{t}` 와 같은 파일인지 확인할 수 없습니다(파일 시스템 조회 실패) — 같은 파일일 수 있어 {id} 가 끝난 뒤 다시 하세요(RULINGS EG1)"
                 ))
             }
         }

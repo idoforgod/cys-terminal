@@ -4581,3 +4581,64 @@ fn ed3_one_begin_conservative_pair_gets_the_conditional_sentence() {
     );
     assert!(!e.message.contains("같은 파일입니다"), "{}", e.message);
 }
+
+/// RULINGS EG1: a lookup that FAILS is never evidence of "different" — with an injected failing
+/// lookup (test builds only, no platform trick) for the NEW target's ancestor, for the OPEN
+/// repair's ancestor and for an EXISTING file's identity, the second `begin` is refused saying it
+/// could not be determined; positive "different" cases still open.
+#[test]
+fn eg1_a_failed_lookup_refuses_like_same() {
+    let r = rig("eg1");
+    for d in ["u1", "u2", "v1", "v2", "w", "z"] {
+        std::fs::create_dir_all(r.pack.join(d)).unwrap();
+    }
+    std::fs::write(r.pack.join("w/x.txt"), b"x\n").unwrap();
+    let begin = |sid: u64, rel: &str| {
+        r.call(
+            T0,
+            &seat(sid, if sid == 3 { "worker" } else { "worker-3" }),
+            "begin",
+            json!({"trigger": "owner_order", "files": [rel]}),
+        )
+    };
+    let id_of = |v: Value| v["repair"].as_str().unwrap().to_string();
+    let unknown = |e: VerbError, first: &str| {
+        assert_eq!(e.code, "repair_precondition", "{}", e.message);
+        assert!(
+            e.message.contains(first) && e.message.contains("확인할 수 없습니다"),
+            "{}",
+            e.message
+        );
+    };
+    // the new target's ancestor cannot be read
+    let a = id_of(begin(3, "u1/a.txt").unwrap());
+    lookup_fail_install(&r.pack.join("u2"));
+    unknown(begin(13, "u2/b.txt").unwrap_err(), &a);
+    lookup_fail_clear(&r.pack.join("u2"));
+    // the open repair's ancestor cannot be read
+    let c = id_of(begin(3, "v1/c.txt").unwrap());
+    lookup_fail_install(&r.pack.join("v1"));
+    let e = begin(13, "v2/d.txt").unwrap_err();
+    lookup_fail_clear(&r.pack.join("v1"));
+    unknown(e, &c);
+    // an existing file's identity cannot be read
+    let x = id_of(begin(3, "w/x.txt").unwrap());
+    lookup_fail_install(&r.pack.join("w/x.txt"));
+    let e = begin(13, "w/y.txt").unwrap_err();
+    lookup_fail_clear(&r.pack.join("w/x.txt"));
+    unknown(e, &x);
+    // positive "different": with every lookup readable the same begins open
+    assert!(begin(13, "u2/b.txt").is_ok());
+    assert!(begin(13, "v2/d.txt").is_ok());
+    assert!(
+        begin(13, "w/y.txt").is_ok(),
+        "an existing file and an absent name are different"
+    );
+    std::fs::write(r.pack.join("z/one.txt"), b"1\n").unwrap();
+    std::fs::write(r.pack.join("z/two.txt"), b"2\n").unwrap();
+    assert!(begin(3, "z/one.txt").is_ok());
+    assert!(
+        begin(13, "z/two.txt").is_ok(),
+        "two existing files with two identities are different"
+    );
+}
