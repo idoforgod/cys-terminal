@@ -130,6 +130,10 @@ pub struct TickReport {
     pub m10: Vec<Finding>,
     /// DR5: the fault keys whose intake was attempted in THIS tick (once per tick per repair).
     pub intake_tried: Vec<String>,
+    /// DX3: an automatic return / a put-back was skipped because another apply or update held the
+    /// pack-apply lock — the probation check / the scan stays due (retried at the next tick).
+    pub deferred_probation: bool,
+    pub deferred_sweep: bool,
 }
 
 /// One tick of the job (the daemon calls it on its job thread, after the readiness check and the
@@ -219,12 +223,23 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
         probation_pass(env, &mut report);
     }
     if d.sweep {
-        match m10_sweep(env) {
+        let deferred = std::cell::Cell::new(false);
+        let swept = m10_sweep_with(env, &deferred);
+        report.deferred_sweep = deferred.get();
+        match swept {
             Ok(f) => report.m10 = f,
             Err(e) => report.lines.push(format!("미승인 변경 검사를 마치지 못했습니다 — 다음 차례에 다시({e:?})")),
         }
     }
-    write_job_state(root, lane, env.incarnation, now, &d)?;
+    // DX3: work skipped for the lock is not marked done — the next tick retries it
+    let mut done = d;
+    if report.deferred_probation {
+        done.probation = false;
+    }
+    if report.deferred_sweep {
+        done.sweep = false;
+    }
+    write_job_state(root, lane, env.incarnation, now, &done)?;
     Ok(report)
 }
 
@@ -803,11 +818,18 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, repor
     if let Some(why) = failure {
         let first_rel = ledger::file_targets(rec).map(|f| f.rel.as_str()).next().unwrap_or("");
         if env.op.form == ApplyForm::Exchange {
-            let r = crate::pack_apply_lock::with_apply_lock(env.apply_lock, || {
+            // DX3: the job NEVER waits for the pack-apply lock — held → no return this tick, retried
+            let r = match crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || {
                 revert_in(&env.op, id, RevertCaller::DaemonAuto, env.hooks, env.locked)
-            })
-            .map_err(RepairError::Io)
-            .and_then(|r| r);
+            }) {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    report.deferred_probation = true;
+                    report.lines.push(format!("{}: 재검사 실패 — 다른 적용이나 업데이트가 팩을 바꾸는 중이라 이번 차례에는 되돌리지 않았습니다(다음 차례에 다시)", id.as_str()));
+                    return Ok(());
+                }
+                Err(e) => Err(RepairError::Io(e)),
+            };
             // DR8: the intake description is derived from the MEASURED outcome of the revert
             let outcome_text = match &r {
                 Ok(x) if x.outcome == ApplyOutcome::Applied => "되돌림".to_string(),
@@ -998,6 +1020,11 @@ fn sha_hex(b: &[u8]) -> String {
 /// vault); Windows → recorded and reported only. A check timeout is attributed first (O3: the
 /// control is the content that would be put back, as a scratch copy).
 pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
+    m10_sweep_with(env, &std::cell::Cell::new(false))
+}
+
+/// [`m10_sweep`]; `report_deferred_sweep` is set when a put-back was skipped for the lock (DX3).
+fn m10_sweep_with(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool>) -> Result<Vec<Finding>, RepairError> {
     let root = env.op.root;
     let lane = env.op.lane;
     let pack = env.op.pack;
@@ -1263,7 +1290,7 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
             source: Some(src_file.clone()),
             generation: Some(bound_gen.clone()),
         };
-        let r = crate::pack_apply_lock::with_apply_lock(env.apply_lock, || -> Result<Option<apply::OpDone>, RepairError> {
+        let r = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || -> Result<Option<apply::OpDone>, RepairError> {
             // CT5: THE binding, revalidated under the lock — generation, live state, source of the bytes
             if apply::pack_generation(pack) != bound_gen {
                 return Ok(None);
@@ -1283,6 +1310,11 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
         })
         .map_err(RepairError::Io)?;
         let _ = std::fs::remove_file(&src_file); // our own source copy (the slot holds what went live)
+        // DX3: the job never waits for the lock — held → no put-back this tick, the scan stays due
+        let Some(r) = r else {
+            report_deferred_sweep.set(true);
+            continue;
+        };
         let Some(r) = r? else {
             new_findings.push(Finding {
                 rel: rel.to_string(),
