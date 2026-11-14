@@ -16,13 +16,17 @@
     python3 cysjavis-pack/bin/tests/test_ceo_composition.py
 """
 import ast
+import contextlib
+import errno
 import glob
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -123,6 +127,18 @@ def extract_shell_function(src, name):
     return m.group(0)
 
 
+def ceo_py_module():
+    """cys-dept 의 ceo_py 파이썬 원문(heredoc)을 그대로 모듈로 싣는다 — 마지막 `sys.exit(main(sys.argv))` 한 줄만 뺀다.
+    시험이 그 안의 함수 하나를 감싸 '읽은 뒤·쓰기 전'에 사용자 저장을 끼워 넣을 수 있게(결정론 끼어들기 · 제품 시험 이음매 없음)."""
+    src = extract_shell_function(_slurp(DEPT, encoding="utf-8"), "ceo_py")
+    body = src.split("<<'PY'\n", 1)[1].rsplit("\nPY\n", 1)[0]
+    tail = "sys.exit(main(sys.argv))"
+    assert body.rstrip().endswith(tail), "ceo_py 원문의 끝이 바뀌었다"
+    ns = {"__name__": "ceo_py_under_test"}
+    exec(compile(body.rstrip()[: -len(tail)], DEPT + ":ceo_py", "exec"), ns)
+    return ns
+
+
 class Rig(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ceo-comp-")
@@ -132,6 +148,7 @@ class Rig(unittest.TestCase):
         self.dirs = os.path.join(self.home, ".cys", "pack", "directives")
         self.log = os.path.join(self.tmp, "calls.log")
         self.feedlist = os.path.join(self.tmp, "feed-list.txt")
+        self.pushfail = os.path.join(self.tmp, "feed-push-fails")      # 있으면 스텁의 feed push 가 실패한다(데몬 없음 등)
         os.makedirs(self.bindir)
         os.makedirs(self.dirs)
         # 스텁 cys: 전 호출 기록 · ping=소켓 파일 실존 · status 실패(재주입 skip 경로) · feed list = 파일 내용.
@@ -141,8 +158,9 @@ class Rig(unittest.TestCase):
                'case "$1" in\n'
                '  ping) [ -e "$CYS_SOCKET" ] && exit 0 || exit 1 ;;\n'
                '  status|identify) exit 1 ;;\n'
-               '  feed) if [ "$2" = "list" ]; then [ -f "%(fl)s" ] && cat "%(fl)s"; exit 0; fi; exit 0 ;;\n'
-               'esac\nexit 0\n' % {"log": self.log, "fl": self.feedlist}, 0o755)
+               '  feed) if [ "$2" = "list" ]; then [ -f "%(fl)s" ] && cat "%(fl)s"; exit 0; fi\n'
+               '        if [ "$2" = "push" ] && [ -f "%(pf)s" ]; then exit 1; fi; exit 0 ;;\n'
+               'esac\nexit 0\n' % {"log": self.log, "fl": self.feedlist, "pf": self.pushfail}, 0o755)
         _write(os.path.join(self.bindir, "cysd"),
                '#!/bin/sh\nmkdir -p "$(dirname "$CYS_SOCKET")"\ntouch "$CYS_SOCKET"\nexit 0\n', 0o755)
         self.env = dict(os.environ)
@@ -158,7 +176,20 @@ class Rig(unittest.TestCase):
     def p(self, name):
         return os.path.join(self.dirs, name)
 
+    def outbox(self):
+        """★RULINGS FY3 — 영속 알림함(승격 대기 표지와 같은 상태 폴더)."""
+        return os.path.join(self.home, ".cys", "state", "ceo-notices")
+
+    def outbox_files(self, sent=False):
+        d = os.path.join(self.outbox(), "sent") if sent else self.outbox()
+        return sorted(os.path.join(d, f) for f in (os.listdir(d) if os.path.isdir(d) else []) if f.endswith(".notice"))
+
+    def notices_text(self):
+        """영속 알림함의 알림 — 아직 배달되지 않은 것과 sent/ 의 것 — 의 제목·본문(시험이 '알림이 있다'를 재는 곳)."""
+        return "".join(_slurp(f, encoding="utf-8") for f in self.outbox_files() + self.outbox_files(sent=True))
+
     def seed(self, md=USER, tmpl=TEMPLATE, marker=True, ndepts=1):
+        shutil.rmtree(self.outbox(), ignore_errors=True)
         _write(self.p("MASTER_DIRECTIVE.md"), md)
         _write(self.p("CEO_TEMPLATE.md"), tmpl)
         if marker:
@@ -220,8 +251,14 @@ class Rig(unittest.TestCase):
                            encoding="utf-8", env=self.env, timeout=60)
         return r.returncode, r.stdout, r.stderr
 
+    def kept(self, reason="*"):
+        """보관 폴더(directives/.ceo-kept/)의 보관 사본들(곁 파일 *.kept 제외) — ★RULINGS EY1."""
+        return sorted(f for f in glob.glob(os.path.join(self.dirs, ".ceo-kept", "*.%s" % reason))
+                      if not f.endswith(".kept"))
+
     def captures(self, kind):
-        return sorted(glob.glob(self.p("MASTER_DIRECTIVE.md.%s.*" % kind)))
+        """시각 붙은 보관 사본 — EY1 부터 보관 폴더 안(<UTC>-<pid>-<n>.<kind>)."""
+        return self.kept(kind)
 
     def leftovers(self):
         return [f for f in os.listdir(self.dirs) if f.endswith(".tmp")]
@@ -290,19 +327,22 @@ class Composition(Rig):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), body, "강등이 구분선 뒤 바이트가 아니다")
         self.assertIsNone(self.read("MASTER_DIRECTIVE.md.pre-ceo"), "강등 뒤 .pre-ceo 가 남아 '승격 중'으로 보인다")
-        kept = sorted(glob.glob(self.p("MASTER_DIRECTIVE.md.pre-ceo.*")))
+        kept = sorted(self.kept("backup"))
         self.assertEqual(len(kept), 1, "다른 내용의 백업은 시각을 붙여 보관해야 한다: %r" % os.listdir(self.dirs))
         self.assertEqual(_slurp(kept[0], encoding="utf-8"), USER, "백업이 원본으로 쓰이지 않았는데 내용이 바뀌었다")
         self.assertIsNone(self.read(".ceo-receipt.json"))
         self.assertIn("CEO 강등", out + err)
 
-    def test_demotion_without_edits_removes_identical_backup(self):
+    def test_demotion_without_edits_keeps_the_identical_backup(self):
+        """★RULINGS EY1 로 다시 씀(종전: '같은 내용의 백업은 지운다'): 비교로 지우지 않는다 — 강등 뒤 .pre-ceo 는 같은 내용이어도
+        보관 폴더로 옮겨 남고, 디렉티브 폴더에는 .pre-ceo 가 없다(승격 중에만 있게)."""
         self.seed()
         self.assertEqual(self.run_dept("promote-ceo")[0], 0)
         rc, out, err = self.run_dept("down", "d0")
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER)
-        self.assertEqual(glob.glob(self.p("MASTER_DIRECTIVE.md.pre-ceo*")), [], "같은 내용의 백업은 지운다")
+        self.assertEqual(glob.glob(self.p("MASTER_DIRECTIVE.md.pre-ceo*")), [], "강등 뒤 .pre-ceo 가 디렉티브 폴더에 남았다")
+        self.assertEqual([_slurp(k, encoding="utf-8") for k in self.kept("backup")], [USER], "같은 내용의 백업을 지웠다(EY1)")
 
     def test_user_header_edit_is_captured_before_recomposition(self):
         """E-6-07: 사용자가 머리말 자체를 고쳤다 → 다시 조립하기 전에 시각을 붙여 보관(틀 전진·틀 동일 두 경우)."""
@@ -317,7 +357,7 @@ class Composition(Rig):
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER_V2 + SEP + USER + "USERFIX-E6-2\n")
         caps = self.captures("before-compose")
         self.assertEqual(len(caps), 1, "고친 머리말을 보관하지 않았다: %r" % os.listdir(self.dirs))
-        self.assertRegex(os.path.basename(caps[0]), r"\.before-compose\.\d{8}T\d{6}Z$")
+        self.assertRegex(os.path.basename(caps[0]), r"^\d{8}T\d{6}Z-\d+-\d+\.before-compose$")   # EY1: 보관 폴더의 이름
         self.assertEqual(_slurp(caps[0], encoding="utf-8"), live, "보관 사본이 조립 전 바이트가 아니다")
         self.assert_receipt_for(HEADER_V2, USER + "USERFIX-E6-2\n", self.read("MASTER_DIRECTIVE.md"))
         lines = self.pushes_prefix("CEO 지침 사본 보관(머리말) — ")
@@ -479,47 +519,49 @@ class Composition(Rig):
         self.assertEqual(self.leftovers(), [])
 
     def test_concurrent_promotion_lock_is_taken(self):
-        """H-14-N2-01: 동시 승격 락(D-5) — flock 이 있으면 잡힌 락 뒤에서 기다리고, 없으면(mac·PortableGit) mkdir 락을
-        잡으며, 남이 쥔 락은 경고 후 무락 진행(종전 계약)한다. 락을 지우는 변이는 이 시험이 잡는다."""
+        """H-14-N2-01 ★RULINGS DC1 로 다시 씀: 동시 승격 락(D-5)은 모든 플랫폼에서 진짜 잠금이다 — 잡힌 잠금 뒤에서 상한까지
+        기다리고, 그 안에 풀리면 이어서 조립한다. (종전 시험의 mkdir 갈래 — '남이 쥔 락이면 경고 뒤 무락 진행'을 성공으로
+        기대 — 은 DC1 이 금지한 동작이라 지웠다: 잡혀 있으면 이제 보류다 → LockIsReal.) 실제 ceo_py 코드를 싣고, 잠금 대기의
+        첫 쉼(time.sleep)을 사건으로 받아 '기다리는 중'을 판정한다 — 시간이 아니라."""
+        import threading
+        try:
+            import fcntl
+        except ImportError:
+            self.skipTest("fcntl 없는 플랫폼")
         self.seed()
         md = self.p("MASTER_DIRECTIVE.md")
-        path_dirs = [self.bindir, "/opt/homebrew/bin", "/usr/local/bin"] + self.env["PATH"].split(os.pathsep)
-        if shutil.which("flock", path=os.pathsep.join(path_dirs)):
-            import fcntl
-            fd = os.open(md + ".promote.lock", os.O_RDWR | os.O_CREAT, 0o644)
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            proc = subprocess.Popen(["bash", DEPT, "promote-ceo"], env=self.env,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            try:
-                # 사건으로 판정한다(시간이 아니라): 승격 프로세스 트리에 `flock` 이 나타나면 그 순간 승격은 락 앞에서
-                # 막혀 있다 — 락을 쥔 동안 끝날 수도, 지침을 바꿀 수도 없다. 락을 지우는 변이는 `flock` 이 끝내 안 나타난다.
-                deadline = time.monotonic() + 60
-                while "flock" not in _descendant_names(proc.pid):
-                    self.assertIsNone(proc.poll(), "락이 잡혀 있는데 승격이 락 없이 끝났다(락 제거)")
-                    self.assertLess(time.monotonic(), deadline, "승격이 락에 닿지 않았다")  # wallclock: guard the promotion always reaches its lock; 60 s only ends a hang
-                    time.sleep(0.05)
-                self.assertIsNone(proc.poll(), "락이 잡혀 있는데 승격이 끝났다(락 없음)")
-                self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "락 밖에서 지침이 바뀌었다")
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
-            self.assertEqual(proc.wait(timeout=120), 0)
-            proc.stdout.close()
-            proc.stderr.close()
-        else:
-            os.mkdir(md + ".promote.lock.d")       # 남이 쥔 락
-            rc, out, err = self.run_dept("promote-ceo")
-            self.assertEqual(rc, 0, out + err)
-            self.assertIn("승격 락(", err, "mkdir 락을 시도하지 않았다(락 제거 변이)")
-            self.assertTrue(os.path.isdir(md + ".promote.lock.d"), "남의 락을 지웠다")
-            os.rmdir(md + ".promote.lock.d")
-            # 강등도 같은 락을 잡는다.
-            os.mkdir(md + ".promote.lock.d")
-            rc, out, err = self.run_dept("down", "d0")
-            self.assertEqual(rc, 0, out + err)
-            self.assertIn("승격 락(", err)
-            os.rmdir(md + ".promote.lock.d")
-        self.assertFalse(os.path.exists(md + ".promote.lock.d"), "제 락을 풀지 않았다")
+        fd = os.open(md + ".promote.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        ns = ceo_py_module()
+        waiting = threading.Event()
+        real_time = ns["time"]
+
+        class Clock:
+            def __getattr__(self, name):
+                return getattr(real_time, name)
+
+            @staticmethod
+            def sleep(s):
+                waiting.set()
+                real_time.sleep(s)
+        ns["time"] = Clock()
+        os.environ["CYS_CEO_LOCK_WAIT_S"] = "60"
+        self.addCleanup(os.environ.pop, "CYS_CEO_LOCK_WAIT_S", None)
+        out = {}
+        t = threading.Thread(target=lambda: out.setdefault("rc", ns["do_compose"](
+            [self.p("CEO_TEMPLATE.md"), md, sha(TEMPLATE), ""])))
+        t.start()
+        try:
+            self.assertTrue(waiting.wait(60), "조립이 잠금에 닿지 않았다")  # wallclock: guard 60 s only ends a hang; the verdict is the event
+            self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "잠금이 잡혀 있는데 지침을 바꿨다(잠금 없음)")
+            self.assertTrue(t.is_alive(), "잠금이 잡혀 있는데 조립이 끝났다")
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            t.join(120)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(out.get("rc"), 0, "잠금이 풀린 뒤 조립하지 않았다")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER)
 
     def test_concurrent_promotions_give_one_valid_composition(self):
         """E-6-11: 동시에 여러 번 승격해도 결과는 한 가지 조립이고 백업은 사용자 지침(CEO 사본 아님 — D-5) · 전부 exit 0."""
@@ -569,6 +611,21 @@ class Composition(Rig):
         self.assert_receipt_for(HEADER, USER, self.read("MASTER_DIRECTIVE.md"))
         self.assertFalse(os.path.exists(self.pending_path()), "승격된 기계의 PENDING 이 남았다")
 
+    def test_title_dedupe_is_bytewise(self):
+        """★T8b: 알림 제목 비교는 바이트 그대로다 — 맥의 /usr/bin/awk 는 en_US.UTF-8 에서 문자열 == 을 strcoll 로 비교해 한글만
+        다른 두 제목을 같다고 봤다(보관 중인 'CEO 승격 보류(…)' 때문에 'CEO 강등 보류(…)' 를 올리지 않음). 그 로캘로 잰다."""
+        self.seed()
+        self.env["LC_ALL"] = "en_US.UTF-8"
+        _write(self.feedlist, "rid-p\t[pending]\tceo-notice\tCEO 승격 보류(다른 승격·강등이 진행 중)\tdecision=-\n")
+        funcs = extract_shell_function(_slurp(DEPT, encoding="utf-8"), "ceo_notice_once")
+        r = subprocess.run(["bash", "-c", "CYS=cys\n" + funcs + 'ceo_notice_once "$1" "본문"\n', DEPT,
+                            "CEO 강등 보류(다른 승격·강등이 진행 중)"], capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.pushes("CEO 강등 보류(다른 승격·강등이 진행 중)"), 1, "다른 제목을 같은 제목으로 걸렀다(strcoll)")
+        r = subprocess.run(["bash", "-c", "CYS=cys\n" + funcs + 'ceo_notice_once "$1" "본문"\n', DEPT,
+                            "CEO 승격 보류(다른 승격·강등이 진행 중)"], capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertEqual(self.pushes("CEO 승격 보류(다른 승격·강등이 진행 중)"), 0, "보관 중인 같은 제목을 또 올렸다")
+
     def test_successful_demotion_closes_demote_hold_notices(self):
         """★CG2: 강등이 끝나면 '강등 보류'·'강등 불능' 알림의 사유가 사라진다 — 비허가 결정(ceo-demoted)으로 닫는다.
         대조: 보류(rc 6)로 끝난 강등은 닫지 않는다."""
@@ -608,32 +665,43 @@ class Composition(Rig):
         caps = self.captures("before-compose")
         self.assertEqual(len(caps), 2)
         self.assertEqual(sorted(t.rsplit(" — ", 1)[1] for t in titles), sorted(os.path.basename(c) for c in caps))
-        # 같은 사본의 알림을 다시 올리지는 않는다(제목 완전일치 dedupe 는 그대로).
-        nf = os.path.join(self.tmp, "nf.txt")
-        _write(nf, "NOTICE\t%s\t본문\n" % titles[0])
+        # 같은 사본의 알림을 다시 올리지는 않는다(제목 완전일치 dedupe 는 그대로 — ★FY3: 알림함 배달이 그것을 지난다).
+        stray = os.path.join(self.outbox(), "0" * 32 + ".notice")
+        _write(stray, "%s\n본문\n" % titles[0])
         funcs = "".join(extract_shell_function(_slurp(DEPT, encoding="utf-8"), f)
-                        for f in ("ceo_notice_once", "ceo_notices_from"))
-        r = subprocess.run(["bash", "-c", 'CYS=cys\n' + funcs + 'ceo_notices_from "$1"\n', DEPT, nf],
-                           capture_output=True, text=True, encoding="utf-8", env=self.env, timeout=60)
+                        for f in ("ceo_notice_once", "ceo_outbox_deliver"))
+        r = subprocess.run(["bash", "-c", 'CYS=cys\nCEO_OUTBOX="$1"\n_CEO_DELIVERED=0\n' + funcs + 'ceo_outbox_deliver\n', DEPT,
+                            self.outbox()], capture_output=True, text=True, encoding="utf-8", env=self.env, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(len(self.pushes_prefix("CEO 지침 사본 보관(머리말) — ")), 2, "같은 사본 알림을 또 올렸다")
+        self.assertTrue(os.path.exists(os.path.join(self.outbox(), "sent", os.path.basename(stray))),
+                        "이미 대기 중인 제목인데 sent/ 로 옮기지 않았다(피드가 받은 것)")
 
     def test_failed_notice_write_keeps_the_replacement_result(self):
-        """★CG2: 교체가 끝난 뒤 알림 기록이 실패해도(알림 파일 = 폴더) 결과(rc)는 교체의 결과다 — 다시 조립 12 · 강등 0."""
+        """★CG2: 교체가 끝난 뒤 알림 기록이 실패해도(★FY3: 영속 알림함을 쓸 수 없다 — 그 경로가 파일) 결과(rc)는 교체의 결과다 —
+        다시 조립 12 · 강등 0. 그 동작의 기록은 알림이 알림함에 들어갈 때까지 남고(FY3 i), 알림함이 고쳐지면 다음 입구가 마무리한다."""
         self.seed()
         self.assertEqual(self.run_dept("promote-ceo")[0], 0)
         live = HEADER + "USER-HEADER-EDIT\n" + SEP + USER          # 영수증이 증명 못 하는 머리말 → 사본 + 알림
         _write(self.p("MASTER_DIRECTIVE.md"), live)
-        bad_nf = os.path.join(self.tmp, "notice-dir")
-        os.mkdir(bad_nf)
+        bad_box = os.path.join(self.tmp, "outbox-is-a-file")
+        _write(bad_box, "not a folder\n")
+        self.env["CYS_CEO_OUTBOX"] = bad_box
         rc, out, err = self.run_ceo_py("compose", self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"),
-                                       sha(TEMPLATE), bad_nf)
+                                       sha(TEMPLATE), os.path.join(self.tmp, "kept-lines"))
         self.assertEqual(rc, 12, "알림 실패가 다시 조립의 결과를 바꿨다\n" + err)
         self.assertIn("알림 기록 실패", err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER)
         self.assert_receipt_for(HEADER, USER, HEADER + SEP + USER)
+        self.assertIsNotNone(self.read(".ceo-intent.json"), "알림이 알림함에 없는데 기록을 지웠다(★FY3 i)")
+        del self.env["CYS_CEO_OUTBOX"]
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)        # 알림함이 고쳐졌다 — 다음 입구가 넣고 기록을 지운다
+        self.assertIsNone(self.read(".ceo-intent.json"))
+        self.assertTrue(self.pushes_prefix("CEO 지침 사본 보관(머리말) — "), "알림함이 고쳐진 뒤에도 사본 알림이 없다")
         _write(self.p("MASTER_DIRECTIVE.md"), live)
-        rc, out, err = self.run_ceo_py("demote", self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), bad_nf)
+        self.env["CYS_CEO_OUTBOX"] = bad_box
+        rc, out, err = self.run_ceo_py("demote", self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"),
+                                       os.path.join(self.tmp, "kept-lines"))
         self.assertEqual(rc, 0, "알림 실패가 강등의 결과를 바꿨다\n" + err)
         self.assertIn("알림 기록 실패", err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER)
@@ -675,7 +743,7 @@ class ReceiptlessComposition(Rig):
         rc, out, err = self.run_dept("down", "d0")
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER + self.EDIT, "강등이 고친 본문을 돌려주지 않았다")
-        kept = glob.glob(self.p("MASTER_DIRECTIVE.md.pre-ceo.*"))
+        kept = self.kept("backup")
         self.assertEqual([_slurp(k, encoding="utf-8") for k in kept], [USER], "다른 내용의 백업은 시각을 붙여 보관한다")
         self.assertIsNone(self.read(".ceo-receipt.json"))
 
@@ -704,8 +772,1925 @@ class ReceiptlessComposition(Rig):
         rc, out, err = self.run_dept("down", "d0")
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER + self.EDIT, "낡은 .pre-ceo 로 강등했다")
-        self.assertEqual([_slurp(k, encoding="utf-8") for k in glob.glob(self.p("MASTER_DIRECTIVE.md.pre-ceo.*"))],
+        self.assertEqual([_slurp(k, encoding="utf-8") for k in self.kept("backup")],
                          [stale])
+
+
+class KeptFolder(Rig):
+    """★RULINGS EY1·FA1 — 살아 있던 지침 파일은 지우지도 덮지도 않는다: 교체로 밀려난 파일·강등 뒤의 .pre-ceo 는 보관 폴더
+    (directives/.ceo-kept/)로 옮겨져 남고, 각자 보관 시각의 해시를 담은 곁 파일(.kept, 단독 생성)을 가진다. 교체 전에 열린
+    편집기 핸들이 교체 뒤에 저장하면 그 바이트는 보관 사본에 남고 preflight C03 가 파일마다 한 번 알린다(codex 순서 ①)."""
+    EDIT = "USERSAVE-EY1 교체 뒤 옛 핸들로 저장한 줄\n"
+
+    def c03(self):
+        env0 = dict(os.environ)
+        try:
+            os.environ["HOME"] = self.home
+            for k in pf.PACK_DIR_ENV_KEYS:
+                os.environ.pop(k, None)
+            p = pf.Preflight(fix=False, skips=[])
+            p.c03_content_pins()
+            return {r["id"]: r for r in p.results}
+        finally:
+            os.environ.clear()
+            os.environ.update(env0)
+
+    def late_save_through_an_old_handle(self, op):
+        md = self.p("MASTER_DIRECTIVE.md")
+        live = self.read("MASTER_DIRECTIVE.md")
+        fh = open(md, "r+b")                      # 편집기가 교체 전에 연 핸들
+        try:
+            ns = ceo_py_module()
+            if op == "demote":
+                rc = ns["do_demote"]([self.p("CEO_TEMPLATE.md"), md, ""])
+            else:
+                rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), md, sha(_slurp(self.p("CEO_TEMPLATE.md"), "rb")), ""])
+            self.assertIn(rc, (0, 12), "교체가 일어나지 않았다(시험 무효)")
+            fh.seek(0)
+            fh.write((live + self.EDIT).encode("utf-8"))
+            fh.truncate()
+        finally:
+            fh.close()
+        holders = [k for k in self.kept() if self.EDIT in _slurp(k, encoding="utf-8")]
+        self.assertEqual(len(holders), 1, "교체 뒤 옛 핸들의 저장이 어디에도 없다(지워진 파일에 들어갔다) — %r" % self.kept())
+        return holders[0]
+
+    def test_late_save_into_the_displaced_file_survives_demotion_and_is_reported_until_handled(self):
+        """★FY2a(FL6 의 '파일마다 한 번' 을 대신한다) — 경고는 조건이 서 있는 동안 매번 나오고, 사람이 다 본 사본을 handled/ 로
+        옮기면 끝난다(이 행은 그 폴더를 보지 않고, 행의 문장이 그 폴더를 말한다)."""
+        self.seed()
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        holder = self.late_save_through_an_old_handle("demote")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER)
+        rows = self.c03()
+        self.assertEqual(rows["C03.ceo-kept"]["status"], pf.WARN, rows.get("C03.ceo-kept"))
+        self.assertIn(holder, rows["C03.ceo-kept"]["detail"])
+        self.assertIn("살아 있는 지침에는 없다", rows["C03.ceo-kept"]["detail"])
+        handled = os.path.join(self.dirs, ".ceo-kept", "handled")
+        self.assertIn(handled, rows["C03.ceo-kept"]["detail"], "행이 경고를 끝내는 폴더를 말하지 않는다")
+        again = self.c03()["C03.ceo-kept"]
+        self.assertEqual(again["status"], pf.WARN, "조건이 그대로인데 두 번째 확인이 경고하지 않았다(기억으로 끝냈다)")
+        os.makedirs(handled)
+        for f in (holder, holder + ".kept"):
+            os.rename(f, os.path.join(handled, os.path.basename(f)))
+        done = self.c03()["C03.ceo-kept"]
+        self.assertEqual(done["status"], pf.PASS, "handled/ 로 옮긴 뒤에도 경고했다 — %r" % done)
+
+    def test_late_save_into_the_displaced_file_survives_recomposition(self):
+        self.seed()
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        _write(self.p("CEO_TEMPLATE.md"), TEMPLATE_V2)             # 틀 전진 → 다시 조립(머리말이 영수증으로 증명됨)
+        self.late_save_through_an_old_handle("compose")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER_V2 + SEP + USER)
+
+    def test_nothing_that_was_live_is_deleted(self):
+        """승격 → 강등 → 승격: 밀려난 지침 파일과 강등 뒤의 .pre-ceo 가 모두 보관 폴더에 남는다(지운 것 0) · 곁 파일마다 보관
+        시각의 해시 · 승격·강등은 보관 사본을 지우지 않는다."""
+        self.seed()
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        self.assertEqual([_slurp(k, encoding="utf-8") for k in self.kept()], [USER], "밀려난 평문 MASTER 를 보관하지 않았다")
+        rc, out, err = self.run_dept("down", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn(os.path.join(".ceo-kept", ""), out + err, "강등 출력이 보관 사본을 말하지 않는다")
+        self.register()
+        rc, out, err = self.run_dept("promote-ceo")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn(os.path.join(".ceo-kept", ""), out + err, "승격 출력이 보관 사본을 말하지 않는다")
+        got = sorted(_slurp(k, encoding="utf-8") for k in self.kept())
+        self.assertEqual(got, sorted([USER, HEADER + SEP + USER, USER, USER]),
+                         "보관 사본이 빠졌다(밀려난 평문·조립본·강등 뒤 .pre-ceo·두 번째 평문): %r" % self.kept())
+        for k in self.kept():
+            side = json.loads(_slurp(k + ".kept", encoding="utf-8"))
+            self.assertEqual(side["sha256"], sha(_slurp(k, "rb")), "곁 파일의 해시가 보관 시각의 바이트가 아니다")
+
+    def test_sidecar_is_created_exclusively(self):
+        """곁 파일은 단독 생성이다 — 같은 이름이 이미 있으면 다른 보관 이름을 고른다(공유 원장을 다시 쓰지 않는다)."""
+        self.seed()
+        ns = ceo_py_module()
+        ns["stamp"] = lambda: "20260101T000000Z"
+        kd = os.path.join(self.dirs, ".ceo-kept")
+        os.makedirs(kd)
+        taken = os.path.join(kd, "20260101T000000Z-%d-1.test" % os.getpid())
+        _write(taken + ".kept", "{}")
+        src = self.p("MASTER_DIRECTIVE.md.scratch")
+        _write(src, "보관할 바이트\n")
+        kept, digest = ns["keep_file"](src, self.p("MASTER_DIRECTIVE.md"), "test")
+        self.assertNotEqual(kept, taken)
+        self.assertEqual(_slurp(taken + ".kept", encoding="utf-8"), "{}", "남의 곁 파일을 덮었다")
+        self.assertEqual(json.loads(_slurp(kept + ".kept", encoding="utf-8"))["sha256"], digest)
+        self.assertFalse(os.path.exists(src))
+
+    # ── ★RULINGS FL6 ──
+    def test_a_crash_while_a_sidecar_is_published_leaves_no_empty_sidecar(self):
+        """곁 파일은 통째로 게시된다(codex B6: 단독 생성 뒤 쓰기 전에 멈추면 빈 곁 파일이 남았다). 곁 파일 이름을 만드는 바로 그
+        호출 뒤에서 멈춘다 — 남은 곁 파일은 온전하다(점으로 시작하는 임시 파일은 사본도 곁 파일도 아니다)."""
+        self.seed()
+        ns = ceo_py_module()
+        stop = lambda target: str(target).endswith(".kept") and not os.path.basename(str(target)).startswith(".")
+
+        class _Os:
+            def __getattr__(self, name):
+                return getattr(os, name)
+
+            def open(self, path, flags, *a, **kw):
+                fd = os.open(path, flags, *a, **kw)
+                if stop(path) and flags & os.O_CREAT:
+                    os.close(fd)
+                    raise SystemExit("crash right after the sidecar name was created")
+                return fd
+
+            def link(self, a, b):
+                os.link(a, b)
+                if stop(b):
+                    raise SystemExit("crash right after the sidecar was placed")
+        ns["os"] = _Os()
+        nr0 = ns["noreplace_fn"]()
+        if nr0 is not None:
+            def nr(a, b):
+                nr0(a, b)
+                if stop(b):
+                    raise SystemExit("crash right after the sidecar was placed")
+            ns["noreplace_fn"] = lambda: nr
+        src = self.p("MASTER_DIRECTIVE.md.scratch")
+        _write(src, "보관할 바이트\n")
+        with self.assertRaises(SystemExit):
+            ns["keep_file"](src, self.p("MASTER_DIRECTIVE.md"), "test")
+        kd = os.path.join(self.dirs, ".ceo-kept")
+        sides = [f for f in os.listdir(kd) if stop(f)]
+        self.assertTrue(sides, "곁 파일 이름을 만드는 호출에 이르지 않았다(시험 무효)")
+        for f in sides:
+            raw = _slurp(os.path.join(kd, f), encoding="utf-8")
+            self.assertTrue(raw.strip(), "멈춘 뒤 빈 곁 파일이 남았다(codex B6)")
+            self.assertEqual(json.loads(raw)["sha256"], sha("보관할 바이트\n"))
+
+    def test_a_kept_file_without_a_readable_sidecar_is_unresolved_not_skipped(self):
+        """곁 파일이 없거나 형식이 틀린 사본은 C03 이 건너뛰지 않는다 — '미확인'으로 보이고, 그대로인 동안 매번 WARN(FY2)."""
+        self.seed()
+        kd = os.path.join(self.dirs, ".ceo-kept")
+        os.makedirs(kd)
+        bare = os.path.join(kd, "20260101T000000Z-1-1.compose")
+        bad = os.path.join(kd, "20260101T000000Z-1-2.compose")
+        _write(bare, USER)
+        _write(bad, USER)
+        _write(bad + ".kept", "")
+        _write(os.path.join(kd, ".20260101T000000Z-1-3.compose.kept.x.tmp"), "")    # 멈춘 게시의 임시 파일 — 사본이 아니다
+        row = self.c03()["C03.ceo-kept"]
+        self.assertEqual(row["status"], pf.WARN, row)
+        for k in (bare, bad):
+            self.assertIn(k, row["detail"], "곁 파일이 없거나 틀린 사본을 건너뛰었다")
+        self.assertIn("미확인", row["detail"])
+        self.assertIn("보관 사본 2개", row["detail"], "임시 파일을 사본으로 셌다")
+        again = self.c03()["C03.ceo-kept"]
+        self.assertEqual(again["status"], pf.WARN, "미확인 사본이 그대로인데 경고가 멈췄다(★FY2a — 기억 없음)")
+        for k in (bare, bad):
+            self.assertIn(k, again["detail"], "미확인 사본이 다음 확인에서 사라졌다")
+
+    def test_nothing_is_acknowledged_so_a_lost_output_loses_no_warning(self):
+        """codex R2 — 종전: WARN 행을 메모리에 남긴 뒤 '알렸다' 표지를 만들어, 출력 전에 멈추면 그 경고는 영영 나오지 않았다. 이제
+        이 행은 아무것도 기억하지 않는다(FY2a): 출력되지 못한 실행 뒤의 다음 실행도 WARN 이고, 표지 폴더는 생기지 않는다."""
+        self.seed()
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        holder = self.late_save_through_an_old_handle("demote")
+        orig = pf.Preflight.add
+
+        def failing_add(p, cid, status, *a, **kw):
+            if cid == "C03.ceo-kept" and status == pf.WARN:
+                raise RuntimeError("the WARN row was never printed (crash)")
+            return orig(p, cid, status, *a, **kw)
+        pf.Preflight.add = failing_add
+        try:
+            with self.assertRaises(RuntimeError):
+                self.c03()
+        finally:
+            pf.Preflight.add = orig
+        self.c03()                                  # 결과를 내지 못하고 끝난 또 한 번의 실행(출력 전에 멈춤)
+        row = self.c03()["C03.ceo-kept"]
+        self.assertEqual(row["status"], pf.WARN, "출력되지 못한 경고를 '이미 알림'으로 넘겼다(codex R2)")
+        self.assertIn(holder, row["detail"])
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".cys", "state", "preflight-c03-kept-warned")),
+                         "'알렸다' 표지 폴더가 생겼다")
+
+    def test_a_header_only_change_is_not_reported_as_in_the_live_directive(self):
+        """★FY5(codex R5) — 머리말만 바뀐 조립 사본: 본문은 살아 있는 지침에 있지만 머리말은 이 사본에만 있다. 종전에는 본문만 비교해
+        '살아 있는 지침에도 있다'고 말했다. 이제 머리말과 본문을 따로 재고, 머리말이 다르면 그대로 말하며 WARN 이다. 머리말까지
+        같으면(내용 전체가 살아 있다) PASS."""
+        self.seed(md=HEADER + SEP + USER)
+        kd = os.path.join(self.dirs, ".ceo-kept")
+        os.makedirs(kd)
+        k = os.path.join(kd, "20260101T000000Z-1-1.before-compose")
+        _write(k, "# 사용자가 고친 머리말 줄\n" + HEADER + SEP + USER)          # 보관 뒤 머리말만 바뀌었다
+        _write(k + ".kept", json.dumps({"schema": 2, "kind": "regular", "sha256": sha(HEADER + SEP + USER)}))
+        row = self.c03()["C03.ceo-kept"]
+        self.assertEqual(row["status"], pf.WARN, "머리말만 바뀐 사본을 '살아 있는 지침에 있다'로 넘겼다(codex R5): %r" % row)
+        self.assertIn("머리말이 살아 있는 지침의 머리말과 다르다", row["detail"])
+        self.assertNotIn("그 내용은 살아 있는 지침에도 있다", row["detail"])
+        _write(k, HEADER + SEP + USER + "옮겨 적은 줄\n")                      # 머리말 같음 · 본문의 새 줄도 살아 있게 옮긴다
+        _write(self.p("MASTER_DIRECTIVE.md"), HEADER + SEP + USER + "옮겨 적은 줄\n")
+        row = self.c03()["C03.ceo-kept"]
+        self.assertEqual(row["status"], pf.PASS, row)
+        self.assertIn("머리말과 본문", row["detail"])
+
+    def test_every_unusable_sidecar_is_unresolved(self):
+        """★FY2b·c — 기준을 세울 수 없는 곁 파일은 모두 '미확인'(WARN): {} · {"sha256": null} · 종류 없음 · 일반 파일인데 해시 없음 ·
+        읽지 못했다(unread) · 객체가 아님 · 해시 형식이 틀림 · 일반 파일이 아니라는데 지금은 일반 파일. 폴더로 보관된 것은
+        '비교하지 않음'으로 이름이 나온다(조용히 건너뛰지 않는다)."""
+        good = sha("보관 때의 바이트\n")
+        cases = [("empty object", {}, "file"), ("null hash only", {"sha256": None}, "file"),
+                 ("regular without hash", {"kind": "regular", "sha256": None}, "file"),
+                 ("unread", {"kind": "regular", "sha256": None, "unread": True}, "file"),
+                 ("not an object", [good], "file"), ("bad hash", {"kind": "regular", "sha256": "xyz"}, "file"),
+                 ("link but now a file", {"kind": "link", "sha256": None}, "file"),
+                 ("no kind with a hash", {"sha256": good}, "file")]
+        for label, side, what in cases:
+            with self.subTest(sidecar=label):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                kd = os.path.join(self.dirs, ".ceo-kept")
+                os.makedirs(kd)
+                k = os.path.join(kd, "20260101T000000Z-1-1.compose")
+                _write(k, "보관 때의 바이트\n")
+                _write(k + ".kept", json.dumps(side))
+                row = self.c03()["C03.ceo-kept"]
+                self.assertEqual(row["status"], pf.WARN, "%s 곁 파일을 미확인으로 보지 않았다: %r" % (label, row))
+                self.assertIn("미확인", row["detail"])
+                self.assertIn(k, row["detail"])
+        shutil.rmtree(self.dirs, ignore_errors=True)
+        self.seed()
+        kd = os.path.join(self.dirs, ".ceo-kept")
+        os.makedirs(os.path.join(kd, "20260101T000000Z-1-1.backup"))
+        _write(os.path.join(kd, "20260101T000000Z-1-1.backup.kept"), json.dumps({"kind": "dir", "sha256": None}))
+        row = self.c03()["C03.ceo-kept"]
+        self.assertEqual(row["status"], pf.PASS, row)
+        self.assertIn("비교하지 않음", row["detail"])
+        self.assertIn("20260101T000000Z-1-1.backup", row["detail"])
+
+    def test_the_warning_claims_only_what_it_measured(self):
+        """경고는 잰 것을 말한다 — 사본의 바이트가 보관 뒤에 바뀌었다. '살아 있는 지침에는 없다'는 살아 있는 지침과 비교했을 때만:
+        바뀐 내용이 살아 있는 지침에도 있으면 그렇게, 살아 있는 지침을 읽지 못하면 '비교하지 못했다'고 말한다(codex minor)."""
+        self.seed()
+        kd = os.path.join(self.dirs, ".ceo-kept")
+        os.makedirs(kd)
+        k1 = os.path.join(kd, "20260101T000000Z-1-1.compose")
+        _write(k1, USER)                                                  # 바뀐 사본 — 그 내용은 살아 있는 지침(USER)에 있다
+        _write(k1 + ".kept", json.dumps({"schema": 2, "kind": "regular", "sha256": sha("보관 때의 바이트\n")}))
+        row = self.c03()["C03.ceo-kept"]
+        self.assertEqual(row["status"], pf.PASS, "바뀐 내용이 살아 있는 지침에 있는데 경고했다(★FY2a): %r" % row)
+        self.assertIn("살아 있는 지침에도 있다", row["detail"])
+        self.assertNotIn("살아 있는 지침에는 없다", row["detail"], "비교해 보면 있는데 없다고 말했다")
+        k2 = os.path.join(kd, "20260101T000000Z-1-2.compose")
+        _write(k2, USER + "다른 줄\n")
+        _write(k2 + ".kept", json.dumps({"schema": 2, "kind": "regular", "sha256": sha("보관 때의 바이트\n")}))
+        aside = self.p("MASTER_DIRECTIVE.md.aside")
+        os.rename(self.p("MASTER_DIRECTIVE.md"), aside)                   # 살아 있는 지침을 읽을 수 없다
+        try:
+            row = self.c03()["C03.ceo-kept"]
+        finally:
+            os.rename(aside, self.p("MASTER_DIRECTIVE.md"))
+        self.assertEqual(row["status"], pf.WARN, row)
+        self.assertIn(k2, row["detail"])
+        self.assertIn("비교하지 못했다", row["detail"])
+        self.assertNotIn("살아 있는 지침에는 없다", row["detail"], "비교하지 않고 '없다'고 말했다")
+
+
+class IntentRecovery(Rig):
+    """★RULINGS EY2·FA2·FA3 — 교체는 복구할 수 있는 한 단위다: 살아 있는 이름이 바뀌기 전에 의도 기록(directives/.ceo-intent.json)
+    이 남고, 조립 경로의 모든 입구가 끝나지 않은 의도를 먼저 마무리한다. 어느 지점에서 멈춰도 다음 실행은 옛 지침이나 (의도와
+    함께) 새 지침을 보고, 빠졌거나 반쪽이거나 낡은 지침을 현행으로 받지 않는다. 멈춤은 실제 ceo_py 의 함수를 감싸 SystemExit 로
+    끼워 넣는다(시간이 아니라)."""
+    SAVE = "USERSAVE-EY2 읽은 뒤에 저장한 줄\n"
+
+    def setUp(self):
+        super().setUp()
+        self.env["CYS_CEO_LOCK_WAIT_S"] = "5"
+
+    def ns_mode(self, mode):
+        ns = ceo_py_module()
+        if mode == "deposit":
+            ns["exchange_fn"] = lambda: None
+        elif ns["exchange_fn"]() is None:
+            self.skipTest("이 플랫폼에는 원자 맞바꾸기가 없다")
+        return ns
+
+    def crash_after(self, ns, name, before=None):
+        orig = ns[name]
+
+        def wrapped(*a, **kw):
+            if before:
+                before()
+            orig(*a, **kw)
+            raise SystemExit("injected crash after %s" % name)
+        ns[name] = wrapped
+
+    def compose(self, ns):
+        return ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), ""])
+
+    def candidates(self):
+        return [f for f in os.listdir(self.dirs) if f.endswith(".candidate")]
+
+    def assert_recovered_composed(self, body):
+        rc, out, err = self.run_dept("promote-ceo")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + body, "다음 실행이 바른 조립에 이르지 않았다")
+        self.assertIsNone(self.read(".ceo-intent.json"), "의도 기록이 남았다")
+        self.assertEqual(self.candidates(), [], "후보 파일이 남았다")
+
+    # ── codex 순서 ② ──
+    def test_crash_after_exchange_before_validation_recovers_the_save(self):
+        """B 를 읽은 뒤 B+E 저장 → 낡은 후보 H+S+B 가 맞바꿔 들어감 → 검사 전에 멈춤. 다음 실행은 낡은 후보를 현행으로 받지
+        않고, 밀려난 파일(B+E)을 새 진실로 보고 그것으로 조립한다(종전: current-fix 가 H+S+B 를 받아 E 를 잃었다)."""
+        ns = ceo_py_module()
+        real = ns["exchange_fn"]()
+        if real is None:
+            self.skipTest("이 플랫폼에는 원자 맞바꾸기가 없다")
+        self.seed()
+
+        def ex_then_crash(a, b):
+            if not a.endswith(".candidate"):
+                return real(a, b)               # 방법 시험(swap_mode)의 맞바꾸기는 그대로
+            _write(self.p("MASTER_DIRECTIVE.md"), USER + self.SAVE)    # 읽은 뒤 · 맞바꾸기 전의 저장
+            real(a, b)
+            raise SystemExit("crash right after the exchange")
+        ns["exchange_fn"] = lambda: ex_then_crash
+        with self.assertRaises(SystemExit):
+            self.compose(ns)
+        self.assert_recovered_composed(USER + self.SAVE)
+        self.assertIn(HEADER + SEP + USER, [_slurp(k, encoding="utf-8") for k in self.kept()],
+                      "잠깐 살아 있던 낡은 후보를 보관하지 않았다(EY1)")
+
+    def test_second_save_before_the_rollback_is_never_moved_out(self):
+        """맞바꾸기 직후(검사 전) 살아 있는 파일에 두 번째 저장. 되돌리기는 지금 살아 있는 것을 다시 읽는다 — 우리 후보가 아니면
+        그것은 새 편집이라 그대로 두고(보류 · 알림), 앞의 저장은 보관 폴더에 남는다(종전: 무조건 맞바꿔 두 번째 저장을 밀어냈다)."""
+        ns = ceo_py_module()
+        real = ns["exchange_fn"]()
+        if real is None:
+            self.skipTest("이 플랫폼에는 원자 맞바꾸기가 없다")
+        self.seed()
+        second = USER + "SECOND-SAVE 맞바꾸기 직후 두 번째 저장\n"
+        fired = []
+
+        def ex_with_two_saves(a, b):
+            if not a.endswith(".candidate"):
+                return real(a, b)               # 방법 시험(swap_mode)의 맞바꾸기는 그대로
+            if not fired:
+                fired.append(1)
+                _write(self.p("MASTER_DIRECTIVE.md"), USER + self.SAVE)
+                real(a, b)
+                with open(self.p("MASTER_DIRECTIVE.md"), "w", encoding="utf-8") as f:
+                    f.write(second)
+                return
+            real(a, b)
+        ns["exchange_fn"] = lambda: ex_with_two_saves
+        nf = os.path.join(self.tmp, "nf.txt")
+        rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), nf])
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), second, "되돌리기가 두 번째 저장을 살아 있는 이름에서 밀어냈다")
+        self.assertIn(USER + self.SAVE, [_slurp(k, encoding="utf-8") for k in self.kept()], "앞의 저장이 보관되지 않았다")
+        self.assertEqual(rc, 6, "두 저장이 겹쳤는데 보류가 아니다")
+        self.assertIn("두 저장이 겹침", self.notices_text())
+
+    # ── 멈춤 지점 표(보고서 Round 2 (2)) ──
+    def test_crash_points_of_a_promotion(self):
+        steps = [("exchange", "write_candidate"), ("exchange", "write_intent"), ("exchange", "prim_exchange"),
+                 ("exchange", "keep_file"), ("deposit", "write_intent"), ("deposit", "keep_file"),
+                 ("deposit", "place_candidate")]
+        for mode, name in steps:
+            with self.subTest(mode=mode, crash_after=name):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                ns = self.ns_mode(mode)
+                self.assertIn(name, ns, "교체 단계 함수 %s 가 없다" % name)
+                self.crash_after(ns, name)
+                with self.assertRaises(SystemExit):
+                    self.compose(ns)
+                live = self.read("MASTER_DIRECTIVE.md")
+                self.assertIn(live, (None, USER, HEADER + SEP + USER), "멈춘 뒤 반쪽 지침: %r" % live)
+                if live is None:
+                    self.assertIsNotNone(self.read(".ceo-intent.json"), "살아 있는 이름이 빠졌는데 의도 기록이 없다")
+                self.assert_recovered_composed(USER)
+                self.assertIn(USER, [_slurp(k, encoding="utf-8") for k in self.kept()] + [self.read("MASTER_DIRECTIVE.md.pre-ceo")])
+
+    def test_crash_points_of_a_demotion(self):
+        for mode in ("exchange", "deposit"):
+            with self.subTest(mode=mode):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                self.register()
+                self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+                ns = self.ns_mode(mode)
+                self.crash_after(ns, "prim_exchange" if mode == "exchange" else "keep_file")
+                with self.assertRaises(SystemExit):
+                    ns["do_demote"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), ""])
+                rc, out, err = self.run_dept("down", "d0")
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "다음 강등이 중단된 교체를 마무리하지 않았다")
+                self.assertIsNone(self.read(".ceo-intent.json"))
+
+    # ── codex B1 · B7(Round 3 — RULINGS FL4: 기록은 마지막에 지워지고, 복구는 기록된 동작을 끝낸다) ──
+    def hook_save_before_swap(self, ns, text):
+        """조립이 지침을 읽은 뒤 · 교체 전(첫 swap_unit 직전)에 사용자 저장 1회(제자리 쓰기)."""
+        orig = ns["swap_unit"]
+        fired = []
+
+        def wrapped(md, *a, **kw):
+            if not fired:
+                fired.append(1)
+                with open(self.p("MASTER_DIRECTIVE.md"), "w", encoding="utf-8") as f:
+                    f.write(text)
+            return orig(md, *a, **kw)
+        ns["swap_unit"] = wrapped
+        return fired
+
+    def test_a_crash_after_the_record_is_removed_never_accepts_a_stale_composition(self):
+        """codex B1 — 기록이 검증보다 먼저 지워져, 그 사이에서 멈추면 다음 실행이 낡은 조립을 현행으로 받아 읽은 뒤의 저장을
+        잃었다. 기록은 마지막에 지워진다: 첫 기록 제거 바로 뒤에서 멈춰도 그 저장은 조립돼 살아 있다."""
+        for mode in ("exchange", "deposit"):
+            with self.subTest(mode=mode):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                ns = self.ns_mode(mode)
+                fired = self.hook_save_before_swap(ns, USER + self.SAVE)
+                self.crash_after(ns, "remove_intent")
+                with self.assertRaises(SystemExit):
+                    self.compose(ns)
+                self.assertEqual(fired, [1], "끼어들기가 일어나지 않았다(시험 무효)")
+                self.assert_recovered_composed(USER + self.SAVE)
+
+    def test_the_tick_finishes_the_operation_after_restoring_a_newer_save(self):
+        """codex B7 — 틱이 밀려난 새 진실을 되돌린 뒤 기록을 지우고 끝나 조립이 끝나지 않은 채 남았다(PENDING 이 없으면 다음 부서
+        이벤트까지 · 기록도 없이). 틱은 기록된 동작을 끝낸다: 되돌린 저장으로 다시 조립하고 영수증까지 쓴 뒤 기록을 지운다."""
+        for mode in ("exchange", "deposit"):
+            with self.subTest(mode=mode):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                ns = self.ns_mode(mode)
+                self.hook_save_before_swap(ns, USER + self.SAVE)
+                self.crash_after(ns, "keep_file")
+                with self.assertRaises(SystemExit):
+                    self.compose(ns)
+                self.assertFalse(os.path.exists(self.pending_path()))
+                rc, out, err = self.run_dept("promote-if-pending")
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER + self.SAVE,
+                                 "틱이 되돌리기만 하고 기록된 조립을 끝내지 않았다(codex B7)")
+                self.assertIsNone(self.read(".ceo-intent.json"))
+                self.assert_receipt_for(HEADER, USER + self.SAVE, HEADER + SEP + USER + self.SAVE)
+                self.assertIn(USER + self.SAVE, [_slurp(k, encoding="utf-8") for k in self.kept()])
+
+    def test_the_tick_closes_a_gap_without_a_launch(self):
+        """FA3 — 10분 승격 대기 틱(promote-if-pending)이 PENDING 없이도 끝나지 않은 교체를 마무리한다(빠진 살아 있는 이름 포함) ·
+        틱은 알림을 보내지 않는다."""
+        self.seed()
+        ns = self.ns_mode("deposit")
+        self.crash_after(ns, "keep_file")
+        with self.assertRaises(SystemExit):
+            self.compose(ns)
+        self.assertIsNone(self.read("MASTER_DIRECTIVE.md"), "시험 전제: 살아 있는 이름이 빠진 상태")
+        self.assertFalse(os.path.exists(self.pending_path()))
+        n0 = len(self.pushes_prefix("CEO "))
+        rc, out, err = self.run_dept("promote-if-pending")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER, "틱이 빠진 이름을 메우지 않았다")
+        self.assertIsNone(self.read(".ceo-intent.json"))
+        self.assertEqual(len(self.pushes_prefix("CEO ")), n0, "틱이 알림을 보냈다")
+
+    def test_read_only_entries_see_an_open_intent(self):
+        self.seed()
+        ns = self.ns_mode("exchange")
+        self.crash_after(ns, "prim_exchange")
+        with self.assertRaises(SystemExit):
+            self.compose(ns)
+        self.assertEqual(self.run_ceo_py("state", self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"))[1].strip(),
+                         "intent")
+        rc, out, _ = self.run_ceo_py("verify", self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"))
+        self.assertEqual(rc, 1)
+        self.assertIn("끝나지 않았다", out)
+        env0 = dict(os.environ)
+        try:
+            os.environ["HOME"] = self.home
+            for k in pf.PACK_DIR_ENV_KEYS:
+                os.environ.pop(k, None)
+            p = pf.Preflight(fix=False, skips=[])
+            p.c03_content_pins()
+            rows = {r["id"]: r for r in p.results}
+        finally:
+            os.environ.clear()
+            os.environ.update(env0)
+        self.assertEqual(rows["C03.ceo-intent"]["status"], pf.WARN)
+        self.assertIn("끝나지 않은 CEO 지침 교체", rows["C03.ceo-intent"]["detail"])
+
+    # ── ★RULINGS FL2(FA2 철회) — 이 코드는 아무것도 지우지 않는다 ──
+    def test_an_orphan_candidate_goes_to_the_kept_folder(self):
+        """기록이 이름 대지 않는 후보도 지우지 않고 보관 폴더로 옮긴다(이유 unused-candidate). 종전 FA2 는 '살아 있던 적이 없다'며
+        지웠다 — 읽을 수 없는 기록을 치운 뒤에는 그것이 밀려난 판일 수 있었다(codex B3). 이 시험이 FA2 의 시험을 대신한다."""
+        self.seed()
+        orphan = self.p(".MASTER_DIRECTIVE.md.20260101T000000Z-1-1.candidate")
+        _write(orphan, "never live\n")
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        self.assertFalse(os.path.exists(orphan), "이름 없는 후보가 지침 폴더에 남았다")
+        self.assertEqual([_slurp(k, encoding="utf-8") for k in self.kept("unused-candidate")], ["never live\n"],
+                         "이름 없는 후보를 지웠다(보관 폴더에 없다)")
+
+    def test_a_cancelled_swap_keeps_its_candidate(self):
+        """바꾸기 전에 멈춘 교체의 후보도 지우지 않는다 — 다음 입구가 그것을 보관 폴더로 옮기고 동작을 끝낸다."""
+        for mode in ("exchange", "deposit"):
+            with self.subTest(mode=mode):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                ns = self.ns_mode(mode)
+                self.crash_after(ns, "write_intent")
+                with self.assertRaises(SystemExit):
+                    self.compose(ns)
+                self.assert_recovered_composed(USER)
+                self.assertEqual([_slurp(k, encoding="utf-8") for k in self.kept("unused-candidate")], [HEADER + SEP + USER],
+                                 "바꾸기 전에 멈춘 교체의 후보를 지웠다")
+
+    def test_an_unreadable_record_is_a_barrier(self):
+        """codex B3 — 맞바꾼 뒤 멈춰 밀려난 판이 후보 이름에 있는데 기록을 읽을 수 없다. 종전: 첫 입구가 기록을 보관 폴더로 치우고
+        다음 입구가 '이름 없는 후보'로 그 판을 지웠다. 이제 장벽이다: 아무것도 옮기거나 지우지 않고 조립·강등을 보류하며(알림
+        한 번), 몇 번을 다시 와도(지명·틱) 그대로다."""
+        ns = self.ns_mode("exchange")
+        self.seed()
+        self.crash_after(ns, "prim_exchange")
+        with self.assertRaises(SystemExit):
+            self.compose(ns)
+        _write(self.p(".ceo-intent.json"), "{ 반쪽 기록")
+        snap = lambda: {f: _slurp(self.p(f), "rb") for f in os.listdir(self.dirs) if os.path.isfile(self.p(f))}
+        before = snap()
+        self.assertIn(USER.encode(), before.values(), "시험 전제: 밀려난 판(평문 MASTER)이 후보 이름에 있다")
+        for args in (("promote-ceo",), ("promote-ceo",), ("promote-if-pending",)):
+            rc, out, err = self.run_dept(*args)
+            self.assertIn(rc, (0, 5), out + err)
+        after = snap()
+        for f, b in before.items():
+            self.assertEqual(after.get(f), b, "장벽인데 %s 가 바뀌거나 사라졌다" % f)
+        self.assertIn(USER.encode(), after.values(), "밀려난 판이 지워졌다(codex B3)")
+        self.assertEqual(self.kept(), [], "장벽인데 무언가를 옮겼다")
+        self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), 1, "장벽 알림이 한 번이 아니다(틱마다 보내지 않는다 — FA3)")
+
+
+class _Crash(BaseException):
+    """끼워 넣은 멈춤 — BaseException 이라 제품의 어떤 except 도 삼키지 않는다(죽은 프로세스)."""
+
+
+class _Runaway(BaseException):
+    """한 입구가 정한 원시 연산 수를 넘었다 — 끝나지 않는 되풀이(S3 위반)."""
+
+
+DOOR = ("fs_read", "fs_kind", "fs_list", "fs_mode", "fs_create", "fs_temp", "fs_replace", "fs_rename_into", "fs_place",
+        "fs_link", "fs_exchange", "fs_unlink", "fs_mkdir", "fs_sync_dir", "fs_append", "fs_lock")
+DOOR_IMPL = ("exchange_fn", "noreplace_fn", "retry_sharing")     # 문 안에서만 쓰는 도우미(libc 찾기 · 윈도우 공유 위반 재시도)
+READS = ("fs_read", "fs_kind", "fs_list", "fs_mode")
+FLUSHES = ("fs_sync_dir", "fs_create", "fs_temp")
+
+
+def ceo_py_ast():
+    src = extract_shell_function(_slurp(DEPT, encoding="utf-8"), "ceo_py")
+    return ast.parse(src.split("<<'PY'\n", 1)[1].rsplit("\nPY\n", 1)[0])
+
+
+class DoorCensus(unittest.TestCase):
+    """★RULINGS FY4a — 한 문(門): ceo_py 의 모든 파일 시스템 효과와 읽기는 보고서의 원시 연산 표를 지난다. 이 시험은 원문을 읽어
+    그 표 밖에서 open · os 의 파일 함수 · os.path 의 존재 검사 · tempfile · shutil · 잠금 모듈 · ctypes 를 쓰는 곳을 센다 — 0 이어야
+    한다(그래야 속성 시험의 연산 상한이 S3 을 증명한다: 세지 않고 빠져나가는 연산이 없다). 예외는 load_preflight 하나 — 상위집합
+    검사가 javis_preflight 모듈을 import 로 싣는다(파이썬의 import 장치 · 실패하면 닫힌 쪽으로 보류)."""
+    OS = {"open", "read", "write", "fsync", "fdopen", "stat", "lstat", "fstat", "listdir", "scandir", "rename", "replace",
+          "link", "unlink", "remove", "rmdir", "mkdir", "makedirs", "chmod", "utime", "symlink", "readlink", "close",
+          "truncate", "ftruncate", "chdir", "walk"}
+    PATH = {"exists", "lexists", "isfile", "isdir", "islink", "getsize", "getmtime", "realpath", "samefile"}
+    MODS = {"tempfile", "shutil", "fcntl", "msvcrt", "ctypes", "glob", "io", "pathlib"}
+    EXEMPT = {"load_preflight"}
+
+    def outside(self, tree):
+        found = []
+        for top in tree.body:
+            name = getattr(top, "name", "<module>")
+            if isinstance(top, ast.FunctionDef) and (name in DOOR or name in DOOR_IMPL or name in self.EXEMPT):
+                continue
+            for n in ast.walk(top):
+                bad = None
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "open":
+                    bad = "open()"
+                elif isinstance(n, ast.Attribute):
+                    v = n.value
+                    if isinstance(v, ast.Name) and v.id == "os" and n.attr in self.OS:
+                        bad = "os." + n.attr
+                    elif (isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name) and v.value.id == "os"
+                          and v.attr == "path" and n.attr in self.PATH):
+                        bad = "os.path." + n.attr
+                elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in self.MODS:
+                    bad = n.id
+                if bad:
+                    found.append("%s:%d %s" % (name, n.lineno, bad))
+        return found
+
+    def test_every_file_operation_goes_through_the_door(self):
+        tree = ceo_py_ast()
+        names = {t.name for t in tree.body if isinstance(t, ast.FunctionDef)}
+        self.assertEqual([d for d in DOOR + DOOR_IMPL if d not in names], [], "보고서 표의 원시 연산이 원문에 없다")
+        self.assertEqual(self.outside(tree), [], "원시 연산 표 밖의 파일 연산(문을 지나지 않는다)")
+
+    def test_the_census_sees_an_operation_outside_the_door(self):
+        """시험이 무엇이든 통과시키지 않는다는 대조: 표 밖에 os.replace · open · os.path.exists 를 넣은 원문은 센다."""
+        tree = ast.parse("import os\ndef sneaky(p):\n    os.replace(p, p + '.x')\n    open(p).read()\n"
+                         "    return os.path.exists(p)\ndef fs_read(p):\n    return open(p, 'rb').read()\n")
+        self.assertEqual(len(self.outside(tree)), 3)
+
+
+class _Door:
+    """ceo_py 의 원시 연산(DOOR) 하나하나에 번호를 매긴다. crash_at 번째 호출 **뒤에서** 멈추고(그 뒤의 호출은 하지 않고 다시
+    멈춘다 — 죽은 프로세스는 정리 코드도 돌지 않는다), save_at 번째 호출 **앞에서** 사용자 저장 1회, fail = (n, how) 로 그 호출
+    자체의 실패를 끼워 넣는다: read-once · read-lasting(그 원시 연산·그 경로는 이 입구와 다음 입구에서 계속 실패 — 마지막 깨끗한
+    입구에서 풀린다) · flush(쓰기는 됐으나 flush 가 실패: fs_create 는 반쪽 파일을 남기고, fs_temp 는 그 임시 파일을 치우고, 폴더
+    flush 는 효과 없이). 끼워 넣은 것은 모두 '닿았다'고 센다(planned = reached)."""
+    BUDGET = 1500
+
+    def __init__(self, ns, crash_at=None, save_at=None, save=None, fail=None, lasting=None, after=None, outbox=""):
+        self.crash_at, self.save_at, self.save, self.fail = crash_at, save_at, save, fail
+        self.lasting = set(lasting or ())
+        self.after, self.outbox = after, outbox
+        self.n, self.dead, self.calls = 0, False, []
+        self.crashed = self.saved = self.failed = self.unknown = self.outbox_failed = False
+        self.new_lasting = set()
+        for name in DOOR:
+            self.wrap(ns, name)
+
+    def wrap(self, ns, name):
+        orig, unknown = ns[name], ns["Unknown"]
+
+        def call(*a, **kw):
+            if self.dead:
+                raise _Crash()
+            self.n += 1
+            n = self.n
+            if n > self.BUDGET:
+                raise _Runaway()
+            path = os.path.abspath(str(a[0])) if a else ""
+            self.calls.append((name, path))
+            if self.save_at == n:
+                self.save()
+                self.saved = True
+            hit = (name, path) in self.lasting
+            if self.fail and self.fail[0] == n:
+                self.failed, hit = True, self.fail[1].startswith("read")
+                if self.fail[1] == "read-lasting":
+                    self.lasting.add((name, path))
+                    self.new_lasting.add((name, path))
+                if self.fail[1] == "flush":
+                    if self.outbox and path.startswith(self.outbox):
+                        self.outbox_failed = True
+                    if name != "fs_sync_dir":
+                        r = orig(*a, **kw)
+                        if name == "fs_temp":
+                            os.unlink(r)            # 실제 fs_temp 는 flush 실패 때 그 임시 파일을 치운다
+                    raise OSError(errno.EIO, "flush failed (injected)")
+            if hit:
+                self.unknown = True
+                if self.outbox and path.startswith(self.outbox):
+                    self.outbox_failed = True
+                raise unknown(path, OSError(errno.EIO, "read failed (injected)"))
+            try:
+                return orig(*a, **kw)       # 돌려주든 예외를 올리든(예: 없는 영수증 지우기) 그 호출은 끝났다
+            finally:
+                if self.after:
+                    self.after()
+                if self.crash_at == n:
+                    self.dead = self.crashed = True
+                    raise _Crash()          # 그 호출 **뒤에서** 멈춘다(호출의 결과·예외 대신)
+        ns[name] = call
+
+
+class CrashProperty(Rig):
+    """★RULINGS FL7 · FY4 — 한 속성 시험이 S1–S3 을 진다. ceo_py 의 원시 연산(문 — DoorCensus 가 빠짐없음을 잰다) **모든 호출**에
+    끼워 넣는다: 그 호출 뒤의 멈춤, 그리고 멈춤 없이 실패할 수 있는 원시 연산에는 그 실패 자체(읽기 오류 — 한 번 · 계속 · flush 실패).
+    멈춘 지점마다 다음 입구(같은 동작의 입구 · 10분 틱)를 돌리고, 그 입구도 그 호출마다 멈춘다(두 번째 고장) — 저장이 연 복구 경로
+    (되돌리기 · 다시 조립)까지. 그리고 깨끗한 입구가 마무리한 뒤 단언한다:
+      I1 살아 있던 적이 있는 모든 판(호출마다 관찰)과 끼워 넣은 사용자 저장은 살아 있는 지침이나 보관 폴더에 있다(사용자 자신의
+         저장이 덮은 판만 예외).
+      I2 끝난 입구마다 살아 있는 이름이 있고, 더 새 저장이 있을 때 낡은 결과가 아니다.
+      I3 기록된 동작은 끝났거나(조립 = 현행 머리말 + 마지막 본문 · 유효한 영수증 / 강등 = 마지막 본문 · 영수증 없음) 알림과 함께
+         보류됐다 — 보류한 입구마다 그 알림이 영속 알림함(또는 sent/)에 있다(★FY3 · 알림함 자체에 끼운 실패면 stderr 의 '알림 기록
+         실패'). 계속 실패하는 읽기는 다시 와도 보류이고 아무것도 더 옮기지 않는다. 끝에 기록·후보가 남지 않는다.
+      I4 모든 입구가 원시 연산 상한 안에서 끝났다(문 밖의 연산이 없으니 상한이 곧 S3 의 증명이다).
+    끼워 넣기로 계획한 것은 모두 닿았는지 센다(planned = reached). 무엇을 모델하는가: 원시 연산 사이에서 프로세스가 멈추는 것 —
+    끝난 원시 연산의 효과는 남는다. 모델하지 않는 것: flush 하지 않은 데이터를 잃는 정전(FL5 의 flush 실패 보고까지만)과 원시 연산
+    하나 안의 찢어진 쓰기('통째로 게시'가 답한다). 시간은 쓰지 않는다(EZ1). 묶음 실행은 완전한 단일 고장 쓸기 + (첫 멈춤의 단계 ×
+    저장의 단계 × 두 번째 고장의 단계) 모든 칸을 담은 결정론적 층화 표본이다. CYS_T8_FL7_COMPLETE=1 이면 완전한 곱을 돈다."""
+    SAVE_LINE = "USERSAVE-FL7 어느 걸음에서든 끼워 넣은 저장\n"
+    _code = None
+
+    @classmethod
+    def code(cls):
+        if cls._code is None:
+            src = extract_shell_function(_slurp(DEPT, encoding="utf-8"), "ceo_py")
+            body = src.split("<<'PY'\n", 1)[1].rsplit("\nPY\n", 1)[0].rstrip()
+            tail = "sys.exit(main(sys.argv))"
+            assert body.endswith(tail)
+            cls._code = compile(body[: -len(tail)], DEPT + ":ceo_py", "exec")
+        return cls._code
+
+    def module(self, mode):
+        ns = {"__name__": "ceo_py_property"}
+        exec(self.code(), ns)
+        # 이름에 든 UTC 초를 고정한다 — 두 입구가 같은 초에 들었는지에 따라 이름 찾기 횟수(원시 연산 수)가 달라지면 계획한 호출
+        #   번호가 실행마다 밀린다(완전한 곱이 찾았다). 이름의 유일함은 초가 아니라 잠금 안의 존재 확인이 지킨다.
+        ns["stamp"] = lambda: "20260101T000000Z"
+        if mode == "deposit":
+            ns["exchange_fn"] = lambda: None
+        ns["_MODE"][os.path.dirname(os.path.abspath(self.md))] = mode   # 방법 시험은 이 시나리오의 경로로 고정
+        orig_pub = ns["publish_notice"]
+
+        def pub(md, key, title, body):
+            # ★GQ2a — 빚진 알림 하나하나를 그 안정된 키로 센다(넣었다고 답했는지 · 그때 기록이 디스크에 있었는지)
+            there = os.path.lexists(self.p(".ceo-intent.json"))
+            ok = orig_pub(md, key, title, body)
+            self.published.append((key, ok, there, title))
+            return ok
+        ns["publish_notice"] = pub
+        return ns
+
+    # ── 관찰 ──
+    def md_bytes(self):
+        try:
+            with open(self.md, "rb") as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+
+    def observe(self):
+        try:
+            st = os.stat(self.md)
+            key = (st.st_ino, st.st_size, st.st_mtime_ns)
+        except FileNotFoundError:
+            return
+        if key != self._seen:
+            self._seen = key
+            b = self.md_bytes()
+            if b is not None:
+                self.observed.add(b)
+
+    def phase(self):
+        """디스크의 단계: none · bad · run · swap:<op|restore>:<pre|post>(밀려난 판이 보관됐나) · swapped."""
+        try:
+            with open(self.p(".ceo-intent.json"), "rb") as f:
+                rec = json.loads(f.read().decode("utf-8"))
+        except FileNotFoundError:
+            return "none"
+        except (OSError, ValueError):
+            return "bad"
+        if not isinstance(rec, dict):
+            return "bad"
+        if rec.get("closing"):
+            return str(rec.get("step"))         # 알림만 남은 기록 — 그 단계 그대로
+        if rec.get("step") == "swap" and isinstance(rec.get("swap"), dict):
+            sw = rec["swap"]
+            post = os.path.lexists(os.path.join(self.dirs, ".ceo-kept", str(sw.get("kept"))))
+            return "swap:%s:%s" % (sw.get("purpose"), "post" if post else "pre")
+        return str(rec.get("step"))
+
+    def sample(self):
+        self.observe()
+        self.phases[-1].append(self.phase())
+
+    def snapshot(self):
+        out = {}
+        for root, _dirs, files in os.walk(self.dirs):
+            for f in files:
+                if not f.endswith(".promote.lock"):
+                    q = os.path.join(root, f)
+                    out[os.path.relpath(q, self.dirs)] = _slurp(q, "rb")
+        return out
+
+    def make_save(self, op, how):
+        text = ((HEADER + SEP + USER + self.SAVE_LINE) if op == "demote" else (USER + self.SAVE_LINE)).encode("utf-8")
+
+        def save():
+            self.save_phase = self.phase()
+            cur = self.md_bytes()
+            if cur is not None:
+                self.excused.add(cur)       # 사용자 자신의 저장이 덮는 판
+            if how == "in-place":
+                with open(self.md, "wb") as f:
+                    f.write(text)
+            else:
+                tmp = self.md + ".editor-tmp"
+                with open(tmp, "wb") as f:
+                    f.write(text)
+                os.replace(tmp, self.md)
+            self.saved, self._seen = text, None
+        return save
+
+    def expected(self, op):
+        body = USER + (self.SAVE_LINE if self.saved else "")
+        return ((HEADER + SEP + body) if op == "compose" else body).encode("utf-8")
+
+    def fresh(self, op, mode):
+        shutil.rmtree(self.dirs, ignore_errors=True)
+        shutil.rmtree(self.outbox(), ignore_errors=True)
+        os.makedirs(self.dirs)
+        _write(self.md, USER)
+        _write(self.tmpl, TEMPLATE)
+        if op == "demote":                  # 강등의 출발점 = 깨끗한 승격(세지 않는다)
+            ns = self.module(mode)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(ns["do_compose"]([self.tmpl, self.md, sha(TEMPLATE), ""]), 0)
+            shutil.rmtree(self.outbox(), ignore_errors=True)
+        self.observed, self.excused, self.saved, self._seen = set(), set(), None, None
+        self.save_phase = "none"
+        self.published, self.owed_all = [], []
+        self.observe()
+
+    def entry(self, op, mode, kind, door_args):
+        ns = self.module(mode)
+        door = _Door(ns, outbox=os.path.abspath(self.outbox()), after=self.sample, **door_args)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            try:
+                if kind == "tick":
+                    res = ns["do_recover"]([self.md, ""])
+                elif op == "compose":
+                    res = ns["do_compose"]([self.tmpl, self.md, sha(TEMPLATE), ""])
+                else:
+                    res = ns["do_demote"]([self.tmpl, self.md, ""])
+            except _Crash:
+                res = "crash"
+            except _Runaway:
+                res = "runaway"
+            except OSError:
+                res = "error"               # main 이면 rc 2(판독·쓰기 오류) — 기록은 남고 다음 입구가 이어 간다
+        return res, door, err.getvalue()
+
+    def in_box(self, key):
+        name = key + ".notice"
+        return (os.path.exists(os.path.join(self.outbox(), name))
+                or os.path.exists(os.path.join(self.outbox(), "sent", name)))
+
+    def owed_keys(self):
+        try:
+            with open(self.p(".ceo-intent.json"), "rb") as f:
+                rec = json.loads(f.read().decode("utf-8"))
+        except (OSError, ValueError):
+            return set()
+        return {o.get("key") for o in rec.get("owed") or []} if isinstance(rec, dict) else set()
+
+    def check_notices(self, pubs, errs, where):
+        """★GQ2a·GQ1 — 이 입구가 빚진 알림 **하나하나**를 키로: 넣었다면 알림함이나 sent/ 에 그 키가 있다 · 못 넣었고 그때 기록이
+        있었다면 기록이 그 키를 담고 남았다 · 기록이 없던 보류면 stderr 가 말한다. 다른 키의 옛 알림은 아무것도 채우지 않는다."""
+        for key, ok, there, title in pubs:
+            if ok:
+                self.assertTrue(self.in_box(key), "I3: 넣었다는 알림(%s · %s)이 알림함에 없다 — %s" % (title, key, where))
+            elif there:
+                self.assertIn(key, self.owed_keys(),
+                              "GQ1: 넣지 못한 알림(%s)을 기록이 담고 있지 않다(기록이 닫혔다) — %s" % (title, where))
+            else:
+                self.assertIn("알림 기록 실패", errs, "I3: 기록 없는 보류의 넣지 못한 알림이 stderr 에도 없다 — %s" % where)
+            if ok or there:
+                self.owed_all.append((key, title))
+
+    def note_count(self):
+        return len(self.outbox_files()) + len(self.outbox_files(sent=True))
+
+    def scenario(self, op, mode, plan):
+        """plan = [(kind, crash_at, save_at, how, fail), ...] — 그 뒤에 실패가 풀린 깨끗한 같은 동작 입구. 돌려주는 값 = 결과 사전
+        (입구별 호출 수 · 입구별 호출 뒤의 단계 · 첫 입구 뒤의 단계 · 저장 때의 단계)."""
+        self.fresh(op, mode)
+        where = "%s/%s %r" % (op, mode, plan)
+        intent = self.p(".ceo-intent.json")
+        lasting, out = set(), {"calls": [], "phases": [], "p1": None, "ps": "none"}
+        self.phases = out["phases"]
+        steps = list(plan) + [("op", None, None, None, None)]
+        for i, (kind, crash_at, save_at, how, fail) in enumerate(steps):
+            if i == len(plan):
+                lasting = set()             # 마지막 입구 — 실패가 풀렸다
+            had = os.path.lexists(intent)
+            self.phases.append([self.phase()])
+            args = {"crash_at": crash_at, "save_at": save_at, "fail": fail, "lasting": lasting,
+                    "save": self.make_save(op, how) if save_at else None}
+            self.published = []
+            gap_before = not os.path.lexists(self.md)           # 맡기고 먼저의 빈 이름(FA4)이 이 입구 앞에 이미 있었다
+            res, door, errs = self.entry(op, mode, kind, args)
+            pubs = self.published
+            out["calls"].append(door.calls)
+            self.planned += bool(crash_at) + bool(save_at) + bool(fail)
+            self.reached += door.crashed + door.saved + door.failed
+            self.assertEqual((bool(crash_at), bool(save_at), bool(fail)), (door.crashed, door.saved, door.failed),
+                             "계획한 끼워 넣기에 닿지 않았다(planned ≠ reached) — 입구 %d · %s" % (i, where))
+            self.assertNotEqual(res, "runaway", "I4: 입구 %d 가 원시 연산 %d 개를 넘었다 — %s" % (i, _Door.BUDGET, where))
+            lasting |= door.new_lasting
+            self.observe()
+            if i == 0:
+                out["p1"], out["ps"] = self.phase(), (self.save_phase if save_at else "none")
+            if save_at:
+                out["save_phase"] = self.save_phase
+            if res == "crash":
+                continue
+            self.check_notices(pubs, errs, where)
+            if res == "error":
+                self.assertTrue(fail and fail[1] == "flush", "입구 %d 가 예외로 끝났다(끼운 flush 실패가 아니다) — %s" % (i, where))
+                continue
+            live = self.md_bytes()
+            held = res in (6, 9) or (kind == "tick" and os.path.lexists(intent) and had)
+            if held:
+                # I2: 보류한 입구 뒤에도 살아 있는 이름이 있다 — 단, 그 이름이 입구 **앞에** 이미 비어 있었으면(FA4 의 멈춤 틈) 그것을
+                #   채우는 데 필요한 읽기가 실패한 보류(FY1)는 틈을 그대로 둔다: 채움은 다음에 읽을 수 있는 입구의 몫이다(보고서).
+                if not gap_before:
+                    self.assertIsNotNone(live, "I2: 보류 뒤 살아 있는 이름이 없다 — %s" % where)
+                self.assertTrue(pubs or self.owed_keys(), "I3: 보류(rc %s)가 알림을 빚지 않았다 — %s" % (res, where))
+                if door.unknown and not door.outbox_failed:
+                    self.assertIn("CEO 지침 보류(파일을 읽지 못함)", [t for *_x, t in pubs],
+                                  "I3: 읽기 실패 보류가 그 알림을 내지 않았다 — %s" % where)
+                if lasting and door.unknown and i < len(plan):
+                    # 계속 실패하는 읽기: 다시 와도 보류이고 아무것도 더 옮기지 않는다(다음 입구가 다시 읽는다 — 그대로).
+                    #   ★FY1 그대로: 기록은 그대로 · 이미 있던 것은 하나도 바뀌거나 사라지지 않는다 · 알림은 그 하나(같은 키). 새로
+                    #   생길 수 있는 것은 앞 입구가 남긴 후보를 '쓰이지 않은 후보'로 보관한 사본뿐이다(FL2 — 다시 시도하는 입구의 정상
+                    #   걸음). 입구마다 새로 짓는 이름의 실패는 다음 입구가 다시 만날 때만 잰다.
+                    before, notes0 = self.snapshot(), self.note_count()
+                    self.published = []
+                    again, d2, e2 = self.entry(op, mode, kind, {"lasting": lasting})
+                    self.check_notices(self.published, e2, where)
+                    if d2.unknown:
+                        self.assertTrue(again in (6, 9) or kind == "tick", "계속 실패하는 읽기인데 보류가 아니다 — %s" % where)
+                        after = self.snapshot()
+                        self.assertEqual({k: v for k, v in after.items() if k in before}, before,
+                                         "계속 실패하는 읽기에 다시 온 입구가 있던 것을 바꾸거나 없앴다 — %s" % where)
+                        extra = [k for k in after if k not in before and ".unused-candidate" not in k]
+                        self.assertEqual(extra, [], "계속 실패하는 읽기에 다시 온 입구가 새로 만든 것 — %s" % where)
+                        self.assertEqual(self.note_count(), notes0, "오래가는 보류가 알림을 또 냈다 — %s" % where)
+                continue
+            if kind == "op" or had:
+                self.assertIn(res, (0, 10, 11, 12), "입구 %d 의 rc — %s" % (i, where))
+                self.assertFalse(os.path.lexists(intent), "I3: 끝난 입구 %d 뒤에 기록이 남았다 — %s" % (i, where))
+                self.assertIn(live, (self.expected(op),) + ((self.saved,) if self.saved else ()),
+                              "I2/I3: 끝난 입구 %d 뒤의 지침이 낡았거나 동작이 끝나지 않았다 — %s" % (i, where))
+        self.final(op, where)
+        for key, title in self.owed_all:
+            self.assertTrue(self.in_box(key), "I3/GQ1: 빚진 알림(%s · %s)이 끝내 알림함에 들어가지 않았다 — %s" % (title, key, where))
+        self.scenarios += 1
+        return out
+
+    def final(self, op, where):
+        live = self.md_bytes()
+        self.assertEqual(live, self.expected(op), "I2/I3: 마지막 지침 — %s" % where)
+        self.assertFalse(os.path.lexists(self.p(".ceo-intent.json")), "I3: 기록이 남았다 — %s" % where)
+        self.assertEqual([f for f in os.listdir(self.dirs) if f.endswith(".candidate")], [], "후보가 남았다 — %s" % where)
+        pool = {live} | {_slurp(k, "rb") for k in self.kept()}
+        if self.saved:
+            self.assertIn(self.saved, pool, "I1: 끼워 넣은 저장이 살아 있는 지침에도 보관 폴더에도 없다 — %s" % where)
+        lost = [v[:60] for v in self.observed - self.excused if v not in pool]
+        self.assertEqual(lost, [], "I1: 살아 있던 판이 사라졌다 — %s" % where)
+        r = self.receipt()
+        if op == "compose":
+            self.assertIsNotNone(r, "I3: 조립을 끝냈는데 영수증이 없다 — %s" % where)
+            self.assertEqual(r["composed_sha256"], hashlib.sha256(live).hexdigest(), "I3: 영수증 — %s" % where)
+        else:
+            self.assertIsNone(r, "I3: 강등을 끝냈는데 영수증이 남았다 — %s" % where)
+
+    def test_every_primitive_call_second_fault_save_and_failure_keeps_s1_to_s3(self):
+        """★GQ2 — 칸(class)의 정의(보고서의 한 문장): 첫 고장의 단계 × 저장의 단계 × 두 번째 고장의 단계 × 고장의 종류. 단계 = 디스크의
+        기록 상태를 코드 자신의 단계표(STEPS · PURPOSES — 기록 없음 · run · swap:<op|restore>:<pre|post> · swapped)로 읽은 것, 종류 =
+        멈춤 · 읽기 오류 · flush 실패. 시험은 고르기 **전에** 모든 첫 단계(모든 호출 뒤의 멈춤 · 모든 호출 앞의 저장과 그 뒤 모든 멈춤 ·
+        복구 입구의 모든 호출 앞의 저장)를 돌려 칸의 전체 집합을 세우고, 칸마다 첫 시나리오를 골라 돌린 뒤 모든 칸이 시나리오를 가졌고
+        계획 = 도달임을 단언한다. 이 정의로 완전하다 — 이 릴리스에서 더 넓히지 않는다(GQ2)."""
+        complete = os.environ.get("CYS_T8_FL7_COMPLETE") == "1"
+        self.md, self.tmpl = self.p("MASTER_DIRECTIVE.md"), self.p("CEO_TEMPLATE.md")
+        base = ceo_py_module()
+        table = ({"none"} | {x for x in base["STEPS"] if x != "swap"}
+                 | {"swap:%s:%s" % (pp, q) for pp in base["PURPOSES"] for q in ("pre", "post")})
+        modes = (["exchange"] if base["exchange_fn"]() is not None else []) + ["deposit"]
+        if base["noreplace_fn"]() is None and os.name == "posix":
+            modes.remove("deposit")
+        hows = ("in-place", "rename")
+        st = {"crash points": 0, "read failures": 0, "flush failures": 0, "saves": 0, "first stages": 0,
+              "second faults": 0, "classes": 0}
+        self.planned = self.reached = self.scenarios = 0
+        t0 = time.monotonic()               # wallclock: guard 측정만 — 이 시험의 판정은 시간에 기대지 않는다(실행 시간 보고)
+        for op in ("compose", "demote"):
+            for mode in modes:
+                universe, plans = {}, []
+
+                def offer(kind2, p1, ps, run, first, save=None):
+                    """그 실행의 둘째 입구(복구 경로)의 호출마다, 그 원시 연산이 가질 수 있는 고장 종류마다 칸 하나."""
+                    calls2, phs2 = run["calls"][1], run["phases"][1]
+                    lo = save[0] if save else 1                     # 저장이 연 경로 — 그 저장 뒤의 호출들
+                    for k2 in range(lo, len(calls2) + 1):
+                        prim = calls2[k2 - 1][0]
+                        for fk in ("stop",) + (("read",) if prim in READS else ()) + (("flush",) if prim in FLUSHES else ()):
+                            cls = (kind2, p1, ps, phs2[k2], fk)
+                            self.assertTrue({p1, ps.split(":", 1)[-1], phs2[k2]} <= table | {"none"},
+                                            "코드의 단계표 밖의 단계: %r" % (cls,))
+                            second = (kind2, k2 if fk == "stop" else None, save[0] if save else None,
+                                      save[1] if save else None,
+                                      None if fk == "stop" else (k2, "read-once" if fk == "read" else "flush"))
+                            if cls not in universe:
+                                universe[cls] = first + [second]
+                            elif complete:
+                                plans.append(first + [second])
+                dry = self.scenario(op, mode, [("op", None, None, None, None)])
+                calls1, n1 = dry["calls"][0], len(dry["calls"][0])
+                self.assertGreater(n1, 10, "시험 무효: 감싼 원시 연산이 없다")
+                rec2 = {}
+                # ── 첫 단계(전부 — 칸의 전체 집합을 세운다; 그 자체가 단일 고장 쓸기다) ──
+                for k1 in range(1, n1 + 1):                         # ① 첫 입구의 모든 호출 뒤 멈춤 × 다음 입구 둘
+                    st["crash points"] += 1
+                    for kind2 in ("op", "tick"):
+                        first = [("op", k1, None, None, None)]
+                        r = rec2[k1, kind2] = self.scenario(op, mode, first + [(kind2, None, None, None, None)])
+                        offer(kind2, r["p1"], "none", r, first)
+                for k, (prim, _path) in enumerate(calls1, 1):       # ② 첫 입구의 모든 읽기 오류(한 번 · 계속)와 flush 실패
+                    kind2 = "tick" if k % 2 else "op"
+                    if prim in READS:
+                        for how in ("read-once", "read-lasting"):
+                            self.scenario(op, mode, [("op", None, None, None, (k, how)), (kind2, None, None, None, None)])
+                            st["read failures"] += 1
+                    if prim in FLUSHES:
+                        self.scenario(op, mode, [("op", None, None, None, (k, "flush")), (kind2, None, None, None, None)])
+                        st["flush failures"] += 1
+                for s_ in range(1, n1 + 1):                         # ③ 첫 입구의 모든 호출 앞 저장 — 혼자, 그 뒤의 멈춤
+                    how = hows[s_ % 2]
+                    r = self.scenario(op, mode, [("op", None, s_, how, None)])
+                    st["saves"] += 1
+                    #   멈춤 자리: 저장한 그 호출 뒤 + 그 뒤의 상태를 바꾸는 호출마다. 읽기 바로 뒤의 멈춤은 그 앞 호출 뒤의 멈춤과 디스크가
+                    #   같다(읽기는 아무것도 바꾸지 않는다 · 멈춘 프로세스는 기억이 없다) — 칸의 전체 집합은 줄지 않는다(모든 호출 뒤의
+                    #   멈춤은 ① 의 단일 고장 쓸기가 돈다).
+                    calls_s = r["calls"][0]
+                    stops = [k1 for k1 in range(s_, len(calls_s) + 1)
+                             if k1 == s_ or calls_s[k1 - 1][0] not in READS + ("fs_lock",)]
+                    for k1 in stops:
+                        kind2 = "tick" if k1 % 2 else "op"
+                        first = [("op", k1, s_, how, None)]
+                        r2 = self.scenario(op, mode, first + [(kind2, None, None, None, None)])
+                        st["first stages"] += 1
+                        offer(kind2, r2["p1"], "e1:" + r2["ps"], r2, first)
+                for k1 in range(1, n1 + 1):                         # ④ 복구 입구의 모든 호출 앞 저장(멈춘 지점마다)
+                    kind2 = "tick" if k1 % 2 else "op"
+                    for s2 in range(1, len(rec2[k1, kind2]["calls"][1]) + 1):
+                        how = hows[(k1 + s2) % 2]
+                        first = [("op", k1, None, None, None)]
+                        r = self.scenario(op, mode, first + [(kind2, None, s2, how, None)])
+                        st["saves"] += 1
+                        offer(kind2, r["p1"], "e2:" + r["save_phase"], r, first, save=(s2, how))
+                # ── 둘째 단계: 칸마다 첫 시나리오(완전이면 모두) ──
+                covered = set()
+                for cls, plan in universe.items():
+                    self.scenario(op, mode, plan)
+                    covered.add(cls)
+                    st["second faults"] += 1
+                for plan in plans:
+                    self.scenario(op, mode, plan)
+                    st["second faults"] += 1
+                self.assertEqual(covered, set(universe), "시나리오가 없는 칸이 있다")
+                st["classes"] += len(universe)
+        secs = time.monotonic() - t0        # wallclock: guard 실행 시간 보고만
+        sys.stderr.write("\n[FL7/FY4/GQ2] %s · paths %s · crash points %d · read failures %d · flush failures %d · saves %d · "
+                         "save-then-stop first stages %d · classes %d (each with a scenario) · second faults %d · scenarios %d"
+                         " · injections planned %d = reached %d · %.0f s\n"
+                         % ("COMPLETE" if complete else "suite (all first stages + one scenario per class)",
+                            "+".join(modes), st["crash points"], st["read failures"], st["flush failures"], st["saves"],
+                            st["first stages"], st["classes"], st["second faults"], self.scenarios, self.planned,
+                            self.reached, secs))
+        self.assertEqual(self.planned, self.reached)
+        self.assertGreater(st["classes"], 0)
+
+
+class ReadUnknown(Rig):
+    """★RULINGS FY1 — 이 경로의 모든 읽기는 한 읽기 함수를 지나고 답은 셋이다: 바이트 · 없음 · 모른다(오류). 어느 호출부도 '모른다'를
+    '없음'·기본값·갈래 선택으로 바꾸지 않는다 — 기록은 그대로, 아무것도 옮기지 않고, 그 걸음은 알림과 함께 보류되며, 다음 입구가
+    다시 읽는다(지나가는 실패는 저절로 풀리고 오래가는 실패는 보류로 남는다). 실패는 윈도우의 공유 위반처럼 open 이 PermissionError
+    로 답하게 끼워 넣는다(시간이 아니라)."""
+    SAVE = "USERSAVE-FY1 읽은 뒤에 저장한 줄\n"
+    TITLE = "CEO 지침 보류(파일을 읽지 못함)"
+
+    def failing_open(self, ns, hit, times=None):
+        """ns 안의 open 이 hit(경로) 가 참인 경로를 읽을 때 PermissionError — times 번(None = 계속). 쓰기는 그대로."""
+        real, left = open, [times]
+
+        def fake(path, mode="r", *a, **kw):
+            if ("r" in mode and "+" not in mode and hit(os.path.abspath(str(path)))
+                    and (left[0] is None or left[0] > 0)):
+                if left[0] is not None:
+                    left[0] -= 1
+                raise PermissionError(13, "sharing violation (injected)", str(path))
+            return real(path, mode, *a, **kw)
+        ns["open"] = fake
+
+    def snapshot(self):
+        out = {}
+        for root, _dirs, files in os.walk(self.dirs):
+            for f in files:
+                if not f.endswith(".promote.lock"):
+                    q = os.path.join(root, f)
+                    out[os.path.relpath(q, self.dirs)] = _slurp(q, "rb")
+        return out
+
+    def compose(self, ns, nf):
+        return ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), nf])
+
+    def crash_after_exchange_with_a_save(self):
+        """B 를 읽은 뒤 B+E 저장 → 낡은 후보 H+S+B 가 맞바꿔 들어감 → 밀려난 B+E 를 보관하기 전에 멈춤. 돌려주는 값 = 후보 이름."""
+        ns = ceo_py_module()
+        real = ns["exchange_fn"]()
+
+        def ex(a, b):
+            if not a.endswith(".candidate"):
+                return real(a, b)
+            _write(self.p("MASTER_DIRECTIVE.md"), USER + self.SAVE)
+            real(a, b)
+            raise SystemExit("crash right after the exchange")
+        ns["exchange_fn"] = lambda: ex
+        with self.assertRaises(SystemExit):
+            self.compose(ns, "")
+        cands = [f for f in os.listdir(self.dirs) if f.endswith(".candidate")]
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(_slurp(self.p(cands[0]), encoding="utf-8"), USER + self.SAVE, "시험 전제: 후보 이름에 밀려난 저장")
+        return self.p(cands[0])
+
+    def test_an_unreadable_candidate_after_the_exchange_holds_and_moves_nothing(self):
+        """codex R1 — 맞바꾼 뒤 멈춘 기록의 후보(= 밀려난 새 저장)를 읽지 못하면, 종전에는 '맞바꾸지 않았다'로 읽혀 새 저장이 쓰이지
+        않은 후보로 치워지고 낡은 조립이 현행으로 받아들여졌다. 이제 보류다 — 한 번 실패도, 계속 실패도. 풀리면 저장으로 조립한다."""
+        if ceo_py_module()["exchange_fn"]() is None:
+            self.skipTest("이 플랫폼에는 원자 맞바꾸기가 없다")
+        for times in (1, None):
+            with self.subTest(failure="once" if times else "lasting"):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                cand = self.crash_after_exchange_with_a_save()
+                before = self.snapshot()
+                for attempt in range(1 if times else 2):
+                    ns = ceo_py_module()
+                    self.failing_open(ns, lambda q: q == os.path.abspath(cand), times)
+                    nf = os.path.join(self.tmp, "nf-r1-%d.txt" % attempt)
+                    rc = self.compose(ns, nf)
+                    self.assertEqual(rc, 6, "후보를 읽지 못했는데 보류하지 않았다(codex R1)")
+                    self.assertEqual(self.snapshot(), before, "읽지 못했는데 무언가를 옮기거나 바꿨다")
+                    self.assertIn(self.TITLE, self.notices_text())
+                rc, out, err = self.run_dept("promote-ceo")
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER + self.SAVE,
+                                 "풀린 뒤에도 낡은 조립이 남았다 — 밀려난 저장으로 조립해야 한다")
+                self.assertIsNone(self.read(".ceo-intent.json"))
+
+    def test_every_read_of_the_path_holds_when_it_fails(self):
+        """살아 있는 지침 · 틀 · 영수증 · 0.14 영수증 · .pre-ceo · 끝나지 않은 교체 기록 — 어느 것을 읽지 못해도 보류(rc 6 · 알림 ·
+        파일 무변경)하고, 풀리면 다음 입구가 바르게 끝낸다(종전: 영수증은 '손상'으로 다시 쓰였고, 0.14 영수증·.pre-ceo 는 '없음'처럼
+        지나갔고, 기록은 '형식이 틀린 기록'의 장벽 문구로 갔고, 지침·틀은 예외로 죽었다)."""
+        def promoted():
+            self.seed()
+            self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+
+        def crashed_record():
+            self.seed()
+            ns = ceo_py_module()
+            orig = ns["write_intent"]
+
+            def stop(*a, **kw):
+                orig(*a, **kw)
+                raise SystemExit("crash after the record")
+            ns["write_intent"] = stop
+            with self.assertRaises(SystemExit):
+                self.compose(ns, "")
+
+        def legacy():
+            self.seed()
+            _write(self.p(".ceo-template-applied"), sha("다른 옛 지침\n") + "\n")    # 남은(낡은) 0.14 영수증
+        cases = [("live", self.seed, "MASTER_DIRECTIVE.md"), ("template", self.seed, "CEO_TEMPLATE.md"),
+                 ("receipt", promoted, ".ceo-receipt.json"), ("legacy receipt", legacy, ".ceo-template-applied"),
+                 (".pre-ceo", promoted, "MASTER_DIRECTIVE.md.pre-ceo"), ("record", crashed_record, ".ceo-intent.json")]
+        for label, setup, name in cases:
+            with self.subTest(unreadable=label):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                setup()
+                target = os.path.abspath(self.p(name))
+                before = self.snapshot()
+                ns = ceo_py_module()
+                self.failing_open(ns, lambda q: q == target)
+                nf = os.path.join(self.tmp, "nf-%s.txt" % name)
+                rc = self.compose(ns, nf)
+                self.assertEqual(rc, 6, "%s 를 읽지 못했는데 보류하지 않았다" % label)
+                self.assertEqual(self.snapshot(), before, "%s 를 읽지 못했는데 무언가를 바꿨다" % label)
+                self.assertIn(self.TITLE, self.notices_text())
+                rc, out, err = self.run_dept("promote-ceo")
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER)
+                self.assertIsNone(self.read(".ceo-intent.json"))
+
+    def test_a_file_unreadable_when_kept_is_recorded_as_unread(self):
+        """보관한 순간 읽지 못한 일반 파일은 '일반 파일이 아니었다'(sha256 null 만)가 아니라 **읽지 못했다**로 적힌다(FY1 · FY2c)."""
+        self.seed()
+        ns = ceo_py_module()
+        kd = os.path.abspath(os.path.join(self.dirs, ".ceo-kept"))
+        self.failing_open(ns, lambda q: os.path.dirname(q) == kd and not q.endswith(".kept"))
+        src = self.p("MASTER_DIRECTIVE.md.scratch")
+        _write(src, "보관할 바이트\n")
+        kept, _side = ns["keep_file"](src, self.p("MASTER_DIRECTIVE.md"), "test")
+        doc = json.loads(_slurp(kept + ".kept", encoding="utf-8"))
+        self.assertEqual(doc.get("kind"), "regular", "읽지 못한 일반 파일을 다른 종류로 적었다: %r" % doc)
+        self.assertIs(doc.get("unread"), True, "읽지 못했다는 사실을 적지 않았다: %r" % doc)
+        self.assertIsNone(doc.get("sha256"))
+        self.assertEqual(_slurp(kept, encoding="utf-8"), "보관할 바이트\n")
+
+
+class SafePrimitives(Rig):
+    """★RULINGS EY3 — 살아 있는 이름은 반쪽 지침을 드러낼 수 없는 방법으로만 바뀐다: 맞바꾸기(맥·리눅스), 그것이 없으면 맡기고
+    먼저(살아 있는 파일을 보관 폴더로 옮긴 뒤 **다 쓴** 후보를 덮지 않는 이동으로 놓기 — 의도 기록 아래). 살아 있는 이름에 직접
+    쓰는 일은 없고, 둘 다 안 되는 파일 시스템에서는 보류한다(지침 무변경) — codex 순서 ④."""
+
+    class _Os:
+        """ceo_py 모듈 안의 `os` 만 바꾼다 — 하드 링크가 없는 파일 시스템(EPERM)과, 살아 있는 이름을 쓰기로 연 기록."""
+        def __init__(self, real, md):
+            self._real, self._md, self.opened_live = real, md, []
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def link(self, a, b):
+            raise PermissionError(1, "hard links unsupported here", a)
+
+        def open(self, path, flags, *a, **kw):
+            if os.path.abspath(path) == os.path.abspath(self._md) and flags & (os.O_WRONLY | os.O_RDWR):
+                self.opened_live.append(flags)
+            return self._real.open(path, flags, *a, **kw)
+
+    def ns_without_links(self, noreplace=True):
+        ns = ceo_py_module()
+        ns["exchange_fn"] = lambda: None
+        if not noreplace:
+            ns["noreplace_fn"] = lambda: None
+        proxy = self._Os(os, self.p("MASTER_DIRECTIVE.md"))
+        ns["os"] = proxy
+        return ns, proxy
+
+    def test_no_safe_primitive_holds_and_leaves_live_untouched(self):
+        """맞바꾸기도 하드 링크도 덮지 않는 이름 바꾸기도 없다 → 보류(rc 6 · 알림 1건) · 살아 있는 지침 바이트 그대로 · 의도·후보
+        없음(종전: 하드 링크가 안 되면 살아 있는 경로에 직접 써서 반쪽 지침이 남을 수 있었다)."""
+        self.seed()
+        ns, proxy = self.ns_without_links(noreplace=False)
+        nf = os.path.join(self.tmp, "nf.txt")
+        rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), nf])
+        self.assertEqual(rc, 6, "안전한 바꾸기 방법이 없는데 보류하지 않았다")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "살아 있는 지침이 바뀌었다")
+        self.assertIsNone(self.read(".ceo-intent.json"))
+        self.assertEqual([f for f in os.listdir(self.dirs) if f.endswith(".candidate")], [])
+        self.assertIn("CEO 지침 교체 보류(이 디스크에서는 안전하게 바꿀 수 없음)", self.notices_text())
+        self.assertEqual(proxy.opened_live, [], "살아 있는 이름을 쓰기로 열었다")
+
+    def test_the_live_name_is_never_written_in_place(self):
+        """하드 링크가 없는 파일 시스템(덮지 않는 이름 바꾸기는 있음): 승격도, 빈 살아 있는 이름을 채우는 복구도 살아 있는 경로를
+        쓰기로 열지 않는다 — 다 쓴 후보를 덮지 않게 옮겨 놓는다(종전: 복구의 채우기가 O_EXCL 로 살아 있는 경로에 직접 썼다)."""
+        ns0 = ceo_py_module()
+        if ns0.get("noreplace_fn") is not None and ns0["noreplace_fn"]() is None:
+            self.skipTest("이 플랫폼에는 덮지 않는 이름 바꾸기가 없다")
+        self.seed()
+        ns, proxy = self.ns_without_links()
+        self.assertEqual(ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), ""]), 0)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER)
+        self.assertEqual(proxy.opened_live, [], "승격이 살아 있는 이름을 쓰기로 열었다")
+        # 빈 살아 있는 이름 + 의도 기록(후보 없음 — 보관된 판만 남은 경우) → 다음 입구가 채운다(쓰기로 열지 않고).
+        #   기록 = ★FL4 스키마 2(동작 하나에 하나 · 단계 'swap' — 진행 중인 교체의 이름은 swap 안에).
+        rec = {"schema": 2, "id": "X", "op": "compose", "args": {"tmpl": self.p("CEO_TEMPLATE.md"), "tsha": sha(TEMPLATE)},
+               "step": "swap", "notices": [], "kept_report": [], "done": {},
+               "swap": {"purpose": "op", "mode": "deposit", "read_sha256": sha(HEADER + SEP + USER),
+                        "candidate": ".MASTER_DIRECTIVE.md.X.candidate", "candidate_sha256": "0" * 64,
+                        "kept": "X.compose", "reason": "compose"},
+               "created_at": "2026-11-14T00:00:00Z"}
+        kd = os.path.join(self.dirs, ".ceo-kept")
+        os.replace(self.p("MASTER_DIRECTIVE.md"), os.path.join(kd, "X.compose"))
+        _write(self.p(".ceo-intent.json"), json.dumps(rec))
+        ns2, proxy2 = self.ns_without_links()
+        ns2["close_intent"](self.p("MASTER_DIRECTIVE.md"), "")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER, "빈 살아 있는 이름을 채우지 않았다")
+        self.assertEqual(proxy2.opened_live, [], "복구의 채우기가 살아 있는 이름을 쓰기로 열었다(제자리 쓰기)")
+        self.assertTrue(os.path.exists(os.path.join(kd, "X.compose")), "보관된 판을 지웠다")
+
+
+class OneRename(Rig):
+    """★RULINGS FL3 — 살아 있는 이름은 한 번의 원자 이름 바꾸기로 유일한 보관 이름에 옮겨진다(codex B2: 링크 뒤 지우기는, 두 호출
+    사이에 편집기의 원자 저장이 이름을 바꿔 놓으면 둘째 호출이 그 저장을 지웠다). 저장은 옮기는 바로 그 호출 뒤에 끼워 넣는다."""
+    SAVE = "USERSAVE-FL3 살아 있는 이름이 옮겨지는 순간의 원자 저장\n"
+
+    def test_an_atomic_save_while_the_live_name_is_moved_away_survives(self):
+        self.seed()
+        ns = ceo_py_module()
+        ns["exchange_fn"] = lambda: None              # 맡기고 먼저(윈도우 등) — 살아 있는 이름이 옮겨지는 형식
+        md = os.path.abspath(self.p("MASTER_DIRECTIVE.md"))
+        fired, linked = [], []
+
+        def save():
+            if not fired:
+                fired.append(1)
+                tmp = md + ".editor-tmp"
+                _write(tmp, USER + self.SAVE)
+                os.replace(tmp, md)
+
+        class _Os:
+            def __getattr__(self, name):
+                return getattr(os, name)
+
+            def link(self, a, b):
+                os.link(a, b)
+                if os.path.abspath(a) == md:
+                    linked.append(b)
+                    save()
+
+            def rename(self, a, b):
+                os.rename(a, b)
+                if os.path.abspath(a) == md:
+                    save()
+        ns["os"] = _Os()
+        nr0 = ns["noreplace_fn"]()
+        if nr0 is not None:
+            def nr(a, b):
+                nr0(a, b)
+                if os.path.abspath(a) == md:
+                    save()
+            ns["noreplace_fn"] = lambda: nr
+        rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), md, sha(TEMPLATE), ""])
+        self.assertEqual(fired, [1], "끼어들기가 일어나지 않았다(시험 무효)")
+        everywhere = [self.read("MASTER_DIRECTIVE.md") or ""] + [_slurp(k, encoding="utf-8") for k in self.kept()]
+        self.assertTrue(any(self.SAVE in v for v in everywhere),
+                        "살아 있는 이름이 옮겨지는 순간의 원자 저장이 지워졌다(링크 뒤 지우기 — codex B2)")
+        self.assertEqual(linked, [], "살아 있는 이름을 링크로 옮겼다(한 번의 이름 바꾸기가 아니다)")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER + self.SAVE, "이긴 저장으로 조립하지 않았다")
+        self.assertIn(USER, [_slurp(k, encoding="utf-8") for k in self.kept()], "옮겨진 판이 보관 폴더에 없다")
+
+
+class DurableOutbox(Rig):
+    """★RULINGS FY3 — 이 부분의 알림은 영속 알림함(~/.cys/state/ceo-notices)에 통째 파일로, 그것이 다루는 상태가 사라질 수 있기
+    **전에** 놓인다(동작 기록은 그 알림이 알림함에 들어간 뒤에만 지워진다). 셸이 조립 경로의 모든 입구에서 배달하고, 피드가 받은
+    것만 sent/ 로 옮긴다 — sent/<키> 가 '이미 알렸다'의 유일한 기억이다(.held 없음). 배달은 관문이 아니다."""
+
+    def barrier(self):
+        """읽을 수 없는(형식이 틀린) 기록 — 오래가는 보류."""
+        self.seed()
+        _write(self.p(".ceo-intent.json"), "{ 반쪽 기록")
+
+    def tick(self):
+        rc, out, err = self.run_dept("promote-if-pending")
+        self.assertEqual(rc, 0, out + err)
+        return out + err
+
+    def test_a_notice_survives_the_shell_dying_before_delivery(self):
+        """codex R3 — 종전: 보류 알림을 임시 파일에 덧붙인 뒤 .held 표지를 적어, 셸이 그 파일을 배달하기 전에 죽으면 알림은 영영
+        나가지 않았다(다음 틱은 표지를 보고 다시 쓰지 않았다). 이제 알림은 영속 알림함에 있고 다음 입구가 배달한다."""
+        self.barrier()
+        ns = ceo_py_module()
+        nf = os.path.join(self.tmp, "nf-dies.txt")
+        self.assertEqual(ns["do_recover"]([self.p("MASTER_DIRECTIVE.md"), nf]), 0)
+        # 셸이 여기서 죽었다 — ceo_notices_from 도 배달도 돌지 않았다(nf 는 버려진다).
+        self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), 0, "시험 전제: 아직 아무것도 올라가지 않았다")
+        self.tick()
+        self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), 1, "셸이 죽은 뒤의 보류 알림이 사라졌다(codex R3)")
+        self.assertEqual(self.outbox_files(), [])
+        self.assertEqual(len(self.outbox_files(sent=True)), 1)
+        self.assertFalse(os.path.exists(self.p(".ceo-intent.json.held")), ".held 표지가 생겼다")
+
+    def test_a_failed_push_stays_in_the_outbox_for_the_next_entry(self):
+        """피드가 받지 못한 알림(데몬 없음 · 올리기 실패)은 알림함에 남고 다음 입구가 다시 올린다 — 받은 뒤에야 sent/ 로. 그동안
+        조립 경로는 막히지 않는다(배달은 관문이 아니다)."""
+        self.barrier()
+        _write(self.pushfail, "1\n")
+        self.tick()
+        self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), 1, "올리기를 시도하지 않았거나 한 실행에 두 번 시도했다")
+        self.assertEqual(len(self.outbox_files()), 1, "피드가 받지 못한 알림이 알림함에 남지 않았다")
+        self.assertEqual(self.outbox_files(sent=True), [], "피드가 받지 못했는데 '보냈다'로 옮겼다")
+        os.unlink(self.pushfail)
+        self.tick()
+        self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), 2, "다음 입구가 다시 올리지 않았다")
+        self.assertEqual(self.outbox_files(), [])
+        self.assertEqual(len(self.outbox_files(sent=True)), 1)
+
+    def test_a_lasting_hold_gives_exactly_one_notice_and_a_dismissed_one_does_not_return(self):
+        self.barrier()
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), 1, "오래가는 보류가 알림을 여러 번 냈다")
+        _write(self.feedlist, "")                                       # 오너가 그 알림을 닫았다(대기 중 아님)
+        self.tick()
+        rc, out, err = self.run_dept("promote-ceo")
+        self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), 1, "닫은 알림이 같은 기록에 다시 나왔다")
+
+    def test_an_unpublished_hold_notice_keeps_its_record_until_published(self):
+        """★GQ1(codex M1) — 알림함에 넣는 일의 답은 동작의 결과다. 바꾸기 기록을 남긴 뒤 맞바꾸기 전에 멈춤 → 빈 지침이 경로로 저장됨
+        → 알림함을 쓸 수 없다 → 복구(틱)가 쓰이지 않은 후보를 보관하고 다시 계획해 보류하는데, 종전에는 그 보류 알림의 '넣지 못함'을
+        무시하고 기록을 닫아 지웠다 — 승격 대기 표지도 없으니 그 알림을 다시 낼 것이 남지 않았다. 이제 기록은 그 알림을 담은 채 남고,
+        알림함이 다시 쓰이면 다음 틱이 알림을 넣은 뒤 기록을 닫는다."""
+        self.seed()
+        ns = ceo_py_module()
+        orig = ns["write_intent"]
+
+        def stop(*a, **kw):
+            orig(*a, **kw)
+            raise SystemExit("crash after the swap intent, before the exchange")
+        ns["write_intent"] = stop
+        with self.assertRaises(SystemExit):
+            ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), ""])
+        _write(self.p("MASTER_DIRECTIVE.md"), "")                          # 경로로 저장된 빈 지침
+        bad_box = os.path.join(self.tmp, "outbox-is-a-file")
+        _write(bad_box, "x\n")
+        os.environ["CYS_CEO_OUTBOX"] = bad_box
+        try:
+            self.assertEqual(ceo_py_module()["do_recover"]([self.p("MASTER_DIRECTIVE.md"), ""]), 0)
+        finally:
+            del os.environ["CYS_CEO_OUTBOX"]
+        self.assertFalse(os.path.exists(self.pending_path()), "시험 전제: 승격 대기 표지가 없다")
+        rec = json.loads(self.read(".ceo-intent.json") or "null")
+        self.assertIsNotNone(rec, "보류 알림이 알림함에 없는데 기록을 지웠다(codex M1)")
+        self.assertTrue(any(o["title"] == "CEO 승격 보류(본부 지침 확인 필요)" for o in rec.get("owed") or []),
+                        "기록이 넣지 못한 알림을 담고 있지 않다: %r" % rec)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), "", "보류인데 지침을 바꿨다")
+        self.tick()                                                         # 알림함이 다시 쓰인다 — 다음 틱
+        self.assertEqual(self.pushes("CEO 승격 보류(본부 지침 확인 필요)"), 1, "다음 틱이 그 알림을 내지 않았다")
+        self.assertIsNone(self.read(".ceo-intent.json"), "알림을 넣은 뒤에도 기록을 닫지 않았다")
+        self.tick()
+        self.assertEqual(self.pushes("CEO 승격 보류(본부 지침 확인 필요)"), 1, "같은 알림을 또 냈다")
+
+    def test_the_record_is_removed_only_after_its_notices_are_in_the_outbox(self):
+        """기록이 담은 알림(보관 사본 알림 — 그 동작의 정체가 키)이 알림함에 들어가지 못하면 기록은 지워지지 않는다(★FY3 i ·
+        종전: 알림은 임시 파일에만 있었고 기록은 먼저 지워졌다). 알림함이 고쳐지면 다음 입구가 넣고 지운다."""
+        self.seed()
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        _write(self.p("MASTER_DIRECTIVE.md"), HEADER + "USER-HEADER-EDIT\n" + SEP + USER)
+        ns = ceo_py_module()
+        bad_box = os.path.join(self.tmp, "outbox-is-a-file")
+        _write(bad_box, "x\n")
+        os.environ["CYS_CEO_OUTBOX"] = bad_box
+        try:
+            rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), ""])
+        finally:
+            del os.environ["CYS_CEO_OUTBOX"]
+        self.assertEqual(rc, 12)
+        rec = json.loads(self.read(".ceo-intent.json") or "null")
+        self.assertIsNotNone(rec, "알림이 알림함에 없는데 기록을 지웠다")
+        self.assertTrue(any("머리말" in t for t, _b in rec["notices"]), "기록이 알림을 담고 있지 않다")
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        self.assertIsNone(self.read(".ceo-intent.json"))
+        self.assertEqual(len(self.pushes_prefix("CEO 지침 사본 보관(머리말) — ")), 1)
+
+
+class FlushFailure(Rig):
+    """★RULINGS FL5 — 실패한 flush 는 실패다(codex B4: fsync_dir 가 폴더 flush 실패를 삼켜, 디스크에 확정되지 않은 의도 기록 아래서
+    살아 있는 이름을 바꿨다). 후보나 교체 기록의 폴더 flush 가 실패하면 살아 있는 이름을 건드리기 전에 보류하고(rc 6 · 알림 1건),
+    만든 것은 지우지 않는다. 용인은 '지원하지 않음'(EINVAL·ENOTSUP) 뿐 — 그때는 교체가 그대로 끝난다."""
+
+    class _Os:
+        """ceo_py 모듈 안의 `os` 만 바꾼다 — 폴더 fd 의 fsync 가 주어진 errno 로 실패한다(when(폴더) 가 참일 때만)."""
+        def __init__(self, real, code, when):
+            self._real, self._code, self._when, self.failed = real, code, when, 0
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def fsync(self, fd):
+            if stat.S_ISDIR(self._real.fstat(fd).st_mode) and self._when():
+                self.failed += 1
+                raise OSError(self._code, os.strerror(self._code))
+            return self._real.fsync(fd)
+
+    def run_with(self, mode, code, when):
+        shutil.rmtree(self.dirs, ignore_errors=True)
+        self.seed()
+        ns = ceo_py_module()
+        if mode == "deposit":
+            ns["exchange_fn"] = lambda: None
+        proxy = self._Os(os, code, when)
+        ns["os"] = proxy
+        nf = os.path.join(self.tmp, "nf-%s.txt" % mode)
+        if os.path.exists(nf):
+            os.unlink(nf)
+        rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), nf])
+        return rc, proxy, self.notices_text()
+
+    def modes(self):
+        return (["exchange"] if ceo_py_module()["exchange_fn"]() is not None else []) + ["deposit"]
+
+    def test_a_failed_flush_holds_before_the_live_name_is_touched(self):
+        intent = lambda: os.path.lexists(self.p(".ceo-intent.json"))
+        for mode in self.modes():
+            for label, when in (("candidate", lambda: True), ("intent", intent)):
+                with self.subTest(mode=mode, failing=label):
+                    rc, proxy, notes = self.run_with(mode, errno.EIO, when)
+                    self.assertGreater(proxy.failed, 0, "폴더 flush 실패를 끼워 넣지 못했다(시험 무효)")
+                    self.assertEqual(rc, 6, "flush 가 실패했는데 보류하지 않았다(codex B4)")
+                    self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "확정되지 않은 기록 아래서 살아 있는 이름이 바뀌었다")
+                    self.assertIn("CEO 지침 교체 기록 확인 필요", notes, "보류 알림이 없다")
+                    self.assertIn("디스크에 확정하지", notes)
+                    self.assertTrue([f for f in os.listdir(self.dirs) if f.endswith(".candidate")],
+                                    "확실하지 않은데 후보를 치웠다(모든 산출물을 남긴다)")
+                    if label == "intent":
+                        self.assertTrue(intent(), "교체 기록을 치웠다")
+                    rc, out, err = self.run_dept("promote-ceo")
+                    self.assertEqual(rc, 0, out + err)
+                    self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER, "다음 입구가 이어 가지 않았다")
+                    self.assertIsNone(self.read(".ceo-intent.json"))
+
+    def test_an_unsupported_directory_flush_is_tolerated(self):
+        for mode in self.modes():
+            for code in (errno.EINVAL, errno.ENOTSUP):
+                with self.subTest(mode=mode, errno=errno.errorcode[code]):
+                    rc, proxy, notes = self.run_with(mode, code, lambda: True)
+                    self.assertGreater(proxy.failed, 0, "폴더 flush 를 부르지 않았다(시험 무효)")
+                    self.assertEqual(rc, 0, notes)
+                    self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER)
+
+
+class SaveDuringSwap(Rig):
+    """★RULINGS DC1 — 승격·강등은 이제 살아 있는 지침이 아닌 본문을 쓰지 않는다: 원본을 읽은 뒤·교체 전에 사용자 저장이
+    끼어들면 그 새 바이트는 살아 있는 파일이나 백업 어딘가에 있다(어느 쪽에도 없는 경우는 없다). 실제 ceo_py 코드를 모듈로
+    싣고 교체 직전의 함수를 감싸 저장을 결정론으로 끼워 넣는다."""
+    EDIT = "USERSAVE-DC1 교체 직전에 저장한 줄\n"
+
+    def everywhere(self):
+        """살아 있는 파일 + 디렉티브 폴더의 모든 백업·사본(이름이 MASTER_DIRECTIVE.md 로 시작하는 파일) 바이트."""
+        out = {}
+        for f in os.listdir(self.dirs):
+            if f.startswith("MASTER_DIRECTIVE.md") and not f.endswith(".lock") and os.path.isfile(self.p(f)):
+                out[f] = _slurp(self.p(f), encoding="utf-8")
+        for k in self.kept():
+            out[os.path.relpath(k, self.dirs)] = _slurp(k, encoding="utf-8")
+        return out
+
+    def hook_first_live_write(self, ns, save):
+        """살아 있는 MASTER 를 처음 건드리는 함수(지금 코드: swap_unit · DC1: swap_live · 종전: write_atomic)에 들어가기 직전 save() 1회."""
+        md = self.p("MASTER_DIRECTIVE.md")
+        name = next(n for n in ("swap_unit", "swap_live", "write_atomic") if n in ns)
+        orig = ns[name]
+        fired = []
+
+        def wrapped(path, *a, **kw):
+            if os.path.abspath(path) == os.path.abspath(md) and not fired:
+                fired.append(1)
+                save()
+            return orig(path, *a, **kw)
+        ns[name] = wrapped
+        return fired
+
+    @staticmethod
+    def modes(ns):
+        """교체의 두 방식 — 맞바꾸기(맥·리눅스, 이 플랫폼에 있을 때)와 이름 옮기기(윈도우 등의 대안 · 여기서 강제로 잰다)."""
+        out = []
+        if ns["exchange_fn"]() is not None:
+            out.append("exchange")
+        out.append("rename")
+        return out
+
+    @staticmethod
+    def force(ns, mode):
+        if mode == "rename":
+            ns["exchange_fn"] = lambda: None
+
+    def save_in_place(self, text):
+        with open(self.p("MASTER_DIRECTIVE.md"), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def save_by_rename(self, text):
+        tmp = self.p("MASTER_DIRECTIVE.md.editor-tmp")
+        _write(tmp, text)
+        os.replace(tmp, self.p("MASTER_DIRECTIVE.md"))
+
+    def test_save_between_read_and_promotion_write_is_never_lost(self):
+        for mode in self.modes(ceo_py_module()):
+          for how in ("in-place", "rename"):
+            with self.subTest(swap=mode, save=how):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                ns = ceo_py_module()
+                self.force(ns, mode)
+                saver = self.save_in_place if how == "in-place" else self.save_by_rename
+                fired = self.hook_first_live_write(ns, lambda: saver(USER + self.EDIT))
+                rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), ""])
+                self.assertEqual(fired, [1], "끼어들기가 일어나지 않았다(시험 무효)")
+                held = [k for k, v in self.everywhere().items() if self.EDIT in v]
+                self.assertTrue(held, "교체 직전 저장(%s)이 살아 있는 파일에도 백업에도 없다: rc=%r %r"
+                                % (how, rc, self.everywhere()))
+                live = self.read("MASTER_DIRECTIVE.md")
+                if rc in (0, 12):
+                    self.assertIn(self.EDIT, live, "승격이 끝났는데 살아 있는 지침이 저장 전 본문이다(DC1)")
+                    self.assertEqual(live, HEADER + SEP + USER + self.EDIT)
+                    self.assertEqual(self.read("MASTER_DIRECTIVE.md.pre-ceo"), USER + self.EDIT,
+                                     "백업이 저장 전 본문이다 — 승격 전 본부 지침은 저장된 것이다")
+                else:
+                    self.assertEqual(live, USER + self.EDIT, "보류했는데 저장한 파일이 살아 있지 않다")
+
+    def test_save_while_the_live_name_is_empty_wins(self):
+        """이름 옮기기 방식(맞바꾸기가 없는 플랫폼)의 두 단계 사이 — 살아 있는 이름이 비어 있는 순간 — 에 편집기가 새 파일을
+        만들면 그 파일이 이긴다(덮지 않는다)."""
+        self.seed()
+        ns = ceo_py_module()
+        self.force(ns, "rename")
+        self.assertIn("place_candidate", ns, "교체가 '덮지 않는 자리 놓기'를 쓰지 않는다")
+        orig = ns["place_candidate"]
+        md = self.p("MASTER_DIRECTIVE.md")
+        fired = []
+
+        def wrapped(src, dst):
+            if os.path.abspath(dst) == os.path.abspath(md) and not fired:
+                fired.append(1)
+                _write(md, USER + self.EDIT)
+            return orig(src, dst)
+        ns["place_candidate"] = wrapped
+        rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), md, sha(TEMPLATE), ""])
+        self.assertEqual(fired, [1])
+        self.assertEqual(rc, 0, "다시 읽어 저장된 본문으로 승격해야 한다")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER + self.EDIT)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md.pre-ceo"), USER + self.EDIT)
+        self.assertEqual([f for f in os.listdir(self.dirs) if ".displaced" in f], [], "옮겨 둔 옛 파일이 남았다")
+
+    def test_save_between_read_and_demotion_write_is_never_lost(self):
+        for mode in self.modes(ceo_py_module()):
+            with self.subTest(swap=mode):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                self.register()
+                self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+                composed = self.read("MASTER_DIRECTIVE.md")
+                ns = ceo_py_module()
+                self.force(ns, mode)
+                fired = self.hook_first_live_write(ns, lambda: self.save_in_place(composed + self.EDIT))
+                rc = ns["do_demote"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), ""])
+                self.assertEqual(fired, [1])
+                held = [k for k, v in self.everywhere().items() if self.EDIT in v]
+                self.assertTrue(held, "강등 직전 저장이 살아 있는 파일에도 백업에도 없다: rc=%r %r" % (rc, self.everywhere()))
+                if rc == 0:
+                    self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER + self.EDIT,
+                                     "강등이 저장 전 본문을 돌려줬다(DC1)")
+
+    def test_live_name_never_absent_during_an_exchange_swap(self):
+        """맞바꾸기 방식에서는 교체 중에도 살아 있는 이름이 한순간도 비지 않는다 — 읽는 쪽(훅·배달)이 '파일 없음'을 볼 수 없다.
+        읽는 스레드가 200번의 교체 내내 여는 동안 FileNotFoundError 0."""
+        import threading
+        ns = ceo_py_module()
+        if ns["exchange_fn"]() is None:
+            self.skipTest("이 플랫폼에는 원자 맞바꾸기가 없다(이름 옮기기 방식 — 잠깐 빈다)")
+        self.seed()
+        md = self.p("MASTER_DIRECTIVE.md")
+        stop, misses, reads = threading.Event(), [], [0]
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    with open(md, "rb") as f:
+                        f.read(16)
+                    reads[0] += 1
+                except FileNotFoundError:
+                    misses.append(1)
+        t = threading.Thread(target=reader)
+        t.start()
+        try:
+            cur = USER.encode()
+            for i in range(200):
+                nxt = (USER + "v%d\n" % i).encode()
+                ns["swap_unit"](md, nxt, sha(cur), "compose", "test")   # 밀려난 판은 보관 폴더로(EY1)
+                cur = nxt
+        finally:
+            stop.set()
+            t.join(60)
+        self.assertGreater(reads[0], 0, "읽는 스레드가 돌지 않았다(시험 무효)")
+        self.assertEqual(misses, [], "교체 중 살아 있는 이름이 비었다")
+
+    def test_retries_are_bounded_and_end_in_a_hold(self):
+        """원본이 매번 바뀌면 정해진 횟수만 다시 하고 보류한다(아무것도 쓰지 않음 · 알림 1건) — 끝없는 재시도 없음."""
+        self.seed()
+        ns = ceo_py_module()
+        orig = ns["swap_unit"]
+        n = []
+
+        def always_changing(path, data, expect_sha, op, *a, **kw):
+            if op == "compose":                 # 되돌리기(restore)는 끼어들지 않는다 — 조립마다 한 번 저장
+                n.append(1)
+                self.save_in_place(USER + "CHANGE %d\n" % len(n))
+            return orig(path, data, expect_sha, op, *a, **kw)
+        ns["swap_unit"] = always_changing
+        nf = os.path.join(self.tmp, "nf.txt")
+        rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), nf])
+        self.assertEqual(rc, 9, "계속 바뀌는 원본에서 보류(rc 9)가 아니다")
+        self.assertLessEqual(len(n), 3, "재시도 상한이 없다")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER + "CHANGE %d\n" % len(n), "마지막 저장이 살아 있지 않다")
+        self.assertIsNone(self.read(".ceo-receipt.json"))
+        self.assertIn("CEO 승격 보류(본부 지침이 조립 중에 계속 바뀜)", self.notices_text())
+
+
+class StaleLegacyReceipt(Rig):
+    """★RULINGS DC2 — 남은 0.14 영수증(.ceo-template-applied)은 조립된 지침을 0.14.x 승격으로 다시 분류하지 못한다: 0.14 영수증은
+    그 해시가 살아 있는 파일과 같을 때만 증거다. 이전이 끝나는 쓰기들 사이에서 멈춰도 다음 승격 확인이 바르게 이어 가고,
+    빠른 경로도 남은 0.14 영수증을 치운다."""
+    OLD_HEADER = "# CEO 옛 머리말 (master of master · 단일소유 강제 · exit 7)\n"
+    OLD_VENDOR = master_text("OLD-STANDARD-MASTER")
+    USER_OLD = OLD_VENDOR + "USERFIX-OLD 승격 전에 고친 줄\n"
+    EDIT = "CEO-EDIT-DC2 CEO 동안 고친 본문 줄\n"
+
+    def migrated(self):
+        old_copy = self.OLD_HEADER + SEP + self.OLD_VENDOR
+        self.seed(md=old_copy)
+        _write(self.p("MASTER_DIRECTIVE.md.pre-ceo"), self.USER_OLD)
+        _write(self.p(".ceo-template-applied"), sha(old_copy) + "\n")
+        rc, out, err = self.run_dept("promote-ceo")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + self.USER_OLD)
+        return old_copy
+
+    def test_crash_residue_then_edit_then_lost_receipt_keeps_the_edit(self):
+        old_copy = self.migrated()
+        _write(self.p(".ceo-template-applied"), sha(old_copy) + "\n")      # 이전의 마지막 쓰기 앞에서 멈춘 흔적
+        edited = HEADER + SEP + self.USER_OLD + self.EDIT
+        _write(self.p("MASTER_DIRECTIVE.md"), edited)                       # CEO 동안 고친 본문
+        os.remove(self.p(".ceo-receipt.json"))                              # 새 영수증 유실
+        rc, out, err = self.run_dept("promote-ceo")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), edited, "남은 0.14 영수증이 조립된 지침을 다시 분류했다(DC2)")
+        self.assertIsNone(self.read(".ceo-template-applied"), "남은 0.14 영수증을 치우지 않았다")
+        self.assert_receipt_for(HEADER, self.USER_OLD + self.EDIT, edited)
+        rc, out, err = self.run_dept("down", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.USER_OLD + self.EDIT, "강등이 CEO 동안 고친 본문을 잃었다")
+
+    def test_demotion_with_residue_and_no_receipt_keeps_the_edit(self):
+        old_copy = self.migrated()
+        _write(self.p(".ceo-template-applied"), sha(old_copy) + "\n")
+        edited = HEADER + SEP + self.USER_OLD + self.EDIT
+        _write(self.p("MASTER_DIRECTIVE.md"), edited)
+        os.remove(self.p(".ceo-receipt.json"))
+        rc, out, err = self.run_dept("down", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.USER_OLD + self.EDIT, "강등이 낡은 .pre-ceo 를 돌려줬다(DC2)")
+
+    def test_fast_path_cleans_legacy_residue(self):
+        old_copy = self.migrated()
+        _write(self.p(".ceo-template-applied"), sha(old_copy) + "\n")
+        rc, out, err = self.run_dept("launch", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIsNone(self.read(".ceo-template-applied"), "빠른 경로가 남은 0.14 영수증을 치우지 않았다")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + self.USER_OLD)
+
+    def test_matching_legacy_receipt_is_still_evidence(self):
+        """대조: 해시가 살아 있는 파일과 같은 0.14 영수증은 여전히 0.14.x 승격의 증거다(배포 표 밖 머리말이어도)."""
+        old_copy = self.OLD_HEADER + SEP + self.OLD_VENDOR
+        self.seed(md=old_copy)
+        _write(self.p("MASTER_DIRECTIVE.md.pre-ceo"), self.USER_OLD)
+        _write(self.p(".ceo-template-applied"), sha(old_copy) + "\n")
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + self.USER_OLD)
+
+    def test_interrupted_migration_at_every_write_recovers(self):
+        """이전의 쓰기마다(지침 교체 · 0.14 영수증 정리 · 새 영수증) 그 뒤에서 멈춘 상태 → CEO 동안 고친 본문 → 다음 승격 확인과
+        강등이 그 본문을 지킨다. 실제 ceo_py 를 모듈로 싣고 n 번째 쓰기에서 멈춘다(SystemExit)."""
+        for stop_after in ("swap", "legacy", "receipt"):
+            with self.subTest(stop_after=stop_after):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                old_copy = self.OLD_HEADER + SEP + self.OLD_VENDOR
+                self.seed(md=old_copy)
+                _write(self.p("MASTER_DIRECTIVE.md.pre-ceo"), self.USER_OLD)
+                _write(self.p(".ceo-template-applied"), sha(old_copy) + "\n")
+                ns = ceo_py_module()
+                names = {"swap": "swap_unit", "legacy": "drop_legacy", "receipt": "write_receipt"}
+                self.assertIn(names[stop_after], ns)
+                orig = ns[names[stop_after]]
+
+                def stop(*a, _orig=orig, **kw):
+                    _orig(*a, **kw)
+                    raise SystemExit("crash after %s" % stop_after)
+                ns[names[stop_after]] = stop
+                with self.assertRaises(SystemExit):
+                    ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), ""])
+                live = self.read("MASTER_DIRECTIVE.md")
+                self.assertEqual(live, HEADER + SEP + self.USER_OLD, "멈춘 뒤 지침이 이전 결과가 아니다")
+                _write(self.p("MASTER_DIRECTIVE.md"), live + self.EDIT)
+                rec = self.p(".ceo-receipt.json")
+                if os.path.exists(rec):
+                    os.remove(rec)
+                rc, out, err = self.run_dept("promote-ceo")
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(self.read("MASTER_DIRECTIVE.md"), live + self.EDIT)
+                self.assertIsNone(self.read(".ceo-template-applied"))
+                rc, out, err = self.run_dept("down", "d0")
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.USER_OLD + self.EDIT)
+                self.register()
+
+
+class ReportingFailureKeepsTheLifeCycle(Rig):
+    """★RULINGS DC3 — 보고 자체가 실패해도 생명주기 규칙은 선다: PENDING 쓰기 실패는 치명이 아니다(stderr 1줄), 조립과 그 상태
+    파일 쓰기가 둘 다 실패해도 `launch` 는 0 으로 끝나고 티켓 발급·편성 단계에 닿는다(합성 레인 — 실제 설치 무접촉)."""
+
+    def unwritable(self, path):
+        os.makedirs(path, exist_ok=True)
+        os.chmod(path, 0o555)
+        self.addCleanup(os.chmod, path, 0o755)
+        try:
+            open(os.path.join(path, ".probe"), "w").close()
+        except PermissionError:
+            return
+        os.remove(os.path.join(path, ".probe"))
+        self.skipTest("읽기 전용 폴더에도 쓸 수 있는 실행 계정(root) — 측정 불가")
+
+    def assert_life_cycle_reached(self, rc, out, err):
+        self.assertEqual(rc, 0, "launch 가 생명주기를 깼다\n" + out + err)
+        self.assertIn("CEO 티켓 자동 발급 생략", err, "티켓 발급 단계에 닿지 않았다\n" + err)
+        self.assertIn("편성 ensure 생략", err, "편성 단계에 닿지 않았다\n" + err)
+        self.assertIn("가동 완료", out, out + err)
+
+    def test_composition_and_pending_write_both_fail(self):
+        self.seed()
+        self.unwritable(os.path.join(self.home, ".cys", "state"))     # PENDING(ceo-pending) 쓰기 실패
+        self.unwritable(self.dirs)                                     # 조립(잠금·지침·영수증) 실패
+        rc, out, err = self.run_dept("launch", "d0")
+        self.assert_life_cycle_reached(rc, out, err)
+        self.assertIn("PENDING 기록 실패", err, "PENDING 쓰기 실패가 보이지 않는다(무음)")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER)
+
+    def test_boot_gate_pending_write_fails(self):
+        self.seed(marker=False)
+        self.unwritable(os.path.join(self.home, ".cys", "state"))
+        rc, out, err = self.run_dept("launch", "d0")
+        self.assert_life_cycle_reached(rc, out, err)
+        self.assertIn("PENDING 기록 실패", err)
+
+
+class LockIsReal(Rig):
+    """★RULINGS DC1 — 승격·강등은 진짜 잠금(POSIX: 잠금 파일의 flock(2) · 윈도우: msvcrt.locking)을 상한 있는 대기로 잡는다.
+    시간 안에 못 잡으면 '잠금 없이 진행'하지 않고 보류한다(알림 1건 · 지침 무변경) — 스크립트는 그래도 0 으로 끝난다."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import fcntl  # noqa: F401
+        except ImportError:
+            self.skipTest("fcntl 없는 플랫폼 — 윈도우의 msvcrt 잠금은 이 맥에서 잴 수 없다")
+        self.env["CYS_CEO_LOCK_WAIT_S"] = "1"
+
+    def hold_lock(self):
+        import fcntl
+        fd = os.open(self.p("MASTER_DIRECTIVE.md.promote.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+        return fd
+
+    def test_a_held_lock_holds_promotion_and_demotion(self):
+        import fcntl
+        self.seed()
+        fd = self.hold_lock()
+        title = "CEO 승격 보류(다른 승격·강등이 진행 중)"
+        for args in (("promote-ceo",), ("launch", "d0")):
+            rc, out, err = self.run_dept(*args)
+            self.assertEqual(rc, 5 if args == ("promote-ceo",) else 0, out + err)
+            self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "잠금을 못 잡았는데 지침을 바꿨다(무잠금 진행)")
+            self.assertIsNone(self.read("MASTER_DIRECTIVE.md.pre-ceo"))
+            self.register()
+        # ★FY3: 같은 상태(같은 지침 바이트)의 오래가는 보류 = 알림 정확히 1건 — 영속 알림함의 키(sent/)가 기억한다(종전: 데몬이
+        #   보관 중이 아니면 입구마다 1건).
+        self.assertEqual(self.pushes(title), 1, "보류 알림이 없거나 같은 보류를 입구마다 다시 알렸다")
+        _write(self.feedlist, "rid-l\t[pending]\tceo-notice\t%s\tdecision=-\n" % title)
+        self.assertEqual(self.run_dept("launch", "d0")[0], 0)
+        self.assertEqual(self.pushes(title), 1, "보관 중인 보류 알림을 또 올렸다(폭주)")
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        rc, out, err = self.run_dept("promote-ceo")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER)
+        self.assertIn("cys feed reply rid-l ceo-promoted", self.calls(), "잠금 보류 알림이 승격 뒤에 남았다")
+        # 강등도 같은 잠금 — 잡혀 있으면 보류(지침 무변경 · 알림), 풀리면 강등.
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        rc, out, err = self.run_dept("down", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER, "잠금을 못 잡았는데 강등했다")
+        self.assertEqual(self.pushes("CEO 강등 보류(다른 승격·강등이 진행 중)"), 1)
+        self.assertNotIn("무락 진행", out + err, "'잠금 없이 진행' 갈래가 남았다")
+
+    def test_bad_wait_values_fall_back_to_the_bounded_default(self):
+        """★RULINGS EY4 — 환경의 대기 값이 유한하지 않거나(nan·inf) 음수거나 숫자가 아니면 기본값(10 초)이다. 풀리지 않는 잠금
+        앞에서 `launch` 가 그 상한 안에 돌아와 티켓·편성 단계에 닿는다(종전: nan 이면 마감이 영원히 오지 않아 launch 가 멈췄다).
+        subprocess 의 120 초 상한은 멈춤을 끝낼 뿐이고, 판정은 rc·지침·단계 문구다."""
+        self.seed()
+        self.hold_lock()
+        for bad in ("nan", "inf", "-1", "abc"):
+            with self.subTest(wait=bad):
+                self.env["CYS_CEO_LOCK_WAIT_S"] = bad
+                try:
+                    rc, out, err = self.run_dept("launch", "d0", timeout=120)
+                except subprocess.TimeoutExpired:
+                    self.fail("CYS_CEO_LOCK_WAIT_S=%s 에서 launch 가 돌아오지 않았다(끝없는 잠금 대기)" % bad)
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "잠금 없이 진행했다")
+                self.assertIn("가동 완료", out, out + err)
+        ns = ceo_py_module()
+        for bad, want in (("nan", 10.0), ("inf", 10.0), ("-1", 10.0), ("abc", 10.0), ("", 10.0),
+                          ("1e9", 120.0), ("0.5", 0.5), ("0", 0.0)):
+            os.environ["CYS_CEO_LOCK_WAIT_S"] = bad
+            try:
+                self.assertEqual(ns["lock_wait_s"](), want, "대기 값 %r" % bad)
+            finally:
+                os.environ.pop("CYS_CEO_LOCK_WAIT_S", None)
+
+    def test_the_lock_is_taken_by_the_real_code(self):
+        """잠금을 지우는 변이는 이 시험이 잡는다: 잠금이 잡혀 있으면 do_compose 는 상한 안에 rc 8(보류)로 끝난다."""
+        self.seed()
+        self.hold_lock()
+        ns = ceo_py_module()
+        nf = os.path.join(self.tmp, "nf.txt")
+        os.environ["CYS_CEO_LOCK_WAIT_S"] = "0.3"
+        self.addCleanup(os.environ.pop, "CYS_CEO_LOCK_WAIT_S", None)
+        rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), nf])
+        self.assertEqual(rc, 8)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER)
+        self.assertIn("CEO 승격 보류(다른 승격·강등이 진행 중)", self.notices_text())
+        rc = ns["do_demote"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), nf])
+        self.assertEqual(rc, 8)
 
 
 class LegacyShapes(Rig):
@@ -843,20 +2828,27 @@ class LegacyShapes(Rig):
         self.assertIsNone(self.read("MASTER_DIRECTIVE.md.pre-ceo"))
         self.assertEqual(self.captures("before-demote"), [])
 
-    def test_edited_while_ceo_body_is_the_backup_and_the_copy_is_kept(self):
+    def test_edited_copy_with_a_stale_legacy_receipt_is_a_composition(self):
+        """★RULINGS DC2 로 다시 씀(종전: 'CEO 동안 고친 복사본 + 0.14 영수증 → 본문 = .pre-ceo'): 0.14 영수증은 그 해시가 살아
+        있는 파일과 같을 때만 증거다. 고친 복사본은 해시가 다르고 머리말도 배포 표 밖이라 0.14.x 증거가 없다 → 조립(본문 =
+        구분선 뒤 · 고친 줄 그대로) + 지금 지침 통째 사본 + 알림 1건(.pre-ceo 가 다른 MASTER 임과 그 경로). 배포된 머리말의 고친
+        복사본은 여전히 .pre-ceo 를 본문으로 쓴다(test_released_header_with_ceo_edits_keeps_the_old_directive)."""
         original = self.OLD_HEADER + SEP + self.OLD_VENDOR
         edited = original + self.EDIT.decode()
+        tail = self.OLD_VENDOR + self.EDIT.decode()
         self.migrate(edited, legacy_hash=sha(original))
-        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + self.USER_OLD, "본문이 승격 전 본부 지침이 아니다")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + tail, "해시가 안 맞는 0.14 영수증이 증거로 쓰였다(DC2)")
         caps = self.captures("before-compose")
-        self.assertEqual([_slurp(c, encoding="utf-8") for c in caps], [edited], "옛 CEO 지침을 통째로 보관하지 않았다")
-        lines = self.pushes_prefix(self.MIGRATION)
-        self.assertEqual(len(lines), 1)
-        self.assertIn("— %s --body" % os.path.basename(caps[0]), lines[0], "알림이 보관 사본을 이름으로 가리키지 않는다")
+        self.assertEqual([_slurp(c, encoding="utf-8") for c in caps], [edited], "지금 지침을 통째로 보관하지 않았다")
+        lines = self.pushes_prefix("CEO ")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("cys feed push --title " + self.HEADER_COPY + os.path.basename(caps[0])))
+        self.assertIn(self.p("MASTER_DIRECTIVE.md.pre-ceo"), lines[0])
         self.assertEqual(self.read("MASTER_DIRECTIVE.md.pre-ceo"), self.USER_OLD, "백업을 덮었다")
-        self.assertEqual(self.run_dept("promote-ceo")[0], 0)             # 이전 뒤에는 현행 — 알림 없음
-        self.assertEqual(len(self.pushes_prefix(self.MIGRATION)), 1)
-        self.demote_to(self.USER_OLD)
+        self.assertIsNone(self.read(".ceo-template-applied"), "0.14 영수증을 치우지 않았다")
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)             # 조립 뒤에는 현행 — 알림 없음
+        self.assertEqual(len(self.pushes_prefix("CEO ")), 1)
+        self.demote_to(tail)
 
     # ── ★CG1: 양성 증거 없는 구분선 지침 = 조립 ──
     def test_edited_v014_header_without_legacy_receipt_is_a_composition(self):
@@ -886,7 +2878,7 @@ class LegacyShapes(Rig):
                 self.assertIn("다른 MASTER", lines[0])
                 self.assert_receipt_for(HEADER, tail, HEADER.encode() + SEP.encode() + tail)
                 self.demote_to(tail.decode("utf-8"))
-                kept = glob.glob(self.p("MASTER_DIRECTIVE.md.pre-ceo.*"))
+                kept = self.kept("backup")
                 self.assertEqual([_slurp(k, encoding="utf-8") for k in kept], [self.USER_OLD], "강등이 .pre-ceo 를 썼거나 지웠다")
 
     def test_copy_of_the_current_template_is_a_composition(self):
