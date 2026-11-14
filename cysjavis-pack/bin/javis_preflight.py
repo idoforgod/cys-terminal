@@ -8802,7 +8802,7 @@ NOTICE_RESULT_SENTENCES = {
     "already": "wakeup 생략(같은 상태를 이미 보냈거나 다른 점검이 지금 보내는 중)",
     "unrecorded": "wakeup 적재하지 않음(알림 기록을 남길 수 없음 — 기록 없이 보내면 매 점검 되풀이된다)",
     "exhausted": "wakeup 적재하지 않음(같은 알림을 이미 정해진 횟수만큼 적재했으나 '보냄' 기록이 남지 않음 — 더 보내지 않는다)",
-    "failed": "wakeup 적재 실패(큐가 받지 않음 — 다음 점검이 다시 시도)",
+    "failed": "wakeup 적재 도구가 실패를 알림(큐가 받았는지는 알 수 없음 — 이 시도는 정해진 횟수에 센다)",
 }
 
 
@@ -8929,10 +8929,9 @@ def _notice_once(task, fp, enqueue):
     if mark is None:
         return "exhausted"
     if not enqueue():
-        try:
-            os.remove(mark)
-        except OSError:
-            pass
+        # ★T2i(RULINGS GB1): 표지는 거둬들이지 않는다 — '적재 도구가 실패를 알림'은 '큐가 받지 않음'이 아니다(큐는 대기 항목을 먼저
+        #   저장하고 그 뒤에 감사 원장에 쓴다 — 원장을 쓸 수 없거나 그 사이에 멈추면 항목은 배달된다). 이 시도는 번호를 소비하고,
+        #   한 지문의 적재는 저장소 · 원장 · 프로세스가 어떻든 N + 1 번 이하다(그 뒤 'exhausted'). 표지를 지우는 길은 나이 규칙뿐.
         return "failed"
     try:
         _notice_create_mark(_notice_mark(task, fp, "sent"), fp)

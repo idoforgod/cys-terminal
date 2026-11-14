@@ -306,15 +306,22 @@ class LedgerKinds(Rig):
         self.assertEqual(len([x for x in self.wakes(log) if "parked-merge" in x]), 3, "나이가 지난 표지는 치워지고 다시 알린다")
 
     def test_failed_enqueue_is_retried_not_recorded(self):
+        # ★T2i(RULINGS GB1 — 기대가 바뀜): 도구가 실패를 알려도 시도 표지는 남는다 — 곧바로 다음 점검은 다시 적재하지 않고(방금의
+        #   시도가 진행 중일 수 있다), 표지가 오래되면 번호를 매긴 다시 적재가 한 번 간다. '보냄'은 기록되지 않는다.
         log = self._wake_rig()
         wk = os.path.join(self.pack, "bin", "javis_wakeup.py")
         with open(wk, "w", encoding="utf-8") as f:
             f.write("import sys,json\nopen(%r,'a').write(json.dumps(sys.argv[1:])+'\\n')\nsys.exit(1)\n" % log)
         self.ledger({"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "version": "0.15.0", "ts": 1}})
-        self.run_check("c62_pack_heal_ledger", "C62")
-        self.assertEqual(self.delivered(), {}, "적재 실패는 기록하지 않는다")
-        self.run_check("c62_pack_heal_ledger", "C62")
-        self.assertEqual(len([x for x in self.wakes(log) if "parked-merge" in x]), 2, "다음 점검이 다시 시도한다")
+        clock = [1_000_000.0]
+        with mock.patch.object(pf, "_notice_now", lambda: clock[0]):
+            self.run_check("c62_pack_heal_ledger", "C62")
+            self.assertEqual(self.delivered(), {}, "적재 실패는 '보냄'으로 기록하지 않는다")
+            self.run_check("c62_pack_heal_ledger", "C62")
+            self.assertEqual(len([x for x in self.wakes(log) if "parked-merge" in x]), 1, "방금의 시도 표지가 있으면 다시 적재하지 않는다")
+            clock[0] += pf.NOTICE_PENDING_STALE_S
+            self.run_check("c62_pack_heal_ledger", "C62")
+        self.assertEqual(len([x for x in self.wakes(log) if "parked-merge" in x]), 2, "표지가 오래되면 번호를 매긴 다시 적재")
 
     # ★T2h(RULINGS CW4) → ★T2i(RULINGS EC6 — 기대가 바뀜): 알림 기록('보내는 중' 표지)을 남길 수 없으면 **적재하지 않는다**
     #   (종전: 큐 옆 표지로 데몬 기동당 한 번 보냈다) — 쓸 수 없는 저장소에서 매 점검 되풀이 없음 · stderr 한 줄.
@@ -589,10 +596,53 @@ class NoticeMarksRealQueue(Rig):
         self.assertFalse(os.path.exists(self.mark("t", "f1", "pending")))
         self.assertTrue(os.path.exists(self.mark("t", "f9", "pending")), "'보냄' 없는 지문의 표지는 남긴다(횟수 상한)")
 
-    def test_failed_enqueue_leaves_no_mark(self):
+    def test_failed_enqueue_keeps_its_mark(self):
+        # ★T2i(RULINGS GB1): 실패한 적재의 표지도 남는다 — 그 시도는 번호를 소비한다.
         self.assertEqual(pf._notice_once("t", "f1", lambda: False), "failed")
-        self.assertFalse(os.path.exists(self.mark("t", "f1", "pending")), "다음 점검이 곧바로 다시 시도한다")
+        self.assertTrue(os.path.exists(self.mark("t", "f1", "pending")), "표지는 거둬들이지 않는다")
+        self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "already", "방금의 시도가 있으면 다시 적재하지 않는다")
+        self.clock[0] += pf.NOTICE_PENDING_STALE_S
         self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "sent")
+        self.assertTrue(os.path.exists(self.mark("t", "f1", "retry-1")))
+
+    def _ledger_unwritable(self):
+        wk = os.path.join(self.ws, "_round", "wakeups")
+        os.makedirs(os.path.join(wk, "queue.jsonl"), exist_ok=True)   # 감사 원장 자리가 폴더 — 대기 폴더는 쓸 수 있음
+
+    def _drain_count(self):
+        n = len(self.queued())
+        subprocess.run([sys.executable, self.wakeup, "drain"], capture_output=True, text=True, timeout=60, env=dict(os.environ))
+        return n
+
+    def test_gb1_ledger_unwritable_deliveries_stop_at_the_bound(self):
+        # ★T2i(RULINGS GB1): 실제 큐 — 대기 폴더는 쓸 수 있고 감사 원장은 못 쓴다: 적재 도구는 항목을 저장한 뒤 원장에서 실패하고,
+        #   drain 은 배달(대기 항목 제거) 뒤 원장에서 실패한다. 점검 · drain 을 되풀이해도 배달은 N + 1 에서 멈춘다.
+        self._ledger_unwritable()
+        delivered, outcomes = 0, []
+        for _ in range(pf.NOTICE_RETRY_MAX + 5):
+            outcomes.append(pf._notice_once("t", "f1", self.enqueue("t", "f1")))
+            delivered += self._drain_count()
+            self.clock[0] += pf.NOTICE_PENDING_STALE_S
+        self.assertEqual(delivered, pf.NOTICE_RETRY_MAX + 1, outcomes)
+        self.assertEqual(outcomes[0], "failed", "도구는 실패를 알렸지만 항목은 저장됐다")
+        self.assertEqual(set(outcomes[pf.NOTICE_RETRY_MAX + 1:]), {"exhausted"}, outcomes)
+
+    def test_gb1_a_stop_after_the_store_is_bounded(self):
+        # 큐가 받은 뒤 '보냄' 전에 프로세스가 멈춤(적재 뒤 예외) — 표지는 남고, 그 뒤의 점검은 번호를 매겨 N + 1 번까지만.
+        def store_then_stop():
+            self.enqueue("t", "f1")()
+            raise KeyboardInterrupt("stopped after the store")
+        with self.assertRaises(KeyboardInterrupt):
+            pf._notice_once("t", "f1", store_then_stop)
+        delivered = self._drain_count()
+        for _ in range(pf.NOTICE_RETRY_MAX + 4):
+            self.clock[0] += pf.NOTICE_PENDING_STALE_S
+            with contextlib.redirect_stderr(io.StringIO()):
+                pf._notice_once("t", "f1", self.enqueue("t", "f1"))
+            delivered += self._drain_count()
+        self.assertLessEqual(delivered, pf.NOTICE_RETRY_MAX + 1)
+        self.assertEqual(delivered, 2, "멈춘 시도 하나 + 번호를 매긴 다시 적재 하나 — 그 뒤 '보냄'이 있어 조용하다")
+        self.assertTrue(os.path.exists(self.mark("t", "f1", "sent")))
 
     def test_result_sentences(self):
         self.assertEqual(set(pf.NOTICE_RESULT_SENTENCES), {"sent", "already", "unrecorded", "exhausted", "failed"})
