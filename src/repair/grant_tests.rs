@@ -1150,3 +1150,62 @@ fn cv3_a_failed_pause_write_fails_closed() {
     assert_eq!(start_new(&r3, t + 60.0, D, &o).1.unwrap(), StartVerdict::Paused, "recovered, still within the pause");
     assert!(!pause_uncertain_in(&r3));
 }
+
+// ───────────────────────────── RULINGS DG (T4b round 2) ─────────────────────────────
+
+/// DG2 (the verdict's sequence): the attempt passes the first pause check; an owner input arrives
+/// before placement (a pause that ends soon); the claim is placed; the attempt is suspended between
+/// its two admission reads while `grant off` is published and the pause runs out. Every instant
+/// after placement was paused or off → not Allowed (off), its claim closed, its lock released.
+/// Without the Off: the pause that was in force when admission began refuses it (Paused); a pause
+/// that starts between the two reads refuses it too (the reads differ).
+#[test]
+fn dg2_final_admission_is_one_coherent_read() {
+    for case in ["off-and-expiry", "expiry-only", "input-between"] {
+        let r = root("dg2");
+        grant_on(&r, 5);
+        let t = t0();
+        let id = rid(1);
+        put(&r, &rec(&id, RepairState::InProgress, None));
+        let o = owner("base", 3, "inc-1");
+        let lane = LaneKey(format!("dg2-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+        let clock_now = Cell::new(t);
+        let hook = |s: ClaimStep| {
+            match (s, case) {
+                (ClaimStep::BeforePlace, "off-and-expiry" | "expiry-only") => {
+                    // an owner input whose pause ends 2 s from now
+                    let at = clock_now.get() - (PAUSE_QUIET_SECS as f64 + PAUSE_WRITE_COALESCE_SECS) + 2.0;
+                    assert!(note_owner_input_in(&r, &lane, at).unwrap());
+                }
+                (ClaimStep::BetweenAdmissionReads, "off-and-expiry") => {
+                    decide_in(&r, std::time::Duration::from_secs(2), &|_| {}, |cur| {
+                        let mut d = cur.decision.cloned().unwrap();
+                        d.state = GrantState::Off;
+                        Ok(d)
+                    })
+                    .unwrap();
+                    clock_now.set(clock_now.get() + 60.0); // the pause has run out
+                }
+                (ClaimStep::BetweenAdmissionReads, "expiry-only") => {
+                    clock_now.set(clock_now.get() + 60.0);
+                }
+                (ClaimStep::BetweenAdmissionReads, "input-between") => {
+                    assert!(note_owner_input_in(&r, &lane, clock_now.get()).unwrap());
+                }
+                _ => {}
+            }
+            HookAction::Continue
+        };
+        let clock = || clock_now.get();
+        let today = || D.to_string();
+        let v = try_claim_in(&ClaimEnv { root: &r, clock: &clock, today: &today, hook: &hook }, &o, &id);
+        match case {
+            "off-and-expiry" => assert!(matches!(&v, Err(RepairError::Precondition(m)) if m == GRANT_OFF_KO), "{case}: {v:?}"),
+            _ => assert_eq!(v.as_ref().ok(), Some(&StartVerdict::Paused), "{case}: {v:?}"),
+        }
+        assert_eq!(get(&r, &id).lock, None, "{case}: own lock released");
+        let placed = claims(&r);
+        assert_eq!(placed.len(), 1, "{case}");
+        assert!(closed(&r, placed[0].0), "{case}: own claim closed");
+    }
+}

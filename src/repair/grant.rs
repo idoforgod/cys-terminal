@@ -592,6 +592,29 @@ pub fn last_owner_input_in(root: &Path, now: f64) -> Option<f64> {
     last
 }
 
+/// The pause as one read (RULINGS DG2): the end of the pause (memory and stored, the later) and
+/// whether the stored state is uncertain. Two reads that compare equal saw no change in between.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PauseState {
+    pub deadline: Option<f64>,
+    pub uncertain: bool,
+}
+
+impl PauseState {
+    /// Paused at `now`: uncertain, or the pause has not ended.
+    pub fn paused_at(&self, now: f64) -> bool {
+        self.uncertain || self.deadline.is_some_and(|d| now < d)
+    }
+}
+
+/// [`PauseState`] of `root` read now.
+pub fn pause_state_in(root: &Path, now: f64) -> PauseState {
+    PauseState {
+        uncertain: pause_uncertain_in(root),
+        deadline: pause_deadline_in(root, now),
+    }
+}
+
 /// B4 / CV3: paused while the pause has not ended ([`pause_deadline_in`] — memory and file, the
 /// later wins), and while a pause write failed and has not succeeded since (fail closed). A clock
 /// set back keeps the pause on (the safe side).
@@ -631,6 +654,8 @@ pub enum ClaimStep {
     BeforePlace,
     /// Step 4 done (the claim is placed).
     AfterPlace,
+    /// Step 5 (RULINGS DG2): between the first and the second read of the admission state.
+    BetweenAdmissionReads,
 }
 
 /// What a test hook tells the attempt to do at a [`ClaimStep`].
@@ -1123,17 +1148,27 @@ pub fn try_claim_in(
         }
     }
     step!(env, ClaimStep::AfterPlace);
-    // (5) ADMIT — RULINGS CV1: admission is decided at the END. The decision and the pause are read
-    // again AFTER the claim is placed: a `grant off`, a new decision or an owner input published
-    // before this point refuses the attempt, which closes its own claim (`<n>.closed` — a closed
-    // claim counts toward today's cap: failures count, G3 / K3) and releases its own lock. Anything
-    // published after this point is ordered after this start (a running round is not stopped by a
-    // pause — B4).
-    let after = read_decision_in(env.root).unwrap_or(None);
-    let on_now = is_on(after.as_ref());
-    let same = after.as_ref().map(|d| d.generation) == Some(generation);
-    reconcile_pause_in(env.root, (env.clock)());
-    let paused = is_paused_in(env.root, (env.clock)());
+    // (5) ADMIT — RULINGS CV1 / DG2: admission is decided at the END, on ONE coherent state. With
+    // the clock read once (`now`), the decision and the pause are each read TWICE in alternation
+    // (decision, pause, decision, pause): admitted only when both decision reads are ON with the
+    // generation the attempt started under and both pause reads are equal and not paused at `now`.
+    // Generations only grow and stored pause ends never move back (DG4), so equal reads bracket
+    // an instant at which that decision and that pause held together — never a combination of
+    // two independent reads. A refusal closes the attempt's own claim (`<n>.closed` — a closed
+    // claim counts toward today's cap: failures count, G3 / K3) and releases its own lock.
+    // Anything published after the second reads is ordered after this start (a running round is
+    // not stopped by a pause — B4).
+    let now = (env.clock)();
+    reconcile_pause_in(env.root, now);
+    let d1 = read_decision_in(env.root).unwrap_or(None);
+    let p1 = pause_state_in(env.root, now);
+    step!(env, ClaimStep::BetweenAdmissionReads);
+    let d2 = read_decision_in(env.root).unwrap_or(None);
+    let p2 = pause_state_in(env.root, now);
+    let gen = |d: &Option<GrantDecision>| d.as_ref().map(|d| (d.state, d.generation));
+    let on_now = is_on(d1.as_ref()) && is_on(d2.as_ref());
+    let same = gen(&d1) == gen(&d2) && d2.as_ref().map(|d| d.generation) == Some(generation);
+    let paused = p1.paused_at(now) || p2.paused_at(now) || p1 != p2;
     if !on_now || !same || paused {
         if let Err(e) = create_marker(env.root, target) {
             // stderr only (F1); the claim's lock is released below, so it is closable by any evaluator
