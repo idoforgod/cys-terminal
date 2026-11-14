@@ -26744,8 +26744,8 @@ fn run_pack_merge_with(
             // ★T2g(RULINGS CL2): 등재 파일의 줄은 그 파일에서 거부되는 동사를 권하지 않는다 — 수리 흐름을 이름 댄다.
             println!("{}", merge_status_line(&dir, rel, e, sources.is_listed(rel)));
         }
-        if !scan.copies.is_empty() {
-            println!("{}", unrecorded_copies_line(&scan.copies, &|r| sources.is_listed(r)));
+        for line in unrecorded_copies_lines(&scan.copies, &|r| sources.is_listed(r)) {
+            println!("{line}");
         }
         if let Some(why) = scan.incomplete.as_deref() {
             println!("{}", unrecorded_scan_incomplete_line(why));
@@ -28304,8 +28304,8 @@ const UNRECORDED_SCAN_CAP: usize = 100_000;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct UnrecordedScan {
-    /// (팩 상대 rel, 원본 없음) — 정렬.
-    copies: Vec<(String, bool)>,
+    /// (팩 상대 rel, 원본 없음, 그 사본을 이름 대지 않는 원장 기록의 종류) — 정렬. ★FP4: 기록이 다른 종류면 그 종류.
+    copies: Vec<(String, bool, Option<String>)>,
     /// 조사를 끝내지 못한 사유(끝냈으면 None).
     incomplete: Option<String>,
 }
@@ -28359,7 +28359,8 @@ fn unrecorded_parked_copies_capped(
             if matches!(kind, Some("vendor-first" | "healed" | "conflicted")) {
                 continue;
             }
-            scan.copies.push((rel, orphan));
+            let record = kind.map(str::to_string);
+            scan.copies.push((rel, orphan, record));
         }
     }
     scan.copies.sort();
@@ -28371,33 +28372,56 @@ fn merge_list_says_consistent(pending: &serde_json::Map<String, serde_json::Valu
     pending.is_empty() && scan.copies.is_empty() && scan.incomplete.is_none()
 }
 
-/// ★T2i(RULINGS EF2 · EF3 · FH4): `cys pack-merge` 목록의 기록 없는 보관 사본 줄 — 세 경우(기록이 지워짐 · `--take-new` 로 확정 ·
-/// 등재 파일 아님)와 원본이 없는 사본에 참인 문장. 다시 입히는 두 길 또는 사본을 옮기기를 이름 대고, 지우라고 하지 않는다.
-fn unrecorded_copies_line(unrecorded: &[(String, bool)], is_listed: &dyn Fn(&str) -> bool) -> String {
-    let shown: Vec<String> = unrecorded
-        .iter()
-        .take(8)
-        .map(|(r, orphan)| {
-            let mut tags: Vec<&str> = Vec::new();
-            if *orphan {
-                tags.push("원본 없음");
-            }
-            if is_listed(r) {
-                tags.push("기동 필수·보호 목록");
-            }
-            if tags.is_empty() { r.clone() } else { format!("{r}({})", tags.join(" · ")) }
-        })
-        .collect();
-    let more = if unrecorded.len() > 8 { format!(" 외 {}건", unrecorded.len() - 8) } else { String::new() };
-    format!(
-        "⚠ 병합 대기 기록 없이 남은 보관 사본 {}건: {}{more} — 원장에 없어서 위 목록에는 나오지 않습니다(`--take-new` 로 vendor 본 \
-         유지를 확정했거나 기록이 지워졌습니다 · '원본 없음' = 그 파일이 지워졌거나 업데이트에서 빠졌습니다). 기동 필수·보호 목록 \
-         파일은 그 사본이 있는 동안 되돌리기(`cys pack-rollback`)가 건너뜁니다. 다시 입히려면 {} — 워커가 승인 절차로. 다시 입히지 \
+/// ★T2i(RULINGS EF2 · EF3 · FH4 · FP4): `cys pack-merge` 목록의 보관 사본 줄들 — (a) 원장에 기록이 없는 사본, (b) 원장 기록이 다른
+/// 종류라 그 사본을 이름 대지 않는 사본(그 종류를 이름 댄다 · "위 목록에 없다"고 하지 않는다). 다시 입히는 길은 vendor 우선 기록이
+/// 없으므로 `cys repair begin` 하나(FP4 (iii)), 아니면 사본을 다른 이름으로 옮기기 — 지우라고 하지 않는다.
+fn unrecorded_copies_lines(unrecorded: &[(String, bool, Option<String>)], is_listed: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let show = |items: &[&(String, bool, Option<String>)]| -> String {
+        let shown: Vec<String> = items
+            .iter()
+            .take(8)
+            .map(|(r, orphan, kind)| {
+                let mut tags: Vec<String> = Vec::new();
+                if let Some(k) = kind {
+                    tags.push(format!("원장 기록 '{k}'"));
+                }
+                if *orphan {
+                    tags.push("원본 없음".into());
+                }
+                if is_listed(r) {
+                    tags.push("기동 필수·보호 목록".into());
+                }
+                if tags.is_empty() { r.clone() } else { format!("{r}({})", tags.join(" · ")) }
+            })
+            .collect();
+        let more = if items.len() > 8 { format!(" 외 {}건", items.len() - 8) } else { String::new() };
+        format!("{}{more}", shown.join(", "))
+    };
+    let tail = format!(
+        "기동 필수·보호 목록 파일은 그 사본이 있는 동안 되돌리기(`cys pack-rollback`)가 건너뜁니다. 다시 입히려면 {} · 다시 입히지 \
          않으려면 그 사본을 다른 이름으로 옮기십시오(지우지 마십시오).",
-        unrecorded.len(),
-        shown.join(", "),
-        cys::pack::parked_copy_routes("<파일>")
-    )
+        unrecorded_copy_route("<파일>")
+    );
+    let none: Vec<&(String, bool, Option<String>)> = unrecorded.iter().filter(|c| c.2.is_none()).collect();
+    let other: Vec<&(String, bool, Option<String>)> = unrecorded.iter().filter(|c| c.2.is_some()).collect();
+    let mut out = Vec::new();
+    if !none.is_empty() {
+        out.push(format!(
+            "⚠ 병합 대기 기록 없이 남은 보관 사본 {}건: {} — 원장에 없어서 위 목록에는 나오지 않습니다(`--take-new` 로 vendor 본 유지를 \
+             확정했거나 기록이 지워졌습니다 · '원본 없음' = 그 파일이 지워졌거나 업데이트에서 빠졌습니다). {tail}",
+            none.len(),
+            show(&none)
+        ));
+    }
+    if !other.is_empty() {
+        out.push(format!(
+            "⚠ 원장 기록이 이름 대지 않는 보관 사본 {}건: {} — 위 목록에는 이 파일들이 괄호 안의 종류로 나오지만, 그 기록은 이 사본(<파일>.user)을 \
+             이름 대지 않습니다. {tail}",
+            other.len(),
+            show(&other)
+        ));
+    }
+    out
 }
 
 /// ★T2i(RULINGS FH4): 보관 사본 조사를 끝내지 못했을 때의 줄 — '0건' · '정합'을 말하지 않는다.
@@ -28711,6 +28735,42 @@ fn parked_copy_present(dir: &std::path::Path, rel: &str) -> bool {
     std::fs::symlink_metadata(dir.join(format!("{rel}.user"))).is_ok()
 }
 
+/// ★T2i(RULINGS FP4): 되돌리지 않는 파일의 경우 — 문장은 경우마다 그 경우에 통하는 길만 이름 댄다.
+/// (i) vendor 우선 기록(사본은 디스크에서 본 대로 있음 · 없음) — 다시 입히는 두 길(CN1) · '사본을 옮기면 풀린다'는 말하지 않는다
+/// (거부가 기록에도 걸린다); (ii) 다른 종류의 기록 + 사본 — 그 종류를 이름 댄다; (iii) 기록 없음 + 사본 — `cys repair begin` 또는
+/// 사본을 다른 이름으로 옮기기(`reapply` 는 vendor 우선 기록 없이 거부되므로 이름 대지 않는다).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ParkCase {
+    VendorFirst { present: bool },
+    OtherRecord { kind: String },
+    NoRecord,
+}
+
+/// 되돌리기가 이 파일을 거부하는 경우인가 — vendor 우선 기록, 또는 등재 파일에 디스크의 보관 사본.
+fn park_case(
+    dir: &std::path::Path,
+    rel: &str,
+    pending: &serde_json::Map<String, serde_json::Value>,
+    listed: bool,
+) -> Option<ParkCase> {
+    let kind = pending.get(rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str());
+    let present = parked_copy_present(dir, rel);
+    match kind {
+        Some("vendor-first") => Some(ParkCase::VendorFirst { present }),
+        _ if !(listed && present) => None,
+        Some(k) => Some(ParkCase::OtherRecord { kind: k.to_string() }),
+        None => Some(ParkCase::NoRecord),
+    }
+}
+
+/// ★T2i(RULINGS FP4 (iii)): vendor 우선 기록이 없는 사본을 다시 입히는 길 — 직접 고친 파일의 길 하나(`reapply` 는 거부된다).
+fn unrecorded_copy_route(rel: &str) -> String {
+    format!(
+        "워커가 `cys repair begin --files {rel} --trigger update` 로 그 사본으로 새 수리를 열어 예행·검사를 거치고 주인 최종 승인 뒤에 \
+         다시 입힙니다"
+    )
+}
+
 /// ★T2i(RULINGS EF1): 등재 파일에 보관된 사본(`<rel>.user`)이 있는데 vendor-first 기록이 **없을** 때의 되돌리기 거부 문장 —
 /// 기록이 지워졌든(두 쓰는 쪽의 원장 통째 저장) `--take-new` 로 vendor 본 유지를 확정해 지웠든, 그 사본이 무엇인지 알 수
 /// 없으므로 더 엄격한 규칙(되돌리지 않음)이다. 이 파일을 풀어 주는 길: 다시 입히기(두 길 · CN1) 또는 그 사본을 다른 이름으로
@@ -28730,9 +28790,9 @@ fn rollback_unrecorded_copy_refusal(rel: &str, prev_ver: &str, live_is_embed: bo
          이 기록으로는 알 수 없으므로 되돌리기는 이 파일에 아무것도 쓰지 않습니다 — \
          되돌린 바이트는 그다음 설치가 내 사본 자리에 보관해 그 사본을 한 세대 뒤로 밀어낼 수 있습니다. 아무것도 쓰지 않았습니다.\n\
          \x20  다른 파일을 팩 {prev_ver} 으로 되돌리면 이 파일만 {stays} 남아, 팩은 {prev_ver} 의 파일과 이 파일이 섞인 상태가 됩니다.\n\
-         \x20  이 파일을 풀어 주는 길: 그 사본을 다시 입히려면 {} — 워커가 그 사본으로 새 수리를 열어 예행·검사를 거치고 주인 최종 승인 뒤에 \
-         다시 입힙니다. 다시 입히지 않으려면 그 사본을 다른 이름으로 옮기십시오(지우지 마십시오).",
-        cys::pack::parked_copy_routes(rel)
+         \x20  이 파일을 풀어 주는 길: 그 사본을 다시 입히려면 {}. 다시 입히지 않으려면 그 사본을 다른 이름으로 옮기십시오(지우지 \
+         마십시오).",
+        unrecorded_copy_route(rel)
     )
 }
 
@@ -28788,11 +28848,16 @@ fn snapshot_mismatch_how(system: bool, guarded: bool) -> &'static str {
 
 /// ★T2g(RULINGS CL1 (c) · CR1): 목록(파일을 고르기 전)이 미리 밝히는 vendor-first 파일의 표시 — 되돌리기는 이 파일을 언제나
 /// 거부하므로(사본이 무엇이든) 결과를 그대로 말한다: 다른 파일을 되돌리면 이 파일만 남는다.
-fn parked_list_note(rel: &str, live_is_embed: bool) -> String {
+fn parked_list_note(rel: &str, live_is_embed: bool, case: &ParkCase) -> String {
     let stays = if live_is_embed { "새 출시본으로" } else { "지금의 바이트로" };
-    format!(
-        " — 되돌리지 않음: 보관된 사본 {rel}.user 가 있는 기동 필수·보호 목록 파일 · 다른 파일을 되돌리면 이 파일만 {stays} 남음"
-    )
+    // ★T2i(RULINGS FP4): 사본이 '있다'는 디스크에서 본 때만 말한다 · 기록의 종류를 경우대로.
+    let what = match case {
+        ParkCase::VendorFirst { present: true } => format!("vendor 우선 보관 기록이 있고 보관된 사본 {rel}.user 가 있는"),
+        ParkCase::VendorFirst { present: false } => format!("vendor 우선 보관 기록이 있는(보관된 사본 {rel}.user 는 지금 없음)"),
+        ParkCase::OtherRecord { kind } => format!("보관된 사본 {rel}.user 가 있고 원장 기록이 '{kind}' 인"),
+        ParkCase::NoRecord => format!("보관된 사본 {rel}.user 가 있고 병합 대기 기록이 없는"),
+    };
+    format!(" — 되돌리지 않음: {what} 기동 필수·보호 목록 파일 · 다른 파일을 되돌리면 이 파일만 {stays} 남음")
 }
 
 /// ★T2g(RULINGS CL2): 목록이 미리 밝히는 등재 파일(vendor-first 기록 없음)의 표시 — `--file` 과 같은 판정.
@@ -28806,15 +28871,35 @@ fn rollback_list_note(copy: &GuardedCopy) -> String {
 
 /// ★T2g(RULINGS CL1 (c) · CR1): vendor-first 파일이 하나라도 있으면 목록 끝에 — 다른 파일을 되돌리면 그 파일들만 남아 팩이
 /// 섞인다는 것을 무엇이든 되돌리기 **전에** 말한다(되돌리기 거부 문장도 같은 결과를 다시 말한다).
-fn rollback_mixed_warning(stuck: &[String], prev_ver: &str) -> String {
+fn rollback_mixed_warning(stuck: &[(String, ParkCase)], prev_ver: &str) -> String {
+    // ★T2i(RULINGS FP4): 경우마다 그 경우에 통하는 길만 — vendor 우선 기록이 있는 파일은 다시 입히기(두 길)로만 풀리고, 기록이
+    //   없는(또는 다른 종류의) 사본이 있는 파일은 `cys repair begin` 으로 다시 입히거나 사본을 다른 이름으로 옮기면 풀린다.
+    let vf: Vec<&str> = stuck.iter().filter(|(_, c)| matches!(c, ParkCase::VendorFirst { .. })).map(|(r, _)| r.as_str()).collect();
+    let other: Vec<&str> = stuck.iter().filter(|(_, c)| !matches!(c, ParkCase::VendorFirst { .. })).map(|(r, _)| r.as_str()).collect();
+    let names: Vec<&str> = stuck.iter().map(|(r, _)| r.as_str()).collect();
+    let mut ways: Vec<String> = Vec::new();
+    if !vf.is_empty() {
+        ways.push(format!(
+            "vendor 우선 보관 기록이 있는 {}: 그 기록의 사본이 다시 입혀지기 전에는 되돌리지 않습니다 — {}",
+            vf.join(", "),
+            parked_reapply_way("<파일>")
+        ));
+    }
+    if !other.is_empty() {
+        ways.push(format!(
+            "vendor 우선 기록 없이 보관된 사본(<파일>.user)이 있는 {}: 그 사본을 다시 입히려면 {} · 다시 입히지 않으려면 그 사본을 다른 \
+             이름으로 옮기십시오(지우지 마십시오) — 그 뒤에는 되돌릴 수 있습니다.",
+            other.join(", "),
+            unrecorded_copy_route("<파일>")
+        ));
+    }
     format!(
-        "⚠ 되돌리지 않는 기동 필수·보호 목록 파일 {}건: {} — 이 파일들에는 보관된 사본(<파일>.user)이 있고, 그 사본이 다시 입혀지거나 \
-         다른 이름으로 옮겨지기 전에는 되돌리기가 이 파일들에 아무것도 쓰지 않습니다. 다른 파일을 팩 {prev_ver} 으로 되돌리면 이 \
-         파일들만 업데이트 뒤의 바이트(새 출시본, 또는 그 뒤에 손으로 고친 바이트)로 남아, 팩은 {prev_ver} 의 파일과 이 파일들이 \
-         섞인 상태가 됩니다. {}",
-        stuck.len(),
-        stuck.join(", "),
-        parked_reapply_way("<파일>")
+        "⚠ 되돌리지 않는 기동 필수·보호 목록 파일 {}건: {} — 되돌리기는 이 파일들에 아무것도 쓰지 않습니다. 다른 파일을 팩 {prev_ver} \
+         으로 되돌리면 이 파일들만 업데이트 뒤의 바이트(새 출시본, 또는 그 뒤에 손으로 고친 바이트)로 남아, 팩은 {prev_ver} 의 파일과 \
+         이 파일들이 섞인 상태가 됩니다. {}",
+        names.len(),
+        names.join(", "),
+        ways.join(" ")
     )
 }
 
@@ -28830,7 +28915,7 @@ fn snapshot_listing_lines(
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut count = 0usize;
-    let mut stuck: Vec<String> = Vec::new();
+    let mut stuck: Vec<(String, ParkCase)> = Vec::new();
     for f in &meta.files {
         let p = dir.join(&f.rel);
         let differs = match &f.link_target {
@@ -28841,14 +28926,13 @@ fn snapshot_listing_lines(
             continue;
         }
         let own = cys::pack::ownership_name_scoped(&f.rel, dir);
-        let vendor_first = pending.get(&f.rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str()) == Some("vendor-first");
         // ★RULINGS AC1: system 파일은 출시본 바이트일 때만 되돌린다 — 아닌 항목은 목록에서 미리 밝힌다. ★T2g: vendor-first 파일은
         // 언제나 되돌리지 않고(CR1), 등재 파일은 `--file` 과 같은 판정(다시 잰 출시본 · 링크 아님)으로 밝힌다. ★T2i(RULINGS EF1):
         // 보관된 사본이 있는 등재 파일도(기록 없이) 되돌리지 않는다 — 같은 디스크 사실.
-        let unrecorded = !vendor_first && sources.is_listed(&f.rel) && parked_copy_present(dir, &f.rel);
-        let note = if vendor_first || unrecorded {
-            stuck.push(f.rel.clone());
-            parked_list_note(&f.rel, live_is_embedded(dir, &f.rel))
+        let note = if let Some(case) = park_case(dir, &f.rel, pending, sources.is_listed(&f.rel)) {
+            let n = parked_list_note(&f.rel, live_is_embedded(dir, &f.rel), &case);
+            stuck.push((f.rel.clone(), case));
+            n
         } else if sources.is_listed(&f.rel) {
             rollback_list_note(&snapshot_copy(dir, snap, f, sources))
         } else if own == "system" && !f.released {
@@ -28880,21 +28964,19 @@ fn snapshot_listing_lines(
 }
 
 /// ★T2g(RULINGS CL1 (c) · CR1): pack.prev 목록의 한 줄 표시 — vendor-first 파일 · 등재 파일만(그 밖은 빈 표시 = 지금 동작).
-/// 둘째 값 = vendor-first 파일인가(경고 대상).
+/// 둘째 값 = 되돌리지 않는 경우(경고 대상 — FP4 의 경우).
 fn prev_listing_note(
     dir: &std::path::Path,
     prev: &std::path::Path,
     rel: &str,
     sources: &cys::pack::UpdateSources,
     pending: &serde_json::Map<String, serde_json::Value>,
-) -> (String, bool) {
-    if pending.get(rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str()) == Some("vendor-first")
-        || (sources.is_listed(rel) && parked_copy_present(dir, rel))
-    {
-        return (parked_list_note(rel, live_is_embedded(dir, rel)), true);
+) -> (String, Option<ParkCase>) {
+    if let Some(case) = park_case(dir, rel, pending, sources.is_listed(rel)) {
+        return (parked_list_note(rel, live_is_embedded(dir, rel), &case), Some(case));
     }
     if !sources.is_listed(rel) {
-        return (String::new(), false);
+        return (String::new(), None);
     }
     let src = prev.join(rel);
     let copy = match std::fs::read(&src) {
@@ -28904,7 +28986,7 @@ fn prev_listing_note(
             Err(_) => GuardedCopy::NotReleased,
         },
     };
-    (rollback_list_note(&copy), false)
+    (rollback_list_note(&copy), None)
 }
 
 /// [`run_pack_rollback`] 의 입력원 주입판 — 기동 필수 질의·과거 출시 해시 표(RULINGS AJ2)를 입력원에서 읽는다.
@@ -28959,7 +29041,7 @@ fn run_pack_rollback_with(
             prev.display(), prev_ver.trim(), cur_ver.trim()
         );
         let mut count = 0usize;
-        let mut stuck: Vec<String> = Vec::new();
+        let mut stuck: Vec<(String, ParkCase)> = Vec::new();
         let mut stack = vec![prev.clone()];
         while let Some(d) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&d) else { continue };
@@ -28990,9 +29072,9 @@ fn run_pack_rollback_with(
                     // SOT 단일 통과 — 설치가 seed-once 로 다루는 파일을 목록이 user 로 말하면 안 된다).
                     let own = cys::pack::ownership_name_scoped(&rel_s, &dir);
                     // ★T2g(RULINGS CL1 (c)): 등재 파일·vendor-first 파일은 `--file` 과 같은 판정으로 미리 밝힌다.
-                    let (note, is_stuck) = prev_listing_note(&dir, &prev, &rel_s, sources, &pending);
-                    if is_stuck {
-                        stuck.push(rel_s.clone());
+                    let (note, case) = prev_listing_note(&dir, &prev, &rel_s, sources, &pending);
+                    if let Some(case) = case {
+                        stuck.push((rel_s.clone(), case));
                     }
                     if count < 200 {
                         println!("  [{own}] {rel_s}{note}");
@@ -43143,7 +43225,10 @@ mod tests {
         let scan = unrecorded_parked_copies(&td, &none);
         assert_eq!(
             scan,
-            UnrecordedScan { copies: vec![(".hidden/x.md".into(), false), ("hooks/gone.sh".into(), true)], incomplete: None }
+            UnrecordedScan {
+                copies: vec![(".hidden/x.md".into(), false, None), ("hooks/gone.sh".into(), true, None)],
+                incomplete: None
+            }
         );
         assert!(!merge_list_says_consistent(&none, &scan), "사본이 있으면 정합이 아니다");
         // 상한에 닿음 → 미완.
@@ -43203,7 +43288,7 @@ mod tests {
         cys::pack::save_merge_pending(&td, &stale).unwrap();
         assert_eq!(t4_ledger_kind(&td, &rel), None, "검체: 기록이 지워졌다");
         // EF3: 기록 없는 사본은 `cys pack-merge` 목록에 보인다(같은 디스크 규칙).
-        assert_eq!(unrecorded_parked_copies(&td, &cys::pack::load_merge_pending(&td)).copies, vec![(rel.clone(), false)]);
+        assert_eq!(unrecorded_parked_copies(&td, &cys::pack::load_merge_pending(&td)).copies, vec![(rel.clone(), false, None)]);
         // ③ 다음 업데이트(손대지 않은 파일)의 스냅샷 = 이전 출시본(출시본 바이트).
         std::fs::write(td.join(&rel), old).unwrap();
         let s = cys::pack::create_update_snapshot(
@@ -43219,8 +43304,8 @@ mod tests {
         // 목록도 같은 사실로 표시하고 경고한다.
         let meta = cys::pack::read_update_snapshot_meta(&s.path).unwrap();
         let lines = snapshot_listing_lines(&td, &s.path, &meta, "0.15.0", &src, &cys::pack::load_merge_pending(&td));
-        assert_eq!(lines[0], format!("  [system] {rel}{}", parked_list_note(&rel, true)));
-        assert_eq!(lines.last().unwrap(), &rollback_mixed_warning(std::slice::from_ref(&rel), "0.15.0"));
+        assert_eq!(lines[0], format!("  [system] {rel}{}", parked_list_note(&rel, true, &ParkCase::NoRecord)));
+        assert_eq!(lines.last().unwrap(), &rollback_mixed_warning(&[(rel.clone(), ParkCase::NoRecord)], "0.15.0"));
         // ⑤ `--take-new` 로 기록을 지운 뒤에도 같다(사본은 남는다).
         t4_write_ledger(&td, &rel, serde_json::json!({"kind": "vendor-first", "side": format!("{rel}.user"), "version": "0.15.0", "ts": 0}));
         let take = MergeFlags { yes: true, take_new: true, ..MergeFlags::default() };
@@ -43229,7 +43314,7 @@ mod tests {
         assert!(td.join(format!("{rel}.user")).is_file(), "사본은 남았다");
         assert_eq!(
             unrecorded_parked_copies(&td, &cys::pack::load_merge_pending(&td)).copies,
-            vec![(rel.clone(), false)],
+            vec![(rel.clone(), false, None)],
             "--take-new 뒤에도 보인다"
         );
         assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, false, false, &src), 1, "--take-new 뒤에도 거부");
@@ -43279,8 +43364,9 @@ mod tests {
         let pending = cys::pack::load_merge_pending(&td);
         let footer = "복원: cys pack-rollback --file <경로> (스냅샷의 기록 해시로 검증한 뒤에만 씁니다 · system 파일은 출시본일 때만 · \
                       기동 필수 vendor 우선 보관 파일은 수리 흐름으로만)";
-        let vf_line = format!("  [system] {vf}{}", parked_list_note(&vf, true));
-        let warning = rollback_mixed_warning(std::slice::from_ref(&vf), "0.14.56");
+        let vfc = ParkCase::VendorFirst { present: true };
+        let vf_line = format!("  [system] {vf}{}", parked_list_note(&vf, true, &vfc));
+        let warning = rollback_mixed_warning(&[(vf.clone(), vfc.clone())], "0.14.56");
         assert_eq!(
             snapshot_listing_lines(&td, &snap.path, &meta, "0.14.56", &none, &pending),
             vec![vf_line.clone(), format!("  [system] {other}"), footer.to_string(), warning.clone()],
@@ -43299,8 +43385,8 @@ mod tests {
         let prev = cys::pack::pack_prev_dir(&td);
         std::fs::create_dir_all(prev.join(&vf).parent().unwrap()).unwrap();
         std::fs::write(prev.join(&vf), edit).unwrap();
-        assert_eq!(prev_listing_note(&td, &prev, &vf, &none, &pending), (parked_list_note(&vf, true), true));
-        assert_eq!(prev_listing_note(&td, &prev, &other, &none, &pending), (String::new(), false), "등재 아님 → 지금 동작");
+        assert_eq!(prev_listing_note(&td, &prev, &vf, &none, &pending), (parked_list_note(&vf, true, &vfc), Some(vfc.clone())));
+        assert_eq!(prev_listing_note(&td, &prev, &other, &none, &pending), (String::new(), None), "등재 아님 → 지금 동작");
         let _ = std::fs::remove_dir_all(&prev);
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
     }
@@ -43480,16 +43566,29 @@ mod tests {
             rollback_guarded_restored(rel, src, false),
             format!("{done} 이 파일을 바꾸는 길은 수리 흐름입니다: 워커가 `cys repair begin --files hooks/guard.sh --trigger …` → 예행·검사 → 주인 승인.")
         );
-        // ★T2i(RULINGS EF1): 표시는 보관된 사본이라는 디스크 사실로 — 기록이 있든 없든 참인 문장.
+        // ★T2i(RULINGS EF1 · FP4): 표시는 경우대로 — 사본이 '있다'는 디스크에서 본 때만, 기록의 종류를 이름 댄다.
+        let tail = " 기동 필수·보호 목록 파일 · 다른 파일을 되돌리면 이 파일만 새 출시본으로 남음";
         assert_eq!(
-            parked_list_note(rel, true),
-            " — 되돌리지 않음: 보관된 사본 hooks/guard.sh.user 가 있는 기동 필수·보호 목록 파일 · 다른 파일을 되돌리면 이 파일만 새 출시본으로 남음"
+            parked_list_note(rel, true, &ParkCase::VendorFirst { present: true }),
+            format!(" — 되돌리지 않음: vendor 우선 보관 기록이 있고 보관된 사본 hooks/guard.sh.user 가 있는{tail}")
         );
         assert_eq!(
-            parked_list_note(rel, false),
-            " — 되돌리지 않음: 보관된 사본 hooks/guard.sh.user 가 있는 기동 필수·보호 목록 파일 · 다른 파일을 되돌리면 이 파일만 지금의 바이트로 남음"
+            parked_list_note(rel, true, &ParkCase::VendorFirst { present: false }),
+            format!(" — 되돌리지 않음: vendor 우선 보관 기록이 있는(보관된 사본 hooks/guard.sh.user 는 지금 없음){tail}")
         );
-        let routes = cys::pack::parked_copy_routes(rel);
+        assert_eq!(
+            parked_list_note(rel, true, &ParkCase::OtherRecord { kind: "kept-drift".into() }),
+            format!(" — 되돌리지 않음: 보관된 사본 hooks/guard.sh.user 가 있고 원장 기록이 'kept-drift' 인{tail}")
+        );
+        assert_eq!(
+            parked_list_note(rel, false, &ParkCase::NoRecord),
+            " — 되돌리지 않음: 보관된 사본 hooks/guard.sh.user 가 있고 병합 대기 기록이 없는 기동 필수·보호 목록 파일 · 다른 파일을 \
+             되돌리면 이 파일만 지금의 바이트로 남음"
+        );
+        // FP4 (iii): 기록 없는 사본을 다시 입히는 길은 `cys repair begin` 하나 — `reapply` 를 이름 대지 않는다.
+        let route1 = "워커가 `cys repair begin --files hooks/guard.sh --trigger update` 로 그 사본으로 새 수리를 열어 예행·검사를 거치고 주인 \
+                      최종 승인 뒤에 다시 입힙니다";
+        assert_eq!(unrecorded_copy_route(rel), route1);
         assert_eq!(
             rollback_unrecorded_copy_refusal(rel, "0.14.56", true, None),
             format!(
@@ -43497,11 +43596,13 @@ mod tests {
                  기록은 없습니다(`--take-new` 로 vendor 본 유지를 확정했거나 기록이 지워졌습니다). 그 사본이 무엇인지 이 기록으로는 알 수 \
                  없으므로 되돌리기는 이 파일에 아무것도 쓰지 않습니다 — 되돌린 바이트는 그다음 설치가 내 사본 자리에 보관해 그 사본을 한 세대 뒤로 밀어낼 수 \
                  있습니다. 아무것도 쓰지 않았습니다.\n   다른 파일을 팩 0.14.56 으로 되돌리면 이 파일만 새 출시본으로 남아, 팩은 0.14.56 의 \
-                 파일과 이 파일이 섞인 상태가 됩니다.\n   이 파일을 풀어 주는 길: 그 사본을 다시 입히려면 {routes} — 워커가 그 사본으로 새 \
-                 수리를 열어 예행·검사를 거치고 주인 최종 승인 뒤에 다시 입힙니다. 다시 입히지 않으려면 그 사본을 다른 이름으로 옮기십시오\
-                 (지우지 마십시오)."
+                 파일과 이 파일이 섞인 상태가 됩니다.\n   이 파일을 풀어 주는 길: 그 사본을 다시 입히려면 {route1}. 다시 입히지 않으려면 \
+                 그 사본을 다른 이름으로 옮기십시오(지우지 마십시오)."
             )
         );
+        for k in [None, Some("kept-drift"), Some("quarantined")] {
+            assert!(!rollback_unrecorded_copy_refusal(rel, "0.14.56", true, k).contains("cys repair reapply"), "FP4 (iii)");
+        }
         assert!(!rollback_unrecorded_copy_refusal(rel, "0.14.56", false, None).contains("지우십시오"), "지우라고 하지 않는다");
         // ★T2i(RULINGS FH6): healed / conflicted 기록이 있으면 "기록은 없습니다"라고 하지 않는다 — 확인한 것을 말한다.
         for k in ["healed", "conflicted"] {
@@ -43516,20 +43617,35 @@ mod tests {
                 "{s}"
             );
         }
-        assert_eq!(
-            unrecorded_copies_line(
-                &[(rel.to_string(), false), ("bin/x.py".to_string(), false), ("hooks/gone.sh".to_string(), true)],
-                &|r| r == rel || r == "hooks/gone.sh"
-            ),
-            format!(
-                "⚠ 병합 대기 기록 없이 남은 보관 사본 3건: hooks/guard.sh(기동 필수·보호 목록), bin/x.py, hooks/gone.sh(원본 없음 · 기동 \
-                 필수·보호 목록) — 원장에 없어서 위 목록에는 나오지 않습니다(`--take-new` 로 vendor 본 유지를 확정했거나 기록이 \
-                 지워졌습니다 · '원본 없음' = 그 파일이 지워졌거나 업데이트에서 빠졌습니다). 기동 필수·보호 목록 파일은 그 사본이 있는 \
-                 동안 되돌리기(`cys pack-rollback`)가 건너뜁니다. 다시 입히려면 {} — 워커가 승인 절차로. 다시 입히지 않으려면 그 \
-                 사본을 다른 이름으로 옮기십시오(지우지 마십시오).",
-                cys::pack::parked_copy_routes("<파일>")
-            )
+        let lines = unrecorded_copies_lines(
+            &[
+                (rel.to_string(), false, None),
+                ("bin/x.py".to_string(), false, None),
+                ("hooks/gone.sh".to_string(), true, None),
+                ("agents.json".to_string(), false, Some("kept-drift".to_string())),
+            ],
+            &|r| r == rel || r == "hooks/gone.sh",
         );
+        let tail = format!(
+            "기동 필수·보호 목록 파일은 그 사본이 있는 동안 되돌리기(`cys pack-rollback`)가 건너뜁니다. 다시 입히려면 {} · 다시 입히지 \
+             않으려면 그 사본을 다른 이름으로 옮기십시오(지우지 마십시오).",
+            unrecorded_copy_route("<파일>")
+        );
+        assert_eq!(
+            lines,
+            vec![
+                format!(
+                    "⚠ 병합 대기 기록 없이 남은 보관 사본 3건: hooks/guard.sh(기동 필수·보호 목록), bin/x.py, hooks/gone.sh(원본 없음 · 기동 \
+                     필수·보호 목록) — 원장에 없어서 위 목록에는 나오지 않습니다(`--take-new` 로 vendor 본 유지를 확정했거나 기록이 \
+                     지워졌습니다 · '원본 없음' = 그 파일이 지워졌거나 업데이트에서 빠졌습니다). {tail}"
+                ),
+                format!(
+                    "⚠ 원장 기록이 이름 대지 않는 보관 사본 1건: agents.json(원장 기록 'kept-drift') — 위 목록에는 이 파일들이 괄호 안의 \
+                     종류로 나오지만, 그 기록은 이 사본(<파일>.user)을 이름 대지 않습니다. {tail}"
+                ),
+            ]
+        );
+        assert!(lines.iter().all(|l| !l.contains("cys repair reapply")), "FP4 (iii)");
         assert_eq!(
             unrecorded_scan_incomplete_line("방문 상한 1개에 닿음"),
             "⚠ 보관 사본 조사를 끝내지 못했습니다(방문 상한 1개에 닿음) — 기록 없는 보관 사본이 더 있을 수 있어, 이 목록은 완전하지 \
@@ -43548,17 +43664,24 @@ mod tests {
             "system 파일은 기록과 다른 보관본을 쓰지 않습니다(--force-vendor 로도 불가 — 검증된 되돌리기)."
         );
         assert_eq!(snapshot_mismatch_how(false, false), "강행하려면 --force-vendor 를 명시하십시오.");
+        // ★T2i(RULINGS FP4): 경우마다 그 경우에 통하는 길만.
+        let vfc = ParkCase::VendorFirst { present: true };
         assert_eq!(
-            rollback_mixed_warning(&["hooks/a.sh".to_string(), "hooks/b.sh".to_string()], "0.14.56"),
+            rollback_mixed_warning(&[("hooks/a.sh".to_string(), vfc.clone()), ("hooks/b.sh".to_string(), ParkCase::NoRecord)], "0.14.56"),
             format!(
-                "⚠ 되돌리지 않는 기동 필수·보호 목록 파일 2건: hooks/a.sh, hooks/b.sh — 이 파일들에는 보관된 사본(<파일>.user)이 있고, \
-                 그 사본이 다시 입혀지거나 다른 이름으로 옮겨지기 전에는 되돌리기가 이 파일들에 아무것도 쓰지 않습니다. 다른 파일을 팩 \
-                 0.14.56 으로 되돌리면 이 파일들만 업데이트 뒤의 바이트(새 출시본, 또는 그 뒤에 손으로 고친 바이트)로 남아, 팩은 0.14.56 의 \
-                 파일과 이 파일들이 섞인 상태가 됩니다. 다시 입히는 길은 수리 흐름입니다: 수리로 고친 파일이면 \
-                 `cys repair reapply <수리번호>`, 직접 고친 파일이면 `cys repair begin --files <파일> --trigger update` — 워커가 그 \
-                 사본으로 새 수리를 열어 예행·검사를 거치고 주인 최종 승인 뒤에 다시 입힙니다."
+                "⚠ 되돌리지 않는 기동 필수·보호 목록 파일 2건: hooks/a.sh, hooks/b.sh — 되돌리기는 이 파일들에 아무것도 쓰지 않습니다. 다른 \
+                 파일을 팩 0.14.56 으로 되돌리면 이 파일들만 업데이트 뒤의 바이트(새 출시본, 또는 그 뒤에 손으로 고친 바이트)로 남아, 팩은 \
+                 0.14.56 의 파일과 이 파일들이 섞인 상태가 됩니다. vendor 우선 보관 기록이 있는 hooks/a.sh: 그 기록의 사본이 다시 입혀지기 \
+                 전에는 되돌리지 않습니다 — {} vendor 우선 기록 없이 보관된 사본(<파일>.user)이 있는 hooks/b.sh: 그 사본을 다시 입히려면 \
+                 {} · 다시 입히지 않으려면 그 사본을 다른 이름으로 옮기십시오(지우지 마십시오) — 그 뒤에는 되돌릴 수 있습니다.",
+                parked_reapply_way("<파일>"),
+                unrecorded_copy_route("<파일>")
             )
         );
+        let only_vf = rollback_mixed_warning(&[("hooks/a.sh".to_string(), vfc.clone())], "0.14.56");
+        assert!(!only_vf.contains("다른 이름으로 옮기"), "FP4 (i): vendor 우선 기록이 있는 파일은 옮겨도 풀리지 않는다 — {only_vf}");
+        let only_none = rollback_mixed_warning(&[("hooks/b.sh".to_string(), ParkCase::NoRecord)], "0.14.56");
+        assert!(!only_none.contains("cys repair reapply"), "FP4 (iii): {only_none}");
         // ── RULINGS CN2: 보관된 사본으로 보내는 그 밖의 문장 — 두 길과 그 조건 ──
         assert_eq!(
             cys::pack::listed_file_refusal(rel, "cys pack-adopt"),
@@ -43695,7 +43818,8 @@ mod tests {
         }
         texts.push(rollback_guarded_restored(rel, src, true));
         texts.push(rollback_parked_refusal(rel, &present));
-        texts.push(parked_list_note(rel, true));
+        texts.push(parked_list_note(rel, true, &ParkCase::VendorFirst { present: true }));
+        texts.push(parked_list_note(rel, true, &ParkCase::NoRecord));
         texts.push(rollback_unrecorded_copy_refusal(rel, "0.14.56", true, None));
         texts.push(rollback_unrecorded_copy_refusal(rel, "0.14.56", true, Some("healed")));
         texts.push(snapshot_mismatch_how(false, true).to_string());
@@ -43709,7 +43833,7 @@ mod tests {
         reapply_texts.extend([
             cys::pack::listed_file_refusal(rel, "cys pack-adopt"),
             vendor_first_merge_refusal(rel),
-            rollback_mixed_warning(&["hooks/a.sh".to_string()], "0.14.56"),
+            rollback_mixed_warning(&[("hooks/a.sh".to_string(), ParkCase::VendorFirst { present: true })], "0.14.56"),
             plan_vf.to_string(),
         ]);
         for t in reapply_texts.iter().filter(|t| t.contains("cys repair reapply")) {

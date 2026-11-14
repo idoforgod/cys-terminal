@@ -176,17 +176,27 @@ class LedgerKinds(Rig):
                 f.write("e")
         os.symlink(elsewhere, os.path.join(self.pack, "linked"))
         # ★T2i(RULINGS FH4 — 기대가 바뀜): 원본이 없는 사본(hooks/orphan.sh.user)도 '원본 없음'으로 보인다.
+        # ★T2i(RULINGS FP4 — 기대가 바뀜): 기록 없는 사본을 다시 입히는 길은 `cys repair begin` 하나(`reapply` 는 이름 대지 않는다).
         want = ("★기록 없는 보관 사본 2건 — 병합 대기 기록 없이 디스크에 남은 내 수정본 <파일>.user(`--take-new` 로 vendor 본 "
                 "유지를 확정했거나 기록이 지워짐 · '원본 없음' = 그 파일이 지워졌거나 업데이트에서 빠짐 · 기동 필수·보호 목록 "
-                "파일이면 사본이 있는 동안 되돌리기가 그 파일을 건너뜀 · 다시 입히기 = 워커가 승인 절차로: 수리로 고친 파일이면 "
-                "`cys repair reapply <수리번호>`, 직접 고친 파일이면 `cys repair begin --files <파일> --trigger update` · 다시 "
-                "입히지 않으려면 그 사본을 다른 이름으로 옮긴다(지우지 않는다)): hooks/guard.sh, hooks/orphan.sh(원본 없음)")
+                "파일이면 사본이 있는 동안 되돌리기가 그 파일을 건너뜀 · 다시 입히기 = 워커가 승인 절차로 `cys repair begin --files "
+                "<파일> --trigger update` · 다시 입히지 않으려면 그 사본을 다른 이름으로 옮긴다(지우지 않는다)): hooks/guard.sh, "
+                "hooks/orphan.sh(원본 없음)")
+        self.assertNotIn("cys repair reapply", want)
         st, detail = self.run_check("c62_pack_heal_ledger", "C62", fix=False)
         self.assertEqual((st, detail), (WARN, want), "원장 없음")
         self.ledger({"bin/other.py": {"kind": "kept-drift", "side": "bin/other.py", "version": "x", "ts": 0}})
         st, detail = self.run_check("c62_pack_heal_ledger", "C62", fix=False)
         self.assertEqual(st, WARN)
         self.assertIn(want, detail, "원장이 다른 파일만 이름 댐")
+        # ★FP4 (ii): 그 파일의 기록이 다른 종류(kept-drift)면 '기록 없이'가 아니라 그 종류를 이름 댄다.
+        self.ledger({"hooks/guard.sh": {"kind": "kept-drift", "side": "hooks/guard.sh", "version": "x", "ts": 0}})
+        st, detail = self.run_check("c62_pack_heal_ledger", "C62", fix=False)
+        self.assertIn("★원장 기록이 이름 대지 않는 보관 사본 1건 — 원장에는 이 파일들이 괄호 안의 종류로 적혀 있으나 그 기록은 이 "
+                      "사본(<파일>.user)을 이름 대지 않음(기동 필수·보호 목록 파일이면 사본이 있는 동안 되돌리기가 그 파일을 건너뜀 · "
+                      "다시 입히기 = 워커가 승인 절차로 `cys repair begin --files <파일> --trigger update` · 다시 입히지 않으려면 그 "
+                      "사본을 다른 이름으로 옮긴다(지우지 않는다)): hooks/guard.sh(원장 기록 'kept-drift')", detail)
+        self.assertIn("★기록 없는 보관 사본 1건", detail, "원본 없는 사본은 기록 없이")
         self.ledger({"hooks/guard.sh": {"kind": "vendor-first", "side": "hooks/guard.sh.user", "version": "0.15.0", "ts": 1}})
         st, detail = self.run_check("c62_pack_heal_ledger", "C62", fix=False)
         self.assertEqual(st, WARN)

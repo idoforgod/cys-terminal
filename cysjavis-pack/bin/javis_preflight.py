@@ -407,7 +407,8 @@ _USER_SIDE_KINDS = ("vendor-first", "healed", "conflicted")
 
 
 def _unrecorded_parked_copies(root, pending, cap=None):
-    """→ (copies, incomplete) — copies = 정렬된 [(rel, 원본 없음)] · incomplete = 조사를 끝내지 못한 사유(끝냈으면 None)."""
+    """→ (copies, incomplete) — copies = 정렬된 [(rel, 원본 없음, 그 사본을 이름 대지 않는 원장 기록의 종류 또는 None)] ·
+    incomplete = 조사를 끝내지 못한 사유(끝냈으면 None)."""
     cap = UNRECORDED_SCAN_CAP if cap is None else cap
     out = []
     problems = []
@@ -433,21 +434,37 @@ def _unrecorded_parked_copies(root, pending, cap=None):
             v = pending.get(rel) if isinstance(pending, dict) else None
             if isinstance(v, dict) and v.get("kind") in _USER_SIDE_KINDS:
                 continue
-            out.append((rel, not os.path.lexists(base)))
+            kind = v.get("kind") if isinstance(v, dict) and isinstance(v.get("kind"), str) else None
+            out.append((rel, not os.path.lexists(base), kind))
     return sorted(out), (problems[0] if problems else None)
 
 
 def _unrecorded_copies_part(unrecorded, incomplete=None):
+    """★T2i(RULINGS FH4 · FP4): 기록 없는 사본과 원장 기록이 다른 종류인 사본을 나눠 말한다 — 다른 종류면 그 종류를 이름 대고
+    '기록 없이'라고 하지 않는다. 다시 입히는 길은 vendor 우선 기록이 없으므로 `cys repair begin` 하나(`reapply` 는 거부된다)."""
+    def shown(items):
+        out = []
+        for r, orphan, kind in items[:8]:
+            tags = []
+            if kind:
+                tags.append("원장 기록 '%s'" % kind)
+            if orphan:
+                tags.append("원본 없음")
+            out.append("%s(%s)" % (r, " · ".join(tags)) if tags else r)
+        return ", ".join(out) + (" 외 %d건" % (len(items) - 8) if len(items) > 8 else "")
+    route = ("다시 입히기 = 워커가 승인 절차로 `cys repair begin --files <파일> --trigger update` · 다시 입히지 않으려면 그 사본을 "
+             "다른 이름으로 옮긴다(지우지 않는다)")
+    none = [c for c in unrecorded if not c[2]]
+    other = [c for c in unrecorded if c[2]]
     parts = []
-    if unrecorded:
-        shown = ["%s(원본 없음)" % r if orphan else r for r, orphan in unrecorded]
+    if none:
         parts.append("★기록 없는 보관 사본 %d건 — 병합 대기 기록 없이 디스크에 남은 내 수정본 <파일>.user(`--take-new` 로 vendor 본 "
                      "유지를 확정했거나 기록이 지워짐 · '원본 없음' = 그 파일이 지워졌거나 업데이트에서 빠짐 · 기동 필수·보호 목록 "
-                     "파일이면 사본이 있는 동안 되돌리기가 그 파일을 건너뜀 · 다시 입히기 = 워커가 승인 절차로: 수리로 고친 파일이면 "
-                     "`cys repair reapply <수리번호>`, 직접 고친 파일이면 `cys repair begin --files <파일> --trigger update` · 다시 "
-                     "입히지 않으려면 그 사본을 다른 이름으로 옮긴다(지우지 않는다)): %s%s"
-                     % (len(unrecorded), ", ".join(shown[:8]),
-                        " 외 %d건" % (len(shown) - 8) if len(shown) > 8 else ""))
+                     "파일이면 사본이 있는 동안 되돌리기가 그 파일을 건너뜀 · %s): %s" % (len(none), route, shown(none)))
+    if other:
+        parts.append("★원장 기록이 이름 대지 않는 보관 사본 %d건 — 원장에는 이 파일들이 괄호 안의 종류로 적혀 있으나 그 기록은 이 "
+                     "사본(<파일>.user)을 이름 대지 않음(기동 필수·보호 목록 파일이면 사본이 있는 동안 되돌리기가 그 파일을 건너뜀 · "
+                     "%s): %s" % (len(other), route, shown(other)))
     if incomplete:
         parts.append("★보관 사본 조사 미완(%s) — 기록 없는 보관 사본이 더 있을 수 있음(이 점검은 '0건'이라고 말하지 않는다)"
                      % incomplete)
