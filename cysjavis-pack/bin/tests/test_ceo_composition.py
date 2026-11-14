@@ -896,6 +896,8 @@ class IntentRecovery(Rig):
         self.seed()
 
         def ex_then_crash(a, b):
+            if not a.endswith(".candidate"):
+                return real(a, b)               # 방법 시험(swap_mode)의 맞바꾸기는 그대로
             _write(self.p("MASTER_DIRECTIVE.md"), USER + self.SAVE)    # 읽은 뒤 · 맞바꾸기 전의 저장
             real(a, b)
             raise SystemExit("crash right after the exchange")
@@ -918,6 +920,8 @@ class IntentRecovery(Rig):
         fired = []
 
         def ex_with_two_saves(a, b):
+            if not a.endswith(".candidate"):
+                return real(a, b)               # 방법 시험(swap_mode)의 맞바꾸기는 그대로
             if not fired:
                 fired.append(1)
                 _write(self.p("MASTER_DIRECTIVE.md"), USER + self.SAVE)
@@ -1020,6 +1024,76 @@ class IntentRecovery(Rig):
         _write(orphan, "never live\n")
         self.assertEqual(self.run_dept("promote-ceo")[0], 0)
         self.assertFalse(os.path.exists(orphan), "의도 없는 후보를 지우지 않았다")
+
+
+class SafePrimitives(Rig):
+    """★RULINGS EY3 — 살아 있는 이름은 반쪽 지침을 드러낼 수 없는 방법으로만 바뀐다: 맞바꾸기(맥·리눅스), 그것이 없으면 맡기고
+    먼저(살아 있는 파일을 보관 폴더로 옮긴 뒤 **다 쓴** 후보를 덮지 않는 이동으로 놓기 — 의도 기록 아래). 살아 있는 이름에 직접
+    쓰는 일은 없고, 둘 다 안 되는 파일 시스템에서는 보류한다(지침 무변경) — codex 순서 ④."""
+
+    class _Os:
+        """ceo_py 모듈 안의 `os` 만 바꾼다 — 하드 링크가 없는 파일 시스템(EPERM)과, 살아 있는 이름을 쓰기로 연 기록."""
+        def __init__(self, real, md):
+            self._real, self._md, self.opened_live = real, md, []
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def link(self, a, b):
+            raise PermissionError(1, "hard links unsupported here", a)
+
+        def open(self, path, flags, *a, **kw):
+            if os.path.abspath(path) == os.path.abspath(self._md) and flags & (os.O_WRONLY | os.O_RDWR):
+                self.opened_live.append(flags)
+            return self._real.open(path, flags, *a, **kw)
+
+    def ns_without_links(self, noreplace=True):
+        ns = ceo_py_module()
+        ns["exchange_fn"] = lambda: None
+        if not noreplace:
+            ns["noreplace_fn"] = lambda: None
+        proxy = self._Os(os, self.p("MASTER_DIRECTIVE.md"))
+        ns["os"] = proxy
+        return ns, proxy
+
+    def test_no_safe_primitive_holds_and_leaves_live_untouched(self):
+        """맞바꾸기도 하드 링크도 덮지 않는 이름 바꾸기도 없다 → 보류(rc 6 · 알림 1건) · 살아 있는 지침 바이트 그대로 · 의도·후보
+        없음(종전: 하드 링크가 안 되면 살아 있는 경로에 직접 써서 반쪽 지침이 남을 수 있었다)."""
+        self.seed()
+        ns, proxy = self.ns_without_links(noreplace=False)
+        nf = os.path.join(self.tmp, "nf.txt")
+        rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), nf])
+        self.assertEqual(rc, 6, "안전한 바꾸기 방법이 없는데 보류하지 않았다")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "살아 있는 지침이 바뀌었다")
+        self.assertIsNone(self.read(".ceo-intent.json"))
+        self.assertEqual([f for f in os.listdir(self.dirs) if f.endswith(".candidate")], [])
+        self.assertIn("CEO 지침 교체 보류(이 디스크에서는 안전하게 바꿀 수 없음)", _slurp(nf, encoding="utf-8"))
+        self.assertEqual(proxy.opened_live, [], "살아 있는 이름을 쓰기로 열었다")
+
+    def test_the_live_name_is_never_written_in_place(self):
+        """하드 링크가 없는 파일 시스템(덮지 않는 이름 바꾸기는 있음): 승격도, 빈 살아 있는 이름을 채우는 복구도 살아 있는 경로를
+        쓰기로 열지 않는다 — 다 쓴 후보를 덮지 않게 옮겨 놓는다(종전: 복구의 채우기가 O_EXCL 로 살아 있는 경로에 직접 썼다)."""
+        ns0 = ceo_py_module()
+        if ns0.get("noreplace_fn") is not None and ns0["noreplace_fn"]() is None:
+            self.skipTest("이 플랫폼에는 덮지 않는 이름 바꾸기가 없다")
+        self.seed()
+        ns, proxy = self.ns_without_links()
+        self.assertEqual(ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), ""]), 0)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER)
+        self.assertEqual(proxy.opened_live, [], "승격이 살아 있는 이름을 쓰기로 열었다")
+        # 빈 살아 있는 이름 + 의도 기록(후보 없음 — 보관된 판만 남은 경우) → 다음 입구가 채운다(쓰기로 열지 않고).
+        rec = {"schema": 1, "id": "X", "op": "compose", "reason": "compose", "mode": "deposit", "live": "MASTER_DIRECTIVE.md",
+               "read_sha256": sha(HEADER + SEP + USER), "candidate": ".MASTER_DIRECTIVE.md.X.candidate",
+               "candidate_sha256": "0" * 64,
+               "kept": "X.compose", "created_at": "2026-11-14T00:00:00Z"}
+        kd = os.path.join(self.dirs, ".ceo-kept")
+        os.replace(self.p("MASTER_DIRECTIVE.md"), os.path.join(kd, "X.compose"))
+        _write(self.p(".ceo-intent.json"), json.dumps(rec))
+        ns2, proxy2 = self.ns_without_links()
+        ns2["close_intent"](self.p("MASTER_DIRECTIVE.md"), "")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER, "빈 살아 있는 이름을 채우지 않았다")
+        self.assertEqual(proxy2.opened_live, [], "복구의 채우기가 살아 있는 이름을 쓰기로 열었다(제자리 쓰기)")
+        self.assertTrue(os.path.exists(os.path.join(kd, "X.compose")), "보관된 판을 지웠다")
 
 
 class SaveDuringSwap(Rig):

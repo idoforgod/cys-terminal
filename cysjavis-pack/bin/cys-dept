@@ -1813,34 +1813,11 @@ def write_atomic(path, data, expect=None):
     fsync_dir(os.path.dirname(os.path.abspath(path)))
 
 
-def place_new(src, dst):
-    """src 를 dst 자리에 놓는다 — dst 가 이미 있으면 **덮지 않고** FileExistsError. POSIX = 하드 링크(기존 이름을 덮지 않는다)
-    + 원래 이름 지우기 · 하드 링크가 안 되는 파일 시스템은 O_EXCL 로 만들어 바이트를 옮겨 쓴다. 윈도우 = os.rename(대상이
-    있으면 FileExistsError · 공유 위반은 짧게 재시도)."""
-    if os.name == "posix":
-        try:
-            os.link(src, dst)
-        except FileExistsError:
-            raise
-        except OSError:
-            data = read_bytes(src)
-            fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, os.stat(src).st_mode & 0o7777)
-            with os.fdopen(fd, "wb") as g:
-                g.write(data)
-                g.flush()
-                os.fsync(g.fileno())
-        os.unlink(src)
-    else:
-        retry_sharing(os.rename, src, dst)
-    fsync_dir(os.path.dirname(os.path.abspath(dst)))
-    return dst
-
-
 def write_new(path, data):
     """없는 파일을 새로 만든다(덮지 않는다 — 그 사이 누가 만들었으면 FileExistsError, 그 파일은 그대로)."""
     tmp = write_temp(path, data)
     try:
-        return place_new(tmp, path)
+        return move_noreplace(tmp, path)       # ★EY3: 다 쓴 임시 파일을 덮지 않게 옮긴다 — 대상 경로에 직접 쓰지 않는다
     except BaseException:
         silent_unlink(tmp)
         raise
@@ -1858,11 +1835,6 @@ def side_name(path, kind):
     return p
 
 
-def rename_away(path, dst):
-    """살아 있는 이름의 파일을 **그 순간 그대로** 옆 이름으로 옮긴다(공유 위반은 짧게 재시도)."""
-    retry_sharing(os.rename, path, dst)
-
-
 KEPT_DIR = ".ceo-kept"
 
 
@@ -1870,23 +1842,36 @@ def kept_dir(md):
     return os.path.join(os.path.dirname(os.path.abspath(md)), KEPT_DIR)
 
 
+class NoSafeMove(OSError):
+    """이 파일 시스템에는 덮지 않는 이동이 없다(하드 링크도 RENAME_EXCL/RENAME_NOREPLACE 도 안 됨) — 바꾸지 않고 보류한다."""
+
+
 def move_noreplace(src, dst):
-    """src 를 dst 로 옮긴다 — dst 가 있으면 덮지 않고 FileExistsError. POSIX = 하드 링크 + 원래 이름 지우기(링크는 기존 이름을
-    덮지 않는다) · 하드 링크가 안 되면 같은 이름 검사 뒤의 이름 바꾸기(보관 폴더 안 · 잠금을 쥔 동안만 부른다). 윈도우 =
-    os.rename(대상이 있으면 FileExistsError · 공유 위반은 짧게 재시도). 바이트를 다시 쓰지 않는다 — 같은 파일 그대로다."""
-    if os.name == "posix":
-        try:
-            os.link(src, dst)
-        except FileExistsError:
-            raise
-        except OSError:
-            if os.path.lexists(dst):
-                raise FileExistsError(dst)
-            os.rename(src, dst)
-            return dst
-        os.unlink(src)
+    """★RULINGS EY3 — src 를 dst 로 옮긴다, dst 가 있으면 **덮지 않고** FileExistsError. 바이트를 다시 쓰지 않는다(같은 파일 그대로).
+    POSIX = 하드 링크 + 원래 이름 지우기(링크는 기존 이름을 덮지 않는다) → 하드 링크가 안 되면 덮지 않는 이름 바꾸기(맥 renamex_np
+    RENAME_EXCL · 리눅스 renameat2 RENAME_NOREPLACE) → 그것도 없으면 NoSafeMove(호출부가 보류 — 확인 뒤 이름 바꾸기는 쓰지 않는다).
+    윈도우 = os.rename(대상이 있으면 FileExistsError · 공유 위반은 짧게 재시도)."""
+    if os.name != "posix":
+        retry_sharing(os.rename, src, dst)
         return dst
-    retry_sharing(os.rename, src, dst)
+    try:
+        os.link(src, dst)
+    except FileExistsError:
+        raise
+    except OSError:
+        nr = noreplace_fn()
+        if nr is None:
+            raise NoSafeMove(errno.ENOTSUP, "덮지 않는 이동이 없는 파일 시스템", dst)
+        try:
+            nr(src, dst)
+        except OSError as e:
+            if e.errno == errno.EEXIST:
+                raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), dst)
+            if e.errno in _NO_EXCHANGE:
+                raise NoSafeMove(e.errno, "덮지 않는 이동이 없는 파일 시스템", dst)
+            raise
+        return dst
+    os.unlink(src)
     return dst
 
 
@@ -2047,6 +2032,79 @@ def exchange_fn():
 
 
 _NO_EXCHANGE = (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOSYS, errno.EXDEV)
+_NOREPLACE = []
+
+
+def noreplace_fn():
+    """덮지 않는 이름 바꾸기 — 맥 renamex_np(RENAME_EXCL) · 리눅스 renameat2(RENAME_NOREPLACE). 없으면 None. 한 번만 찾는다."""
+    if not _NOREPLACE:
+        fn = None
+        try:
+            import ctypes
+            libc = ctypes.CDLL(None, use_errno=True)
+
+            def raise_errno(a):
+                e = ctypes.get_errno()
+                raise OSError(e, os.strerror(e), a)
+            if sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+                f = libc.renamex_np
+                f.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+                f.restype = ctypes.c_int
+
+                def fn(a, b):
+                    if f(os.fsencode(a), os.fsencode(b), 0x4) != 0:     # RENAME_EXCL
+                        raise_errno(a)
+            elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+                f = libc.renameat2
+                f.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+                f.restype = ctypes.c_int
+
+                def fn(a, b):
+                    if f(-100, os.fsencode(a), -100, os.fsencode(b), 0x1) != 0:   # AT_FDCWD · RENAME_NOREPLACE
+                        raise_errno(a)
+        except Exception:
+            fn = None
+        _NOREPLACE.append(fn)
+    return _NOREPLACE[0]
+
+
+_MODE = {}
+
+
+def swap_mode(md):
+    """★RULINGS EY3 — 이 폴더에서 살아 있는 이름을 바꿀 수 있는 안전한 방법을 **의도 기록 전에** 잰다(폴더마다 한 번): 맞바꾸기가
+    되면 'exchange', 덮지 않는 이동이 되면 'deposit'(맡기고 먼저), 둘 다 안 되면 None(보류 — 살아 있는 지침 무변경). 시험 파일
+    두 개로 실제로 해 본다(지원 여부는 파일 시스템이 정한다)."""
+    d = os.path.dirname(os.path.abspath(md))
+    if d in _MODE:
+        return _MODE[d]
+    mode = None
+    tag = "%s-%d" % (stamp(), os.getpid())
+    pa, pb, pc = (os.path.join(d, ".ceo-probe.%s.%s" % (tag, x)) for x in ("a", "b", "c"))
+    try:
+        for q, body in ((pa, b"a"), (pb, b"b")):
+            with open(q, "wb") as f:
+                f.write(body)
+        ex = exchange_fn()
+        if ex is not None:
+            try:
+                ex(pa, pb)
+                mode = "exchange"
+            except OSError:
+                pass
+        if mode is None:
+            try:
+                move_noreplace(pa, pc)
+                mode = "deposit"
+            except OSError:
+                pass
+    except OSError:
+        mode = None
+    finally:
+        for q in (pa, pb, pc):
+            silent_unlink(q)
+    _MODE[d] = mode
+    return mode
 
 
 INTENT = ".ceo-intent.json"
@@ -2151,16 +2209,23 @@ def place_candidate(cand_p, md):
     fsync_dir(os.path.dirname(os.path.abspath(md)))
 
 
-def swap_unit(md, data, expect_sha, op, reason, expect=None):
+def swap_unit(md, data, expect_sha, op, reason, expect=None, nf=""):
     """★RULINGS EY2 — 하나의 복구할 수 있는 교체. ① 후보를 다 쓴다 ② 의도 기록(읽은 바이트의 해시 · 후보 · 미리 정한 보관
     이름)을 남긴다 ③ 살아 있는 이름을 바꾼다 — 맞바꾸기(맥·리눅스) 또는 맡기고 먼저(살아 있는 파일을 보관 폴더로 옮긴 뒤 다
     쓴 후보를 덮지 않게 놓는다) ④ 밀려난 파일을 보관 폴더로(곁 파일에 그 순간의 해시) ⑤ 의도 기록을 지운다. 어느 걸음 뒤에서
     멈춰도 다음 입구의 close_intent 가 이어 간다. 돌려주는 값 = (보관 경로, 보관 시각의 해시) — 그 해시가 expect_sha 와 다르면
     읽은 뒤에 저장된 판이 밀려난 것이다(호출부가 그것을 새 진실로 다룬다)."""
+    mode = swap_mode(md)
+    if mode is None:                            # ★EY3: 반쪽을 드러내지 않는 방법이 없다 — 바꾸지 않고 보류(쓴 것 0)
+        err("CEO 지침 교체 보류: 이 파일 시스템에서는 본부 지침을 안전하게 바꿀 수 없다(맞바꾸기·덮지 않는 이동 없음) — %s"
+            % os.path.dirname(os.path.abspath(md)))
+        note(nf, T_NO_SAFE_SWAP, "본부 지침이 있는 파일 시스템(%s)에서는 지침을 반쪽 없이 바꾸는 방법(이름 맞바꾸기·덮지 않는 "
+                                 "이동)이 없어 CEO 지침을 바꾸지 않았습니다. 지침은 그대로입니다. 팩을 일반 디스크(APFS·NTFS·"
+                                 "ext4 등)로 옮겨야 승격·강등이 됩니다." % os.path.dirname(os.path.abspath(md)))
+        raise HoldSwap("no safe primitive")
     iid = new_iid()
     cand_p = candidate_path(md, iid)
     kname = "%s.%s" % (iid, reason)
-    mode = "exchange" if exchange_fn() is not None else "deposit"
     write_candidate(cand_p, data, md, expect)
     rec = {"schema": 1, "id": iid, "op": op, "reason": reason, "mode": mode, "live": os.path.basename(md),
            "read_sha256": expect_sha, "candidate": os.path.basename(cand_p), "candidate_sha256": sha(data),
@@ -2186,6 +2251,7 @@ def swap_unit(md, data, expect_sha, op, reason, expect=None):
                 raise
             mode = rec["mode"] = "deposit"          # 이 파일 시스템은 맞바꾸기를 못 한다 — 맡기고 먼저로
             write_intent(md, rec)
+            _MODE[os.path.dirname(os.path.abspath(md))] = "deposit"
     if mode == "exchange":
         kept, ksha = keep_file(cand_p, md, reason, name=kname)
     else:
@@ -2229,7 +2295,7 @@ def restore_newer(md, src_kept, expected_sha, nf):
                                   "앞의 저장은 %s 에 그대로 보관했습니다 — 자동으로 합치지 않습니다. 앞의 판의 내용이 필요하면 오너 "
                                   "지시로 워커가 본문에 옮기십시오." % src_kept)
             raise HoldSwap("two edits")
-        kept2, k2 = swap_unit(md, target, expected_sha, "restore", "replaced")
+        kept2, k2 = swap_unit(md, target, expected_sha, "restore", "replaced", nf=nf)
         note_kept(nf, kept2)
         if k2 == expected_sha:
             print("[cys-dept] 읽은 뒤 저장된 판을 살아 있는 지침으로 되돌렸다(밀려난 후보: %s)" % kept2)
@@ -2282,12 +2348,17 @@ def close_intent(md, nf):
     if not os.path.lexists(md):
         # 맡기고 먼저의 두 걸음 사이에서 멈췄다 — 빈 살아 있는 이름을 채운다(후보 → 덮지 않게 · 후보가 없으면 보관된 판의 사본)
         try:
-            if os.path.lexists(cand_p) and sha(read_bytes(cand_p)) == rec["candidate_sha256"]:
-                place_candidate(cand_p, md)
-            else:
-                write_new(md, read_bytes(kept_p))
+            if not (os.path.lexists(cand_p) and sha(read_bytes(cand_p)) == rec["candidate_sha256"]):
+                cand_p = candidate_path(md, new_iid())          # ★EY3: 보관된 판의 사본을 후보로 **다** 쓴 뒤
+                write_candidate(cand_p, read_bytes(kept_p), kept_p)
+            place_candidate(cand_p, md)                         # 덮지 않는 이동으로 놓는다(살아 있는 경로에 직접 쓰지 않는다)
         except FileExistsError:
-            pass                                # 그 사이 누가 만들었다 — 그것이 살아 있다
+            silent_unlink(cand_p)               # 그 사이 누가 만들었다 — 그것이 살아 있다(우리 후보는 살아 있던 적 없음)
+        except NoSafeMove:
+            silent_unlink(cand_p)
+            note(nf, T_NO_SAFE_SWAP, "끝나지 않은 본부 지침 교체를 마무리하려 했으나 이 파일 시스템에는 덮지 않는 이동이 없어 빈 "
+                                     "지침 이름을 채우지 못했습니다. 교체 전 판은 %s 에 있습니다." % kept_p)
+            raise HoldSwap("no safe primitive")
     elif os.path.lexists(cand_p):
         silent_unlink(cand_p)                   # 놓이지 않은 후보 — 살아 있던 적이 없다
     remove_intent(md)
@@ -2452,6 +2523,7 @@ T_HOLD_CHANGING = "CEO 승격 보류(본부 지침이 조립 중에 계속 바�
 T_DEMOTE_CHANGING = "CEO 강등 보류(본부 지침이 강등 중에 계속 바뀜)"
 T_TWO_EDITS = "CEO 지침 교체 보류(두 저장이 겹침)"
 T_INTENT_CHECK = "CEO 지침 교체 기록 확인 필요"
+T_NO_SAFE_SWAP = "CEO 지침 교체 보류(이 디스크에서는 안전하게 바꿀 수 없음)"
 TICK_LOCK_WAIT_S = 2.0
 SEP_LINE = "# [본문 — 표준 MASTER 운영 계약 전문]"
 
@@ -2755,7 +2827,7 @@ def compose_once(tmpl, md, tsha, nf):
     # ★EY2: 한 단위의 교체(의도 기록 → 바꾸기 → 밀려난 파일 보관). ★EY1: 밀려난 파일은 언제나 보관 폴더로(지우지 않는다) —
     #   보관 사본 알림이 필요한 경우(고친 머리말·0.14.x 옛 지침)는 아래 알림이, 그 밖에도 출력·자동 승격 알림이 경로를 말한다.
     kept, ksha = swap_unit(md, cand, sha(mb), "compose", "before-compose" if keep else "compose",
-                           expect=lambda back: back == cand and split(back) == (H, S, body))
+                           expect=lambda back: back == cand and split(back) == (H, S, body), nf=nf)
     note_kept(nf, kept)
     if ksha != sha(mb):
         restore_newer(md, kept, sha(cand), nf)   # 읽은 뒤 저장된 판이 밀려났다 — 그 판을 되돌린 뒤 그것으로 다시 조립
@@ -2880,7 +2952,7 @@ def demote_once(tmpl, md, nf):
             print("[cys-dept] 승격 백업 정리(지침은 이미 표준 MASTER): .pre-ceo %s" % moved)
         return 10
     kept, ksha = swap_unit(md, new_md, sha(mb), "demote", "before-demote" if keep else "demote",
-                           expect=lambda back: back == new_md)   # ★EY2 한 단위 · ★EY1 밀려난 파일은 보관
+                           expect=lambda back: back == new_md, nf=nf)   # ★EY2 한 단위 · ★EY1 밀려난 파일은 보관 · ★EY3 방법
     note_kept(nf, kept)
     if ksha != sha(mb):
         restore_newer(md, kept, sha(new_md), nf)
