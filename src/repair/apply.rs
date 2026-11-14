@@ -1006,7 +1006,7 @@ pub fn resume_op(env: &OpEnv<'_>, mut rec: OpRecord) -> Result<OpDone, RepairErr
                     if !meta_ok {
                         // the copy is never placed (its deposit is not vouched for): abandon
                         if let Some(c) = rec.incoming_copy.take() {
-                            let _ = std::fs::remove_file(&c);
+                            let _ = std::fs::remove_file(c); // our own non-slot incoming copy
                         }
                         rec.incoming_copy_identity = None;
                     }

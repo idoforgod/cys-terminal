@@ -85,6 +85,10 @@ pub fn full_flush_file(f: &std::fs::File) -> std::io::Result<()> {
     }
 }
 
+fn io(p: &Path, e: impl std::fmt::Display) -> RepairError {
+    RepairError::Io(format!("{}: {e}", p.display()))
+}
+
 /// Full flush of a directory (unix). Windows has no directory flush (the rename is journaled by
 /// NTFS; there is no handle to flush) — a no-op there.
 pub fn full_flush_dir(dir: &Path) -> Result<(), RepairError> {
