@@ -158,9 +158,6 @@ fn read_site_census_only_the_bounded_reader() {
         "std::fs::read(e.path().join(\"environ\"))",
         "std::fs::OpenOptions::new()",
         "    std::fs::File::open(p)",
-        // RULINGS V2(a): THE candidate reader of the T0 contract (body T3 over `TargetState::read`);
-        // its bound lies in `types.rs`, which this unit does not edit — stated in the report (GA5)
-        "ledger::candidate_states_in(&ctx.root, &id)",
     ];
     // RULINGS GA5: the daemon side too — the approval channel and the check's consequence step, and
     // the T5b functions of the daemon's repair module (the intake filing, the worker's `check`)
@@ -194,8 +191,6 @@ fn read_site_census_only_the_bounded_reader() {
         "OpenOptions::new(",
         "TargetState::read(",
         "read_under_no_link(",
-        "candidate_states(",
-        "candidate_states_in(",
     ];
     let mut bad = Vec::new();
     for (name, src) in files {
@@ -207,6 +202,63 @@ fn read_site_census_only_the_bounded_reader() {
         }
     }
     assert!(bad.is_empty(), "unbounded read sites: {bad:#?}");
+    // RULINGS GR5: the ONE candidate reader (V2 (a)) reads with the size limit — no allow-list entry
+    let ledger = include_str!("ledger.rs");
+    let reader = region(ledger, "pub fn candidate_states_in(", "\n}\n");
+    assert!(
+        reader.contains("TargetState::read_capped(") && reader.contains("MAX_CANDIDATE_BYTES"),
+        "the candidate reader is capped: {reader}"
+    );
+}
+
+/// RULINGS GR5 (CCR-T5b-1) — the capped read: a file far over the limit (a 64 GiB sparse file) is
+/// refused at once without being read to the end; a file within it reads exactly as the uncapped
+/// read; a link stays a link. The cap is at least eight times the largest file the two compiled lists
+/// name (measured here from the embedded copies).
+#[test]
+fn candidate_read_is_capped() {
+    use crate::repair::ledger::MAX_CANDIDATE_BYTES;
+    let root = test_root("gr5-cap");
+    let huge = root.join("huge.sh");
+    let f = std::fs::File::create(&huge).unwrap();
+    f.set_len(64 * 1024 * 1024 * 1024).unwrap();
+    drop(f);
+    match TargetState::read_capped(&huge, MAX_CANDIDATE_BYTES) {
+        Err(RepairError::Precondition(m)) => assert!(m.contains("over the size limit"), "{m}"),
+        other => panic!("a 64 GiB candidate was not refused: {other:?}"),
+    }
+    let small = root.join("small.sh");
+    std::fs::write(&small, b"#!/bin/sh\nexit 0\n").unwrap();
+    assert_eq!(
+        TargetState::read_capped(&small, MAX_CANDIDATE_BYTES).unwrap(),
+        TargetState::read(&small).unwrap()
+    );
+    // exactly at the cap: read; one byte over: refused
+    let edge = root.join("edge");
+    std::fs::write(&edge, vec![b'x'; 16]).unwrap();
+    assert!(TargetState::read_capped(&edge, 16).is_ok());
+    assert!(TargetState::read_capped(&edge, 15).is_err());
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&huge, root.join("l")).unwrap();
+        assert!(matches!(
+            TargetState::read_capped(&root.join("l"), MAX_CANDIDATE_BYTES),
+            Ok(TargetState::Link { .. })
+        ));
+    }
+    let largest = crate::repair::boot_critical::entries()
+        .iter()
+        .chain(crate::repair::boot_critical::protection_entries().iter())
+        .filter_map(|e| replay::released_text(e.rel).map(|t| (t.len() as u64, e.rel)))
+        .max()
+        .unwrap();
+    assert!(largest.0 > 100_000, "{largest:?}");
+    assert!(
+        MAX_CANDIDATE_BYTES >= 8 * largest.0,
+        "cap {MAX_CANDIDATE_BYTES} < 8 × {largest:?}"
+    );
+    eprintln!("T5b MEASURED: largest listed file {largest:?}; candidate cap {MAX_CANDIDATE_BYTES}");
+    cleanup(&root);
 }
 
 /// RULINGS GA5 — the stub's call log has three answers: absent (no call), the calls, and "could not
