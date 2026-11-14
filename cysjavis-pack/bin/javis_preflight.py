@@ -6485,36 +6485,19 @@ class Preflight:
         #   대기 중일 때만 묶으므로, 지문 기록 없이는 배달 뒤 다음 점검이 같은 목록을 다시 적재한다. 집합이 바뀌면 새로
         #   보이고, 집합이 비면 기록을 지운다(같은 수정이 나중에 다시 보관되면 다시 보인다). 적재가 실패하면 기록하지
         #   않는다(다음 점검이 다시 시도).
-        state_p = os.path.join(pack_dir(), "state", "merge-notice-delivered.json")
-        try:
-            with open(state_p, encoding="utf-8") as f:
-                delivered = json.load(f)
-            if not isinstance(delivered, dict):
-                delivered = {}
-        except Exception:
-            delivered = {}
-        before = dict(delivered)
-        for task in list(delivered):
-            if task not in fps:
-                del delivered[task]
+        # ★T2h(RULINGS CW4 · 검토자 B4): 배달 기록은 **적재 전에** 남긴다(선기록) — 기록을 남길 수 없으면 같은 알림을 매 점검
+        #   다시 보내는 고리가 되므로, 그때는 큐 옆의 표지로 데몬 기동당 한 번만 보낸다(`_notice_once`). 적재가 실패하면 선기록을
+        #   되돌린다(다음 점검이 다시 시도). 집합이 비면 그 과제의 기록만 지운다(C68 의 `merge-review` 는 C68 이 관리한다).
+        state_p = _notice_store_path()
+        delivered = _notice_store_read(state_p)
+        gone = [t for t in ("parked-merge", "legacy-user-list") if t in delivered and t not in fps]
+        if gone:
+            kept = {k: v for k, v in delivered.items() if k not in gone}
+            _notice_store_write(state_p, kept)
         for task, reason, key in jobs:
-            if delivered.get(task) == fps[task]:
-                continue
-            try:
-                r = subprocess.run(
-                    [sys.executable, wakeup, "enqueue", "--to", "master", "--task", task,
-                     "--reason", reason, "--idempotency-key", key],
-                    capture_output=True, text=True, timeout=10, env=_utf8_env())
-                if r.returncode == 0:
-                    delivered[task] = fps[task]
-            except Exception:
-                pass   # 관측 채널 — 실패가 점검을 막지 않는다(C62 WARN 은 그대로 남는다)
-        if delivered != before:
-            try:
-                os.makedirs(os.path.dirname(state_p), exist_ok=True)
-                _write_json_lf_atomic(state_p, delivered, prefix=".merge-notice.")
-            except Exception:
-                pass
+            _notice_once(task, fps[task], wk_root,
+                         lambda reason=reason, key=key, task=task: _wakeup_enqueue(
+                             wakeup, task, reason, key))
 
     # ── C68 병합 원장 체류 기한 게이트 (★W-D1 커스텀 생존 2026-07-17) ──
     # 고지 채널은 실측으로 반증됐다(원장 항목 9주 체류 — C62 WARN·init-pack 보고 줄이 있었는데도).
@@ -6585,17 +6568,17 @@ class Preflight:
         if self.fix and not root_ok:
             enq = "큐 적재 보류(워크스페이스 루트 미확정: %s — JAVIS_ROOT 미설정·cwd 에 _round 부재)" % wk_root
         if self.fix and root_ok and os.path.isfile(wakeup):
-            try:
-                r = subprocess.run(
-                    [sys.executable, wakeup, "enqueue", "--to", "master",
-                     "--task", "merge-review",
-                     "--reason", "병합 원장 기한 초과 %d건(최장 %.0f일) — 워커에 pack-merge 검토 위임 필요"
-                                 % (len(stale), oldest),
-                     "--idempotency-key", "merge-review-" + fingerprint],
-                    capture_output=True, text=True, timeout=10, env=_utf8_env())
-                enq = "wakeup enqueue %s" % ("OK" if r.returncode == 0 else "실패(%d)" % r.returncode)
-            except Exception as e:
-                enq = "wakeup enqueue 예외(%s)" % e
+            # ★T2h(RULINGS CW4 · 검토자 B4): 같은 잔존 상태(지문)는 **한 번만** 알린다 — 큐의 멱등키는 대기 중일 때만 묶어
+            #   배달 뒤에는 같은 과제가 다시 왔다. 배달 기록은 적재 전에 남기고, 남길 수 없으면 데몬 기동당 한 번만.
+            reason = ("병합 원장 기한 초과 %d건(최장 %.0f일) — 워커에 pack-merge 검토 위임 필요"
+                      % (len(stale), oldest))
+            outcome = _notice_once("merge-review", fingerprint, wk_root,
+                                   lambda: _wakeup_enqueue(wakeup, "merge-review", reason,
+                                                           "merge-review-" + fingerprint))
+            enq = {"sent": "wakeup enqueue OK",
+                   "already": "wakeup enqueue 생략(같은 상태 이미 알림)",
+                   "failed": "wakeup enqueue 실패(다음 점검이 다시 시도)",
+                   "silent": "wakeup enqueue 생략(배달 기록을 남길 수 없어 이번 데몬 기동에는 이미 한 번 보냄)"}[outcome]
         shown = ", ".join("%s(%.0f일)" % (rel, d) for rel, d in stale[:6])
         self.add(cid, WARN,
                  "병합 대기 기한(%.0f일) 초과 %d건: %s%s — master: 워커에 `cys pack-merge` 검토 위임(직접 병합 금지) · %s"
@@ -8705,6 +8688,96 @@ def claude_procs_for_config(config_dir, runner=None, os_name=None, platform=None
 def _open_nofollow(path, flags, mode=0o600):
     """심링크 무추종 open(가능한 플랫폼에서) — Windows 는 O_NOFOLLOW 부재 → 호출자의 _is_link_like 검사가 방벽."""
     return os.open(path, flags | getattr(os, "O_NOFOLLOW", 0), mode)
+
+
+def _notice_store_path():
+    """★T2h(RULINGS CW4): 알림 배달 기록(레인 상태) — {과제: 지문}."""
+    return os.path.join(pack_dir(), "state", "merge-notice-delivered.json")
+
+
+def _notice_store_read(path):
+    data = _read_json_tolerant(path)
+    return data if isinstance(data, dict) else {}
+
+
+def _notice_store_write(path, data):
+    """기록을 디스크에 남겼으면 True(폴더 · 쓰기 불가 · 링크 자리 = False)."""
+    try:
+        if os.path.islink(path) or (os.path.exists(path) and not os.path.isfile(path)):
+            return False
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _write_json_lf_atomic(path, data, prefix=".merge-notice.")
+        return True
+    except Exception:
+        return False
+
+
+def _notice_incarnation():
+    """★T2h(RULINGS CW4): 지금 데몬 기동의 표지(허브 상태의 `boot-epoch`) — 모르면 'unknown'(막히지 않는 판독)."""
+    sd = _hub_state_dir()
+    if not sd:
+        return "unknown"
+    try:
+        fd, _st = _open_unblocking_ro(os.path.join(sd, "boot-epoch"), nofollow=True)
+        with os.fdopen(fd, "rb") as f:
+            v = f.read(64).decode("ascii", "replace").strip()
+        return v or "unknown"
+    except (OSError, ValueError):
+        return "unknown"
+
+
+def _wakeup_enqueue(wakeup, task, reason, key):
+    """master 큐 적재 1회 — 적재됐으면 True(실패 · 예외 = False · 점검을 막지 않는다)."""
+    try:
+        r = subprocess.run(
+            [sys.executable, wakeup, "enqueue", "--to", "master", "--task", task,
+             "--reason", reason, "--idempotency-key", key],
+            capture_output=True, text=True, timeout=10, env=_utf8_env())
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _notice_once(task, fp, wk_root, enqueue):
+    """★T2h(RULINGS CW4 · 검토자 B4): 같은 (과제, 지문) 알림을 **한 번만** 보낸다 — 'sent' | 'already' | 'failed' | 'silent'.
+
+    ① 레인 상태의 배달 기록에 그 지문이 있으면 보내지 않는다. ② 기록을 **먼저** 남기고(선기록) 적재한다 — 적재가 실패하면
+    기록을 되돌린다(다음 점검이 다시 시도). ③ 기록을 남길 수 없으면(폴더 · 쓰기 불가) 큐 옆의 표지
+    (`<워크스페이스>/_round/wakeups/notice-delivered/` · 이름 = 레인 · 과제 · 지문 · 데몬 기동 표지의 해시, O_EXCL 생성)로
+    **데몬 기동당 한 번만** 보내고 stderr 한 줄을 남긴다 — 그 표지도 만들 수 없으면 보내지 않는다(고리 0)."""
+    state_p = _notice_store_path()
+    delivered = _notice_store_read(state_p)
+    if delivered.get(task) == fp:
+        return "already"
+    marked = dict(delivered)
+    marked[task] = fp
+    if _notice_store_write(state_p, marked):
+        if enqueue():
+            return "sent"
+        _notice_store_write(state_p, delivered)
+        return "failed"
+    ident = "%s|%s|%s|%s" % (os.path.abspath(pack_dir()), task, fp, _notice_incarnation())
+    mark_dir = os.path.join(wk_root, "_round", "wakeups", "notice-delivered")
+    mark = os.path.join(mark_dir, hashlib.sha1(ident.encode("utf-8")).hexdigest()[:24] + ".mark")
+    try:
+        os.makedirs(mark_dir, exist_ok=True)
+        fd = os.open(mark, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        os.close(fd)
+    except FileExistsError:
+        return "silent"
+    except OSError as e:
+        print("[preflight] 알림 '%s' 보류 — 배달 기록(%s)도 큐 옆 표지도 남길 수 없다(%s) — 보내지 않는다"
+              % (task, state_p, e), file=sys.stderr)
+        return "silent"
+    print("[preflight] 알림 '%s' — 배달 기록(%s)을 남길 수 없어 이번 데몬 기동에 한 번만 보낸다" % (task, state_p),
+          file=sys.stderr)
+    if enqueue():
+        return "sent"
+    try:
+        os.remove(mark)
+    except OSError:
+        pass
+    return "failed"
 
 
 def _open_unblocking_ro(path, nofollow=False):

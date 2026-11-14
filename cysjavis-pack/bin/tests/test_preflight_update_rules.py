@@ -223,6 +223,43 @@ class LedgerKinds(Rig):
         self.run_check("c62_pack_heal_ledger", "C62")
         self.assertEqual(len([x for x in self.wakes(log) if "parked-merge" in x]), 2, "다음 점검이 다시 시도한다")
 
+    # ★T2h(RULINGS CW4 · 검토자 B4): 배달 기록을 남길 수 없어도 같은 알림이 매 점검 다시 가지 않는다 — 기록 자리가 폴더면
+    #   큐 옆 표지로 데몬 기동당 한 번만(세 번 점검 → 한 번). C68 의 기한 초과 알림도 같다.
+    def _store_unwritable(self):
+        os.makedirs(os.path.join(self.pack, "state", "merge-notice-delivered.json"), exist_ok=True)
+
+    def test_parked_notice_store_unwritable_sent_at_most_once(self):
+        log = self._wake_rig()
+        self._store_unwritable()
+        self.ledger({"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "version": "0.15.0", "ts": 1}})
+        for _ in range(3):
+            self.run_check("c62_pack_heal_ledger", "C62")
+        self.assertEqual(len([x for x in self.wakes(log) if "parked-merge" in x]), 1,
+                         "기록을 못 남겨도 데몬 기동당 한 번 — 매 점검 재전송 고리 없음")
+
+    def _stale_ledger(self):
+        self.ledger({"hooks/b.sh": {"kind": "vendor-first", "side": "hooks/b.sh.user", "version": "0.15.0", "ts": 1}})
+
+    def test_c68_notice_sent_once_per_state(self):
+        log = self._wake_rig()
+        self._stale_ledger()
+        for _ in range(3):
+            self.run_check("c68_merge_pending_age", "C68")
+        w = [x for x in self.wakes(log) if "merge-review" in x]
+        self.assertEqual(len(w), 1, "같은 잔존 상태는 한 번만(배달 뒤 다시 적재하지 않는다)")
+        self.assertIn("merge-review", self.delivered(), "지문이 레인 상태에 기록된다")
+        st, detail = self.run_check("c68_merge_pending_age", "C68")
+        self.assertIn("wakeup enqueue 생략(같은 상태 이미 알림)", detail)
+
+    def test_c68_notice_store_unwritable_sent_at_most_once(self):
+        log = self._wake_rig()
+        self._store_unwritable()
+        self._stale_ledger()
+        for _ in range(3):
+            self.run_check("c68_merge_pending_age", "C68")
+        self.assertEqual(len([x for x in self.wakes(log) if "merge-review" in x]), 1,
+                         "기록을 못 남겨도 데몬 기동당 한 번")
+
     def test_legacy_user_list_shown_once_per_set(self):
         log = self._wake_rig()
         with open(os.path.join(self.pack, "x.md.user"), "w") as f:
