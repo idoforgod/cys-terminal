@@ -1520,10 +1520,32 @@ pub fn closure_owes_return(closed: &str) -> bool {
     closed.starts_with(&format!("{CLOSED_FAILED} — {RETURN_OWED}"))
 }
 
-/// Whether a lane row's closure is one that owes an intake row (EN1): the probation closed FAILED,
-/// or closed by the daemon's automatic return.
+/// RULINGS EN1 / FG3 — the class of a closure that owes an intake row, `None` when it owes none. Each
+/// class is a separate duty (its own acknowledgement), so a later terminal outcome of the same repair
+/// — the owed return made, or ended 충돌 — is reported even after an earlier one was acknowledged:
+/// `failed-return-owed` (a failed re-check, the return still owed — EK2), `failed` (FAILED),
+/// `reverted-auto` (the daemon's automatic return complete), `conflict-auto` (the automatic return
+/// could not finish — 충돌), `superseded-after-failure` (a failed re-check whose return found nothing to
+/// change, or whose repair was superseded before it).
+pub fn closure_report_class(closed: &str) -> Option<&'static str> {
+    if closure_owes_return(closed) {
+        Some("failed-return-owed")
+    } else if closed.starts_with(&format!("{CLOSED_FAILED} — ")) {
+        Some("failed")
+    } else if closed == format!("{CLOSED_REVERTED} — {BY_DAEMON_AUTO}") {
+        Some("reverted-auto")
+    } else if closed.starts_with(&format!("충돌 — 되돌리기를 마치지 못했습니다({BY_DAEMON_AUTO})")) {
+        Some("conflict-auto")
+    } else if closed == format!("대체됨 — {BY_DAEMON_AUTO}") || closed.starts_with("대체됨 — 재검사 실패 뒤") {
+        Some("superseded-after-failure")
+    } else {
+        None
+    }
+}
+
+/// Whether a lane row's closure is one that owes an intake row (EN1 / FG3).
 pub fn closure_owes_intake(closed: &str) -> bool {
-    closed.starts_with(&format!("{CLOSED_FAILED} — ")) || closed == format!("{CLOSED_REVERTED} — {BY_DAEMON_AUTO}")
+    closure_report_class(closed).is_some()
 }
 
 /// DX1 — THE definition of "revertible in this lane" (`revert_in` accepts exactly these; the app's
@@ -4200,8 +4222,11 @@ pub fn resume_hook_steps_report_in(
             Ok(_) => n += 1,
             Err(e) => {
                 // CT7: a resumed hook operation that fails marks the lane 충돌 (as the first run would)
-                mark_lane_conflict(root, &rec.id, lane, now, locked);
-                errors.push((rec.id.clone(), format!("끊긴 훅 단계를 마치지 못했습니다({e:?})")));
+                let marked = mark_lane_conflict(root, &rec.id, lane, now, locked)
+                    .err()
+                    .map(|m| format!(" · 충돌 표시도 쓰지 못함({m:?})"))
+                    .unwrap_or_default();
+                errors.push((rec.id.clone(), format!("끊긴 훅 단계를 마치지 못했습니다({e:?}){marked}")));
                 n += u32::from(op.finished);
             }
         }
@@ -4210,12 +4235,13 @@ pub fn resume_hook_steps_report_in(
     (n, errors)
 }
 
-/// The lane row of `id` → 충돌 (a hook step that could not complete — CT7).
-pub fn mark_lane_conflict(root: &Path, id: &RepairId, lane: &LaneKey, now: f64, locked: &RepairLock<'_>) {
+/// The lane row of `id` → 충돌 (a hook step that could not complete — CT7). FG3: a failure to mark is
+/// returned (the hook operation's declined end is reported from its record in any case).
+pub fn mark_lane_conflict(root: &Path, id: &RepairId, lane: &LaneKey, now: f64, locked: &RepairLock<'_>) -> Result<(), RepairError> {
     let rootb = root.to_path_buf();
     let idc = id.clone();
     let lanec = lane.clone();
-    let _ = locked(id, &mut || {
+    locked(id, &mut || {
         let _mutex_scope = super::guard::MutexScope::enter();
         if let Some(mut row) = ledger::read_lane_in(&rootb, &idc, &lanec)? {
             row.state = LaneState::Conflict;
@@ -4223,7 +4249,7 @@ pub fn mark_lane_conflict(root: &Path, id: &RepairId, lane: &LaneKey, now: f64, 
             ledger::write_lane_durable_in(&rootb, &row)?;
         }
         Ok(())
-    });
+    })
 }
 
 /// RULINGS Y1: the ONE hook step (operation record first, tombstone, reconcile, record finished).

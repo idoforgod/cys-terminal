@@ -164,9 +164,11 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
     // pack-apply lock, TRIED — held means a writer is ACTIVE ("unfinished" is not "interrupted"):
     // this tick then does nothing at all and its job state is not written (due again next time);
     // the unfinished records are read only after the lock is taken
-    let recovered = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || -> Result<(u32, Vec<String>, Vec<(RepairId, String)>), RepairError> {
+    #[allow(clippy::type_complexity)]
+    let recovered = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || -> Result<(u32, Vec<String>, Vec<(RepairId, String)>, Vec<String>), RepairError> {
         let mut lines = Vec::new();
         let mut faults: Vec<(RepairId, String)> = Vec::new();
+        let mut m10_faults: Vec<String> = Vec::new();
         let mut n = 0u32;
         let injected = |e: &RepairError| format!("{e:?}").contains(apply::INJECTED_STOP);
         match apply::resume_interrupted_report_in(&env.op) {
@@ -184,7 +186,7 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
             match apply::resume_interrupted_report_in(&m10_env) {
                 Ok((k, errors)) => {
                     n += k;
-                    faults.extend(errors.into_iter().map(|(_, why)| (m10_bucket(), format!("M10: {why}"))));
+                    m10_faults.extend(errors.into_iter().map(|(_, why)| why));
                 }
                 Err(e) if injected(&e) => return Err(e),
                 Err(e) => lines.push(format!("M10 의 끊긴 동작을 마저 하지 못했습니다 — 다음 차례에 다시({e:?})")),
@@ -193,17 +195,26 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
         lines.extend(apply::recover_apply_intents_in(&env.op, env.locked));
         // DR7: interrupted reverts are completed as a whole
         lines.extend(apply::recover_revert_intents_in(&env.op, env.hooks, env.locked));
-        Ok((n, lines, faults))
+        Ok((n, lines, faults, m10_faults))
     });
     match recovered {
         Ok(Some(r)) => {
-            let (n, lines, faults) = r?;
+            let (n, lines, faults, m10_faults) = r?;
             report.resumed = n;
             report.lines.extend(lines);
             // DR5: an error of a recovery operation is recorded (a line + one acknowledged report)
             for (id, why) in faults {
                 fault_once(env, &id, "recovery-error", &format!("repairs/{}/ops", id.as_str()), &why, &mut report);
             }
+            // FI4: the M10 sub-ledger's recovery errors have their OWN key (never a repair's R-1)
+            if !m10_faults.is_empty() {
+                let line = format!("M10: {}", m10_faults.join(" · "));
+                report.lines.push(format!("{line} — 다음 차례에 다시"));
+                let text = format!("자체 해결 작업이 이 부서의 미승인 변경 되돌리기의 끊긴 동작을 처리하지 못함 — {}", line.chars().take(300).collect::<String>());
+                file_once(env, &format!("m10:{}:recovery-error", lane.0), &format!("m10/{}/R-1/ops", lane.0), &text, &mut report);
+            }
+            // FG3: a hook operation that finished declined is reported until acknowledged
+            hook_terminal_obligations(env, &mut report);
         }
         Ok(None) => {
             report.lines.push("다른 적용이나 업데이트가 팩을 바꾸는 중 — 이번 차례는 아무것도 하지 않습니다".into());
@@ -297,18 +308,56 @@ fn fault_once(env: &JobEnv<'_>, id: &RepairId, kind: &str, rel: &str, line: &str
 /// EN1: every lane row whose closure owes an intake row (closed 실패, or 되돌려짐 by the daemon's
 /// automatic return) files it until acknowledged — re-derived at every tick from the closures.
 fn closure_obligations(env: &JobEnv<'_>, report: &mut TickReport) {
-    for id in ledger::list_ids_in(env.op.root) {
+    // FG1: an unlistable root is the pass's own reported fault (probation_pass); unreadable rows are
+    // reported there too (lane-row-unreadable) — here they are only not filed twice
+    let Ok(ids) = ledger::list_ids_checked_in(env.op.root) else {
+        return;
+    };
+    for id in ids {
         let Ok(Some(row)) = ledger::read_lane_in(env.op.root, &id, env.op.lane) else {
             continue;
         };
         let Some(closed) = row.probation.as_ref().and_then(|p| p.closed.clone()) else {
             continue;
         };
-        if !apply::closure_owes_intake(&closed) {
+        // FG3: one duty per CLASS of terminal outcome (re-derived every tick from the row)
+        let Some(class) = apply::closure_report_class(&closed) else {
             continue;
-        }
+        };
         let rel = row.applied.first().map(|(r, _)| r.clone()).unwrap_or_else(|| format!("repairs/{}/record.json", id.as_str()));
-        file_once(env, &format!("{}:closure", id.as_str()), &rel, &format!("시험 기간 재검사 실패 — 수리 {} · {closed}", id.as_str()), report);
+        file_once(env, &format!("{}:closure:{class}", id.as_str()), &rel, &format!("시험 기간 재검사 실패 — 수리 {} · {closed}", id.as_str()), report);
+    }
+}
+
+/// RULINGS FG3 — every hook operation of THIS lane that FINISHED declined (its step could not complete
+/// — a first run or a resumed one) owes ONE intake row until acknowledged: re-derived every tick from
+/// the operation records (recovery selects only unfinished records, so nothing else finds it again).
+fn hook_terminal_obligations(env: &JobEnv<'_>, report: &mut TickReport) {
+    let ids = match ledger::list_ids_checked_in(env.op.root) {
+        Ok(ids) => ids,
+        Err(e) => {
+            report.lines.push(format!("훅 단계의 끝을 확인할 수 없습니다 — 수리 장부 목록을 읽을 수 없음({e:?})"));
+            return;
+        }
+    };
+    for id in ids {
+        let ops = match super::wal::list_checked_in(env.op.root, &id) {
+            Ok(ops) => ops,
+            Err(e) => {
+                fault_once(env, &id, "ops-unreadable", &format!("repairs/{}/ops", id.as_str()), &format!("동작 기록을 읽을 수 없습니다({e})"), report);
+                continue;
+            }
+        };
+        for op in ops.iter().filter(|o| o.lane_key == *env.op.lane && o.form == "hook" && o.finished && o.outcome.as_deref() == Some("declined")) {
+            let hooks = op.hooks.iter().map(|h| format!("{}:{}", h.event, h.script)).collect::<Vec<_>>().join(", ");
+            file_once(
+                env,
+                &format!("{}:hook-op:{}", id.as_str(), op.op),
+                &format!("repairs/{}/ops/{}.json", id.as_str(), op.op),
+                &format!("훅 단계가 끝나지 못했습니다 — 수리 {} · {} ({hooks}) · {}", id.as_str(), op.kind, op.note.chars().take(300).collect::<String>()),
+                report,
+            );
+        }
     }
 }
 
@@ -435,8 +484,11 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
                 match (env.hooks)(&rec.id, lane, HookStep::Unregister) {
                     Ok(_) => lines.push(format!("{}: 끊긴 확정의 훅 단계를 마쳤습니다", rec.id.as_str())),
                     Err(e) => {
-                        apply::mark_lane_conflict(root, &rec.id, lane, env.op.now, env.locked);
-                        lines.push(format!("{}: 끊긴 확정의 훅 단계 실패 — 충돌로 남깁니다({e:?})", rec.id.as_str()));
+                        let marked = apply::mark_lane_conflict(root, &rec.id, lane, env.op.now, env.locked)
+                            .err()
+                            .map(|m| format!(" · 충돌 표시도 쓰지 못함({m:?})"))
+                            .unwrap_or_default();
+                        lines.push(format!("{}: 끊긴 확정의 훅 단계 실패 — 충돌로 남깁니다({e:?}){marked}", rec.id.as_str()));
                     }
                 }
             }
@@ -799,7 +851,9 @@ fn settle_owed_return(env: &JobEnv<'_>, id: &RepairId, detail: &str, report: &mu
 }
 
 /// The probation re-check of ONE repair in this lane.
-pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, report: &mut TickReport) -> Result<(), RepairError> {
+/// `_listed_row` is the row as listed by the caller; every decision uses the row re-read under the
+/// repair's guard (EJ4 / FG5).
+pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, _listed_row: &LaneRecord, report: &mut TickReport) -> Result<(), RepairError> {
     // EJ4: the repair's guard (tried) for the re-check, and every decision on state read AFTER it is
     // held; it is released before the pack-apply lock is tried for a return (EN5's order: lock →
     // guard → mutex) — `revert_in` takes the guard again and re-reads

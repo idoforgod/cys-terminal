@@ -1378,6 +1378,136 @@ fn a_supersession_during_a_recheck_defers() {
     assert_eq!(std::fs::read(r.pack.join("hooks/s.sh")).unwrap(), b"PRE\n");
 }
 
+// ───────────────────────────── RULINGS FG3 — every terminal outcome that owes a report is found again ─────────────────────────────
+
+/// FG3 (codex r4 M4): a PARTIAL automatic return (the file put back, the hook re-registration
+/// failing) closes the row 충돌 by the daemon — a terminal outcome that owes a report. The intake
+/// rejects it in the first tick; after a restart the next tick files it ONCE; never again after.
+/// Without FG3 `closure_owes_intake` rejected the 충돌 closure: it was never filed.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_partial_automatic_return_is_reported_until_acknowledged() {
+    let r = rig("fg3partial");
+    let a = rid("R-1");
+    let mut rec = committed_general(&r, &a, "hooks/p.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    rec.files.push(crate::repair::ledger::FileChange {
+        rel: "settings:Stop:p.sh".into(),
+        kind: crate::repair::ledger::ChangeKind::HookUnregister { event: "Stop".into(), script: "p.sh".into() },
+        pre: PreImage::Absent,
+        post: TargetState::Absent,
+        diff: None,
+    });
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let fails = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Fail("bad".into()), 5);
+    let accept = std::cell::Cell::new(false);
+    let filed = RefCell::new(Vec::<String>::new());
+    let intake = |_: &str, line: &str| {
+        if accept.get() {
+            filed.borrow_mut().push(line.to_string());
+        }
+        accept.get()
+    };
+    let failing_hooks = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> { Err(RepairError::Io("등록기 없음".into())) };
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &intake, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    let mut env = job(&r, &d, ApplyForm::Exchange, NOW, &lock);
+    env.hooks = &failing_hooks;
+    let _ = run_tick(&env, false).unwrap();
+    let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
+    assert!(closed.starts_with("충돌"), "a partial return: {closed}");
+    assert_eq!(std::fs::read(r.pack.join("hooks/p.sh")).unwrap(), b"PRE\n", "the file was put back");
+    // the restart: a new job environment, the intake accepting
+    accept.set(true);
+    let mut env = job(&r, &d, ApplyForm::Exchange, NOW + 700.0, &lock);
+    env.hooks = &failing_hooks;
+    let _ = run_tick(&env, false).unwrap();
+    let n = || filed.borrow().iter().filter(|l| l.contains("충돌")).count();
+    assert_eq!(n(), 1, "filed once after the restart: {:?}", filed.borrow());
+    let mut env = job(&r, &d, ApplyForm::Exchange, NOW + 1400.0, &lock);
+    env.hooks = &failing_hooks;
+    let _ = run_tick(&env, false).unwrap();
+    assert_eq!(n(), 1, "never twice");
+}
+
+/// FG3 (codex r4 M4): a hook operation that FINISHED declined (its step's terminal error) owes a
+/// report found again at every tick from its record — rejected by the intake, then a restart: filed
+/// ONCE. Without FG3 recovery selected only unfinished records and nothing found it again.
+#[test]
+fn a_terminal_hook_error_is_reported_until_acknowledged() {
+    let r = rig("fg3hook");
+    let a = rid("R-1");
+    committed_general(&r, &a, "hooks/k.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let op = crate::repair::wal::OpRecord {
+        schema: 1,
+        op: "20261114-hook-1".into(),
+        repair: a.clone(),
+        lane_key: r.lane.clone(),
+        kind: "hook-reregister".into(),
+        form: "hook".into(),
+        rel: "settings".into(),
+        pre_existed: true,
+        expected: String::new(),
+        incoming: String::new(),
+        pack_generation: None,
+        slot: None,
+        slot_identity: None,
+        live_identity: None,
+        incoming_copy: None,
+        incoming_copy_identity: None,
+        step: "tombstoned".into(),
+        hooks: Vec::new(),
+        finished: true,
+        outcome: Some("declined".into()),
+        note: "등록기가 실패했습니다".into(),
+        created_at: 1.0,
+        updated_at: 2.0,
+        notice: None,
+    };
+    crate::repair::wal::write_in(&r.root, &op).unwrap();
+    let pass = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Pass, 5);
+    let accept = std::cell::Cell::new(false);
+    let filed = RefCell::new(Vec::<String>::new());
+    let intake = |_: &str, line: &str| {
+        if accept.get() {
+            filed.borrow_mut().push(line.to_string());
+        }
+        accept.get()
+    };
+    let d = Doubles { check: &pass, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &intake, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    accept.set(true);
+    let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 700.0, &lock), false).unwrap();
+    let n = || filed.borrow().iter().filter(|l| l.contains("훅 단계가 끝나지 못했습니다")).count();
+    assert_eq!(n(), 1, "filed once after the restart: {:?}", filed.borrow());
+    let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 1400.0, &lock), false).unwrap();
+    assert_eq!(n(), 1, "never twice");
+}
+
+/// FI4: the M10 sub-ledger's recovery errors are acknowledged under `m10:<lane>:recovery-error` — a
+/// real repair R-1's recovery error in the same tick is its own report. Without FI4 both were filed
+/// under `R-1:recovery-error`: the second was never filed.
+#[test]
+fn m10_recovery_errors_have_their_own_key() {
+    let r = rig("fi4key");
+    let a = rid("R-1");
+    committed_general(&r, &a, "hooks/m.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let real = crate::repair::wal::op_path_in(&r.root, &a, "broken-op");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, b"{ broken").unwrap();
+    let sub = m10_root_in(&r.root, &r.lane);
+    let m10 = crate::repair::wal::op_path_in(&sub, &m10_bucket(), "broken-m10");
+    std::fs::create_dir_all(m10.parent().unwrap()).unwrap();
+    std::fs::write(&m10, b"{ broken").unwrap();
+    let pass = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Pass, 5);
+    let d = Doubles { check: &pass, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    let acks = load_acks(&r.root, &r.lane);
+    assert!(acks.contains_key(&format!("m10:{}:recovery-error", r.lane.0)), "{acks:?}");
+    assert!(acks.contains_key("R-1:recovery-error"), "the real repair's own report: {acks:?}");
+}
+
 // ───────────────────────────── RULINGS EK2 — a failed re-check is a fact from the moment it is measured ─────────────────────────────
 
 /// EK2: a re-check fails while another apply / update holds the pack-apply lock — the failure is made
