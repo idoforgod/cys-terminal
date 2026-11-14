@@ -19023,6 +19023,13 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
                 // S6 adds only owner_token to close; no operator exemption is granted.
                 "close_surface".to_string(),
                 "feed_reply".to_string(),
+                // T5b (rewrite: the locked set was close_surface, feed_reply, send_input, trash_delete,
+                // trash_preview_poll, trash_preview_start): CONTRACTS C5 O-C5-3 rules that the two
+                // repair-approval commands read `read_operator_token_for(socket)` — through their one
+                // helper, and ONLY for `repair.approval_list` / `approval_start` / `approval_reject`.
+                // The token is a filter there, never the approval (C5 5.10 — the daemon's own child,
+                // the OS user verification, decides); no deletion verb is sent by it.
+                "repair_approval_rpc".to_string(),
                 // 0.15.0 T6 (interpretation 36): the revert button is a human's — old expectation had no
                 // repair_revert_last in this set
                 "repair_revert_last".to_string(),
