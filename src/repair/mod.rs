@@ -22,6 +22,7 @@ pub mod paths;
 pub mod platform;
 /// T6 — the appended job's work: probation re-check, M10, the start-time pass.
 pub mod probation;
+pub mod reapply_claim;
 pub mod rehearsal;
 pub mod roles;
 pub mod rules;

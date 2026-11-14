@@ -340,6 +340,39 @@ fn reapply_refusal_is_true_with_and_without_the_kept_copy() {
     assert_eq!(v["begin"], "new", "{v}");
 }
 
+/// CT8: AR1 across lanes — another lane's claim on R (made a moment ago, its R′ not yet begun) is a
+/// durable exclusive claim in the shared ledger: this lane's `reapply R` is refused and starts
+/// nothing. Without CT8 both lanes passed the record scan and each began its own R′.
+#[test]
+fn reapply_respects_another_lanes_claim() {
+    let r = rig("ct8claim");
+    let w = seat(3, "worker");
+    let id = committed(&r, "hooks/h.sh", b"#!/bin/sh\necho mine\n");
+    park(&r, "hooks/h.sh", b"#!/bin/sh\necho mine\n", b"#!/bin/sh\necho vendor\n");
+    let mut rec = r.record_of(&id);
+    rec.state = RepairState::Superseded;
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let rid = cys::repair::types::RepairId::parse(&id).unwrap();
+    let other = cys::repair::types::LaneKey("dept-9".into());
+    assert_eq!(cys::repair::reapply_claim::claim_in(&r.root, &rid, &other, T0 + 11.0, &|_| true), Ok(1));
+    let e = r.call(T0 + 12.0, &w, "reapply", json!({"repair": id})).unwrap_err();
+    assert!(e.message.contains("다른 부서가 방금"), "{}", e.message);
+    assert_eq!(ledger::list_ids_in(&r.root).len(), 1, "nothing started");
+}
+
+/// CU4: a parked `<rel>.user` that is NOT R's own edit (its bytes differ from R's repaired state)
+/// is refused by `reapply R`, naming the copy and the hand-edit route.
+#[test]
+fn reapply_refuses_a_parked_copy_that_is_not_rs_edit() {
+    let r = rig("cu4foreign");
+    let w = seat(3, "worker");
+    let id = committed(&r, "hooks/h.sh", b"#!/bin/sh\necho mine\n");
+    park(&r, "hooks/h.sh", b"#!/bin/sh\necho someone-elses\n", b"#!/bin/sh\necho vendor\n");
+    let e = r.call(T0 + 12.0, &w, "reapply", json!({"repair": id})).unwrap_err();
+    assert!(e.message.contains("의 수정본이 아닙니다") && e.message.contains("cys repair begin --files hooks/h.sh --trigger update"), "{}", e.message);
+    assert_eq!(ledger::list_ids_in(&r.root).len(), 1, "nothing started");
+}
+
 /// `tick` / `sweep` reach the daemon's own handler only; through the bare dispatcher (no daemon) they
 /// are refused with a sentence (the old expectation of T3's census was `repair_not_implemented`).
 #[test]

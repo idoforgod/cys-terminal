@@ -3716,6 +3716,7 @@ mod apply_verbs {
         let mut parked: Vec<(String, std::path::PathBuf)> = Vec::new();
         // CQ2: a regular `<rel>.user` on disk that no `vendor-first` record names
         let mut unrecorded: Vec<(String, std::path::PathBuf)> = Vec::new();
+        let mut foreign: Vec<(String, std::path::PathBuf)> = Vec::new();
         let is_regular = |p: &std::path::Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file());
         for f in ledger::file_targets(&r) {
             let copy_at_rel = ctx.pack_dir.join(format!("{}.user", f.rel));
@@ -3735,11 +3736,34 @@ mod apply_verbs {
                 .unwrap_or_else(|| format!("{}.user", f.rel));
             let path = ctx.pack_dir.join(&side);
             if is_regular(&path) {
-                parked.push((f.rel.clone(), path));
+                // CU4: the parked copy must be R's OWN edit (its bytes = R's repaired state of the
+                // file); a copy of something else is never re-applied as R
+                let own = match &f.post {
+                    cys::repair::types::TargetState::File { sha256, .. } => cys::repair::types::TargetState::read(&path)
+                        .ok()
+                        .is_some_and(|st| matches!(st, cys::repair::types::TargetState::File { sha256: s, .. } if s == *sha256)),
+                    _ => false,
+                };
+                if own {
+                    parked.push((f.rel.clone(), path));
+                } else {
+                    foreign.push((f.rel.clone(), path));
+                }
             } else if path != copy_at_rel && is_regular(&copy_at_rel) {
                 // the record names another side copy that is gone; `<rel>.user` is not the one it names
                 unrecorded.push((f.rel.clone(), copy_at_rel));
             }
+        }
+        if parked.is_empty() && !foreign.is_empty() {
+            let copies = foreign.iter().map(|(_, p)| p.display().to_string()).collect::<Vec<_>>().join(", ");
+            let rels = foreign.iter().map(|(rel, _)| rel.as_str()).collect::<Vec<_>>().join(" ");
+            return Err(VerbError::new(
+                cys::repair::types::ERR_PRECONDITION,
+                format!(
+                    "{id}: 보관 사본 {copies} 은 {id} 의 수정본이 아닙니다(내용이 다릅니다) — 다시 입히기(reapply)로는 입히지 않습니다. 그 사본을 살리는 길은 수리입니다: cys repair begin --files {rels} --trigger update (작업 사본에서 <파일>.user 를 합친 뒤 검증·감사 서명 → 주인 최종 승인)",
+                    id = r_id.as_str()
+                ),
+            ));
         }
         if parked.is_empty() && !unrecorded.is_empty() {
             let copies = unrecorded
@@ -3804,12 +3828,55 @@ mod apply_verbs {
                 ));
             }
         }
+        // CT8: ONE re-application per parked edit ACROSS lanes — a durable exclusive claim keyed by R
+        // in the shared ledger (no-replace placement; no cross-lane lock); the scan above stays as
+        // the sequential check of records that already name R
+        let holder_alive = |h: &RepairId| {
+            ledger::read_record_in(&ctx.root, h)
+                .ok()
+                .flatten()
+                .is_some_and(|o| being_worked(o.state) || matches!(o.state, RepairState::Probation | RepairState::InUse))
+        };
+        let k = match cys::repair::reapply_claim::claim_in(&ctx.root, &r_id, &ctx.lane, ctx.now, &holder_alive) {
+            Ok(k) => k,
+            Err(cys::repair::reapply_claim::ClaimRefused::Held { holder }) => {
+                let s = ledger::read_record_in(&ctx.root, &holder)
+                    .ok()
+                    .flatten()
+                    .map(|o| o.state.label_ko())
+                    .unwrap_or("?");
+                return Err(VerbError::new(
+                    cys::repair::types::ERR_PRECONDITION,
+                    format!(
+                        "{r}: 이미 {o} 가 {r} 의 수정본을 다시 입히고 있습니다(상태: {s}) — 두 번 입히지 않습니다. 그 수리가 적용되면 전파로 이 부서에도 닿습니다",
+                        r = r_id.as_str(),
+                        o = holder.as_str()
+                    ),
+                ));
+            }
+            Err(cys::repair::reapply_claim::ClaimRefused::Starting { .. }) | Err(cys::repair::reapply_claim::ClaimRefused::LostRace) => {
+                return Err(VerbError::new(
+                    cys::repair::types::ERR_PRECONDITION,
+                    format!(
+                        "{r}: 다른 부서가 방금 {r} 의 수정본을 다시 입히기 시작했습니다 — 두 번 입히지 않습니다. 그 수리가 적용되면 전파로 이 부서에도 닿습니다",
+                        r = r_id.as_str()
+                    ),
+                ));
+            }
+            Err(cys::repair::reapply_claim::ClaimRefused::Io(e)) => return Err(VerbError::new("io", e)),
+        };
         let files: Vec<String> = parked.iter().map(|(rel, _)| rel.clone()).collect();
-        let mut out = super::ledger_verbs::begin(
+        let mut out = match super::ledger_verbs::begin(
             ctx,
             caller,
             &json!({"files": files, "trigger": "update"}),
-        )?;
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = cys::repair::reapply_claim::close_in(&ctx.root, &r_id, k, "begin 이 거절됨", ctx.now);
+                return Err(e);
+            }
+        };
         let new_id = out
             .get("repair")
             .and_then(|x| x.as_str())
@@ -3822,6 +3889,7 @@ mod apply_verbs {
             rec.reapplies = Some(r_id.clone());
             ledger::write_record_durable_in(&ctx.root, &rec).map_err(VerbError::from)
         })?;
+        cys::repair::reapply_claim::set_holder_in(&ctx.root, &r_id, k, &new_id).map_err(VerbError::from)?;
         out["reapplies"] = json!(r_id.as_str());
         out["parked"] = json!(parked
             .iter()
