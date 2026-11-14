@@ -35,6 +35,11 @@ pub struct GrantDecision {
     pub prompt_excerpt: String,
     pub paused_at: Option<f64>,
     pub resumed_at: Option<f64>,
+    /// RULINGS CV1 (T4b): the decision's GENERATION — one more than the decision it replaced (0 = a
+    /// file written before T4b). A decision is published only by [`decide_in`], under the shared
+    /// grant lock, and only if the generation it validated is still the current one.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +163,210 @@ pub fn write_decision_in(root: &Path, d: &GrantDecision) -> Result<(), RepairErr
 /// Whether a decision lets autonomous repairs start at all (absent / unreadable / off = no).
 pub fn is_on(d: Option<&GrantDecision>) -> bool {
     d.is_some_and(|d| d.state == GrantState::On)
+}
+
+// ───────────────────────────── one order for decisions (RULINGS CV1 · T4b) ─────────────────────────────
+
+/// `<root>/grant.lock` — the lock every lane daemon takes to decide (validate the answer, consume
+/// the question, publish `grant.json`). An OS advisory lock on an open file (unix `flock`, Windows
+/// `LockFileEx` on byte 0): the kernel releases it when the holder's process ends, so a dead holder
+/// never leaves it held. The file itself is empty and never removed.
+pub fn grant_lock_path_in(root: &Path) -> PathBuf {
+    root.join("grant.lock")
+}
+
+/// How long a decision waits for the grant lock before it is refused (milliseconds). Only the
+/// owner-decision verbs (`grant on` / `grant off`) take the lock — never a start, a boot step, a
+/// sweep or a read.
+pub const GRANT_LOCK_WAIT_MS: u64 = 2_000;
+
+/// The refusal of a decision that could not get the lock in time.
+pub const GRANT_LOCK_BUSY_KO: &str = "다른 좌석이 지금 자동 수리 허락을 결정하는 중입니다 — 잠시 뒤 다시 하세요(아무것도 바꾸지 않았습니다)";
+
+/// The refusal of a decision whose validated generation is no longer the current one.
+pub const GRANT_STALE_KO: &str = "이 결정을 확인하는 사이에 다른 결정이 먼저 났습니다 — 아무것도 바꾸지 않았습니다(다시 물으려면 `cys repair grant ask`)";
+
+/// The held grant lock (released when dropped).
+pub struct GrantLock {
+    file: std::fs::File,
+}
+
+impl Drop for GrantLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: the descriptor is owned by `self.file` for the duration of the call.
+            unsafe {
+                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::UnlockFile;
+            // SAFETY: the handle is owned by `self.file`; byte 0, length 1, as locked.
+            unsafe {
+                UnlockFile(self.file.as_raw_handle() as _, 0, 0, 1, 0);
+            }
+        }
+    }
+}
+
+/// One non-blocking try of the lock: `Ok(true)` taken, `Ok(false)` another holder, `Err` cannot tell.
+fn try_lock_file(file: &std::fs::File) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: the descriptor is owned by `file` for the duration of the call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(c) if c == libc::EWOULDBLOCK || c == libc::EAGAIN => Ok(false),
+            _ => Err(e),
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        };
+        // SAFETY: a zeroed OVERLAPPED is the documented "offset 0" value; the handle is owned by
+        // `file` for the duration of the call.
+        let mut ov: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as _,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut ov,
+            )
+        };
+        if ok != 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(33) => Ok(false), // ERROR_LOCK_VIOLATION
+            _ => Err(e),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no file lock"))
+    }
+}
+
+/// Takes the grant lock, waiting at most `wait` (polled every 20 ms). The lock file is opened
+/// without following a link and without blocking (unix `O_NOFOLLOW | O_NONBLOCK`) and must be a
+/// regular file. Not taken in time → `Err(Precondition(GRANT_LOCK_BUSY_KO))`.
+pub fn lock_grant_in(root: &Path, wait: std::time::Duration) -> Result<GrantLock, RepairError> {
+    let p = grant_lock_path_in(root);
+    std::fs::create_dir_all(root).map_err(|e| io_err(root, e))?;
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = o.open(&p).map_err(|e| io_err(&p, e))?;
+    match file.metadata() {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err(io_err(&p, "the grant lock is not a regular file")),
+        Err(e) => return Err(io_err(&p, e)),
+    }
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match try_lock_file(&file) {
+            Ok(true) => return Ok(GrantLock { file }),
+            Ok(false) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(false) => return Err(RepairError::Precondition(GRANT_LOCK_BUSY_KO.to_string())),
+            Err(e) => return Err(io_err(&p, e)),
+        }
+    }
+}
+
+/// The decision a [`decide_in`] step validated against.
+#[derive(Debug, Clone, Copy)]
+pub struct CurrentDecision<'a> {
+    /// The decision read under the lock (`None` = no decision yet, or unreadable — see `unreadable`).
+    pub decision: Option<&'a GrantDecision>,
+    /// `grant.json` exists but cannot be read.
+    pub unreadable: bool,
+    /// The current generation (0 when there is no readable decision).
+    pub generation: u64,
+}
+
+/// Points of a decision where a test can suspend it (production: none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecideStep {
+    /// The lock is held; nothing has been read yet.
+    Locked,
+    /// The decision is validated (the caller's step ran and returned it); publication is next.
+    BeforePublish,
+}
+
+/// RULINGS CV1 — ONE step for a decision: under the grant lock, read the current decision, let
+/// `decide` validate the owner's answer against it (and consume the question — the caller's memory),
+/// then publish the result with generation `validated + 1` — refused if the current generation is no
+/// longer the one validated (`GRANT_STALE_KO`). A decision that validated an older generation can
+/// therefore never overwrite a later one ("an old 예 never overwrites a later off"). `hook` = test
+/// suspension points. On any `Err` nothing was published.
+pub fn decide_in<F>(
+    root: &Path,
+    wait: std::time::Duration,
+    hook: &dyn Fn(DecideStep),
+    decide: F,
+) -> Result<GrantDecision, RepairError>
+where
+    F: FnOnce(CurrentDecision<'_>) -> Result<GrantDecision, RepairError>,
+{
+    let _lock = lock_grant_in(root, wait)?;
+    hook(DecideStep::Locked);
+    let read = read_decision_in(root);
+    let (current, unreadable) = match &read {
+        Ok(d) => (d.as_ref(), false),
+        Err(_) => (None, true),
+    };
+    let generation = current.map(|d| d.generation).unwrap_or(0);
+    let mut d = decide(CurrentDecision {
+        decision: current,
+        unreadable,
+        generation,
+    })?;
+    hook(DecideStep::BeforePublish);
+    // defence in depth: a writer that does not take the lock (an older build) may have written
+    let now_gen = read_decision_in(root)
+        .ok()
+        .flatten()
+        .map(|x| x.generation)
+        .unwrap_or(0);
+    if now_gen != generation {
+        return Err(RepairError::Precondition(GRANT_STALE_KO.to_string()));
+    }
+    d.generation = generation.saturating_add(1);
+    write_decision_in(root, &d)?;
+    Ok(d)
+}
+
+/// The current decision's generation (0 when absent or unreadable) — what `grant ask` records in
+/// its question (RULINGS CV1: an answer is good only while no decision was published after it).
+pub fn current_generation_in(root: &Path) -> u64 {
+    read_decision_in(root)
+        .ok()
+        .flatten()
+        .map(|d| d.generation)
+        .unwrap_or(0)
 }
 
 // ───────────────────────────── the pause (B4) ─────────────────────────────
@@ -693,6 +902,8 @@ pub fn try_claim_in(
     if !is_on(decision.as_ref()) {
         return Err(RepairError::Precondition(GRANT_OFF_KO.to_string()));
     }
+    // RULINGS CV1: the generation the attempt is admitted under (re-checked at the end)
+    let generation = decision.as_ref().map(|d| d.generation).unwrap_or(0);
     let cap = decision
         .as_ref()
         .map(|d| d.daily_cap)
@@ -752,7 +963,30 @@ pub fn try_claim_in(
         }
     }
     step!(env, ClaimStep::AfterPlace);
-    // (5) START
+    // (5) ADMIT — RULINGS CV1: admission is decided at the END. The decision and the pause are read
+    // again AFTER the claim is placed: a `grant off`, a new decision or an owner input published
+    // before this point refuses the attempt, which closes its own claim (`<n>.closed` — a closed
+    // claim counts toward today's cap: failures count, G3 / K3) and releases its own lock. Anything
+    // published after this point is ordered after this start (a running round is not stopped by a
+    // pause — B4).
+    let after = read_decision_in(env.root).unwrap_or(None);
+    let on_now = is_on(after.as_ref());
+    let same = after.as_ref().map(|d| d.generation) == Some(generation);
+    let paused = is_paused_in(env.root, (env.clock)());
+    if !on_now || !same || paused {
+        if let Err(e) = create_marker(env.root, target) {
+            // stderr only (F1); the claim's lock is released below, so it is closable by any evaluator
+            eprintln!("[cysd] repair grant: refused start could not close its claim {target}: {e:?}");
+        }
+        release();
+        if !on_now {
+            return Err(RepairError::Precondition(GRANT_OFF_KO.to_string()));
+        }
+        if paused {
+            return Ok(StartVerdict::Paused);
+        }
+        return Ok(StartVerdict::LostRace);
+    }
     Ok(StartVerdict::Allowed { claim: target })
 }
 

@@ -99,6 +99,7 @@ fn grant_on(root: &Path, cap: u32) {
             prompt_excerpt: "예".into(),
             paused_at: None,
             resumed_at: None,
+            generation: 0,
         },
     )
     .unwrap();
@@ -212,9 +213,10 @@ fn decision_file_read_write() {
     keys.sort();
     assert_eq!(
         keys,
+        // RULINGS CV1 (T4b): + `generation` (OLD expectation: the same list without it)
         [
-            "daily_cap", "decided_at", "decided_lane", "decided_seat", "paused_at", "prompt_digest",
-            "prompt_excerpt", "resumed_at", "schema", "state"
+            "daily_cap", "decided_at", "decided_lane", "decided_seat", "generation", "paused_at",
+            "prompt_digest", "prompt_excerpt", "resumed_at", "schema", "state"
         ]
     );
     std::fs::write(grant_path_in(&r), b"{not json").unwrap();
@@ -911,4 +913,174 @@ fn grant_code_sends_nothing_to_queues() {
     for needle in ["cys send", "send_text", "alert_route", "events::", "feed.push", "wakeup", "enqueue", "Command::new"] {
         assert!(!prod.contains(needle), "grant.rs production code mentions {needle}");
     }
+}
+
+// ───────────────────────────── RULINGS CV1 (T4b) ─────────────────────────────
+
+/// CV1: a decision is ONE step under the grant lock — while one decision holds the lock between its
+/// validation and its publication (B suspended right before its write), another decision cannot
+/// interleave (bounded wait → refused, nothing written); B then publishes generation 1; a later
+/// `off` publishes generation 2. A writer that does not take the lock (an older build) and writes
+/// between validation and publication makes the decision STALE: refused, its file left as it is.
+#[test]
+fn cv1_decisions_are_one_step_under_the_shared_lock() {
+    let r = root("cv1-lock");
+    let d = |state: GrantState| GrantDecision {
+        schema: 1,
+        state,
+        daily_cap: 5,
+        decided_at: 1.0,
+        decided_lane: LaneKey("base".into()),
+        decided_seat: 1,
+        prompt_digest: "d".into(),
+        prompt_excerpt: "예".into(),
+        paused_at: None,
+        resumed_at: None,
+        generation: 0,
+    };
+    let short = std::time::Duration::from_millis(150);
+    let (to_main, at_main) = std::sync::mpsc::channel::<()>();
+    let (to_b, at_b) = std::sync::mpsc::channel::<()>();
+    let rb = r.clone();
+    let b = std::thread::spawn(move || {
+        let hook = move |s: DecideStep| {
+            if s == DecideStep::BeforePublish {
+                to_main.send(()).unwrap();
+                at_b.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+            }
+        };
+        decide_in(&rb, std::time::Duration::from_secs(5), &hook, |cur| {
+            assert_eq!((cur.generation, cur.unreadable), (0, false));
+            Ok(GrantDecision { state: GrantState::On, ..d(GrantState::On) })
+        })
+    });
+    at_main.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+    // B is validated and suspended before its write: nothing can interleave
+    let e = lock_grant_in(&r, short).err().expect("the lock is held by B");
+    assert!(matches!(&e, RepairError::Precondition(m) if m == GRANT_LOCK_BUSY_KO), "{e:?}");
+    let a = decide_in(&r, short, &|_| {}, |_| Ok(d(GrantState::Off)));
+    assert!(a.is_err(), "A waits at most `wait` and is refused");
+    assert_eq!(read_decision_in(&r).unwrap(), None, "nothing written while B holds the lock");
+    to_b.send(()).unwrap();
+    let pb = b.join().unwrap().unwrap();
+    assert_eq!((pb.state, pb.generation), (GrantState::On, 1));
+    let off = decide_in(&r, short, &|_| {}, |cur| {
+        assert_eq!(cur.generation, 1);
+        Ok(d(GrantState::Off))
+    })
+    .unwrap();
+    assert_eq!((off.state, off.generation), (GrantState::Off, 2));
+    // a lock-less writer between validation and publication → stale, refused, nothing overwritten
+    let sneak = |s: DecideStep| {
+        if s == DecideStep::BeforePublish {
+            write_decision_in(&r, &GrantDecision { generation: 7, ..d(GrantState::Off) }).unwrap();
+        }
+    };
+    let e = decide_in(&r, short, &sneak, |_| Ok(d(GrantState::On))).unwrap_err();
+    assert!(matches!(&e, RepairError::Precondition(m) if m == GRANT_STALE_KO), "{e:?}");
+    let now = read_decision_in(&r).unwrap().unwrap();
+    assert_eq!((now.state, now.generation), (GrantState::Off, 7), "the stale decision wrote nothing");
+    // a validation error publishes nothing and releases the lock
+    let e = decide_in(&r, short, &|_| {}, |_| Err(RepairError::Precondition("no".into())));
+    assert!(e.is_err());
+    assert!(lock_grant_in(&r, short).is_ok(), "released after a refused decision");
+    // an old file (no generation) reads as generation 0
+    std::fs::write(grant_path_in(&r), br#"{"schema":1,"state":"off","daily_cap":5,"decided_at":1.0,"decided_lane":"base","decided_seat":1,"prompt_digest":"d","prompt_excerpt":"","paused_at":null,"resumed_at":null}"#).unwrap();
+    assert_eq!(current_generation_in(&r), 0);
+}
+
+/// CV1 / fatal four: the grant lock dies with its holder — a process that holds it and is killed
+/// leaves it free (the kernel releases an advisory lock with the last descriptor); the wait is
+/// bounded; a link or a non-regular file at the lock's name is refused, never followed.
+#[cfg(unix)]
+#[test]
+fn cv1_the_grant_lock_dies_with_its_holder() {
+    use std::io::BufRead;
+    let r = root("cv1-dead");
+    let p = grant_lock_path_in(&r);
+    std::fs::write(&p, b"").unwrap();
+    // the holder is another PROCESS (perl's flock — not a python spawn site, see lib.rs's census)
+    let mut child = std::process::Command::new("perl")
+        .arg("-MFcntl=:flock")
+        .arg("-e")
+        .arg("open(my $f, '>>', $ARGV[0]) or die; flock($f, LOCK_EX) or die; $| = 1; print \"held\\n\"; sleep 60;")
+        .arg(&p)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("perl is on PATH in the test environment");
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(line.trim(), "held");
+    let started = std::time::Instant::now();
+    assert!(lock_grant_in(&r, std::time::Duration::from_millis(300)).is_err(), "held by the child");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "the wait is bounded");
+    child.kill().unwrap(); // our own child, by its handle (exact pid)
+    child.wait().unwrap();
+    assert!(lock_grant_in(&r, std::time::Duration::from_secs(2)).is_ok(), "free after the holder died");
+    // never follows a link at the lock's name
+    let r2 = root("cv1-link");
+    std::os::unix::fs::symlink(r2.join("elsewhere"), grant_lock_path_in(&r2)).unwrap();
+    assert!(lock_grant_in(&r2, std::time::Duration::from_millis(50)).is_err());
+    assert!(!r2.join("elsewhere").exists(), "the link's target was not created");
+}
+
+/// CV1: a start is admitted at the END — an owner input or a `grant off` published while the
+/// attempt is suspended after its pause check (at AfterLock and at BeforePlace) refuses it: the
+/// attempt closes its own claim (if placed) and releases its own lock; nothing else changes.
+#[test]
+fn cv1_a_start_is_admitted_at_the_end() {
+    for (at, what) in [
+        (ClaimStep::AfterLock, "pause"),
+        (ClaimStep::BeforePlace, "pause"),
+        (ClaimStep::AfterLock, "off"),
+        (ClaimStep::BeforePlace, "off"),
+        (ClaimStep::AfterPlace, "pause"),
+        (ClaimStep::AfterPlace, "off"),
+    ] {
+        let r = root("cv1-admit");
+        grant_on(&r, 5);
+        let t = t0();
+        let id = rid(1);
+        put(&r, &rec(&id, RepairState::InProgress, None));
+        let o = owner("base", 3, "inc-1");
+        let lane = LaneKey(format!("cv1-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+        let hook = |s: ClaimStep| {
+            if s == at {
+                if what == "pause" {
+                    assert!(note_owner_input_in(&r, &lane, t).unwrap());
+                } else {
+                    decide_in(&r, std::time::Duration::from_secs(2), &|_| {}, |cur| {
+                        let mut d = cur.decision.cloned().unwrap();
+                        d.state = GrantState::Off;
+                        Ok(d)
+                    })
+                    .unwrap();
+                }
+            }
+            HookAction::Continue
+        };
+        let clock = move || t + 1.0;
+        let today = || D.to_string();
+        let v = try_claim_in(&ClaimEnv { root: &r, clock: &clock, today: &today, hook: &hook }, &o, &id);
+        if what == "pause" {
+            assert_eq!(v.as_ref().ok(), Some(&StartVerdict::Paused), "{at:?}: {v:?}");
+        } else {
+            assert!(matches!(&v, Err(RepairError::Precondition(m)) if m == GRANT_OFF_KO), "{at:?}: {v:?}");
+        }
+        assert_eq!(get(&r, &id).lock, None, "{at:?} {what}: the attempt's own lock is released");
+        for (n, _) in claims(&r) {
+            assert!(closed(&r, n), "{at:?} {what}: the attempt's own claim {n} is closed");
+        }
+        assert_eq!(get(&r, &id).state, RepairState::InProgress, "the record stays open");
+    }
+    // an unchanged decision and no pause → admitted (the final check reads the same generation)
+    let r = root("cv1-admit-ok");
+    grant_on(&r, 5);
+    let id = rid(1);
+    put(&r, &rec(&id, RepairState::InProgress, None));
+    let v = attempt(&r, t0(), D, &owner("base", 3, "inc-1"), &id).unwrap();
+    assert_eq!(v, StartVerdict::Allowed { claim: 1 });
+    assert!(!closed(&r, 1));
 }

@@ -158,6 +158,7 @@ impl Rig {
                 prompt_excerpt: "예".into(),
                 paused_at: None,
                 resumed_at: None,
+                generation: 0,
             },
         )
         .unwrap();
@@ -1510,6 +1511,79 @@ fn cj5_grant_ask_reply_names_the_limit() {
         v["ask_owner"],
         "자비스가 발견한 명백한 버그·오류를 스스로 고쳐도 될까요? (하루 12건까지)"
     );
+}
+
+// ───────────────────────────── RULINGS CV1 (T4b) ─────────────────────────────
+
+/// CV1 (the verdict's T4-01, as the lock now orders it): two `grant on` requests carry the same
+/// answered question. A turns the grant on and takes the question; the owner says "끄라" and `grant
+/// off` publishes the next generation; B — the same answer, arriving late — is refused: the
+/// question is gone and the decision stays OFF. Generations 1 then 2.
+#[test]
+fn cv1_an_old_yes_never_overwrites_a_later_off() {
+    let r = rig("cv1-seq");
+    let t = now0();
+    r.call(t, &master(), "grant_ask", json!({})).unwrap();
+    r.typed(MASTER, "예", t + 1.0);
+    let on = |at: f64| r.call(at, &master(), "grant", json!({"mode": "on"}));
+    let a = on(t + 2.0).unwrap();
+    assert_eq!((a["grant"].clone(), a["generation"].clone()), (json!("on"), json!(1)));
+    r.prompt(MASTER, "자동 수리 꺼라", "human", t + 3.0);
+    let off = r.call(t + 4.0, &master(), "grant", json!({"mode": "off"})).unwrap();
+    assert_eq!((off["grant"].clone(), off["generation"].clone()), (json!("off"), json!(2)));
+    let b = on(t + 5.0).unwrap_err();
+    assert_eq!(b.code, "repair_precondition");
+    let d = r.decision().unwrap();
+    assert_eq!((d.state, d.generation), (GrantState::Off, 2), "the later off stands");
+}
+
+/// CV1 across lanes: the question was asked in lane X (generation 0) and answered; lane Y's
+/// daemon (same repairs root, its own memory) publishes `off` first — X's `grant on` with that
+/// answer is refused (the question was asked before the current decision) and X's question is
+/// left as it is (nothing taken, nothing written).
+#[test]
+fn cv1_an_answer_older_than_the_current_decision_is_refused() {
+    let x = rig("cv1-x");
+    let mut y = rig("cv1-y");
+    y.root = x.root.clone();
+    y.lane = LaneKey("dept-2".into());
+    let t = now0();
+    x.call(t, &master(), "grant_ask", json!({})).unwrap();
+    x.typed(MASTER, "예", t + 1.0);
+    y.prompt(MASTER, "자동 수리 꺼", "human", t + 2.0);
+    y.call(t + 3.0, &master(), "grant", json!({"mode": "off"})).unwrap();
+    let e = x.call(t + 4.0, &master(), "grant", json!({"mode": "on"})).unwrap_err();
+    assert!(e.message.contains("다른 결정"), "{}", e.message);
+    assert!(x.prompts.lock().unwrap()[&MASTER].question.is_some(), "nothing taken");
+    let d = x.decision().unwrap();
+    assert_eq!((d.state, d.generation), (GrantState::Off, 1));
+    // asked again after the off: the answer counts
+    x.call(t + 5.0, &master(), "grant_ask", json!({})).unwrap();
+    x.typed(MASTER, "예", t + 6.0);
+    let v = x.call(t + 7.0, &master(), "grant", json!({"mode": "on"})).unwrap();
+    assert_eq!((v["grant"].clone(), v["generation"].clone()), (json!("on"), json!(2)));
+}
+
+/// CV1: while another daemon holds the grant lock (B between its validation and its write),
+/// `grant on` waits at most `GRANT_LOCK_WAIT_MS` and is refused with nothing written and the
+/// question kept; once the lock is free the same request succeeds.
+#[test]
+fn cv1_a_decision_waits_a_bounded_time_for_the_lock() {
+    let r = rig("cv1-wait");
+    let t = now0();
+    r.call(t, &master(), "grant_ask", json!({})).unwrap();
+    r.typed(MASTER, "예", t + 1.0);
+    let held = grant::lock_grant_in(&r.root, std::time::Duration::from_secs(1)).unwrap();
+    let started = std::time::Instant::now();
+    let e = r.call(t + 2.0, &master(), "grant", json!({"mode": "on"})).unwrap_err();
+    let waited = started.elapsed();
+    assert_eq!(e.message, format!("repair.grant: {}", grant::GRANT_LOCK_BUSY_KO));
+    assert!(waited >= std::time::Duration::from_millis(grant::GRANT_LOCK_WAIT_MS - 100), "{waited:?}");
+    assert!(waited < std::time::Duration::from_millis(grant::GRANT_LOCK_WAIT_MS + 3_000), "{waited:?}");
+    assert_eq!(r.decision(), None, "nothing written");
+    assert!(r.prompts.lock().unwrap()[&MASTER].question.is_some(), "the question is kept");
+    drop(held);
+    assert_eq!(r.call(t + 3.0, &master(), "grant", json!({"mode": "on"})).unwrap()["grant"], "on");
 }
 
 // ───────────────────────────── RULINGS CV2 (T4b) ─────────────────────────────

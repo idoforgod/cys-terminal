@@ -3345,7 +3345,7 @@ mod grant_verbs {
     use super::{Caller, Ctx, OpenQuestion, PromptOrigin, VerbError};
     use cys::repair::grant::{self, GrantDecision, GrantState};
     use cys::repair::owner_origin::{self as oo, PromptView, QuestionView};
-    use cys::repair::types::{Classification, RepairId, ERR_PRECONDITION};
+    use cys::repair::types::{Classification, RepairError, RepairId, ERR_PRECONDITION};
     use cys::repair::{intake, ledger, lock};
     use serde_json::{json, Value};
     use std::path::Path;
@@ -3437,6 +3437,12 @@ mod grant_verbs {
             first_human: None,
             machine_seen: false,
             daily_cap,
+            // CV1: a grant answer is good only while this is still the current generation
+            asked_generation: if path.is_none() {
+                grant::current_generation_in(&ctx.root)
+            } else {
+                0
+            },
         });
         json!({
             "asked_at": ctx.now,
@@ -3555,8 +3561,9 @@ mod grant_verbs {
         Ok(v)
     }
 
-    /// `cys repair grant on|off` (C9 · RULINGS B1, Q1, T3, T5, U4(b), CI4, CI5 (a)): written to
-    /// `grant.json` (atomic replace, the latest decision wins) only after the owner-origin check.
+    /// `cys repair grant on|off` (C9 · RULINGS B1, Q1, T3, T5, U4(b), CI4, CI5 (a), CV1): written to
+    /// `grant.json` (atomic replace) only after the owner-origin check, in ONE step with that check
+    /// and the question's consumption under the shared grant lock, with the next generation.
     /// `on` takes the daily limit of the answered question; `off` keeps the current limit; neither
     /// takes `--daily-cap` (CI4 — refused with the sentence naming `grant ask --daily-cap`).
     pub(crate) fn grant(ctx: &Ctx<'_>, caller: &Caller, p: &Value) -> Result<Value, VerbError> {
@@ -3567,78 +3574,110 @@ mod grant_verbs {
         if !matches!(p.get("daily_cap"), None | Some(Value::Null)) {
             return Err(VerbError::invalid(CAP_ON_ASK_ONLY_KO));
         }
-        let current = grant::read_decision_in(&ctx.root).unwrap_or(None);
-        let record = record_of(ctx, sid);
-        let asked_at = record
-            .as_ref()
-            .and_then(|r| r.question.as_ref())
-            .map(|q| q.asked_at);
-        let view = record.as_ref().map(prompt_view);
-        let refuse = |m: String| VerbError::new(ERR_PRECONDITION, m);
-        let decision = match mode {
-            "on" => {
-                let a = oo::judge_grant_on(view.as_ref(), ctx.now).map_err(refuse)?;
-                GrantDecision {
-                    schema: cys::repair::REPAIR_SCHEMA,
-                    state: GrantState::On,
-                    // CI4: the limit of the answered question (registered by `grant ask`)
-                    daily_cap: record
-                        .as_ref()
-                        .and_then(|r| r.question.as_ref())
-                        .and_then(|q| q.daily_cap)
-                        .filter(|c| (1..=grant::MAX_DAILY_CAP).contains(c))
-                        .unwrap_or_else(|| current_cap(current.as_ref())),
-                    decided_at: ctx.now,
-                    decided_lane: ctx.lane.clone(),
-                    decided_seat: sid,
-                    prompt_digest: a.digest,
-                    prompt_excerpt: a.excerpt,
-                    // the owner's answer is itself an owner input (B4); CI5 (a): dated from NOW
-                    paused_at: Some(ctx.now),
-                    resumed_at: Some(ctx.now + grant::PAUSE_QUIET_SECS as f64),
+        if !matches!(mode, "on" | "off") {
+            return Err(VerbError::invalid(format!(
+                "알 수 없는 mode: {mode:?} (on · off)"
+            )));
+        }
+        let refuse = |m: String| RepairError::Precondition(m);
+        // RULINGS CV1: validate the answer, take the question and publish the decision as ONE step
+        // under the grant lock every lane daemon takes (`grant::decide_in`); the seat's record is
+        // judged and its question taken inside one section of the record lock. A decision that is
+        // not published gives the question back.
+        let mut taken: Option<OpenQuestion> = None;
+        let published = grant::decide_in(
+            &ctx.root,
+            std::time::Duration::from_millis(grant::GRANT_LOCK_WAIT_MS),
+            &|_| {},
+            |cur| {
+                let mut map = ctx.prompts.lock().unwrap_or_else(|e| e.into_inner());
+                let (decision, take) = {
+                    let record = map.get(&sid);
+                    let view = record.map(prompt_view);
+                    let question = record.and_then(|r| r.question.as_ref());
+                    if mode == "on" {
+                        if cur.unreadable {
+                            return Err(refuse("자동 수리 허락 파일(grant.json)을 읽을 수 없어 켜지 않습니다 — 끄기(`grant off`)는 됩니다".into()));
+                        }
+                        let a = oo::judge_grant_on(view.as_ref(), ctx.now).map_err(refuse)?;
+                        // CV1: the answer is good only while no decision was published after the
+                        // question was asked (in any lane)
+                        if question.map(|q| q.asked_generation) != Some(cur.generation) {
+                            return Err(refuse(GRANT_ASKED_BEFORE_KO.to_string()));
+                        }
+                        (
+                            GrantDecision {
+                                schema: cys::repair::REPAIR_SCHEMA,
+                                state: GrantState::On,
+                                // CI4: the limit of the answered question (registered by `grant ask`)
+                                daily_cap: question
+                                    .and_then(|q| q.daily_cap)
+                                    .filter(|c| (1..=grant::MAX_DAILY_CAP).contains(c))
+                                    .unwrap_or_else(|| current_cap(cur.decision)),
+                                decided_at: ctx.now,
+                                decided_lane: ctx.lane.clone(),
+                                decided_seat: sid,
+                                prompt_digest: a.digest,
+                                prompt_excerpt: a.excerpt,
+                                // the owner's answer is itself an owner input (B4); CI5 (a): from NOW
+                                paused_at: Some(ctx.now),
+                                resumed_at: Some(ctx.now + grant::PAUSE_QUIET_SECS as f64),
+                                generation: 0, // set by `decide_in`
+                            },
+                            true,
+                        )
+                    } else {
+                        let a = oo::judge_grant_off(view.as_ref(), cur.decision.map(|d| d.decided_at))
+                            .map_err(refuse)?;
+                        (
+                            GrantDecision {
+                                schema: cys::repair::REPAIR_SCHEMA,
+                                state: GrantState::Off,
+                                daily_cap: current_cap(cur.decision), // CI4: never changes the limit
+                                decided_at: ctx.now,
+                                decided_lane: ctx.lane.clone(),
+                                decided_seat: sid,
+                                prompt_digest: a.digest,
+                                prompt_excerpt: a.excerpt,
+                                paused_at: None,
+                                resumed_at: None,
+                                generation: 0, // set by `decide_in`
+                            },
+                            question.is_some_and(|q| q.path.is_none()),
+                        )
+                    }
+                };
+                if take {
+                    taken = map.get_mut(&sid).and_then(|r| r.question.take());
                 }
-            }
-            "off" => {
-                let a = oo::judge_grant_off(view.as_ref(), current.as_ref().map(|d| d.decided_at))
-                    .map_err(refuse)?;
-                GrantDecision {
-                    schema: cys::repair::REPAIR_SCHEMA,
-                    state: GrantState::Off,
-                    daily_cap: current_cap(current.as_ref()), // CI4: `off` never changes the limit
-                    decided_at: ctx.now,
-                    decided_lane: ctx.lane.clone(),
-                    decided_seat: sid,
-                    prompt_digest: a.digest,
-                    prompt_excerpt: a.excerpt,
-                    paused_at: None,
-                    resumed_at: None,
+                Ok(decision)
+            },
+        );
+        let decision = match published {
+            Ok(d) => d,
+            Err(e) => {
+                if let Some(q) = taken {
+                    let mut map = ctx.prompts.lock().unwrap_or_else(|e| e.into_inner());
+                    let r = map.entry(sid).or_default();
+                    if r.question.is_none() {
+                        r.question = Some(q);
+                    }
                 }
-            }
-            other => {
-                return Err(VerbError::invalid(format!(
-                    "알 수 없는 mode: {other:?} (on · off)"
-                )))
+                return Err(e.into());
             }
         };
-        grant::write_decision_in(&ctx.root, &decision)?;
-        if let Some(t) = asked_at {
-            if decision.state == GrantState::On
-                || record
-                    .as_ref()
-                    .and_then(|r| r.question.as_ref())
-                    .is_some_and(|q| q.path.is_none())
-            {
-                let _ = consume_question(ctx, sid, t);
-            }
-        }
         Ok(json!({
             "grant": decision.state,
             "daily_cap": decision.daily_cap,
             "decided_at": decision.decided_at,
             "decided_lane": decision.decided_lane,
             "paused_until": decision.resumed_at,
+            "generation": decision.generation,
         }))
     }
+
+    /// RULINGS CV1: a `grant on` whose question was asked before the current decision was published.
+    const GRANT_ASKED_BEFORE_KO: &str = "질문을 등록한 뒤에 다른 결정(켬·끔)이 먼저 났습니다 — 그 답으로는 켜지 않습니다. `cys repair grant ask`로 다시 물으세요";
 
     /// `cys repair owner-token [--repair <R-id>] --path <doc>` (C10 · RULINGS F10, F11, Q2, T3, U4):
     /// after the owner-origin check, a scoped token `ot-<base32 128 bit>` for exactly that path, valid
@@ -3958,6 +3997,9 @@ pub(crate) struct OpenQuestion {
     pub machine_seen: bool,
     /// RULINGS CI4: the daily limit a grant question carries (`grant ask [--daily-cap N]`).
     pub daily_cap: Option<u32>,
+    /// RULINGS CV1 (T4b): the decision generation current when the grant question was asked — its
+    /// answer turns the grant on only while no decision was published since.
+    pub asked_generation: u64,
 }
 
 /// Longest kept excerpt of an owner-typed answer (characters; memory only).
