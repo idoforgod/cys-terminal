@@ -997,6 +997,54 @@ fn extra_stdout_line_from_lib_refuses_every_gate_class() {
     cleanup(&root);
 }
 
+/// RULINGS DF2 — behaviour decides: a registration whose command names the gate but cannot make it
+/// deny (`true || sh <gate>`; the gate's output swallowed) is not registered → REFUSED.
+#[test]
+fn i3_refuses_registrar_writing_true_or_gate() {
+    i3_refuses_registrar_mutation("df2-or", REGISTRAR_FORM, "    return \"true || sh \" + script");
+}
+
+#[test]
+fn i3_refuses_registrar_swallowing_the_gate_output() {
+    i3_refuses_registrar_mutation(
+        "df2-quiet",
+        REGISTRAR_FORM,
+        "    return \"sh \" + script + \" >/dev/null\"",
+    );
+}
+
+/// RULINGS DF2 — behaviour decides the other way too: a command outside CZ1's closed grammar that
+/// really runs the gate (`exec sh <gate>`) IS registered — no I3 probe is refused. (Under the grammar
+/// alone this candidate was refused.)
+#[test]
+fn i3_accepts_a_registration_that_really_runs_the_gate() {
+    let root = test_root("df2-exec");
+    let lane = lane_of(&root, &[]);
+    let pf = released("bin/javis_preflight.py");
+    assert_eq!(pf.matches(REGISTRAR_FORM).count(), 1);
+    let cand = candidate_of(
+        &root,
+        &[(
+            "bin/javis_preflight.py",
+            Some(pf.replace(REGISTRAR_FORM, "    return \"exec sh \" + script")),
+        )],
+    );
+    let c = cfg(&root, Some(vec![]), Some(vec![]), true);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let i3: Vec<&ProbeResult> = rep.probes.iter().filter(|p| p.test == "I3").collect();
+    let s3 = i3
+        .iter()
+        .find(|p| p.cell == "L1/S3/run1" && p.class == "I3:.claude")
+        .unwrap_or_else(|| panic!("no L1/S3 probe: {i3:#?}"));
+    assert_eq!((s3.released, s3.clean), (Answer::Deny, Some(Answer::Deny)), "{s3:#?}");
+    assert!(
+        i3.iter().all(|p| p.decision != ProbeDecision::Refused),
+        "{:#?}",
+        i3.iter().filter(|p| p.decision == ProbeDecision::Refused).collect::<Vec<_>>()
+    );
+    cleanup(&root);
+}
+
 /// I4: a candidate guard.sh whose backstop region differs from the released copy → REFUSED; a
 /// candidate whose region anchor is gone → REFUSED; a lane whose own copy differs and a candidate
 /// that does not touch guard.sh → a lane finding (BA4).
