@@ -186,8 +186,8 @@ pub fn pack_generation_checked(pack: &Path) -> Result<PackGeneration, String> {
     Ok(PackGeneration { version, pro_revision })
 }
 
-/// The pack generation for DISPLAY and records only ("unknown" when it cannot be read — never a
-/// decision: decisions use [`Bound::now`]).
+/// The pack generation for DISPLAY and records only (the word unknown when it cannot be read —
+/// never a decision: decisions use [`Bound::now`]).
 pub fn pack_generation(pack: &Path) -> PackGeneration {
     let version = std::fs::read_to_string(pack.join(".pack-version"))
         .map(|s| s.trim().to_string())
