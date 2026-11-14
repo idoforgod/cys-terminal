@@ -966,11 +966,11 @@ pub fn run_child_with(
         pump_stdin(&mut sin, stdin, &mut written);
         pump_out(&mut sout, &mut out.stdout, &mut out.stdout_state);
         pump_out(&mut serr, &mut out.stderr, &mut out.stderr_state);
-        if ended_at.is_none() {
-            // the child's descendants while it lives (a process that leaves the group is still one)
-            if !sample_tree(pid as u32, &mut seen) {
-                out.observation_incomplete = true;
-            }
+        // RULINGS GR4: the child's process tree is sampled at EVERY turn of this one loop — while the
+        // child lives and during the drain after its exit (a process seen before is still followed:
+        // a child that outlived the root may start another one now)
+        if !sample_tree(pid as u32, &mut seen) {
+            out.observation_incomplete = true;
         }
         let now = Instant::now();
         if ended_at.is_none() && exited_no_reap(pid) {
@@ -1003,7 +1003,13 @@ pub fn run_child_with(
     }
     let me = pid as u32;
     let mut group_seen_whole = true;
-    let mut alive_now = |seen: &[SeenProcess]| -> Vec<u32> {
+    // RULINGS GR4 — ONE turn of the clean-up: the tree is sampled again (no phase waits without
+    // sampling), everything of the run alive now that was not killed yet is killed by its exact pid and
+    // reported, and what is alive now is returned
+    let mut turn = |seen: &mut Vec<SeenProcess>, out: &mut ChildOutcome| -> Vec<u32> {
+        if !sample_tree(me, seen) {
+            out.observation_incomplete = true;
+        }
         let (mut v, ok) = still_alive(seen, me);
         group_seen_whole &= ok;
         for p in marked_processes(&mark) {
@@ -1012,20 +1018,23 @@ pub fn run_child_with(
             }
         }
         v.retain(|p| *p != me);
-        v
-    };
-    for p in alive_now(&seen) {
-        if kill == KillMode::Kill {
-            // SAFETY: kill(2) of a process of THIS run (seen as the child's descendant with this start
-            // time, a member of its group, or carrying its marker), by its exact pid.
-            unsafe {
-                libc::kill(p as libc::pid_t, libc::SIGKILL);
+        for p in &v {
+            if !out.leftovers.contains(p) {
+                if kill == KillMode::Kill {
+                    // SAFETY: kill(2) of a process of THIS run (seen as the child's descendant with
+                    // this start time, a member of its group, or carrying its marker), by its exact pid.
+                    unsafe {
+                        libc::kill(*p as libc::pid_t, libc::SIGKILL);
+                    }
+                }
+                out.leftovers.push(*p);
             }
         }
-        out.leftovers.push(p);
-    }
+        v
+    };
+    turn(&mut seen, &mut out);
     kill_group();
-    // the exit: already seen, or polled for a short fixed grace after the kill
+    // the exit: already seen, or polled for a short fixed grace after the kill (sampling every turn)
     let grace_until = Instant::now() + KILL_GRACE;
     while ended_at.is_none() {
         if exited_no_reap(pid) {
@@ -1036,15 +1045,17 @@ pub fn run_child_with(
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
+        turn(&mut seen, &mut out);
     }
     // what the kill did not reach, once the kill has had a moment to land (a killed process is torn
-    // down asynchronously — re-read for at most SETTLE)
+    // down asynchronously — re-read for at most SETTLE, sampling every turn)
     let settle_until = Instant::now() + SETTLE;
-    out.survivors = alive_now(&seen);
-    while !out.survivors.is_empty() && Instant::now() < settle_until {
+    let mut alive = turn(&mut seen, &mut out);
+    while !alive.is_empty() && Instant::now() < settle_until {
         std::thread::sleep(Duration::from_millis(20));
-        out.survivors = alive_now(&seen);
+        alive = turn(&mut seen, &mut out);
     }
+    out.survivors = alive;
     if !group_seen_whole {
         out.observation_incomplete = true;
     }
