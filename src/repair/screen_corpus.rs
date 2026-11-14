@@ -967,69 +967,87 @@ pub fn census_region(text: &str, start: &str, end: &str) -> Result<(usize, Strin
     Ok((e - s, h.iter().map(|b| format!("{b:02x}")).collect()))
 }
 
-/// RULINGS CZ7 — census (iii): each released device's DENY-DECISION region and ENVIRONMENT-BRANCH
-/// region(s), pinned WHOLE between explicit anchors ([`census_region`]): (device, region, start
-/// anchor, end anchor — `""` = to the end, line count, sha256 of the region). guard.sh: its bash head
-/// (lane redirect, script folder, the autopilot flag files of the test mode, the interpreter
-/// resolution, the deny output, the flag trust check, the python environment reads and input parse,
-/// the normalisers), its python decision code (protected names, wrappers, STRICT allow-lists and
-/// `git`/`cys` gating, the LOOSE rules — the `gh pr create/merge` condition among them — and the
-/// dispatch), and its bash tail (constitution token, bash backstop, dispatch). The gate: its bash
-/// head (lane redirect, role cache, gated-role predicate, role resolution, self-test switch, the
-/// big-input and no-interpreter branches) and its python decision code up to the self-tests (every
-/// table — WRITE_SHELL_CMDS, GIT_WRITE_SUBS, CSO_CYS_SUBVERBS, BUILDER_ENV_WRITE … — and `main`).
-/// `_lib.sh`: everything after its header (interpreter resolution and shim checks, lane redirect,
-/// role helpers). Headers, comments outside the regions and the gate's self-tests are not pinned. A
-/// change inside a region fails `screen::tests::census_iii_deny_rules_and_branches_pinned` until the
-/// corpora and cells are reviewed against the device and this table is updated with them (CM4: a
-/// lib-suite test).
+/// RULINGS EL6 — census (iii) pins the WHOLE released device except DECLARED free regions (CZ7
+/// inverted: pinning named regions had left the dispatch outside every pin). The digest is the sha256
+/// of the device's lines, LF-joined, with the lines of every free region of that device removed (a free
+/// region runs from the ONE line whose anchor text is its start up to, not including, the ONE line
+/// whose anchor text is its end — [`census_region`]'s anchors). Returns (pinned line count, digest).
+pub fn census_pinned(text: &str, frees: &[(&str, &str)]) -> Result<(usize, String), String> {
+    use sha2::{Digest, Sha256};
+    let lines: Vec<&str> = text.split('\n').collect();
+    let at = |a: &str| -> Result<usize, String> {
+        let hits: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| anchor_text(l) == a)
+            .map(|(i, _)| i)
+            .collect();
+        match hits.as_slice() {
+            [i] => Ok(*i),
+            [] => Err(format!("anchor not found: {a:?}")),
+            _ => Err(format!("anchor occurs {} times: {a:?}", hits.len())),
+        }
+    };
+    let mut free = vec![false; lines.len()];
+    for (start, end) in frees {
+        let (s, e) = (at(start)?, at(end)?);
+        if e <= s {
+            return Err(format!("anchor {end:?} does not follow {start:?}"));
+        }
+        for f in free.iter_mut().take(e).skip(s) {
+            *f = true;
+        }
+    }
+    let kept: Vec<&str> = lines
+        .iter()
+        .zip(free.iter())
+        .filter(|(_, f)| !**f)
+        .map(|(l, _)| *l)
+        .collect();
+    let h = Sha256::digest(kept.join("\n").as_bytes());
+    Ok((kept.len(), h.iter().map(|b| format!("{b:02x}")).collect()))
+}
+
+/// RULINGS EL6 / CZ7 — census (iii): per released device ONE `pin` row (device, `pin`, "", "", pinned
+/// line count, sha256 — [`census_pinned`]) and its `free` rows (device, `free`, start anchor, end
+/// anchor, 0, the reason the region is free). DEFAULT = PINNED: guard.sh and `_lib.sh` are pinned
+/// whole (their `_lib.sh` prelude sourcing, its `CYS_PACK_DIR` fallback and the `exit 0` when the
+/// library is missing included — EO3); the gate is pinned whole except its self-tests (the dispatch
+/// `if CAPGATE_SELF_TEST … else main()` after them is pinned). Any edit outside a free region — a
+/// comment included — fails `screen::tests::census_iii_deny_rules_and_branches_pinned` until the
+/// corpora and cells are reviewed against the device and this table is updated (CM4: a lib-suite
+/// test); a pack-only release that edits a protection file is held by it.
 pub const CENSUS_PINS: &[(&str, &str, &str, &str, usize, &str)] = &[
     (
         "hooks/guard.sh",
-        "environment-head",
-        "command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect $@",
-        "def _strip_hidden(s):",
-        90,
-        "df69e734af1511381e3ab5c7e560d348a7b30cfb76effaa517f463be739ff3ec",
-    ),
-    (
-        "hooks/guard.sh",
-        "deny-decision",
-        "def _strip_hidden(s):",
-        "PY",
-        897,
-        "51e6619b1db565200afdd6dcf4bc8f1d6915f6cd88d089fb127726d709ef8b81",
-    ),
-    (
-        "hooks/guard.sh",
-        "backstop-and-dispatch",
-        "PY",
+        "pin",
         "",
-        69,
-        "f61562abaffeddd6a51f08ac239b6d5b1d6cf1b3c6950f7328374b9dc48f24f5",
+        "",
+        1097,
+        "65e4584f0687d1df2e04c5d419e6fd1be45c8c853bb52eb0dedd2a042236f3d9",
     ),
     (
         "hooks/role-capability-gate.sh",
-        "environment-head",
-        "command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect $@",
-        "exec $CYS_PY - <<PYEOF",
-        276,
-        "3b869a6f67b58b414efa99fa5c9350f5a331b8f357d4b1dcaf16f649c73edb39",
+        "pin",
+        "",
+        "",
+        3464,
+        "f145731c70b6da7d6394780766747ee047b90cabf7fb6a60e97b7eae93873da3",
     ),
     (
         "hooks/role-capability-gate.sh",
-        "deny-decision",
-        "exec $CYS_PY - <<PYEOF",
+        "free",
         "def self_test():",
-        3095,
-        "bbaa170bc98b3f380936aece6cdde45e365a635ea0186ce07eaa39cd3115e8cb",
+        "if os.environ.get(CAPGATE_SELF_TEST):",
+        0,
+        "the self-tests run only under CAPGATE_SELF_TEST which no harness and no screen sets",
     ),
     (
         "hooks/_lib.sh",
-        "environment",
-        "-n ${CYS_LIB_SH_LOADED:-} && return 0",
+        "pin",
         "",
-        1063,
-        "e03702093e8d982f160ccb39c495851614e0e439e219cb1c862351d0e79f4413",
+        "",
+        1103,
+        "3ecbbd4c775d72520345e3deece3d83c8d58580234e47c3c2cdee82b13db2320",
     ),
 ];

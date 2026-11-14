@@ -300,79 +300,106 @@ fn census_i_every_class_has_a_probe_in_every_cell() {
 /// released device's deny rules or environment branches without a table review fails here.
 #[test]
 fn census_iii_deny_rules_and_branches_pinned() {
+    let frees_of = |rel: &str| -> Vec<(&'static str, &'static str)> {
+        CENSUS_PINS
+            .iter()
+            .filter(|p| p.0 == rel && p.1 == "free")
+            .map(|p| (p.2, p.3))
+            .collect()
+    };
     let mut actual = Vec::new();
     let mut differs = Vec::new();
-    for (rel, region, start, end, n, digest) in CENSUS_PINS {
-        match corpus::census_region(&released(rel), start, end) {
+    for (rel, kind, _, _, n, digest) in CENSUS_PINS {
+        if *kind != "pin" {
+            assert_eq!(*kind, "free", "{rel}: a row is a pin or a free region");
+            continue;
+        }
+        match corpus::census_pinned(&released(rel), &frees_of(rel)) {
             Ok((an, ad)) => {
-                actual.push(format!("({rel:?}, {region:?}, {an}, {ad:?})"));
-                assert!(an > 20, "{rel} {region}: only {an} lines — the region reads nothing");
+                actual.push(format!("({rel:?}, {an}, {ad:?})"));
+                assert!(an > 100, "{rel}: only {an} pinned lines");
                 if (an, ad.as_str()) != (*n, *digest) {
-                    differs.push(format!("{rel} {region} ({n} → {an} lines)"));
+                    differs.push(format!("{rel} ({n} → {an} lines)"));
                 }
             }
-            Err(e) => differs.push(format!("{rel} {region}: {e}")),
+            Err(e) => differs.push(format!("{rel}: {e}")),
         }
     }
     assert!(
         differs.is_empty(),
-        "census (iii): a deny-decision / environment-branch region changed in {}. Review CORPUS_G / \
-         CORPUS_R / CORPUS_C and the cell table against the device, then update CENSUS_PINS. Current \
-         values: {}",
+        "census (iii): a pinned protection file changed in {}. Review CORPUS_G / CORPUS_R / CORPUS_C \
+         and the cell table against the device, then update CENSUS_PINS. Current values: {}",
         differs.join(", "),
         actual.join(", ")
     );
-    // RULINGS CZ7 — mutation checks both ways: a changed predicate / table entry / environment branch
-    // changes a pinned region; a harmless edit outside the regions changes none
-    let regions = |rel: &str, text: &str| -> Vec<Result<(usize, String), String>> {
-        CENSUS_PINS
-            .iter()
-            .filter(|p| p.0 == rel)
-            .map(|p| corpus::census_region(text, p.2, p.3))
-            .collect()
-    };
-    let cases: [(&str, &str, &str, bool); 7] = [
-        // guard.sh's `gh pr create/merge` condition (the line the needle census missed)
+    // every pinned device has its pin row; every free row's device has one too
+    for rel in ["hooks/guard.sh", "hooks/role-capability-gate.sh", "hooks/_lib.sh"] {
+        assert!(CENSUS_PINS.iter().any(|p| p.0 == rel && p.1 == "pin"), "{rel} unpinned");
+    }
+    // RULINGS EL6 / EO3 / CZ7 — mutation controls both ways
+    let digest = |rel: &str, text: &str| corpus::census_pinned(text, &frees_of(rel));
+    let cases: [(&str, &str, &str, bool); 11] = [
+        // the gate's dispatch: main() replaced by pass — outside every named region before EL6
+        ("hooks/role-capability-gate.sh", "    main()\nPYEOF", "    pass\nPYEOF", true),
+        // the CAPGATE_SELF_TEST branch
+        (
+            "hooks/role-capability-gate.sh",
+            "if os.environ.get(\"CAPGATE_SELF_TEST\"):",
+            "if os.environ.get(\"CAPGATE_SELF_TESTS\"):",
+            true,
+        ),
+        // the prelude sourcing of both devices (EO3: the fallback and the `exit 0` when missing)
+        (
+            "hooks/guard.sh",
+            "|| . \"${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh\" 2>/dev/null",
+            "|| . \"${CYS_PACK_DIR:-$HOME/.cys/elsewhere}/hooks/_lib.sh\" 2>/dev/null",
+            true,
+        ),
+        (
+            "hooks/guard.sh",
+            "|| { echo \"[cys-hook] _lib.sh 소실 — 훅 강등(guard)\" >&2; exit 0; }",
+            "|| { echo \"[cys-hook] _lib.sh 소실 — 훅 강등(guard)\" >&2; exit 2; }",
+            true,
+        ),
+        (
+            "hooks/role-capability-gate.sh",
+            "|| { echo \"[cys-hook] _lib.sh 소실 — 훅 강등(role-capability-gate)\" >&2; exit 0; }",
+            "|| { echo \"[cys-hook] _lib.sh 소실 — 훅 강등(role-capability-gate)\" >&2; exit 1; }",
+            true,
+        ),
+        // the rules (CZ7's controls stay)
         (
             "hooks/guard.sh",
             "x in args for x in (\"create\", \"merge\")",
             "x in args for x in (\"create\",)",
             true,
         ),
-        // guard.sh's no-interpreter test switch (an environment branch)
-        (
-            "hooks/guard.sh",
-            "GUARD_FORCE_NOPY:-0}\" = \"1\"",
-            "GUARD_FORCE_NOPY:-0}\" = \"2\"",
-            true,
-        ),
-        // the gate's GIT_WRITE_SUBS table loses `push`
         (
             "hooks/role-capability-gate.sh",
             "{\"commit\", \"push\", \"add\",",
             "{\"commit\", \"add\",",
             true,
         ),
-        // _lib.sh's interpreter-shim folder default
         (
             "hooks/_lib.sh",
             "_cys_sh_d=\"${CYS_DEVTOOLS_SHIM_DIR:-/usr/bin}\"",
             "_cys_sh_d=\"${CYS_DEVTOOLS_SHIM_DIR:-/usr/local/bin}\"",
             true,
         ),
-        // harmless: headers and the gate's self-tests lie outside every region
+        // default = pinned: a header comment is pinned too
         (
             "hooks/guard.sh",
             "# guard.sh — Autopilot 집행 hook",
             "# guard.sh — Autopilot 집행 훅",
-            false,
+            true,
         ),
         (
             "hooks/_lib.sh",
             "# _lib.sh — cysjavis 훅 공용 프리루드",
             "# _lib.sh — cysjavis 훅 공용 머리말",
-            false,
+            true,
         ),
+        // the only free region: the gate's self-test body
         (
             "hooks/role-capability-gate.sh",
             "# ── ① reviewer/planner(종전 핀 · 무변경)",
@@ -384,16 +411,12 @@ fn census_iii_deny_rules_and_branches_pinned() {
         let t = released(rel);
         assert_eq!(t.matches(from).count(), 1, "{rel}: mutation anchor {from:?}");
         let m = t.replacen(from, to, 1);
-        assert_eq!(
-            regions(rel, &t) != regions(rel, &m),
-            changes,
-            "{rel}: {from:?} → {to:?}"
-        );
+        assert_eq!(digest(rel, &t) != digest(rel, &m), changes, "{rel}: {from:?} → {to:?}");
     }
-    // an anchor that is no longer unique is a failure, not a guess
-    let g = released("hooks/guard.sh");
-    let doubled = g.replacen("def _strip_hidden(s):", "def _strip_hidden(s):\ndef _strip_hidden(s):", 1);
-    assert!(corpus::census_region(&doubled, "def _strip_hidden(s):", "PY").is_err());
+    // a doubled free-region anchor is an error, never a guess
+    let g = released("hooks/role-capability-gate.sh");
+    let doubled = g.replacen("def self_test():", "def self_test():\ndef self_test():", 1);
+    assert!(corpus::census_pinned(&doubled, &frees_of("hooks/role-capability-gate.sh")).is_err());
 }
 
 /// RULINGS DF5: an I4 anchor that occurs twice gives no region (never the first copy's).
