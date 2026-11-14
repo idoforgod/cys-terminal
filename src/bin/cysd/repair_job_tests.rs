@@ -147,6 +147,78 @@ fn sweep_reply_carries_notices_once() {
     let _ = std::fs::remove_dir_all(root.parent().unwrap());
 }
 
+/// RULINGS FG2 / FI3 (codex r4 M3) through the real trigger path: the due notices are acknowledged
+/// only once the job started and the reply carrying them is handed over — a failed spawn, then a
+/// failed acknowledgement (the M10 folder read-only), leave EVERY notice due; the next sweep carries
+/// all of them, the one after none. Without FG2 the notices were marked told BEFORE the spawn and a
+/// failed spawn lost them (the next reply carried none).
+#[cfg(unix)]
+#[test]
+fn notices_survive_a_failed_spawn_and_a_failed_acknowledgement() {
+    use std::os::unix::fs::PermissionsExt;
+    let (daemon, root, pack) = rig("t6-fg2");
+    mark_ready(&daemon);
+    let lane = LaneKey::of_socket(&daemon.socket_path);
+    let f = cys::repair::probation::findings_path_in(&root, &lane);
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    std::fs::write(
+        &f,
+        serde_json::json!({"schema": 1, "lane": lane.0, "findings": [
+            {"rel": "hooks/x.sh", "sha256": "ab", "kind": "kept", "at": 1.0, "notice": true, "notified": false, "slot": null, "note": "n"},
+            {"rel": "hooks/z.sh", "sha256": "ef", "kind": "kept", "at": 1.0, "notice": true, "notified": false, "slot": null, "note": "n"}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let fail = |_: &Arc<Daemon>, _: bool| -> Result<(), String> { Err("no thread".into()) };
+    let ok = |_: &Arc<Daemon>, _: bool| -> Result<(), String> { Ok(()) };
+    let v = trigger_with(&daemon, "sweep", &root, &pack, &fail);
+    assert_eq!(v["tick"], "busy", "{v}");
+    // the acknowledgement fails: the M10 folder cannot take the write
+    let m10 = f.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&m10, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let v = trigger_with(&daemon, "sweep", &root, &pack, &ok);
+    std::fs::set_permissions(&m10, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(v["notices"].as_array().unwrap().len(), 2, "both carried after the failed spawn: {v}");
+    assert!(v["notices_ack_error"].is_string(), "{v}");
+    daemon.repair_tick_running.store(false, Ordering::SeqCst);
+    let v = trigger_with(&daemon, "sweep", &root, &pack, &ok);
+    assert_eq!(v["notices"].as_array().unwrap().len(), 2, "ALL still due after the failed acknowledgement: {v}");
+    daemon.repair_tick_running.store(false, Ordering::SeqCst);
+    let v = trigger_with(&daemon, "sweep", &root, &pack, &ok);
+    assert_eq!(v["notices"].as_array().unwrap().len(), 0, "acknowledged once handed over: {v}");
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
+/// RULINGS FG1 / FG2 through the trigger: an unreadable notice source (the findings view corrupt) is
+/// said in the reply — never an empty list that loses the notices — and nothing is written over it;
+/// once readable again, the notices are carried. Without FG2 the error became an empty vector.
+#[test]
+fn an_unreadable_notice_source_is_said_not_emptied() {
+    let (daemon, root, pack) = rig("t6-fg2bad");
+    mark_ready(&daemon);
+    let lane = LaneKey::of_socket(&daemon.socket_path);
+    let f = cys::repair::probation::findings_path_in(&root, &lane);
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    std::fs::write(&f, b"{ corrupt").unwrap();
+    let ok = |_: &Arc<Daemon>, _: bool| -> Result<(), String> { Ok(()) };
+    let v = trigger_with(&daemon, "sweep", &root, &pack, &ok);
+    assert!(v["notices_error"].is_string(), "the unreadable source is said: {v}");
+    assert_eq!(std::fs::read(&f).unwrap(), b"{ corrupt", "nothing written over it");
+    std::fs::write(
+        &f,
+        serde_json::json!({"schema": 1, "lane": lane.0, "findings": [
+            {"rel": "hooks/x.sh", "sha256": "ab", "kind": "kept", "at": 1.0, "notice": true, "notified": false, "slot": null, "note": "n"}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    daemon.repair_tick_running.store(false, Ordering::SeqCst);
+    let v = trigger_with(&daemon, "sweep", &root, &pack, &ok);
+    assert_eq!(v["notices"].as_array().unwrap().len(), 1, "{v}");
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
 /// O-C7-3 / F8 source pin: the readiness flag and its time are set FIRST in `post_listen_boot` (the
 /// one function both accept loops call), before anything it spawns.
 #[test]

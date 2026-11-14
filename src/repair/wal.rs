@@ -87,10 +87,17 @@ pub fn list_checked_in(root: &Path, id: &RepairId) -> Result<Vec<OpRecord>, Stri
     let rd = match std::fs::read_dir(&dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return match std::fs::read_dir(super::ledger::repair_dir_in(root, id)) {
-                Ok(_) => Ok(Vec::new()),
-                Err(e2) => Err(format!("{}: 없음, 그러나 수리 폴더도 읽을 수 없음 — {e2}", dir.display())),
-            };
+            // positive evidence of absence: every missing folder up to the nearest existing ancestor,
+            // and that ancestor readable
+            let mut up = dir.parent();
+            while let Some(a) = up {
+                match std::fs::read_dir(a) {
+                    Ok(_) => return Ok(Vec::new()),
+                    Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => up = a.parent(),
+                    Err(e2) => return Err(format!("{}: 없음, 그러나 그 상위 폴더({})를 읽을 수 없음 — {e2}", dir.display(), a.display())),
+                }
+            }
+            return Err(format!("{}: 없음, 그러나 읽을 수 있는 상위 폴더가 없음", dir.display()));
         }
         Err(e) => return Err(format!("{}: 목록을 읽을 수 없음 — {e}", dir.display())),
     };

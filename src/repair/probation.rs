@@ -999,15 +999,82 @@ pub fn m10_bucket() -> RepairId {
     RepairId::parse("R-1").expect("R-1 is a canonical repair id")
 }
 
-fn load_findings(root: &Path, lane: &LaneKey) -> Vec<Finding> {
-    std::fs::read(findings_path_in(root, lane))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<FindingsFile>(&b).ok())
-        .map(|f| f.findings)
-        .unwrap_or_default()
+/// RULINGS FG1 — a JSON file of the repair module read with three answers: `Ok(Some(value))`;
+/// `Ok(None)` only on positive evidence (the file does not exist AND its folder — or, when the folder
+/// is missing too, the nearest existing ancestor — can be read); `Err` for everything else (a read
+/// error, a parse error).
+fn read_json_checked<T: serde::de::DeserializeOwned>(p: &Path) -> Result<Option<T>, RepairError> {
+    match std::fs::read(p) {
+        Ok(b) => serde_json::from_slice::<T>(&b).map(Some).map_err(|e| RepairError::Io(format!("{}: 읽을 수 없음(손상) — {e}", p.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut up = p.parent();
+            while let Some(a) = up {
+                match std::fs::read_dir(a) {
+                    Ok(_) => return Ok(None),
+                    Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => up = a.parent(),
+                    Err(e2) => return Err(RepairError::Io(format!("{}: 없음, 그러나 상위 폴더({})를 읽을 수 없음 — {e2}", p.display(), a.display()))),
+                }
+            }
+            Err(RepairError::Io(format!("{}: 없음, 그러나 읽을 수 있는 상위 폴더가 없음", p.display())))
+        }
+        Err(e) => Err(RepairError::Io(format!("{}: 읽을 수 없음 — {e}", p.display()))),
+    }
+}
+
+/// FG1: the findings view with three answers (absent on positive evidence = no findings).
+fn load_findings_checked(root: &Path, lane: &LaneKey) -> Result<Vec<Finding>, RepairError> {
+    Ok(read_json_checked::<FindingsFile>(&findings_path_in(root, lane))?.map(|f| f.findings).unwrap_or_default())
+}
+
+/// RULINGS FG2 / FI3 — `<root>/m10/<lane>.notices-acked.json`: the keys of the owner notices the
+/// receiver was handed (the acknowledgement), written in ONE durable write per hand-over.
+pub fn notices_acked_path_in(root: &Path, lane: &LaneKey) -> PathBuf {
+    root.join("m10").join(format!("{}.notices-acked.json", lane.0))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct NoticeAcks {
+    schema: u32,
+    lane: String,
+    keys: std::collections::BTreeSet<String>,
+}
+
+/// FG1 / FG2: the acknowledged notice keys (absent on positive evidence = none acknowledged).
+fn load_notice_acks(root: &Path, lane: &LaneKey) -> Result<std::collections::BTreeSet<String>, RepairError> {
+    Ok(read_json_checked::<NoticeAcks>(&notices_acked_path_in(root, lane))?.map(|a| a.keys).unwrap_or_default())
+}
+
+/// The acknowledgement key of a finding's notice (one per file, bytes and kind).
+pub fn notice_key_of_finding(f: &Finding) -> String {
+    format!("f:{}:{}:{}", f.rel, f.sha256, f.kind)
+}
+
+/// The acknowledgement key of a completed put-back's notice (one per operation).
+pub fn notice_key_of_op(op: &super::wal::OpRecord) -> String {
+    format!("op:{}", op.op)
+}
+
+/// RULINGS FG2 — one notice the owner is owed and the key that acknowledges it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DueNotice {
+    pub key: String,
+    pub finding: Finding,
 }
 
 fn save_findings(root: &Path, lane: &LaneKey, findings: &[Finding]) -> Result<(), RepairError> {
+    // FG2: an acknowledged notice is folded into the view as told (when the acknowledgements can be
+    // read; otherwise the view keeps it untold — it is never dropped)
+    let acked = load_notice_acks(root, lane).unwrap_or_default();
+    let findings: Vec<Finding> = findings
+        .iter()
+        .cloned()
+        .map(|mut f| {
+            if f.notice && !f.notified && acked.contains(&notice_key_of_finding(&f)) {
+                f.notified = true;
+            }
+            f
+        })
+        .collect();
     let f = FindingsFile {
         schema: super::REPAIR_SCHEMA,
         lane: lane.0.clone(),
@@ -1025,25 +1092,26 @@ fn save_findings(root: &Path, lane: &LaneKey, findings: &[Finding]) -> Result<()
     super::durable::write_json_durable(&findings_path_in(root, lane), &f)
 }
 
-/// The findings not yet told to the owner; marks them told (the preflight's sweep reply carries
-/// each exactly once — "같은 파일의 같은 바이트는 다시 알리지 않음").
-pub fn take_notices_in(root: &Path, lane: &LaneKey) -> Result<Vec<Finding>, RepairError> {
-    let mut all = load_findings(root, lane);
+/// RULINGS FG2 / FI3 — step ONE: the notices the owner is owed, READ ONLY (nothing is marked). The
+/// findings not yet told, and every completed put-back whose notice is due (EJ3: the duty lives on
+/// its operation record), minus the acknowledged keys. Any source that cannot be read is an `Err` —
+/// never an empty list (FG1).
+pub fn due_notices_in(root: &Path, lane: &LaneKey) -> Result<Vec<DueNotice>, RepairError> {
+    let acked = load_notice_acks(root, lane)?;
     let mut out = Vec::new();
-    for f in all.iter_mut() {
-        if f.notice && !f.notified {
-            f.notified = true;
-            out.push(f.clone());
+    for f in load_findings_checked(root, lane)? {
+        let key = notice_key_of_finding(&f);
+        if f.notice && !f.notified && !acked.contains(&key) {
+            out.push(DueNotice { key, finding: f });
         }
     }
-    if !out.is_empty() {
-        save_findings(root, lane, &all)?;
-    }
-    // EJ3: every completed put-back whose notice is DUE is delivered here — its operation record is
-    // marked `delivered` (the receiver's acknowledgement), independent of any view
     let sub = m10_root_in(root, lane);
-    let (ops, _) = super::wal::list_in(&sub, &m10_bucket());
-    for mut op in ops.into_iter().filter(|o| o.lane_key == *lane && o.notice.as_deref() == Some("due")) {
+    let ops = super::wal::list_checked_in(&sub, &m10_bucket()).map_err(RepairError::Io)?;
+    for op in ops.into_iter().filter(|o| o.lane_key == *lane && o.notice.as_deref() == Some("due")) {
+        let key = notice_key_of_op(&op);
+        if acked.contains(&key) {
+            continue;
+        }
         let sha = match apply::state_of_canon(&op.expected) {
             Some(TargetState::File { sha256, .. }) => sha256,
             _ => String::new(),
@@ -1060,11 +1128,52 @@ pub fn take_notices_in(root: &Path, lane: &LaneKey) -> Result<Vec<Finding>, Repa
             note: "검사 결과: 실패".into(),
         };
         finalize_finding(&mut f, Path::new(""));
-        op.notice = Some("delivered".into());
-        super::wal::write_in(&sub, &op)?;
-        out.push(f);
+        out.push(DueNotice { key, finding: f });
     }
     Ok(out)
+}
+
+/// RULINGS FG2 / FI3 — step TWO: the receiver was handed these notices — their keys are acknowledged
+/// in ONE durable write (all of them or none: a failure leaves every one of them due). Keys whose
+/// notice is no longer owed (a finding the view now shows as told or no longer holds) are dropped in
+/// the same write when the sources can be read.
+pub fn ack_notices_in(root: &Path, lane: &LaneKey, keys: &[String]) -> Result<(), RepairError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let mut acked = load_notice_acks(root, lane)?;
+    let owed: Option<std::collections::BTreeSet<String>> = (|| {
+        let mut s = std::collections::BTreeSet::new();
+        for f in load_findings_checked(root, lane).ok()? {
+            if f.notice && !f.notified {
+                s.insert(notice_key_of_finding(&f));
+            }
+        }
+        for op in super::wal::list_checked_in(&m10_root_in(root, lane), &m10_bucket()).ok()? {
+            if op.notice.as_deref() == Some("due") {
+                s.insert(notice_key_of_op(&op));
+            }
+        }
+        Some(s)
+    })();
+    if let Some(owed) = owed {
+        acked.retain(|k| owed.contains(k));
+    }
+    acked.extend(keys.iter().cloned());
+    super::durable::write_json_durable(
+        &notices_acked_path_in(root, lane),
+        &NoticeAcks { schema: super::REPAIR_SCHEMA, lane: lane.0.clone(), keys: acked },
+    )
+}
+
+/// The notices owed and, in the same call, acknowledged ([`due_notices_in`] then [`ack_notices_in`]) —
+/// for a receiver that holds them the moment this returns `Ok` (the daemon's trigger uses the two
+/// steps itself, acknowledging only once the reply is handed over).
+pub fn take_notices_in(root: &Path, lane: &LaneKey) -> Result<Vec<Finding>, RepairError> {
+    let due = due_notices_in(root, lane)?;
+    let keys: Vec<String> = due.iter().map(|d| d.key.clone()).collect();
+    ack_notices_in(root, lane, &keys)?;
+    Ok(due.into_iter().map(|d| d.finding).collect())
 }
 
 fn strip_cr(b: &[u8]) -> Vec<u8> {
@@ -1099,7 +1208,10 @@ fn m10_sweep_full(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
     let root = env.op.root;
     let lane = env.op.lane;
     let pack = env.op.pack;
-    let mut existing = load_findings(root, lane);
+    // FG1: an unreadable view or acknowledgement file stops the scan (a reported fault) — it is never
+    // read as empty and overwritten
+    let mut existing = load_findings_checked(root, lane)?;
+    let acked = load_notice_acks(root, lane)?;
     let mut new_findings = Vec::new();
     // EJ3: the findings file is a VIEW; a put-back's notice duty lives on its operation record
     let mut ledger_unreadable: Option<(String, Vec<String>)> = None;
@@ -1112,7 +1224,7 @@ fn m10_sweep_full(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
     }) {
         // EJ3: the view is rebuilt only for a put-back whose notice is still DUE and that the view
         // does not show; a delivered one never comes back
-        if op.notice.as_deref() != Some("due") {
+        if op.notice.as_deref() != Some("due") || acked.contains(&notice_key_of_op(&op)) {
             continue;
         }
         if existing.iter().chain(new_findings.iter()).any(|f: &Finding| f.slot.is_some() && f.slot == op.slot) {

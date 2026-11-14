@@ -1025,6 +1025,73 @@ fn a_finding_is_notified_once_for_ever() {
     }
 }
 
+/// RULINGS FG2 / FI3 (codex r4 M3): a finding's notice and a put-back's notice are acknowledged in ONE
+/// write — when the operation log cannot be written (its folder read-only) both are still delivered
+/// together; when the acknowledgement itself fails (the M10 folder read-only) BOTH stay due. Without
+/// FG2 the findings were marked told first and then each operation in a loop: the operation's write
+/// failed, the call returned an error, and the finding was lost (the next call carried only the
+/// operation).
+#[cfg(unix)]
+#[test]
+fn notices_are_acknowledged_all_together_or_not_at_all() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = rig("fg2acks");
+    let sub = m10_root_in(&r.root, &r.lane);
+    let mut op = crate::repair::wal::OpRecord {
+        schema: 1,
+        op: "m10-fg2".into(),
+        repair: m10_bucket(),
+        lane_key: r.lane.clone(),
+        kind: "m10-revert".into(),
+        form: "exchange".into(),
+        rel: "hooks/z.sh".into(),
+        pre_existed: true,
+        expected: format!("file:{:064x}:0755", 7),
+        incoming: format!("file:{}:0755", "a".repeat(64)),
+        pack_generation: None,
+        slot: Some(sub.join("displaced/R-1").join("slot-fg2")),
+        slot_identity: None,
+        live_identity: None,
+        incoming_copy: None,
+        incoming_copy_identity: None,
+        step: "sealed".into(),
+        hooks: Vec::new(),
+        finished: false,
+        outcome: None,
+        note: String::new(),
+        created_at: 1.0,
+        updated_at: 1.0,
+        notice: None,
+    };
+    crate::repair::wal::finish(&sub, &mut op, "applied", "", 2.0).unwrap();
+    save_findings(&r.root, &r.lane, &[Finding {
+        rel: "hooks/x.sh".into(),
+        sha256: "ab".into(),
+        kind: "kept".into(),
+        at: 1.0,
+        notice: true,
+        notified: false,
+        slot: None,
+        kept_copy: None,
+        note: "n".into(),
+    }])
+    .unwrap();
+    let m10 = findings_path_in(&r.root, &r.lane).parent().unwrap().to_path_buf();
+    // the acknowledgement fails: both stay due
+    std::fs::set_permissions(&m10, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let res = take_notices_in(&r.root, &r.lane);
+    std::fs::set_permissions(&m10, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(res.is_err(), "the acknowledgement failed");
+    assert_eq!(due_notices_in(&r.root, &r.lane).unwrap().len(), 2, "both still due");
+    // the operation log cannot be written: both delivered together (the operation is not rewritten)
+    let ops = crate::repair::wal::ops_dir_in(&sub, &m10_bucket());
+    std::fs::set_permissions(&ops, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let got = take_notices_in(&r.root, &r.lane);
+    std::fs::set_permissions(&ops, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(got.unwrap().len(), 2, "the finding and the put-back delivered together");
+    assert!(due_notices_in(&r.root, &r.lane).unwrap().is_empty(), "never twice");
+}
+
 // ───────────────────────────── RULINGS DR2 — one resolution, three answers ─────────────────────────────
 
 /// DR2: starting from a genuine applied approved repair, each member of the agreement broken ON ITS

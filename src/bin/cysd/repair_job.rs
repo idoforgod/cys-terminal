@@ -99,18 +99,40 @@ pub(crate) fn trigger_with(
     {
         return json!({"tick": "busy"});
     }
-    let notices: Vec<Value> = if force_sweep {
-        cys::repair::probation::take_notices_in(root, &lane)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|f| json!({"rel": f.rel, "kind": f.kind, "sha256": f.sha256, "kept_copy": f.kept_copy, "note": f.note, "slot": f.slot}))
-            .collect()
+    // RULINGS FG2 / FI3: reading the due notices and acknowledging them are TWO steps — read here
+    // (nothing marked), acknowledged only once the job started and the reply carrying them is handed
+    // over; an unreadable source is said in the reply, never an empty list
+    let (notices, keys, notices_error): (Vec<Value>, Vec<String>, Option<String>) = if force_sweep {
+        match cys::repair::probation::due_notices_in(root, &lane) {
+            Ok(due) => (
+                due.iter()
+                    .map(|d| {
+                        let f = &d.finding;
+                        json!({"rel": f.rel, "kind": f.kind, "sha256": f.sha256, "kept_copy": f.kept_copy, "note": f.note, "slot": f.slot})
+                    })
+                    .collect(),
+                due.iter().map(|d| d.key.clone()).collect(),
+                None,
+            ),
+            Err(e) => (Vec::new(), Vec::new(), Some(format!("알림을 읽을 수 없습니다 — 다음 확인 때 다시 전합니다: {e:?}"))),
+        }
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new(), None)
     };
     match spawn(daemon, force_sweep) {
-        Ok(()) => json!({"tick": "started", "sweep": force_sweep, "notices": notices}),
+        Ok(()) => {
+            let mut reply = json!({"tick": "started", "sweep": force_sweep, "notices": notices});
+            if let Some(e) = notices_error {
+                reply["notices_error"] = json!(e);
+            }
+            if let Err(e) = cys::repair::probation::ack_notices_in(root, &lane, &keys) {
+                // all of them stay due: told again at the next sweep (twice, never lost)
+                reply["notices_ack_error"] = json!(format!("{e:?}"));
+            }
+            reply
+        }
         Err(e) => {
+            // nothing acknowledged: every notice stays due
             daemon.repair_tick_running.store(false, Ordering::SeqCst);
             json!({"tick": "busy", "error": e})
         }
