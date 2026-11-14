@@ -1464,25 +1464,78 @@ pub(crate) struct DaemonEffects {
     pub daemon: Arc<Daemon>,
 }
 
+/// RULINGS DF4: runs `f`, a panic inside it caught and logged (the caller's loop — the governance
+/// watchdog, a worker thread of this channel — goes on). `false` = it panicked.
+pub(crate) fn guarded(what: &str, f: impl FnOnce()) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(()) => true,
+        Err(_) => {
+            eprintln!("cysd: 「스스로 해결」 {what} 에서 패닉 — 잡아서 기록하고 계속합니다");
+            false
+        }
+    }
+}
+
+/// RULINGS DF4: a named thread for this channel; a thread that cannot be created is an error that is
+/// handled (logged, `false` — the caller takes its fallback), never a panic.
+pub(crate) fn spawn_thread(name: &str, f: impl FnOnce() + Send + 'static) -> bool {
+    match std::thread::Builder::new()
+        .name(format!("repair-{name}"))
+        .spawn(move || {
+            guarded("작업 스레드", f);
+        }) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("cysd: 「스스로 해결」 스레드({name})를 만들지 못했습니다 — {e}");
+            false
+        }
+    }
+}
+
+/// One enqueue attempt without waiting (the fallback when no delivery thread could be made).
+fn deliver_now(daemon: &Arc<Daemon>, seat: u64, text: String) {
+    use crate::alert_route::{enqueue_into_seat, FreezeGuard};
+    let _ = enqueue_into_seat(
+        daemon,
+        seat,
+        text,
+        Some("repair".to_string()),
+        "repair_result",
+        100,
+        None,
+        FreezeGuard::Daemon,
+        None,
+    );
+}
+
 impl Effects for DaemonEffects {
     fn deliver(&self, seat: u64, text: String) {
         let d = self.daemon.clone();
-        std::thread::spawn(move || deliver_once(&d, seat, text));
+        let (d2, t2) = (d.clone(), text.clone());
+        if !spawn_thread("deliver", move || deliver_once(&d, seat, text)) {
+            deliver_now(&d2, seat, t2);
+        }
     }
 
     fn tell_master(&self, text: String) {
-        let d = self.daemon.clone();
-        std::thread::spawn(move || {
-            let master = d
-                .roles
+        let master = |d: &Arc<Daemon>| {
+            d.roles
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get("master")
-                .copied();
-            if let Some(sid) = master {
+                .copied()
+        };
+        let d = self.daemon.clone();
+        let (d2, t2) = (d.clone(), text.clone());
+        if !spawn_thread("tell-master", move || {
+            if let Some(sid) = master(&d) {
                 deliver_once(&d, sid, text);
             }
-        });
+        }) {
+            if let Some(sid) = master(&d2) {
+                deliver_now(&d2, sid, t2);
+            }
+        }
     }
 
     fn publish(&self, name: &str, payload: Value) {
@@ -1624,12 +1677,44 @@ pub(crate) fn handle_submit(
             .map(str::to_string),
     ) {
         let d = daemon.clone();
-        std::thread::spawn(move || {
+        let rid2 = rid.clone();
+        let started = spawn_thread("step3", move || {
             let eff = DaemonEffects { daemon: d.clone() };
-            crate::repair::with_daemon_ctx(&d, |ctx| {
-                run_step3(ctx, &d.repair_approvals, &eff, &rid, &s3)
+            let ok = guarded("제출 검사", || {
+                crate::repair::with_daemon_ctx(&d, |ctx| {
+                    run_step3(ctx, &d.repair_approvals, &eff, &rid, &s3)
+                })
             });
+            if !ok {
+                // a panic in step 3 returns the candidate (never a request left in step 3 to expire)
+                crate::repair::with_daemon_ctx(&d, |ctx| {
+                    let _ = end_request(
+                        ctx,
+                        &d.repair_approvals,
+                        &eff,
+                        &rid,
+                        &[ReqState::Checking],
+                        ReqState::Voided,
+                        "제출 검사가 비정상으로 끝났습니다(주인에게 올리지 않았습니다)".into(),
+                        RepairState::InProgress,
+                        RecApproval::Keep,
+                    );
+                });
+            }
         });
+        if !started {
+            let _ = end_request(
+                ctx,
+                &daemon.repair_approvals,
+                &eff,
+                &rid2,
+                &[ReqState::Checking],
+                ReqState::Voided,
+                "제출 검사를 시작하지 못했습니다(주인에게 올리지 않았습니다)".into(),
+                RepairState::InProgress,
+                RecApproval::Keep,
+            );
+        }
     }
     Ok(out)
 }
@@ -1645,24 +1730,53 @@ pub(crate) fn handle_start(
     });
     let d = daemon.clone();
     let waiter = move |rid: String, nonce: String, child: std::process::Child| {
-        let d = d.clone();
-        std::thread::spawn(move || {
+        let pid = child.id();
+        let (d1, rid1, nonce1) = (d.clone(), rid.clone(), nonce.clone());
+        let started = spawn_thread("helper-wait", move || {
             let verified = wait_helper(child);
-            let eff = DaemonEffects { daemon: d.clone() };
-            crate::repair::with_daemon_ctx(&d, |ctx| {
-                let _ = finish_verification(ctx, &d.repair_approvals, &eff, &rid, &nonce, verified);
+            let eff = DaemonEffects { daemon: d1.clone() };
+            crate::repair::with_daemon_ctx(&d1, |ctx| {
+                let _ = finish_verification(ctx, &d1.repair_approvals, &eff, &rid1, &nonce1, verified);
             });
         });
+        if !started {
+            // no waiter: the helper is killed + reaped here and the click is not an approval
+            kill_and_reap(pid);
+            let eff = DaemonEffects { daemon: d.clone() };
+            crate::repair::with_daemon_ctx(&d, |ctx| {
+                let _ = finish_verification(ctx, &d.repair_approvals, &eff, &rid, &nonce, false);
+            });
+        }
     };
     approval_start(ctx, p, &daemon.repair_approvals, &eff, &waiter)
 }
 
-/// Production: the watchdog's call (governance).
+/// Kills and reaps a helper whose `Child` handle is gone (its waiter thread could not be made).
+fn kill_and_reap(pid: u32) {
+    #[cfg(unix)]
+    {
+        let pid = pid as libc::pid_t;
+        // SAFETY: kill(2) / waitpid(2) on our own child, not reaped yet (its pid cannot be reused).
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+/// Production: the watchdog's call (governance) — panic-isolated (RULINGS DF4: a panic in the sweep
+/// is logged and the watchdog cycle goes on).
 pub(crate) fn watchdog_sweep(daemon: &Arc<Daemon>) {
     let eff = DaemonEffects {
         daemon: daemon.clone(),
     };
-    crate::repair::with_daemon_ctx(daemon, |ctx| sweep(ctx, &daemon.repair_approvals, &eff));
+    guarded("승인 만료 정리", || {
+        crate::repair::with_daemon_ctx(daemon, |ctx| sweep(ctx, &daemon.repair_approvals, &eff))
+    });
 }
 
 /// Routes the T5b verbs (`None` = not one of them). The role table comes first — T3's
