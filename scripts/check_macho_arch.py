@@ -557,12 +557,15 @@ class RecordCensus:
             self.buf, self.base = self.buf[cut:], self.base + cut
 
     def _header(self, h):
-        if h == ZERO_BLOCK:
+        if h == ZERO_BLOCK:                     # ET1: the first zero block begins the END (two blocks, nothing after)
             self.zeros += 1
             self.done = self.zeros == 2
             self.next = self.base + 512
             return
-        self.zeros = 0
+        if self.zeros:                          # ET1: never skipped, reading never resumes behind a zero block
+            self.label = "(after record %d)" % self.records
+            return self._stop("a zero block is followed by further records — the archive ends at its first zero block "
+                              "(the real archives end with exactly two zero blocks and nothing after them)")
         self.records += 1
         name, prefix = h[0:100].split(b"\0", 1)[0], h[345:500].split(b"\0", 1)[0]
         label = self.label = (prefix + b"/" + name if prefix else name).decode("utf-8", "replace")
@@ -721,7 +724,8 @@ def scan_tar(path, target_arch, out):
         except zlib.error as e:
             library_error = library_error or e
             dec.problem = dec.problem or "the gzip stream is corrupted (%s)" % e
-        census.close()
+        if dec.d is not None:           # ET2: a file that is not gzip is "not gzip" — nothing unmeasured is "truncated"
+            census.close()
         dec.close()
         if dec.problem:                  # the compression layer comes first: it is the cause of what follows
             census.bad.append((-1, "(compression)", dec.problem))
