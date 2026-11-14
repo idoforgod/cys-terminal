@@ -1287,22 +1287,32 @@ fn load_hand_outs(root: &Path, lane: &LaneKey) -> Result<std::collections::BTree
     Ok(read_json_checked::<NoticeHandOuts>(&notices_handed_path_in(root, lane))?.map(|h| h.counts).unwrap_or_default())
 }
 
-/// RULINGS GK3 — these notices were handed out in a reply: each key's count goes up by one, in ONE
-/// durable write (keys acknowledged meanwhile are dropped from the counts). Nothing is acknowledged.
-pub fn hand_out_notices_in(root: &Path, lane: &LaneKey, keys: &[String]) -> Result<(), RepairError> {
-    if keys.is_empty() {
-        return Ok(());
+/// RULINGS GV2 — the ONE short in-process critical section of the notice book-keeping: choosing
+/// the due notices with reserving their hand-outs, and the acknowledgement. It never spans the job
+/// or a send (it lives here, not in the job's flight guard).
+static NOTICE_BOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RULINGS GK3 / GV2 — chooses the notices due NOW and reserves a hand-out for each, in ONE critical
+/// section and ONE durable write of the counts (keys acknowledged meanwhile are dropped from the
+/// counts); a key at its limit is never chosen. Returns only the notices whose reservation was
+/// written (an error = none handed out — they stay due). Nothing is acknowledged.
+pub fn hand_out_due_notices_in(root: &Path, lane: &LaneKey) -> Result<Vec<DueNotice>, RepairError> {
+    let _book = NOTICE_BOOK.lock().unwrap_or_else(|e| e.into_inner());
+    let due = due_notices_in(root, lane)?;
+    if due.is_empty() {
+        return Ok(due);
     }
     let acked = load_notice_acks(root, lane)?;
     let mut counts = load_hand_outs(root, lane)?;
     counts.retain(|k, _| !acked.contains(k));
-    for k in keys {
-        *counts.entry(k.clone()).or_insert(0) += 1;
+    for d in &due {
+        *counts.entry(d.key.clone()).or_insert(0) += 1;
     }
     super::durable::write_json_durable(
         &notices_handed_path_in(root, lane),
         &NoticeHandOuts { schema: super::REPAIR_SCHEMA, lane: lane.0.clone(), counts },
-    )
+    )?;
+    Ok(due)
 }
 
 /// RULINGS GK3 — the notices closed "not confirmed": handed out [`NOTICE_HAND_OUTS`] times without
@@ -1420,6 +1430,8 @@ pub fn ack_notices_in(root: &Path, lane: &LaneKey, keys: &[String]) -> Result<()
     if keys.is_empty() {
         return Ok(());
     }
+    // GV2: serialised with the choice-and-reservation of hand-outs
+    let _book = NOTICE_BOOK.lock().unwrap_or_else(|e| e.into_inner());
     let mut acked = load_notice_acks(root, lane)?;
     let owed: Option<std::collections::BTreeSet<String>> = (|| {
         let mut s = std::collections::BTreeSet::new();

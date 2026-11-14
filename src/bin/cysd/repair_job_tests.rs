@@ -292,6 +292,49 @@ fn the_consumed_seam_answers_inside_the_repair_lock_and_the_table_lock() {
     let _ = std::fs::remove_dir_all(root.parent().unwrap());
 }
 
+/// RULINGS GV2 (codex r6 M2) — a controlled interleaving, not timed: notice K has been handed out
+/// twice; trigger A starts its job, and BEFORE A reserves its hand-out the job ends (the flight flag
+/// clears) and trigger B runs to its end in between (B hands K out — the third time). A then hands
+/// out NOTHING: no fourth hand-out, the count is exactly three (none lost). Without GV2 A chose K
+/// before its job started and counted it after — K went out a fourth time.
+#[test]
+fn a_trigger_overtaken_by_another_never_hands_out_a_fourth_time() {
+    let (daemon, root, pack) = rig("t6-gv2");
+    mark_ready(&daemon);
+    let lane = LaneKey::of_socket(&daemon.socket_path);
+    let f = cys::repair::probation::findings_path_in(&root, &lane);
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    std::fs::write(
+        &f,
+        serde_json::json!({"schema": 1, "lane": lane.0, "findings": [
+            {"rel": "hooks/x.sh", "sha256": "ab", "kind": "kept", "at": 1.0, "notice": true, "notified": false, "slot": null, "note": "n"}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let key = "f:hooks/x.sh:ab:kept";
+    std::fs::write(
+        cys::repair::probation::notices_handed_path_in(&root, &lane),
+        serde_json::json!({"schema": 1, "lane": lane.0, "counts": {key: 2}}).to_string(),
+    )
+    .unwrap();
+    let ok = |_: &Arc<Daemon>, _: bool| -> Result<(), String> { Ok(()) };
+    let b_reply = std::cell::RefCell::new(Value::Null);
+    let a_spawn = |d: &Arc<Daemon>, _: bool| -> Result<(), String> {
+        // A's job ends at once (its flight flag clears) and B runs in between
+        d.repair_tick_running.store(false, Ordering::SeqCst);
+        *b_reply.borrow_mut() = trigger_with(d, "sweep", &root, &pack, &ok);
+        Ok(())
+    };
+    let a = trigger_with(&daemon, "sweep", &root, &pack, &a_spawn);
+    let b = b_reply.borrow().clone();
+    assert_eq!(b["notices"].as_array().unwrap().len(), 1, "B hands K out the third time: {b}");
+    assert_eq!(a["notices"].as_array().unwrap().len(), 0, "no fourth hand-out: {a}");
+    let counts: Value = serde_json::from_slice(&std::fs::read(cys::repair::probation::notices_handed_path_in(&root, &lane)).unwrap()).unwrap();
+    assert_eq!(counts["counts"][key], 3, "no lost and no extra count: {counts}");
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
 /// RULINGS GK5 through the seam: a FIFO (no writer) and a file over the cap, at a repair's
 /// `record.json` and at the lane's intent, read by `approval_consumed_in` called inside the daemon's
 /// real per-repair lock and a held stand-in for T5b's table lock — the answer is Unknown and the call

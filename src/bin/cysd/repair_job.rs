@@ -117,34 +117,29 @@ pub(crate) fn trigger_with(
     {
         return json!({"tick": "busy"});
     }
-    // RULINGS FG2 / GK3: the reply carries the due notices WITH their keys and marks nothing — the
-    // receiver confirms the keys in a second call (`confirm_notices`); each hand-out is counted
-    // durably, and a notice handed out three times without confirmation is closed "not confirmed";
-    // an unreadable source is said in the reply, never an empty list
-    let (notices, keys, notices_error): (Vec<Value>, Vec<String>, Option<String>) = if force_sweep {
-        match cys::repair::probation::due_notices_in(root, &lane) {
-            Ok(due) => (
-                due.iter()
-                    .map(|d| {
-                        let f = &d.finding;
-                        json!({"key": d.key, "rel": f.rel, "kind": f.kind, "sha256": f.sha256, "kept_copy": f.kept_copy, "note": f.note, "slot": f.slot})
-                    })
-                    .collect(),
-                due.iter().map(|d| d.key.clone()).collect(),
-                None,
-            ),
-            Err(e) => (Vec::new(), Vec::new(), Some(format!("알림을 읽을 수 없습니다 — 다음 확인 때 다시 전합니다: {e:?}"))),
-        }
-    } else {
-        (Vec::new(), Vec::new(), None)
-    };
     match spawn(daemon, force_sweep) {
         Ok(()) => {
-            // GK3: the hand-out is counted BEFORE the notices go out — a count that cannot be written
-            // hands out nothing (the notices stay due; never an unbounded repeat)
-            let (notices, notices_error) = match cys::repair::probation::hand_out_notices_in(root, &lane, &keys) {
-                Ok(()) => (notices, notices_error),
-                Err(e) => (Vec::new(), Some(format!("알림을 건넨 횟수를 적지 못해 이번에는 건네지 않습니다 — 다음 확인 때 다시: {e:?}"))),
+            // RULINGS FG2 / GK3 / GV2: the reply carries the due notices WITH their keys and marks
+            // nothing — the receiver confirms them in a second call (`confirm_notices`). Choosing them
+            // and reserving each hand-out (the durable count) is ONE short critical section of the
+            // library, independent of the job just started: only keys whose reservation was written go
+            // out; a key at its limit never does; an unreadable source or a failed reservation is
+            // said in the reply, never an empty list that loses them
+            let (notices, notices_error): (Vec<Value>, Option<String>) = if force_sweep {
+                match cys::repair::probation::hand_out_due_notices_in(root, &lane) {
+                    Ok(due) => (
+                        due.iter()
+                            .map(|d| {
+                                let f = &d.finding;
+                                json!({"key": d.key, "rel": f.rel, "kind": f.kind, "sha256": f.sha256, "kept_copy": f.kept_copy, "note": f.note, "slot": f.slot})
+                            })
+                            .collect(),
+                        None,
+                    ),
+                    Err(e) => (Vec::new(), Some(format!("알림을 읽거나 건넨 횟수를 적지 못해 이번에는 건네지 않습니다 — 다음 확인 때 다시: {e:?}"))),
+                }
+            } else {
+                (Vec::new(), None)
             };
             let mut reply = json!({"tick": "started", "sweep": force_sweep, "notices": notices});
             if let Some(e) = notices_error {
