@@ -189,9 +189,11 @@ pub fn input_fingerprint(candidate: &ScreenCandidate, lane: &Path) -> Result<Str
     let rels = all_input_rels()?;
     let mut lines = Vec::with_capacity(rels.len());
     for rel in rels {
+        // RULINGS GA5: the lane's input through the bounded no-follow reader (never the shared type's
+        // unbounded hash loop) — the same state the screen computes from what it read (CZ5)
         let st = match candidate.targets.iter().find(|(r, _)| *r == rel) {
             Some((_, s)) => s.clone(),
-            None => TargetState::read(&lane.join(&rel))?,
+            None => LaidSource::read(&lane.join(&rel))?.state(),
         };
         lines.push((rel, st));
     }
@@ -1104,8 +1106,23 @@ fn run_hook_probe_inner(
             }
         };
         drop(sock);
-        // the stub's call log proves the hook reached the screen's own stub (never a real cys)
-        let calls = replay::stub_calls(&bin);
+        // the stub's call log proves the hook reached the screen's own stub (never a real cys);
+        // RULINGS GA5: a log that could not be read fails the probe — never "no calls"
+        let calls = match replay::stub_calls(&bin) {
+            replay::StubCalls::Absent => Vec::new(),
+            replay::StubCalls::Read(c) => c,
+            replay::StubCalls::Unreadable(why) => {
+                whole.set(false);
+                return Ok(judged
+                    .into_iter()
+                    .map(|j| Judged {
+                        suffix: j.suffix,
+                        answer: Answer::Error,
+                        detail: format!("{}; the stub's call log could not be read: {why}", j.detail),
+                    })
+                    .collect());
+            }
+        };
         let mut judged = judged;
         if let Some(last) = judged.last_mut() {
             let shown: Vec<String> = calls

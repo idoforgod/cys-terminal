@@ -2145,8 +2145,9 @@ pub(crate) fn comparison_consequence(
         Comparison::Noted(l) => (l.clone(), false),
         Comparison::Refused(l) => (l.clone(), true),
     };
-    let state = TargetState::read(live)
-        .map(|s| s.canon())
+    // RULINGS GA5: the bounded no-follow reader, never the shared type's unbounded hash loop
+    let state = cys::repair::replay::LaidSource::read(live)
+        .map(|s| s.state().canon())
         .unwrap_or_default();
     let tell = refused
         && TOLD

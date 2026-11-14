@@ -223,12 +223,30 @@ pub fn write_stub_conf(dir: &Path, role: &str, status_holds: bool) -> Result<(),
         .map_err(|e| RepairError::Io(format!("{}: {e}", dir.display())))
 }
 
-/// The lines the stub logged (one per call) — read through the bounded reader (RULINGS EL3 / EO4:
-/// candidate code could replace the log with a FIFO).
-pub fn stub_calls(dir: &Path) -> Vec<String> {
-    read_bounded(&dir.join("cys-calls.log"))
-        .map(|b| String::from_utf8_lossy(&b).lines().map(str::to_string).collect())
-        .unwrap_or_default()
+/// RULINGS GA5 — what the stub's call log says, in three answers: no log (no call), the calls, or a
+/// log that could not be read (not a regular file, a link, over the cap, a read error — candidate
+/// code can shape it) — "could not read" is never "empty": the probe FAILS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StubCalls {
+    Absent,
+    Read(Vec<String>),
+    Unreadable(String),
+}
+
+/// The lines the stub logged (one per call) — through the bounded no-follow reader (EL3 / EO4).
+pub fn stub_calls(dir: &Path) -> StubCalls {
+    let p = dir.join("cys-calls.log");
+    match read_stamped(&p) {
+        Ok((LaidSource::Absent, _)) => StubCalls::Absent,
+        Ok((LaidSource::Bytes { bytes, .. }, _)) => StubCalls::Read(
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(str::to_string)
+                .collect(),
+        ),
+        Ok((LaidSource::Link(t), _)) => StubCalls::Unreadable(format!("a link to {t}")),
+        Err(e) => StubCalls::Unreadable(format!("{e:?}")),
+    }
 }
 
 /// A unix socket the screen binds in its scratch folder (E-1, E-3, I3's daemon axis) — never the
@@ -1438,7 +1456,7 @@ fn stamp_from(m: &std::fs::Metadata) -> String {
 }
 
 /// Largest file a replayed / compared read takes (a pack file or a settings file is far smaller).
-const MAX_READ: u64 = 64 * 1024 * 1024;
+pub const MAX_READ: u64 = 64 * 1024 * 1024;
 
 /// RULINGS DF5: ONE read of a replayed or compared path — its content, mode and change stamp all from
 /// the SAME no-follow, non-blocking handle (a link is reported as a link from `lstat`; a missing
