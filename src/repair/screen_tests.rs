@@ -1361,7 +1361,7 @@ fn deny_is_read_as_strictly_as_the_harness() {
         (String::new(), false),
     ];
     for (out, want) in rows {
-        assert_eq!(deny_payload(out.as_bytes()), want, "{out:?}");
+        assert_eq!(replay::deny_payload(out.as_bytes()), want, "{out:?}");
     }
 }
 
@@ -1385,7 +1385,7 @@ fn deny_is_a_byte_grammar() {
     rows.push((deny.replace("\"deny\",", "\"deny\",\"permissionDecision\":\"deny\",").into_bytes(), false));
     rows.push((deny.replace("\"x\"}", "\"x\",\"more\":\"y\"}").into_bytes(), false));
     for (out, want) in rows {
-        assert_eq!(deny_payload(&out), want, "{:?}", String::from_utf8_lossy(&out));
+        assert_eq!(replay::deny_payload(&out), want, "{:?}", String::from_utf8_lossy(&out));
     }
 }
 
@@ -1404,9 +1404,101 @@ fn output_behind_the_capture_limit_is_not_a_deny() {
     let o = replay::run_child(&["/bin/sh".into(), "-c".into(), script], &env, &root, b"", Duration::from_secs(20));
     assert_eq!(o.code, Some(0), "{:?}", o.stderr_state);
     assert!(o.stdout_state.dropped > 0 && !o.stdout_whole());
-    assert!(deny_payload(&o.stdout), "the kept prefix alone would read as a deny");
+    assert!(replay::deny_payload(&o.stdout), "the kept prefix alone would read as a deny");
     let (a, d) = answer_of(&o);
     assert_eq!(a, Answer::Error, "{d}");
+    cleanup(&root);
+}
+
+/// RULINGS GA1 — ONE judge for every hook answer: in the product's source (every file under `src/`
+/// but the test files) the deny grammar has exactly one caller, `replay::judge_hook`; the screen and
+/// the rehearsal read no hook's standard output themselves; the deny object's key names occur only in
+/// the grammar.
+#[test]
+fn deny_grammar_has_one_caller() {
+    fn walk(d: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&src, &mut files);
+    let is_test = |p: &Path| {
+        let n = p.file_name().unwrap().to_string_lossy();
+        n.ends_with("_tests.rs") || n == "tests.rs"
+    };
+    let mut calls = Vec::new();
+    let mut keys = Vec::new();
+    for f in files.iter().filter(|f| !is_test(f)) {
+        let text = std::fs::read_to_string(f).unwrap();
+        let rel = f.strip_prefix(&src).unwrap().to_string_lossy().into_owned();
+        let mut in_judge = false;
+        for (i, l) in text.lines().enumerate() {
+            let code = l.split("//").next().unwrap_or("");
+            if code.starts_with("pub fn judge_hook(") {
+                in_judge = true;
+            } else if code.starts_with('}') {
+                in_judge = false;
+            }
+            if code.contains("deny_payload(") && !code.contains("fn deny_payload(") {
+                calls.push((rel.clone(), i + 1, in_judge));
+            }
+            if (rel.starts_with("repair/") || rel.starts_with("bin/cysd/repair"))
+                && code.contains("\"permissionDecision")
+                && rel != "repair/replay.rs"
+            {
+                keys.push(format!("{rel}:{}", i + 1));
+            }
+        }
+    }
+    assert_eq!(calls.len(), 1, "callers of the deny grammar: {calls:?}");
+    assert_eq!((calls[0].0.as_str(), calls[0].2), ("repair/replay.rs", true), "{calls:?}");
+    assert!(keys.is_empty(), "the deny object's keys outside the grammar: {keys:?}");
+    for (name, text) in [
+        ("screen.rs", include_str!("screen.rs")),
+        ("rehearsal.rs", include_str!("rehearsal.rs")),
+    ] {
+        let reads: Vec<String> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.split("//").next().unwrap_or("").contains(".stdout"))
+            .map(|(i, l)| format!("{name}:{}: {}", i + 1, l.trim()))
+            .collect();
+        assert!(reads.is_empty(), "a hook's standard output read outside the judge: {reads:?}");
+    }
+}
+
+/// RULINGS GA1 regression — on the real registrar path (I3 on) a candidate gate that prints a deny
+/// object, then white space beyond the capture limit, then a suffix, exit 0: the kept prefix is a deny
+/// object, the whole output is not — the judge answers "not shown", never DENY, so the reviewer
+/// class the released gate denies is REFUSED. (`gate_executes` judged exit 0 + the kept prefix
+/// without asking whether the output was observed whole.)
+#[test]
+fn gate_printing_a_deny_past_the_cap_is_not_a_deny() {
+    let root = test_root("ga1-cap");
+    let lane = lane_of(&root, &[]);
+    let deny = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"x"}}"#;
+    let gate = format!(
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{deny}'\nhead -c {} /dev/zero | tr '\\000' ' '\nprintf 'suffix'\nexit 0\n",
+        replay::MAX_CAPTURE + 4096
+    );
+    let cand = candidate_of(&root, &[(Device::Gate.rel(), Some(gate))]);
+    let c = cfg(&root, Some(vec!["R-4"]), Some(vec!["E-1"]), true);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let r4: Vec<&ProbeResult> = rep.probes.iter().filter(|p| p.class.starts_with("R-4")).collect();
+    let bound: Vec<&&ProbeResult> = r4.iter().filter(|p| p.released == Answer::Deny).collect();
+    assert!(!bound.is_empty(), "R-4 binds in E-1 on the released copies: {r4:#?}");
+    for p in &bound {
+        assert_eq!(p.clean, Some(Answer::Error), "{p:#?}");
+        assert_eq!(p.decision, ProbeDecision::Refused, "{p:#?}");
+    }
+    assert_eq!(rep.verdict, ScreenVerdict::Refused, "{:?}", rep.refusals);
     cleanup(&root);
 }
 
