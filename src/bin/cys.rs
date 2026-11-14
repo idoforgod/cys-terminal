@@ -28715,11 +28715,19 @@ fn parked_copy_present(dir: &std::path::Path, rel: &str) -> bool {
 /// 기록이 지워졌든(두 쓰는 쪽의 원장 통째 저장) `--take-new` 로 vendor 본 유지를 확정해 지웠든, 그 사본이 무엇인지 알 수
 /// 없으므로 더 엄격한 규칙(되돌리지 않음)이다. 이 파일을 풀어 주는 길: 다시 입히기(두 길 · CN1) 또는 그 사본을 다른 이름으로
 /// 옮기기 — 지우라고 하지 않는다.
-fn rollback_unrecorded_copy_refusal(rel: &str, prev_ver: &str, live_is_embed: bool) -> String {
+/// ★T2i(RULINGS FH6): 문장은 확인한 것을 말한다 — `ledger_kind` = 병합 대기 원장에 적힌 이 파일의 기록 종류(vendor-first 가 아닌 것 ·
+/// 없으면 None). 기록이 있으면 "기록은 없습니다"가 아니라 그 종류가 vendor 우선 보관이 아니라고 말한다.
+fn rollback_unrecorded_copy_refusal(rel: &str, prev_ver: &str, live_is_embed: bool, ledger_kind: Option<&str>) -> String {
     let stays = if live_is_embed { "새 출시본으로" } else { "지금의 바이트로" };
+    let checked = match ledger_kind {
+        None => "병합 대기 기록은 없습니다(`--take-new` 로 vendor 본 유지를 확정했거나 기록이 지워졌습니다)".to_string(),
+        Some(k) => format!(
+            "병합 대기 원장에는 이 파일이 '{k}' 로 적혀 있고, 그 사본을 vendor 우선 보관으로 적은 기록은 아닙니다"
+        ),
+    };
     format!(
-        "⛔ 되돌리지 않음: '{rel}' 은 기동 필수·보호 목록 파일이고, 보관된 사본 {rel}.user 가 있습니다 — 병합 대기 기록은 없습니다(`--take-new` \
-         로 vendor 본 유지를 확정했거나 기록이 지워졌습니다). 그 사본이 무엇인지 알 수 없으므로 되돌리기는 이 파일에 아무것도 쓰지 않습니다 — \
+        "⛔ 되돌리지 않음: '{rel}' 은 기동 필수·보호 목록 파일이고, 보관된 사본 {rel}.user 가 있습니다 — {checked}. 그 사본이 무엇인지 \
+         이 기록으로는 알 수 없으므로 되돌리기는 이 파일에 아무것도 쓰지 않습니다 — \
          되돌린 바이트는 그다음 설치가 내 사본 자리에 보관해 그 사본을 한 세대 뒤로 밀어낼 수 있습니다. 아무것도 쓰지 않았습니다.\n\
          \x20  다른 파일을 팩 {prev_ver} 으로 되돌리면 이 파일만 {stays} 남아, 팩은 {prev_ver} 의 파일과 이 파일이 섞인 상태가 됩니다.\n\
          \x20  이 파일을 풀어 주는 길: 그 사본을 다시 입히려면 {} — 워커가 그 사본으로 새 수리를 열어 예행·검사를 거치고 주인 최종 승인 뒤에 \
@@ -29049,7 +29057,8 @@ fn run_pack_rollback_with(
     // ★T2i(RULINGS EF1): '보관 중'은 디스크의 사실이고 기록은 그것을 설명할 뿐이다 — 등재 파일에 보관된 사본이 있으면 기록이
     //   없어도(지워졌거나 `--take-new` 뒤) 되돌리지 않는다(종류를 모르니 더 엄격한 규칙).
     if sources.is_listed(&rel) && parked_copy_present(&dir, &rel) {
-        eprintln!("{}", rollback_unrecorded_copy_refusal(&rel, prev_ver.trim(), live_is_embedded(&dir, &rel)));
+        let kind = pending.get(&rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str());
+        eprintln!("{}", rollback_unrecorded_copy_refusal(&rel, prev_ver.trim(), live_is_embedded(&dir, &rel), kind));
         return 1;
     }
     // ★0.15.0 M11 아: 스냅샷에 이 파일이 있으면 스냅샷이 원천이다 — 기록 해시(링크면 링크 대상)로 검증한 뒤에만
@@ -43482,18 +43491,31 @@ mod tests {
         );
         let routes = cys::pack::parked_copy_routes(rel);
         assert_eq!(
-            rollback_unrecorded_copy_refusal(rel, "0.14.56", true),
+            rollback_unrecorded_copy_refusal(rel, "0.14.56", true, None),
             format!(
                 "⛔ 되돌리지 않음: 'hooks/guard.sh' 은 기동 필수·보호 목록 파일이고, 보관된 사본 hooks/guard.sh.user 가 있습니다 — 병합 대기 \
-                 기록은 없습니다(`--take-new` 로 vendor 본 유지를 확정했거나 기록이 지워졌습니다). 그 사본이 무엇인지 알 수 없으므로 되돌리기는 \
-                 이 파일에 아무것도 쓰지 않습니다 — 되돌린 바이트는 그다음 설치가 내 사본 자리에 보관해 그 사본을 한 세대 뒤로 밀어낼 수 \
+                 기록은 없습니다(`--take-new` 로 vendor 본 유지를 확정했거나 기록이 지워졌습니다). 그 사본이 무엇인지 이 기록으로는 알 수 \
+                 없으므로 되돌리기는 이 파일에 아무것도 쓰지 않습니다 — 되돌린 바이트는 그다음 설치가 내 사본 자리에 보관해 그 사본을 한 세대 뒤로 밀어낼 수 \
                  있습니다. 아무것도 쓰지 않았습니다.\n   다른 파일을 팩 0.14.56 으로 되돌리면 이 파일만 새 출시본으로 남아, 팩은 0.14.56 의 \
                  파일과 이 파일이 섞인 상태가 됩니다.\n   이 파일을 풀어 주는 길: 그 사본을 다시 입히려면 {routes} — 워커가 그 사본으로 새 \
                  수리를 열어 예행·검사를 거치고 주인 최종 승인 뒤에 다시 입힙니다. 다시 입히지 않으려면 그 사본을 다른 이름으로 옮기십시오\
                  (지우지 마십시오)."
             )
         );
-        assert!(!rollback_unrecorded_copy_refusal(rel, "0.14.56", false).contains("지우십시오"), "지우라고 하지 않는다");
+        assert!(!rollback_unrecorded_copy_refusal(rel, "0.14.56", false, None).contains("지우십시오"), "지우라고 하지 않는다");
+        // ★T2i(RULINGS FH6): healed / conflicted 기록이 있으면 "기록은 없습니다"라고 하지 않는다 — 확인한 것을 말한다.
+        for k in ["healed", "conflicted"] {
+            let s = rollback_unrecorded_copy_refusal(rel, "0.14.56", true, Some(k));
+            assert!(!s.contains("기록은 없습니다"), "{s}");
+            assert!(
+                s.starts_with(&format!(
+                    "⛔ 되돌리지 않음: 'hooks/guard.sh' 은 기동 필수·보호 목록 파일이고, 보관된 사본 hooks/guard.sh.user 가 있습니다 — 병합 \
+                     대기 원장에는 이 파일이 '{k}' 로 적혀 있고, 그 사본을 vendor 우선 보관으로 적은 기록은 아닙니다. 그 사본이 무엇인지 이 \
+                     기록으로는 알 수 없으므로"
+                )),
+                "{s}"
+            );
+        }
         assert_eq!(
             unrecorded_copies_line(
                 &[(rel.to_string(), false), ("bin/x.py".to_string(), false), ("hooks/gone.sh".to_string(), true)],
@@ -43674,7 +43696,8 @@ mod tests {
         texts.push(rollback_guarded_restored(rel, src, true));
         texts.push(rollback_parked_refusal(rel, &present));
         texts.push(parked_list_note(rel, true));
-        texts.push(rollback_unrecorded_copy_refusal(rel, "0.14.56", true));
+        texts.push(rollback_unrecorded_copy_refusal(rel, "0.14.56", true, None));
+        texts.push(rollback_unrecorded_copy_refusal(rel, "0.14.56", true, Some("healed")));
         texts.push(snapshot_mismatch_how(false, true).to_string());
         for t in &texts {
             for refused in ["pack-adopt", "--revert-merge", "--ai", "--force-vendor"] {
