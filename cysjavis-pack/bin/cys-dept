@@ -1984,10 +1984,6 @@ def write_sidecar(kept, reason, origin):
         return digest
 
 
-class SourceChanged(Exception):
-    """조립·강등이 읽은 뒤에 살아 있는 지침이 바뀌었다 — 지침은 바꾸지 않았다(또는 되돌렸다). 다시 읽어 처음부터 한다."""
-
-
 class LockBusy(Exception):
     """승격·강등 잠금을 정해진 시간 안에 잡지 못했다 — 잠금 없이 진행하지 않는다(보류)."""
 
@@ -2165,11 +2161,18 @@ def swap_mode(md):
 
 
 INTENT = ".ceo-intent.json"
+INTENT_SCHEMA = 2
+OPS = ("compose", "demote")
+STEPS = ("run", "swap", "swapped")
 _IID = [0]
 
 
 class HoldSwap(Exception):
-    """교체를 끝낼 수 없어 보류한다 — 살아 있는 지침은 그대로, 살아 있던 모든 판은 보관 폴더에(알림은 던지기 전에 남겼다)."""
+    """동작(조립·강등)을 끝낼 수 없어 보류한다 — 살아 있는 지침은 사용자의 판(또는 그대로), 살아 있던 모든 판은 보관 폴더에(알림은
+    던지기 전에 남겼다). rc = 입구의 종료 코드(6 보류 · 9 계속 바뀜)."""
+    def __init__(self, why, rc=6):
+        Exception.__init__(self, why)
+        self.rc = rc
 
 
 def intent_path(md):
@@ -2208,12 +2211,17 @@ def write_candidate(cand_p, data, like, expect=None):
 
 
 def write_intent(md, rec):
-    """의도 기록을 **살아 있는 이름이 바뀌기 전에** 원자 교체로 남긴다(fsync · POSIX 는 폴더 fsync 도)."""
+    """★RULINGS FL4·FL5 — 동작 기록(동작 하나에 하나 · 그 단계를 담는다)을 원자 교체로 남긴다: 임시 파일 fsync → 교체 → 폴더 fsync.
+    어느 flush 든 실패하면 OSError — 부르는 쪽은 그 기록 아래에서 더 나아가지 않는다(살아 있는 이름을 건드리기 전이면 보류)."""
     write_atomic(intent_path(md), (json.dumps(rec, ensure_ascii=False, indent=1) + "\n").encode("utf-8"))
 
 
+def _plain_name(n):
+    return isinstance(n, str) and n not in ("", ".", "..") and os.sep not in n and "/" not in n
+
+
 def read_intent(md):
-    """None(없음) | dict(읽을 수 있는 기록) | "bad"(있지만 읽을 수 없음)."""
+    """None(없음) | dict(읽을 수 있는 기록 — 스키마 2) | "bad"(있지만 읽을 수 없거나 형식이 틀림)."""
     try:
         raw = read(intent_path(md))
     except OSError:
@@ -2224,12 +2232,54 @@ def read_intent(md):
         rec = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         return "bad"
-    need = ("id", "op", "candidate", "candidate_sha256", "kept", "read_sha256")
-    if not isinstance(rec, dict) or any(not isinstance(rec.get(k), str) for k in need):
+    if (not isinstance(rec, dict) or rec.get("schema") != INTENT_SCHEMA or rec.get("op") not in OPS
+            or rec.get("step") not in STEPS or not isinstance(rec.get("id"), str)):
         return "bad"
-    if os.sep in rec["candidate"] or os.sep in rec["kept"] or "/" in rec["candidate"] or "/" in rec["kept"]:
+    args = rec.get("args")
+    if (not isinstance(args, dict) or not isinstance(args.get("tmpl"), str)
+            or not (args.get("tsha") is None or (isinstance(args["tsha"], str) and HEX64.fullmatch(args["tsha"])))):
         return "bad"
+    if (not isinstance(rec.get("notices"), list)
+            or any(not (isinstance(n, list) and len(n) == 2 and all(isinstance(x, str) for x in n)) for n in rec["notices"])
+            or not isinstance(rec.get("kept_report"), list) or any(not isinstance(k, str) for k in rec["kept_report"])
+            or not isinstance(rec.get("done", {}), dict)):
+        return "bad"
+    if rec["step"] != "run":
+        sw = rec.get("swap")
+        if (not isinstance(sw, dict) or sw.get("purpose") not in ("op", "restore")
+                or sw.get("mode") not in ("exchange", "deposit") or not isinstance(sw.get("reason"), str)
+                or not _plain_name(sw.get("candidate")) or not _plain_name(sw.get("kept"))
+                or any(not (isinstance(sw.get(k), str) and HEX64.fullmatch(sw[k]))
+                       for k in ("read_sha256", "candidate_sha256"))):
+            return "bad"
+    rec["_disk"] = True
     return rec
+
+
+def new_record(op, args=None):
+    """메모리의 새 동작 기록(단계 'run') — 처음 교체를 시작할 때 디스크에 남는다(그 전에는 진행 중인 것이 없다)."""
+    return {"schema": INTENT_SCHEMA, "id": new_iid(), "op": op,
+            "args": dict(args) if args else {"tmpl": "", "tsha": None}, "step": "run", "notices": [],
+            "kept_report": [], "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+def save_record(md, rec):
+    write_intent(md, {k: v for k, v in rec.items() if not k.startswith("_")})
+    rec["_disk"] = True
+
+
+def set_step(md, rec, step, nf):
+    """★FL4 — 다음 단계를 **먼저** 디스크에 확정한다. 확정하지 못하면(FL5) 그 자리에서 멈춘다 — 디스크의 기록이 앞 단계든 새
+    단계든 다음 입구가 거기서 이어 간다(모든 판은 그대로)."""
+    rec["step"] = step
+    try:
+        save_record(md, rec)
+    except OSError as e:
+        err("CEO 지침 교체: 기록의 다음 단계(%s)를 디스크에 확정하지 못해 멈췄다(%s) — 다음 입구가 기록에서 이어 간다" % (step, e))
+        note(nf, T_INTENT_CHECK, "본부 지침 교체 기록의 다음 단계를 디스크에 확정하지(flush) 못해(%s) 멈췄습니다. 지침과 살아 있던 "
+                                 "모든 판은 그대로 있고(지운 것 없음) 다음 승격 확인이 기록에서 이어 갑니다. 같은 일이 되풀이되면 "
+                                 "디스크 상태를 확인하십시오." % e)
+        raise HoldSwap("unflushed step")
 
 
 def remove_intent(md):
@@ -2238,6 +2288,11 @@ def remove_intent(md):
     except FileNotFoundError:
         pass
     fsync_dir(os.path.dirname(os.path.abspath(md)))
+
+
+def discard_candidate(md, p):
+    """살아 있던 적 없는 후보(바꾸기 전에 멈춤 · 놓이지 않음)를 치운다(FA2)."""
+    silent_unlink(p)
 
 
 def remove_orphan_candidates(md):
@@ -2251,7 +2306,7 @@ def remove_orphan_candidates(md):
         return
     for n in names:
         if n.startswith(pre) and n.endswith(".candidate"):
-            silent_unlink(os.path.join(d, n))
+            discard_candidate(md, os.path.join(d, n))
 
 
 def prim_exchange(cand_p, md):
@@ -2276,12 +2331,43 @@ def hold_unflushed(md, nf, what, e):
     raise HoldSwap("unflushed: %s" % what)
 
 
-def swap_unit(md, data, expect_sha, op, reason, expect=None, nf=""):
-    """★RULINGS EY2 — 하나의 복구할 수 있는 교체. ① 후보를 다 쓴다 ② 의도 기록(읽은 바이트의 해시 · 후보 · 미리 정한 보관
-    이름)을 남긴다 ③ 살아 있는 이름을 바꾼다 — 맞바꾸기(맥·리눅스) 또는 맡기고 먼저(살아 있는 파일을 보관 폴더로 옮긴 뒤 다
-    쓴 후보를 덮지 않게 놓는다) ④ 밀려난 파일을 보관 폴더로(곁 파일에 그 순간의 해시) ⑤ 의도 기록을 지운다. 어느 걸음 뒤에서
-    멈춰도 다음 입구의 close_intent 가 이어 간다. 돌려주는 값 = (보관 경로, 보관 시각의 해시) — 그 해시가 expect_sha 와 다르면
-    읽은 뒤에 저장된 판이 밀려난 것이다(호출부가 그것을 새 진실로 다룬다)."""
+def hold_record(md, nf, title, body):
+    """기록을 그대로 두고 보류한다(다음 입구가 다시 본다). 알림은 같은 기록에 한 번(FA3 — 틱마다 보내지 않는다): 표지
+    <기록>.held 에 기록 바이트의 해시를 알림을 남긴 **뒤에** 적는다(먼저 적고 멈추면 알림 없이 표지만 남는다)."""
+    try:
+        raw = read(intent_path(md)) or b""
+    except OSError:
+        raw = b""
+    key = sha(raw)
+    mark = intent_path(md) + ".held"
+    try:
+        seen = (read(mark) or b"").decode("utf-8", "replace").strip()
+    except OSError:
+        seen = ""
+    err("CEO 지침 교체 보류: %s" % title)
+    if seen != key and note(nf, title, body) and nf:
+        try:
+            write_atomic(mark, (key + "\n").encode("utf-8"))
+        except OSError as e:
+            err("보류 표지 기록 실패(%s) — 다음 확인 때 다시 알린다" % e)
+    raise HoldSwap(title)
+
+
+def unreadable_record(md, nf):
+    """기록을 읽을 수 없다 — 보관 폴더로 옮기고 알림 1건(FA2)."""
+    parked, _ = keep_file(intent_path(md), md, "intent-unreadable")
+    note(nf, T_INTENT_CHECK, "끝나지 않은 본부 지침 교체 기록을 읽을 수 없어 아무것도 바꾸지 않았습니다. 그 기록은 %s 에, "
+                             "살아 있던 판들은 %s 에 있습니다 — 오너 지시로 확인하십시오." % (parked, kept_dir(md)))
+    raise HoldSwap("unreadable intent")
+
+
+def swap_unit(md, data, expect_sha, op, reason, expect=None, nf="", rec=None, notices=None, done=None):
+    """★RULINGS EY2·FL4 — 동작 기록 아래의 교체 하나(살아 있는 이름을 바꾸는 물리적 부분): ① 후보를 다 쓴다 ② 기록을 'swap' 단계로
+    확정한다(읽은 바이트의 해시 · 후보 · 미리 정한 보관 이름 · 방식 — 동작의 교체면 그 동작이 끝날 때 쓸 값과 알림도) ③ 살아 있는
+    이름을 바꾼다 — 맞바꾸기(맥·리눅스) 또는 맡기고 먼저(살아 있는 파일을 한 번의 이름 바꾸기로 보관 폴더에 옮긴 뒤 다 쓴 후보를
+    덮지 않게 놓는다) ④ 밀려난 파일을 보관 폴더로(곁 파일에 그 순간의 해시). 검증·되돌리기·동작 마무리·기록 지우기는 이 함수가
+    아니라 기록의 다음 단계다(finish_swap → settle → complete — 기록은 마지막에 지운다). op = 'compose'|'demote'(동작의 교체) ·
+    'restore'(읽은 뒤의 저장을 되돌리는 교체 — 같은 기록 아래). 돌려주는 값 = 미리 정한 보관 경로."""
     mode = swap_mode(md)
     if mode is None:                            # ★EY3: 반쪽을 드러내지 않는 방법이 없다 — 바꾸지 않고 보류(쓴 것 0)
         err("CEO 지침 교체 보류: 이 파일 시스템에서는 본부 지침을 안전하게 바꿀 수 없다(맞바꾸기·덮지 않는 이동 없음) — %s"
@@ -2290,156 +2376,276 @@ def swap_unit(md, data, expect_sha, op, reason, expect=None, nf=""):
                                  "이동)이 없어 CEO 지침을 바꾸지 않았습니다. 지침은 그대로입니다. 팩을 일반 디스크(APFS·NTFS·"
                                  "ext4 등)로 옮겨야 승격·강등이 됩니다." % os.path.dirname(os.path.abspath(md)))
         raise HoldSwap("no safe primitive")
+    if rec is None:
+        rec = new_record(op if op in OPS else "compose")
     iid = new_iid()
     cand_p = candidate_path(md, iid)
     kname = "%s.%s" % (iid, reason)
+    kept_p = os.path.join(kept_dir(md), kname)
     try:
         write_candidate(cand_p, data, md, expect)
     except OSError as e:
         hold_unflushed(md, nf, "새 지침 후보", e)
-    rec = {"schema": 1, "id": iid, "op": op, "reason": reason, "mode": mode, "live": os.path.basename(md),
-           "read_sha256": expect_sha, "candidate": os.path.basename(cand_p), "candidate_sha256": sha(data),
-           "kept": kname, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    rec["swap"] = {"purpose": "restore" if op == "restore" else "op", "mode": mode, "read_sha256": expect_sha,
+                   "candidate": os.path.basename(cand_p), "candidate_sha256": sha(data), "kept": kname, "reason": reason}
+    rec["step"] = "swap"
+    if op == "restore":
+        rec["notices"] = []         # 동작이 되돌린 판으로 다시 계획한다 — 앞 계획의 알림은 이제 맞지 않다
+    else:
+        rec["notices"] = list(rec.get("notices") or []) + [list(n) for n in (notices(kept_p) if notices else [])]
+        rec["done"] = done or {}
     try:
-        write_intent(md, rec)
+        save_record(md, rec)
     except OSError as e:
         # ★FL5: 기록(파일 또는 폴더)의 flush 가 실패했다 — 기록이 디스크에 있다고 믿을 수 없으니 살아 있는 이름을 건드리기 전에
         #   보류한다. 확실하지 않으면 아무것도 치우지 않는다(후보·기록 그대로 — 다음 입구가 이어 간다).
         hold_unflushed(md, nf, "교체 기록(%s)" % INTENT, e)
-    if mode == "exchange":
+    swap_names(md, rec, nf)
+    return kept_p
+
+
+def swap_names(md, rec, nf):
+    """'swap' 단계의 이름 바꾸기 — 실패해도 판단하지 않는다(기록이 있으니 finish_swap 이 지금 상태에서 끝낸다)."""
+    sw = rec["swap"]
+    d = os.path.dirname(os.path.abspath(md))
+    cand_p = os.path.join(d, sw["candidate"])
+    if sw["mode"] == "exchange":
         try:
             prim_exchange(cand_p, md)
         except FileNotFoundError:
-            silent_unlink(cand_p)
-            remove_intent(md)
-            raise SourceChanged("살아 있는 지침이 사라졌다")
+            return                  # 살아 있는 지침이 없다 — 바꾸지 않았다(finish_swap 이 후보를 정리한다)
         except OSError as e:
             if e.errno not in _NO_EXCHANGE:
-                silent_unlink(cand_p)
-                remove_intent(md)
                 raise
-            mode = rec["mode"] = "deposit"          # 이 파일 시스템은 맞바꾸기를 못 한다 — 맡기고 먼저로
+            sw["mode"] = "deposit"  # 이 파일 시스템은 맞바꾸기를 못 한다 — 맡기고 먼저로(기록에 먼저 · 아직 아무것도 안 바꿨다)
             try:
-                write_intent(md, rec)
-            except OSError as e:
-                hold_unflushed(md, nf, "교체 기록(%s)" % INTENT, e)     # ★FL5 — 아직 살아 있는 이름은 그대로다
-            _MODE[os.path.dirname(os.path.abspath(md))] = "deposit"
-    if mode == "exchange":
-        kept, ksha = keep_file(cand_p, md, reason, name=kname)
-    else:
-        try:
-            kept, ksha = keep_file(md, md, reason, name=kname)       # 살아 있는 파일 → 보관 폴더(그 순간 그대로)
-        except FileNotFoundError:
-            if os.path.lexists(os.path.join(kept_dir(md), kname)):
-                raise                                # 옮긴 뒤 곁 파일 단계에서 — 다음 입구가 이어 간다
-            silent_unlink(cand_p)
-            remove_intent(md)
-            raise SourceChanged("살아 있는 지침이 사라졌다")
-        except OSError:
-            if not os.path.lexists(os.path.join(kept_dir(md), kname)):
-                silent_unlink(cand_p)              # 살아 있는 파일을 옮기지 못했다 — 무변경(후보는 살아 있던 적이 없다)
-                remove_intent(md)
-            raise
-        try:
-            place_candidate(cand_p, md)
-        except FileExistsError:
-            # 비어 있던 순간 편집기가 새 파일을 만들었다 — 그것이 살아 있다(이긴다). 우리 후보는 살아 있던 적이 없다.
-            silent_unlink(cand_p)
-            remove_intent(md)
-            raise SourceChanged("교체 순간 새 지침이 저장됐다")
-    remove_intent(md)
-    return kept, ksha
-
-
-def restore_newer(md, src_kept, expected_sha, nf):
-    """★EY2 — 밀려난 파일이 새 진실일 때: 살아 있는 이름에 그 판을 다시 놓는다(호출부가 그다음 그 판으로 조립한다). 되돌리기는
-    지금 살아 있는 것을 **다시 읽는다** — 우리 후보(expected_sha)가 아니면 그것은 또 하나의 편집이라 밀어내지 않고 보류한다(두 판 모두
-    남는다). 바꾸는 순간 또 저장되면 그것이 다음 새 진실이다(보관 · 상한 SWAP_ATTEMPTS 뒤 보류)."""
-    target = read_bytes(src_kept)
-    for _ in range(SWAP_ATTEMPTS):
-        try:
-            live = read_bytes(md)
-        except FileNotFoundError:
-            live = None
-        if live is None or sha(live) != expected_sha:
-            err("CEO 지침 교체 보류: 교체 뒤 살아 있는 지침도 저장됐다 — 두 판을 합치지 않는다(앞의 판: %s)" % src_kept)
-            note(nf, T_TWO_EDITS, "본부 지침을 바꾸는 동안 저장이 두 번 겹쳤습니다. 지금 살아 있는 지침(나중 저장)은 그대로 두었고, "
-                                  "앞의 저장은 %s 에 그대로 보관했습니다 — 자동으로 합치지 않습니다. 앞의 판의 내용이 필요하면 오너 "
-                                  "지시로 워커가 본문에 옮기십시오." % src_kept)
-            raise HoldSwap("two edits")
-        kept2, k2 = swap_unit(md, target, expected_sha, "restore", "replaced", nf=nf)
-        note_kept(nf, kept2)
-        if k2 == expected_sha:
-            print("[cys-dept] 읽은 뒤 저장된 판을 살아 있는 지침으로 되돌렸다(밀려난 후보: %s)" % kept2)
+                save_record(md, rec)
+            except OSError as e2:
+                hold_unflushed(md, nf, "교체 기록(%s)" % INTENT, e2)
+            _MODE[d] = "deposit"
+        else:
+            keep_file(cand_p, md, sw["reason"], name=sw["kept"])    # 밀려난 파일(후보 이름에 있다) → 보관 폴더
             return
-        expected_sha, target, src_kept = sha(target), read_bytes(kept2), kept2
-    note(nf, T_HOLD_CHANGING, "본부 지침이 교체 중에 계속 저장되어 보류했습니다. 살아 있던 모든 판은 %s 에 있습니다." % kept_dir(md))
-    raise HoldSwap("changing")
+    try:
+        keep_file(md, md, sw["reason"], name=sw["kept"])            # 살아 있는 파일 → 보관 폴더(★FL3 한 번의 이름 바꾸기)
+    except FileNotFoundError:
+        if not os.path.lexists(os.path.join(kept_dir(md), sw["kept"])):
+            return                  # 살아 있는 지침이 없다 — 바꾸지 않았다
+        raise
+    try:
+        place_candidate(cand_p, md)
+    except FileExistsError:
+        pass                        # 비어 있던 순간 편집기가 만든 새 파일이 이긴다 — settle 이 우리 후보를 정리한다
 
 
-def close_intent(md, nf):
-    """★RULINGS EY2 — 조립 경로의 모든 입구(compose · demote · recover)가 잠금 안에서 **먼저** 부른다. 끝나지 않은 교체를 마무리한다:
-    교체 전에 멈췄으면 후보를 버리고(살아 있던 적 없음), 뒤에 멈췄으면 밀려난 파일을 보관하고 빈 살아 있는 이름을 채운다. 밀려난
-    파일이 읽은 바이트와 다르면 그 판을 새 진실로 되돌린다(restore_newer). 보류면 HoldSwap(알림 1건 — 기록은 보관 폴더로 옮겨
-    다시 알리지 않는다)."""
+def read_or_none(p):
+    try:
+        return read_bytes(p)
+    except FileNotFoundError:
+        return None
+
+
+def finish_swap(md, rec, nf):
+    """★FL4 — 'swap' 단계의 기록을 물리적으로 끝낸다(멈춘 지점이 어디든 · 몇 번을 다시 해도 같은 끝). 바꾸기 전에 멈췄으면 후보는
+    살아 있던 적이 없다 — 정리하고 단계를 'run'(동작을 다시 계획) · 바꾼 뒤면 밀려난 파일이 곁 파일과 함께 보관 폴더에 있고
+    살아 있는 이름이 비어 있지 않게 한다. 돌려주는 값 = 밀려난 판의 보관 시각 해시 | None('run' 으로 돌아감)."""
+    sw = rec["swap"]
+    d = os.path.dirname(os.path.abspath(md))
+    cand_p, kept_p = os.path.join(d, sw["candidate"]), os.path.join(kept_dir(md), sw["kept"])
+    if not os.path.lexists(kept_p):
+        try:
+            csha = sha(read_bytes(cand_p)) if os.path.lexists(cand_p) else None
+        except OSError:
+            csha = None
+        if sw["mode"] == "exchange" and csha is not None and csha != sw["candidate_sha256"]:
+            keep_file(cand_p, md, sw["reason"], name=sw["kept"])    # 맞바꾼 뒤에 멈췄다 — 후보 이름의 것은 밀려난 파일이다
+        elif os.path.lexists(cand_p):
+            discard_candidate(md, cand_p)   # 바꾸기 전에 멈췄다(살아 있는 파일은 옮겨지지 않았다) — 후보는 살아 있던 적이 없다
+            set_step(md, rec, "run", nf)
+            return None
+        else:
+            live = read_or_none(md)
+            if live is not None and sha(live) == sw["candidate_sha256"]:
+                hold_record(md, nf, T_INTENT_CHECK,
+                            "끝나지 않은 본부 지침 교체에서 밀려난 판(%s)이 어디에도 없습니다(이 제품 밖에서 지워졌습니다) — 그 사이의 "
+                            "저장이 사라지지 않았는지 잴 수 없어 CEO 지침을 더 바꾸지 않고 보류했습니다. 기록(%s)은 그대로 "
+                            "두었습니다 — 오너 지시로 확인하십시오." % (kept_p, intent_path(md)))
+            set_step(md, rec, "run", nf)    # 후보가 이 제품 밖에서 사라졌다 — 바꾼 것이 없다
+            return None
+    ksha = write_sidecar(kept_p, sw["reason"], os.path.basename(md))   # 곁 파일이 없으면 지금 게시한다
+    if not os.path.lexists(md):
+        # 맡기고 먼저의 두 걸음 사이에서 멈췄다(FA4) — 빈 살아 있는 이름을 채운다(후보 → 덮지 않게 · 후보가 없으면 보관된 판의 사본)
+        src = cand_p
+        try:
+            if not (os.path.lexists(cand_p) and sha(read_bytes(cand_p)) == sw["candidate_sha256"]):
+                src = candidate_path(md, new_iid())     # ★EY3: 보관된 판의 사본을 후보로 **다** 쓴 뒤
+                write_candidate(src, read_bytes(kept_p), kept_p)
+            place_candidate(src, md)                    # 덮지 않는 이동으로 놓는다(살아 있는 경로에 직접 쓰지 않는다)
+        except FileExistsError:
+            if src != cand_p:
+                discard_candidate(md, src)              # 그 사이 누가 만들었다 — 그것이 살아 있다(이긴다)
+        except NoSafeMove:
+            if src != cand_p:
+                discard_candidate(md, src)
+            hold_record(md, nf, T_NO_SAFE_SWAP,
+                        "끝나지 않은 본부 지침 교체를 마무리하려 했으나 이 파일 시스템에는 덮지 않는 이동이 없어 빈 지침 이름을 "
+                        "채우지 못했습니다. 교체 전 판은 %s 에 있습니다." % kept_p)
+    return ksha
+
+
+def settle(md, rec, nf, ksha):
+    """★FL4 — 밀려난 판을 검증하고 다음 단계를 **먼저 디스크에** 정한다. 읽은 바이트 그대로였다 → 동작의 교체이고 우리 후보가 살아
+    있으면 'swapped'(마무리 차례) · 아니면(되돌리기였거나 그 뒤의 저장이 살아 있다) 'run'(동작을 지금 판으로 다시). 달랐다(읽은
+    뒤의 저장이 밀려났다 = 새 진실) → 우리 후보가 아직 살아 있으면 'restore' 를 돌려준다(부르는 쪽이 같은 기록 아래 되돌리기
+    교체를 시작) · 살아 있는 지침도 바뀌었으면 두 저장이 겹친 것 — 둘 다 남기고 보류(동작 끝 · 기록 제거 · 알림 1건)."""
+    sw = rec["swap"]
+    d = os.path.dirname(os.path.abspath(md))
+    cand_p, kept_p = os.path.join(d, sw["candidate"]), os.path.join(kept_dir(md), sw["kept"])
+    if os.path.lexists(cand_p):
+        discard_candidate(md, cand_p)       # 놓이지 않은 후보(그 사이 저장이 살아 있는 이름을 만들었다) — 살아 있던 적이 없다
+    live = read_or_none(md)
+    lsha = sha(live) if live is not None else None
+    if kept_p not in rec["kept_report"]:
+        rec["kept_report"].append(kept_p)
+    if ksha == sw["read_sha256"]:
+        if sw["purpose"] == "restore":
+            print("[cys-dept] 읽은 뒤 저장된 판을 살아 있는 지침으로 되돌렸다(밀려난 후보: %s)" % kept_p)
+        set_step(md, rec, "swapped" if sw["purpose"] == "op" and lsha == sw["candidate_sha256"] else "run", nf)
+        return None
+    if lsha == sw["candidate_sha256"]:
+        return "restore"
+    err("CEO 지침 교체 보류: 교체 뒤 살아 있는 지침도 저장됐다 — 두 판을 합치지 않는다(앞의 판: %s)" % kept_p)
+    note(nf, T_TWO_EDITS, "본부 지침을 바꾸는 동안 저장이 두 번 겹쳤습니다. 지금 살아 있는 지침(나중 저장)은 그대로 두었고, "
+                          "앞의 저장은 %s 에 그대로 보관했습니다 — 자동으로 합치지 않습니다. 앞의 판의 내용이 필요하면 오너 "
+                          "지시로 워커가 본문에 옮기십시오." % kept_p)
+    close_record(md, rec, nf, notices=False)
+    raise HoldSwap("two edits")
+
+
+def close_record(md, rec, nf, notices=True):
+    """★FL4 — 동작이 끝났다(완료 또는 보류): 기록에 남긴 알림·보관 경로를 내보낸 **뒤** 기록을 지운다(마지막 걸음)."""
+    if notices:
+        for t, b in rec.get("notices") or []:
+            note(nf, t, b)
+    for k in rec.get("kept_report") or []:
+        note_kept(nf, k)
+    if rec.get("_disk"):
+        remove_intent(md)
+        rec["_disk"] = False
+
+
+def complete(md, rec, nf):
+    """★FL4 — 'swapped': 동작의 나머지를 기록에 적힌 값으로 끝낸다 — 조립 = .pre-ceo(없을 때 · 놓인 조립의 본문) → 0.14 영수증
+    정리 → 새 영수증(DC2 순서) · 강등 = .pre-ceo 보관 → 영수증 정리. 그다음 알림을 내보내고 기록을 지운다(마지막). 몇 번을 다시
+    해도 같은 결과다(멈추면 다음 입구가 이 단계에서 이어 간다). 돌려주는 값 = 동작의 rc."""
+    done = rec.get("done") or {}
+    sw = rec["swap"]
+    d = os.path.dirname(os.path.abspath(md))
+    pre_p, rec_p, leg_p = md + ".pre-ceo", os.path.join(d, RECEIPT), os.path.join(d, LEGACY_RECEIPT)
+    kept = os.path.join(kept_dir(md), sw["kept"])
+    if rec["op"] == "compose":
+        print("[cys-dept] 이전 본부 지침 파일 보관: %s" % kept)
+        live = read_or_none(md)
+        if done.get("pre") and not pre_present(pre_p) and live is not None and sha(live) == sw["candidate_sha256"]:
+            c = split(live)
+            if c is not None:
+                best_effort(write_new, pre_p, c[2])     # 백업 = 이 조립에 쓴 사용자 본부 지침(덮지 않는다)
+        best_effort(drop_legacy, leg_p)
+        if done.get("receipt"):
+            write_receipt(rec_p, hashes=done["receipt"])
+        if done.get("keep"):
+            print("[cys-dept] 조립 전 지침 사본 보관: %s" % kept)
+    else:
+        moved = best_effort(dispose_backup, pre_p, md)
+        best_effort(drop, rec_p)   # ★승격 영수증 삭제(G0 D3) — 강등=승격 사실 소멸
+        best_effort(drop_legacy, leg_p)
+        print("[cys-dept] CEO 강등 원본: %s · CEO 지침 사본 %s%s"
+              % (done.get("via", "?"), kept, " · .pre-ceo %s" % moved if moved else ""))
+    close_record(md, rec, nf)
+    return done.get("rc", 0)
+
+
+def plan_op(op, md, nf, args):
+    """동작을 지금 상태에서 계획한다 — rc(바꿀 것 없이 끝남 · 보류) | 교체 계획(dict)."""
+    if op == "compose":
+        return compose_once(args["tmpl"], md, args.get("tsha"), nf)
+    return demote_once(args["tmpl"], md, nf)
+
+
+def run_record(md, nf, rec, args, until_run=False):
+    """★RULINGS FL4 — 기록 하나를 그 단계부터 동작 완료 또는 보류까지 몬다. 단계는 먼저 디스크에 확정되고, 기록은 동작이 끝난
+    뒤에야 지워진다. 이 입구의 시도는 유한하다(계획 SWAP_ATTEMPTS 번 · 되돌리기 SWAP_ATTEMPTS 번 — 넘으면 보류 rc 9).
+    until_run 이면 'run' 에 이르러 None 을 돌려준다(부르는 쪽이 같은 동작을 새 인자로 이어 간다). 돌려주는 값 = 동작의 rc."""
+    op = rec["op"]
+    changing, action = (T_HOLD_CHANGING, "조립") if op == "compose" else (T_DEMOTE_CHANGING, "강등")
+    attempts = restores = 0
+    while True:
+        step = rec["step"]
+        if step == "swap":
+            ksha = finish_swap(md, rec, nf)
+            if ksha is None and rec["step"] == "run":
+                continue
+            if settle(md, rec, nf, ksha) == "restore":
+                restores += 1
+                if restores > SWAP_ATTEMPTS:
+                    err("CEO %s 보류: 본부 지침이 되돌리는 중에도 계속 저장된다 — 다음 확인 때 이어 간다" % action)
+                    note(nf, changing, "본부 지침이 CEO %s 중에 계속 저장되어 보류했습니다. 살아 있던 모든 판은 %s 에 있고, 다음 "
+                                       "승격 확인이 기록에서 이어 갑니다." % (action, kept_dir(md)))
+                    raise HoldSwap("changing", 9)
+                sw = rec["swap"]
+                swap_unit(md, read_bytes(os.path.join(kept_dir(md), sw["kept"])), sw["candidate_sha256"], "restore",
+                          "replaced", nf=nf, rec=rec)
+            continue
+        if step == "swapped":
+            return complete(md, rec, nf)
+        if until_run:
+            return None
+        if attempts >= SWAP_ATTEMPTS:
+            err("CEO %s 보류: 본부 지침이 %d번 연달아 읽은 뒤에 바뀌었다 — %s 을(를) 마치지 않았다" % (action, SWAP_ATTEMPTS, action))
+            note(nf, changing, "본부 지침의 CEO %s을(를) 하는 동안 지침이 %d번 연달아 저장되어(편집 중) %s을(를) 마치지 않고 "
+                               "보류했습니다. 살아 있는 지침은 마지막으로 저장된 판이고, 그 사이 살아 있던 판들은 보관 폴더 %s 에 "
+                               "있습니다(지우지 않았습니다). 편집을 마치면 다음 승격 확인 때 다시 합니다."
+                               % (action, SWAP_ATTEMPTS, action, kept_dir(md)))
+            close_record(md, rec, nf)
+            raise HoldSwap("changing", 9)
+        if attempts:
+            err("CEO %s: 읽은 뒤에 지침이 저장됐다 — 다시 읽어 처음부터 한다(%d/%d)" % (action, attempts, SWAP_ATTEMPTS))
+        attempts += 1
+        plan = plan_op(op, md, nf, args)
+        if not isinstance(plan, dict):
+            close_record(md, rec, nf)       # 바꿀 것 없이 끝났거나(10·11) 보류다(그 알림은 계획이 남겼다) — 동작 끝
+            return plan
+        swap_unit(md, plan["data"], plan["read_sha"], op, plan["reason"], expect=plan["expect"], nf=nf, rec=rec,
+                  notices=plan["notices"], done=plan["done"])
+
+
+def close_intent(md, nf, op=None, args=None):
+    """★RULINGS EY2·FL4 — 조립 경로의 모든 입구(조립 · 강등 · 틱)가 잠금 안에서 **먼저** 부른다: 남은 동작 기록을 그 단계에서
+    이어 간다. 같은 동작의 입구면 기록이 'run' 에 이르렀을 때 그 기록을 돌려준다(이 입구의 새 인자로 이어 간다 — 기록은 동작이
+    끝나야 지워진다). 다른 동작의 입구·틱이면 기록에 적힌 인자로 그 동작을 끝까지 한다. 돌려주는 값 = (이어 갈 기록 | None,
+    끝낸 동작의 rc | None, 기록의 동작 | None)."""
     rec = read_intent(md)
     if rec is None:
         remove_orphan_candidates(md)
-        return
-    d = os.path.dirname(os.path.abspath(md))
+        return None, None, None
     if rec == "bad":
-        parked, _ = keep_file(intent_path(md), md, "intent-unreadable")
-        note(nf, T_INTENT_CHECK, "끝나지 않은 본부 지침 교체 기록을 읽을 수 없어 아무것도 바꾸지 않았습니다. 그 기록은 %s 에, "
-                                 "살아 있던 판들은 %s 에 있습니다 — 오너 지시로 확인하십시오." % (parked, kept_dir(md)))
-        raise HoldSwap("unreadable intent")
-    cand_p = os.path.join(d, rec["candidate"])
-    kept_p = os.path.join(kept_dir(md), rec["kept"])
-    reason = rec.get("reason") or "kept"
-    if not os.path.lexists(kept_p):
-        if not os.path.lexists(cand_p):
-            parked, _ = keep_file(intent_path(md), md, "intent-orphan")
-            note(nf, T_INTENT_CHECK, "끝나지 않은 본부 지침 교체 기록에 그 파일들이 없어 아무것도 바꾸지 않았습니다(기록: %s). 살아 "
-                                     "있는 지침은 그대로입니다." % parked)
-            raise HoldSwap("intent without files")
-        try:
-            csha = sha(read_bytes(cand_p))
-        except OSError:
-            csha = None
-        try:
-            lsha = sha(read_bytes(md))
-        except FileNotFoundError:
-            lsha = None
-        if csha == rec["candidate_sha256"] and lsha is not None and lsha != rec["candidate_sha256"]:
-            silent_unlink(cand_p)               # 교체 전에 멈췄다 — 후보는 살아 있던 적이 없다
-            remove_intent(md)
-            err("CEO 지침: 교체 전에 멈춘 기록을 정리했다(살아 있는 지침은 그대로)")
-            return
-        keep_file(cand_p, md, reason, name=rec["kept"])     # 맞바꾸기 뒤에 멈췄다 — 후보 이름의 것은 밀려난 파일이다
-    ksha = write_sidecar(kept_p, reason, rec.get("live", os.path.basename(md)))   # 곁 파일이 없으면 지금 만든다
-    note_kept(nf, kept_p)
-    if not os.path.lexists(md):
-        # 맡기고 먼저의 두 걸음 사이에서 멈췄다 — 빈 살아 있는 이름을 채운다(후보 → 덮지 않게 · 후보가 없으면 보관된 판의 사본)
-        try:
-            if not (os.path.lexists(cand_p) and sha(read_bytes(cand_p)) == rec["candidate_sha256"]):
-                cand_p = candidate_path(md, new_iid())          # ★EY3: 보관된 판의 사본을 후보로 **다** 쓴 뒤
-                write_candidate(cand_p, read_bytes(kept_p), kept_p)
-            place_candidate(cand_p, md)                         # 덮지 않는 이동으로 놓는다(살아 있는 경로에 직접 쓰지 않는다)
-        except FileExistsError:
-            silent_unlink(cand_p)               # 그 사이 누가 만들었다 — 그것이 살아 있다(우리 후보는 살아 있던 적 없음)
-        except NoSafeMove:
-            silent_unlink(cand_p)
-            note(nf, T_NO_SAFE_SWAP, "끝나지 않은 본부 지침 교체를 마무리하려 했으나 이 파일 시스템에는 덮지 않는 이동이 없어 빈 "
-                                     "지침 이름을 채우지 못했습니다. 교체 전 판은 %s 에 있습니다." % kept_p)
-            raise HoldSwap("no safe primitive")
-    elif os.path.lexists(cand_p):
-        silent_unlink(cand_p)                   # 놓이지 않은 후보 — 살아 있던 적이 없다
-    remove_intent(md)
-    print("[cys-dept] 끝나지 않은 본부 지침 교체를 마무리했다(밀려난 판: %s)" % kept_p)
-    if ksha != rec["read_sha256"]:
-        restore_newer(md, kept_p, rec["candidate_sha256"], nf)
-def write_receipt(p, header, sep, body, composed):
-    doc = {"schema": 1, "header_sha256": sha(header), "master_sha256_at_compose": sha(body),
-           "composed_sha256": sha(composed), "separator": sep.decode("utf-8"),
+        unreadable_record(md, nf)
+    rc = run_record(md, nf, rec, rec["args"], until_run=(op == rec["op"]))
+    if rc is None:
+        return rec, None, rec["op"]
+    return None, rc, rec["op"]
+
+
+def receipt_hashes(header, sep, body, composed):
+    return {"header_sha256": sha(header), "master_sha256_at_compose": sha(body), "composed_sha256": sha(composed),
+            "separator": sep.decode("utf-8")}
+
+
+def write_receipt(p, header=None, sep=None, body=None, composed=None, hashes=None):
+    """승격 영수증(O-C11-1) — 바이트(header·sep·body·composed)나, 동작 기록이 담아 둔 그 해시들(hashes — FL4 마무리)로."""
+    r = hashes if hashes is not None else receipt_hashes(header, sep, body, composed)
+    doc = {"schema": 1, "header_sha256": r["header_sha256"], "master_sha256_at_compose": r["master_sha256_at_compose"],
+           "composed_sha256": r["composed_sha256"], "separator": r["separator"],
            "composed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     write_atomic(p, (json.dumps(doc, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
@@ -2558,13 +2764,15 @@ def note(nf, title, body):
     """bash 가 제목 완전일치 dedupe 로 1건만 올리는 알림 — 줄 하나(NOTICE\t제목\t본문)를 인자로 받은 파일에 덧붙인다.
     ★CG2: 알림 쓰기가 실패해도 이미 끝난 교체의 결과를 바꾸지 않는다(예외를 올리지 않고 stderr 에 한 줄)."""
     if not nf:
-        return
+        return False
     clean = lambda t: t.replace("\t", " ").replace("\r", " ").replace("\n", " ")
     try:
         with open(nf, "a", encoding="utf-8") as f:
             f.write("NOTICE\t%s\t%s\n" % (clean(title), clean(body)))
+        return True
     except OSError as e:
         err("알림 기록 실패(%s) — 결과는 그대로다: %s" % (e, title))
+        return False
 
 
 def note_kept(nf, kept):
@@ -2596,6 +2804,7 @@ T_DEMOTE_CHANGING = "CEO 강등 보류(본부 지침이 강등 중에 계속 바
 T_TWO_EDITS = "CEO 지침 교체 보류(두 저장이 겹침)"
 T_INTENT_CHECK = "CEO 지침 교체 기록 확인 필요"
 T_NO_SAFE_SWAP = "CEO 지침 교체 보류(이 디스크에서는 안전하게 바꿀 수 없음)"
+T_WAIT_RECOMPOSE = "CEO 승격 보류(다시 조립 대기)"
 TICK_LOCK_WAIT_S = 2.0
 SEP_LINE = "# [본문 — 표준 MASTER 운영 계약 전문]"
 
@@ -2750,9 +2959,10 @@ def pre_differs_text(pre_p):
             "본문에 반영하십시오." % pre_p)
 
 
-def locked_attempts(md, nf, once, busy_title, changing_title, action):
-    """★RULINGS DC1 — 잠금(상한 있는 대기) 안에서 once() 를 SourceChanged 가 나지 않을 때까지(최대 SWAP_ATTEMPTS 번) 다시 한다.
-    잠금을 못 잡으면 rc 8, 원본이 매번 바뀌면 rc 9 — 둘 다 보류(지침 무변경 · 알림 1건 · 호출부는 0 으로 끝난다)."""
+def locked_attempts(md, nf, op, args, busy_title, action):
+    """★RULINGS DC1·FL4 — 잠금(상한 있는 대기) 안에서: 남은 동작 기록을 먼저 끝내고(close_intent) 이 입구의 동작을 한 기록 아래에서
+    완료나 보류까지 한다(run_record — 읽은 뒤의 저장은 되돌린 뒤 다시 계획 · 시도 유한). 잠금을 못 잡으면 rc 8, 원본이 계속
+    바뀌면 rc 9, 보류 rc 6 — 셋 다 알림 1건 · 호출부는 0 으로 끝난다."""
     try:
         lk = take_lock(md)
     except LockBusy:
@@ -2764,22 +2974,13 @@ def locked_attempts(md, nf, once, busy_title, changing_title, action):
         return 8
     try:
         try:
-            close_intent(md, nf)                # ★EY2 — 끝나지 않은 교체를 무엇보다 먼저 마무리한다
-        except HoldSwap:
-            return 6
-        for n in range(SWAP_ATTEMPTS):
-            try:
-                return once()
-            except HoldSwap:
-                return 6
-            except SourceChanged as e:
-                err("CEO %s: %s — 다시 읽어 처음부터 한다(%d/%d)" % (action, e, n + 1, SWAP_ATTEMPTS))
-        err("CEO %s 보류: 본부 지침이 %d번 연달아 읽은 뒤에 바뀌었다 — %s 을(를) 마치지 않았다" % (action, SWAP_ATTEMPTS, action))
-        note(nf, changing_title, "본부 지침의 CEO %s을(를) 하는 동안 지침이 %d번 연달아 저장되어(편집 중) %s을(를) 마치지 않고 "
-                                 "보류했습니다. 살아 있는 지침은 마지막으로 저장된 판이고, 그 사이 살아 있던 판들은 보관 폴더 %s 에 "
-                                 "있습니다(지우지 않았습니다). 편집을 마치면 다음 승격 확인 때 다시 합니다."
-                                 % (action, SWAP_ATTEMPTS, action, kept_dir(md)))
-        return 9
+            rec, resumed, rop = close_intent(md, nf, op, args)     # ★EY2·FL4 — 남은 동작을 무엇보다 먼저 끝낸다
+            rc = run_record(md, nf, rec or new_record(op, args), args)
+        except HoldSwap as h:
+            return h.rc
+        if rop == op and resumed in (0, 12) and rc in (10, 11):
+            rc = resumed            # 앞 입구가 바꾼 지침을 이 입구가 마무리했다 — 바뀐 사실(재주입)을 그대로 알린다
+        return rc
     finally:
         lk.close()
 
@@ -2791,8 +2992,7 @@ def do_compose(a):
     #     8 잠금 대기 상한 초과 · 9 원본이 읽은 뒤에 계속 바뀜(★DC1 — 둘 다 보류: 지침 무변경 + 알림)
     tmpl, md, tsha = a[0], a[1], a[2]
     nf = a[3] if len(a) > 3 else ""
-    return locked_attempts(md, nf, lambda: compose_once(tmpl, md, tsha, nf), T_HOLD_BUSY, T_HOLD_CHANGING, "조립")
-
+    return locked_attempts(md, nf, "compose", {"tmpl": os.path.abspath(tmpl), "tsha": tsha}, T_HOLD_BUSY, "조립")
 
 def compose_once(tmpl, md, tsha, nf):
     d = os.path.dirname(md)
@@ -2895,49 +3095,36 @@ def compose_once(tmpl, md, tsha, nf):
         write_receipt(rec_p, H, S, body, cand)
         print("[cys-dept] CEO 지침은 그대로(이미 그 조립 결과) — 영수증 기록")
         return 11
-    # ★DC1: 교체 순간의 파일이 읽은 mb 와 같을 때만 남는다(아니면 SourceChanged → 다시 읽어 처음부터). 옮겨 둔 파일이 곧
-    #   교체 순간의 그 파일이다 — 보관 사본·새 승격의 백업은 그 파일의 이름만 바꾼다(다시 쓰지 않는다).
-    # ★EY2: 한 단위의 교체(의도 기록 → 바꾸기 → 밀려난 파일 보관). ★EY1: 밀려난 파일은 언제나 보관 폴더로(지우지 않는다) —
-    #   보관 사본 알림이 필요한 경우(고친 머리말·0.14.x 옛 지침)는 아래 알림이, 그 밖에도 출력·자동 승격 알림이 경로를 말한다.
-    kept, ksha = swap_unit(md, cand, sha(mb), "compose", "before-compose" if keep else "compose",
-                           expect=lambda back: back == cand and split(back) == (H, S, body), nf=nf)
-    note_kept(nf, kept)
-    if ksha != sha(mb):
-        restore_newer(md, kept, sha(cand), nf)   # 읽은 뒤 저장된 판이 밀려났다 — 그 판을 되돌린 뒤 그것으로 다시 조립
-        raise SourceChanged("읽은 뒤에 지침이 저장됐다 — 그 판으로 다시 조립한다")
-    print("[cys-dept] 이전 본부 지침 파일 보관: %s" % kept)
-    if pstate == "absent" and not pre_present(pre_p):
-        best_effort(write_new, pre_p, body)   # 백업 = 이 조립에 쓴 사용자 본부 지침(덮지 않는다)
-    # ★DC2 — 이전을 끝내는 쓰기의 순서: 지침 교체(위) → 0.14 영수증 정리 → 새 영수증. 어느 쓰기 뒤에서 멈춰도 다음 승격 확인이
-    #   바르게 이어 간다: 교체 뒤 = 현행 머리말 + (해시가 안 맞는) 0.14 영수증 → 조립으로 영수증 기록·정리 · 정리 뒤 = 영수증만
-    #   없는 조립 → 기록. 남은 0.14 영수증은 해시가 살아 있는 파일과 다르므로 증거가 아니다(legacy_matches).
-    best_effort(drop_legacy, leg_p)
-    write_receipt(rec_p, H, S, body, cand)
-    # ── 여기부터는 교체가 끝났다: 정리·알림의 실패는 결과(rc)를 바꾸지 않는다(CG2) ──
+    # ★DC1·EY2·FL4: 교체는 계획으로 돌려준다 — 동작 기록 아래에서 바꾸고(swap_unit), 밀려난 파일이 읽은 mb 인지 검증하고
+    #   (settle — 아니면 그 판을 되돌린 뒤 다시 계획), 마무리(.pre-ceo · 0.14 영수증 정리 → 새 영수증 — DC2 순서)와 알림은 기록에
+    #   적어 둔 값으로 한다(complete). 기록은 그 모두가 끝난 뒤에 지워진다. ★EY1: 밀려난 파일은 언제나 보관 폴더로(지우지 않는다).
     differs = differs_check and pre_differs(pstate, pb, body, rs)
-    if keep:
-        print("[cys-dept] 조립 전 지침 사본 보관: %s" % kept)
+
+    def notices(kept):
         if keep == "header":
             # 알림 1건 — .pre-ceo 가 본문과 다르면 그 사실과 경로도 같은 알림에 싣는다(고친 0.14.x 머리말 + 0.14 영수증 없음
             #   = 조립 + 이 알림 하나 · CG1). 영수증이 증명하지 못하는 머리말이면 언제나 이 갈래로 온다(keep == "header").
-            note(nf, copy_title("머리말", kept),
-                 "본부 CEO 지침의 머리말(구분선 앞)이 지금 생성되는 머리말과 달라(고쳤거나 출처를 영수증으로 증명할 수 없음), "
-                 "다시 조립하기 전에 지침 전체를 %s 에 보관했습니다. 본문(본부 지침 = 구분선 뒤)은 그대로입니다. 머리말은 제품이 "
-                 "생성하는 부분이라 고친 내용은 자동으로 반영되지 않습니다.%s"
-                 % (kept, pre_differs_text(pre_p) if differs else ""))
-        elif keep == "migration":
-            note(nf, copy_title("0.14.x 이전", kept),
-                 "0.14.x 방식(통째 복사)으로 승격돼 있던 본부 지침을 조립 방식으로 옮겼습니다. 새 CEO 지침의 본문은 승격 전 본부 "
-                 "지침(.pre-ceo)입니다. 옛 CEO 지침은 배포된 틀과 바이트가 달라(CEO 동안 고쳤거나 출처를 확인할 수 없음) 통째로 "
-                 "%s 에 보관했습니다 — 그 수정은 자동으로 합치지 않습니다. 필요하면 워커에게 규칙 문서 수리로 다시 반영하게 "
-                 "하십시오." % kept)
-        else:
-            note(nf, copy_title("0.14.x 이전", kept),
-                 "0.14.x 방식(통째 복사)으로 승격돼 있던 본부 지침을 조립 방식으로 옮겼습니다. 승격 전 본부 지침 백업(.pre-ceo)이 "
-                 "없어 옛 CEO 지침의 구분선 뒤 본문을 새 본문으로 썼습니다. 옛 CEO 지침 전체는 %s 에 보관했습니다 — 자동으로 "
-                 "합치지 않습니다. 필요하면 워커에게 규칙 문서 수리로 다시 반영하게 하십시오." % kept)
-    return 0 if new else 12
-
+            return [[copy_title("머리말", kept),
+                     "본부 CEO 지침의 머리말(구분선 앞)이 지금 생성되는 머리말과 달라(고쳤거나 출처를 영수증으로 증명할 수 없음), "
+                     "다시 조립하기 전에 지침 전체를 %s 에 보관했습니다. 본문(본부 지침 = 구분선 뒤)은 그대로입니다. 머리말은 제품이 "
+                     "생성하는 부분이라 고친 내용은 자동으로 반영되지 않습니다.%s"
+                     % (kept, pre_differs_text(pre_p) if differs else "")]]
+        if keep == "migration":
+            return [[copy_title("0.14.x 이전", kept),
+                     "0.14.x 방식(통째 복사)으로 승격돼 있던 본부 지침을 조립 방식으로 옮겼습니다. 새 CEO 지침의 본문은 승격 전 본부 "
+                     "지침(.pre-ceo)입니다. 옛 CEO 지침은 배포된 틀과 바이트가 달라(CEO 동안 고쳤거나 출처를 확인할 수 없음) 통째로 "
+                     "%s 에 보관했습니다 — 그 수정은 자동으로 합치지 않습니다. 필요하면 워커에게 규칙 문서 수리로 다시 반영하게 "
+                     "하십시오." % kept]]
+        if keep:
+            return [[copy_title("0.14.x 이전", kept),
+                     "0.14.x 방식(통째 복사)으로 승격돼 있던 본부 지침을 조립 방식으로 옮겼습니다. 승격 전 본부 지침 백업(.pre-ceo)이 "
+                     "없어 옛 CEO 지침의 구분선 뒤 본문을 새 본문으로 썼습니다. 옛 CEO 지침 전체는 %s 에 보관했습니다 — 자동으로 "
+                     "합치지 않습니다. 필요하면 워커에게 규칙 문서 수리로 다시 반영하게 하십시오." % kept]]
+        return []
+    return {"data": cand, "read_sha": sha(mb), "reason": "before-compose" if keep else "compose",
+            "expect": lambda back: back == cand and split(back) == (H, S, body), "notices": notices,
+            "done": {"rc": 0 if new else 12, "pre": pstate == "absent", "keep": keep,
+                     "receipt": receipt_hashes(H, S, body, cand)}}
 
 def dispose_backup(pre_p, md):
     """강등 뒤 .pre-ceo — ★RULINGS EY1: 비교로 지우지 않는다. 그 순간의 파일 그대로 보관 폴더로 옮긴다(승격 중에만 .pre-ceo 가
@@ -2953,7 +3140,7 @@ def do_demote(a):
     #   · 2 판독 불능 · 8 잠금 대기 상한 초과 · 9 원본이 읽은 뒤에 계속 바뀜(★DC1 — 보류: 지침 무변경 + 알림)
     tmpl, md = a[0], a[1]
     nf = a[2] if len(a) > 2 else ""
-    return locked_attempts(md, nf, lambda: demote_once(tmpl, md, nf), T_DEMOTE_BUSY, T_DEMOTE_CHANGING, "강등")
+    return locked_attempts(md, nf, "demote", {"tmpl": os.path.abspath(tmpl), "tsha": None}, T_DEMOTE_BUSY, "강등")
 
 
 def demote_once(tmpl, md, nf):
@@ -3024,30 +3211,23 @@ def demote_once(tmpl, md, nf):
         if moved:
             print("[cys-dept] 승격 백업 정리(지침은 이미 표준 MASTER): .pre-ceo %s" % moved)
         return 10
-    kept, ksha = swap_unit(md, new_md, sha(mb), "demote", "before-demote" if keep else "demote",
-                           expect=lambda back: back == new_md, nf=nf)   # ★EY2 한 단위 · ★EY1 밀려난 파일은 보관 · ★EY3 방법
-    note_kept(nf, kept)
-    if ksha != sha(mb):
-        restore_newer(md, kept, sha(new_md), nf)
-        raise SourceChanged("읽은 뒤에 지침이 저장됐다 — 그 판으로 다시 강등한다")
-    # ── 교체 끝: 정리·알림 실패는 결과를 바꾸지 않는다(CG2) ──
-    shown = kept if keep else None      # 알림이 필요한 보관 사본(고친 머리말·0.14.x 옛 지침)만 아래 알림으로
-    moved = best_effort(dispose_backup, pre_p, md)
-    best_effort(drop, rec_p)   # ★승격 영수증 삭제(G0 D3) — 강등=승격 사실 소멸. 강등 불능(rc 7)·보류(rc 6)에선 지우지 않는다.
-    best_effort(drop_legacy, leg_p)
-    print("[cys-dept] CEO 강등 원본: %s%s%s" % (via, " · CEO 지침 사본 %s" % kept if kept else "",
-                                             " · .pre-ceo %s" % moved if moved else ""))
-    if shown:
-        note(nf, copy_title("강등", kept),
-             "CEO 강등 때 본부 지침을 %s(으)로 되돌렸고, 강등 전 CEO 지침 전체를 %s 에 보관했습니다(배포된 틀과 다르거나 "
-             "머리말을 고친 지침 — 자동으로 합치지 않습니다). 필요하면 워커에게 규칙 문서 수리로 다시 반영하게 하십시오."
-             % (via, kept))
-    return 0
+    # ★EY2·FL4 — 계획으로 돌려준다(한 동작 기록 아래: 바꾸기 → 검증 → .pre-ceo 보관·영수증 정리 → 알림 → 기록 제거).
 
+    def notices(kept):
+        if not keep:            # 알림이 필요한 보관 사본(고친 머리말·0.14.x 옛 지침)만
+            return []
+        return [[copy_title("강등", kept),
+                 "CEO 강등 때 본부 지침을 %s(으)로 되돌렸고, 강등 전 CEO 지침 전체를 %s 에 보관했습니다(배포된 틀과 다르거나 "
+                 "머리말을 고친 지침 — 자동으로 합치지 않습니다). 필요하면 워커에게 규칙 문서 수리로 다시 반영하게 하십시오."
+                 % (via, kept)]]
+    return {"data": new_md, "read_sha": sha(mb), "reason": "before-demote" if keep else "demote",
+            "expect": lambda back: back == new_md, "notices": notices, "done": {"rc": 0, "via": via, "keep": keep}}
 
 def do_recover(a):
-    # a = md [notice-file] — ★RULINGS FA3: 10분 승격 대기 틱의 복구 입구. 의도 기록이 없으면 아무것도 안 한다. 잠금은 짧게만
-    #   시도하고(쥐어져 있으면 다음 틱), 늘 0 · 틱마다 보내는 것 없음(보류 알림은 교체 하나에 한 번 — 기록을 보관 폴더로 옮긴다).
+    # a = md [notice-file] — ★RULINGS FA3·FL4: 10분 승격 대기 틱의 복구 입구. 동작 기록이 없으면 아무것도 안 한다. 있으면 그
+    #   단계에서 이어 가 **기록된 동작을 끝낸다**(조립·강등 — 되돌린 뒤의 다시 조립까지). 잠금은 짧게만 시도하고(쥐어져 있으면
+    #   다음 틱) 틱마다 보내는 것은 없다(보류 알림은 기록 하나에 한 번). rc: 0 · 3 = 기록된 조립을 끝내려 했으나 틀이 그 조립의
+    #   검사 뒤에 바뀌었다(지침은 사용자의 판 그대로 — bash 가 PENDING 을 남겨 다음 틱의 승격 확인이 새 틀을 검사해 조립한다).
     md = a[0]
     nf = a[1] if len(a) > 1 else ""
     if not os.path.lexists(intent_path(md)):
@@ -3057,13 +3237,17 @@ def do_recover(a):
     except LockBusy:
         return 0
     try:
-        close_intent(md, nf)
-    except (HoldSwap, SourceChanged):
-        pass
+        _rec, rc, rop = close_intent(md, nf)
+        if rop == "compose" and rc == 3:
+            note(nf, T_WAIT_RECOMPOSE, "끝나지 않은 CEO 승격을 마무리하던 중 CEO_TEMPLATE.md 가 그 승격의 검사 뒤에 바뀌어, 지금 "
+                                       "본부 지침(사용자의 판 그대로)을 새 틀로 조립하는 것은 다음 승격 확인으로 넘겼습니다. 아무것도 "
+                                       "지우지 않았습니다.")
+            return 3
+        return 0
+    except HoldSwap:
+        return 0
     finally:
         lk.close()
-    return 0
-
 
 def do_verify(a):
     # a = tmpl md — promote-ceo 의 승격 확인(C11 11.10 · O-C11-1). stdout 한 줄 = 판정 사유.
@@ -3114,8 +3298,8 @@ def main(argv):
     try:
         return acts[cmd](rest)
     except Exception as e:   # 어떤 예외도 부서 생명주기를 깨지 않는다 — 호출부가 rc 로 보류한다(쓰기는 원자 교체뿐)
-        err("CEO %s 실패(%s: %s) — 지침 이름은 맞바꾸기나 다 쓴 후보의 덮지 않는 이동으로만 바뀌고, 중간에 멈춘 교체는 의도 기록"
-            "(%s)으로 다음 입구가 마무리한다" % (cmd, type(e).__name__, e, INTENT))
+        err("CEO %s 실패(%s: %s) — 지침 이름은 맞바꾸기·한 번의 이름 바꾸기·다 쓴 후보의 덮지 않는 놓기로만 바뀌고, 멈춘 동작은 "
+            "기록(%s)의 단계에서 다음 입구가 이어 가 끝낸다" % (cmd, type(e).__name__, e, INTENT))
         return 2
 
 
@@ -3166,7 +3350,7 @@ CEO_NOTICE_CLOSE_DECISION="ceo-promoted"
 ceo_notices_close(){
   local ids id n=0
   ids="$(env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
-    | LC_ALL=C awk -F'\t' '$2=="[pending]" && ($4=="CEO 승격 보류(부트 필요)" || $4=="CEO 승격 대기" || $4=="CEO 승격 보류(템플릿 상위집합 검사 실패)" || $4=="CEO 승격 보류(영수증 손상)" || $4=="CEO 승격 보류(본부 지침에 조립 구분선 — 승격 기록 없음)" || $4=="CEO 승격 보류(본부 지침 확인 필요)" || $4=="CEO 승격 보류(다른 승격·강등이 진행 중)" || $4=="CEO 승격 보류(본부 지침이 조립 중에 계속 바뀜)" || $4=="CEO 지침 교체 보류(두 저장이 겹침)" || $4=="CEO 지침 교체 기록 확인 필요"){print $1}')" \
+    | LC_ALL=C awk -F'\t' '$2=="[pending]" && ($4=="CEO 승격 보류(부트 필요)" || $4=="CEO 승격 대기" || $4=="CEO 승격 보류(템플릿 상위집합 검사 실패)" || $4=="CEO 승격 보류(영수증 손상)" || $4=="CEO 승격 보류(본부 지침에 조립 구분선 — 승격 기록 없음)" || $4=="CEO 승격 보류(본부 지침 확인 필요)" || $4=="CEO 승격 보류(다른 승격·강등이 진행 중)" || $4=="CEO 승격 보류(본부 지침이 조립 중에 계속 바뀜)" || $4=="CEO 지침 교체 보류(두 저장이 겹침)" || $4=="CEO 지침 교체 기록 확인 필요" || $4=="CEO 승격 보류(다시 조립 대기)"){print $1}')" \
     || return 0
   for id in $ids; do
     [ "$n" -lt 20 ] || break
@@ -4749,14 +4933,20 @@ EOF
     # 조건 = PENDING 존재 + .master-bootstrapped 존재 + 부서≥1. 미충족=no-op(exit 0·멱등).
     # --request-only(부트 ⑦ 전용·비대기): 알림 재발행만 — 실제 승격은 하지 않는다
     #   (부트와 자동 승격의 분리 — 설계 v1.1 결함⑤). 대기형: ceo_promote(자동 승격, 제품 기본 정책) 경유.
-    # ★RULINGS FA3: 이 동사는 base 데몬의 10분 틱(ceo-promote-pending-tick)이 부른다 — 끝나지 않은 본부 지침 교체(의도 기록
-    #   directives/.ceo-intent.json)가 있으면 PENDING 과 무관하게 먼저 마무리한다(빠진 살아 있는 이름 포함). 잠금은 짧게만
-    #   시도하고(쥐어져 있으면 다음 틱) 늘 0, 틱마다 보내는 것은 없다(보류 알림은 교체 하나에 한 번 — 기록을 보관 폴더로 옮긴다).
+    # ★RULINGS FA3·FL4: 이 동사는 base 데몬의 10분 틱(ceo-promote-pending-tick)이 부른다 — 끝나지 않은 본부 지침 동작(기록
+    #   directives/.ceo-intent.json)이 있으면 PENDING 과 무관하게 먼저 그 단계에서 이어 가 기록된 동작(조립·강등)을 끝낸다(빠진
+    #   살아 있는 이름 · 읽은 뒤의 저장을 되돌린 뒤의 다시 조립 포함). 잠금은 짧게만 시도하고(쥐어져 있으면 다음 틱) 틱마다
+    #   보내는 것은 없다(보류 알림은 기록 하나에 한 번). rc 3 = 그 조립의 틀이 검사 뒤에 바뀌었다 — PENDING 을 남겨 다음 틱의
+    #   승격 확인(ceo_promote — 새 틀을 상위집합 검사)이 조립한다.
     if [ "${2:-}" != "--request-only" ] && [ -e "$PACK_DEFAULT/directives/.ceo-intent.json" ]; then
       _rnf="$(mktemp "${TMPDIR:-/tmp}/cys-ceo-notice.XXXXXX" 2>/dev/null)" || _rnf=""
-      ceo_py recover "$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md" "$_rnf" >&2 || true
+      _rrc=0
+      ceo_py recover "$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md" "$_rnf" >&2 || _rrc=$?
       _CEO_KEPT=""
       ceo_notices_from "$_rnf"
+      if [ "$_rrc" -eq 3 ] && [ ! -f "$CEO_PENDING" ]; then
+        ceo_pending_write "pending since $(date +%Y-%m-%dT%H:%M:%S 2>/dev/null || echo unknown) (recompose)"   # ★DC3: 실패해도 계속
+      fi
     fi
     _pend_ok=0
     _dept_count="$(reg_count)" || exit $?

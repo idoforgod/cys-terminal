@@ -1090,6 +1090,57 @@ class IntentRecovery(Rig):
                 self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "다음 강등이 중단된 교체를 마무리하지 않았다")
                 self.assertIsNone(self.read(".ceo-intent.json"))
 
+    # ── codex B1 · B7(Round 3 — RULINGS FL4: 기록은 마지막에 지워지고, 복구는 기록된 동작을 끝낸다) ──
+    def hook_save_before_swap(self, ns, text):
+        """조립이 지침을 읽은 뒤 · 교체 전(첫 swap_unit 직전)에 사용자 저장 1회(제자리 쓰기)."""
+        orig = ns["swap_unit"]
+        fired = []
+
+        def wrapped(md, *a, **kw):
+            if not fired:
+                fired.append(1)
+                with open(self.p("MASTER_DIRECTIVE.md"), "w", encoding="utf-8") as f:
+                    f.write(text)
+            return orig(md, *a, **kw)
+        ns["swap_unit"] = wrapped
+        return fired
+
+    def test_a_crash_after_the_record_is_removed_never_accepts_a_stale_composition(self):
+        """codex B1 — 기록이 검증보다 먼저 지워져, 그 사이에서 멈추면 다음 실행이 낡은 조립을 현행으로 받아 읽은 뒤의 저장을
+        잃었다. 기록은 마지막에 지워진다: 첫 기록 제거 바로 뒤에서 멈춰도 그 저장은 조립돼 살아 있다."""
+        for mode in ("exchange", "deposit"):
+            with self.subTest(mode=mode):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                ns = self.ns_mode(mode)
+                fired = self.hook_save_before_swap(ns, USER + self.SAVE)
+                self.crash_after(ns, "remove_intent")
+                with self.assertRaises(SystemExit):
+                    self.compose(ns)
+                self.assertEqual(fired, [1], "끼어들기가 일어나지 않았다(시험 무효)")
+                self.assert_recovered_composed(USER + self.SAVE)
+
+    def test_the_tick_finishes_the_operation_after_restoring_a_newer_save(self):
+        """codex B7 — 틱이 밀려난 새 진실을 되돌린 뒤 기록을 지우고 끝나 조립이 끝나지 않은 채 남았다(PENDING 이 없으면 다음 부서
+        이벤트까지 · 기록도 없이). 틱은 기록된 동작을 끝낸다: 되돌린 저장으로 다시 조립하고 영수증까지 쓴 뒤 기록을 지운다."""
+        for mode in ("exchange", "deposit"):
+            with self.subTest(mode=mode):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                ns = self.ns_mode(mode)
+                self.hook_save_before_swap(ns, USER + self.SAVE)
+                self.crash_after(ns, "keep_file")
+                with self.assertRaises(SystemExit):
+                    self.compose(ns)
+                self.assertFalse(os.path.exists(self.pending_path()))
+                rc, out, err = self.run_dept("promote-if-pending")
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER + self.SAVE,
+                                 "틱이 되돌리기만 하고 기록된 조립을 끝내지 않았다(codex B7)")
+                self.assertIsNone(self.read(".ceo-intent.json"))
+                self.assert_receipt_for(HEADER, USER + self.SAVE, HEADER + SEP + USER + self.SAVE)
+                self.assertIn(USER + self.SAVE, [_slurp(k, encoding="utf-8") for k in self.kept()])
+
     def test_the_tick_closes_a_gap_without_a_launch(self):
         """FA3 — 10분 승격 대기 틱(promote-if-pending)이 PENDING 없이도 끝나지 않은 교체를 마무리한다(빠진 살아 있는 이름 포함) ·
         틱은 알림을 보내지 않는다."""
@@ -1197,10 +1248,13 @@ class SafePrimitives(Rig):
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER)
         self.assertEqual(proxy.opened_live, [], "승격이 살아 있는 이름을 쓰기로 열었다")
         # 빈 살아 있는 이름 + 의도 기록(후보 없음 — 보관된 판만 남은 경우) → 다음 입구가 채운다(쓰기로 열지 않고).
-        rec = {"schema": 1, "id": "X", "op": "compose", "reason": "compose", "mode": "deposit", "live": "MASTER_DIRECTIVE.md",
-               "read_sha256": sha(HEADER + SEP + USER), "candidate": ".MASTER_DIRECTIVE.md.X.candidate",
-               "candidate_sha256": "0" * 64,
-               "kept": "X.compose", "created_at": "2026-11-14T00:00:00Z"}
+        #   기록 = ★FL4 스키마 2(동작 하나에 하나 · 단계 'swap' — 진행 중인 교체의 이름은 swap 안에).
+        rec = {"schema": 2, "id": "X", "op": "compose", "args": {"tmpl": self.p("CEO_TEMPLATE.md"), "tsha": sha(TEMPLATE)},
+               "step": "swap", "notices": [], "kept_report": [], "done": {},
+               "swap": {"purpose": "op", "mode": "deposit", "read_sha256": sha(HEADER + SEP + USER),
+                        "candidate": ".MASTER_DIRECTIVE.md.X.candidate", "candidate_sha256": "0" * 64,
+                        "kept": "X.compose", "reason": "compose"},
+               "created_at": "2026-11-14T00:00:00Z"}
         kd = os.path.join(self.dirs, ".ceo-kept")
         os.replace(self.p("MASTER_DIRECTIVE.md"), os.path.join(kd, "X.compose"))
         _write(self.p(".ceo-intent.json"), json.dumps(rec))

@@ -2373,12 +2373,19 @@ class Preflight:
                      % (ip, os.path.join(d, self._C03_CEO_KEPT_DIR)))
             return
         live = os.path.join(d, "MASTER_DIRECTIVE.md")
-        kept = os.path.join(d, self._C03_CEO_KEPT_DIR, str(rec.get("kept", "?")))
-        cand = os.path.join(d, str(rec.get("candidate", "?")))
-        where = kept if os.path.lexists(kept) else cand
-        self.add(cid, WARN, "끝나지 않은 CEO 지침 교체(%s · %s 시작) — 다음 승격 확인(부서 켜기·`cys-dept promote-ceo`)이나 base "
-                            "데몬의 10분 승격 대기 틱이 마무리한다. 살아 있는 이름: %s · 교체 전 판 또는 후보: %s"
-                 % (rec.get("op", "?"), rec.get("created_at", "?"),
+        # ★FL4: 기록(스키마 2)은 동작 하나에 하나이고 단계(run · swap · swapped)를 담는다 — 진행 중인 교체의 이름은 swap 안에 있다.
+        sw = rec.get("swap") if isinstance(rec.get("swap"), dict) else {}
+        step = str(rec.get("step", "?"))
+        if sw:
+            kept = os.path.join(d, self._C03_CEO_KEPT_DIR, str(sw.get("kept", "?")))
+            cand = os.path.join(d, str(sw.get("candidate", "?")))
+            where = kept if os.path.lexists(kept) else cand
+        else:
+            where = "없음(진행 중인 교체 없음 — 동작을 지금 판으로 다시 할 차례)"
+        self.add(cid, WARN, "끝나지 않은 CEO 지침 교체(%s · 단계 %s · %s 시작) — 다음 승격 확인(부서 켜기·`cys-dept promote-ceo`)이나 "
+                            "base 데몬의 10분 승격 대기 틱이 그 단계에서 이어 가 동작을 끝낸다(또는 보류하고 알린다). 살아 있는 "
+                            "이름: %s · 교체 전 판 또는 후보: %s"
+                 % (rec.get("op", "?"), step, rec.get("created_at", "?"),
                     "있음" if os.path.lexists(live) else "없음(C02 FAIL — 그 바이트는 오른쪽 파일에 있다)", where))
 
     def _c03_boot_contract(self, st):
