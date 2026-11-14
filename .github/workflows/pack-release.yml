@@ -97,7 +97,14 @@ jobs:
       #   cys 0.14.51 에 `--help` 만 써서 `kept-pane-notice` rc 2 확인). ⚠ 아래 하한 검증기(해법②)는 태그
       #   `v0.14.52` 소스를 빌드하므로 이 레인의 다음 팩-only 발행은 v0.14.52 본체 태그 뒤에만 가능하다.
       #   두 값 동일 계약이므로 release.yml PACK_MIN_BINARY 와 같은 커밋에서 함께 올린다.
-      PACK_MIN_BINARY_OVERRIDE: '0.14.52'
+      # ★0.15.0 상향(2026-11-15 · 「스스로 해결」 릴리스 버전 커밋 · 설계 v0.5 §4-11 카 · RULINGS AE3) — 근거는 release.yml
+      #   PACK_MIN_BINARY 주석과 같다: 이 세대 팩이 `cys repair …`(지침의 `cys repair report` 결함 접수 ·
+      #   javis_preflight.py 의 `cys repair boot-critical|tombstones` · javis_report_gate.py 의 `cys repair list`)를
+      #   직접 지시하는데 v0.14.56(31f87878)에는 없다(부재 실측: `repair_cli|RepairCmd` grep -c → 0). ⚠ 아래 하한
+      #   검증기(해법②)는 태그 `v$MIN_BINARY` 소스를 빌드하므로 이 레인의 다음 팩-only 발행은 v0.15.0 본체 태그
+      #   뒤에만 가능하다(설계 §4-11 카 "다음 팩 단독 발행은 v0.15.0 태그가 생긴 뒤에야 가능하다").
+      #   두 값 동일 계약이므로 release.yml PACK_MIN_BINARY 와 같은 커밋에서 함께 올린다.
+      PACK_MIN_BINARY_OVERRIDE: '0.15.0'
     steps:
       - uses: actions/checkout@v4
 
