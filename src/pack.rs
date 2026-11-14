@@ -7594,8 +7594,9 @@ fn restore_journaled_file(
 pub fn rollback_journal() -> Result<(), String> {
     let jdir = pack_journal_dir();
     let index_path = jdir.join("index.json");
-    let s = std::fs::read_to_string(&index_path)
-        .map_err(|e| format!("journal 인덱스 읽기 실패 {}: {e}", index_path.display()))?;
+    // ★T2i(RULINGS FP2): 데몬이 듣기 전의 판독 — 시작 경로의 판독기(막히지 않음 · 일반 파일 · 상한). 판독 불가 = 종전 읽기 오류와
+    //   같은 갈래(Err — 복구를 하지 않고 그대로 둔다). 복구의 순서 · 잠금 · 판정은 바꾸지 않는다(설계 §4).
+    let s = journal_text(&index_path, "journal 인덱스 읽기 실패")?;
     let index: JournalIndex =
         serde_json::from_str(&s).map_err(|e| format!("journal 인덱스 파싱 실패: {e}"))?;
     let dir = pack_dir();
@@ -7604,8 +7605,13 @@ pub fn rollback_journal() -> Result<(), String> {
         let target = dir.join(&entry.rel);
         if entry.existed {
             let backup = files_dir.join(&entry.rel);
-            let bytes = std::fs::read(&backup)
-                .map_err(|e| format!("journal 백업 복원 읽기 실패 {}: {e}", backup.display()))?;
+            let bytes = match read_start_meta(&backup) {
+                StartRead::Bytes(b) => b,
+                StartRead::Missing => return Err(format!("journal 백업 복원 읽기 실패 {}: 없음", backup.display())),
+                StartRead::Unreadable(e) => {
+                    return Err(format!("journal 백업 복원 읽기 실패 {}: {e}", backup.display()))
+                }
+            };
             if let Some(parent) = target.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -7633,6 +7639,15 @@ pub fn rollback_journal() -> Result<(), String> {
     Ok(())
 }
 
+/// ★T2i(RULINGS FP2): 저널 메타 파일의 텍스트 — 시작 경로의 판독기로(없음 · 판독 불가 · UTF-8 아님 = Err, 종전 읽기 오류와 같은 갈래).
+fn journal_text(path: &Path, what: &str) -> Result<String, String> {
+    match read_start_meta(path) {
+        StartRead::Bytes(b) => String::from_utf8(b).map_err(|e| format!("{what} {}: UTF-8 아님({e})", path.display())),
+        StartRead::Missing => Err(format!("{what} {}: 없음", path.display())),
+        StartRead::Unreadable(e) => Err(format!("{what} {}: {e}", path.display())),
+    }
+}
+
 /// crash recovery(§7-⑤): orphan 저널을 발견하면 `.pack-version`(= hard commit marker)을 저널의
 /// 목표 버전과 대조한다. 같으면 커밋은 성공했고 저널 정리 중 crash였으므로 저널만 삭제(롤백 금지).
 /// 다르면 미커밋(부분적용)이므로 rollback으로 pre-state 자가치유. 인덱스 부재(백업 도중 crash)는
@@ -7649,11 +7664,13 @@ pub fn recover_pack_journal() -> Result<bool, String> {
         }
         return Ok(false);
     }
-    let s = std::fs::read_to_string(&index_path)
-        .map_err(|e| format!("journal 인덱스 읽기 실패 {}: {e}", index_path.display()))?;
+    // ★T2i(RULINGS FP2): 시작 경로의 판독기 — 판독 불가 = 종전 읽기 오류 갈래(인덱스: Err = 복구 건너뜀 · `.pack-version`: 빈 값 =
+    //   종전 읽기 실패와 같은 '미커밋' 판정).
+    let s = journal_text(&index_path, "journal 인덱스 읽기 실패")?;
     let index: JournalIndex =
         serde_json::from_str(&s).map_err(|e| format!("journal 인덱스 파싱 실패(손상): {e}"))?;
-    let disk_version = std::fs::read_to_string(pack_dir().join(PACK_VERSION_FILE))
+    let disk_version = read_start_meta(&pack_dir().join(PACK_VERSION_FILE))
+        .text()
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     if !disk_version.is_empty() && disk_version == index.target_version {
@@ -15582,6 +15599,31 @@ mod m11_tests {
             assert!(!cfg.join(FIRST_RUN_SEED_BACKUP).exists(), ".claude.json as {form}: 백업 없음");
             let _ = std::fs::remove_dir_all(&root);
         }
+        // ★T2i(RULINGS FP2): 데몬이 듣기 전의 저널 복구 — 정상 저널(인덱스 + 백업)에서 인덱스 · 백업 · `.pack-version` 자리에 같은
+        //   형태를 두어도 복구는 시한 안에 돌아온다(복구의 순서 · 판정은 그대로 — 판독 불가 = 종전 읽기 오류 갈래).
+        for (ti, target) in ["index.json", "files/a.txt", "../pack/.pack-version"].iter().enumerate() {
+            for form in &forms {
+                let root = rig.base.join(format!("j{ti}-{form}"));
+                let pack = root.join("pack");
+                std::fs::create_dir_all(&pack).unwrap();
+                std::fs::write(pack.join("a.txt"), "new").unwrap();
+                std::fs::write(pack.join(PACK_VERSION_FILE), "1.0.0
+").unwrap();
+                let jdir = root.join(".pack-journal");
+                std::fs::create_dir_all(jdir.join("files")).unwrap();
+                std::fs::write(
+                    jdir.join("index.json"),
+                    r#"{"target_version":"2.0.0","entries":[{"rel":"a.txt","existed":true,"mode":null}]}"#,
+                )
+                .unwrap();
+                std::fs::write(jdir.join("files").join("a.txt"), "old").unwrap();
+                let p = jdir.join(target);
+                plant_special(&p, form, &root, &format!("journal {target} as {form}"));
+                let _env = EnvGuard::set("CYS_PACK_DIR", &pack);
+                let _ = deadline(&format!("journal {target} as {form}"), recover_pack_journal);
+                let _ = std::fs::remove_dir_all(&root);
+            }
+        }
         // 잠금 파일 자리의 FIFO → 잠금 없이 진행(종전 열기 실패와 같은 갈래) · 병합은 끝난다.
         #[cfg(unix)]
         {
@@ -15712,79 +15754,263 @@ mod m11_tests {
         }
     }
 
-    /// ★T2i(RULINGS EC5): 시작 경로 판독 조사(census) — 데몬의 기동 설치(`install_into_with`)에서 닿는 함수 가운데 파일을 읽는
-    /// 것은 시작 경로의 두 판독기(`read_start_meta` · `read_start_live`)로만 읽는다. 아래 목록은 호출 그래프로 찾은 것이다(보고서
-    /// R3 EC5 절 — 기계 조사 · 판독 함수 27곳 + `packsig::read_accepted`). 각 몸통에 날것의 판독(`std::fs::read(` · `read_to_string(` · `std::fs::copy(` ·
-    /// `File::open(`)이 없어야 한다. `write_atomic_mode_inner` 의 `File::open(parent)` 는 폴더를 여는 것(내용 판독 아님)이라 뺀다.
+    /// ★T2i(RULINGS EC5 · FP2): 시작 경로 판독 조사(census) — 데몬이 듣기 **전**에 도는 팩 코드의 실제 뿌리(`cysd` main 의
+    /// `recover_pack_journal` · `pack_current_for` · `install`)에서 **호출 그래프를 따라** 닿는 함수(이 파일과 `packsig.rs` 의
+    /// 시험 밖 함수, 이름으로 해소 — 넘치게 잡는 쪽) 가운데 날것의 경로 판독(`std::fs::read(` · `std::fs::read_to_string(` ·
+    /// `fs::read_to_string(` · `std::fs::copy(` · `File::open(`)이 있는 곳은 없어야 한다. 예외 둘: `write_atomic_mode_inner` 와
+    /// `sync_parent_dir` 의 `File::open(parent)` = 폴더를 내리려고 여는 것(내용 판독 아님). 새 판독 함수 · 새 호출이 생기면 이 조사가
+    /// 저절로 잡는다(이 Mac 에서 닿는 함수 165개 — 파이썬 이식으로 같은 규칙을 미리 잰 값, `impl/runs/T2-scratch/census_port.py`).
     #[test]
     fn ec5_start_path_read_census() {
         let pack_src = include_str!("pack.rs");
         let sig_src = include_str!("packsig.rs");
-        let body_of = |src: &str, head: &str| -> String {
-            let at = src.find(head).unwrap_or_else(|| panic!("census: {head} not found"));
-            let rest = &src[at..];
-            let open = rest.find('{').unwrap();
-            let mut depth = 0i32;
-            for (i, ch) in rest[open..].char_indices() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return rest[..open + i + 1].to_string();
+        // 문자열 · 문자 · 주석을 지운 사본(괄호 짝 맞추기용 — 길이 보존).
+        fn blank(src: &str) -> String {
+            let b = src.as_bytes();
+            let mut out = b.to_vec();
+            let mut i = 0;
+            while i < b.len() {
+                match b[i] {
+                    b'/' if b.get(i + 1) == Some(&b'/') => {
+                        while i < b.len() && b[i] != b'\n' {
+                            out[i] = b' ';
+                            i += 1;
                         }
                     }
-                    _ => {}
+                    b'/' if b.get(i + 1) == Some(&b'*') => {
+                        while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                            if b[i] != b'\n' {
+                                out[i] = b' ';
+                            }
+                            i += 1;
+                        }
+                        out[i] = b' ';
+                        if i + 1 < b.len() {
+                            out[i + 1] = b' ';
+                        }
+                        i += 2;
+                    }
+                    b'r' if (b.get(i + 1) == Some(&b'"') || b.get(i + 1) == Some(&b'#'))
+                        && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) =>
+                    {
+                        let mut j = i + 1;
+                        let mut hashes = 0;
+                        while b.get(j) == Some(&b'#') {
+                            hashes += 1;
+                            j += 1;
+                        }
+                        if b.get(j) != Some(&b'"') {
+                            i += 1;
+                            continue;
+                        }
+                        j += 1;
+                        loop {
+                            if j >= b.len() {
+                                break;
+                            }
+                            if b[j] == b'"' && (0..hashes).all(|h| b.get(j + 1 + h) == Some(&b'#')) {
+                                j += 1 + hashes;
+                                break;
+                            }
+                            j += 1;
+                        }
+                        for o in out.iter_mut().take(j).skip(i) {
+                            if *o != b'\n' {
+                                *o = b' ';
+                            }
+                        }
+                        i = j;
+                    }
+                    b'"' => {
+                        out[i] = b' ';
+                        i += 1;
+                        while i < b.len() && b[i] != b'"' {
+                            if b[i] == b'\\' {
+                                out[i] = b' ';
+                                i += 1;
+                            }
+                            if i < b.len() && b[i] != b'\n' {
+                                out[i] = b' ';
+                            }
+                            i += 1;
+                        }
+                        if i < b.len() {
+                            out[i] = b' ';
+                        }
+                        i += 1;
+                    }
+                    b'\'' => {
+                        // 문자 리터럴('x' · '\n' · '\u{..}')만 지운다 — 수명('a)은 그대로.
+                        let end = if b.get(i + 1) == Some(&b'\\') {
+                            (i + 2..b.len().min(i + 12)).find(|&k| b[k] == b'\'')
+                        } else if b.get(i + 2) == Some(&b'\'') {
+                            Some(i + 2)
+                        } else {
+                            std::str::from_utf8(&b[i + 1..b.len().min(i + 6)])
+                                .ok()
+                                .or_else(|| std::str::from_utf8(&b[i + 1..b.len().min(i + 5)]).ok())
+                                .and_then(|s| s.chars().next())
+                                .map(|c| i + 1 + c.len_utf8())
+                                .filter(|&k| b.get(k) == Some(&b'\''))
+                        };
+                        match end {
+                            Some(e) => {
+                                for o in out.iter_mut().take(e + 1).skip(i) {
+                                    *o = b' ';
+                                }
+                                i = e + 1;
+                            }
+                            None => i += 1,
+                        }
+                    }
+                    _ => i += 1,
                 }
             }
-            panic!("census: {head} unbalanced")
+            String::from_utf8_lossy(&out).into_owned()
+        }
+        // 시험 모듈(`#[cfg(test)] mod … { … }`)의 바이트 구간.
+        fn test_regions(code: &str) -> Vec<(usize, usize)> {
+            let mut out = Vec::new();
+            let mut from = 0;
+            while let Some(k) = code[from..].find("#[cfg(test)]") {
+                let at = from + k;
+                let rest = &code[at..];
+                let Some(m) = rest.find("mod ") else { break };
+                if rest[..m].contains(';') || rest[..m].contains("fn ") {
+                    from = at + 12;
+                    continue;
+                }
+                let Some(open) = rest.find('{') else { break };
+                let mut depth = 0i32;
+                let mut end = rest.len();
+                for (i, ch) in rest[open..].char_indices() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = open + i + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                out.push((at, at + end));
+                from = at + end;
+            }
+            out
+        }
+        // 이름 → 몸통(원문) 목록.
+        fn functions(src: &str) -> Vec<(String, String)> {
+            let code = blank(src);
+            let tests = test_regions(&code);
+            let mut out = Vec::new();
+            let bytes = code.as_bytes();
+            let mut pos = 0;
+            while let Some(k) = code[pos..].find("fn ") {
+                let at = pos + k;
+                pos = at + 3;
+                if at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') {
+                    continue;
+                }
+                if tests.iter().any(|&(s, e)| at >= s && at < e) {
+                    continue;
+                }
+                let name: String = code[at + 3..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                if name.is_empty() {
+                    continue;
+                }
+                let rest = &code[at..];
+                let (Some(open), semi) = (rest.find('{'), rest.find(';')) else { continue };
+                if semi.is_some_and(|s| s < open) {
+                    continue;
+                }
+                let mut depth = 0i32;
+                let mut end = None;
+                for (i, ch) in rest[open..].char_indices() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(open + i + 1);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(end) = end else { continue };
+                out.push((name, src[at..at + end].to_string()));
+            }
+            out
+        }
+        let mut fns: Vec<(String, String, &str)> = Vec::new();
+        for (n, b) in functions(pack_src) {
+            fns.push((n, b, "pack.rs"));
+        }
+        for (n, b) in functions(sig_src) {
+            fns.push((n, b, "packsig.rs"));
+        }
+        let names: std::collections::BTreeSet<String> = fns.iter().map(|(n, _, _)| n.clone()).collect();
+        let calls_of = |body: &str| -> Vec<String> {
+            let code = blank(body);
+            let mut out = Vec::new();
+            let b = code.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+                    let s = i;
+                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                        i += 1;
+                    }
+                    let mut j = i;
+                    while j < b.len() && b[j] == b' ' {
+                        j += 1;
+                    }
+                    if b.get(j) == Some(&b'(') {
+                        out.push(code[s..i].to_string());
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            out
         };
-        let readers = [
-            "fn channel_guard_and_heal(",
-            "fn pro_file_evidence(",
-            "pub fn read_pack_state(",
-            "fn load_manifest_state(",
-            "pub fn load_merge_pending(",
-            "fn merge_audit_keep_rels(",
-            "fn classify_stale_entry(",
-            "pub fn classify_stale_entry_with(",
-            "fn ensure_pristine_checked(",
-            "fn load_verified_base(",
-            "fn byte_backup_user(",
-            "fn park_user_copy(",
-            "fn park_user_kept(",
-            "fn plan_install_core(",
-            "fn preserve_prior_user_generation_at(",
-            "fn ceo_promoted_in(",
-            "fn seed_dept_soul_content(",
-            "pub fn create_update_snapshot(",
-            "pub fn read_update_snapshot_meta(",
-            "fn take_update_snapshot(",
-            "pub fn merge_desired_hooks(",
-            "pub fn retune_registered_hook_timeouts(",
-            "pub fn verify_desired_hooks_registered(",
-            "pub fn seed_first_run_gates_at(",
-            "fn settings_read_bounded(",
-            "fn settings_backup_from(",
-            "pub fn install_into_with<",
-        ];
-        let raw = ["std::fs::read(", "read_to_string(", "std::fs::copy(", "File::open("];
-        let mut bad = Vec::new();
-        for head in readers {
-            let b = body_of(pack_src, head);
-            for r in raw {
-                if b.lines().any(|l| l.contains(r) && !l.trim_start().starts_with("//")) {
-                    bad.push(format!("{head} {r}"));
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut stack: Vec<String> = ["recover_pack_journal", "pack_current_for", "install"].iter().map(|s| s.to_string()).collect();
+        for r in &stack {
+            assert!(names.contains(r), "census root {r} not found");
+        }
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n.clone()) {
+                continue;
+            }
+            for (fname, body, _) in fns.iter().filter(|(f, _, _)| *f == n) {
+                let _ = fname;
+                for c in calls_of(body) {
+                    if names.contains(&c) && !seen.contains(&c) {
+                        stack.push(c);
+                    }
                 }
             }
         }
-        let acc = body_of(sig_src, "fn read_accepted(");
-        for r in raw {
-            if acc.lines().any(|l| l.contains(r) && !l.trim_start().starts_with("//")) {
-                bad.push(format!("packsig read_accepted {r}"));
+        for must in ["install_into_with", "channel_guard_and_heal", "read_accepted", "rollback_journal", "merge_desired_hooks", "park_copy_at"] {
+            assert!(seen.contains(must), "census must reach {must} (reached {})", seen.len());
+        }
+        let raw = ["std::fs::read(", "std::fs::read_to_string(", "fs::read_to_string(", "std::fs::copy(", "File::open("];
+        let mut bad = Vec::new();
+        for (n, body, file) in fns.iter().filter(|(n, _, _)| seen.contains(n)) {
+            let code = blank(body);
+            for r in raw {
+                let dir_open = r == "File::open(" && (n == "write_atomic_mode_inner" || n == "sync_parent_dir");
+                if code.contains(r) && !dir_open {
+                    bad.push(format!("{file}::{n} {r}"));
+                }
             }
         }
-        assert!(bad.is_empty(), "start-path raw reads: {bad:?}");
+        assert!(bad.is_empty(), "unbounded reads reachable before the daemon listens ({} functions): {bad:?}", seen.len());
     }
 
     /// ★T2h(RULINGS CW3 · 검토자 B3): 시작 경로(데몬의 기동 설치 — 바인드 전)는 장부·메타 파일 하나로 멈추지 않는다 — 감사 원장 ·
