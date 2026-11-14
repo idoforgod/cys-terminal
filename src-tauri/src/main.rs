@@ -19127,10 +19127,14 @@ mod repair_stub_tests {
         // DR8 (REWRITTEN — old expectation: the Windows text contains "두 번의 옮기기" for every
         // revert): each form is named for what it really does — changed files moved out then the
         // pre-image placed, created files only moved out, deleted files only placed, hooks re-registered
-        let win = &item[item.find("? \"").unwrap()..item.find(": \"").unwrap()];
+        // the Windows text runs from `? "` to the first `: "` AFTER it (the item's own `id: "` comes
+        // before it)
+        let q = item.find("? \"").unwrap();
+        let colon = q + item[q..].find(": \"").unwrap();
+        let win = &item[q..colon];
         assert!(win.contains("먼저 보관소로 옮긴 뒤") && win.contains("새로 만든 파일은 보관소로 옮기기만") && win.contains("지운 파일은 적용 전 내용을 놓기만") && win.contains("훅 등록은 다시 등록"), "{win}");
         assert!(!win.contains("원자적 맞바꾸기"), "{win}");
-        let mac = &item[item.find(": \"").unwrap()..];
+        let mac = &item[colon..];
         assert!(mac.contains("바뀐 파일은 원자적 맞바꾸기로") && mac.contains("새로 만든 파일은 보관소로 옮겨서"), "{mac}");
         assert!(item.contains("가장 최근에 적용된 수리"));
     }
