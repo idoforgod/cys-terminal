@@ -2901,6 +2901,21 @@ mod defect_intake_tests {
             Ok(m) => m,
             Err(_) => panic!("cycle {cycle}: the flush ended before its first row section: {:?}", flusher.join().map(|r| format!("{r:?}"))),
         };
+        // (#106) decide on the first probe BEFORE a reporter exists: a detector inside the free row's section without
+        // that row's lock — or holding the contended row's lock there — fails now, so no reporter can block on a
+        // shard the waiting detector holds (the go-channel is closed first, so the detector never waits for ever)
+        let early = if first.0 != free_rep.signature || !first.1 {
+            Some(format!("cycle {cycle}: the detector was inside the free row's section WITHOUT that row's lock ({first:?})"))
+        } else if crate::repair::intake_lock_is_held(&cont_rep.signature) {
+            Some(format!("cycle {cycle}: the detector held the contended row's lock inside the free row's section"))
+        } else {
+            None
+        };
+        if let Some(why) = early {
+            drop(go_tx);
+            let _ = flusher.join();
+            panic!("{why}");
+        }
         // ② meanwhile the reporter really updates the contended row under the shared lock, and releases it
         let (r_root, r_lane, r_rep, r_raw, r_path) = (root.to_path_buf(), lane.clone(), cont_rep.clone(), contended.clone(), cont_path.clone());
         let reporter = std::thread::spawn(move || {
