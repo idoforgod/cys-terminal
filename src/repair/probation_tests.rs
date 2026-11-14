@@ -1705,3 +1705,95 @@ fn a_corrupt_pack_state_suspends_the_put_back() {
     let _ = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
     assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"#!/bin/bash\nbroken(\n", "nothing put back");
 }
+
+// ───────────────────────────── RULINGS HF2 — the notice book reads only through the bounded reader ─────────────────────────────
+
+/// HF2 (codex r7 M2): every read inside the notice book's critical section is GK5's bounded reader. A
+/// FIFO at the notice-state name (the hand-out counts) and at an M10 operation record's name: the
+/// request that chooses and reserves the due notices answers "unreadable" — said, not waited for —
+/// and a SECOND request (the acknowledgement, under the same mutex) is served; the notice stays due.
+/// Causal, not timed: a writer thread offers a VALID file to every reader of each FIFO, so the old
+/// blocking reads got a value and answered without an error; with HF2 the FIFO is refused before any
+/// read.
+#[cfg(unix)]
+#[test]
+fn the_notice_book_answers_unreadable_for_a_fifo_and_serves_the_next_request() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let r = rig("hf2fifo");
+    let lane = r.lane.clone();
+    let findings = findings_path_in(&r.root, &lane);
+    std::fs::create_dir_all(findings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &findings,
+        serde_json::json!({"schema": 1, "lane": lane.0, "findings": [
+            {"rel": "hooks/x.sh", "sha256": "ab", "kind": "kept", "at": 1.0, "notice": true, "notified": false, "slot": null, "note": "n"}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let handed = notices_handed_path_in(&r.root, &lane);
+    let op_at = crate::repair::wal::op_path_in(&m10_root_in(&r.root, &lane), &m10_bucket(), "20261115-m10-hf2");
+    std::fs::create_dir_all(op_at.parent().unwrap()).unwrap();
+    let op = crate::repair::wal::OpRecord {
+        schema: 1,
+        op: "20261115-m10-hf2".into(),
+        repair: m10_bucket(),
+        lane_key: lane.clone(),
+        kind: "m10-revert".into(),
+        form: "exchange".into(),
+        rel: "hooks/y.sh".into(),
+        pre_existed: true,
+        expected: String::new(),
+        incoming: String::new(),
+        pack_generation: None,
+        slot: None,
+        slot_identity: None,
+        live_identity: None,
+        incoming_copy: None,
+        incoming_copy_identity: None,
+        step: "done".into(),
+        hooks: Vec::new(),
+        finished: true,
+        outcome: Some("applied".into()),
+        note: String::new(),
+        created_at: 1.0,
+        updated_at: 2.0,
+        notice: None,
+    };
+    let valid_handed = serde_json::json!({"schema": 1, "lane": lane.0, "counts": {}}).to_string().into_bytes();
+    for (at, valid) in [(handed.clone(), valid_handed), (op_at.clone(), serde_json::to_vec(&op).unwrap())] {
+        let c = std::ffi::CString::new(at.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0, "{}", at.display());
+        let w_at = at.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let w_stop = std::sync::Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            // each open waits for a reader of the FIFO and serves it; a write error (the reader already
+            // gone) is fine; it ends when told to, or when the name no longer holds the FIFO
+            use std::os::unix::fs::FileTypeExt;
+            while !w_stop.load(std::sync::atomic::Ordering::SeqCst) && std::fs::symlink_metadata(&w_at).is_ok_and(|m| m.file_type().is_fifo()) {
+                match std::fs::OpenOptions::new().write(true).open(&w_at) {
+                    Ok(mut f) => {
+                        let _ = f.write_all(&valid);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let got = hand_out_due_notices_in(&r.root, &lane);
+        assert!(matches!(&got, Err(RepairError::Io(m)) if m.contains("일반 파일이 아님")), "a FIFO at {}: {got:?}", at.display());
+        // the second request is served (the mutex was released): an acknowledgement
+        ack_notices_in(&r.root, &lane, &["k:hf2".to_string()]).unwrap();
+        // stop the writer (a reader lets its waiting open go), then take the FIFO away
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let release = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&at).unwrap();
+        writer.join().unwrap();
+        drop(release);
+        std::fs::remove_file(&at).unwrap();
+    }
+    // nothing was lost: the notice is still due and goes out now
+    let due = hand_out_due_notices_in(&r.root, &lane).unwrap();
+    assert_eq!(due.iter().map(|d| d.key.as_str()).collect::<Vec<_>>(), vec!["f:hooks/x.sh:ab:kept"]);
+}

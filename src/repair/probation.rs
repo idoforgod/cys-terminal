@@ -1224,11 +1224,14 @@ pub fn m10_bucket() -> RepairId {
 /// RULINGS FG1 — a JSON file of the repair module read with three answers: `Ok(Some(value))`;
 /// `Ok(None)` only on positive evidence (the file does not exist AND its folder — or, when the folder
 /// is missing too, the nearest existing ancestor — can be read); `Err` for everything else (a read
-/// error, a parse error).
+/// error, a parse error). RULINGS HF2 — read through GK5's ONE bounded reader (a non-blocking open
+/// that follows no link, a regular file, the size cap): a FIFO, a link or an oversized file is
+/// unreadable at once, never waited for (the notice book reads these files under its mutex).
 fn read_json_checked<T: serde::de::DeserializeOwned>(p: &Path) -> Result<Option<T>, RepairError> {
-    match std::fs::read(p) {
-        Ok(b) => serde_json::from_slice::<T>(&b).map(Some).map_err(|e| RepairError::Io(format!("{}: 읽을 수 없음(손상) — {e}", p.display()))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+    match super::durable::read_record_bytes(p) {
+        super::durable::RecordRead::Bytes(b) => serde_json::from_slice::<T>(&b).map(Some).map_err(|e| RepairError::Io(format!("{}: 읽을 수 없음(손상) — {e}", p.display()))),
+        super::durable::RecordRead::Unreadable(why) => Err(RepairError::Io(format!("읽을 수 없음 — {why}"))),
+        super::durable::RecordRead::NotFound => {
             let mut up = p.parent();
             while let Some(a) = up {
                 match std::fs::read_dir(a) {
@@ -1239,7 +1242,6 @@ fn read_json_checked<T: serde::de::DeserializeOwned>(p: &Path) -> Result<Option<
             }
             Err(RepairError::Io(format!("{}: 없음, 그러나 읽을 수 있는 상위 폴더가 없음", p.display())))
         }
-        Err(e) => Err(RepairError::Io(format!("{}: 읽을 수 없음 — {e}", p.display()))),
     }
 }
 

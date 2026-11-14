@@ -108,7 +108,13 @@ pub fn list_checked_in(root: &Path, id: &RepairId) -> Result<Vec<OpRecord>, Stri
         if p.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
-        let b = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        // RULINGS HF2 — GK5's bounded reader: a FIFO, a link or an oversized record is unreadable at
+        // once (the notice book lists the M10 records under its mutex)
+        let b = match super::durable::read_record_bytes(&p) {
+            super::durable::RecordRead::Bytes(b) => b,
+            super::durable::RecordRead::NotFound => return Err(format!("{}: 목록을 읽은 뒤 사라짐", p.display())),
+            super::durable::RecordRead::Unreadable(why) => return Err(why),
+        };
         let r: OpRecord = serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", p.display()))?;
         out.push(r);
     }
