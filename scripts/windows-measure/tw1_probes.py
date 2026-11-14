@@ -2736,9 +2736,13 @@ def probe_s3_judges(pr):
         shutil.rmtree(pc, ignore_errors=True)
     # 7. compgen in Git Bash: _cys_lc_handback for the four LC_CTYPE states, and what the wrapper's child sees
     f["compgen_type"] = _bash(pr, "type compgen", seat_env(pr), "compgen-type")["out"].strip()[:80]
+    # precondition of the 'unset' / 'shellvar' cases: Git Bash itself does not export LC_CTYPE when its parent has none
+    pre = _bash(pr, "compgen -e -X '!LC_CTYPE' LC_CTYPE; echo end", seat_env(pr), "compgen-pre")
+    f["compgen_bash_exports_lc_ctype_itself"] = None if "end" not in pre["out"] else ("LC_CTYPE" in pre["out"])
     child = ("import os; print(repr(os.environ.get('LC_CTYPE')))")
-    cases = (("exported", {"LC_CTYPE": "C.UTF-8"}, ""), ("unset", {}, ""), ("shellvar", {}, "LC_CTYPE=xx_TW1; "),
-             ("empty", {"LC_CTYPE": ""}, ""))
+    # the four states are set up by the shell itself (independent of how Windows hands an empty value to MSYS)
+    cases = (("exported", {}, "export LC_CTYPE=C.UTF-8; "), ("unset", {}, "unset LC_CTYPE; "),
+             ("shellvar", {}, "unset LC_CTYPE; LC_CTYPE=xx_TW1; "), ("empty", {}, "export LC_CTYPE=; "))
     for name, extra, pre in cases:
         q = ('. "%s"; %s_cys_lc_handback; printf "[%%s]\\n" "$_cys_lc"; timeout() { return 1; }; '
              'gtimeout() { return 1; }; cys_timeout_run 20 "$CYS_PY" -I -S -c "%s"') % (lib, pre, child)

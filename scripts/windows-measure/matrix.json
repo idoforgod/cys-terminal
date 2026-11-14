@@ -3893,8 +3893,8 @@
    ],
    "run_when_absent": true,
    "title": "a file the update must REPLACE is held open without delete sharing during the app's init-pack",
-   "source": "RULINGS GJ3, GS2; reports/T9a-report.md GH3 (3), 'TW1 row IN-PLACE-HELD'",
-   "expected": "the run stops at that file with a non-zero exit naming it; files before it (item order) updated, it and later ones unchanged; nothing deleted; .pack-version old; after the holder is released one more run exits 0 and completes the tree",
+   "source": "RULINGS GJ3, GS2; reports/T9a-report.md GH3 (3), GH4, 'TW1 row IN-PLACE-HELD'",
+   "expected": "nothing deleted; after the holder is released one more run exits 0 and completes the tree; IF Windows refuses the replacement (T9a: unmeasured) the run stops at that file - see IN-PLACE-HELD.stop",
    "checks": [
     {
      "id": "base",
@@ -3928,56 +3928,23 @@
      "op": "true"
     },
     {
-     "id": "earlier-files",
-     "role": "control",
-     "fact": "iph_updated_before_held_count",
-     "op": "ge",
-     "value": 1,
-     "text": "files before the held one were updated (the scenario can show a partial run)"
+     "id": "refused",
+     "role": "assumption",
+     "fact": "iph_held_unchanged_1",
+     "op": "true",
+     "assumption": "T9a GH3 (3) / GH4: Windows refuses to replace a pack file held open without delete sharing (never measured before)"
     },
     {
-     "id": "exit-nonzero",
+     "id": "exit",
      "role": "check",
      "fact": "iph_exit_1",
-     "op": "ne",
-     "value": 0
-    },
-    {
-     "id": "names-held",
-     "role": "check",
-     "fact": "iph_err_names_held",
-     "op": "true",
-     "text": "'cannot write <the held file>'"
+     "op": "present"
     },
     {
      "id": "nothing-missing",
      "role": "check",
      "fact": "iph_missing_1",
      "op": "empty"
-    },
-    {
-     "id": "none-after",
-     "role": "check",
-     "fact": "iph_updated_after_held",
-     "op": "empty"
-    },
-    {
-     "id": "all-before",
-     "role": "check",
-     "fact": "iph_not_updated_before_held",
-     "op": "empty"
-    },
-    {
-     "id": "held-untouched",
-     "role": "check",
-     "fact": "iph_held_unchanged_1",
-     "op": "true"
-    },
-    {
-     "id": "version-old",
-     "role": "check",
-     "fact": "iph_pack_version_1_is_base",
-     "op": "true"
     },
     {
      "id": "rerun-exit0",
@@ -4017,6 +3984,75 @@
      "role": "check",
      "fact": "iph_pack_prev_after",
      "op": "false"
+    }
+   ],
+   "subrows": [
+    {
+     "id": "IN-PLACE-HELD.stop",
+     "probe": "s6_inplace",
+     "needs_units": [
+      "T9a"
+     ],
+     "run_when_absent": true,
+     "title": "when the replacement IS refused: the run stops at that file - non-zero exit naming it, the files before it (item order) updated, none after it, .pack-version old",
+     "checks": [
+      {
+       "id": "held",
+       "role": "complete",
+       "fact": "iph_holder_held",
+       "op": "true"
+      },
+      {
+       "id": "refused",
+       "role": "complete",
+       "fact": "iph_held_unchanged_1",
+       "op": "true",
+       "text": "the held file kept its bytes (the replacement was refused)"
+      },
+      {
+       "id": "earlier-files",
+       "role": "control",
+       "fact": "iph_updated_before_held_count",
+       "op": "ge",
+       "value": 1,
+       "text": "files before the held one were updated (the scenario can show a partial run)"
+      },
+      {
+       "id": "exit-nonzero",
+       "role": "check",
+       "fact": "iph_exit_1",
+       "op": "ne",
+       "value": 0
+      },
+      {
+       "id": "names-held",
+       "role": "check",
+       "fact": "iph_err_names_held",
+       "op": "true",
+       "text": "'cannot write <the held file>'"
+      },
+      {
+       "id": "none-after",
+       "role": "check",
+       "fact": "iph_updated_after_held",
+       "op": "empty"
+      },
+      {
+       "id": "all-before",
+       "role": "check",
+       "fact": "iph_not_updated_before_held",
+       "op": "empty"
+      },
+      {
+       "id": "version-old",
+       "role": "check",
+       "fact": "iph_pack_version_1_is_base",
+       "op": "true"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
     }
    ],
    "kind": "assert",
@@ -4816,6 +4852,13 @@
      "fact": "compgen_type",
      "op": "contains",
      "value": "builtin"
+    },
+    {
+     "id": "bash-own",
+     "role": "check",
+     "fact": "compgen_bash_exports_lc_ctype_itself",
+     "op": "present",
+     "text": "recorded: whether Git Bash exports LC_CTYPE by itself (the four states are set up with export / unset)"
     },
     {
      "id": "hb-exported",
