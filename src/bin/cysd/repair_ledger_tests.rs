@@ -4557,3 +4557,27 @@ fn ed1_finished_repair_no_longer_refuses() {
         .unwrap();
     assert_eq!(p["begin"], "new", "{p}");
 }
+
+/// RULINGS ED3: two names in ONE `begin` that only the conservative rule equates (case twins
+/// that do not exist yet) get the conditional sentence — "같은 파일입니다" is said only for one
+/// identity.
+#[test]
+fn ed3_one_begin_conservative_pair_gets_the_conditional_sentence() {
+    let r = rig("ed3");
+    std::fs::create_dir_all(r.pack.join("g")).unwrap();
+    let e = r
+        .call(
+            T0,
+            &seat(3, "worker"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["g/a.txt", "g/A.txt"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "invalid_params", "{}", e.message);
+    assert!(
+        e.message.contains("볼륨에 따라 같은 파일일 수 있습니다"),
+        "{}",
+        e.message
+    );
+    assert!(!e.message.contains("같은 파일입니다"), "{}", e.message);
+}

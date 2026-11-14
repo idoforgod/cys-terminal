@@ -1673,15 +1673,21 @@ mod ledger_verbs {
         for rel in &files {
             target_rules(ctx, rel)?;
         }
-        // DA4: one file named twice (another spelling, a hard link) is one target
+        // DA4 / ED3: one file named twice is one target; the sentence says what is known — one
+        // identity ("같은 파일입니다") or only the conservative rule (one file on some volumes)
         for (i, a) in files.iter().enumerate() {
-            if let Some(b) = files[i + 1..]
+            if let Some((b, how)) = files[i + 1..]
                 .iter()
-                .find(|b| super::same_target(&ctx.pack_dir, a, b))
+                .find_map(|b| super::same_now(&ctx.pack_dir, a, b).map(|h| (b, h)))
             {
-                return Err(VerbError::invalid(format!(
-                    "{a} 와 {b} 는 같은 파일입니다 — 한 번만 지정하세요(RULINGS DA4)"
-                )));
+                return Err(VerbError::invalid(match how {
+                    super::Same::Identity | super::Same::Spelling => {
+                        format!("{a} 와 {b} 는 같은 파일입니다 — 한 번만 지정하세요(RULINGS DA4)")
+                    }
+                    super::Same::CaseFold | super::Same::NonAscii => format!(
+                        "{a} 와 {b} 는 볼륨에 따라 같은 파일일 수 있습니다(대소문자만 다르거나 ASCII 가 아닌 아직 없는 이름) — 한 수리에 함께 지정하지 마세요(RULINGS DJ1 · ED3)"
+                    ),
+                }));
             }
         }
         // T4 (C10 10.6 · AD6 replaced · AW8): the rule-document branch — a rule document (any
@@ -4412,7 +4418,8 @@ pub(crate) fn same_now(pack: &Path, a: &str, b: &str) -> Option<Same> {
     }
 }
 
-/// [`same_now`] as a yes / no.
+/// [`same_now`] as a yes / no (the tests' shorthand; the verbs use `same_now` for its sentence).
+#[cfg(test)]
 pub(crate) fn same_target(pack: &Path, a: &str, b: &str) -> bool {
     same_now(pack, a, b).is_some()
 }
