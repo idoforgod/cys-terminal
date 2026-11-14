@@ -1118,7 +1118,9 @@ fn scratch_prefix(lane: &LaneKey) -> String {
     format!(".propagate-{}-", lane.0)
 }
 
-/// Removes leftovers `lanes/.propagate-<lane>-<pid>-<n>` of OTHER processes (exact names only).
+/// Removes leftovers `lanes/.propagate-<lane>-<pid>-<n>` of OTHER processes (exact names only): only
+/// this lane's daemon makes this lane's scratch and one daemon runs per lane (the startup lock), so a
+/// scratch of another pid is a previous incarnation's.
 fn sweep_own_scratch(root: &Path, lane: &LaneKey) {
     let dir = root.join("lanes");
     let Ok(rd) = std::fs::read_dir(&dir) else { return }; // nothing to sweep (absent or unreadable — retried next tick)

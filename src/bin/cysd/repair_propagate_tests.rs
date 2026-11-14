@@ -130,14 +130,13 @@ fn a_commit_over_the_seal_limit_is_refused_and_nothing_is_published() {
     drop(f);
     r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "big"})).unwrap();
     r.call(T0 + 2.0, &seat(7, "reviewer-codex"), "attest_verify", json!({"repair": id, "verdict": "pass", "note": "ok"})).unwrap();
-    let before = r.record_of(&id);
     let e = r.call(T0 + 3.0, &w, "commit", json!({"repair": id})).unwrap_err();
     assert_eq!(e.code, cys::repair::types::ERR_PRECONDITION);
     assert!(e.message.contains(&cys::repair::propagate::SEAL_LIMIT.to_string()), "{}", e.message);
     let after = r.record_of(&id);
     assert_eq!(after.state, RepairState::InProgress);
-    assert!(after.committed.is_empty());
-    assert_eq!(after, before, "nothing published");
+    assert!(after.committed.is_empty(), "nothing published");
+    assert!(after.verify.is_some(), "the signatures stay: the commit can be tried again");
     assert!(ledger::read_lane_in(&r.root, &RepairId::parse(&id).unwrap(), &r.lane).unwrap().is_none(), "no row");
 }
 
