@@ -898,6 +898,64 @@ fn t4_print(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, v: &Value
 /// O-C1-8: `cys repair tombstones [--json]` — a LOCAL read of this lane's tombstone file (no daemon);
 /// the lane is the caller's socket (`CYS_SOCKET`, as `lane_key` does). An unreadable file → the
 /// sentence on stderr and exit 95, nothing on stdout (a reader then behaves as today: no tombstones).
+/// `cys repair gate --lane <lane_key> [--json]` (T7b · RULINGS I1 / I7 / I8 / P5 · HH7): the LOCAL
+/// assignment gate — reads the ledger and the lane's job state, sends nothing, starts nothing; exit 0
+/// OPEN, 95 HELD (flagged interpretation 19), 2 a lane key that is not one. The JSON also carries the
+/// one summary line of lanes left in 충돌 (HH7 — a pull; the delegation tool prints it).
+fn gate_local(lane: &str, json_out: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    gate_local_in(lane, json_out, out, err, &cys::repair::paths::repairs_root(), &cys::lane::registry_path())
+}
+
+fn gate_local_in(lane: &str, json_out: bool, out: &mut dyn Write, err: &mut dyn Write, root: &std::path::Path, registry: &std::path::Path) -> i32 {
+    let valid = !lane.is_empty()
+        && lane != "."
+        && lane != ".."
+        && lane.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !valid {
+        let _ = writeln!(err, "cys repair gate: 레인 키가 아닙니다: {lane:?} (영문·숫자·. _ - 만)");
+        return 2;
+    }
+    let key = cys::repair::types::LaneKey(lane.to_string());
+    let verdict = cys::repair::propagate::gate_verdict_in(root, &key);
+    let summary = cys::repair::propagate::conflict_summary_line_in(root, registry);
+    let (open, cause) = match &verdict {
+        cys::repair::ledger::GateVerdict::Open => (true, None),
+        cys::repair::ledger::GateVerdict::Held(c) => (false, Some(c)),
+    };
+    if json_out {
+        let cause_json = cause.map(|c| {
+            let (pending, conflict, rows) = match c {
+                cys::repair::ledger::HoldCause::Pending { pending, conflict } => (Some(*pending), Some(*conflict), None),
+                cys::repair::ledger::HoldCause::AwaitingFinalApproval { rows } => (None, None, Some(*rows)),
+                _ => (None, None, None),
+            };
+            json!({"kind": cys::repair::propagate::hold_kind(c), "text": cys::repair::propagate::hold_text(c), "pending": pending, "conflict": conflict, "rows": rows})
+        });
+        let _ = writeln!(
+            out,
+            "{}",
+            json!({"lane": lane, "verdict": if open { "open" } else { "held" }, "cause": cause_json, "conflict_summary": summary})
+        );
+    } else {
+        match cause {
+            None => {
+                let _ = writeln!(out, "작업 배정 관문: 열림 ({lane})");
+            }
+            Some(c) => {
+                let _ = writeln!(out, "작업 배정 관문: 보류 ({lane}) — {}", cys::repair::propagate::hold_text(c));
+            }
+        }
+        if let Some(line) = &summary {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+    if open {
+        0
+    } else {
+        cys::repair::types::EXIT_REPAIR_PRECONDITION
+    }
+}
+
 fn tombstones_local(out: &mut dyn Write, err: &mut dyn Write, json_out: bool) -> i32 {
     let lane = cys::repair::types::LaneKey::of_socket(&super::socket_path());
     tombstones_local_in(
@@ -1003,7 +1061,27 @@ fn run_with(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, rpc: Rpc<
             Err(e) => fail(err, &e),
         };
     }
-    // The verbs whose bodies belong to other tracks (T7b gate/recheck).
+    // T7b — the LOCAL assignment gate (I1: no daemon request) and the daemon's `recheck` (H8).
+    if let RepairCmd::Gate { lane, json } = cmd {
+        return gate_local(lane, *json, out, err);
+    }
+    if let RepairCmd::Recheck { repair } = cmd {
+        return match rpc("repair.recheck", json!({"repair": repair})) {
+            Ok(v) => {
+                let _ = writeln!(
+                    out,
+                    "{}: 이 부서({})에서 다시 검사 — {}",
+                    s(&v, "repair"),
+                    s(&v, "lane"),
+                    s(&v, "lane_state_label")
+                );
+                0
+            }
+            Err(e) => fail(err, &e),
+        };
+    }
+    // The verbs whose bodies belong to other tracks (T5b's submit / auth-helper and T7b's gate / recheck
+    // have theirs above).
     let _ = writeln!(
         err,
         "{}: cys repair {}",
@@ -1542,6 +1620,9 @@ mod tests {
             "tick",
             // T5b (rewrite: `submit` left the stub set — was "exit 99"; an old daemon → 93 like T3's)
             "submit",
+            // T7b (rewrite: `recheck` left the stub set — an old daemon → 93 like the others; the old
+            // expectation was exit 99 with the not-implemented sentence)
+            "recheck",
         ];
         let mut covered: Vec<&str> = Vec::new();
         for argv in calls {
@@ -1552,8 +1633,10 @@ mod tests {
             if !covered.contains(&name) {
                 covered.push(name);
             }
-            if name == "tombstones" || name == "boot-critical" {
-                continue; // local verbs: their own tests pin them (T5a: boot_critical_* below)
+            if name == "tombstones" || name == "boot-critical" || name == "gate" {
+                // local verbs: their own tests pin them (T5a: boot_critical_* below; T7b: gate_* —
+                // rewrite: the old expectation for `gate` was exit 99 with the not-implemented sentence)
+                continue;
             }
             if name == "rules" {
                 // T1a: the local `rules` prints the block (byte-exact in
@@ -1930,6 +2013,42 @@ mod tests {
         let src = include_str!("repair_cli.rs");
         let prod = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
         assert!(prod.contains("super::AUTOSTART.store(false"));
+    }
+
+    /// T7b · RULINGS I1 (flagged interpretation 19): `cys repair gate --lane <key> [--json]` is LOCAL — it
+    /// sends no request (`run_local`'s rpc fails every call) — and answers exit 0 OPEN, 95 HELD (here: a
+    /// ledger member that cannot be read holds — never "open on error"), 2 for a lane key that is not
+    /// one; the JSON carries the verdict, the cause and the summary line.
+    #[test]
+    fn gate_local_exit_codes_and_json() {
+        let base = std::env::temp_dir().join(format!("cys-cli-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("repairs");
+        let registry = base.join("depts.json");
+        let mut out = Vec::new();
+        assert_eq!(gate_local_in("base", true, &mut out, &mut Vec::new(), &root, &registry), 0);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["verdict"], "open");
+        assert!(v["cause"].is_null());
+        std::fs::create_dir_all(root.join("R-1")).unwrap();
+        std::fs::write(root.join("R-1").join("record.json"), b"{ broken").unwrap();
+        let mut out = Vec::new();
+        assert_eq!(gate_local_in("base", true, &mut out, &mut Vec::new(), &root, &registry), 95);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["verdict"], "held");
+        assert_eq!(v["cause"]["kind"], "state_unreadable");
+        let mut out = Vec::new();
+        assert_eq!(gate_local_in("base", false, &mut out, &mut Vec::new(), &root, &registry), 95);
+        assert!(String::from_utf8(out).unwrap().starts_with("작업 배정 관문: 보류 (base)"));
+        for bad in ["", "..", "a/b", "a b"] {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(gate_local_in(bad, true, &mut out, &mut err, &root, &registry), 2, "{bad:?}");
+            assert!(out.is_empty());
+        }
+        // through the dispatcher with an rpc that refuses everything: no request is ever sent
+        let cmd = parse(&["gate", "--lane", "base", "--json"]).unwrap();
+        assert!(is_local(&cmd));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// O-C1-8: the local tombstone reader prints the struct's JSON (field order fixed) for the
