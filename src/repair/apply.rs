@@ -1170,6 +1170,13 @@ pub fn resume_op(env: &OpEnv<'_>, mut rec: OpRecord) -> Result<OpDone, RepairErr
 
 /// The lane's interrupted operations finished or abandoned from their records, in record order.
 pub fn resume_interrupted_in(env: &OpEnv<'_>) -> Result<u32, RepairError> {
+    resume_interrupted_report_in(env).map(|(n, _)| n)
+}
+
+/// [`resume_interrupted_in`] that also returns each operation that could not be finished this time
+/// (repair, why) — recorded by the job, never swallowed (RULINGS DR5).
+pub fn resume_interrupted_report_in(env: &OpEnv<'_>) -> Result<(u32, Vec<(RepairId, String)>), RepairError> {
+    let mut errors = Vec::new();
     let mut n = 0u32;
     for rec in wal::unfinished_for_lane(env.root, env.lane) {
         if rec.form == "hook" {
@@ -1179,13 +1186,15 @@ pub fn resume_interrupted_in(env: &OpEnv<'_>) -> Result<u32, RepairError> {
         let Some(_owned) = wal::LiveOp::try_enter(&rec.op) else {
             continue;
         };
+        let (repair, op_id) = (rec.repair.clone(), rec.op.clone());
         match resume_op(env, rec) {
             Ok(_) => n += 1,
             Err(e) if format!("{e:?}").contains(INJECTED_STOP) => return Err(e),
-            Err(_) => {} // left for the next run (nothing is forced)
+            // left for the next run (nothing is forced) — and reported
+            Err(e) => errors.push((repair, format!("끊긴 동작 {op_id} 을 마저 하지 못했습니다({e:?})"))),
         }
     }
-    Ok(n)
+    Ok((n, errors))
 }
 
 /// Finishes or abandons interrupted operations of a lane; returns how many.

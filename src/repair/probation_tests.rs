@@ -20,7 +20,7 @@ struct Doubles<'a> {
     check: &'a CheckFn<'a>,
     reference: &'a ReferenceFn<'a>,
     original: &'a dyn Fn(&str) -> Option<Vec<u8>>,
-    intake: &'a dyn Fn(&str, &str),
+    intake: &'a dyn Fn(&str, &str) -> bool,
     excluded: &'a dyn Fn(&str) -> bool,
 }
 
@@ -83,7 +83,10 @@ fn failing_recheck_reverts_one_repair_and_files_one_defect() {
         if rel == "hooks/a.sh" { outcome(CheckResult::Fail("syntax error".into()), 5) } else { outcome(CheckResult::Pass, 5) }
     };
     let intake = RefCell::new(Vec::new());
-    let note = |rel: &str, e: &str| intake.borrow_mut().push((rel.to_string(), e.to_string()));
+    let note = |rel: &str, e: &str| {
+        intake.borrow_mut().push((rel.to_string(), e.to_string()));
+        true
+    };
     let d = Doubles { check: &fail_a, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &note, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
@@ -104,7 +107,7 @@ fn windows_recheck_failure_reports_only() {
     let a = rid("R-3");
     committed_general(&r, &a, "bin/a.py", Some(b"A0\n"), Some(b"A1\n"));
     let fail = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Fail("x".into()), 5);
-    let d = Doubles { check: &fail, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| false };
+    let d = Doubles { check: &fail, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     let rep = run_tick(&job(&r, &d, ApplyForm::DepositFirst, NOW, &lock), false).unwrap();
     assert!(rep.reverted.is_empty());
@@ -128,7 +131,7 @@ fn update_inside_probation_never_restores_old_bytes() {
             r.put("hooks/s.sh", b"VENDOR-NEW\n", 0o755);
         }
         let fail = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Fail("would fail".into()), 5);
-        let d = Doubles { check: &fail, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| false };
+        let d = Doubles { check: &fail, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
         let lock = r.base.join(".pack-apply.lock");
         let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
         assert!(rep.reverted.is_empty(), "never reverted");
@@ -153,7 +156,7 @@ fn probation_rechecks_only_repaired_files() {
         seen.borrow_mut().push(rel.to_string());
         outcome(CheckResult::Pass, 5)
     };
-    let d = Doubles { check: &rec, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| true };
+    let d = Doubles { check: &rec, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
     let mut report = TickReport::default();
     let env = job(&r, &d, ApplyForm::Exchange, NOW, &lock);
@@ -205,7 +208,7 @@ fn o3_timeout_attribution() {
             if *k == 1 { outcome(CheckResult::Timeout, 60_000) } else { outcome(c.second.clone(), 60_000) }
         };
         let reference = |_: CheckKind, _: Duration| outcome(CheckResult::Pass, c.ref_now_ms);
-        let d = Doubles { check: &check, reference: &reference, original: &|_| None, intake: &|_, _| {}, excluded: &|_| false };
+        let d = Doubles { check: &check, reference: &reference, original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
         let lock = r.base.join(".pack-apply.lock");
         let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
         if c.failure {
@@ -233,7 +236,7 @@ fn created_file_hang_is_blamed_only_within_the_reference_slowdown() {
         with_timings(&r, &a, "hooks/new.sh", 30_000, 100);
         let reference = move |_: CheckKind, _: Duration| outcome(CheckResult::Pass, (100.0 * ratio) as u64);
         let check = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Timeout, 60_000);
-        let d = Doubles { check: &check, reference: &reference, original: &|_| None, intake: &|_, _| {}, excluded: &|_| false };
+        let d = Doubles { check: &check, reference: &reference, original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
         let lock = r.base.join(".pack-apply.lock");
         run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
         assert_eq!(r.live("hooks/new.sh") == TargetState::Absent, moved, "ratio {ratio}");
@@ -250,7 +253,7 @@ fn probation_of_only_timeouts_ends_in_use_at_24h() {
     row.probation.as_mut().unwrap().check_timeouts.push(("hooks/a.sh".into(), 5.0));
     ledger::write_lane_in(&r.root, &row).unwrap();
     let never = |_: &str, _: &Path, _: Duration| -> Result<CheckOutcome, RepairError> { panic!("no check after 24 h") };
-    let d = Doubles { check: &never, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| true };
+    let d = Doubles { check: &never, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
     let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 2.0 * 86_400.0, &lock), false).unwrap();
     assert_eq!(rep.ended, vec![a.clone()]);
@@ -269,7 +272,7 @@ fn start_time_pass_rebuilds_tombstones_and_finishes_an_interrupted_commit() {
     let newer = rid("R-10");
     committed_general(&r, &newer, "hooks/del.sh", Some(b"Y\n"), None);
     std::fs::remove_file(ledger::lane_path_in(&r.root, &newer, &r.lane)).unwrap();
-    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| true };
+    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
     let env = job(&r, &d, ApplyForm::Exchange, NOW, &lock);
     let lines = start_time_pass(&env).unwrap();
@@ -308,7 +311,7 @@ fn m10_scan_rules() {
     let lock = r.base.join(".pack-apply.lock");
     // broken → reverted
     r.put(rel, b"#!/bin/bash\nbroken(\n", 0o755);
-    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
     assert!(f.iter().any(|x| x.rel == rel && x.kind == "reverted"), "{f:?}");
     assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), original);
@@ -360,7 +363,7 @@ fn m10_planted_row_still_reverted() {
     let o2 = orig.clone();
     let orig_of = move |_: &str| Some(o2.clone());
     let fails = |x: &str, _: &Path, _: Duration| if x == rel { outcome(CheckResult::Fail("bad".into()), 5) } else { outcome(CheckResult::Pass, 5) };
-    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
     assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), orig);
@@ -386,7 +389,7 @@ fn m10_changed_between_check_and_revert_is_left() {
         }
     };
     let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
-    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
     assert!(f.iter().any(|x| x.kind == "superseded"), "{f:?}");
@@ -419,7 +422,7 @@ fn m10_hang_attribution() {
             if *n.borrow() == 1 { outcome(CheckResult::Timeout, 60_000) } else { outcome(second2.clone(), 60_000) }
         };
         let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
-        let d = Doubles { check: &check, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
+        let d = Doubles { check: &check, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
         let lock = r.base.join(".pack-apply.lock");
         let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
         assert_eq!(std::fs::read(r.pack.join(rel)).unwrap() == b"#!/bin/bash\necho ok\n", reverted, "control_ok={control_ok} second={second:?}");
@@ -439,7 +442,7 @@ fn supersession_is_checked_before_the_24_hour_close() {
     let a = rid("R-1");
     committed_general(&r, &a, "hooks/s.sh", Some(b"PRE\n"), Some(b"POST\n"));
     std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
-    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| false };
+    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     let later = NOW + 3.0 * 86_400.0;
     let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, later, &lock), false).unwrap();
@@ -493,7 +496,7 @@ fn tick_child_deadline_is_clamped() {
         seen.borrow_mut().push((rel.to_string(), d));
         outcome(CheckResult::Pass, 1)
     };
-    let d = Doubles { check: &check, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| true };
+    let d = Doubles { check: &check, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
     run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
     assert_eq!(*seen.borrow(), vec![("bin/plain.py".to_string(), Duration::from_secs(60))]);
@@ -526,7 +529,7 @@ fn m10_unknown_original_uses_the_install_manifest_for_unchanged_only() {
         *calls.borrow_mut() += 1;
         outcome(CheckResult::Pass, 1)
     };
-    let d = Doubles { check: &check, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| false };
+    let d = Doubles { check: &check, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
     assert!(f.iter().all(|x| x.rel != rel), "{f:?}");
@@ -551,7 +554,7 @@ fn m10_finding_names_the_kept_copy_and_the_repair_route() {
     r.put(rel, &broken, 0o755);
     let fails = |x: &str, _: &Path, _: Duration| if x == rel { outcome(CheckResult::Fail("bad".into()), 5) } else { outcome(CheckResult::Pass, 5) };
     let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
-    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
     let rev = f.iter().find(|x| x.kind == "reverted").expect("a put-back");
@@ -586,7 +589,7 @@ fn m10_each_put_back_takes_a_fresh_slot() {
     let r = rig("m10fresh");
     let fails = |x: &str, _: &Path, _: Duration| if x == rel { outcome(CheckResult::Fail("bad".into()), 5) } else { outcome(CheckResult::Pass, 5) };
     let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
-    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     r.put(rel, b"#!/bin/bash\nfirst(\n", 0o755);
     let a = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
@@ -631,7 +634,7 @@ fn m10_put_back_revalidates_its_binding_under_the_lock() {
         }
     };
     let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
-    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
     assert!(f.iter().any(|x| x.rel == rel && x.kind == "superseded"), "{f:?}");
@@ -659,7 +662,7 @@ fn recovery_waits_for_an_active_writer() {
     assert!(crate::repair::apply::run_op(&r.env(&StopAfterRecord, ApplyForm::Exchange), &spec).is_err());
     assert_eq!(crate::repair::wal::unfinished_for_lane(&r.root, &r.lane).len(), 1);
     let lock = r.base.join(".pack-apply.lock");
-    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| false };
+    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
     let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let lock2 = lock.clone();
@@ -705,7 +708,7 @@ fn hook_only_commit_interrupted_before_its_hook_record_is_recovered() {
         calls.borrow_mut().push(step);
         Ok(ReconcileReport { hooks: Vec::new() })
     };
-    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| false };
+    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     let env = JobEnv { hooks: &hooks, ..job(&r, &d, ApplyForm::Exchange, NOW, &lock) };
     let lines = start_time_pass(&env).unwrap();
@@ -726,7 +729,7 @@ fn reconstructed_origin_row_is_closed_when_the_generation_cannot_be_confirmed() 
     std::thread::sleep(Duration::from_millis(1100)); // wallclock: guard mtime granularity of the filesystem (1 s on some volumes)
     std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
     let _ = rec;
-    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| false };
+    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     start_time_pass(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
     let row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
@@ -752,7 +755,7 @@ fn line_endings_only_is_ledger_only_before_any_check() {
         outcome(CheckResult::Fail("bad".into()), 5)
     };
     let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
-    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
     assert!(f.iter().any(|x| x.rel == rel && x.kind == "line-endings-only" && !x.notice), "{f:?}");
@@ -774,7 +777,7 @@ fn a_put_back_finding_survives_a_crash_before_it_is_written() {
     r.put(rel, b"#!/bin/bash\nbroken(\n", 0o755);
     let fails = |x: &str, _: &Path, _: Duration| if x == rel { outcome(CheckResult::Fail("bad".into()), 5) } else { outcome(CheckResult::Pass, 5) };
     let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
-    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     let first = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
     assert!(first.iter().any(|x| x.kind == "reverted"));
@@ -808,7 +811,10 @@ fn one_unreadable_record_never_stops_the_job() {
         outcome(CheckResult::Pass, 5)
     };
     let filed = RefCell::new(Vec::new());
-    let intake = |rel: &str, line: &str| filed.borrow_mut().push((rel.to_string(), line.to_string()));
+    let intake = |rel: &str, line: &str| {
+        filed.borrow_mut().push((rel.to_string(), line.to_string()));
+        true
+    };
     let d = Doubles { check: &check, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &intake, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), true).unwrap();
@@ -838,7 +844,7 @@ fn a_revert_that_errors_every_time_ends_failed() {
         std::fs::write(&p, b"DAMAGED").unwrap();
     }
     let fails = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Fail("bad".into()), 5);
-    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| false };
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
     assert!(rep.reported_only.iter().any(|(i, _)| *i == a), "{rep:?}");
@@ -885,7 +891,7 @@ fn the_scan_never_puts_back_less_than_the_approved_copy() {
         r.put(rel, b"#!/bin/bash\nbroken(\n", 0o755);
         let fails = |x: &str, _: &Path, _: Duration| if x == rel { outcome(CheckResult::Fail("bad".into()), 5) } else { outcome(CheckResult::Pass, 5) };
         let orig_of = |_: &str| Some(b"#!/bin/bash\necho vendor\n".to_vec());
-        let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
+        let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
         let lock = r.base.join(".pack-apply.lock");
         let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
         let live = std::fs::read(r.pack.join(rel)).unwrap();
@@ -911,11 +917,42 @@ fn a_boot_critical_symlink_is_a_finding() {
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     let _ = std::fs::remove_file(&p);
     std::os::unix::fs::symlink("/nonexistent/elsewhere", &p).unwrap();
-    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| Some(b"x".to_vec()), intake: &|_, _| {}, excluded: &|_| false };
+    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| Some(b"x".to_vec()), intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
     assert!(f.iter().any(|x| x.rel == rel && x.kind == "not-a-file" && x.notice), "{f:?}");
     assert!(std::fs::symlink_metadata(&p).unwrap().file_type().is_symlink(), "left as it is");
     let again = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0, &lock)).unwrap();
     assert!(!again.iter().any(|x| x.kind == "not-a-file"), "noticed once");
+}
+
+// ───────────────────────────── RULINGS DR5 — "reported" after the report was accepted ─────────────────────────────
+
+/// DR5: a fault report refused by the intake (over quota / an error) stays PENDING and is retried at
+/// the next tick — once per tick — and is marked filed only when the intake acknowledges it; after
+/// that it is never sent again. Without DR5 the first unacknowledged attempt marked it reported for
+/// good and the report was lost.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_report_is_marked_filed_only_after_the_intake_accepted_it() {
+    let r = rig("dr5intake");
+    committed_general(&r, &rid("R-1"), "hooks/k1.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    std::fs::write(ledger::record_path_in(&r.root, &rid("R-1")), b"{ broken").unwrap();
+    let accept = std::cell::Cell::new(false);
+    let calls = std::cell::Cell::new(0);
+    let intake = |_: &str, _: &str| {
+        calls.set(calls.get() + 1);
+        accept.get()
+    };
+    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &intake, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    assert_eq!(calls.get(), 1, "tried once in the tick");
+    run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 700.0, &lock), false).unwrap();
+    assert_eq!(calls.get(), 2, "still pending → retried at the next tick, once");
+    accept.set(true);
+    run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 1400.0, &lock), false).unwrap();
+    assert_eq!(calls.get(), 3, "accepted now");
+    run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 2100.0, &lock), false).unwrap();
+    assert_eq!(calls.get(), 3, "filed: never sent again");
 }

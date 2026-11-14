@@ -182,21 +182,23 @@ fn run_job(daemon: &Arc<Daemon>, force_sweep: bool) {
     let excluded = |rel: &str| crate::repair::rule_document_name(rel).is_some();
     let root_for_intake = root.clone();
     let lane_for_intake = lane.clone();
-    let intake = move |rel: &str, err: &str| {
-        if let Ok(report) = cys::repair::intake::parse_report(rel, err) {
-            // CU4: the REAL count of new rows this lane wrote in the last hour (the quota of C7 /
-            // T3 — never bypassed by a constant 0), read from the rows themselves
-            let new_in_last_hour = new_intake_rows_in_last_hour(&root_for_intake, &lane_for_intake, now);
-            let _ = cys::repair::intake::record_in(
-                &root_for_intake,
-                &lane_for_intake,
-                &report,
-                "daemon",
-                now,
-                new_in_last_hour,
-                windows,
-                err,
-            );
+    let intake = move |rel: &str, err: &str| -> bool {
+        // DR5: the result is the acknowledgement — never discarded
+        let Ok(report) = cys::repair::intake::parse_report(rel, err) else {
+            eprintln!("[cysd] repair tick: 보고 형식이 맞지 않아 접수할 수 없습니다(다시 보내지 않음) — {rel}");
+            return true; // definitively refused: retrying cannot change it
+        };
+        // CU4: the REAL count of new rows this lane wrote in the last hour (the quota of C7 / T3 —
+        // never bypassed by a constant 0), read from the rows themselves
+        let new_in_last_hour = new_intake_rows_in_last_hour(&root_for_intake, &lane_for_intake, now);
+        match cys::repair::intake::record_in(&root_for_intake, &lane_for_intake, &report, "daemon", now, new_in_last_hour, windows, err) {
+            Ok(cys::repair::intake::Recorded::New(_)) | Ok(cys::repair::intake::Recorded::Updated(_)) => true,
+            Ok(cys::repair::intake::Recorded::Excluded { .. }) => true,
+            Ok(cys::repair::intake::Recorded::OverQuota { .. }) => false,
+            Err(e) => {
+                eprintln!("[cysd] repair tick: 보고를 기록하지 못했습니다(다음 차례에 다시) — {e:?}");
+                false
+            }
         }
     };
     let env = cys::repair::probation::JobEnv {

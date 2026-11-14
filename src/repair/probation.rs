@@ -36,8 +36,10 @@ pub struct JobEnv<'a> {
     /// Our original of the CURRENT pack generation for a rel (`None` = not known for this
     /// generation — then nothing is put back).
     pub original: &'a dyn Fn(&str) -> Option<Vec<u8>>,
-    /// One intake row (data, never a message): (rel, error line).
-    pub intake: &'a dyn Fn(&str, &str),
+    /// One intake row (data, never a message): (rel, error line) → `true` only when the intake
+    /// ACKNOWLEDGED it (recorded, or definitively refused by rule); `false` = over quota or an error
+    /// — the report stays pending and is retried at a later tick (RULINGS DR5).
+    pub intake: &'a dyn Fn(&str, &str) -> bool,
     /// The existing pack-apply lock file (taken around every put-back, blocking on the job thread).
     pub apply_lock: &'a Path,
 }
@@ -126,6 +128,8 @@ pub struct TickReport {
     pub timeouts: Vec<(RepairId, String)>,
     pub reported_only: Vec<(RepairId, String)>,
     pub m10: Vec<Finding>,
+    /// DR5: the fault keys whose intake was attempted in THIS tick (once per tick per repair).
+    pub intake_tried: Vec<String>,
 }
 
 /// One tick of the job (the daemon calls it on its job thread, after the readiness check and the
@@ -159,10 +163,14 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
     // the unfinished records are read only after the lock is taken
     let recovered = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || -> Result<(u32, Vec<String>), RepairError> {
         let mut lines = Vec::new();
+        let mut faults: Vec<(RepairId, String)> = Vec::new();
         let mut n = 0u32;
         let injected = |e: &RepairError| format!("{e:?}").contains(apply::INJECTED_STOP);
-        match apply::resume_interrupted_in(&env.op) {
-            Ok(k) => n += k,
+        match apply::resume_interrupted_report_in(&env.op) {
+            Ok((k, errors)) => {
+                n += k;
+                faults.extend(errors);
+            }
             Err(e) if injected(&e) => return Err(e),
             Err(e) => lines.push(format!("끊긴 동작을 마저 하지 못했습니다 — 다음 차례에 다시({e:?})")),
         }
@@ -175,13 +183,17 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
             }
         }
         lines.extend(apply::recover_apply_intents_in(&env.op, env.locked));
-        Ok((n, lines))
+        Ok((n, lines, faults))
     });
     match recovered {
         Ok(Some(r)) => {
-            let (n, lines) = r?;
+            let (n, lines, faults) = r?;
             report.resumed = n;
             report.lines.extend(lines);
+            // DR5: an error of a recovery operation is recorded (a line + one acknowledged report)
+            for (id, why) in faults {
+                fault_once(env, &id, "recovery-error", &format!("repairs/{}/ops", id.as_str()), &why, &mut report);
+            }
         }
         Ok(None) => {
             report.lines.push("다른 적용이나 업데이트가 팩을 바꾸는 중 — 이번 차례는 아무것도 하지 않습니다".into());
@@ -214,379 +226,97 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
     Ok(report)
 }
 
-/// `<root>/lanes/<lane>.job-faults.json` — the repairs whose fault this lane's job already filed as
-/// an intake row (CU1: once per repair).
+/// `<root>/lanes/<lane>.job-faults.json` — this lane's job's fault reports, keyed `<R-id>:<kind>`:
+/// `pending` until the intake ACKNOWLEDGED the row, then `filed` (RULINGS CU1 / DR5).
 fn faults_path_in(root: &Path, lane: &LaneKey) -> PathBuf {
     root.join("lanes").join(format!("{}.job-faults.json", lane.0))
 }
 
-/// CU1: a repair the job could not handle — logged in the tick's lines every time, filed as ONE
-/// intake row (through the job's intake writer, which applies the hourly quota) the first time.
-fn fault_once(env: &JobEnv<'_>, id: &RepairId, rel: &str, line: &str, report: &mut TickReport) {
-    report.lines.push(format!("{}: {line} — 이 수리는 건너뛰고 나머지는 계속합니다", id.as_str()));
-    let path = faults_path_in(env.op.root, env.op.lane);
-    let mut seen: std::collections::BTreeMap<String, String> = std::fs::read(&path)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct FaultEntry {
+    rel: String,
+    line: String,
+    state: String,
+}
+
+fn load_faults(root: &Path, lane: &LaneKey) -> std::collections::BTreeMap<String, FaultEntry> {
+    std::fs::read(faults_path_in(root, lane))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    if seen.contains_key(id.as_str()) {
+        .unwrap_or_default()
+}
+
+/// Tries the intake of one pending fault (once per tick per key); `filed` is written only AFTER the
+/// intake acknowledged it.
+fn try_file(env: &JobEnv<'_>, key: &str, report: &mut TickReport) {
+    if report.intake_tried.iter().any(|k| k == key) {
         return;
     }
-    seen.insert(id.as_str().to_string(), line.chars().take(300).collect());
-    if super::durable::write_json_durable(&path, &seen).is_ok() {
-        (env.intake)(rel, &format!("자체 해결 작업이 수리 {}를 처리하지 못함 — {line}", id.as_str()));
-    }
-}
-
-// ───────────────────────────── the start-time pass (AK7 + DEFERRED #49) ─────────────────────────────
-
-fn in_force(rec: &RepairRecord) -> bool {
-    matches!(rec.state, RepairState::Probation | RepairState::InUse)
-}
-
-/// At the first ready tick of every daemon incarnation: (a) every committed `Absent` of a repair in
-/// force rebuilds its File tombstone in this lane (AK7 — a crash right after a deletion commit, or
-/// a revert of a later repair, never leaves a committed deletion without its tombstone); (b) the
-/// idempotent parts of an interrupted commit's second step (DEFERRED_MINOR #49): the hook step of a
-/// committed repair whose unregistration never finished, older in-force repairs on the same targets
-/// superseded, the origin lane's row written when it is missing.
-pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
-    let root = env.op.root;
-    let lane = env.op.lane;
-    let mut lines = Vec::new();
-    let mut recs: Vec<RepairRecord> = ledger::list_ids_in(root)
-        .into_iter()
-        .filter_map(|id| ledger::read_record_in(root, &id).ok().flatten())
-        .collect();
-    recs.sort_by(|a, b| b.id.cmp(&a.id)); // newest first (AK4 supersedes the older ones)
-    for rec in &recs {
-        if !in_force(rec) {
-            continue;
-        }
-        let row = ledger::read_lane_in(root, &rec.id, lane).ok().flatten();
-        // (a) tombstones of committed deletions
-        let applied: Vec<(String, String)> = if rec.origin_lane == *lane {
-            rec.committed.clone()
-        } else {
-            row.as_ref().map(|r| r.applied.clone()).unwrap_or_default()
-        };
-        for (rel, canon) in &applied {
-            let pre_present = ledger::file_targets(rec)
-                .find(|f| f.rel == *rel)
-                .is_some_and(|f| f.pre != PreImage::Absent);
-            if canon == "absent" && pre_present {
-                let t = super::tombstones::Tombstone {
-                    rel: rel.clone(),
-                    kind: super::tombstones::TombstoneKind::File,
-                    repair: rec.id.clone(),
-                };
-                if super::tombstones::load_in(root, lane).is_ok_and(|ts| !ts.contains(&t)) {
-                    match super::tombstones::record_in(root, lane, &t) {
-                        Ok(()) => lines.push(format!("{}: 확정된 삭제의 묘비를 다시 세웠습니다 — {rel}", rec.id.as_str())),
-                        Err(e) => lines.push(format!("{}: 묘비를 다시 세우지 못했습니다 — {rel}({e:?})", rec.id.as_str())),
-                    }
-                }
-            }
-        }
-        // CT7: a hook-only repair (no committed file) is recovered too — its hook step is its state
-        if rec.origin_lane != *lane || (rec.committed.is_empty() && ledger::hook_lines(rec).next().is_none()) {
-            continue;
-        }
-        // (b3) the origin's own row FIRST (the hook step below marks it 충돌 when it cannot finish).
-        // CU4: it records the COMMIT's generation — confirmed when the pack's generation files are
-        // older than the record's durable commit write — else it is written closed 대체됨 (nothing is
-        // re-checked or reverted against bytes of a generation nobody can confirm)
-        if row.is_none() {
-            let gen = apply::pack_generation(env.op.pack);
-            let confirmed = generation_unchanged_since_commit(root, env.op.pack, &rec.id);
-            let new_row = LaneRecord {
-                schema: super::REPAIR_SCHEMA,
-                repair: rec.id.clone(),
-                lane: lane.clone(),
-                state: super::types::LaneState::Verified,
-                probation: Some(ledger::Probation {
-                    pack_generation: gen.version,
-                    pro_revision: gen.pro_revision,
-                    applied_at: env.op.now,
-                    expected: rec.committed.clone(),
-                    closed: (!confirmed).then(|| "대체됨 — 확정 때의 팩 세대를 확인할 수 없어 시험 기간을 다시 열지 않습니다(워커 검토)".to_string()),
-                    check_timings: Vec::new(),
-                    check_timeouts: Vec::new(),
-                }),
-                merge: None,
-                merge_history: Vec::new(),
-                approval_ref: rec.approval.as_ref().map(|a| a.request_id.clone()),
-                conflict_live: Vec::new(),
-                applied: rec.committed.clone(),
-                applied_history: Vec::new(),
-                merge_base: Vec::new(),
-                merge_lock: None,
-                merge_attempt: 0,
-                updated_at: env.op.now,
-            };
-            let rootb = root.to_path_buf();
-            let idc = rec.id.clone();
-            let lanec = lane.clone();
-            if let Err(e) = (env.locked)(&rec.id, &mut || {
-                if ledger::read_lane_in(&rootb, &idc, &lanec)?.is_none() {
-                    ledger::write_lane_in(&rootb, &new_row)?;
-                }
-                Ok(())
-            }) {
-                lines.push(format!("{}: 끊긴 확정의 부서 행을 쓰지 못했습니다({e:?})", rec.id.as_str()));
-                continue;
-            }
-            lines.push(format!(
-                "{}: 끊긴 확정의 부서 행을 썼습니다{}",
-                rec.id.as_str(),
-                if confirmed { "" } else { "(세대를 확인할 수 없어 대체됨으로 닫음)" }
-            ));
-        }
-        // (b1) the hook step of the committed repair, when its unregistration never finished
-        if ledger::hook_lines(rec).next().is_some() {
-            let (ops, _) = super::wal::list_in(root, &rec.id);
-            let done = ops.iter().any(|o| o.kind == "hook-unregister" && o.finished && o.outcome.as_deref() == Some("applied"));
-            let attempted = ops.iter().any(|o| o.kind == "hook-unregister");
-            if !done && !attempted {
-                match (env.hooks)(&rec.id, lane, HookStep::Unregister) {
-                    Ok(_) => lines.push(format!("{}: 끊긴 확정의 훅 단계를 마쳤습니다", rec.id.as_str())),
-                    Err(e) => {
-                        apply::mark_lane_conflict(root, &rec.id, lane, env.op.now, env.locked);
-                        lines.push(format!("{}: 끊긴 확정의 훅 단계 실패 — 충돌로 남깁니다({e:?})", rec.id.as_str()));
-                    }
-                }
-            }
-        }
-        // (b2) older in-force repairs on the same targets
-        match supersede_older(root, lane, rec, env.locked) {
-            Ok(ids) => {
-                for oid in ids {
-                    lines.push(format!("{}: 같은 파일의 더 새 수리 {} 로 대체됨", oid.as_str(), rec.id.as_str()));
-                }
-            }
-            Err(e) => lines.push(format!("{}: 더 오래된 수리를 정리하지 못했습니다({e:?})", rec.id.as_str())),
-        }
-    }
-    Ok(lines)
-}
-
-/// CU4: the pack generation is confirmed unchanged since a commit when the files that define it
-/// (`.pack-version`, the pack state) were last written BEFORE the record's durable commit write.
-fn generation_unchanged_since_commit(root: &Path, pack: &Path, id: &RepairId) -> bool {
-    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    let Some(committed_at) = mtime(&ledger::record_path_in(root, id)) else {
-        return false;
+    report.intake_tried.push(key.to_string());
+    let mut all = load_faults(env.op.root, env.op.lane);
+    let Some(entry) = all.get(key).cloned() else {
+        return;
     };
-    [pack.join(".pack-version"), pack.join(crate::pack::PACK_STATE_FILE)]
-        .iter()
-        .all(|p| match std::fs::symlink_metadata(p) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-            Err(_) => false,
-            Ok(_) => mtime(p).is_some_and(|t| t <= committed_at),
-        })
-}
-
-fn supersede_older(
-    root: &Path,
-    lane: &LaneKey,
-    newer: &RepairRecord,
-    locked: &RepairLock<'_>,
-) -> Result<Vec<RepairId>, RepairError> {
-    let targets: Vec<String> = ledger::file_targets(newer).map(|f| f.rel.clone()).collect();
-    let mut out = Vec::new();
-    for oid in ledger::list_ids_in(root).into_iter().filter(|o| *o < newer.id).rev() {
-        let mut changed = false;
-        let rootb = root.to_path_buf();
-        let _ = locked(&oid, &mut || {
-            // CU1: an unreadable older record is skipped (never stops the pass)
-            let Ok(Some(mut r)) = ledger::read_record_in(&rootb, &oid) else {
-                return Ok(());
-            };
-            if r.origin_lane == *lane && in_force(&r) && r.files.iter().any(|f| targets.contains(&f.rel)) {
-                r.state = RepairState::Superseded;
-                ledger::write_record_durable_in(&rootb, &r)?;
-                changed = true;
-            }
-            Ok(())
-        });
-        if changed {
-            out.push(oid);
-        }
+    if entry.state == "filed" {
+        return;
     }
-    Ok(out)
-}
-
-// ───────────────────────────── the 24-hour re-check ─────────────────────────────
-
-/// The result of RULINGS O3's attribution of a re-check timeout.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Attribution {
-    /// An established failure (the control passed in time, the second run timed out again, and for
-    /// EVERY target the scaled recorded duration is under the deadline ÷ 1.5) — or the second run
-    /// failed outright.
-    Failure(String),
-    /// Everything else: recorded, one line, nothing moved, tried again at the next due tick.
-    CheckTimeout(String),
-}
-
-fn passed_in_time(o: &Result<CheckOutcome, RepairError>) -> bool {
-    matches!(o, Ok(CheckOutcome { result: CheckResult::Pass, .. }))
-}
-
-/// O3 (+ P3, R5, K4, H1, H2, F8): control → second run → reference NOW, one sequence, one decision.
-/// The control is the same check with the same deadline against a scratch copy of the repair's
-/// PRE-IMAGE (every target at its pre-image, from the sealed deposits; a hash mismatch → timeout),
-/// or — for a target the repair CREATED — the built-in reference check of its kind.
-pub fn attribute_timeout(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, rel: &str) -> Attribution {
-    let deadline = check_deadline(rel);
-    let pre = match pre_image_for(env.op.root, rec, env.op.lane, rel) {
-        Ok(p) => p,
-        Err(e) => return Attribution::CheckTimeout(format!("{rel}: 적용 전 내용을 확인할 수 없습니다({e:?}) — 시간 초과로 기록")),
-    };
-    // (1) the control
-    let control = if pre.0 == TargetState::Absent {
-        (env.reference)(check_kind_of(rel), deadline)
+    if (env.intake)(&entry.rel, &entry.line) {
+        all.insert(key.to_string(), FaultEntry { state: "filed".into(), ..entry });
+        if let Err(e) = super::durable::write_json_durable(&faults_path_in(env.op.root, env.op.lane), &all) {
+            report.lines.push(format!("{key}: 접수된 보고를 '보고함'으로 적지 못했습니다 — 다음 차례에 다시 확인({e:?})"));
+        }
     } else {
-        match scratch_pre_image(env, rec, row) {
-            Ok(dir) => {
-                let r = (env.check)(rel, &dir, deadline);
-                let _ = std::fs::remove_dir_all(&dir); // our own scratch copy (never a slot)
-                r
-            }
-            Err(e) => {
-                return Attribution::CheckTimeout(format!("{rel}: 적용 전 사본을 만들 수 없습니다({e:?}) — 시간 초과로 기록"))
-            }
-        }
-    };
-    if !passed_in_time(&control) {
-        return Attribution::CheckTimeout(format!("{rel}: 대조 검사(적용 전 내용)도 제때 끝나지 않았습니다 — 느린 기계로 봅니다"));
+        report.lines.push(format!("{key}: 보고가 아직 접수되지 않았습니다(한도 초과나 오류) — 다음 차례에 다시"));
     }
-    // (2) the repaired file's check again
-    match (env.check)(rel, env.op.pack, deadline) {
-        Ok(CheckOutcome { result: CheckResult::Pass, .. }) => {
-            return Attribution::CheckTimeout(format!("{rel}: 두 번째 검사는 통과했습니다 — 일시적인 지연으로 봅니다"))
-        }
-        Ok(CheckOutcome { result: CheckResult::Fail(m), .. }) => return Attribution::Failure(format!("{rel}: {m}")),
-        Ok(CheckOutcome { result: CheckResult::Timeout, .. }) => {}
-        Err(e) => return Attribution::CheckTimeout(format!("{rel}: 두 번째 검사를 돌릴 수 없습니다({e:?})")),
-    }
-    // (3) the reference NOW, for EVERY target: recorded duration × (reference now ÷ reference then)
-    //     must be under the deadline ÷ 1.5 for every one (no recorded duration → not under)
-    let timings = row.probation.as_ref().map(|p| p.check_timings.clone()).unwrap_or_default();
-    for (t_rel, canon) in row.probation.as_ref().map(|p| p.expected.clone()).unwrap_or_default() {
-        if canon == "absent" {
-            continue;
-        }
-        let dl = check_deadline(&t_rel);
-        let Some(t) = timings.iter().find(|t| t.rel == t_rel) else {
-            return Attribution::CheckTimeout(format!("{t_rel}: 기록된 검사 시간이 없어 실패로 단정하지 않습니다"));
-        };
-        let now_ref = match (env.reference)(t.reference_kind, dl) {
-            Ok(CheckOutcome { result: CheckResult::Pass, ms }) => ms,
-            _ => return Attribution::CheckTimeout(format!("{t_rel}: 기준 검사가 지금 제때 끝나지 않습니다 — 느린 기계로 봅니다")),
-        };
-        if t.reference_ms == 0 {
-            return Attribution::CheckTimeout(format!("{t_rel}: 기록된 기준 검사 시간이 없습니다"));
-        }
-        // scaled = check_ms × now_ref ÷ reference_ms ; under ⇔ scaled × 1.5 < deadline
-        let scaled_x1000 = u128::from(t.check_ms) * u128::from(now_ref) * 1000 / u128::from(t.reference_ms);
-        let limit_x1000 = dl.as_millis() * 1_000_000 / u128::from(REFERENCE_SLOWDOWN_PERMILLE);
-        if scaled_x1000 >= limit_x1000 {
-            return Attribution::CheckTimeout(format!(
-                "{t_rel}: 지금의 기계 속도로 환산한 검사 시간이 시한의 2/3 를 넘습니다 — 느린 기계로 봅니다"
-            ));
-        }
-    }
-    Attribution::Failure(format!("{rel}: 대조 검사는 제때 통과했는데 고친 파일의 검사가 두 번 모두 시간 초과"))
 }
 
-/// A scratch copy of the repair's PRE-IMAGE for the control run (F8 (ii)): every target at its
-/// pre-image (absent ones absent), each verified against its recorded hash.
-fn scratch_pre_image(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord) -> Result<PathBuf, RepairError> {
-    let dir = env.op.root.join(".scratch").join(super::wal::new_op_id(env.op.now, "control"));
-    std::fs::create_dir_all(&dir).map_err(|e| RepairError::Io(format!("{}: {e}", dir.display())))?;
-    for (rel, _) in &row.applied {
-        let (st, holder) = pre_image_for(env.op.root, rec, env.op.lane, rel)?;
-        let dst = dir.join(rel);
-        if let Some(p) = dst.parent() {
-            std::fs::create_dir_all(p).map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
-        }
-        match (st, holder) {
-            (TargetState::Absent, _) => {}
-            (TargetState::Link { target }, _) => {
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(&target, &dst).map_err(|e| RepairError::Io(e.to_string()))?;
-                #[cfg(not(unix))]
-                let _ = target;
-            }
-            (TargetState::File { mode, .. }, Some(h)) => {
-                std::fs::copy(&h, &dst).map_err(|e| RepairError::Io(format!("{}: {e}", h.display())))?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(mode));
-                }
-                #[cfg(not(unix))]
-                let _ = mode;
-            }
-            (TargetState::File { .. }, None) => {
-                return Err(RepairError::Superseded(format!("{rel}: 적용 전 내용의 보관본이 없습니다")))
-            }
+/// CU1 / DR5: a repair the job could not handle — logged in the tick's lines every time, recorded
+/// `pending` (durably) the first time, and filed as ONE intake row: marked `filed` only after the
+/// intake acknowledged it; a pending one is retried at later ticks.
+fn fault_once(env: &JobEnv<'_>, id: &RepairId, kind: &str, rel: &str, line: &str, report: &mut TickReport) {
+    report.lines.push(format!("{}: {line} — 이 수리는 건너뛰고 나머지는 계속합니다", id.as_str()));
+    let key = format!("{}:{kind}", id.as_str());
+    let mut all = load_faults(env.op.root, env.op.lane);
+    if !all.contains_key(&key) {
+        all.insert(
+            key.clone(),
+            FaultEntry {
+                rel: rel.to_string(),
+                line: format!("자체 해결 작업이 수리 {}를 처리하지 못함 — {}", id.as_str(), line.chars().take(300).collect::<String>()),
+                state: "pending".into(),
+            },
+        );
+        if let Err(e) = super::durable::write_json_durable(&faults_path_in(env.op.root, env.op.lane), &all) {
+            report.lines.push(format!("{key}: 보고 대기를 기록하지 못했습니다({e:?})"));
         }
     }
-    Ok(dir)
+    try_file(env, &key, report);
 }
 
-fn close_row(env: &JobEnv<'_>, id: &RepairId, closed: &str, timeouts: &[(String, f64)], record_state: Option<RepairState>) -> Result<(), RepairError> {
-    let root = env.op.root.to_path_buf();
-    let lane = env.op.lane.clone();
-    let now = env.op.now;
-    let idc = id.clone();
-    let closed = closed.to_string();
-    (env.locked)(id, &mut || {
-        if let Some(mut row) = ledger::read_lane_in(&root, &idc, &lane)? {
-            if let Some(p) = row.probation.as_mut() {
-                if p.closed.is_none() {
-                    p.closed = Some(closed.chars().take(400).collect());
-                }
-                for t in timeouts {
-                    if !p.check_timeouts.contains(t) {
-                        p.check_timeouts.push(t.clone());
-                    }
-                }
-            }
-            row.updated_at = now;
-            ledger::write_lane_in(&root, &row)?;
-        }
-        if let Some(st) = record_state {
-            if let Some(mut r) = ledger::read_record_in(&root, &idc)? {
-                if r.origin_lane == lane && r.state == RepairState::Probation || (st == RepairState::Superseded && r.origin_lane == lane && in_force(&r)) {
-                    r.state = st;
-                    ledger::write_record_durable_in(&root, &r)?;
-                }
-            }
-        }
-        Ok(())
-    })
+/// DR5: every pending report of this lane is retried (once per tick per key).
+fn retry_pending_faults(env: &JobEnv<'_>, report: &mut TickReport) {
+    let pending: Vec<String> = load_faults(env.op.root, env.op.lane)
+        .into_iter()
+        .filter(|(_, e)| e.state == "pending")
+        .map(|(k, _)| k)
+        .collect();
+    for key in pending {
+        try_file(env, &key, report);
+    }
 }
 
-fn note_timeouts(env: &JobEnv<'_>, id: &RepairId, timeouts: &[(String, f64)]) -> Result<(), RepairError> {
-    let root = env.op.root.to_path_buf();
-    let lane = env.op.lane.clone();
-    let idc = id.clone();
-    (env.locked)(id, &mut || {
-        if let Some(mut row) = ledger::read_lane_in(&root, &idc, &lane)? {
-            if let Some(p) = row.probation.as_mut() {
-                for t in timeouts {
-                    if !p.check_timeouts.contains(t) {
-                        p.check_timeouts.push(t.clone());
-                    }
-                }
-            }
-            ledger::write_lane_in(&root, &row)?;
+/// A report filed through the same acknowledged path, with its own description (the probation's
+/// failure reports — DR5 / DR8).
+fn report_once(env: &JobEnv<'_>, id: &RepairId, kind: &str, rel: &str, description: &str, report: &mut TickReport) {
+    let key = format!("{}:{kind}", id.as_str());
+    let mut all = load_faults(env.op.root, env.op.lane);
+    if !all.contains_key(&key) {
+        all.insert(key.clone(), FaultEntry { rel: rel.to_string(), line: description.to_string(), state: "pending".into() });
+        if let Err(e) = super::durable::write_json_durable(&faults_path_in(env.op.root, env.op.lane), &all) {
+            report.lines.push(format!("{key}: 보고 대기를 기록하지 못했습니다({e:?})"));
         }
-        Ok(())
-    })
+    }
+    try_file(env, &key, report);
 }
 
 /// Every repair in probation in THIS lane re-checked — only repaired files (no full sweep), with
@@ -594,13 +324,14 @@ fn note_timeouts(env: &JobEnv<'_>, id: &RepairId, timeouts: &[(String, f64)]) ->
 fn probation_pass(env: &JobEnv<'_>, report: &mut TickReport) {
     let root = env.op.root;
     let lane = env.op.lane;
+    retry_pending_faults(env, report);
     for id in ledger::list_ids_in(root) {
         let ledger_rel = format!("repairs/{}/record.json", id.as_str());
         let row = match ledger::read_lane_in(root, &id, lane) {
             Ok(Some(row)) => row,
             Ok(None) => continue,
             Err(e) => {
-                fault_once(env, &id, &ledger_rel, &format!("이 부서의 행을 읽을 수 없습니다({e:?})"), report);
+                fault_once(env, &id, "lane-row-unreadable", &ledger_rel, &format!("이 부서의 행을 읽을 수 없습니다({e:?})"), report);
                 continue;
             }
         };
@@ -614,7 +345,7 @@ fn probation_pass(env: &JobEnv<'_>, report: &mut TickReport) {
             Ok(Some(rec)) => rec,
             Ok(None) => continue,
             Err(e) => {
-                fault_once(env, &id, &ledger_rel, &format!("수리 기록을 읽을 수 없습니다(손상 또는 더 높은 판의 기록 — {e:?})"), report);
+                fault_once(env, &id, "record-unreadable", &ledger_rel, &format!("수리 기록을 읽을 수 없습니다(손상 또는 더 높은 판의 기록 — {e:?})"), report);
                 continue;
             }
         };
@@ -623,7 +354,7 @@ fn probation_pass(env: &JobEnv<'_>, report: &mut TickReport) {
         }
         if let Err(e) = recheck_one(env, &rec, &row, report) {
             let rel = ledger::file_targets(&rec).map(|f| f.rel.clone()).next().unwrap_or(ledger_rel);
-            fault_once(env, &id, &rel, &format!("재검사를 마치지 못했습니다({e:?})"), report);
+            fault_once(env, &id, "recheck-error", &rel, &format!("재검사를 마치지 못했습니다({e:?})"), report);
         }
     }
 }
@@ -746,7 +477,7 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, repor
                 Ok(x) => format!("되돌리지 못함({:?})", x.outcome),
                 Err(e) => format!("되돌리지 못함({e:?})"),
             };
-            (env.intake)(first_rel, &format!("시험 기간 재검사 실패 — 수리 {} {outcome_text} — {why}", id.as_str()));
+            report_once(env, id, "probation-failed", first_rel, &format!("시험 기간 재검사 실패 — 수리 {} {outcome_text} — {why}", id.as_str()), report);
             match r {
                 Ok(r) if r.outcome == ApplyOutcome::Applied => {
                     report.reverted.push(id.clone());
@@ -772,7 +503,7 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, repor
             // Windows 0.15.0: automatic return is off — ONE intake row and a FAILED end of this
             // probation (CU4: never 사용 중 later; the row closed, so it is not re-filed every check)
             note_timeouts(env, id, &timeouts)?;
-            (env.intake)(first_rel, &format!("시험 기간 재검사 실패(이 운영체제에서는 자동으로 되돌리지 않음) — 수리 {} · {why}", id.as_str()));
+            report_once(env, id, "probation-failed", first_rel, &format!("시험 기간 재검사 실패(이 운영체제에서는 자동으로 되돌리지 않음) — 수리 {} · {why}", id.as_str()), report);
             close_failed(env, id, &format!("재검사 실패(이 운영체제에서는 자동으로 되돌리지 않음 — 기록·알림) · {why} — 워커 검토"))?;
             report.reported_only.push((id.clone(), why.clone()));
             report.lines.push(format!("{}: 재검사 실패 — 이 운영체제에서는 자동으로 되돌리지 않고 실패로 기록·알림만 합니다 · {why}", id.as_str()));
