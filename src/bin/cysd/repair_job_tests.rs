@@ -109,7 +109,7 @@ fn tick_single_flight_busy_idle_and_cleared() {
 fn real_job_thread_runs_and_clears() {
     let (daemon, root, _pack) = rig("t6-real");
     mark_ready(&daemon);
-    let v = trigger(&daemon, "tick");
+    let v = trigger(&daemon, "tick", &serde_json::json!({}));
     assert_eq!(v["tick"], "started", "{v}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while daemon.repair_tick_running.load(Ordering::SeqCst) {
