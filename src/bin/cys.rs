@@ -28221,8 +28221,17 @@ fn run_pack_rollback_with(
             cys::pack::newest_update_snapshot(&cys::pack::local_dir().join("update-snapshots"), &l.0)
         })
         .and_then(|p| cys::pack::read_update_snapshot_meta(&p).ok().map(|m| (p, m)));
-    if snap.is_none() && !prev.is_dir() {
-        eprintln!("보존본 없음({}) — .prev 는 설치·업데이트가 1회 이상 실행된 뒤 생깁니다.", prev.display());
+    // ★T9a (RULINGS GJ1 · 설계 §7 13행): 되돌리기의 원천은 이 레인의 업데이트 전 스냅샷 **하나뿐**이다. 0.15.0 은 `pack.prev`
+    //   를 만들지도 쓰지도 않으므로(있는 팩은 제자리 갱신 — GH1) 남아 있는 `pack.prev` 는 0.15.0 이전 버전의 것이다 — 읽지도
+    //   지우지도 않는다. 스냅샷이 없으면 아무것도 바꾸지 않고 그렇게 말한다. (아래의 `pack.prev` 갈래들은 이 반환 뒤라
+    //   도달하지 않는다 — 지우면 이 함수 밖의 `prev_manifest_hash` 가 고아가 되어 CCR-T9a-1 범위 밖이므로 남겨 둔다.)
+    if snap.is_none() {
+        eprintln!(
+            "⛔ 되돌릴 보존본이 없습니다 — 이 레인에는 업데이트 전 스냅샷이 없어 되돌릴 대상이 없습니다. 아무것도 바꾸지 \
+             않았습니다.\n\x20  {} 폴더가 있다면 0.15.0 이전 버전이 남긴 것이며, 쓰지 않고 그대로 둡니다(되돌리기의 원천은 \
+             업데이트 전 스냅샷뿐입니다).",
+            prev.display()
+        );
         return 1;
     }
     let prev_ver = match &snap {
@@ -41558,8 +41567,11 @@ mod tests {
     }
 
     /// RULINGS AJ1·AJ2: 되돌리기는 스냅샷을 돌아가지 않는다 — 이 레인에 스냅샷이 있는데 그 파일이 없으면(지난 업데이트가
-    /// 바꾸지 않았거나 상한으로 빠진 파일) 거부하고 pack.prev 로 떨어지지 않는다. pack.prev 는 스냅샷이 하나도 없을 때만 쓰고,
-    /// 그 경로에서도 기동 필수 파일의 출시본이 아닌 바이트는 --force-vendor 로 되돌리지 않는다(과거 출시 해시 표의 바이트는 된다).
+    /// 바꾸지 않았거나 상한으로 빠진 파일) 거부하고 pack.prev 로 떨어지지 않는다.
+    /// ★T9a (RULINGS GJ1) 재작성 — 종전 문장 "pack.prev 는 스냅샷이 하나도 없을 때만 쓰고, 그 경로에서도 기동 필수 파일의 출시본이
+    /// 아닌 바이트는 --force-vendor 로 되돌리지 않는다(과거 출시 해시 표의 바이트는 된다)": 이제 스냅샷이 없으면 원천이 없다 —
+    /// pack.prev 가 있어도(출시본 바이트여도 · 기동 필수가 아니어도 · 강행이어도 · 목록 모드도) 거부하고, pack.prev 는 읽지도
+    /// 지우지도 않는다.
     #[test]
     fn m11_rollback_never_goes_around_the_snapshot_and_no_force_for_boot_critical() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -41580,20 +41592,25 @@ mod tests {
         // 목록 대조 키(접은 철자 — RULINGS BO2)를 받으므로 이음새도 접은 키로 비교한다.
         let bc = cys::pack::list_key(&rel);
         let boot = cys::pack::UpdateSources::none().with_listed(move |r| r == bc);
-        // AJ2: 스냅샷 없음 → pack.prev 경로. 기동 필수 + 출시본 아님 → --force-vendor 로도 거부.
-        assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, true, false, &boot), 1, "기동 필수: 강행 불가");
-        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed, "거부 = 무변경");
-        // 같은 바이트가 과거 출시 해시 표에 있으면 출시본이다 — 종전 M4 규칙대로 --force-vendor 로 되돌린다.
+        // ★GJ1: 스냅샷 없음 → 원천 없음. 종전 기대(종전 AJ2 · M4): 기동 필수 + 출시본 아님 → 1 · 과거 출시 해시 표의 바이트 →
+        //   0(살아 있는 파일 = pack.prev 바이트) · 기동 필수가 아닌 파일 강행 → 0. 이제 셋 다 1 · 무변경 · pack.prev 바이트 그대로.
         let bc2 = cys::pack::list_key(&rel);
         let h = cys::pack::content_hash_pub(prev_bytes);
         let boot_released = cys::pack::UpdateSources::none()
             .with_listed(move |r| r == bc2)
             .with_prev_vendor(move |_| vec![h.clone()]);
-        assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, true, false, &boot_released), 0, "출시본 → 종전 규칙");
-        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), prev_bytes);
-        // 기동 필수가 아닌 파일은 종전 M4 그대로(--force-vendor 로 강행 가능).
-        std::fs::write(td.join(&rel), &embed).unwrap();
-        assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, true, false, &cys::pack::UpdateSources::none()), 0);
+        let prev_state = |prev: &std::path::Path| {
+            let mut names: Vec<String> = std::fs::read_dir(prev).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            (names, std::fs::read(prev.join(&rel)).unwrap(), std::fs::read(prev.join(cys::pack::INSTALL_MANIFEST)).unwrap())
+        };
+        let before = prev_state(&prev);
+        for (label, src) in [("기동 필수", &boot), ("출시본", &boot_released), ("기동 필수 아님", &cys::pack::UpdateSources::none())] {
+            assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, true, false, src), 1, "GJ1 {label}: 스냅샷 없음 = 원천 없음");
+            assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed, "GJ1 {label}: 무변경");
+        }
+        assert_eq!(run_pack_rollback_with(None, true, false, false, &cys::pack::UpdateSources::none()), 1, "GJ1: 목록 모드도 원천 없음");
+        assert_eq!(prev_state(&prev), before, "GJ1: pack.prev 는 읽지도 지우지도 않는다(바이트 그대로)");
         // AJ1: 이 레인에 스냅샷이 생기면(이 파일은 지난 업데이트가 바꾸지 않아 없다) pack.prev 로 떨어지지 않는다.
         std::fs::write(td.join(&rel), &embed).unwrap();
         let other = "agents.json".to_string();
@@ -41733,15 +41750,17 @@ mod tests {
         let abs = td.join(rel).display().to_string();
         let aliases = ["./hooks/guard.sh", "hooks//guard.sh", abs.as_str(), "hooks\\guard.sh", "Hooks/Guard.sh", "HOOKS/GUARD.SH"];
         std::fs::create_dir_all(td.join("hooks")).unwrap();
-        // 되돌리기 원천이 실제로 있게(pack.prev 에 이 파일의 출시본 아닌 바이트 + 그 바이트와 맞는 보존본 매니페스트) —
-        // 관문이 없으면 정규형 철자는 M4 를 통과해 쓰였을 형상.
-        let prev = cys::pack::pack_prev_dir(&td);
-        std::fs::create_dir_all(prev.join("hooks")).unwrap();
-        std::fs::write(prev.join(".pack-version"), "0.14.56\n").unwrap();
-        std::fs::write(prev.join(rel), "#!/bin/sh\necho PREV\n").unwrap();
-        let mut pm = std::collections::BTreeMap::new();
-        pm.insert(rel.to_string(), cys::pack::content_hash_pub("#!/bin/sh\necho PREV\n"));
-        std::fs::write(prev.join(cys::pack::INSTALL_MANIFEST), serde_json::to_string(&pm).unwrap()).unwrap();
+        // 되돌리기 원천이 실제로 있게 — 이 레인의 업데이트 전 스냅샷에 이 파일의 출시본 아닌 바이트. ★T9a (RULINGS GJ1) 재작성:
+        // 종전 원천은 pack.prev(그 바이트 + 맞는 보존본 매니페스트)였다. 이제 원천은 스냅샷뿐이라(pack.prev 면 GJ1 이 먼저
+        // 거부해 이 시험이 관문을 재지 못한다) 스냅샷으로 옮긴다 — 관문이 없으면 정규형 철자는 쓰였을 형상.
+        std::fs::write(td.join(rel), "#!/bin/sh\necho PREV\n").unwrap();
+        let none = |_: &str| Vec::<String>::new();
+        let caps = (cys::pack::UPDATE_SNAPSHOT_FILE_CAP, cys::pack::UPDATE_SNAPSHOT_TOTAL_CAP);
+        let _snap = cys::pack::create_update_snapshot(
+            &td, &local.join("update-snapshots"), "base", "0.14.56", &std::collections::BTreeMap::new(),
+            &[rel.to_string()], cys::pack::PackScope::Base, &none, caps,
+        )
+        .unwrap();
         for present in [true, false] {
             if present {
                 std::fs::write(td.join(rel), "#!/bin/sh\necho LIVE\n").unwrap();
@@ -41761,7 +41780,7 @@ mod tests {
             }
             // 정규형 철자도 거부(자작 갈래 · 내장 밖의 rel 이라도 — 미래의 등재 행 `state/hook-targets.json` 와 같은 모양).
             assert_eq!(run_pack_adopt_with(Some(rel.to_string()), false, Some(scratch.display().to_string()), false, true, &listed), 1);
-            assert_eq!(run_pack_rollback_with(Some(rel.to_string()), true, true, false, &listed), 1, "pack.prev 원천도 거부");
+            assert_eq!(run_pack_rollback_with(Some(rel.to_string()), true, true, false, &listed), 1, "스냅샷 원천도 거부");
             if !present {
                 assert!(!td.join(rel).exists());
             }
@@ -41878,13 +41897,18 @@ mod tests {
         let scratch = td.parent().unwrap().join("scratch-bv4.sh");
         std::fs::write(&scratch, "#!/bin/sh\necho NOT RELEASED\n").unwrap();
         std::fs::create_dir_all(td.join("hooks")).unwrap();
-        let prev = cys::pack::pack_prev_dir(&td);
-        std::fs::create_dir_all(prev.join("hooks")).unwrap();
-        std::fs::write(prev.join(".pack-version"), "0.14.56\n").unwrap();
+        // ★T9a (RULINGS GJ1) 재작성: 종전 되돌리기 원천은 pack.prev(그 철자들의 파일)였다 — 이제 원천은 이 레인의 업데이트 전
+        // 스냅샷뿐이라 스냅샷(등재 파일의 출시본 아닌 바이트)을 두고 철자 관문을 잰다(pack.prev 면 GJ1 이 먼저 거부한다).
+        std::fs::write(td.join(rel), "#!/bin/sh\necho PREV\n").unwrap();
+        let none = |_: &str| Vec::<String>::new();
+        let caps = (cys::pack::UPDATE_SNAPSHOT_FILE_CAP, cys::pack::UPDATE_SNAPSHOT_TOTAL_CAP);
+        let _snap = cys::pack::create_update_snapshot(
+            &td, &local.join("update-snapshots"), "base", "0.14.56", &std::collections::BTreeMap::new(),
+            &[rel.to_string()], cys::pack::PackScope::Base, &none, caps,
+        )
+        .unwrap();
         for a in ["hooks/guard.sh.", "hooks/guard.sh ", "hooks./guard.sh", "hooks/guard.sh:x"] {
             assert!(pack_rel_normal_form(a).is_err(), "정규형 관문이 {a:?} 를 거부");
-            let _ = std::fs::create_dir_all(prev.join(a).parent().unwrap());
-            let _ = std::fs::write(prev.join(a), "#!/bin/sh\necho PREV\n");
             for present in [true, false] {
                 if present {
                     std::fs::write(td.join(rel), "#!/bin/sh\necho LIVE\n").unwrap();
@@ -41919,14 +41943,17 @@ mod tests {
         std::os::unix::fs::symlink(td.join("hooks"), td.join("h2")).unwrap();
         let scratch = td.parent().unwrap().join("scratch-bv3.sh");
         std::fs::write(&scratch, "#!/bin/sh\necho NOT RELEASED\n").unwrap();
-        // 되돌리기 원천(pack.prev)에 그 철자의 바이트 + 맞는 보존본 매니페스트 — 관문이 없으면 링크를 거쳐 쓰였을 형상.
-        let prev = cys::pack::pack_prev_dir(&td);
-        std::fs::create_dir_all(prev.join("h2")).unwrap();
-        std::fs::write(prev.join(".pack-version"), "0.14.56\n").unwrap();
-        std::fs::write(prev.join("h2/guard.sh"), "#!/bin/sh\necho PREV\n").unwrap();
-        let mut pm = std::collections::BTreeMap::new();
-        pm.insert("h2/guard.sh".to_string(), cys::pack::content_hash_pub("#!/bin/sh\necho PREV\n"));
-        std::fs::write(prev.join(cys::pack::INSTALL_MANIFEST), serde_json::to_string(&pm).unwrap()).unwrap();
+        // 되돌리기 원천 — ★T9a (RULINGS GJ1) 재작성: 종전 원천은 pack.prev(그 철자 `h2/guard.sh` 의 바이트 + 맞는 보존본
+        // 매니페스트)였다. 이제 원천은 이 레인의 업데이트 전 스냅샷뿐이라 스냅샷(등재 파일의 출시본 아닌 바이트)을 둔다 — 관문이
+        // 없으면 링크를 거쳐 쓰였을 형상(pack.prev 면 GJ1 이 먼저 거부해 링크 관문을 재지 못한다).
+        std::fs::write(td.join("hooks/guard.sh"), "#!/bin/sh\necho PREV\n").unwrap();
+        let none = |_: &str| Vec::<String>::new();
+        let caps = (cys::pack::UPDATE_SNAPSHOT_FILE_CAP, cys::pack::UPDATE_SNAPSHOT_TOTAL_CAP);
+        let _snap = cys::pack::create_update_snapshot(
+            &td, &local.join("update-snapshots"), "base", "0.14.56", &std::collections::BTreeMap::new(),
+            &["hooks/guard.sh".to_string()], cys::pack::PackScope::Base, &none, caps,
+        )
+        .unwrap();
         assert!(pack_rel_gate(&td, "h2/guard.sh").unwrap_err().contains("링크"), "상위 경로 규칙의 문장");
         for present in [true, false] {
             if present {
@@ -42132,7 +42159,10 @@ mod tests {
             assert_eq!(run_pack_merge_with(None, yes, Some(rel.clone()), &real), 1, "revert-merge {rel}");
             assert_eq!(live(&td).as_deref(), Some("MERGED NOW\n"), "revert-merge wrote nothing: {rel}");
             refusals += 1;
-            // ── pack-rollback from pack.prev (no snapshot in this lane) — forced ──
+            // ── pack-rollback with a pack.prev and no snapshot in this lane — forced ──
+            // ★T9a (RULINGS GJ1) rewritten — old expectation: "pack.prev {rel}" refused (1) by the listed gate on the pack.prev
+            //   source. Now there is no pack.prev source at all: refused (1) because the lane has no snapshot, nothing written,
+            //   and pack.prev neither read nor removed (its bytes unchanged).
             let local_prev = base.join("local-prev");
             let lp = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local_prev);
             let prev = cys::pack::pack_prev_dir(&td);
@@ -42143,8 +42173,9 @@ mod tests {
             pm.insert(rel.clone(), cys::pack::content_hash_pub("RELEASED 0.14.56\n"));
             std::fs::write(prev.join(cys::pack::INSTALL_MANIFEST), serde_json::to_string(&pm).unwrap()).unwrap();
             std::fs::write(td.join(&rel), mine).unwrap();
-            assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, true, false, &real), 1, "pack.prev {rel}");
-            assert_eq!(live(&td).as_deref(), Some(mine), "pack.prev rollback wrote nothing: {rel}");
+            assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, true, false, &real), 1, "no snapshot {rel}");
+            assert_eq!(live(&td).as_deref(), Some(mine), "no-snapshot rollback wrote nothing: {rel}");
+            assert_eq!(std::fs::read_to_string(prev.join(&rel)).unwrap(), "UNRELEASED IN PACK.PREV\n", "pack.prev untouched: {rel}");
             drop(lp);
             refusals += 1;
             // ── pack-rollback from the lane's update snapshot — plain and forced ──
@@ -55429,10 +55460,14 @@ mod p3r1_caller_tests {
         }
     }
 
-    /// ★M4 — `pack-rollback` 의 보존본 검증(T15 불일치 거부 · T30 근거 부재 거부 · T29 user 우회 ·
-    /// T25 보존본이 실행 가능하면 그 mode 가 권위). 9dbea792 에는 이 거동이 **없다**(전량 복원).
+    /// ★M4 — `pack-rollback` 의 보존본(pack.prev) 경로. ★T9a (RULINGS GJ1) 재작성 — 종전 이름
+    /// `p3r1_m4_rollback_verifies_the_preserved_copy`, 종전 기대: T15 보존본 매니페스트 불일치 → 거부(1)·쓰기 0 · T15b 같은 상태
+    /// `--force-vendor` → 강행(0)·보존본 바이트 · T25 실행 가능한 보존본의 mode 0755 가 이긴다 · T30 보존본 매니페스트 부재 →
+    /// "확인 불가(unavailable)"(1)·쓰기 0 · T29 user 파일 → 매니페스트 검증 없이 복원(0). 이제 되돌리기의 원천은 이 레인의
+    /// 업데이트 전 스냅샷뿐이다(설계 §7 13행) — 스냅샷이 없으면 다섯 경우 모두 거부(1)·쓰기 0이고, pack.prev 는 읽지도
+    /// 지우지도 않는다(바이트 그대로).
     #[test]
-    fn p3r1_m4_rollback_verifies_the_preserved_copy() {
+    fn p3r1_m4_rollback_without_a_snapshot_never_uses_pack_prev() {
         let _lock = super::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_bytes = "#!/bin/sh\npreserved\n";
         let disk_bytes = "#!/bin/sh\ncurrent on disk\n";
@@ -55450,8 +55485,6 @@ mod p3r1_caller_tests {
             }
             std::fs::write(r.pack.join(rel), disk_bytes).unwrap();
             std::fs::write(prev.join(rel), prev_bytes).unwrap();
-            // 보존본은 실행 가능, 대상은 0644 — T25 의 전제. unix 밖에서는 no-op 이고, 그 플랫폼의
-            // 단언은 아래에서 `cfg(unix)` 로 빠진다(픽스처는 한 가지 철자로 남는다).
             set_mode(&prev.join(rel), 0o755);
             set_mode(&r.pack.join(rel), 0o644);
             if let Some(h) = prev_manifest {
@@ -55465,70 +55498,47 @@ mod p3r1_caller_tests {
             }
             r
         };
+        // pack.prev 의 모든 항목(이름 · 바이트) — 되돌리기 전후가 같아야 한다.
+        let prev_state = |pack: &std::path::Path| -> Vec<(String, Vec<u8>)> {
+            let prev = cys::pack::pack_prev_dir(pack);
+            let mut out = Vec::new();
+            let mut stack = vec![prev.clone()];
+            while let Some(d) = stack.pop() {
+                for e in std::fs::read_dir(&d).unwrap() {
+                    let p = e.unwrap().path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else {
+                        out.push((p.strip_prefix(&prev).unwrap().display().to_string(), std::fs::read(&p).unwrap()));
+                    }
+                }
+            }
+            out.sort();
+            out
+        };
 
-        // T15 — 보존본이 보존본 매니페스트와 불일치 → 거부, 쓰기 0.
-        {
-            let r = rig("probe");
-            let rel = rel_of_class(&r.pack, "system");
+        // (종전 T15·T15b·T30·T29) system 불일치 매니페스트 · system 매니페스트 부재 · user 파일 — 강행 여부와 무관하게 거부.
+        for (tag, class, manifest) in [
+            ("t15", "system", Some(cys::pack::content_hash_pub("something else\n"))),
+            ("t30", "system", None),
+            ("t29", "user", None),
+        ] {
+            let r = rig(&format!("probe-{tag}"));
+            let rel = rel_of_class(&r.pack, class);
             let _ = std::fs::remove_dir_all(&r._root);
-            let r = setup("t15", rel, Some(&cys::pack::content_hash_pub("something else\n")));
-            let rc = super::run_pack_rollback(Some(rel.to_string()), true, false, false);
-            assert_eq!(rc, 1, "T15: 불일치는 거부여야 한다");
-            assert_eq!(
-                std::fs::read_to_string(r.pack.join(rel)).unwrap(),
-                disk_bytes,
-                "T15: 거부 경로는 아무것도 쓰지 않는다"
-            );
-
-            // T15b — 같은 상태에서 --force-vendor 는 강행한다(거부가 영구 벽이 아님을 고정).
-            let rc2 = super::run_pack_rollback(Some(rel.to_string()), true, true, false);
-            assert_eq!(rc2, 0, "T15b: --force-vendor 는 강행한다");
-            assert_eq!(std::fs::read_to_string(r.pack.join(rel)).unwrap(), prev_bytes);
-            // T25 — 보존본이 실행 가능하면 그 mode 가 권위다(대상은 0644 였다).
-            // ★여기만 `cfg(unix)` 다: POSIX 실행비트가 없는 플랫폼에는 이 불변식이 없다. 위의
-            //   거부·쓰기 0·강행 단언은 **윈도우에서도 돈다**(판정 2항의 분리 요구).
-            #[cfg(unix)]
-            {
+            let r = setup(tag, rel, manifest.as_deref());
+            let before = prev_state(&r.pack);
+            for force_vendor in [false, true] {
+                let rc = super::run_pack_rollback(Some(rel.to_string()), true, force_vendor, false);
+                assert_eq!(rc, 1, "[{tag} force={force_vendor}] GJ1: 스냅샷이 없으면 되돌릴 원천이 없다");
                 assert_eq!(
-                    mode_of(&r.pack.join(rel)),
-                    0o755,
-                    "T25: 실행 가능한 보존본의 mode 가 대상 0644 를 이긴다"
+                    std::fs::read_to_string(r.pack.join(rel)).unwrap(),
+                    disk_bytes,
+                    "[{tag} force={force_vendor}] 아무것도 쓰지 않는다"
                 );
             }
-            let _ = std::fs::remove_dir_all(&r._root);
-        }
-
-        // T30 — 보존본 매니페스트 자체가 없다 → "확인 불가(unavailable)", 쓰기 0.
-        {
-            let r = rig("probe2");
-            let rel = rel_of_class(&r.pack, "system");
-            let _ = std::fs::remove_dir_all(&r._root);
-            let r = setup("t30", rel, None);
-            let rc = super::run_pack_rollback(Some(rel.to_string()), true, false, false);
-            assert_eq!(rc, 1, "T30: 검증 근거가 없으면 거부다");
-            assert_eq!(
-                std::fs::read_to_string(r.pack.join(rel)).unwrap(),
-                disk_bytes,
-                "T30: 확인 불가 경로는 **아무것도 쓰지 않는다**"
-            );
-            // 안내 문면(내장본 치유 경로)을 함께 고정한다 — 거부만 하고 길을 안 알려주면 막힌다.
-            let src = include_str!("cys.rs");
-            assert!(
-                src.contains("확인 불가(unavailable)") && src.contains("cys pack-heal --missing-only"),
-                "T30: 거부 메시지가 pack-heal 복구 경로를 가리켜야 한다"
-            );
-            let _ = std::fs::remove_dir_all(&r._root);
-        }
-
-        // T29 — user 등급은 이 검증의 대상이 아니다(보존본의 user 파일은 정당하게 매니페스트와 다르다).
-        {
-            let r = rig("probe3");
-            let rel = rel_of_class(&r.pack, "user");
-            let _ = std::fs::remove_dir_all(&r._root);
-            let r = setup("t29", rel, None);
-            let rc = super::run_pack_rollback(Some(rel.to_string()), true, false, false);
-            assert_eq!(rc, 0, "T29: user 파일은 매니페스트 검증 없이 복원된다");
-            assert_eq!(std::fs::read_to_string(r.pack.join(rel)).unwrap(), prev_bytes);
+            assert_eq!(super::run_pack_rollback(None, true, false, false), 1, "[{tag}] 목록 모드도 원천 없음");
+            assert_eq!(prev_state(&r.pack), before, "[{tag}] pack.prev 는 읽지도 지우지도 않는다");
             let _ = std::fs::remove_dir_all(&r._root);
         }
     }
