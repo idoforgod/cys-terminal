@@ -213,28 +213,98 @@ fn census_i_every_class_has_a_probe_in_every_cell() {
 fn census_iii_deny_rules_and_branches_pinned() {
     let mut actual = Vec::new();
     let mut differs = Vec::new();
-    for (rel, n, digest) in CENSUS_PINS {
-        let (an, ad) = corpus::census_digest(&released(rel));
-        actual.push(format!("(\"{rel}\", {an}, \"{ad}\")"));
-        assert!(
-            an > 10,
-            "{rel}: only {an} census lines — the census reads nothing"
-        );
-        if (an, ad.as_str()) != (*n, *digest) {
-            differs.push(format!("{rel} ({n} → {an} lines)"));
+    for (rel, region, start, end, n, digest) in CENSUS_PINS {
+        match corpus::census_region(&released(rel), start, end) {
+            Ok((an, ad)) => {
+                actual.push(format!("({rel:?}, {region:?}, {an}, {ad:?})"));
+                assert!(an > 20, "{rel} {region}: only {an} lines — the region reads nothing");
+                if (an, ad.as_str()) != (*n, *digest) {
+                    differs.push(format!("{rel} {region} ({n} → {an} lines)"));
+                }
+            }
+            Err(e) => differs.push(format!("{rel} {region}: {e}")),
         }
     }
     assert!(
         differs.is_empty(),
-        "census (iii): the deny rules / environment branches changed in {}. Review CORPUS_G / CORPUS_R / \
-         CORPUS_C and the cell table against the device, then update CENSUS_PINS. Current values: {}",
+        "census (iii): a deny-decision / environment-branch region changed in {}. Review CORPUS_G / \
+         CORPUS_R / CORPUS_C and the cell table against the device, then update CENSUS_PINS. Current \
+         values: {}",
         differs.join(", "),
         actual.join(", ")
     );
-    // the census reads deny sites: a removed deny line changes the digest (positive control)
+    // RULINGS CZ7 — mutation checks both ways: a changed predicate / table entry / environment branch
+    // changes a pinned region; a harmless edit outside the regions changes none
+    let regions = |rel: &str, text: &str| -> Vec<Result<(usize, String), String>> {
+        CENSUS_PINS
+            .iter()
+            .filter(|p| p.0 == rel)
+            .map(|p| corpus::census_region(text, p.2, p.3))
+            .collect()
+    };
+    let cases: [(&str, &str, &str, bool); 7] = [
+        // guard.sh's `gh pr create/merge` condition (the line the needle census missed)
+        (
+            "hooks/guard.sh",
+            "x in args for x in (\"create\", \"merge\")",
+            "x in args for x in (\"create\",)",
+            true,
+        ),
+        // guard.sh's no-interpreter test switch (an environment branch)
+        (
+            "hooks/guard.sh",
+            "GUARD_FORCE_NOPY:-0}\" = \"1\"",
+            "GUARD_FORCE_NOPY:-0}\" = \"2\"",
+            true,
+        ),
+        // the gate's GIT_WRITE_SUBS table loses `push`
+        (
+            "hooks/role-capability-gate.sh",
+            "{\"commit\", \"push\", \"add\",",
+            "{\"commit\", \"add\",",
+            true,
+        ),
+        // _lib.sh's interpreter-shim folder default
+        (
+            "hooks/_lib.sh",
+            "_cys_sh_d=\"${CYS_DEVTOOLS_SHIM_DIR:-/usr/bin}\"",
+            "_cys_sh_d=\"${CYS_DEVTOOLS_SHIM_DIR:-/usr/local/bin}\"",
+            true,
+        ),
+        // harmless: headers and the gate's self-tests lie outside every region
+        (
+            "hooks/guard.sh",
+            "# guard.sh — Autopilot 집행 hook",
+            "# guard.sh — Autopilot 집행 훅",
+            false,
+        ),
+        (
+            "hooks/_lib.sh",
+            "# _lib.sh — cysjavis 훅 공용 프리루드",
+            "# _lib.sh — cysjavis 훅 공용 머리말",
+            false,
+        ),
+        (
+            "hooks/role-capability-gate.sh",
+            "# ── ① reviewer/planner(종전 핀 · 무변경)",
+            "# ── ① reviewer/planner(종전 핀)",
+            false,
+        ),
+    ];
+    for (rel, from, to, changes) in cases {
+        let t = released(rel);
+        assert_eq!(t.matches(from).count(), 1, "{rel}: mutation anchor {from:?}");
+        let m = t.replacen(from, to, 1);
+        assert_eq!(
+            regions(rel, &t) != regions(rel, &m),
+            changes,
+            "{rel}: {from:?} → {to:?}"
+        );
+    }
+    // an anchor that is no longer unique is a failure, not a guess
     let g = released("hooks/guard.sh");
-    let cut = g.replacen("emit_deny", "echo_deny", 1);
-    assert_ne!(corpus::census_digest(&g), corpus::census_digest(&cut));
+    let doubled = g.replacen("def _strip_hidden(s):", "def _strip_hidden(s):\ndef _strip_hidden(s):", 1);
+    assert!(corpus::census_region(&doubled, "def _strip_hidden(s):", "PY").is_err());
 }
 
 /// I4's anchors are found in the released guard.sh, and each region is non-trivial.
