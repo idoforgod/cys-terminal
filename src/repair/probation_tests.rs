@@ -956,3 +956,48 @@ fn a_report_is_marked_filed_only_after_the_intake_accepted_it() {
     run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 2100.0, &lock), false).unwrap();
     assert_eq!(calls.get(), 3, "filed: never sent again");
 }
+
+// ───────────────────────────── RULINGS DR6 — a finding is notified once, for ever ─────────────────────────────
+
+/// DR6: more than 500 put-backs (the display window keeps 500), then repeated sweeps — no old
+/// finding is reconstructed or notified again; an operation whose finding was never recorded is
+/// reconstructed exactly once. Without DR6 every sweep re-created the evicted ones as new notices.
+#[test]
+fn a_finding_is_notified_once_for_ever() {
+    let r = rig("dr6acks");
+    let sub = m10_root_in(&r.root, &r.lane);
+    let ops_dir = crate::repair::wal::ops_dir_in(&sub, &m10_bucket());
+    std::fs::create_dir_all(&ops_dir).unwrap();
+    let ack_dir = ledger::repair_dir_in(&sub, &m10_bucket()).join("acks");
+    std::fs::create_dir_all(&ack_dir).unwrap();
+    let mk = |i: usize| {
+        let op = format!("m10-{i:04}");
+        let v = serde_json::json!({
+            "schema": 1, "op": op, "repair": "R-1", "lane_key": r.lane.0, "kind": "m10-revert", "form": "exchange",
+            "rel": "hooks/z.sh", "pre_existed": true, "expected": format!("file:{}:0755", format!("{i:064x}")),
+            "incoming": format!("file:{}:0755", "a".repeat(64)), "pack_generation": null,
+            "slot": sub.join("displaced/R-1").join(format!("slot-{i}")), "slot_identity": null, "live_identity": null,
+            "incoming_copy": null, "incoming_copy_identity": null, "step": "sealed", "hooks": [], "finished": true,
+            "outcome": "applied", "note": "", "created_at": 1.0, "updated_at": 1.0
+        });
+        std::fs::write(ops_dir.join(format!("{op}.json")), serde_json::to_vec(&v).unwrap()).unwrap();
+        op
+    };
+    // 501 historical put-backs whose findings were recorded (acknowledged); the window keeps 500
+    for i in 0..501 {
+        let op = mk(i);
+        std::fs::write(ack_dir.join(format!("{op}.json")), b"{}").unwrap();
+    }
+    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    for k in 0..3 {
+        let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0 * k as f64, &lock)).unwrap();
+        assert!(f.is_empty(), "sweep {k}: an old finding came back: {}", f.len());
+    }
+    // one operation whose finding was never recorded → reconstructed exactly once
+    mk(9999);
+    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 4.0 * 3600.0, &lock)).unwrap();
+    assert_eq!(f.len(), 1, "{f:?}");
+    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 5.0 * 3600.0, &lock)).unwrap();
+    assert!(f.is_empty(), "never again: {f:?}");
+}

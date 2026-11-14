@@ -666,6 +666,9 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
     let pack = env.op.pack;
     let mut existing = load_findings(root, lane);
     let mut new_findings = Vec::new();
+    // DR6: the operations whose finding is recorded in this sweep — acknowledged write-once next to
+    // the operation's own record AFTER the findings are saved
+    let mut to_ack: Vec<String> = Vec::new();
     // CT9: a put-back's finding survives a crash between the exchange and the findings write — it is
     // rebuilt idempotently from the completed operation records of the M10 sub-ledger
     let sub_root = m10_root_in(root, lane);
@@ -673,9 +676,16 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
     for op in done_ops.into_iter().filter(|o| {
         o.finished && o.outcome.as_deref() == Some("applied") && o.kind == "m10-revert" && o.lane_key == *lane
     }) {
-        if existing.iter().chain(new_findings.iter()).any(|f: &Finding| f.slot.is_some() && f.slot == op.slot) {
+        // DR6: an operation whose finding was ever recorded carries its write-once acknowledgement —
+        // independent of the 500-row display window; it is never reconstructed again
+        if m10_ack_path(&sub_root, &op.op).exists() {
             continue;
         }
+        if existing.iter().chain(new_findings.iter()).any(|f: &Finding| f.slot.is_some() && f.slot == op.slot) {
+            to_ack.push(op.op.clone());
+            continue;
+        }
+        to_ack.push(op.op.clone());
         let sha = match apply::state_of_canon(&op.expected) {
             Some(TargetState::File { sha256, .. }) => sha256,
             _ => continue,
@@ -949,6 +959,9 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
             });
             continue;
         };
+        if let Some(op_id) = &r.op {
+            to_ack.push(op_id.clone());
+        }
         let (kind, note) = match &r.outcome {
             ApplyOutcome::Applied => ("reverted", format!("검사 결과: {why}")),
             ApplyOutcome::Superseded(m) => ("superseded", format!("검사와 되돌리기 사이에 바뀜 — 되돌리지 않고 다음 검사로: {m}")),
@@ -973,7 +986,23 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
         existing.extend(new_findings.iter().cloned());
         save_findings(root, lane, &existing)?;
     }
+    for op_id in to_ack {
+        let p = m10_ack_path(&sub_root, &op_id);
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        match super::vault::publish_new(&p, b"{\"finding\": \"recorded\"}\n", 0o644) {
+            Ok(()) | Err(RepairError::Superseded(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
     Ok(new_findings)
+}
+
+/// DR6: the write-once acknowledgement that an M10 operation's finding was recorded —
+/// `<sub-ledger>/R-1/acks/<op>.json`, next to the operation's own record.
+fn m10_ack_path(sub_root: &Path, op: &str) -> PathBuf {
+    ledger::repair_dir_in(sub_root, &m10_bucket()).join("acks").join(format!("{op}.json"))
 }
 
 /// The resolved restore content of M10 for `rel` in a pack: the binary's embedded copy, only when
