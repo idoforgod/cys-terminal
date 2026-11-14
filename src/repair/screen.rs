@@ -113,6 +113,10 @@ pub struct AfterRun {
     pub rewritten_in_repeat: Vec<LiveDifference>,
     /// Processes the screen started that were still alive after its runs (killed then; must be empty).
     pub leftover_processes: Vec<u32>,
+    /// RULINGS CZ6: `first` was not empty and the repeat ran out of time or did not complete — it
+    /// proves nothing (never "not written again").
+    #[serde(default)]
+    pub repeat_incomplete: bool,
 }
 
 /// What the screen found (C4 AY5; read by `submit` and by T6's apply).
@@ -321,6 +325,18 @@ pub fn judge_after_run(report: &mut ScreenReport, explained: &dyn Fn(&LiveDiffer
     if first.is_empty() {
         return;
     }
+    if report.after_run.repeat_incomplete {
+        // RULINGS CZ6: an incomplete repeat is a failure (§8-1 — not measured is not passed)
+        let items: Vec<&str> = first.iter().map(|d| d.item.as_str()).take(5).collect();
+        let line = format!(
+            "예행 동안 실제 환경의 항목이 바뀌었고({}) 다시 돌린 예행이 시한 안에 끝나지 않아 다시 썼는지 잴 수 없습니다 — 잴 수 없는 것은 통과가 아니므로 거부합니다",
+            items.join(", ")
+        );
+        report.not_measurable.push(line.clone());
+        report.refusals.push(line);
+        report.verdict = ScreenVerdict::Refused;
+        return;
+    }
     let again: Vec<&LiveDifference> = report
         .after_run
         .rewritten_in_repeat
@@ -384,6 +400,9 @@ pub(crate) struct ScreenConfig {
     pub child_cap: Duration,
     /// Test seam (RULINGS CZ5): runs right after the inputs were read, before any probe.
     pub after_inputs_read: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Test seam (RULINGS CZ6): runs with 1 right after the first "before" snapshot and with 2 right
+    /// after the repeat's "before" snapshot.
+    pub between_snapshots: Option<Arc<dyn Fn(u32) + Send + Sync>>,
 }
 
 impl ScreenConfig {
@@ -402,6 +421,7 @@ impl ScreenConfig {
                 .clamp(1, 8),
             child_cap: Duration::from_secs(30),
             after_inputs_read: None,
+            between_snapshots: None,
         }
     }
 
@@ -2370,6 +2390,9 @@ pub(crate) fn screen_with(
     // the scoped after-run comparison (BK1): before
     let settings = replay::real_settings_targets(lane, &cfg.real_home);
     let before = replay::live_snapshot(lane, &settings);
+    if let Some(hook) = &cfg.between_snapshots {
+        hook(1);
+    }
     let (mut results, leftovers, out_of_time) = run_all(cfg, &v, &inputs, until, true)?;
     let after = replay::live_snapshot(lane, &settings);
     let first: Vec<LiveDifference> = replay::changed_items(&before, &after)
@@ -2382,10 +2405,19 @@ pub(crate) fn screen_with(
         .collect();
     let mut rewritten = Vec::new();
     let mut all_leftovers = leftovers;
+    let mut repeat_incomplete = false;
     if !first.is_empty() && !out_of_time {
         // one repeat on a fresh scratch root; an item written AGAIN in that window is the finding
         let before2 = replay::live_snapshot(lane, &settings);
-        let (_again, left2, _) = run_all(cfg, &v, &inputs, until, false)?;
+        if let Some(hook) = &cfg.between_snapshots {
+            hook(2);
+        }
+        // RULINGS CZ6: a repeat that ran out of time or failed is incomplete — it proves nothing
+        let (left2, oot2) = match run_all(cfg, &v, &inputs, until, false) {
+            Ok((_again, left2, oot2)) => (left2, oot2),
+            Err(_) => (Vec::new(), true),
+        };
+        repeat_incomplete = oot2;
         let after2 = replay::live_snapshot(lane, &settings);
         all_leftovers.extend(left2);
         rewritten = replay::changed_items(&before2, &after2)
@@ -2419,6 +2451,7 @@ pub(crate) fn screen_with(
         first,
         rewritten_in_repeat: rewritten,
         leftover_processes: still,
+        repeat_incomplete,
     };
     if !report.after_run.leftover_processes.is_empty() {
         report.refusals.push(format!(
