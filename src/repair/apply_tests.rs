@@ -2551,6 +2551,394 @@ fn an_unreadable_recorded_state_is_an_error_never_absent() {
     assert!(matches!(crate::repair::consumed::approval_consumed_in(&r.root, &r.lane, "rqr-x"), crate::repair::consumed::ApprovalUse::Unknown(_)));
 }
 
+// ───────────────────────────── RULINGS FG6 / FG1 — the censuses of the repair module ─────────────────────────────
+
+/// Every production file of the repair module, read from disk (so a NEW file is seen), test code cut
+/// off: (file name, text).
+fn census_sources() -> Vec<(String, String)> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("repair");
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let p = e.unwrap().path();
+        let name = p.file_name().unwrap().to_str().unwrap().to_string();
+        if !name.ends_with(".rs") || name.ends_with("_tests.rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&p).unwrap();
+        let cut = ["\n#[cfg(test)]\nmod ", "\n#[cfg(test)]\n#[path"].iter().filter_map(|m| src.find(m)).min().unwrap_or(src.len());
+        out.push((name, src[..cut].to_string()));
+    }
+    out.sort();
+    out
+}
+
+/// The function a `fn` line declares (visibility and qualifiers skipped).
+fn census_fn_name(t: &str) -> Option<String> {
+    let mut s = t;
+    loop {
+        let before = s;
+        for p in ["pub(crate) ", "pub(super) ", "pub ", "const ", "unsafe ", "async ", "extern \"C\" "] {
+            if let Some(r) = s.strip_prefix(p) {
+                s = r;
+            }
+        }
+        if s == before {
+            break;
+        }
+    }
+    let r = s.strip_prefix("fn ")?;
+    let name: String = r.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Occurrences of `name(` not preceded by an identifier character (a call, a path or a method).
+fn census_calls(line: &str, name: &str) -> usize {
+    let pat = format!("{name}(");
+    line.match_indices(&pat)
+        .filter(|(i, _)| !line[..*i].chars().last().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .count()
+}
+
+/// (file, fn) → the count of `calls` and `literals` in production code; a line belongs to the last
+/// `fn` line above it; comment lines and `fn` lines themselves are skipped.
+fn census_counts(sources: &[(String, String)], calls: &[&str], literals: &[&str]) -> BTreeMap<(String, String), usize> {
+    let mut m = BTreeMap::new();
+    for (file, prod) in sources {
+        let mut cur = "<module>".to_string();
+        for line in prod.lines() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            if let Some(n) = census_fn_name(t) {
+                cur = n;
+                continue;
+            }
+            let n: usize = calls.iter().map(|c| census_calls(line, c)).sum::<usize>() + literals.iter().map(|l| line.matches(l).count()).sum::<usize>();
+            if n > 0 {
+                *m.entry((file.clone(), cur.clone())).or_insert(0) += n;
+            }
+        }
+    }
+    m
+}
+
+/// The violations of a census: an unlisted file of the module, a (file, fn) with sites but no row, a
+/// row whose counts no longer add up, a class outside `classes`, a row for a function without sites.
+fn census_violations(
+    sources: &[(String, String)],
+    calls: &[&str],
+    literals: &[&str],
+    table: &[(&str, &str, &str, usize, &str)],
+    classes: &[&str],
+) -> Vec<String> {
+    let mut v = Vec::new();
+    for (f, _) in sources {
+        if !CENSUS_MODULE_FILES.contains(&f.as_str()) {
+            v.push(format!("{f}: a file of the repair module the censuses do not list"));
+        }
+    }
+    let counts = census_counts(sources, calls, literals);
+    for ((f, func), n) in &counts {
+        let rows: Vec<_> = table.iter().filter(|(cf, cfn, ..)| cf == f && cfn == func).collect();
+        if rows.is_empty() {
+            v.push(format!("{f}::{func}: {n} site(s), unclassified"));
+            continue;
+        }
+        let listed: usize = rows.iter().map(|r| r.3).sum();
+        if listed != *n {
+            v.push(format!("{f}::{func}: {n} site(s), the census lists {listed} — classify the new one"));
+        }
+        for r in &rows {
+            if !classes.contains(&r.2) {
+                v.push(format!("{f}::{func}: class {} is not one of {classes:?}", r.2));
+            }
+        }
+    }
+    for (cf, cfn, ..) in table {
+        if !counts.contains_key(&(cf.to_string(), cfn.to_string())) {
+            v.push(format!("{cf}::{cfn}: listed, but has no site — remove the row"));
+        }
+    }
+    v
+}
+
+/// FG6: every write primitive of the repair module.
+const CENSUS_WRITE_CALLS: &[&str] = &[
+    "write", "copy", "rename", "create_dir", "create_dir_all", "remove_file", "remove_dir", "remove_dir_all", "hard_link", "symlink",
+    "set_permissions", "exchange", "swap_paths", "place_no_replace", "write_durable", "write_json_durable", "atomic_write_json",
+    "atomic_write_bytes", "clonefile", "renamex_np", "copy_file_new", "copy_link_new", "create_new_with", "write_all", "set_len",
+];
+const CENSUS_WRITE_LITERALS: &[&str] = &[".create_new(true)", ".create(true)"];
+const CENSUS_WRITE_CLASSES: &[&str] = &["door", "vault", "staging", "ledger"];
+/// FG1: every site that can turn a read error into a value.
+const CENSUS_READ_LITERALS: &[&str] = &[".unwrap_or_default()", ".ok()", ".unwrap_or(", ".unwrap_or_else(", ".exists()", "let Ok(", ".is_ok()", ".is_ok_and(", "Err(_) =>"];
+const CENSUS_READ_CLASSES: &[&str] = &["evidence", "reported", "conservative", "not-a-read", "display", "test", "outside"];
+
+fn write_census(sources: &[(String, String)]) -> Vec<String> {
+    census_violations(sources, CENSUS_WRITE_CALLS, CENSUS_WRITE_LITERALS, WRITE_CENSUS, CENSUS_WRITE_CLASSES)
+}
+
+fn read_census(sources: &[(String, String)]) -> Vec<String> {
+    census_violations(sources, &[], CENSUS_READ_LITERALS, READ_DEFAULT_CENSUS, CENSUS_READ_CLASSES)
+}
+
+/// RULINGS FG6 (codex r4 M7): every write primitive (write, copy, rename, create_dir*, exchange,
+/// place, remove, …) in EVERY file of the repair module is classified — door / vault / staging /
+/// ledger; an unclassified one, a new one in a classified function, or a file of the module the
+/// census does not list fails. The module's declared files are exactly its files.
+#[test]
+fn every_write_of_the_repair_module_is_classified() {
+    let sources = census_sources();
+    let v = write_census(&sources);
+    assert!(v.is_empty(), "{v:#?}");
+    let modrs = &sources.iter().find(|(n, _)| n == "mod.rs").unwrap().1;
+    for (f, _) in &sources {
+        if f == "mod.rs" {
+            continue;
+        }
+        let m = f.trim_end_matches(".rs");
+        let declared = modrs.contains(&format!("mod {m};")) || sources.iter().any(|(_, t)| t.contains(&format!("#[path = \"{f}\"]")));
+        assert!(declared, "{f}: not a declared module of the repair module");
+    }
+}
+
+/// FG6's mutation controls: a direct write, a copy, a rename, a directory creation — each added in a
+/// new function — and a new module file each make the census fail; so does one more primitive in a
+/// function already classified.
+#[test]
+fn the_write_census_catches_each_mutation() {
+    let base = census_sources();
+    let with = |file: &str, code: &str| -> Vec<(String, String)> {
+        base.iter()
+            .map(|(n, t)| (n.clone(), if n == file { format!("{t}\nfn census_mutant() {{\n    {code}\n}}\n") } else { t.clone() }))
+            .collect()
+    };
+    for code in ["std::fs::write(p, b\"x\").unwrap();", "std::fs::copy(a, b).unwrap();", "std::fs::rename(a, b).unwrap();", "std::fs::create_dir_all(d).unwrap();"] {
+        assert!(!write_census(&with("probation.rs", code)).is_empty(), "not caught: {code}");
+    }
+    let more: Vec<(String, String)> = base
+        .iter()
+        .map(|(n, t)| (n.clone(), if n == "wal.rs" { t.replacen("super::durable::write_json_durable(&p, &r)", "std::fs::write(&p, b\"\").ok();\n    super::durable::write_json_durable(&p, &r)", 1) } else { t.clone() }))
+        .collect();
+    assert_ne!(more, base, "the mutation applied");
+    assert!(!write_census(&more).is_empty(), "one more primitive in a classified function");
+    let mut new_file = base.clone();
+    new_file.push(("census_mutant.rs".into(), "pub fn x() {}\n".into()));
+    assert!(!write_census(&new_file).is_empty(), "a new module file");
+}
+
+/// RULINGS FG1 (codex r4 B1): every site of the repair module that can turn a read error into a value
+/// (unwrap_or_default, .ok(), unwrap_or, exists(), let Ok(..) else, …) is listed with WHY it is not a
+/// collapse of "could not read" into "not there" — absent on positive evidence, the error reported,
+/// a strictly conservative default, not a read at all, display only, tests only, or another track's
+/// file not changed by T6. An unlisted site fails.
+#[test]
+fn every_read_default_of_the_repair_module_is_listed() {
+    let v = read_census(&census_sources());
+    assert!(v.is_empty(), "{v:#?}");
+}
+
+/// FG1's mutation control: a read error turned into a value in a new function fails the census.
+#[test]
+fn the_read_census_catches_a_new_collapse() {
+    let base = census_sources();
+    let with: Vec<(String, String)> = base
+        .iter()
+        .map(|(n, t)| (n.clone(), if n == "probation.rs" { format!("{t}\nfn census_mutant(p: &Path) -> Vec<u8> {{\n    std::fs::read(p).ok().unwrap_or_default()\n}}\n") } else { t.clone() }))
+        .collect();
+    assert!(!read_census(&with).is_empty());
+}
+
+const CENSUS_MODULE_FILES: &[&str] = &["apply.rs", "boot_critical.rs", "boot_critical_derive.rs", "consumed.rs", "durable.rs", "exchange.rs", "grant.rs", "guard.rs", "intake.rs", "ledger.rs", "lock.rs", "mod.rs", "owner_origin.rs", "paths.rs", "platform.rs", "probation.rs", "reapply_claim.rs", "rehearsal.rs", "roles.rs", "rules.rs", "screen.rs", "tombstones.rs", "types.rs", "vault.rs", "wal.rs"];
+const WRITE_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
+    ("apply.rs", "door", "door", 4, "the ONE door: exchange / place / move out / make parents"),
+    ("apply.rs", "drop", "staging", 4, "the screen's view of the slots' bytes (apply_candidate_in), removed on every exit"),
+    ("apply.rs", "incoming_copy", "vault", 1, "the repair's vault folder"),
+    ("apply.rs", "incoming_copy", "staging", 1, "our own non-slot copy of a link to place"),
+    ("apply.rs", "op_deposit_first", "staging", 3, "our own non-slot incoming copy removed"),
+    ("apply.rs", "op_place", "staging", 1, "our own non-slot incoming copy removed"),
+    ("apply.rs", "resume_op", "staging", 3, "our own non-slot incoming copy removed"),
+    ("apply.rs", "run_op_depth", "vault", 1, "the repair's vault folder"),
+    ("apply.rs", "second_move", "staging", 2, "our own non-slot incoming copy removed"),
+    ("apply.rs", "write_intent", "ledger", 1, "the apply intent (durable)"),
+    ("apply.rs", "write_revert_intent", "ledger", 1, "the revert intent (durable)"),
+    ("durable.rs", "write_durable", "ledger", 6, "the durable writer of ledger files: temporary sibling, flush, rename"),
+    ("durable.rs", "write_json_durable", "ledger", 1, "the durable writer of ledger files"),
+    ("exchange.rs", "exchange", "door", 1, "the exchange primitive the door calls"),
+    ("exchange.rs", "rename_excl", "door", 1, "the no-replace primitive under the door and the vault's publication"),
+    ("grant.rs", "create_marker", "ledger", 2, "T4: a claim marker"),
+    ("grant.rs", "note_owner_input_in", "ledger", 1, "T4: the owner-input mark"),
+    ("grant.rs", "place_claim", "ledger", 8, "T4: a claim file placed no-replace"),
+    ("grant.rs", "place_no_replace", "ledger", 3, "T4: its own no-replace placement of a claim"),
+    ("grant.rs", "write_decision_in", "ledger", 1, "T4: the grant's decision file"),
+    ("intake.rs", "record_in", "ledger", 1, "T3: an intake row"),
+    ("ledger.rs", "allocate_id_in", "ledger", 2, "T3: a repair id folder"),
+    ("ledger.rs", "copy_file_new", "vault", 4, "T3: the begin pre-image copy into a fresh slot"),
+    ("ledger.rs", "copy_link_new", "vault", 1, "T3: the begin pre-image link into a fresh slot"),
+    ("ledger.rs", "copy_preimage_in", "vault", 9, "T3 (FI1 seam): the begin pre-image slot and its meta/pre.json"),
+    ("ledger.rs", "create_locked_in", "ledger", 2, "T3: an empty id folder removed after a failed create"),
+    ("ledger.rs", "populate_staging_in", "staging", 8, "T3: the fixed working copy R-<n>/staging"),
+    ("ledger.rs", "write_lane_durable_in", "ledger", 1, "FG4 seam: a lane row, durable"),
+    ("ledger.rs", "write_lane_in", "ledger", 1, "T3: a lane row (T3's callers)"),
+    ("ledger.rs", "write_record_in", "ledger", 1, "T3: a repair record"),
+    ("owner_origin.rs", "create_token_in", "ledger", 4, "T4: an owner-origin token"),
+    ("owner_origin.rs", "write_token_in", "ledger", 1, "T4: an owner-origin token"),
+    ("probation.rs", "ack_notices_in", "ledger", 1, "the notice acknowledgements (durable)"),
+    ("probation.rs", "attribute_timeout", "staging", 1, "our own scratch copy for the O3 control, removed"),
+    ("probation.rs", "file_once", "ledger", 1, "the acknowledgements (durable)"),
+    ("probation.rs", "m10_sweep_full", "ledger", 1, "the M10 sub-ledger folder"),
+    ("probation.rs", "m10_sweep_full", "staging", 1, "our own source copy of a put-back, removed"),
+    ("probation.rs", "save_findings", "ledger", 1, "the findings view (durable)"),
+    ("probation.rs", "scratch_pre_image", "staging", 5, "our own scratch copy for the O3 control"),
+    ("probation.rs", "write_job_state", "ledger", 1, "the job state (durable)"),
+    ("reapply_claim.rs", "claim_in", "ledger", 1, "the claims folder of a parked edit"),
+    ("tombstones.rs", "write_file", "ledger", 1, "T3: the lane's tombstones (durable)"),
+    ("vault.rs", "build_slot", "vault", 10, "a fresh slot built as a temporary sibling, placed no-replace"),
+    ("vault.rs", "create_new_with", "vault", 4, "a new file inside a slot under construction"),
+    ("vault.rs", "discard_temps_in", "vault", 1, "DX4: our exact temporary names only"),
+    ("vault.rs", "publish_with", "vault", 7, "CT1 publication: temporary, flush, no-replace placement"),
+    ("vault.rs", "seal_with", "vault", 4, "the seal: clone / copy into a temporary, placed no-replace"),
+    ("vault.rs", "sweep_stale_temps", "vault", 2, "temporary entries of ended processes"),
+    ("wal.rs", "write_in", "ledger", 1, "an operation record (durable)"),
+];
+const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
+    ("apply.rs", "after_seal_move_in", "conservative", 1, "as step4"),
+    ("apply.rs", "apply_candidate_in", "not-a-read", 1, "a lookup in the record already read"),
+    ("apply.rs", "begun_in_another_generation", "evidence", 1, "an unreadable generation → another generation: not revertible (FI1)"),
+    ("apply.rs", "drop", "not-a-read", 5, "apply_candidate_in's tail: lookups in values already read"),
+    ("apply.rs", "drop", "conservative", 3, "the approved copy not built / the reference not measured → F9 Unknown later / no failure attributed"),
+    ("apply.rs", "dry_run_measurement", "reported", 1, "no rows → the step declines"),
+    ("apply.rs", "exchange_prepared", "not-a-read", 1, "a path's parent"),
+    ("apply.rs", "exchange_prepared", "conservative", 1, "the approved copy's identity unreadable → none recorded → F9 Unknown"),
+    ("apply.rs", "f9_agreement", "reported", 4, "every failure is an Err of the agreement → the resolution answers Unknown"),
+    ("apply.rs", "found_matcher_timeout_in", "not-a-read", 1, "a field of the settings already read"),
+    ("apply.rs", "group_has_members", "not-a-read", 1, "a pid conversion"),
+    ("apply.rs", "leads_own_group", "not-a-read", 1, "a pid conversion"),
+    ("apply.rs", "mark_incomplete_apply", "not-a-read", 3, "fields of values already read"),
+    ("apply.rs", "new", "not-a-read", 1, "a child's pipe (Windows reader thread)"),
+    ("apply.rs", "now", "evidence", 1, "an unreadable generation IS the answer Unknown"),
+    ("apply.rs", "origin_approval_triple_in", "conservative", 1, "RULINGS R2: false = applies nothing"),
+    ("apply.rs", "pack_generation", "display", 1, "display only; decisions use Bound::now"),
+    ("apply.rs", "parse_canon", "not-a-read", 1, "a mode digit string; a bad one fails the whole parse (canon_req: Err)"),
+    ("apply.rs", "parse_reconcile", "not-a-read", 5, "fields of the registrar's output; completeness is judged by dry_run_measurement / the judge"),
+    ("apply.rs", "pre_image_slot_for", "not-a-read", 1, "no slot named → an empty path → deposit_of fails (Err)"),
+    ("apply.rs", "pump", "not-a-read", 1, "a child's pipe; an unended output is said"),
+    ("apply.rs", "put_back_bound", "evidence", 1, "unreadable slot metadata → Unknown binding: never put back (FI1)"),
+    ("apply.rs", "read_intent_in", "test", 2, "read by tests only; decisions use read_intent_checked_in"),
+    ("apply.rs", "read_revert_intent_in", "test", 2, "read by tests only; decisions use read_revert_intent_checked_in"),
+    ("apply.rs", "reconcile_hook_registrations_with", "reported", 1, "a hook not in the report → neither state → Err"),
+    ("apply.rs", "recover_one_intent", "not-a-read", 4, "fields of the previous row, read with ? before (None = no row on evidence)"),
+    ("apply.rs", "resume_hook_steps_report_in", "not-a-read", 1, "a literal id"),
+    ("apply.rs", "resume_hook_steps_report_in", "display", 1, "a message part"),
+    ("apply.rs", "revert_in", "evidence", 1, "a row without probation → Unknown binding"),
+    ("apply.rs", "run_bounded", "not-a-read", 1, "a child's exit poll in the grace; not reaped → said and handed to the detached reap"),
+    ("apply.rs", "run_registrar", "not-a-read", 1, "the process environment (current executable)"),
+    ("apply.rs", "second_move", "conservative", 1, "an unreadable deposit → not resumed: abandoned, only bytes the record vouches for go back"),
+    ("apply.rs", "second_move", "not-a-read", 1, "the copy path, present when copy_ok"),
+    ("apply.rs", "step4", "conservative", 2, "sealed copy if present else payload — either is verified against the expected state before use"),
+    ("apply.rs", "unreadable_ledger_member", "display", 1, "a path shown relative when it can be"),
+    ("boot_critical_derive.rs", "awakening_hooks", "outside", 2, "another track's file, not changed by T6"),
+    ("boot_critical_derive.rs", "bindings_impl", "outside", 6, "another track's file, not changed by T6"),
+    ("boot_critical_derive.rs", "by_construction_census", "outside", 5, "another track's file, not changed by T6"),
+    ("boot_critical_derive.rs", "derive", "outside", 10, "another track's file, not changed by T6"),
+    ("boot_critical_derive.rs", "file_kind_check", "outside", 1, "another track's file, not changed by T6"),
+    ("boot_critical_derive.rs", "has_err_trap", "outside", 1, "another track's file, not changed by T6"),
+    ("boot_critical_derive.rs", "has_errexit", "outside", 1, "another track's file, not changed by T6"),
+    ("boot_critical_derive.rs", "is_clear_procedure_rel", "outside", 1, "another track's file, not changed by T6"),
+    ("boot_critical_derive.rs", "is_discarding_launch", "outside", 2, "another track's file, not changed by T6"),
+    ("boot_critical_derive.rs", "launch_targets", "outside", 1, "another track's file, not changed by T6"),
+    ("boot_critical_derive.rs", "preflight_census", "outside", 1, "another track's file, not changed by T6"),
+    ("boot_critical_derive.rs", "protection_closure", "outside", 1, "another track's file, not changed by T6"),
+    ("boot_critical_derive.rs", "py_def_body", "outside", 1, "another track's file, not changed by T6"),
+    ("boot_critical_derive.rs", "shell_commands", "outside", 1, "another track's file, not changed by T6"),
+    ("boot_critical_derive.rs", "value", "outside", 1, "another track's file, not changed by T6"),
+    ("durable.rs", "full_flush_file", "not-a-read", 2, "an errno"),
+    ("durable.rs", "write_durable", "not-a-read", 2, "parts of a temporary name"),
+    ("exchange.rs", "volume_serial", "conservative", 1, "Windows: an unknown volume → not the same filesystem → refused"),
+    ("grant.rs", "age_of", "outside", 3, "another track's file, not changed by T6"),
+    ("grant.rs", "claim_held", "outside", 2, "another track's file, not changed by T6"),
+    ("grant.rs", "claim_numbers", "outside", 2, "another track's file, not changed by T6"),
+    ("grant.rs", "last_owner_input_in", "outside", 4, "another track's file, not changed by T6"),
+    ("grant.rs", "may_open_new_round_in", "outside", 1, "another track's file, not changed by T6"),
+    ("grant.rs", "mtime_epoch", "outside", 3, "another track's file, not changed by T6"),
+    ("grant.rs", "new_round_refusal_in", "outside", 1, "another track's file, not changed by T6"),
+    ("grant.rs", "note_owner_input_in", "outside", 1, "another track's file, not changed by T6"),
+    ("grant.rs", "parse_versioned", "outside", 1, "another track's file, not changed by T6"),
+    ("grant.rs", "place_claim", "outside", 2, "another track's file, not changed by T6"),
+    ("grant.rs", "place_no_replace", "outside", 1, "another track's file, not changed by T6"),
+    ("grant.rs", "read_claim", "outside", 3, "another track's file, not changed by T6"),
+    ("grant.rs", "snapshot", "outside", 2, "another track's file, not changed by T6"),
+    ("grant.rs", "try_claim_in", "outside", 2, "another track's file, not changed by T6"),
+    ("grant.rs", "write_decision_in", "outside", 1, "another track's file, not changed by T6"),
+    ("guard.rs", "drop", "not-a-read", 1, "a poisoned mutex recovered"),
+    ("guard.rs", "is_held", "not-a-read", 1, "a poisoned mutex recovered"),
+    ("guard.rs", "try_take", "not-a-read", 1, "a poisoned mutex recovered"),
+    ("intake.rs", "first_stable_line", "outside", 1, "another track's file, not changed by T6"),
+    ("intake.rs", "leading_exit_code", "outside", 1, "another track's file, not changed by T6"),
+    ("intake.rs", "load_all_in", "outside", 2, "another track's file, not changed by T6"),
+    ("intake.rs", "load_row", "outside", 1, "another track's file, not changed by T6"),
+    ("ledger.rs", "allocate_id_in", "outside", 2, "another track's file, not changed by T6"),
+    ("ledger.rs", "copy_preimage_in", "not-a-read", 1, "a path's last part"),
+    ("ledger.rs", "copy_preimage_in", "evidence", 1, "FI1 seam: an unreadable generation is recorded as none (Unknown)"),
+    ("ledger.rs", "held_by_seat_in", "outside", 1, "another track's file, not changed by T6"),
+    ("ledger.rs", "lane_rows_in", "outside", 1, "another track's file, not changed by T6"),
+    ("ledger.rs", "list_ids_checked_in", "not-a-read", 1, "FG1 seam: a name that is not an id is not a repair"),
+    ("ledger.rs", "list_ids_in", "outside", 3, "another track's file, not changed by T6"),
+    ("ledger.rs", "list_slots_in", "outside", 6, "another track's file, not changed by T6"),
+    ("ledger.rs", "now_epoch", "outside", 1, "another track's file, not changed by T6"),
+    ("ledger.rs", "populate_staging_in", "outside", 1, "another track's file, not changed by T6"),
+    ("ledger.rs", "read_json", "outside", 1, "another track's file, not changed by T6"),
+    ("lock.rs", "claim_closed", "outside", 1, "another track's file, not changed by T6"),
+    ("owner_origin.rs", "folded_base", "outside", 1, "another track's file, not changed by T6"),
+    ("owner_origin.rs", "owner_numbers", "outside", 1, "another track's file, not changed by T6"),
+    ("owner_origin.rs", "read_token_in", "outside", 1, "another track's file, not changed by T6"),
+    ("probation.rs", "ack_notices_in", "conservative", 2, "an unreadable source → nothing pruned (every key kept)"),
+    ("probation.rs", "attribute_timeout", "not-a-read", 2, "fields of a row already read"),
+    ("probation.rs", "closure_obligations", "reported", 2, "an unlistable root / unreadable row is reported by probation_pass in the same tick"),
+    ("probation.rs", "closure_obligations", "display", 1, "the report's path"),
+    ("probation.rs", "finalize_finding", "display", 2, "the finding's text: which copy it names, a short hash"),
+    ("probation.rs", "load_acks_checked", "evidence", 1, "after a checked read: absent on positive evidence"),
+    ("probation.rs", "load_findings_checked", "evidence", 1, "after a checked read: absent on positive evidence"),
+    ("probation.rs", "load_notice_acks", "evidence", 1, "after a checked read: absent on positive evidence"),
+    ("probation.rs", "m10_sweep_full", "display", 1, "a link's target in a finding"),
+    ("probation.rs", "m10_sweep_full", "conservative", 4, "approved bytes unreadable → not recognised (the check runs) / no runner → nothing decided / no source → nothing put back"),
+    ("probation.rs", "probation_pass", "display", 1, "the report's path"),
+    ("probation.rs", "read_job_state_in", "conservative", 4, "an unreadable job state = none: every pass due (more work, never less); it holds no duty"),
+    ("probation.rs", "recheck_one", "display", 1, "the fault point's path"),
+    ("probation.rs", "save_findings", "conservative", 1, "unreadable acknowledgements → the view keeps the notice untold (told again, never lost)"),
+    ("probation.rs", "start_time_pass", "not-a-read", 1, "a row read with three answers (None = absent on evidence)"),
+    ("probation.rs", "start_time_pass", "display", 1, "a message part"),
+    ("probation.rs", "write_job_state", "conservative", 1, "as read_job_state_in"),
+    ("reapply_claim.rs", "claim_in", "not-a-read", 1, "no claim yet → the first"),
+    ("reapply_claim.rs", "numbers", "not-a-read", 1, "a name that is not <k>.json is not a claim"),
+    ("reapply_claim.rs", "read_claim_in", "conservative", 2, "an unreadable claim is held (claim_in)"),
+    ("tombstones.rs", "lane_mutex", "outside", 1, "another track's file, not changed by T6"),
+    ("tombstones.rs", "load_in", "outside", 1, "another track's file, not changed by T6"),
+    ("tombstones.rs", "read_file", "outside", 1, "another track's file, not changed by T6"),
+    ("tombstones.rs", "record_in", "outside", 2, "another track's file, not changed by T6"),
+    ("tombstones.rs", "remove_file_rel_in", "outside", 1, "another track's file, not changed by T6"),
+    ("tombstones.rs", "remove_for_repair_in", "outside", 1, "another track's file, not changed by T6"),
+    ("tombstones.rs", "remove_hooks_for_repair_in", "outside", 1, "another track's file, not changed by T6"),
+    ("types.rs", "lane_pack_roots", "outside", 2, "another track's file, not changed by T6"),
+    ("types.rs", "link_target_refusal", "outside", 2, "another track's file, not changed by T6"),
+    ("types.rs", "repair_number", "outside", 1, "another track's file, not changed by T6"),
+    ("vault.rs", "basename", "not-a-read", 1, "a path's last part"),
+    ("vault.rs", "build_slot", "not-a-read", 1, "the clock"),
+    ("vault.rs", "deposit_of", "reported", 2, "unreadable metadata → Err(Superseded)"),
+    ("vault.rs", "deposit_of", "conservative", 1, "every deposit is verified against its recorded hash"),
+    ("vault.rs", "finish_seal_with", "conservative", 1, "a failed probe of the record → the no-replace publication fails loudly"),
+    ("vault.rs", "name", "not-a-read", 1, "a slot's folder name"),
+    ("vault.rs", "read_sealed_meta", "reported", 2, "unreadable → Err(Superseded): never blessed"),
+    ("vault.rs", "seal_with", "conservative", 1, "a failed probe → the no-replace placement fails loudly"),
+    ("vault.rs", "sweep_stale_temps", "conservative", 5, "an entry whose age cannot be read is not removed; a removal counted only when done"),
+    ("vault.rs", "temp_owner_pid", "not-a-read", 1, "a pid in a temporary name"),
+    ("vault.rs", "temp_sibling", "not-a-read", 2, "parts of a temporary name"),
+    ("wal.rs", "list_checked_in", "not-a-read", 1, "an order of floats"),
+    ("wal.rs", "list_in", "conservative", 1, "its callers take a missing record as no agreement / no view rebuild; decisions use list_checked_in"),
+    ("wal.rs", "read_in", "conservative", 1, "a record without its schema is refused"),
+];
+
 // ───────────────────────────── RULINGS EJ4 — one ownership per repair ─────────────────────────────
 
 /// EJ4 through the real entry points: a revert (the owner) paused in its hook phase holds the
