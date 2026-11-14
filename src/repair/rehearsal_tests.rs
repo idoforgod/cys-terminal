@@ -484,6 +484,36 @@ fn grandchild_of_an_escaped_child_is_followed() {
     replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
+/// RULINGS GR4 — the runner samples at EVERY turn of its one loop until it returns: the root exits; a
+/// child C that the sampler saw while the root lived (it left the group with `setsid`) starts a
+/// grandchild G DURING THE DRAIN and stays for several sampling turns before it exits; G closes its
+/// outputs. G is reported (a leftover, killed) and is gone, observed from outside. (The old loop
+/// stopped sampling at the root's exit: G was in no group the runner looked at, and the run came
+/// back clean.)
+#[test]
+#[cfg(unix)]
+fn grandchild_started_during_the_drain_is_followed() {
+    let r = root("gr4-drain");
+    let pidfile = r.join("g.pid");
+    let script = format!(
+        "/usr/bin/perl -e 'use POSIX; POSIX::setsid(); select(undef, undef, undef, 0.6); my $g = fork(); if ($g == 0) {{ close STDIN; close STDOUT; close STDERR; sleep 30; exit 0 }} open(F, \">\", \"{}\"); print F $g; close F; select(undef, undef, undef, 0.25); exit 0' & sleep 0.4; exit 0",
+        pidfile.display()
+    );
+    let env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
+    let o = replay::run_child(
+        &["/bin/sh".into(), "-c".into(), script],
+        &env,
+        &r,
+        b"",
+        Duration::from_secs(20),
+    );
+    assert_eq!(o.code, Some(0), "{o:?}");
+    let g: u32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    assert!(o.leftovers.contains(&g), "the grandchild {g} started during the drain is reported: {o:?}");
+    assert!(gone(g), "the grandchild {g} was killed");
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
 /// RULINGS GA3 — THE completeness of a pass (one function, asked by the screen and the rehearsal):
 /// complete only when every planned execution was recorded observed whole; an execution whose output
 /// hit the cap or could not be read, a spawn failure, one never started — each leaves it incomplete.
