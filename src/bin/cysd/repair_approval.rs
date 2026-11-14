@@ -888,37 +888,55 @@ pub(crate) fn production_step3(s3: &Step3Input) -> Result<Step3Ok, Step3Err> {
 }
 
 /// One rehearsal pass: a fresh scratch copy of the lane's pack with the candidate's states laid in,
-/// every target checked. `Err((why, completed))` — RULINGS EL1: `completed` is true only when every
-/// planned check ran to a result (a check that FAILED is a result); a layout error, a check that could
-/// not run or ran out of time, a scratch that could not be removed — an early return — is not.
+/// EVERY target checked (RULINGS GA3: a failing target does not end the pass early — the plan of the
+/// pass, declared before the first check, must be carried out whole). Returns (the summary or the
+/// first failure, the pass COMPLETE — `replay::PassPlan`: every planned check ran to a result whose
+/// executions were observed whole).
 fn rehearse_once(
     s3: &Step3Input,
     staging: &std::path::Path,
     started: std::time::Instant,
-) -> Result<Vec<String>, (String, bool)> {
+) -> (Result<Vec<String>, String>, bool) {
     use cys::repair::rehearsal::{self, CheckRequest, CheckResult};
-    use cys::repair::replay::{self, ScratchRoot};
-    let done = |why: String| (why, false);
-    let scratch =
-        ScratchRoot::new(&rehearsal::scratch_base(), "s3-").map_err(|e| done(format!("{e:?}")))?;
+    use cys::repair::replay::{self, PassPlan, ScratchRoot};
+    let plan = PassPlan::default();
+    let checks: Vec<&(String, TargetState)> = s3
+        .states
+        .iter()
+        .filter(|(_, st)| *st != TargetState::Absent)
+        .collect();
+    plan.plan(checks.len());
+    let early = |why: String| (Err(why), false);
+    let scratch = match ScratchRoot::new(&rehearsal::scratch_base(), "s3-") {
+        Ok(s) => s,
+        Err(e) => return early(format!("{e:?}")),
+    };
     let layout = scratch.path().join("pack");
-    rehearsal::copy_layout(&s3.pack, &layout)
-        .map_err(|e| done(format!("예행 사본을 만들지 못했습니다 — {e:?}")))?;
+    if let Err(e) = rehearsal::copy_layout(&s3.pack, &layout) {
+        return early(format!("예행 사본을 만들지 못했습니다 — {e:?}"));
+    }
     for (rel, st) in &s3.states {
         let dst = layout.join(rel);
-        replay::remove_tree(&dst).map_err(|e| done(format!("{rel}: {e:?}")))?;
+        if let Err(e) = replay::remove_tree(&dst) {
+            return early(format!("{rel}: {e:?}"));
+        }
         let src = match st {
             TargetState::Absent => replay::LaidSource::Absent,
             TargetState::Link { target } => replay::LaidSource::Link(target.clone()),
-            TargetState::File { .. } => replay::LaidSource::read(&staging.join(rel))
-                .map_err(|e| done(format!("{rel}: {e:?}")))?,
+            TargetState::File { .. } => match replay::LaidSource::read(&staging.join(rel)) {
+                Ok(s) => s,
+                Err(e) => return early(format!("{rel}: {e:?}")),
+            },
         };
         if src.state() != *st {
-            return Err(done(format!("{rel}: 작업 사본이 제출 뒤에 바뀌었습니다")));
+            return early(format!("{rel}: 작업 사본이 제출 뒤에 바뀌었습니다"));
         }
-        replay::lay_out(&dst, &src).map_err(|e| done(format!("{rel}: {e:?}")))?;
+        if let Err(e) = replay::lay_out(&dst, &src) {
+            return early(format!("{rel}: {e:?}"));
+        }
     }
     let mut summary = Vec::new();
+    let mut first_failure: Option<String> = None;
     for (rel, st) in &s3.states {
         if *st == TargetState::Absent {
             summary.push(format!("{rel}: 삭제(검사 대상 없음)"));
@@ -930,27 +948,38 @@ fn rehearse_once(
         let own = Duration::from_secs(u64::from(cys::repair::boot_critical::clamp_check_timeout(
             declared,
         )));
-        let r = rehearsal::run_check(&CheckRequest {
+        let (r, whole) = rehearsal::run_check_observed(&CheckRequest {
             entry_rel: rel.clone(),
             scratch_root: layout.clone(),
             recorded_input: None,
             deadline: own.min(left),
-        })
-        .map_err(|e| done(format!("{rel}: 예행 검사를 돌리지 못했습니다 — {e:?}")))?;
-        match r {
-            CheckResult::Pass => summary.push(if rehearsal::prerehearsal_possible(rel) {
-                format!("{rel}: 통과")
-            } else {
-                format!("{rel}: {}", rehearsal::NOT_REHEARSABLE_KO)
-            }),
-            CheckResult::Fail(m) => return Err((format!("예행 검사 실패 — {m}"), true)),
-            CheckResult::Timeout => return Err((format!("{rel}: 예행 검사 시간 초과"), false)),
+        });
+        plan.record(whole);
+        let failure = match r {
+            Ok(CheckResult::Pass) => {
+                summary.push(if rehearsal::prerehearsal_possible(rel) {
+                    format!("{rel}: 통과")
+                } else {
+                    format!("{rel}: {}", rehearsal::NOT_REHEARSABLE_KO)
+                });
+                None
+            }
+            Ok(CheckResult::Fail(m)) => Some(format!("예행 검사 실패 — {m}")),
+            Ok(CheckResult::Timeout) => Some(format!("{rel}: 예행 검사 시간 초과")),
+            Err(e) => Some(format!("{rel}: 예행 검사를 돌리지 못했습니다 — {e:?}")),
+        };
+        if first_failure.is_none() {
+            first_failure = failure;
         }
     }
-    scratch
-        .close()
-        .map_err(|e| done(format!("예행 사본을 지우지 못했습니다 — {e:?}")))?;
-    Ok(summary)
+    if let Err(e) = scratch.close() {
+        return early(format!("예행 사본을 지우지 못했습니다 — {e:?}"));
+    }
+    let complete = plan.complete();
+    match first_failure {
+        Some(why) => (Err(why), complete),
+        None => (Ok(summary), complete),
+    }
 }
 
 /// [`production_step3`] with the HOME whose real settings files the comparisons watch.
@@ -973,9 +1002,8 @@ pub(crate) fn production_step3_with(
     // (a) the rehearsal, INSIDE the scoped after-run comparison (snapshot → run → repeat on a
     // difference; its failure paths included — RULINGS CZ3 / DE1)
     let (rehearsed, cmp) = rehearsal::compared_runs(&s3.pack, real_home, || {
-        let r = rehearse_once(s3, &staging, started);
-        let completed = !matches!(&r, Err((_, false)));
-        (r, completed)
+        // RULINGS GA3: complete = the pass's plan carried out whole (one function)
+        rehearse_once(s3, &staging, started)
     });
     let mut notes: Vec<String> = Vec::new();
     let mut found: Vec<(String, String)> = Vec::new();
@@ -992,7 +1020,7 @@ pub(crate) fn production_step3_with(
         e.intake.extend(found.iter().cloned());
         e
     };
-    let mut summary = rehearsed.map_err(|(why, _)| with_found(Step3Err::from(why)))?;
+    let mut summary = rehearsed.map_err(|why| with_found(Step3Err::from(why)))?;
     // (b) the protection screen (C4 — every boot-critical and protection-related submit, AT2)
     let cand = ScreenCandidate {
         files: staging.clone(),

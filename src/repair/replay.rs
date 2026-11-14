@@ -343,6 +343,55 @@ impl StreamState {
     }
 }
 
+/// RULINGS GA3 — one execution's outcome was OBSERVED WHOLE: it started, ran to an exit status
+/// within its time, left nothing behind (process, held pipe, incomplete observation) and both outputs
+/// were read whole (end reached, nothing dropped, no read error).
+pub fn observed_whole(o: &ChildOutcome) -> bool {
+    !o.timed_out
+        && o.spawn_error.is_none()
+        && (o.code.is_some() || o.signal.is_some())
+        && o.left_something().is_none()
+        && o.stdout_state.whole()
+        && o.stderr_state.whole()
+}
+
+/// RULINGS GA3 — THE completeness of a pass, in ONE place (the screen and the rehearsal both ask it):
+/// the planned executions are declared before the first one starts ([`PassPlan::plan`]); each ends
+/// with an outcome observed whole or not ([`PassPlan::record`]); the pass is complete only when every
+/// planned execution was recorded observed whole. An early return, a spawn failure, an unread output,
+/// an execution never started — each leaves it incomplete.
+#[derive(Debug, Default)]
+pub struct PassPlan {
+    planned: std::sync::atomic::AtomicUsize,
+    whole: std::sync::atomic::AtomicUsize,
+    broken: std::sync::atomic::AtomicBool,
+}
+
+impl PassPlan {
+    /// Declares `n` more planned executions (before they start).
+    pub fn plan(&self, n: usize) {
+        self.planned
+            .fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// One planned execution ended — observed whole or not.
+    pub fn record(&self, observed_whole: bool) {
+        use std::sync::atomic::Ordering;
+        if observed_whole {
+            self.whole.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.broken.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Complete: nothing recorded as not observed whole, and every planned execution recorded.
+    pub fn complete(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        !self.broken.load(Ordering::SeqCst)
+            && self.whole.load(Ordering::SeqCst) == self.planned.load(Ordering::SeqCst)
+    }
+}
+
 impl ChildOutcome {
     /// RULINGS EL1: the child's standard output was observed whole.
     pub fn stdout_whole(&self) -> bool {
