@@ -6,12 +6,16 @@
   1  표가 없으면(데몬이 거부) 규칙 문서 Write/Edit 은 배포본 그대로 차단된다(같은 deny 문장).
   2  데몬이 허용(rule-doc-allowed 종료 코드 0)하면 그 Write/Edit 만 통과하고, 조회는
      `cys --socket <s> repair rule-doc-allowed --path <파일>` 하나이며 CYS_NO_AUTOSTART=1 로 간다.
-  3  소켓 없음 · 옛 데몬(93) · 거부(95) · 시간 초과 → 오늘의 동작(차단). 시간 초과도 합산 예산 안에서 끝난다.
+  3  소켓 없음 · 옛 데몬(93) · 거부(95) · 시간 초과 → 오늘의 동작(차단). 시간 초과는 답하지 않고 막혀 있는
+     스텁(가드가 죽일 때까지)으로 재고, 벽시계 여유가 아니라 **거부**와 스텁이 남지 않음을 확인한다.
   4  Bash 로 규칙 문서를 쓰는 경로(tee·sed -i·리다이렉트)는 표가 있어도 막힌다.
   5  corpus G 의 대표 호출(외부 발행·외부 전송·영구 삭제)은 표가 있든 없든 막힌다(AT9).
   6  규칙 문서가 아닌 쓰기는 조회 없이 통과한다(평시 동작 무변화).
 밀폐: 가짜 `cys` 스텁(PATH 선두) · 임시 디렉터리의 진짜 unix 소켓 파일 · GUARD_TEST_MODE 로 자율주행 깃발을
 임시 경로에 둔다 · HOME 임시. 데몬·라이브 팩 무접촉.
+결정론(RULINGS EH1 · EA2 — 시간 규칙을 벽시계 여유로 증명하지 않는다): 허용·거부 경우는 가드의 테스트 예산을
+크게(`GUARD_TEST_GATE_BUDGET_MS=20000`) 주어 스텁의 기동 시간이 판정을 가르지 못하게 하고, 시간 초과 경우만
+작은 예산(300ms)과 막혀 있는 스텁을 쓴다. `STUB_START_DELAY=<초>` 로 스텁의 느린 기동을 주입할 수 있다(부하 재현).
 출력: PASS/FAIL 행 · 실패 시 exit 1 · 전부 통과 시 GUARD-OWNER-TOKEN-OK.
 """
 import json
@@ -38,14 +42,23 @@ def check(name, cond, detail=""):
 
 STUB = r"""#!/bin/sh
 # fake cys: logs argv + CYS_NO_AUTOSTART, answers rule-doc-allowed with $STUB_RULEDOC_RC
+[ -n "${STUB_START_DELAY:-}" ] && sleep "$STUB_START_DELAY"   # injected slow start-up (load)
 printf '%s|NO_AUTOSTART=%s\n' "$*" "${CYS_NO_AUTOSTART:-}" >> "$STUB_LOG"
 case "$*" in
   *"repair rule-doc-allowed"*)
-    [ -n "${STUB_SLEEP:-}" ] && exec sleep "$STUB_SLEEP"
+    if [ -n "${STUB_BLOCK_PIDFILE:-}" ]; then
+      echo $$ > "$STUB_BLOCK_PIDFILE"
+      exec sleep 3600   # never answers: blocks until the guard kills it
+    fi
     exit "${STUB_RULEDOC_RC:-95}" ;;
 esac
 exit 1
 """
+
+# RULINGS EH1: a budget so large that the stub's start-up cannot decide a case (the guard's test
+# knob raises its per-query cap with it, up to the guard's ceiling); the time-out case uses a small one
+BIG_BUDGET_MS = "20000"
+SMALL_BUDGET_MS = "300"
 
 
 def main():
@@ -70,7 +83,8 @@ def main():
         soul = os.path.join(pack, "soul.md")
         directive = os.path.join(pack, "directives", "WORKER_DIRECTIVE.md")
 
-        def run(tool_input, tool="Write", rc=None, sock_path=sock, sleep=None, active=False):
+        def run(tool_input, tool="Write", rc=None, sock_path=sock, block=None, active=False,
+                budget_ms=BIG_BUDGET_MS):
             env = {k: v for k, v in os.environ.items()
                    if not k.startswith(("CYS_", "JAVIS_", "AITERM_", "AUTOPILOT_", "GUARD_"))}
             env.update({
@@ -81,11 +95,12 @@ def main():
                 "AUTOPILOT_PAUSED_FILE": os.path.join(flags, "AUTOPILOT_PAUSED"),
                 "AUTOPILOT_ACTIVE_FILE": os.path.join(flags, "AUTOPILOT_ACTIVE"),
                 "STUB_LOG": log,
+                "GUARD_TEST_GATE_BUDGET_MS": budget_ms,
             })
             if rc is not None:
                 env["STUB_RULEDOC_RC"] = str(rc)
-            if sleep is not None:
-                env["STUB_SLEEP"] = str(sleep)
+            if block is not None:
+                env["STUB_BLOCK_PIDFILE"] = block
             act = os.path.join(flags, "AUTOPILOT_ACTIVE")
             if active:
                 open(act, "w").close()
@@ -126,8 +141,22 @@ def main():
         check("3a 소켓 없음 → 조회 없이 차단", p.returncode == 2 and not calls, repr((p.returncode, calls)))
         p, _, _ = run({"file_path": soul, "content": "x"}, rc=93)
         check("3b 옛 데몬(93) → 차단", p.returncode == 2)
-        p, _, el = run({"file_path": soul, "content": "x"}, rc=0, sleep=5)
-        check("3c 시간 초과 → 차단(합산 예산 안)", p.returncode == 2 and el < 4.5, "%.2fs rc=%d" % (el, p.returncode))
+        # 3c — the daemon's answer never comes: a stub that blocks until it is killed, a small budget →
+        # REFUSED (no wall-clock bound), and the guard leaves no stub behind
+        pidfile = os.path.join(root, "blocked.pid")
+        p, _, _ = run({"file_path": soul, "content": "x"}, rc=0, block=pidfile, budget_ms=SMALL_BUDGET_MS)
+        check("3c 시간 초과 → 차단(막혀 있는 스텁 · 작은 예산)", p.returncode == 2
+              and "헌법파일(soul.md) Write 차단" in p.stderr, repr((p.returncode, p.stderr[-200:])))
+        left_alive = False
+        if os.path.exists(pidfile):
+            try:
+                os.kill(int(open(pidfile).read().strip() or "0"), 0)
+                left_alive = True
+            except (ProcessLookupError, ValueError):
+                pass
+            except PermissionError:
+                left_alive = True
+        check("3d 막혀 있던 스텁은 남지 않는다(가드가 죽였다)", not left_alive)
         # 4 — Bash writers of rule documents stay denied with a token
         for cmd in ("tee %s < /dev/null" % soul, "sed -i 's/a/b/' %s" % soul, "echo x > %s" % soul):
             p, _, _ = run({"command": cmd}, tool="Bash", rc=0)
