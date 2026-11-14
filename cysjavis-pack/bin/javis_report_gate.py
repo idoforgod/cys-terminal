@@ -1983,7 +1983,12 @@ APPROVAL_STATE_FILE = "repair_approvals.json"
 
 
 def collect_awaiting_approval(cys_bin, timeout=OPEN_DEFECT_TIMEOUT_S):
-    """(ok, lane, [수리 번호…]) — **이 부서**가 연 수리 중 '승인 대기' 인 것(정렬). 실패는 (False, None, [])."""
+    """(ok, lane, [수리 번호…]) — **이 부서**에서 주인에게 **카드가 떠 있는** 수리(정렬). 실패는 (False, None, []).
+
+    ★RULINGS DF3: 수리 기록의 '승인 대기' 상태를 세지 않는다 — 제출 검사(3단계) 중인 요청·검사에서
+      돌려보낸 요청·만료된 요청도 그 상태를 보이므로, 그것을 세면 카드가 없는데 마스터가 주인에게
+      알리러 가고 고쳐서 다시 낼 때마다 또 간다. 데몬의 `repair list` 가 주는 `approval_cards`(3단계를
+      통과해 주인의 결정을 기다리는 요청의 수리 번호)만 센다. 그 키가 없는 데몬이면 아무것도 보내지 않는다."""
     env = dict(os.environ, CYS_NO_AUTOSTART="1")
     try:
         r = subprocess.run([cys_bin, "repair", "list", "--json"], capture_output=True, text=True,
@@ -2005,10 +2010,10 @@ def collect_awaiting_approval(cys_bin, timeout=OPEN_DEFECT_TIMEOUT_S):
     lane = doc.get("lane")
     if not isinstance(lane, str) or not lane:
         return False, None, []
-    ids = sorted({x.get("repair") for x in doc["repairs"]
-                  if isinstance(x, dict) and x.get("state") == "awaiting_approval"
-                  and x.get("origin_lane") == lane and isinstance(x.get("repair"), str)})
-    return True, lane, ids
+    cards = doc.get("approval_cards")
+    if not isinstance(cards, list) or not all(isinstance(x, str) and x for x in cards):
+        return False, None, []
+    return True, lane, sorted(set(cards))
 
 
 def approval_wake(lane, ids):
