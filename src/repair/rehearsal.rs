@@ -75,27 +75,48 @@ fn rel_is_plain(rel: &str) -> bool {
 }
 
 thread_local! {
-    /// RULINGS GA3: every execution of the check running on this thread was observed whole.
-    static OBSERVED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// RULINGS GA3 / GR3: the execution UNITS of the check running on this thread — one unit is one
+    /// (file × event × side) execution: (listed before the first starts, ended observed whole, one
+    /// ended NOT observed whole).
+    static UNITS: std::cell::Cell<(usize, usize, bool)> = const { std::cell::Cell::new((0, 0, false)) };
 }
 
-/// Records one execution of the current check (RULINGS GA3).
+/// RULINGS GR3: lists `n` more execution units of the current check (before the first starts).
+fn plan_units(n: usize) {
+    UNITS.with(|u| {
+        let (p, w, b) = u.get();
+        u.set((p + n, w, b));
+    });
+}
+
+/// Records one execution unit of the current check (RULINGS GA3 / GR3).
 fn note(o: &ChildOutcome) {
-    if !replay::observed_whole(o) {
-        OBSERVED.with(|c| c.set(false));
-    }
+    UNITS.with(|u| {
+        let (p, w, b) = u.get();
+        if replay::observed_whole(o) {
+            u.set((p, w + 1, b));
+        } else {
+            u.set((p, w, true));
+        }
+    });
 }
 
-/// RULINGS GA3 — [`run_check`] and whether the check ran to a RESULT whose every execution was
-/// observed whole (a spawn failure turned into a failed check, an output that could not be read whole,
-/// a time-out, an error — none is). The plan of a rehearsal pass records this per target
-/// ([`replay::PassPlan`]); `run_check` keeps its T0 signature (CZ10).
+/// RULINGS GA3 / GR3 — [`run_check`] and whether the check ran to a RESULT with EVERY execution unit
+/// it listed before its first one started ended observed whole. A check that returns at its first
+/// failing unit (a hook replay's failing event, a failed syntax check before the events) leaves its
+/// later units without an outcome — incomplete (GR3: the worker's choice of the two the ruling
+/// allows, rather than running the remaining units). A spawn failure turned into a failed check, an
+/// output that could not be read whole, a time-out, an error — none is complete either. The plan of a
+/// rehearsal pass records this per target ([`replay::PassPlan`]); `run_check` keeps its T0 signature
+/// (CZ10).
 pub fn run_check_observed(req: &CheckRequest) -> (Result<CheckResult, RepairError>, bool) {
-    OBSERVED.with(|c| c.set(true));
+    UNITS.with(|u| u.set((0, 0, false)));
     let r = run_check(req);
-    let whole = OBSERVED.with(|c| c.get())
+    let (planned, whole, broken) = UNITS.with(|u| u.get());
+    let complete = !broken
+        && whole == planned
         && matches!(r, Ok(CheckResult::Pass) | Ok(CheckResult::Fail(_)));
-    (r, whole)
+    (r, complete)
 }
 
 /// Runs one check child (killed and reaped at the deadline).
@@ -139,8 +160,14 @@ fn run_kind(
             "{rel}: 일반 파일이 아닙니다(없거나 링크·폴더)"
         ))),
         CheckKind::JsonParse => Ok(json_parse(file, rel)),
-        CheckKind::ShSyntax => Ok(sh_syntax(file, rel, req.deadline)),
-        CheckKind::PyCompile => py_compile(file, rel, req.deadline),
+        CheckKind::ShSyntax => {
+            plan_units(1);
+            Ok(sh_syntax(file, rel, req.deadline))
+        }
+        CheckKind::PyCompile => {
+            plan_units(1);
+            py_compile(file, rel, req.deadline)
+        }
         CheckKind::SelfTest => executed(root, rel, req, Exec::SelfTest(arg)),
         CheckKind::HookReplay => executed(root, rel, req, Exec::Hook(arg)),
     }
@@ -460,6 +487,7 @@ fn executed(
     let started = std::time::Instant::now();
     match &exec {
         Exec::SelfTest(_) => {
+            plan_units(1);
             let o = run_in_copy(root, rel, None, None, &exec, "", req.deadline)?;
             if let Some(m) = broken_marker(&o.stderr) {
                 if !o.timed_out {
@@ -471,17 +499,6 @@ fn executed(
             Ok(outcome_result(&o, rel, "자체 시험"))
         }
         Exec::Hook(events) => {
-            // the syntax check first (design §4-8 "문법 검사를 돌린다"): a hook that `exec`s into its
-            // interpreter early never parses its own tail, so the replay alone cannot see an error there
-            if rel.ends_with(".sh") {
-                if let CheckResult::Fail(m) = sh_syntax(&root.join(rel), rel, req.deadline) {
-                    return Ok(CheckResult::Fail(m));
-                }
-            }
-            let recorded = match &req.recorded_input {
-                Some(p) => Some(read_plain(p)?),
-                None => None,
-            };
             let events: Vec<&str> = events
                 .split(',')
                 .map(str::trim)
@@ -494,6 +511,23 @@ fn executed(
             };
             // the released copy of this hook, for the expected-output comparison
             let released = released_copy(rel);
+            // RULINGS GR3: every unit of this replay is listed before the first one starts — the
+            // syntax check, then per event the candidate's run and the released copy's run
+            plan_units(
+                usize::from(rel.ends_with(".sh"))
+                    + events.len() * (1 + usize::from(released.is_some())),
+            );
+            // the syntax check first (design §4-8 "문법 검사를 돌린다"): a hook that `exec`s into its
+            // interpreter early never parses its own tail, so the replay alone cannot see an error there
+            if rel.ends_with(".sh") {
+                if let CheckResult::Fail(m) = sh_syntax(&root.join(rel), rel, req.deadline) {
+                    return Ok(CheckResult::Fail(m));
+                }
+            }
+            let recorded = match &req.recorded_input {
+                Some(p) => Some(read_plain(p)?),
+                None => None,
+            };
             for ev in events {
                 let left = req.deadline.saturating_sub(started.elapsed());
                 if left < replay::MIN_CHILD_SLICE {

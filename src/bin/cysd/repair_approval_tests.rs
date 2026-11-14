@@ -972,7 +972,64 @@ fn a_failing_target_does_not_end_the_repeat_early() {
     let home = r.dir.join("realhome");
     std::fs::create_dir_all(&home).unwrap();
     let e = production_step3_with(&s3, &home, &|_, _| crate::repair::Filed::New).unwrap_err();
-    assert!(e.why.contains("다시 썼습니다"), "{}", e.why);
+    // RULINGS GR3 (old expectation: `e.why.contains("다시 썼습니다")`): A's failing event leaves its
+    // released-side unit without an outcome, so the repeat is now refused as incomplete; that B still
+    // ran in the repeat (GA3) is read from the live file — written once per pass
+    assert!(e.why.contains("끝나지 않아"), "{}", e.why);
+    assert_eq!(
+        std::fs::read_to_string(&live).unwrap().lines().filter(|l| *l == "x").count(),
+        2,
+        "B ran in both passes"
+    );
+}
+
+/// RULINGS GR3 — the plan lists every execution UNIT (file × event × side) before the first starts.
+/// A real multi-event hook (`hooks/cys-hook.sh`: PermissionRequest, PostToolUse, PreToolUse) passes
+/// all its events in the first pass, the third writing a live listed file; in the repeat its FIRST
+/// event fails, the replay returns there and its later events never run → the repeat is incomplete →
+/// REFUSED, although the first pass succeeded. (The old completeness counted only the executions
+/// that ran: `(Fail, complete)`, the repeat "complete", nothing written again → noted.)
+#[test]
+fn a_hook_failing_its_first_event_only_in_the_repeat_is_incomplete() {
+    let r = rig("gr3");
+    let id = RepairId::parse("R-1").unwrap();
+    let live = r.pack.join("hooks/guard.sh");
+    std::fs::write(&live, b"#!/bin/sh\nexit 0\n").unwrap();
+    let count = r.dir.join("runs");
+    let rel = "hooks/cys-hook.sh";
+    assert_eq!(
+        cys::repair::boot_critical::boot_critical_entry(rel).map(|e| e.check_arg),
+        Some("PermissionRequest,PostToolUse,PreToolUse"),
+        "the hook replays three events"
+    );
+    let staged = ledger::staging_dir_in(&r.root, &id).join(rel);
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::write(
+        &staged,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\nn=$(cat '{c}' 2>/dev/null || echo 0)\nn=$((n+1))\necho \"$n\" > '{c}'\n[ \"$n\" -eq 4 ] && exit 1\n[ \"$n\" -eq 3 ] && printf 'x\\n' >> '{l}'\nexit 0\n",
+            c = count.display(),
+            l = live.display()
+        ),
+    )
+    .unwrap();
+    cys::repair::replay::set_mode(&staged, 0o755);
+    let s3 = Step3Input {
+        root: r.root.clone(),
+        repair: id,
+        pack: r.pack.clone(),
+        states: vec![(rel.to_string(), TargetState::read(&staged).unwrap())],
+        windows: false,
+    };
+    let home = r.dir.join("realhome");
+    std::fs::create_dir_all(&home).unwrap();
+    let e = production_step3_with(&s3, &home, &|_, _| crate::repair::Filed::New).unwrap_err();
+    assert!(e.why.contains("끝나지 않아"), "{}", e.why);
+    assert_eq!(
+        std::fs::read_to_string(&count).unwrap().trim(),
+        "4",
+        "three events in the first pass, the repeat ended at its first"
+    );
 }
 
 /// RULINGS EO5 (b) → GA8 (2): the owner's line for an escape refusal follows the ledger's answer that
