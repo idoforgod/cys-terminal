@@ -967,23 +967,32 @@ fn ch3_owner_input_pauses_new_autonomous_starts_only() {
     let _ = std::fs::remove_dir_all(&r.root);
 }
 
-/// CH3: app typing arrives in many small sends — one lane's mark is rewritten at most once per
-/// `PAUSE_MARK_MIN_GAP_SECS`; a later input moves it on.
+/// CH3 / CV3: app typing arrives in many small sends — one lane's mark is rewritten at most once per
+/// `grant::PAUSE_WRITE_COALESCE_SECS`, but every input moves the in-memory pause at once and each
+/// mark covers the window, so the pause never ends earlier than 30 minutes after the LAST input.
+/// (T4b rewrite — the verdict's T4-05: the old test fixed the defect as the expectation: after
+/// `note_owner_input_throttled(.., t + 1.0)` only `assert_eq!(read(), t, "within the gap: not
+/// rewritten")` — and admission then resumed at t + 1800, 30 minutes after the FIRST input.)
 #[test]
 fn ch3_pause_mark_is_throttled_per_lane() {
     let r = rig("ch3-throttle");
     r.grant_on(5);
     let t = now0();
+    let gap = grant::PAUSE_WRITE_COALESCE_SECS;
     note_owner_input_throttled(&r.root, &r.lane, t);
-    let read = || -> f64 {
+    let read = || -> (f64, f64) {
         let v: Value = serde_json::from_slice(&std::fs::read(grant::pause_path_in(&r.root, &r.lane)).unwrap()).unwrap();
-        v["paused_at"].as_f64().unwrap()
+        (v["paused_at"].as_f64().unwrap(), v["resumed_at"].as_f64().unwrap())
     };
-    assert_eq!(read(), t);
-    note_owner_input_throttled(&r.root, &r.lane, t + 1.0);
-    assert_eq!(read(), t, "within the gap: not rewritten");
-    note_owner_input_throttled(&r.root, &r.lane, t + PAUSE_MARK_MIN_GAP_SECS + 1.0);
-    assert_eq!(read(), t + PAUSE_MARK_MIN_GAP_SECS + 1.0);
+    assert_eq!(read(), (t, t + 1_800.0 + gap));
+    note_owner_input_throttled(&r.root, &r.lane, t + 4.0);
+    assert_eq!(read().0, t, "within the window: the write is coalesced");
+    // … but the pause ends 30 minutes after the SECOND input (memory), the mark covering it
+    assert!(read().1 >= t + 4.0 + 1_800.0);
+    assert!(grant::is_paused_in(&r.root, t + 4.0 + 1_799.9));
+    assert!(!grant::is_paused_in(&r.root, t + 1_800.0 + gap + 0.1));
+    note_owner_input_throttled(&r.root, &r.lane, t + gap + 1.0);
+    assert_eq!(read().0, t + gap + 1.0, "after the window: rewritten");
 }
 
 /// CH4: the owner says "끄라", a machine prompt arrives, then the master runs `grant off` — still
@@ -1315,11 +1324,14 @@ fn ci6b_grant_status_reads_the_state() {
     );
     note_owner_input_throttled(&r.root, &r.lane, t);
     let v = status(&seat(3, "worker"), t + 10.0).unwrap();
+    // CV3 (T4b): the mark covers the coalescing window (OLD expectations: `Some(t + 1_800.0)` and
+    // `status(&master(), t + 1_801.0)…["paused"] == false`)
+    let gap = grant::PAUSE_WRITE_COALESCE_SECS;
     assert_eq!(
         (v["state"].clone(), v["paused"].clone(), v["paused_until"].as_f64()),
-        (json!("on"), json!(true), Some(t + 1_800.0))
+        (json!("on"), json!(true), Some(t + 1_800.0 + gap))
     );
-    assert_eq!(status(&master(), t + 1_801.0).unwrap()["paused"], false);
+    assert_eq!(status(&master(), t + 1_801.0 + gap).unwrap()["paused"], false);
     assert_eq!(
         r.call(t, &master(), "grant_status", json!({"daily_cap": 3}))
             .unwrap_err()
@@ -1663,4 +1675,31 @@ fn cv2_the_real_claim_role_line_takes_the_write_away() {
     assert_eq!(v["allowed"], false);
     assert_eq!(v["reason"], rule_doc_allowed_worker_only_ko(), "{v}");
     let _ = std::fs::remove_dir_all(production_root(&d));
+}
+
+// ───────────────────────────── RULINGS CV3 (T4b) ─────────────────────────────
+
+/// CV3 at the daemon: a pause write that fails (an unwritable pause directory) keeps `begin
+/// --trigger grant` paused and `grant status` paused — also long after 30 minutes — until a write
+/// succeeds; nothing is sent anywhere (stderr only).
+#[test]
+fn cv3_a_failed_pause_write_keeps_starts_paused() {
+    let r = rig("cv3-d");
+    r.grant_on(5);
+    let t = now0();
+    std::fs::create_dir_all(&r.root).unwrap();
+    std::fs::write(r.root.join("grant-pause"), b"not a directory").unwrap();
+    note_owner_input_throttled(&r.root, &r.lane, t);
+    let w = seat(3, "worker");
+    let e = r
+        .call(t + 3_600.0, &w, "begin", json!({"trigger": "grant", "files": ["bin/a.py"]}))
+        .unwrap_err();
+    assert!(e.message.contains("일시정지"), "{}", e.message);
+    let st = r.call(t + 3_600.0, &master(), "grant_status", json!({})).unwrap();
+    assert_eq!(st["paused"], true, "{st}");
+    std::fs::remove_file(r.root.join("grant-pause")).unwrap();
+    let v = r
+        .call(t + 3_600.0, &w, "begin", json!({"trigger": "grant", "files": ["bin/a.py"]}))
+        .unwrap();
+    assert!(v["repair"].is_string(), "{v}");
 }

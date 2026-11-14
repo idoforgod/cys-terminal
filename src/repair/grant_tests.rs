@@ -353,9 +353,14 @@ fn owner_input_pauses_and_resumes() {
     assert!(!seq_dir_in(&r).exists() || claims(&r).is_empty());
     assert!(is_paused_in(&r, t - 3_600.0), "a clock set back keeps the pause");
     assert!(is_paused_in(&r, t + 1_799.0));
-    assert!(!is_paused_in(&r, t + 1_800.5));
-    assert!(may_open_new_round_in(&r, t + 1_801.0).unwrap());
-    assert!(allowed(&start_new(&r, t + 1_801.0, D, &o).1));
+    // RULINGS CV3 (T4b rewrite): a written mark covers the coalescing window — its pause ends at
+    // input + 30 min + PAUSE_WRITE_COALESCE_SECS (never earlier than 30 minutes after an input it
+    // may have coalesced). OLD expectations: `assert!(!is_paused_in(&r, t + 1_800.5));`
+    // `assert!(may_open_new_round_in(&r, t + 1_801.0).unwrap());` `… start_new(&r, t + 1_801.0 …)`.
+    assert!(is_paused_in(&r, t + 1_800.0 + PAUSE_WRITE_COALESCE_SECS - 0.5));
+    assert!(!is_paused_in(&r, t + 1_800.0 + PAUSE_WRITE_COALESCE_SECS + 0.5));
+    assert!(may_open_new_round_in(&r, t + 1_806.0).unwrap());
+    assert!(allowed(&start_new(&r, t + 1_806.0, D, &o).1));
     // an unreadable pause file holds the pause by its modification time
     std::fs::write(pause_path_in(&r, &LaneKey("dept-9".into())), b"x").unwrap();
     assert!(is_paused_in(&r, t0() + 5.0));
@@ -1083,4 +1088,65 @@ fn cv1_a_start_is_admitted_at_the_end() {
     let v = attempt(&r, t0(), D, &owner("base", 3, "inc-1"), &id).unwrap();
     assert_eq!(v, StartVerdict::Allowed { claim: 1 });
     assert!(!closed(&r, 1));
+}
+
+// ───────────────────────────── RULINGS CV3 (T4b) ─────────────────────────────
+
+/// CV3: every owner input moves the in-memory pause at once — two inputs 4 s apart (the second
+/// coalesced, not written) → admission resumes 30 minutes after the SECOND input, never before, and
+/// at most one coalescing window later; the written mark covers the window.
+#[test]
+fn cv3_two_inputs_four_seconds_apart() {
+    let r = root("cv3-two");
+    grant_on(&r, 5);
+    let lane = LaneKey("cv3-two".into());
+    let t = t0();
+    assert!(note_owner_input_coalesced_in(&r, &lane, t).unwrap(), "the first input is written");
+    assert!(!note_owner_input_coalesced_in(&r, &lane, t + 4.0).unwrap(), "the second is coalesced");
+    let m: PauseMark = serde_json::from_slice(&std::fs::read(pause_path_in(&r, &lane)).unwrap()).unwrap();
+    assert_eq!(m.paused_at, t);
+    assert!(m.resumed_at >= t + 4.0 + 1_800.0, "the mark covers the coalesced input");
+    assert!(is_paused_in(&r, t + 4.0 + 1_799.9), "not before 30 minutes after the second input");
+    assert!(pause_deadline_in(&r, t).unwrap() >= t + 4.0 + 1_800.0);
+    assert!(!is_paused_in(&r, t + 1_800.0 + PAUSE_WRITE_COALESCE_SECS + 0.1));
+    let o = owner("base", 3, "inc-1");
+    assert_eq!(start_new(&r, t + 1_803.0, D, &o).1.unwrap(), StartVerdict::Paused);
+    assert!(allowed(&start_new(&r, t + 1_806.0, D, &o).1));
+    // a stored resumed_at far in the future is honoured only up to PAUSE_EXTENSION_MAX_SECS
+    let r2 = root("cv3-ext");
+    let l2 = LaneKey("x".into());
+    crate::atomic_write_json(&pause_path_in(&r2, &l2), &PauseMark { schema: 1, lane_key: l2.clone(), paused_at: t, resumed_at: t + 1e9 }).unwrap();
+    assert_eq!(pause_deadline_in(&r2, t), Some(t + 1_800.0 + PAUSE_EXTENSION_MAX_SECS));
+}
+
+/// CV3: a pause write that fails (the pause directory cannot be created — a plain file stands at
+/// its name) keeps autonomous starts paused — also after 30 minutes — until a write succeeds; the
+/// retry happens at the next admission (or input); then the stored pause rules again.
+#[test]
+fn cv3_a_failed_pause_write_fails_closed() {
+    let r = root("cv3-fail");
+    grant_on(&r, 5);
+    let lane = LaneKey("cv3-fail".into());
+    let t = t0();
+    std::fs::write(r.join("grant-pause"), b"not a directory").unwrap();
+    assert!(note_owner_input_coalesced_in(&r, &lane, t).is_err(), "the write fails");
+    assert!(pause_uncertain_in(&r));
+    assert!(is_paused_in(&r, t + 3_600.0), "uncertain → paused, whatever the clock");
+    let o = owner("base", 3, "inc-1");
+    assert_eq!(start_new(&r, t + 3_600.0, D, &o).1.unwrap(), StartVerdict::Paused, "the retry fails too");
+    assert!(!may_open_new_round_in(&r, t + 3_600.0).unwrap());
+    // the disk is writable again: the next admission writes the remembered input and decides by it
+    std::fs::remove_file(r.join("grant-pause")).unwrap();
+    assert!(allowed(&start_new(&r, t + 3_600.0, D, &o).1), "written, then 30 minutes are over");
+    assert!(!pause_uncertain_in(&r));
+    let m: PauseMark = serde_json::from_slice(&std::fs::read(pause_path_in(&r, &lane)).unwrap()).unwrap();
+    assert_eq!(m.paused_at, t, "the remembered input was written");
+    // a failure within 30 minutes of the input, then recovery: the pause still ends 30 min after it
+    let r3 = root("cv3-fail2");
+    grant_on(&r3, 5);
+    std::fs::write(r3.join("grant-pause"), b"x").unwrap();
+    assert!(note_owner_input_coalesced_in(&r3, &lane, t).is_err());
+    std::fs::remove_file(r3.join("grant-pause")).unwrap();
+    assert_eq!(start_new(&r3, t + 60.0, D, &o).1.unwrap(), StartVerdict::Paused, "recovered, still within the pause");
+    assert!(!pause_uncertain_in(&r3));
 }

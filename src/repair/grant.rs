@@ -396,14 +396,172 @@ pub fn note_owner_input_in(root: &Path, lane: &LaneKey, now: f64) -> Result<bool
         return Ok(false);
     }
     let p = pause_path_in(root, lane);
+    // RULINGS CV3: the mark covers the inputs a coalesced writer may skip after it (the
+    // coalescing window) — the persisted end is never earlier than 30 minutes after the last input
     let mark = PauseMark {
         schema: super::REPAIR_SCHEMA,
         lane_key: lane.clone(),
         paused_at: now,
-        resumed_at: now + PAUSE_QUIET_SECS as f64,
+        resumed_at: now + PAUSE_QUIET_SECS as f64 + PAUSE_WRITE_COALESCE_SECS,
     };
     crate::atomic_write_json(&p, &mark).map_err(|e| io_err(&p, e))?;
     Ok(true)
+}
+
+/// RULINGS CV3 (T4b) — the coalescing window of one lane's pause writes (seconds): at most one write
+/// per window; every input still moves the in-memory deadline at once, and each written mark says
+/// the pause ends 30 minutes + this window after its input, so a skipped input is covered.
+pub const PAUSE_WRITE_COALESCE_SECS: f64 = 5.0;
+
+/// How much later than `paused_at + 30 min` a stored `resumed_at` is honoured (a damaged or
+/// hostile value cannot pause the grant for ever).
+pub const PAUSE_EXTENSION_MAX_SECS: f64 = 60.0;
+
+/// The end of the pause a stored `(paused_at, resumed_at)` stands for.
+fn mark_deadline(paused_at: f64, resumed_at: Option<f64>) -> f64 {
+    let base = paused_at + PAUSE_QUIET_SECS as f64;
+    match resumed_at {
+        Some(r) if r.is_finite() => base.max(r.min(base + PAUSE_EXTENSION_MAX_SECS)),
+        _ => base,
+    }
+}
+
+/// One lane's pause as this process knows it (RULINGS CV3): `deadline` = the latest owner input +
+/// 30 min; `input_at` = that input; `attempt_at` = when a mark was last written or a write last
+/// failed (not set when nothing was written because the grant is off — CI5 (b)); `uncertain` = the
+/// last write failed (starts stay paused until a write succeeds).
+#[derive(Debug, Default, Clone, Copy)]
+struct PauseMemory {
+    deadline: f64,
+    input_at: f64,
+    attempt_at: Option<f64>,
+    uncertain: bool,
+}
+
+type PauseKey = (PathBuf, String);
+
+fn pause_memory() -> &'static std::sync::Mutex<std::collections::HashMap<PauseKey, PauseMemory>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PauseKey, PauseMemory>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Writes the lane's mark for input `at` (attempted at `now`) and records the outcome in memory.
+/// The file I/O runs outside the memory lock.
+fn persist_pause(root: &Path, lane: &LaneKey, at: f64, now: f64) -> Result<bool, RepairError> {
+    let key = (root.to_path_buf(), lane.0.clone());
+    let r = note_owner_input_in(root, lane, at);
+    let mut m = pause_memory().lock().unwrap_or_else(|e| e.into_inner());
+    let e = m.entry(key).or_default();
+    match &r {
+        Ok(true) => {
+            e.uncertain = false;
+            e.attempt_at = Some(now);
+        }
+        // the grant is off: nothing to pause, nothing remembered (CI5 (b))
+        Ok(false) => e.uncertain = false,
+        Err(_) => {
+            e.uncertain = true;
+            e.attempt_at = Some(now);
+        }
+    }
+    r
+}
+
+/// RULINGS CV3 — an owner input seen by `lane`'s daemon at `now`: the in-memory deadline moves to
+/// `now + 30 min` AT ONCE (start admission in this process reads it); a write is attempted at most
+/// once per [`PAUSE_WRITE_COALESCE_SECS`] (a failed one too — a failing disk is not hammered once
+/// per keystroke). `Ok(true)` = a mark was written now; `Err` = the write failed — the lane stays
+/// paused (fail closed) until a later write succeeds (the next due input, or [`reconcile_pause_in`]
+/// at the next start admission). Sends nothing to any queue.
+pub fn note_owner_input_coalesced_in(root: &Path, lane: &LaneKey, now: f64) -> Result<bool, RepairError> {
+    let (due, at) = {
+        let mut m = pause_memory().lock().unwrap_or_else(|e| e.into_inner());
+        let e = m.entry((root.to_path_buf(), lane.0.clone())).or_default();
+        let dl = now + PAUSE_QUIET_SECS as f64;
+        if dl > e.deadline {
+            e.deadline = dl;
+            e.input_at = now;
+        }
+        let due = e
+            .attempt_at
+            .is_none_or(|w| now - w >= PAUSE_WRITE_COALESCE_SECS || now < w);
+        (due, e.input_at)
+    };
+    if !due {
+        return Ok(false);
+    }
+    persist_pause(root, lane, at, now)
+}
+
+/// RULINGS CV3 — retries the write of every lane whose last pause write failed (this process),
+/// with the latest input it remembers (called at start admission — rare); returns whether any lane
+/// is still uncertain.
+pub fn reconcile_pause_in(root: &Path, now: f64) -> bool {
+    let pending: Vec<(String, f64)> = pause_memory()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|((r, _), e)| r == root && e.uncertain)
+        .map(|((_, lane), e)| (lane.clone(), e.input_at))
+        .collect();
+    for (lane, at) in pending {
+        if let Err(e) = persist_pause(root, &LaneKey(lane), at, now) {
+            // stderr only (F1: nothing to a queue); the lane stays paused
+            eprintln!("[cysd] repair grant: owner-input pause still not recorded: {e:?}");
+        }
+    }
+    pause_uncertain_in(root)
+}
+
+/// Whether a pause write of `root` failed in this process and has not succeeded since (CV3).
+pub fn pause_uncertain_in(root: &Path) -> bool {
+    pause_memory()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|((r, _), e)| r == root && e.uncertain)
+}
+
+/// RULINGS CV3 — when the pause ends: the LATER of this process's memory (the latest owner input +
+/// 30 min) and what is stored (`grant.json` and every lane's mark, each `paused_at + 30 min`, a
+/// stored `resumed_at` honoured up to [`PAUSE_EXTENSION_MAX_SECS`] later; an unreadable mark counts
+/// with its modification time, or "now" — fail closed). `None` = no owner input known.
+pub fn pause_deadline_in(root: &Path, now: f64) -> Option<f64> {
+    let mut end: Option<f64> = read_decision_in(root)
+        .ok()
+        .flatten()
+        .and_then(|d| d.paused_at.map(|p| mark_deadline(p, d.resumed_at)));
+    let mut bump = |t: f64| end = Some(end.map_or(t, |l: f64| l.max(t)));
+    let dir = root.join("grant-pause");
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.starts_with('.') || !name.ends_with(".json") {
+                continue; // a temporary file of a writer
+            }
+            match std::fs::read(&p)
+                .map_err(|e| corrupt(&p, e))
+                .and_then(|b| parse_versioned::<PauseMark>(&p, &b))
+            {
+                Ok(m) => bump(mark_deadline(m.paused_at, Some(m.resumed_at))),
+                Err(_) => bump(mtime_epoch(&p).unwrap_or(now) + PAUSE_QUIET_SECS as f64),
+            }
+        }
+    }
+    for ((r, _), m) in pause_memory()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        if r == root && m.deadline > 0.0 {
+            bump(m.deadline);
+        }
+    }
+    end
 }
 
 /// The time of the last owner input known to the grant (`grant.json.paused_at` written with the
@@ -434,10 +592,11 @@ pub fn last_owner_input_in(root: &Path, now: f64) -> Option<f64> {
     last
 }
 
-/// B4: paused while the last owner input is less than 30 minutes old. A clock set back keeps the
-/// pause on (the safe side).
+/// B4 / CV3: paused while the pause has not ended ([`pause_deadline_in`] — memory and file, the
+/// later wins), and while a pause write failed and has not succeeded since (fail closed). A clock
+/// set back keeps the pause on (the safe side).
 pub fn is_paused_in(root: &Path, now: f64) -> bool {
-    last_owner_input_in(root, now).is_some_and(|t| now < t + PAUSE_QUIET_SECS as f64)
+    pause_uncertain_in(root) || pause_deadline_in(root, now).is_some_and(|d| now < d)
 }
 
 /// The modification time of `p` in epoch seconds (`None` = cannot be read).
@@ -922,6 +1081,7 @@ pub fn try_claim_in(
     if let Evaluated::Busy = evaluated {
         return Ok(StartVerdict::Busy);
     }
+    reconcile_pause_in(env.root, (env.clock)()); // CV3: a failed pause write is retried before admission
     if is_paused_in(env.root, (env.clock)()) {
         return Ok(StartVerdict::Paused);
     }
@@ -972,6 +1132,7 @@ pub fn try_claim_in(
     let after = read_decision_in(env.root).unwrap_or(None);
     let on_now = is_on(after.as_ref());
     let same = after.as_ref().map(|d| d.generation) == Some(generation);
+    reconcile_pause_in(env.root, (env.clock)());
     let paused = is_paused_in(env.root, (env.clock)());
     if !on_now || !same || paused {
         if let Err(e) = create_marker(env.root, target) {

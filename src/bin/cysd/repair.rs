@@ -3789,12 +3789,13 @@ mod grant_verbs {
             return Err(VerbError::invalid(CAP_ON_ASK_ONLY_KO));
         }
         let d = grant::read_decision_in(&ctx.root)?;
-        let last = grant::last_owner_input_in(&ctx.root, ctx.now);
+        // CV3: the later of this daemon's memory and the stored marks; a failed pause write = paused
         let paused = grant::is_paused_in(&ctx.root, ctx.now);
+        let until = grant::pause_deadline_in(&ctx.root, ctx.now).filter(|t| ctx.now < *t);
         Ok(json!({
             "state": if grant::is_on(d.as_ref()) { "on" } else { "off" },
             "paused": paused,
-            "paused_until": if paused { last.map(|t| t + grant::PAUSE_QUIET_SECS as f64) } else { None },
+            "paused_until": if paused { until } else { None },
             "daily_cap": current_cap(d.as_ref()),
         }))
     }
@@ -3868,9 +3869,10 @@ mod grant_verbs {
 /// seen by THIS lane's daemon in the grant's pause file (only while the grant is on; nothing is sent
 /// to any queue). Called at the two places the daemon learns of owner input (`handlers.rs`): an
 /// owner-typed prompt in `hook.machine_origin` (STRICT judgment — CH2) and an operator-typed app send
-/// (`human_verified`). App typing arrives in many small sends, so a lane's mark is rewritten at most
-/// once per `PAUSE_MARK_MIN_GAP_SECS` (the pause may then end that much earlier than 30 minutes after
-/// the very last keystroke).
+/// (`human_verified`). App typing arrives in many small sends: the in-memory pause moves with every
+/// one of them and the mark is rewritten at most once per `grant::PAUSE_WRITE_COALESCE_SECS`, each mark
+/// covering that window — the pause never ends earlier than 30 minutes after the very last input
+/// (RULINGS CV3; it may end up to that window later).
 pub(crate) fn grant_note_owner_input(daemon: &Daemon) {
     let root = production_root(daemon);
     let lane = LaneKey::of_socket(&daemon.socket_path);
@@ -3898,30 +3900,12 @@ pub(crate) fn grant_note_app_typing(
     }
 }
 
-/// The smallest gap between two pause-mark writes of one lane (seconds).
-pub(crate) const PAUSE_MARK_MIN_GAP_SECS: f64 = 5.0;
-
-/// [`grant_note_owner_input`]'s body (root and clock explicit for the tests).
+/// [`grant_note_owner_input`]'s body (root and clock explicit for the tests) — RULINGS CV3: the
+/// in-memory pause deadline moves at once, the write is coalesced, a failed write keeps the lane
+/// paused until a later write succeeds (stderr line; nothing to any queue).
 pub(crate) fn note_owner_input_throttled(root: &Path, lane: &LaneKey, now: f64) {
-    static LAST: std::sync::OnceLock<Mutex<HashMap<(PathBuf, String), f64>>> =
-        std::sync::OnceLock::new();
-    let key = (root.to_path_buf(), lane.0.clone());
-    let last = LAST.get_or_init(|| Mutex::new(HashMap::new()));
-    if last
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
-        .is_some_and(|t| (now - t).abs() < PAUSE_MARK_MIN_GAP_SECS)
-    {
-        return;
-    }
-    match cys::repair::grant::note_owner_input_in(root, lane, now) {
-        // CI5 (b): the time is remembered only when a mark was actually written
-        Ok(true) => {
-            last.lock().unwrap_or_else(|e| e.into_inner()).insert(key, now);
-        }
-        Ok(false) => {}
-        Err(e) => eprintln!("[cysd] repair grant: owner-input pause not recorded: {e:?}"),
+    if let Err(e) = cys::repair::grant::note_owner_input_coalesced_in(root, lane, now) {
+        eprintln!("[cysd] repair grant: owner-input pause not recorded (autonomous starts stay paused until it is): {e:?}");
     }
 }
 
