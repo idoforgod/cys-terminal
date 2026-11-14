@@ -861,6 +861,8 @@ describe("TOAST 축 — 출처 핀 · 통짜 가드 금지 · 커버리지", () 
   test("전 이벤트 분기를 이 시험이 덮는다 — onDaemonEvent 의 name 분기 수와 EVENTS 표가 일치", () => {
     const names = new Set([...body.matchAll(/name === "([\w.]+)"/g)].map((m) => m[1]));
     for (const n of names) expect([n, EVENTS.some((e) => e.ev.name === n)]).toEqual([n, true]);
-    expect(names.size).toBe(17); // approval.request/stalled · context.threshold · pane.idle · master.idle/deadman · agent.exited · queue.starved/delivered · status.changed · task.changed · osc.notify · feed.item.created · watchdog.duplicate_procs · surface.exited/closed/reaped
+    // T5b (0.15.0): + repair.approval.created / repair.approval.resolved (the card's event branch, both in EVENTS);
+    // old pin: toBe(17)
+    expect(names.size).toBe(19); // approval.request/stalled · context.threshold · pane.idle · master.idle/deadman · agent.exited · queue.starved/delivered · status.changed · task.changed · osc.notify · feed.item.created · watchdog.duplicate_procs · surface.exited/closed/reaped · repair.approval.created/resolved
   });
 });
