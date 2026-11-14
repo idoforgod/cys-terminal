@@ -665,7 +665,6 @@ fn note_timeouts(env: &JobEnv<'_>, id: &RepairId, timeouts: &[(String, f64)]) ->
 fn probation_pass(env: &JobEnv<'_>, report: &mut TickReport) {
     let root = env.op.root;
     let lane = env.op.lane;
-    closure_obligations(env, report);
     for id in ledger::list_ids_in(root) {
         let ledger_rel = format!("repairs/{}/record.json", id.as_str());
         let row = match ledger::read_lane_in(root, &id, lane) {
@@ -698,6 +697,9 @@ fn probation_pass(env: &JobEnv<'_>, report: &mut TickReport) {
             fault_once(env, &id, "recheck-error", &rel, &format!("재검사를 마치지 못했습니다({e:?})"), report);
         }
     }
+    // EN1: the closures this pass (or an earlier one) wrote owe their intake rows — filed in THIS
+    // tick, until acknowledged
+    closure_obligations(env, report);
 }
 
 /// CU1 / CU4: a failing re-check that could NOT be reverted (or, on Windows, is never reverted
