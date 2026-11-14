@@ -779,8 +779,8 @@ class JudgeIsolation(_PlantedVectors, _Env):
     def test_an_interpreter_that_cannot_start_is_the_broken_gate_it_was(self):
         """DY1 failure mode, unchanged (FO2): an interpreter that cannot start (a dead `#!`) gives exactly what the
         start of dbec50e0 gave for the same input — for every role and a write the judge would refuse: the same
-        exit code (non-blocking: the shell's exec failure), nothing on stdout (no deny), the shell's one line
-        naming the interpreter; the self-test fails loudly. Never deny-everything. (A missing CYS_PY is not this
+        exit code (non-blocking: the shell's exec failure — macOS bash 3.2 prints two lines and exits 1), nothing
+        on stdout (no deny), the shell's lines naming the interpreter; the self-test fails loudly. Never deny-everything. (A missing CYS_PY is not this
         case: the prelude resolves the next interpreter on PATH, as before.)"""
         dead = self.fakebin / "python-dead"
         dead.write_text("#!/nonexistent/interpreter/python3\n", encoding="utf-8")
@@ -796,7 +796,8 @@ class JudgeIsolation(_PlantedVectors, _Env):
                 got.append((r.returncode, r.stdout.strip(), sum(1 for l in r.stderr.splitlines() if "python-dead" in l)))
             self.assertEqual(got[0], got[1], "%s: differs from the start of dbec50e0" % role)
             self.assertNotIn(got[0][0], (0, 2), "%s: %r" % (role, got[0]))
-            self.assertEqual((got[0][1], got[0][2]), ("", 1), "%s: %r" % (role, got[0]))
+            self.assertEqual(got[0][1], "", "%s: a broken gate must not deny: %r" % (role, got[0]))
+            self.assertGreaterEqual(got[0][2], 1, "%s: the shell names the interpreter: %r" % (role, got[0]))
         st = subprocess.run([SH, str(HOOK), "--self-test"], env=dict(self.env, CYS_PY=py),
                             capture_output=True, text=True, timeout=60)
         self.assertNotEqual(st.returncode, 0, "the self-test must fail loudly")
@@ -868,8 +869,10 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
         # CHILD interpreter, which keeps the environment it is given (ES1) and is not what is measured here
         self.probe_leaf = self.root / "probe-leaf" / "leaf.py"
         self.probe_leaf.parent.mkdir()
-        self.probe_leaf.write_text("import hashlib, json, re, tempfile, sys\nsys.stdout.write('reviewer-codex\\n')\n",
-                                   encoding="utf-8")
+        # (it ends with sys.exit like the real leaf, whose `sys.exit(bounded_cli())` is what PYTHONINSPECT turns
+        # into a non-zero exit when it reaches the interpreter)
+        self.probe_leaf.write_text("import hashlib, json, re, tempfile, sys\nsys.stdout.write('reviewer-codex\\n')\n"
+                                   "sys.stdout.flush()\nsys.exit(0)\n", encoding="utf-8")
 
     def lib_copy(self, tag, swaps):
         src = LIB.read_text(encoding="utf-8")
