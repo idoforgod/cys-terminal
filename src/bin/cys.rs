@@ -27037,6 +27037,11 @@ fn run_pack_merge_with(
         "healed" | "conflicted" => {
             let user_path = dir.join(format!("{rel}.user"));
             if to_local {
+                // ★T2j(RULINGS HM1): `bin/` · `hooks/` 파일이면 아무것도 쓰거나 해소하기 전에 거부(그 사본은 읽는 곳이 없다).
+                if let Some(refusal) = to_local_no_reader_refusal(&rel, kind, sources.is_listed(&rel)) {
+                    eprintln!("{refusal}");
+                    return 1;
+                }
                 // 스킬 등 system 파일의 사용자본을 오버레이로 승격 — vendor 무결성(치유)과 공존.
                 let local_root = cys::pack::local_dir();
                 let dest = local_root.join(&rel);
@@ -28785,6 +28790,35 @@ fn parked_reapply_way(rel: &str) -> String {
 }
 
 /// ★T2g(RULINGS CN2): `pack-merge --file` 를 vendor-first 항목에 플래그 없이(또는 거부되는 플래그로) 썼을 때의 문장.
+/// ★T2j(RULINGS HM1 · 설계 §7 15행 "`bin/`·`hooks/` 수정을 읽는 곳 없는 자리로 옮기는 명령은 거부하고 이유를 알린다"): `--to-local` 은
+/// 사용자본을 `~/.cys/local/<rel>` 에 둔다. 그 자리의 사본을 실제로 읽는 것은 같은 이름의 스킬(`skills/` — 로컬이 이긴다)뿐이고,
+/// `bin/` · `hooks/` 파일의 사본은 아무것도 읽지 않는다(로컬 훅은 `hooks/<이벤트>.d/` 의 `*.sh` 만 · 디렉티브는 `.local.md` 만 읽힌다 —
+/// `cysjavis-pack/hooks/cys-hook.sh` · `session-start.sh`). 그래서 그 두 폴더의 파일이면 아무것도 쓰거나 옮기거나 해소하기 **전에**
+/// 거부하고 이유와 지금 쓸 길을 말한다. None = 이 규칙의 대상이 아니다(스킬과 그 밖의 길은 종전 그대로 — 설계가 이 두 폴더만
+/// 이름 댄다).
+fn to_local_no_reader_refusal(rel: &str, kind: &str, listed: bool) -> Option<String> {
+    if !(rel.starts_with("bin/") || rel.starts_with("hooks/")) {
+        return None;
+    }
+    let instead = if kind == "vendor-first" {
+        format!("보관된 내 사본({rel}.user)을 팩 제자리에 다시 입히는 길: {}.", cys::pack::parked_copy_routes(rel))
+    } else if listed {
+        format!("기동 필수·보호 목록 파일이라 팩 안에서 바꾸는 길은 {} 입니다.", listed_repair_route(rel))
+    } else if matches!(kind, "healed" | "conflicted") {
+        format!("보관된 내 사본({rel}.user)을 읽히는 자리(팩 제자리)에 되살리는 길은 cys pack-adopt {rel} 입니다.")
+    } else {
+        "팩 제자리의 파일이 지금 읽히는 파일입니다 — 이 항목에 쓸 수 있는 해소는 cys pack-merge 목록에 나옵니다.".to_string()
+    };
+    let own_hooks = if rel.starts_with("hooks/") {
+        " 따로 두고 싶은 자기 훅은 ~/.cys/local/hooks/<이벤트>.d/ 에 둡니다."
+    } else {
+        ""
+    };
+    Some(format!(
+        "⛔ 거부: '{rel}' 은 bin/·hooks/ 파일입니다 — --to-local 이 ~/.cys/local 에 두는 사본은 읽는 곳이 없어 내 수정이 꺼집니다(그 사본을 실제로 읽는 것은 skills/ 의 스킬뿐). 아무것도 쓰거나 옮기거나 해소하지 않았습니다. {instead}{own_hooks}"
+    ))
+}
+
 fn vendor_first_merge_refusal(rel: &str) -> String {
     format!(
         "'{rel}' 은 기동 필수 파일의 vendor 우선 보관(vendor-first) — 보관된 내 사본({rel}.user)을 다시 입히는 길은 워커의 승인 \
@@ -43334,6 +43368,130 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "pack-verb write sites that open an existing path: {bad:?}");
+    }
+
+    /// ★T2j(RULINGS HM1): 거부 문장 — 이유(그 사본은 읽는 곳이 없다)와 지금 쓸 길. 등재 파일에는 거부되는 되살리기를 권하지 않는다.
+    /// 스킬과 그 밖의 길(디렉티브 · soul.md · 설정)은 이 규칙의 대상이 아니다.
+    #[test]
+    fn t2j_to_local_refusal_sentence() {
+        let r = |rel: &str, kind: &str, listed: bool| to_local_no_reader_refusal(rel, kind, listed);
+        assert_eq!(
+            r("bin/x.py", "healed", false).as_deref(),
+            Some(
+                "⛔ 거부: 'bin/x.py' 은 bin/·hooks/ 파일입니다 — --to-local 이 ~/.cys/local 에 두는 사본은 읽는 곳이 없어 내 수정이 꺼집니다(그 사본을 실제로 읽는 것은 skills/ 의 스킬뿐). 아무것도 쓰거나 옮기거나 해소하지 않았습니다. 보관된 내 사본(bin/x.py.user)을 읽히는 자리(팩 제자리)에 되살리는 길은 cys pack-adopt bin/x.py 입니다."
+            )
+        );
+        let h = r("hooks/x.sh", "conflicted", false).unwrap();
+        assert!(h.contains("cys pack-adopt hooks/x.sh"), "{h}");
+        assert!(h.ends_with(" 따로 두고 싶은 자기 훅은 ~/.cys/local/hooks/<이벤트>.d/ 에 둡니다."), "{h}");
+        let vf = r("hooks/session-start.sh", "vendor-first", true).unwrap();
+        assert!(vf.contains(&cys::pack::parked_copy_routes("hooks/session-start.sh")), "{vf}");
+        let ls = r("bin/x.py", "healed", true).unwrap();
+        assert!(ls.contains(&listed_repair_route("bin/x.py")) && !ls.contains("pack-adopt"), "등재 파일: 수리 흐름 · 되살리기 권하지 않음: {ls}");
+        for kind in ["user-kept", "new-pending", "kept-drift", "merged", "adopted", "quarantined"] {
+            assert!(r("bin/x.py", kind, false).unwrap().contains("cys pack-merge 목록"), "{kind}");
+        }
+        for kind in ["healed", "conflicted", "user-kept", "new-pending", "kept-drift", "merged", "vendor-first", "adopted", "quarantined"] {
+            for (rel, listed) in [("bin/x.py", false), ("hooks/x.sh", true)] {
+                let t = r(rel, kind, listed).unwrap();
+                assert!(t.starts_with("⛔ 거부: ") && t.contains("읽는 곳이 없어"), "{rel} {kind}: {t}");
+                assert!(t.contains("아무것도 쓰거나 옮기거나 해소하지 않았습니다."), "{rel} {kind}: {t}");
+            }
+        }
+        for rel in ["skills/a/SKILL.md", "directives/MASTER_DIRECTIVE.md", "soul.md", "agents.json", "binx/y.py", "hooksy.sh"] {
+            assert_eq!(r(rel, "healed", false), None, "{rel}: 이 규칙의 대상이 아니다");
+        }
+    }
+
+    /// ★T2j(RULINGS HM1): 시험용 — 팩에 실제로 있는 그 폴더의 system 파일 하나(부모 폴더를 만들어 둔다).
+    fn t2j_rel(prefix: &str, td: &std::path::Path) -> String {
+        let rel = cys::pack::PACK_ALL
+            .iter()
+            .map(|(r, _)| r.to_string())
+            .find(|r| r.starts_with(prefix) && cys::pack::ownership_name_scoped(r, td) == "system")
+            .expect("팩에 그 폴더의 system 파일이 있다");
+        if let Some(p) = td.join(&rel).parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        rel
+    }
+
+    /// ★T2j: 한 파일에 대해 `--to-local` 이 건드릴 수 있는 모든 것 — 살아 있는 파일 · `.user` · `.new` · 감사 원장 · 설치 기록 ·
+    /// `.pristine` 사본 · 병합 대기 항목 · 오버레이 자리.
+    #[allow(clippy::type_complexity)]
+    fn t2j_state(
+        td: &std::path::Path,
+        local: &std::path::Path,
+        rel: &str,
+    ) -> (Vec<Option<Vec<u8>>>, Option<serde_json::Value>, bool) {
+        let read = |p: std::path::PathBuf| std::fs::read(p).ok();
+        (
+            vec![
+                read(td.join(rel)),
+                read(td.join(format!("{rel}.user"))),
+                read(td.join(format!("{rel}.new"))),
+                read(td.join(cys::pack::MERGE_AUDIT_FILE)),
+                read(td.join(cys::pack::INSTALL_MANIFEST)),
+                read(td.join(cys::pack::PRISTINE_DIR).join(rel)),
+            ],
+            cys::pack::load_merge_pending(td).get(rel).cloned(),
+            std::fs::symlink_metadata(local.join(rel)).is_ok(),
+        )
+    }
+
+    /// ★T2j(RULINGS HM1 · 설계 §7 15행 "`bin/`·`hooks/` 수정을 읽는 곳 없는 자리로 옮기는 명령은 거부하고 이유를 알린다"):
+    /// healed · conflicted 갈래 — 종전에는 `~/.cys/local` 에 사본을 쓰고 `.user` 와 병합 대기 항목을 해소한 **뒤에** 경고했다.
+    /// 이제 `bin/` · `hooks/` 파일이면 거부(rc 1)이고 아무것도 쓰거나 옮기거나 해소하지 않는다 — 등재되지 않은 파일도, 기동 필수·보호
+    /// 목록 파일도.
+    #[test]
+    fn t2j_to_local_refused_for_bin_and_hooks_healed_conflicted() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, _rel, _embed, _env) = t4_system_fixture("t2j1");
+        let local = td.parent().unwrap().join("local");
+        let _l = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
+        let flags = MergeFlags { to_local: true, yes: true, ..MergeFlags::default() };
+        for prefix in ["bin/", "hooks/"] {
+            let rel = t2j_rel(prefix, &td);
+            let key = cys::pack::list_key(&rel);
+            let listed = cys::pack::UpdateSources::none().with_listed(move |r| r == key);
+            let plain = cys::pack::UpdateSources::none().with_listed(|_| false);
+            for (kind, sources) in [("healed", &plain), ("conflicted", &plain), ("healed", &listed), ("conflicted", &listed)] {
+                std::fs::write(td.join(&rel), "LIVE VENDOR\n").unwrap();
+                std::fs::write(td.join(format!("{rel}.user")), "MY EDIT\n").unwrap();
+                t4_write_ledger(&td, &rel, serde_json::json!({"kind": kind, "side": format!("{rel}.user"), "version": "x", "ts": 0}));
+                let before = t2j_state(&td, &local, &rel);
+                let rc = run_pack_merge_with(Some(rel.clone()), flags, None, sources);
+                assert_eq!(rc, 1, "{rel} ({kind}): bin/·hooks/ 의 --to-local 은 거부");
+                assert_eq!(t2j_state(&td, &local, &rel), before, "{rel} ({kind}): 아무것도 쓰거나 옮기거나 해소하지 않았다");
+                assert!(!local.exists(), "{rel} ({kind}): 오버레이 폴더조차 만들지 않았다");
+            }
+        }
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T2j(RULINGS HM1): 대조군 — 스킬은 오버레이가 실제로 가린다(같은 이름은 로컬이 이긴다). `--to-local` 은 종전 그대로 사본을
+    /// `~/.cys/local` 에 두고 `.user` 와 병합 대기 항목을 해소하고 감사 원장에 적는다.
+    #[test]
+    fn t2j_to_local_on_a_skill_is_as_today() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, _rel, _embed, _env) = t4_system_fixture("t2j3");
+        let local = td.parent().unwrap().join("local");
+        let _l = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
+        let plain = cys::pack::UpdateSources::none().with_listed(|_| false);
+        let rel = t2j_rel("skills/", &td);
+        std::fs::write(td.join(&rel), "LIVE VENDOR\n").unwrap();
+        std::fs::write(td.join(format!("{rel}.user")), "MY SKILL EDIT\n").unwrap();
+        t4_write_ledger(&td, &rel, serde_json::json!({"kind": "healed", "side": format!("{rel}.user"), "version": "x", "ts": 0}));
+        let audit_before = std::fs::read(td.join(cys::pack::MERGE_AUDIT_FILE)).unwrap_or_default();
+        let flags = MergeFlags { to_local: true, yes: true, ..MergeFlags::default() };
+        assert_eq!(run_pack_merge_with(Some(rel.clone()), flags, None, &plain), 0, "스킬은 종전 그대로");
+        assert_eq!(std::fs::read_to_string(local.join(&rel)).unwrap(), "MY SKILL EDIT\n", "오버레이 사본 = 내 수정본");
+        assert!(!td.join(format!("{rel}.user")).exists(), "보관본 해소");
+        assert_eq!(t4_ledger_kind(&td, &rel), None, "병합 대기 해소");
+        let audit_after = std::fs::read(td.join(cys::pack::MERGE_AUDIT_FILE)).unwrap_or_default();
+        assert!(audit_after.len() > audit_before.len(), "감사 원장에 to-local 기록");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), "LIVE VENDOR\n", "팩 제자리는 그대로");
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
     }
 
     /// ★T2i(RULINGS GB3): 보관 사본 조사 안의 오류(항목을 읽지 못함 · 항목의 종류를 알 수 없음)는 '조사 미완'이다 — 첫 항목에서든
