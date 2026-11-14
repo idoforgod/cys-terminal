@@ -707,10 +707,13 @@ fn reconcile_stale_pending(
         None => now >= exp,
     };
     rec.pending_request = None;
-    if rec
-        .approval
-        .as_ref()
-        .is_some_and(|a| a.approved && a.fingerprint_sha256 == fp)
+    // an approval that was applied (its request ended `Approved` here) is consumed, not stale
+    let applied = serving.is_some_and(|r| r.state == ReqState::Approved);
+    if !applied
+        && rec
+            .approval
+            .as_ref()
+            .is_some_and(|a| a.approved && a.fingerprint_sha256 == fp)
     {
         rec.approval = None;
     }
