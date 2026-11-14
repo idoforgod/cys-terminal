@@ -74,6 +74,8 @@ mod trash;
 mod repair;
 // 「스스로 해결」 T6 — the appended job's readiness flag and its tick / sweep request side (C7).
 mod repair_job;
+// Track T5b — the final-approval channel (C5), a FLAT file (the C8 census refuses nested modules).
+mod repair_approval;
 mod undo;
 mod usage;
 // ★U16(0.14.41) 팀 만들기 제안 데몬 잠금 핀 — 테스트 전용 모듈(프로덕션 코드 0).

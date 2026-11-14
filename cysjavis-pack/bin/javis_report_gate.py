@@ -1972,17 +1972,101 @@ def open_defect_wake(sigs):
     return ("열린 결함 %d건 — 워커에게 맡길 것" % len(sigs), "repair-open-defects-%s" % fp)
 
 
+# ── 「스스로 해결」(0.15.0 · 설계 §4-7 8단계 · C5 5.6 · 승인 통로 17번째 자리 · T5b) — 승인 대기 한 줄 ─────────────────
+#   수리 최종 승인은 주인만 한다 — 마스터는 기다리지 않고, 이 부서의 수리가 '승인 대기'에 들어서면 보고 관문 요약에서
+#   **한 줄**만 받는다: 주인님께 이 부서의 승인 탭을 열어 달라고 한 번 알릴 것. 열린 결함 줄(T3)과 같은 규칙:
+#   대기 집합이 **바뀔 때만** 간다(멱등 키 = 대기 수리 번호 집합의 지문 · 마지막 배달 키는 게이트 상태
+#   `repair_approvals.json`), 0건이 되면 기억을 지운다, `cys` 부재·구형·실패·시간 초과 = 아무것도 보내지 않고 기억도
+#   그대로, shadow = 배달 0. 장부는 `cys repair list --json`(데몬 읽기 · CYS_NO_AUTOSTART=1 · 시간 상한)으로만 읽는다.
+APPROVAL_TASK = "repair-approval-waiting"
+APPROVAL_STATE_FILE = "repair_approvals.json"
+
+
+def collect_awaiting_approval(cys_bin, timeout=OPEN_DEFECT_TIMEOUT_S):
+    """(ok, lane, [수리 번호…]) — **이 부서**가 연 수리 중 '승인 대기' 인 것(정렬). 실패는 (False, None, [])."""
+    env = dict(os.environ, CYS_NO_AUTOSTART="1")
+    try:
+        r = subprocess.run([cys_bin, "repair", "list", "--json"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout, env=env)
+    except (subprocess.SubprocessError, OSError):
+        return False, None, []
+    if r.returncode != 0:
+        return False, None, []
+    doc = None
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                doc = json.loads(line)
+            except ValueError:
+                doc = None
+    if not isinstance(doc, dict) or not isinstance(doc.get("repairs"), list):
+        return False, None, []
+    lane = doc.get("lane")
+    if not isinstance(lane, str) or not lane:
+        return False, None, []
+    ids = sorted({x.get("repair") for x in doc["repairs"]
+                  if isinstance(x, dict) and x.get("state") == "awaiting_approval"
+                  and x.get("origin_lane") == lane and isinstance(x.get("repair"), str)})
+    return True, lane, ids
+
+
+def approval_wake(lane, ids):
+    """(본문, 멱등 키) 또는 None(대기 0건)."""
+    if not ids:
+        return None
+    import hashlib
+    fp = hashlib.sha256(("%s\n" % lane + "\n".join(sorted(ids))).encode("utf-8")).hexdigest()[:16]
+    body = ("수리 최종 승인 대기 %d건(%s) — 주인님께 한 줄로 알릴 것: 부서 '%s' 의 승인 탭에서 카드를 열어 주세요. "
+            "결정은 주인만 하고, 마스터는 기다리지 않는다" % (len(ids), ", ".join(ids[:5]), lane))
+    return body, "repair-approval-waiting-%s" % fp
+
+
+# ── RULINGS CI6 (c) (계약 C9 9.8 (4) "깨우기 큐와 보고 관문은 일시정지 상태를 따른다" · T5b) ─────────────────
+#   자동 수리 허락이 **켜져 있고 일시정지 중**이면 열린 결함 줄을 **보류**한다 — 그 실행은 아무것도 보내지 않고 기억한
+#   집합도 바꾸지 않는다(일시정지가 끝난 뒤 첫 실행에서, 열린 집합이 여전히 다르면 그때 간다). 허락이 꺼져 있으면 오늘처럼
+#   간다(계약 9.3 의 한 줄 안내). 상태를 읽지 못하면(옛 데몬 · 무응답 · 시간 초과) 오늘처럼 간다 — 이 줄은 정보이고,
+#   일시정지 중의 새 자동 수리는 데몬이 어차피 거절한다. 읽기는 T4 의 읽기 동사 `cys repair grant status --json`
+#   하나뿐이다(쓰기 0 · 자동 기동 0 · 같은 시간 상한).
+def read_grant_pause(cys_bin, timeout=OPEN_DEFECT_TIMEOUT_S):
+    """'held' = 허락이 켜져 있고 일시정지 중 · 'send' = 그 밖(꺼짐 · 켜짐+일시정지 아님 · 읽지 못함)."""
+    env = dict(os.environ, CYS_NO_AUTOSTART="1")
+    try:
+        r = subprocess.run([cys_bin, "repair", "grant", "status", "--json"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout, env=env)
+    except (subprocess.SubprocessError, OSError):
+        return "send"
+    if r.returncode != 0:
+        return "send"
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(doc, dict) and doc.get("state") == "on" and doc.get("paused") is True:
+            return "held"
+        return "send"
+    return "send"
+
+
 class Gate:
     def __init__(self, state_dir, runner, cycle_minutes=CYCLE_MINUTES_DEFAULT,
                  stall_cycles=STALL_CYCLES_DEFAULT, quiet_cycles=QUIET_CYCLES_DEFAULT,
                  now_epoch_fn=time.time, now_iso_fn=_now_iso,
                  edge_cooldown=EDGE_COOLDOWN_SECS, seen_ttl=SEEN_TTL_SECS,
-                 defect_source=None):
+                 defect_source=None, grant_source=None, approval_source=None):
         self.state_dir = state_dir
         self.runner = runner
         #   「스스로 해결」 열린 결함 원천 — () -> (ok, lane, sigs). None = 끔(시험 대역·직접 구성한 게이트).
         #   운영 진입점(main)만 `cys repair list` 원천을 넘긴다.
         self.defect_source = defect_source
+        #   RULINGS CI6 (c) — () -> "held" | "send". None = 오늘 그대로(보류 없음). 운영 진입점(main)만 T4 의 읽기 동사를 넘긴다.
+        self.grant_source = grant_source
+        #   「스스로 해결」 승인 대기 원천(T5b) — () -> (ok, lane, ids). None = 끔.
+        self.approval_source = approval_source
         self.cycle_minutes = cycle_minutes
         self.stall_cycles = stall_cycles
         self.quiet_cycles = quiet_cycles
@@ -2147,6 +2231,7 @@ class Gate:
             seen_gc(self.state_dir, now_epoch, self.seen_ttl)
             report = self._judge_and_route(shadow, counters)
             self._open_defect_line(shadow)
+            self._approval_line(shadow)
             counters["failopen_streak"] = 0
             self._write_counters(counters)
             return 0
@@ -2163,6 +2248,13 @@ class Gate:
             ok, _lane, sigs = self.defect_source()
             if not ok:
                 return 0                                   # 읽지 못함 = 기억도 그대로
+            #   RULINGS CI6 (c): 허락 켜짐 + 일시정지 → 이 실행은 보류(보내지 않고 기억도 그대로). 그 밖은 오늘 그대로.
+            if self.grant_source is not None:
+                try:
+                    if self.grant_source() == "held":
+                        return 0
+                except Exception:                          # noqa: BLE001 — 상태를 읽지 못함 = 오늘 그대로
+                    pass
             state_path = os.path.join(self.state_dir, OPEN_DEFECT_STATE_FILE)
             last = None
             try:
@@ -2194,6 +2286,49 @@ class Gate:
                 except (OSError, TypeError, ValueError):
                     pass
                 return 0                                   # 넣지 못함 = 다음 실행이 다시 시도
+            self.runner.drain("master")
+            return 1
+        except Exception:                                  # noqa: BLE001 — 부가 줄은 게이트를 멈추지 않는다
+            return 0
+
+    def _approval_line(self, shadow):
+        """「스스로 해결」(T5b) — 이 부서의 '승인 대기' 집합이 **지난 배달 뒤 바뀌었을 때만** master 에게 한 줄(주인님께
+        승인 탭을 열어 달라고 한 번 알리라는 안내). 판정·대장·카운터에는 손대지 않고, 어떤 실패도 게이트를 멈추지 않는다.
+        반환 = 넣은 줄 수."""
+        if shadow or self.approval_source is None:
+            return 0
+        try:
+            ok, lane, ids = self.approval_source()
+            if not ok:
+                return 0
+            state_path = os.path.join(self.state_dir, APPROVAL_STATE_FILE)
+            last = None
+            try:
+                with open(state_path, encoding="utf-8") as f:
+                    doc = json.load(f)
+                if isinstance(doc, dict) and isinstance(doc.get("key"), str):
+                    last = doc["key"]
+            except (OSError, ValueError):
+                last = None
+            wake = approval_wake(lane, ids)
+            if wake is None:
+                if last is not None:
+                    _write_json_atomic(state_path, {"key": None, "count": 0, "at": self.now_epoch_fn()})
+                return 0
+            body, idem = wake
+            if idem == last:
+                return 0
+            try:
+                _write_json_atomic(state_path, {"key": idem, "count": len(ids), "at": self.now_epoch_fn()})
+            except (OSError, TypeError, ValueError):
+                return 0
+            rc, _wid = self._enqueue("master", APPROVAL_TASK, body, idem, SEV_INFO)
+            if rc != 0:
+                try:
+                    _write_json_atomic(state_path, {"key": last, "count": None, "at": self.now_epoch_fn()})
+                except (OSError, TypeError, ValueError):
+                    pass
+                return 0
             self.runner.drain("master")
             return 1
         except Exception:                                  # noqa: BLE001 — 부가 줄은 게이트를 멈추지 않는다
@@ -2975,7 +3110,9 @@ def main(argv=None):
         return cmd_status(state_dir, a.n)
     runner = Runner(default_pack_bin(), state_dir)
     return Gate(state_dir, runner,
-                defect_source=lambda: collect_open_defects(runner.cys_bin)).run(shadow=a.shadow)
+                defect_source=lambda: collect_open_defects(runner.cys_bin),
+                grant_source=lambda: read_grant_pause(runner.cys_bin),
+                approval_source=lambda: collect_awaiting_approval(runner.cys_bin)).run(shadow=a.shadow)
 
 
 if __name__ == "__main__":
