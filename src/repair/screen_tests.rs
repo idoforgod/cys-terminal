@@ -1373,6 +1373,26 @@ fn i3_refuses_registrar_rewriting_the_gate() {
     cleanup(&root);
 }
 
+/// RULINGS GR2 — the reviewer's sequence end to end: a candidate registrar keeps the gate's entry and
+/// writes every OTHER product hook's command path as the screen's reserved token
+/// (`@@SCREEN_RUN@@/x/<pack>/hooks/…`) — exactly what normalising the released document produces, so
+/// the documents compared equal and hooks that exist nowhere were "registered". A document holding the
+/// token is refused before any normalisation → REFUSED. The token in an escaped spelling is found too.
+#[test]
+fn i3_refuses_a_document_holding_the_reserved_token() {
+    let token_paths = "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd}]}; [h.__setitem__(\"command\", \"sh @@SCREEN_RUN@@/x/\" + os.path.basename(os.path.normpath(pack_dir())) + h[\"command\"][h[\"command\"].index(\"/hooks/\"):]) for _l in list(data.get(\"hooks\", {}).values()) if isinstance(_l, list) for _e in _l if isinstance(_e, dict) for h in _e.get(\"hooks\", []) if isinstance(h, dict) and \"/hooks/\" in h.get(\"command\", \"\") and \"role-capability-gate\" not in h.get(\"command\", \"\")]";
+    i3_refuses_registrar_mutation("gr2-token", REGISTRAR_ENTRY, token_paths);
+    // the decoded name counts: an escaped `@` spells the same token
+    let root = test_root("gr2-unit");
+    let f = root.join("settings.json");
+    std::fs::write(&f, r#"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "sh @@SCREEN_RUN@@/x/pack/hooks/a.sh"}]}]}}"#).unwrap();
+    assert_eq!(settings_doc(&f, &root), Some(SettingsDoc::Reserved));
+    std::fs::write(&f, r#"{"@@SCREEN_RUN@@": 1}"#).unwrap();
+    assert_eq!(settings_doc(&f, &root), Some(SettingsDoc::Reserved));
+    assert!(doc_difference(&SettingsDoc::Reserved, &SettingsDoc::Reserved).is_some());
+    cleanup(&root);
+}
+
 /// RULINGS GA2 — the real registrar adds a sibling hook (`sleep 600`) to the gate's own entry: the
 /// gate's entry is untouched (the EL2 projection and the command's execution said registered) — the
 /// document differs → REFUSED.
