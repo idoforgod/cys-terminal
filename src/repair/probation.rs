@@ -713,6 +713,12 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
     let pack = env.op.pack;
     let mut existing = load_findings(root, lane);
     let mut new_findings = Vec::new();
+    // The install manifest (rel → sha256 at install) is read ONLY to tell "unchanged since the install"
+    // when this binary does not know the current generation's original (a pro pack, a pack-only update
+    // newer than the binary): then a file equal to its installed bytes is not an unapproved change. It
+    // is never a put-back source and never stands in for a known original (BO3: the manifest is not
+    // evidence of a released version).
+    let (manifest, _) = crate::pack::load_manifest_state(pack);
     for e in super::boot_critical::entries() {
         let rel = e.rel;
         if (env.excluded)(rel) {
@@ -731,6 +737,9 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
         let sha = sha_hex(&bytes);
         let original = (env.original)(rel);
         if original.as_deref() == Some(bytes.as_slice()) {
+            continue;
+        }
+        if original.is_none() && manifest.get(rel).map(String::as_str) == Some(sha.as_str()) {
             continue;
         }
         if apply::approved_copy_of_current_generation_in(root, pack, lane, rel).unwrap_or(false) {

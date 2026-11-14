@@ -457,3 +457,35 @@ fn tick_child_deadline_is_clamped() {
         assert!((10..=60).contains(&want));
     }
 }
+
+/// M10 without a known original (pro channel / a pack newer than this binary): a file equal to its
+/// install-manifest hash is "unchanged since the install" — no check, no finding, no notice (no
+/// false alarm for every vendor file); a file that differs from it is still examined.
+#[test]
+fn m10_unknown_original_uses_the_install_manifest_for_unchanged_only() {
+    let Some(rel) = listed() else {
+        return;
+    };
+    let r = rig("m10manifest");
+    r.put(rel, b"#!/bin/bash\necho pro-vendor\n", 0o755);
+    let sha: String = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(b"#!/bin/bash\necho pro-vendor\n").iter().map(|x| format!("{x:02x}")).collect()
+    };
+    let mut m = serde_json::Map::new();
+    m.insert(rel.to_string(), serde_json::Value::String(sha));
+    std::fs::write(r.pack.join(".install-manifest.json"), serde_json::Value::Object(m).to_string()).unwrap();
+    let calls = RefCell::new(0);
+    let check = |_: &str, _: &Path, _: Duration| {
+        *calls.borrow_mut() += 1;
+        outcome(CheckResult::Pass, 1)
+    };
+    let d = Doubles { check: &check, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    assert!(f.iter().all(|x| x.rel != rel), "{f:?}");
+    assert_eq!(*calls.borrow(), 0, "an unchanged file is not even checked");
+    r.put(rel, b"#!/bin/bash\necho edited\n", 0o755);
+    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    assert!(f.iter().any(|x| x.rel == rel && x.kind == "kept"), "{f:?}");
+}
