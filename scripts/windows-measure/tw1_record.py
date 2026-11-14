@@ -58,6 +58,8 @@ REQUIRED_ROWS = tuple("G%02d" % i for i in range(1, 17)) + (
     # measurement push 2 (RULINGS GS2, GL4, GB5): the rows T9a, T5c and T2g owe
     "IN-PLACE-HELD", "MANIFEST-HELD", "PACK-PREV", "APP-RESTORE", "T5C-JUDGES", "T5C-CP949", "T5C-DANGLING",
     "T5C-COMPGEN", "T2G-COPY",
+    # measurement push 3 (RULINGS HB5, HD2)
+    "T9-JOURNAL-TAKE", "T5C-HANGUL",
 )
 
 # environment variables whose VALUE may appear in the record (RULINGS EQ6); every other name is listed without its value
@@ -735,3 +737,101 @@ def ntfs_key(name):
 def entries_before(names, held):
     """The directory entries an in-order delete visits before the held entry `held` (it stops there)."""
     return sorted((n for n in names if ntfs_key(n) < ntfs_key(held)), key=ntfs_key)
+
+
+# ───────────────────────────── run-2 corrections (RULINGS HC3, HC4, HC6, HD5) ─────────────────────────────
+
+def aggregate_reason(own_verdict, own_reason, sub_results, agg_verdict):
+    """The reason of a parent row that has its own checks AND sub-rows. When a sub-row makes the parent worse than its
+    own result, the reason names that sub-row first (RULINGS HC4 - run 2's DY3 read "MEASURED-FAIL - all checks met")."""
+    if agg_verdict == own_verdict:
+        return own_reason
+    worse = [sid for sid, v in sub_results if v == agg_verdict]
+    return "made %s by its sub-row%s %s; its own checks: %s" % (
+        agg_verdict, "" if len(worse) == 1 else "s", ", ".join(worse), own_reason or own_verdict)
+
+
+def eol_kind(b):
+    """Line endings of a file's bytes: "none" (no line break), "lf", "crlf" or "mixed"."""
+    if b is None:
+        return None
+    crlf = b.count(b"\r\n")
+    lf = b.count(b"\n") - crlf
+    if crlf == 0 and lf == 0:
+        return "none"
+    if crlf and lf:
+        return "mixed"
+    return "crlf" if crlf else "lf"
+
+
+def text_lines(b):
+    """The lines of a text file's bytes with every line ending removed (CRLF and LF read the same)."""
+    if b is None:
+        return None
+    return b.decode("utf-8", "replace").replace("\r\n", "\n").split("\n")
+
+
+def added_lines(old, new):
+    """The non-blank lines `new` inserts or puts in place of lines of `old` (line endings ignored) - what one side of
+    an update changed, for a structural check of a merge that does not depend on any merge tool's hunk placement."""
+    import difflib
+    a, b = text_lines(old), text_lines(new)
+    if a is None or b is None:
+        return None
+    out = []
+    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag in ("insert", "replace"):
+            out.extend(x for x in b[j1:j2] if x.strip())
+    return out
+
+
+def lines_present(lines, b):
+    """Every line of `lines` occurs as a whole line of the bytes `b` (line endings ignored). None when unknown."""
+    if lines is None or b is None:
+        return None
+    have = set(text_lines(b))
+    return all(x in have for x in lines)
+
+
+def conflicting_edit(base, vendor, marker):
+    """A user edit of `base` that changes a line the vendor also changed (a replaced or deleted line), so that an
+    install-time three-way merge meets a conflict (RULINGS HC3 / FT1's own path). -> (new bytes with LF, the 0-based
+    line index edited) or (None, why). The edit appends `marker` to that line."""
+    import difflib
+    a, v = text_lines(base), text_lines(vendor)
+    if a is None or v is None:
+        return None, "missing side"
+    for tag, i1, i2, _j1, _j2 in difflib.SequenceMatcher(None, a, v, autojunk=False).get_opcodes():
+        if tag in ("replace", "delete"):
+            for i in range(i1, i2):
+                if a[i].strip():
+                    edited = list(a)
+                    edited[i] = a[i] + marker
+                    return "\n".join(edited).encode("utf-8"), i
+    return None, "the vendor changed no existing non-blank line"
+
+
+def redact_tree(root, mapping):
+    """RULINGS EQ6 / HC6: redact every UTF-8 text file under `root` in place (the outputs a child process wrote
+    straight to a file - a daemon's or a holder's - never passed through the evidence writer). Files that are not
+    UTF-8 text are left alone. -> the number of files rewritten."""
+    import os
+    n = 0
+    for dp, _dns, fns in os.walk(root):
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            try:
+                with open(p, "rb") as fh:
+                    raw = fh.read()
+                text = raw.decode("utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            red = redact(text, mapping)
+            if red != text:
+                try:
+                    with open(p, "w", encoding="utf-8", newline="") as fh:
+                        fh.write(red)
+                    n += 1
+                except OSError:
+                    continue
+    return n

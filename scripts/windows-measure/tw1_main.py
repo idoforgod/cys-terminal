@@ -245,7 +245,10 @@ def cmd_run(a):
             dec = decisions.get(r["id"]) or R.decide_row(r, m["probes"], state, a.phase, _units(m, ctx))
             res = R.row_result(r, None, dec, outcomes.get(r["probe"]))
             if r.get("subrows"):
-                res["verdict"] = R.aggregate(r, res["verdict"], sub_v)
+                own_v = res["verdict"]
+                res["verdict"] = R.aggregate(r, own_v, sub_v)
+                res["reason"] = R.aggregate_reason(own_v, res.get("reason"),
+                                                   [(sr["id"], v) for sr, v in zip(r["subrows"], sub_v)], res["verdict"])
         elif r.get("subrows") and r.get("class") != "NO":
             res = R.row_result(r, None, (False, R.NM, None), None)
             res["verdict"] = R.aggregate(r, None, sub_v)
@@ -302,6 +305,10 @@ def cmd_cleanup(a):
             report["defender_restore"] = P.powershell("Set-MpPreference -DisableRealtimeMonitoring $true")["code"]
         report["remaining_cys_processes"] = [p["name"] for p in P.processes()
                                              if (p.get("name") or "").lower() in ("cys.exe", "cysd.exe", "cys-app.exe")]
+    # RULINGS EQ6 / HC6: outputs a child wrote straight to a file (daemons, holders) and the probes' logs - redacted
+    # once every process of the run is stopped, before the artifact is uploaded
+    report["redacted_files"] = sum(R.redact_tree(os.path.join(a.out, d), mapping) for d in ("evidence", "logs")
+                                   if mapping and os.path.isdir(os.path.join(a.out, d)))
     _dump_json(os.path.join(a.out, "cleanup.json"), R.redact(report, mapping))
     print("[tw1] cleanup: %s" % json.dumps(R.redact(report, mapping)), flush=True)
     return 0

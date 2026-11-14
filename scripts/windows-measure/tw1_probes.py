@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -200,6 +201,28 @@ def surface_roles(cys_exe):
         if m:
             roles.append(m.group(1))
     return roles, r
+
+
+def _b64(b):
+    import base64
+    return None if b is None else base64.b64encode(b).decode("ascii")
+
+
+def edited_outcome(live, user_b, base_b, vendor_b, new_b):
+    """RULINGS HC3: what an update did to one edited file, structurally (no hash of another merge tool): line endings
+    of live and of the user's copy, whether `.new` holds the vendor's bytes, and whether the lines the user added and
+    the lines the vendor changed (each against the base) are all in the live file."""
+    ua = R.added_lines(base_b, user_b)
+    va = R.added_lines(base_b, vendor_b)
+    return {
+        "live_eol": R.eol_kind(live), "user_eol": R.eol_kind(user_b),
+        "vendor_changed": None if base_b is None or vendor_b is None else sha256_bytes(base_b) != sha256_bytes(vendor_b),
+        "new_is_vendor": None if new_b is None or vendor_b is None else sha256_bytes(new_b) == sha256_bytes(vendor_b),
+        "user_added_count": None if ua is None else len(ua),
+        "vendor_added_count": None if va is None else len(va),
+        "user_added_in_live": R.lines_present(ua, live),
+        "vendor_added_in_live": R.lines_present(va, live),
+    }
 
 
 def _dump(path, obj):
@@ -966,13 +989,43 @@ def probe_s1_base(pr):
     pick("L3", sc["listed_unchanged"], True, False, taken)
     for key in ("G1", "ENC1", "CG"):
         pick(key, sc["general_changed_py"], False, True, taken)
-    pick("CRLF1", sc["general_changed_sh"], False, True, taken)
+    conflict_line = {}
+
+    def pick_conflict(key, pool, marker):
+        """RULINGS HC3 / FT1's own path: a general file the vendor changed in an EXISTING line, so that a CRLF edit of
+        that same line conflicts with the vendor's change at the install-time merge."""
+        for rel in pool:
+            if rel in taken:
+                continue
+            v, b = vendor(rel), base_b(rel)
+            if v is None or b is None or sha256_bytes(v) == sha256_bytes(b):
+                why.setdefault(key, []).append("%s: missing or unchanged" % rel)
+                continue
+            lc = listed(rel)
+            if lc not in (1, None):
+                why.setdefault(key, []).append("%s: listed_exit=%s" % (rel, lc))
+                continue
+            edited, idx = R.conflicting_edit(b, v, marker)
+            if edited is None:
+                why.setdefault(key, []).append("%s: %s" % (rel, idx))
+                continue
+            sel[key] = rel
+            taken.add(rel)
+            conflict_line[key] = idx
+            return
+
+    # CRLF1 = the general shell script with a CRLF edit that CONFLICTS with the vendor's change (FT1: user-kept, no CR);
+    # the merged shell script (a line-ending-only edit) is the control variant's of stage S6 (the tree has one such file)
+    pick_conflict("CRLF1", sc["general_changed_sh"], "  # tw1 conflicting user edit")
     pick("CRLF2", sc["general_changed_md"], False, True, taken)
     pick("CRLF3", sc["general_cmd"], False, None, taken)        # a Windows batch file (FT1); vendor change recorded
     pick("CRLF4", sc["general_changed_py"], False, True, taken)  # content AND line endings changed together (FT)
+    # CF1 = a non-shell general file with a CRLF edit that CONFLICTS with the vendor's change (FT1: user-kept, exact bytes)
+    pick_conflict("CF1", sc["general_changed_md"] + sc["general_changed_py"], " <!-- tw1 conflicting user edit -->")
     f["selection"] = sel
     f["selection_listed_verified"] = cand_cys is not None
-    f["selection_ok"] = all(k in sel for k in ("L1", "L2", "CL", "L3", "G1", "ENC1", "CG", "CRLF1", "CRLF2"))
+    f["selection_ok"] = all(k in sel for k in ("L1", "L2", "CL", "L3", "G1", "ENC1", "CG", "CRLF2"))
+    f["conflict_lines"] = dict(conflict_line)
     pr.ev("selection.json", {"selected": sel, "rejected": why, "listed_query_by": "candidate cys.exe" if cand_cys else None})
     # ── the user's edits (each with before / after hash) ──
     edits, errors, aux = {}, [], []
@@ -990,6 +1043,7 @@ def probe_s1_base(pr):
         nb = transform(b)
         write_bytes(p, nb)
         write_bytes(os.path.join(pr.work, "user-bytes", key), nb)
+        write_bytes(os.path.join(pr.work, "base-bytes", key), b)
         edits[key] = {"rel": rel, "base_sha": sha256_bytes(b), "user_sha": sha256_bytes(nb),
                       "vendor_sha": sha256_bytes(vendor(rel) or b""), "user_has_cr": b"\r" in nb}
 
@@ -1017,7 +1071,17 @@ def probe_s1_base(pr):
     edit("L3", append_line("L3"))
     edit("G1", append_line("G1"))
     edit("ENC1", to_cp949)
-    edit("CRLF1", to_crlf)
+    def conflict_crlf(key, marker):
+        def t(b):
+            edited, _idx = R.conflicting_edit(b, vendor(sel[key]), marker)
+            return to_crlf(edited if edited is not None else b)
+        return t
+
+    if sel.get("CRLF1"):
+        edit("CRLF1", conflict_crlf("CRLF1", "  # tw1 conflicting user edit"))
+    if sel.get("CF1"):
+        edit("CF1", conflict_crlf("CF1", " <!-- tw1 conflicting user edit -->" if sel["CF1"].endswith(".md")
+                                  else "  # tw1 conflicting user edit"))
     edit("CRLF2", to_crlf)
     if sel.get("CRLF3"):
         edit("CRLF3", content_and_crlf("REM tw1 user edit CRLF3"))
@@ -1386,6 +1450,8 @@ def probe_s2_update(pr):
             pr.unregister_pid(hp)
     # ── identity of the installation under test ──
     f["cand_marker"] = (read_text(pr.exe("cys-installed-version.txt")) or "").strip() or None
+    # checklist P2 (RULINGS HC6 wires G02.P1-P3 to this stage): no `*.new.exe` left in the installation
+    f["new_exe_leftovers"] = sorted(os.path.basename(x) for x in glob.glob(os.path.join(pr.install_dir, "*.new.exe")))
     f["cand_cys_version"] = file_version(pr.exe("cys.exe"))
     f["cand_cysd_version"] = file_version(pr.exe("cysd.exe"))
     f["cand_cys_sha_installed"] = sha256_file(pr.exe("cys.exe"))
@@ -1486,8 +1552,12 @@ def probe_s3_cli(pr):
     for unit, argv in m["unit_markers"].items():
         r = pr.ev_cmd("marker-%s.json" % unit, pr.cys(argv, timeout=60))
         absent = r["code"] == 99 and bool(ni) and ni in (r["out"] + r["err"])
-        beh[unit] = not absent
-        f["behaviour_present_" + unit] = not absent
+        # RULINGS HC6 (run 2: `repair gate` without --lane read as "present"): a usage error never reaches the verb's
+        # code, so it says nothing about the unit - unknown (None), never "present"
+        usage_error = r["code"] == 2 and "Usage:" in r["err"]
+        beh[unit] = None if usage_error else (not absent)
+        f["behaviour_present_" + unit] = beh[unit]
+        f["marker_usage_error_" + unit] = usage_error
     pr.ctx_updates["units_behaviour"] = beh
     pr.restored = True
 
@@ -1504,6 +1574,11 @@ def probe_s3_files(pr):
             pending = doc.get("entries") if isinstance(doc, dict) and isinstance(doc.get("entries"), dict) else doc
         except ValueError:
             pending = {}
+    s2f_ = ((_load(os.path.join(pr.work, "obs", "s2_update.json")) or {}).get("facts") or {})
+    s2_caps = {k: s2f_.get(k + "_in_captures_shas") for k in edits}
+    s2_snap = {k: s2f_.get(k + "_in_snapshot_sha") for k in edits}
+    s1_conflicts = ((_load(os.path.join(pr.work, "obs", "s1_base.json")) or {}).get("facts") or {}).get("conflict_lines") or {}
+    live_ev = {}
     for key, e in edits.items():
         rel = e["rel"]
         p = os.path.join(pack, *rel.split("/"))
@@ -1535,6 +1610,14 @@ def probe_s3_files(pr):
         f[key + "_live_norm_sha"] = sha256_bytes(R.eol_normalized(live)) if live is not None else None
         code, _, _ = _boot_critical_exit(pr.exe("cys.exe"), p)
         f[key + "_listed"] = code
+        bb = read_bytes(os.path.join(pr.work, "base-bytes", key))
+        vb = read_bytes(os.path.join(REPO, "cysjavis-pack", *rel.split("/")))
+        f.update({key + "_" + k: v for k, v in edited_outcome(live, ub, bb, vb, read_bytes(p + ".new")).items()})
+        f[key + "_capture_is_user"] = e["user_sha"] in (s2_caps.get(key) or [])
+        f[key + "_snapshot_is_user"] = (s2_snap.get(key) == e["user_sha"]) if s2_snap.get(key) else None
+        f[key + "_conflict_line"] = s1_conflicts.get(key)
+        live_ev[key] = {"rel": rel, "live_b64": _b64(live), "new_b64": _b64(read_bytes(p + ".new")),
+                        "user_b64": _b64(ub), "base_b64": _b64(bb)}
     s1 = os.path.join(pr.work, "obs", "s1_base.json")
     try:
         f["ENC1_user_invalid_utf8"] = json.loads(read_text(s1))["facts"].get("ENC1_user_invalid_utf8")
@@ -1549,6 +1632,7 @@ def probe_s3_files(pr):
         f["pre_update_%s_sha" % key] = s2f.get("pre_update_%s_sha" % key)
     f["manifest_present_before_install"] = s2f.get("manifest_present_before_install")
     pr.ev("pending.json", pending)
+    pr.ev("edited-files-bytes.json", live_ev)  # RULINGS HC3: the live bytes of every edited file, kept as evidence
     pr.restored = True
 
 
@@ -1638,8 +1722,9 @@ def probe_s3_query(pr):
     f["dotdot_junction_created"] = mk3["code"] == 0 and os.path.isdir(jx)
     if f["dotdot_junction_created"]:
         nat = os.path.join(jx, "..", os.path.basename(lp))
-        f["q_dotdot_native"] = _boot_critical_exit(cys, nat)[0]
-        f["q_dotdot_msys"] = _boot_critical_exit(cys, _msys(jx) + "/../" + os.path.basename(lp))[0]
+        # RULINGS HC4 / HD5: both answers kept whole as evidence
+        f["q_dotdot_native"], _l, out["dotdot_query_native"] = _boot_critical_exit(cys, nat)
+        f["q_dotdot_msys"], _l, out["dotdot_query_msys"] = _boot_critical_exit(cys, _msys(jx) + "/../" + os.path.basename(lp))
         lands = {}
         for who in ("bash", "python"):
             name = "tw1-dotdot-%s.txt" % who
@@ -2181,26 +2266,73 @@ def _kill_product(install_dir):
     return killed
 
 
+UNINSTALL_WAIT_S = 120  # RULINGS HC6: the bound on waiting for the uninstaller to finish (stated in the record)
+
+
+def _uninstaller_processes(install_dir):
+    """NSIS uninstallers still running: a temp copy (`Au_.exe`, `Un_A.exe` …) or any image under the install folder."""
+    out = []
+    base = norm_path(install_dir) + "\\"
+    for p in processes():
+        name = (p.get("name") or "").lower()
+        path = norm_path(p.get("path")) or ""
+        if re.match(r"^(au_|un_[a-z])\.exe$", name) or path.startswith(base):
+            out.append({"pid": p["pid"], "name": name})
+    return out
+
+
+def runtime_ok(install_dir):
+    """RULINGS HC6: the bundled runtime a base install must leave - Git Bash (launcher and the real bash) and Python."""
+    rt = os.path.join(install_dir, "runtime")
+    need = (os.path.join(rt, "git", "bin", "bash.exe"), os.path.join(rt, "git", "usr", "bin", "bash.exe"),
+            os.path.join(rt, "python", "python.exe"))
+    missing = [os.path.relpath(x, install_dir).replace("\\", "/") for x in need if not os.path.isfile(x)]
+    return not missing, missing
+
+
 def _reset_installation(pr):
-    """Uninstall and remove the installation and the user's .cys (the runner is ephemeral). -> facts dict."""
-    res = {"killed": _kill_product(pr.install_dir)}
+    """Uninstall and remove the installation and the user's .cys (the runner is ephemeral). -> facts dict.
+    RULINGS HC6 (run 2): `uninstall.exe /S` re-launches itself from a temp copy and returns while that copy still
+    deletes - the next install raced it. Now the uninstaller runs in place (`_?=<install dir>`, NSIS's documented
+    argument - it then waits) and the reset waits, bounded by UNINSTALL_WAIT_S, until no uninstaller process is left."""
+    res = {"killed": _kill_product(pr.install_dir), "uninstall_wait_bound_s": UNINSTALL_WAIT_S}
     un = os.path.join(pr.install_dir, "uninstall.exe")
     if os.path.isfile(un):
-        r = run([un, "/S"], 300)
+        r = run([un, "/S", "_?=" + pr.install_dir], 300)
         res["uninstall_exit"] = r["code"]
-        time.sleep(3)
+    t0 = time.monotonic()
+    left = _uninstaller_processes(pr.install_dir)
+    while left and time.monotonic() - t0 < UNINSTALL_WAIT_S:
+        time.sleep(1)
+        left = _uninstaller_processes(pr.install_dir)
+    res["uninstaller_wait_s"] = round(time.monotonic() - t0, 1)
+    res["uninstaller_left"] = left
     errs = []
     for d in (pr.install_dir, os.path.dirname(pr.pack_dir)):
         if os.path.exists(d):
             shutil.rmtree(d, onerror=lambda fn, path, exc: errs.append("%s: %s" % (path, exc[1])))
     res["rmtree_errors"] = errs[:20]
-    res["clean"] = not os.path.exists(pr.install_dir) and not os.path.exists(os.path.dirname(pr.pack_dir))
+    res["rmtree_error_count"] = len(errs)
+    res["clean"] = (not os.path.exists(pr.install_dir) and not os.path.exists(os.path.dirname(pr.pack_dir))
+                    and not left)
     return res
 
 
 _HELD_REL = {"bash": lambda sc: "hooks/" + sc["holder_hook"],
              "python": lambda sc: "bin/" + sc["holder_module"] + ".py",
              "early": lambda sc: sc["early_holder_file"]}
+
+
+def _rel_shas_under(root, rel):
+    """sha256 of every file under `root` whose path ends with `rel` (a capture segment or a snapshot's files/)."""
+    out = set()
+    tail = "/" + rel
+    for dp, _dns, fns in os.walk(root):
+        for fn in fns:
+            q = os.path.join(dp, fn)
+            if q.replace("\\", "/").endswith(tail):
+                out.add(sha256_file(q))
+    return sorted(x for x in out if x)
 
 
 def _manifest_entries(pack):
@@ -2244,6 +2376,7 @@ def _first_start(pr, installer, tag):
     time.sleep(2)
     _kill_product(pr.install_dir)
     out["install_exit"] = r["code"]
+    out["runtime_ok"], out["runtime_missing"] = runtime_ok(pr.install_dir)
     out["pack_absent_before"] = not os.path.exists(pr.pack_dir)
     t0 = time.monotonic()
     pid = start_detached([pr.exe("cysd.exe")], env=clean_env(), stdout_path=os.path.join(pr.ev_dir, tag + "-cysd.out"))
@@ -2279,8 +2412,10 @@ def probe_s6_variants(pr):
     pr.ev("first-start.json", {"base": fs_base, "candidate": fs_cand})
     f["first_start_base_s"] = fs_base["first_answer_s"]
     f["first_start_candidate_s"] = fs_cand["first_answer_s"]
-    f["first_start_base_clean"] = fs_base["reset_clean"] and fs_base["pack_absent_before"] and fs_base["install_exit"] == 0
-    f["first_start_candidate_clean"] = fs_cand["reset_clean"] and fs_cand["pack_absent_before"] and fs_cand["install_exit"] == 0
+    f["first_start_base_clean"] = (fs_base["reset_clean"] and fs_base["pack_absent_before"] and fs_base["install_exit"] == 0
+                                   and fs_base["runtime_ok"])
+    f["first_start_candidate_clean"] = (fs_cand["reset_clean"] and fs_cand["pack_absent_before"]
+                                        and fs_cand["install_exit"] == 0 and fs_cand["runtime_ok"])
     f["first_start_base_pack_files"] = fs_base["pack_files_after"]
     f["first_start_candidate_pack_files"] = fs_cand["pack_files_after"]
     f["first_start_ratio"] = (round(f["first_start_candidate_s"] / f["first_start_base_s"], 2)
@@ -2297,6 +2432,7 @@ def probe_s6_variants(pr):
         _kill_product(pr.install_dir)
         f[tag + "_base_ok"] = (r["code"] == 0 and (read_text(pr.exe("cys-installed-version.txt")) or "").strip()
                                == m["base"]["version"])
+        f[tag + "_runtime_ok"], f[tag + "_runtime_missing"] = runtime_ok(pr.install_dir)
         ip0 = pr.cys(["init-pack"], timeout=600)
         dpid = start_detached([pr.exe("cysd.exe")], env=clean_env(), stdout_path=os.path.join(pr.ev_dir, tag + "-base-cysd.out"))
         pr.register_pid(dpid, tag + " base daemon")
@@ -2311,6 +2447,19 @@ def probe_s6_variants(pr):
         f[tag + "_L1_user_sha"] = sha256_bytes(nb)
         f[tag + "_L1_edit_ok"] = sha256_file(lp) == f[tag + "_L1_user_sha"]
         f[tag + "_L1_vendor_sha"] = sha256_bytes(vendor) if vendor else None
+        # RULINGS HC3: the MERGED shell script - a line-ending-only CRLF edit of the general shell script the vendor
+        # changed (stage S1 uses that one file for the conflicting edit; the control variant has no holder)
+        shm = (ctx.get("selection") or {}).get("CRLF1") if name == "control" else None
+        shm_base = shm_user = None
+        if shm:
+            sp = os.path.join(pr.pack_dir, *shm.split("/"))
+            shm_base = read_bytes(sp)
+            if shm_base is not None:
+                shm_user = shm_base.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+                write_bytes(sp, shm_user)
+                f[tag + "_SHM_rel"] = shm
+                f[tag + "_SHM_user_sha"] = sha256_bytes(shm_user)
+                f[tag + "_SHM_edit_ok"] = sha256_file(sp) == f[tag + "_SHM_user_sha"] and b"\r" in shm_user
         holders = {}
         for k in kinds:
             hp = _start_holder(pr, k, pr.pack_dir, tag)
@@ -2359,6 +2508,23 @@ def probe_s6_variants(pr):
         pend = _load(os.path.join(pr.pack_dir, ".merge-pending.json")) or {}
         ent = pend.get(rel) if isinstance(pend, dict) else None
         f[tag + "_L1_pending_kind"] = ent.get("kind") if isinstance(ent, dict) else None
+        if shm and shm_user is not None:
+            sp = os.path.join(pr.pack_dir, *shm.split("/"))
+            sent = pend.get(shm) if isinstance(pend, dict) else None
+            live = read_bytes(sp)
+            vb = read_bytes(os.path.join(REPO, "cysjavis-pack", *shm.split("/")))
+            f[tag + "_SHM_kind"] = sent.get("kind") if isinstance(sent, dict) else None
+            f[tag + "_SHM_new_present"] = os.path.exists(sp + ".new")
+            f[tag + "_SHM_live_has_cr"] = None if live is None else (b"\r" in live)
+            f.update({tag + "_SHM_" + k: v for k, v in edited_outcome(live, shm_user, shm_base, vb,
+                                                                       read_bytes(sp + ".new")).items()})
+            cys_dir = os.path.dirname(pr.pack_dir)
+            f[tag + "_SHM_capture_is_user"] = f[tag + "_SHM_user_sha"] in _rel_shas_under(
+                os.path.join(cys_dir, "pack-captures"), shm)
+            f[tag + "_SHM_snapshot_is_user"] = f[tag + "_SHM_user_sha"] in _rel_shas_under(
+                os.path.join(ctx["paths"]["local_dir"], "update-snapshots"), shm)
+            pr.ev(tag + "/merged-shell-bytes.json", {"rel": shm, "live_b64": _b64(live), "user_b64": _b64(shm_user),
+                                                    "base_b64": _b64(shm_base), "entry": sent})
         ids = (f[tag + "_pack_dir_id_pre"], f[tag + "_pack_dir_id_after_driver"], dir_identity(pr.pack_dir))
         f[tag + "_pack_dir_same"] = None if None in ids else len(set(ids)) == 1
         f[tag + "_pack_prev_after"] = os.path.lexists(os.path.join(os.path.dirname(pr.pack_dir), "pack.prev"))
@@ -2381,6 +2547,7 @@ def _fresh_base(pr, tag, rel):
     _kill_product(pr.install_dir)
     out["base_ok"] = (r["code"] == 0 and (read_text(pr.exe("cys-installed-version.txt")) or "").strip()
                       == m["base"]["version"])
+    out["runtime_ok"], out["runtime_missing"] = runtime_ok(pr.install_dir)
     pr.cys(["init-pack"], timeout=600)
     d = start_detached([pr.exe("cysd.exe")], env=clean_env(), stdout_path=os.path.join(pr.ev_dir, tag + "-base-cysd.out"))
     pr.register_pid(d, tag + " base daemon")
@@ -2455,6 +2622,7 @@ def probe_s6_inplace(pr):
     tag = "iph"
     fb = _fresh_base(pr, tag, rel)
     f["iph_base_ok"] = bool(fb["reset_clean"] and fb["base_ok"] and fb["L1_user_sha"])
+    f["iph_runtime_ok"], f["iph_runtime_missing"] = fb["runtime_ok"], fb["runtime_missing"]
     base = pr.timeline_point(tag + "_base", {})
     f["iph_cand_ok"] = _cand_install(pr)
     changed = [r for r in verbatim if r != rel and base and base.get(r) is not None and base.get(r) != vs[r]]
@@ -2499,6 +2667,7 @@ def probe_s6_inplace(pr):
     tag = "mh"
     fb = _fresh_base(pr, tag, rel)
     f["mh_base_ok"] = bool(fb["reset_clean"] and fb["base_ok"] and fb["L1_user_sha"])
+    f["mh_runtime_ok"], f["mh_runtime_missing"] = fb["runtime_ok"], fb["runtime_missing"]
     base = pr.timeline_point(tag + "_base", {})
     f["mh_cand_ok"] = _cand_install(pr)
     mp = os.path.join(pr.pack_dir, ".install-manifest.json")
@@ -2674,11 +2843,19 @@ def probe_s3_judges(pr):
         r = _bash(pr, q, env_sid, "lib-role-native")
         f["lib_role_native"] = (r["out"].strip().splitlines() or [None])[-1]
         # the wrapper's own interpreter (branch 3): GNU timeout / gtimeout made to answer "not GNU"
-        q = ('. "%s"; timeout() { return 1; }; gtimeout() { return 1; }; set -x; cys_resolve_role --no-cache; set +x; '
+        q = ('. "%s"; timeout() { return 1; }; gtimeout() { return 1; }; cys_resolve_role --no-cache; '
              'printf "%%s|%%s\\n" "$CYS_RESOLVED_ROLE" "$CYS_RESOLVED_ROLE_SOURCE"') % lib
         r = _bash(pr, q, env_sid, "lib-role-wrapper")
         f["lib_role_wrapper"] = (r["out"].strip().splitlines() or [None])[-1]
+        # RULINGS HC4: the library runs the role call as `$( … 2>/dev/null )`, which discards a trace of it by design;
+        # the wrapper is therefore called DIRECTLY under `set -x` - its interpreter's start line is then visible
+        q = ('. "%s"; timeout() { return 1; }; gtimeout() { return 1; }; CYS_NO_AUTOSTART=1; export CYS_NO_AUTOSTART; '
+             'set -x; _tw1_o="$(cys_timeout_run 2 "${CYS_BIN:-cys}" surface-role)"; set +x; printf "%%s\\n" "$_tw1_o"') % lib
+        r = _bash(pr, q, env_sid, "lib-role-wrapper-direct")
+        f["lib_role_wrapper_direct"] = (r["out"].strip().splitlines() or [None])[-1]
         f["lib_role_wrapper_traced_flags"] = "-I -S -B -X utf8 -c" in r["err"]
+        f["lib_role_wrapper_trace_line"] = next((ln.strip()[:200] for ln in r["err"].splitlines()
+                                                 if "-I -S -B -X utf8 -c" in ln), None)
     # 4. guard.sh's judge: an outgoing POST is refused by the Python judge (not by the shell backstop)
     r = _hook(pr, "guard.sh", _payload("Bash", {"command": "curl -X POST https://example.invalid/tw1 -d x"}, pack),
               seat_env(pr), "guard-curl-post")
@@ -2693,15 +2870,24 @@ def probe_s3_judges(pr):
     if IS_WIN:
         f["acp"] = int(_k32.GetACP())
         f["oemcp"] = int(_k32.GetOEMCP())
-    wrap = lambda cmd: ["cmd", "/d", "/c", "chcp 949 >nul & chcp & " + " ".join(cmd)]
-    r = _hook(pr, "role-capability-gate.sh", _payload("Write", {"file_path": forbidden, "content": "x"}, pack),
-              env_rev, "capgate-cp949", wrap=wrap)
-    first = (r["out"].strip().splitlines() or [""])[0]
-    f["cp949_chcp_line"] = first[:80]
-    f["cp949_active"] = "949" in first
-    f["cp949_exit"] = r["code"]
-    f["cp949_deny"], reason = _deny_of(r["out"])
-    f["cp949_reason_decoded"] = bool(reason) and "산출물" in reason
+    # RULINGS HC5 / HD2: the identical `cmd /d /c` call form with and without `chcp 949`, the input handed to bash
+    # EXPLICITLY (`… bash gate < payload`); the two forms through cmd's inherited stdin (run 2's) are recorded too
+    cpf = os.path.join(pr.work, "judges", "cp949-payload.json")
+    write_bytes(cpf, json.dumps(_payload("Write", {"file_path": forbidden, "content": "x"}, pack)).encode("utf-8"))
+    gate_cmd = pr.bundled_hook_bash() + " " + _fwd(gate)
+    for key, prefix, explicit in (("cp949", "chcp 949 >nul & chcp & ", True), ("cp949_ctl", "chcp & ", True),
+                                  ("cp949_inherited", "chcp 949 >nul & chcp & ", False),
+                                  ("cp949_inherited_ctl", "chcp & ", False)):
+        line = prefix + gate_cmd + ((" < " + cpf) if explicit else "")
+        r = run(["cmd", "/d", "/c", line], 90, env=env_rev, stdin_path=None if explicit else cpf)
+        pr.ev("judges/capgate-%s.json" % key.replace("_", "-"), r)
+        first = (r["out"].strip().splitlines() or [""])[0]
+        f[key + "_chcp_line"] = first[:80]
+        f[key + "_active"] = "949" in first
+        f[key + "_exit"] = r["code"]
+        f[key + "_deny"], reason = _deny_of(r["out"])
+        f[key + "_reason_decoded"] = bool(reason) and "산출물" in reason
+        f[key + "_parse_failed"] = "JSON 파싱 실패" in r["err"]
     enc = os.path.join(pr.work, "judges", "enc.py")
     write_bytes(enc, b"import sys\nprint(sys.stdout.encoding, sys.flags.utf8_mode)\n")
     for k, flags in (("utf8flag", "-I -S -B -X utf8"), ("plain", "-I -S -B")):
@@ -2709,6 +2895,19 @@ def probe_s3_judges(pr):
                 env=seat_env(pr))
         pr.ev("judges/cp949-encoding-%s.json" % k, r)
         f["cp949_py_encoding_" + k] = (r["out"].strip().split() or [None])[0]
+    # RULINGS HD3 (records, no verdict): the *.pth files the SHIPPED runtime holds (root, Lib\\site-packages) and
+    # sys.path printed by the shipped interpreter under the judges' flags
+    rtp = os.path.join(pr.install_dir, "runtime", "python")
+    f["shipped_pth_files"] = sorted(os.path.relpath(x, rtp).replace("\\", "/") for x in
+                                    glob.glob(os.path.join(rtp, "*.pth")) + glob.glob(os.path.join(rtp, "*._pth"))
+                                    + glob.glob(os.path.join(rtp, "Lib", "site-packages", "*.pth")))
+    r = run([pr.bundled_python(), "-I", "-S", "-B", "-X", "utf8", "-c", "import sys, json; print(json.dumps(sys.path))"],
+            60, env=seat_env(pr), cwd=pr.work)
+    pr.ev("judges/shipped-sys-path.json", r)
+    try:
+        f["shipped_sys_path_under_flags"] = json.loads(r["out"].strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        f["shipped_sys_path_under_flags"] = None
     # 6. the embeddable runtime's ._pth `import site` against -S (T5c 2.4): a copy of the runtime with a sitecustomize
     pc = os.path.join(pr.work, "judges", "pthcopy")
     shutil.rmtree(pc, ignore_errors=True)
@@ -2750,6 +2949,43 @@ def probe_s3_judges(pr):
         lines = r["out"].strip().splitlines()
         f["compgen_handback_" + name] = lines[0] if lines else None
         f["compgen_child_" + name] = lines[-1] if len(lines) > 1 else None
+    # 9. RULINGS HD2: the capability gate with a pack path and a payload path that contain HANGUL (a user name like the
+    #    owner's users'): a copy of the installed pack's hooks under %RUNNER_TEMP%\\한글 사용자\\.cys\\pack, the seat's
+    #    environment pointing there, the input handed to bash explicitly (removed after)
+    hroot = os.path.join(os.environ.get("RUNNER_TEMP") or pr.work, "한글 사용자")
+    hpack = os.path.join(hroot, ".cys", "pack")
+    f["hangul_pack_ready"] = False
+    try:
+        shutil.rmtree(hroot, ignore_errors=True)
+        shutil.copytree(os.path.join(pack, "hooks"), os.path.join(hpack, "hooks"))
+        os.makedirs(os.path.join(hpack, "round", "_reviews"), exist_ok=True)
+        os.makedirs(os.path.join(hpack, "bin"), exist_ok=True)
+        f["hangul_pack_ready"] = os.path.isfile(os.path.join(hpack, "hooks", "role-capability-gate.sh"))
+    except (OSError, shutil.Error) as e:
+        pr.ev("judges/hangul-setup-error.txt", "%s: %s" % (type(e).__name__, e))
+    h_forbidden = os.path.join(hpack, "bin", "tw1_hangul_probe.py")
+    h_allowed = os.path.join(hpack, "round", "_reviews", "tw1-hangul-verdict.json")
+    # the premise (the lesson of RULINGS HD1): the forbidden write is in no place the reviewer rule allows
+    tmps = [norm_path(x) for x in (os.environ.get("TEMP"), os.environ.get("TMP"), tempfile.gettempdir()) if x]
+    hf = norm_path(h_forbidden)
+    f["hangul_forbidden_not_allowed_place"] = (not any(hf.startswith(t + "\\") for t in tmps)
+                                               and not any(x in _fwd(h_forbidden).lower() for x in ("/logs/", "/log/", "/_round/")))
+    if f["hangul_pack_ready"]:
+        henv = seat_env(pr, {"CYS_ROLE": "reviewer-codex", "CYS_PACK_DIR": hpack, "HOME": hroot})
+        hgate = os.path.join(hpack, "hooks", "role-capability-gate.sh")
+        for key, target in (("hangul_forbidden", h_forbidden), ("hangul_allowed", h_allowed)):
+            pf = os.path.join(pr.work, "judges", key + ".json")
+            write_bytes(pf, json.dumps(_payload("Write", {"file_path": target, "content": "x"}, hpack),
+                                       ensure_ascii=False).encode("utf-8"))
+            r = run([pr.bundled_hook_bash(), _fwd(hgate)], 90, env=henv, stdin_path=pf)
+            pr.ev("judges/capgate-%s.json" % key.replace("_", "-"), r)
+            f[key + "_exit"] = r["code"]
+            f[key + "_deny"], reason = _deny_of(r["out"])
+            f[key + "_reason_decoded"] = bool(reason) and "산출물" in reason and "한글 사용자" in reason
+            f[key + "_traceback"] = "Traceback" in r["err"]
+        f["hangul_target_absent"] = not os.path.exists(h_forbidden)
+    shutil.rmtree(hroot, ignore_errors=True)
+    f["hangul_removed"] = not os.path.exists(hroot)
     # 8. a dangling junction inside the pack (removed after)
     dj, djt = os.path.join(pack, "tw1-dj"), os.path.join(pack, "tw1-dj-target")
     os.makedirs(djt, exist_ok=True)

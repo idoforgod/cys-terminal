@@ -41,7 +41,9 @@
   ],
   "T7b": [
    "repair",
-   "gate"
+   "gate",
+   "--lane",
+   "pack"
   ]
  },
  "scenario": {
@@ -129,7 +131,7 @@
    "cmd": "REM tw1 next-version marker (TNV build only, never committed)"
   }
  },
- "expected_top_rows": 74,
+ "expected_top_rows": 76,
  "order": [
   "s0_env",
   "s1_base",
@@ -638,6 +640,34 @@
        "op": "true"
       },
       {
+       "id": "v-control-runtime",
+       "role": "complete",
+       "fact": "v_control_runtime_ok",
+       "op": "true",
+       "text": "the variant's set-up: the base install left the runtime's Git Bash and Python (RULINGS HC6) - else this variant's set-up failed"
+      },
+      {
+       "id": "v-python-runtime",
+       "role": "complete",
+       "fact": "v_python_runtime_ok",
+       "op": "true",
+       "text": "the variant's set-up: the base install left the runtime's Git Bash and Python (RULINGS HC6) - else this variant's set-up failed"
+      },
+      {
+       "id": "v-bash-runtime",
+       "role": "complete",
+       "fact": "v_bash_runtime_ok",
+       "op": "true",
+       "text": "the variant's set-up: the base install left the runtime's Git Bash and Python (RULINGS HC6) - else this variant's set-up failed"
+      },
+      {
+       "id": "v-early-runtime",
+       "role": "complete",
+       "fact": "v_early_runtime_ok",
+       "op": "true",
+       "text": "the variant's set-up: the base install left the runtime's Git Bash and Python (RULINGS HC6) - else this variant's set-up failed"
+      },
+      {
        "id": "v-control-cand",
        "role": "complete",
        "fact": "v_control_cand_ok",
@@ -717,6 +747,34 @@
      "run_when_absent": true,
      "title": "with each holder set nothing disappears, the app's init-pack exits 0, the pack folder is not renamed and the edited listed file is parked vendor-first",
      "checks": [
+      {
+       "id": "v-control-runtime",
+       "role": "complete",
+       "fact": "v_control_runtime_ok",
+       "op": "true",
+       "text": "the variant's set-up: the base install left the runtime's Git Bash and Python (RULINGS HC6) - else this variant's set-up failed"
+      },
+      {
+       "id": "v-python-runtime",
+       "role": "complete",
+       "fact": "v_python_runtime_ok",
+       "op": "true",
+       "text": "the variant's set-up: the base install left the runtime's Git Bash and Python (RULINGS HC6) - else this variant's set-up failed"
+      },
+      {
+       "id": "v-bash-runtime",
+       "role": "complete",
+       "fact": "v_bash_runtime_ok",
+       "op": "true",
+       "text": "the variant's set-up: the base install left the runtime's Git Bash and Python (RULINGS HC6) - else this variant's set-up failed"
+      },
+      {
+       "id": "v-early-runtime",
+       "role": "complete",
+       "fact": "v_early_runtime_ok",
+       "op": "true",
+       "text": "the variant's set-up: the base install left the runtime's Git Bash and Python (RULINGS HC6) - else this variant's set-up failed"
+      },
       {
        "id": "v-python-held",
        "role": "complete",
@@ -890,30 +948,102 @@
    "subrows": [
     {
      "id": "G02.P1",
-     "probe": null,
-     "title": "checklist P1",
+     "probe": "s2_update",
+     "title": "checklist P1 - the CLI never disappears during the upgrade (the update stage's 200-ms watcher; RULINGS HC6)",
+     "checks": [
+      {
+       "id": "samples",
+       "role": "complete",
+       "fact": "watcher_samples",
+       "op": "ge",
+       "value": 1
+      },
+      {
+       "id": "exit0",
+       "role": "check",
+       "fact": "installer_final_exit",
+       "op": "eq",
+       "value": 0
+      },
+      {
+       "id": "cli-window",
+       "role": "check",
+       "fact": "cli_absent_max_consecutive",
+       "op": "le",
+       "value": 9,
+       "text": "checklist P1: 10+ consecutive 200-ms samples without cys.exe = FAIL"
+      }
+     ],
      "class": "YES",
      "kind": "assert",
-     "phase": 1,
-     "checks": []
+     "phase": 1
     },
     {
      "id": "G02.P2",
-     "probe": null,
-     "title": "checklist P2",
+     "probe": "s2_update",
+     "title": "checklist P2 - after the upgrade the new build is really in (RULINGS HC6)",
+     "checks": [
+      {
+       "id": "cys-version",
+       "role": "check",
+       "fact": "cand_cys_version",
+       "op": "eq_fact",
+       "other": "candidate_version4"
+      },
+      {
+       "id": "marker",
+       "role": "check",
+       "fact": "cand_marker",
+       "op": "eq_fact",
+       "other": "candidate_version"
+      },
+      {
+       "id": "no-failure-file",
+       "role": "check",
+       "fact": "failure_file_present",
+       "op": "false"
+      },
+      {
+       "id": "no-new-exe",
+       "role": "check",
+       "fact": "new_exe_leftovers",
+       "op": "empty",
+       "text": "no *.new.exe left"
+      }
+     ],
      "class": "YES",
      "kind": "assert",
-     "phase": 1,
-     "checks": []
+     "phase": 1
     },
     {
      "id": "G02.P3",
-     "probe": null,
-     "title": "checklist P3",
+     "probe": "s2_update",
+     "title": "checklist P3 - no session lost: the master seat and the Git Bash process from before the upgrade (RULINGS HC6)",
+     "checks": [
+      {
+       "id": "seats-before",
+       "role": "complete",
+       "fact": "seats_before_update",
+       "op": "contains",
+       "value": "master"
+      },
+      {
+       "id": "seat-after",
+       "role": "check",
+       "fact": "seats_after_app",
+       "op": "contains",
+       "value": "master"
+      },
+      {
+       "id": "bash-alive",
+       "role": "check",
+       "fact": "bash_holder_alive_after",
+       "op": "true"
+      }
+     ],
      "class": "YES",
      "kind": "assert",
-     "phase": 1,
-     "checks": []
+     "phase": 1
     },
     {
      "id": "G02.P4",
@@ -1870,9 +2000,9 @@
    "id": "CW7-GENERAL",
    "group": "cw7",
    "probe": "s3_files",
-   "title": "an edited general file is kept",
-   "source": "RULINGS CW7; design 4-11 ga (line 871); 7 row 1",
-   "expected": "live = the user's bytes; <rel>.new = candidate vendor bytes; ledger kind user-kept",
+   "title": "an edited general file whose vendor side also changed is MERGED at install (the released behaviour, RULINGS BO1, HC3)",
+   "source": "RULINGS CW7, BO1, HC3; design 4-11 ga (line 871); reports/T2g-report.md WR2.5; src/pack.rs Merge3",
+   "expected": "kind merged; no .new; the capture and the update snapshot hold the user's exact bytes; the live file holds the user's added line and the vendor's change, with the user's line endings (an edit that CONFLICTS is CW7-ENC.conflict-*)",
    "checks": [
     {
      "id": "sel-G1",
@@ -1893,7 +2023,8 @@
      "role": "control",
      "fact": "CG_live_sha",
      "op": "eq_fact",
-     "other": "CG_vendor_sha"
+     "other": "CG_vendor_sha",
+     "text": "the untouched general file with changed vendor bytes is vendor-updated"
     },
     {
      "id": "ctl-nonew",
@@ -1902,25 +2033,68 @@
      "op": "none"
     },
     {
-     "id": "G1-live",
-     "role": "check",
-     "fact": "G1_live_sha",
-     "op": "eq_fact",
-     "other": "G1_user_sha"
+     "id": "base-record",
+     "role": "complete",
+     "fact": "manifest_present_before_install",
+     "op": "true",
+     "text": "the base's install record existed when the per-file rules ran (a merge needs it)"
     },
     {
-     "id": "G1-new",
-     "role": "check",
-     "fact": "G1_new_sha",
-     "op": "eq_fact",
-     "other": "G1_vendor_sha"
+     "id": "vendor-changed",
+     "role": "complete",
+     "fact": "G1_vendor_changed",
+     "op": "true"
     },
     {
-     "id": "G1-kind",
-     "role": "check",
+     "id": "merged",
+     "role": "complete",
      "fact": "G1_pending_kind",
      "op": "eq",
-     "value": "user-kept"
+     "value": "merged",
+     "text": "the ledger says merged (the expectations below apply only to a merged file - RULINGS HC3)"
+    },
+    {
+     "id": "no-new",
+     "role": "check",
+     "fact": "G1_new_sha",
+     "op": "none",
+     "text": "a merged file gets no .new"
+    },
+    {
+     "id": "capture",
+     "role": "check",
+     "fact": "G1_capture_is_user",
+     "op": "true",
+     "text": "the pre-merge capture holds the user's exact bytes"
+    },
+    {
+     "id": "snapshot",
+     "role": "check",
+     "fact": "G1_snapshot_is_user",
+     "op": "true",
+     "text": "the update snapshot holds the user's exact bytes"
+    },
+    {
+     "id": "user-lines",
+     "role": "check",
+     "fact": "G1_user_added_in_live",
+     "op": "true",
+     "text": "every line the user added is in the live file"
+    },
+    {
+     "id": "vendor-lines",
+     "role": "check",
+     "fact": "G1_vendor_added_in_live",
+     "op": "true",
+     "text": "every line the vendor changed is in the live file (structural - no other tool's merge hash)"
+    },
+    {
+     "id": "user-eol",
+     "role": "check",
+     "fact": "G1_live_eol",
+     "op": "eq_fact",
+     "other": "G1_user_eol",
+     "text": "a merged non-shell file has the user's line endings"
     }
    ],
    "kind": "assert",
@@ -2053,8 +2227,8 @@
    "id": "CW7-ENC",
    "group": "cw7",
    "title": "CP949 / CRLF content",
-   "source": "RULINGS CW7, FT; design 4-11 ga-2 (line 873), ra (line 879); 7 row 3",
-   "expected": "CP949 system file: byte backup at <rel>.user, vendor bytes live; a kept shell script: no CR; a kept non-shell text file (.md, .cmd, .py): content kept, and with the fix of RULINGS FT1 its bytes kept exactly with no 'eol' field",
+   "source": "RULINGS CW7, FT1, HC3; design 4-11 ga-2 (line 873), ra (line 879); 7 row 3; reports/T2g-report.md WR2.4",
+   "expected": "CP949 system file: byte backup at <rel>.user, vendor bytes live. KEPT files (the ledger says kept): the user's bytes exactly, no 'eol' field; a kept shell script without CR. MERGED files (the ledger says merged): no .new, the capture and the snapshot hold the user's exact bytes, both sides' lines in the live file, a non-shell file with the user's line endings, a shell script without CR",
    "subrows": [
     {
      "id": "CW7-ENC.cp949",
@@ -2095,70 +2269,9 @@
      "phase": 1
     },
     {
-     "id": "CW7-ENC.shell",
+     "id": "CW7-ENC.kept-exact",
      "probe": "s3_files",
-     "title": "a kept shell script with CRLF: no CR live, content kept",
-     "checks": [
-      {
-       "id": "sel-CRLF1",
-       "role": "complete",
-       "fact": "CRLF1_listed",
-       "op": "eq",
-       "value": 1
-      },
-      {
-       "id": "crlf1-had-cr",
-       "role": "control",
-       "fact": "CRLF1_user_has_cr",
-       "op": "true",
-       "text": "the user's shell script had CR (the CR detector can see one)"
-      },
-      {
-       "id": "crlf1-no-cr",
-       "role": "check",
-       "fact": "CRLF1_live_has_cr",
-       "op": "false"
-      },
-      {
-       "id": "crlf1-content",
-       "role": "check",
-       "fact": "CRLF1_live_norm_sha",
-       "op": "eq_fact",
-       "other": "CRLF1_user_norm_sha"
-      }
-     ],
-     "class": "YES",
-     "kind": "assert",
-     "phase": 1
-    },
-    {
-     "id": "CW7-ENC.content-md",
-     "probe": "s3_files",
-     "title": "a kept .md with only its line endings changed to CRLF: content kept modulo line endings",
-     "checks": [
-      {
-       "id": "sel-CRLF2",
-       "role": "complete",
-       "fact": "CRLF2_listed",
-       "op": "eq",
-       "value": 1
-      },
-      {
-       "id": "crlf2-content",
-       "role": "check",
-       "fact": "CRLF2_live_norm_sha",
-       "op": "eq_fact",
-       "other": "CRLF2_user_norm_sha"
-      }
-     ],
-     "class": "YES",
-     "kind": "assert",
-     "phase": 1
-    },
-    {
-     "id": "CW7-ENC.content-cmd",
-     "probe": "s3_files",
-     "title": "a kept Windows batch file (.cmd) with a content change and CRLF: content kept modulo line endings",
+     "title": "a Windows batch file (.cmd) the vendor did NOT change, edited with CRLF: kept in place, the user's bytes exactly",
      "checks": [
       {
        "id": "sel-CRLF3",
@@ -2168,11 +2281,40 @@
        "value": 1
       },
       {
-       "id": "crlf3-content",
+       "id": "vendor-unchanged",
+       "role": "complete",
+       "fact": "CRLF3_vendor_changed",
+       "op": "false"
+      },
+      {
+       "id": "kept",
+       "role": "complete",
+       "fact": "CRLF3_pending_kind",
+       "op": "in",
+       "value": [
+        "kept-drift",
+        "user-kept"
+       ],
+       "text": "the ledger says kept (the exact-bytes promise of FT1 is for kept files)"
+      },
+      {
+       "id": "had-cr",
+       "role": "control",
+       "fact": "CRLF3_user_has_cr",
+       "op": "true"
+      },
+      {
+       "id": "exact",
        "role": "check",
-       "fact": "CRLF3_live_norm_sha",
+       "fact": "CRLF3_live_sha",
        "op": "eq_fact",
-       "other": "CRLF3_user_norm_sha"
+       "other": "CRLF3_user_sha"
+      },
+      {
+       "id": "no-eol",
+       "role": "check",
+       "fact": "CRLF3_pending_eol",
+       "op": "none"
       }
      ],
      "class": "YES",
@@ -2180,9 +2322,246 @@
      "phase": 1
     },
     {
-     "id": "CW7-ENC.content-py",
+     "id": "CW7-ENC.conflict-text",
      "probe": "s3_files",
-     "title": "a kept .py with a content change and CRLF: content kept modulo line endings",
+     "needs_units": [
+      "T2g"
+     ],
+     "run_when_absent": true,
+     "title": "FT1's own path: a CRLF edit of a .md / .py that CONFLICTS with the vendor's change -> user-kept, the user's bytes exactly",
+     "checks": [
+      {
+       "id": "sel-CF1",
+       "role": "complete",
+       "fact": "CF1_listed",
+       "op": "eq",
+       "value": 1
+      },
+      {
+       "id": "vendor-changed",
+       "role": "complete",
+       "fact": "CF1_vendor_changed",
+       "op": "true"
+      },
+      {
+       "id": "conflict-built",
+       "role": "complete",
+       "fact": "CF1_conflict_line",
+       "op": "not_none",
+       "text": "the edit changes a line the vendor also changed"
+      },
+      {
+       "id": "base-record",
+       "role": "complete",
+       "fact": "manifest_present_before_install",
+       "op": "true"
+      },
+      {
+       "id": "kept",
+       "role": "complete",
+       "fact": "CF1_pending_kind",
+       "op": "eq",
+       "value": "user-kept",
+       "text": "the merge met a conflict and the user's file was kept (RULINGS FT1's path)"
+      },
+      {
+       "id": "had-cr",
+       "role": "control",
+       "fact": "CF1_user_has_cr",
+       "op": "true"
+      },
+      {
+       "id": "exact",
+       "role": "check",
+       "fact": "CF1_live_sha",
+       "op": "eq_fact",
+       "other": "CF1_user_sha"
+      },
+      {
+       "id": "new-vendor",
+       "role": "check",
+       "fact": "CF1_new_is_vendor",
+       "op": "true"
+      },
+      {
+       "id": "no-eol",
+       "role": "check",
+       "fact": "CF1_pending_eol",
+       "op": "none"
+      },
+      {
+       "id": "reason",
+       "role": "check",
+       "fact": "CF1_pending_reason",
+       "op": "present"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "CW7-ENC.conflict-shell",
+     "probe": "s3_files",
+     "needs_units": [
+      "T2g"
+     ],
+     "run_when_absent": true,
+     "title": "FT1's own path for a shell script: a CRLF edit that CONFLICTS with the vendor's change -> user-kept, the user's content without CR",
+     "checks": [
+      {
+       "id": "sel-CRLF1",
+       "role": "complete",
+       "fact": "CRLF1_listed",
+       "op": "eq",
+       "value": 1
+      },
+      {
+       "id": "vendor-changed",
+       "role": "complete",
+       "fact": "CRLF1_vendor_changed",
+       "op": "true"
+      },
+      {
+       "id": "conflict-built",
+       "role": "complete",
+       "fact": "CRLF1_conflict_line",
+       "op": "not_none"
+      },
+      {
+       "id": "base-record",
+       "role": "complete",
+       "fact": "manifest_present_before_install",
+       "op": "true"
+      },
+      {
+       "id": "kept",
+       "role": "complete",
+       "fact": "CRLF1_pending_kind",
+       "op": "eq",
+       "value": "user-kept"
+      },
+      {
+       "id": "had-cr",
+       "role": "control",
+       "fact": "CRLF1_user_has_cr",
+       "op": "true"
+      },
+      {
+       "id": "no-cr",
+       "role": "check",
+       "fact": "CRLF1_live_has_cr",
+       "op": "false"
+      },
+      {
+       "id": "content",
+       "role": "check",
+       "fact": "CRLF1_live_norm_sha",
+       "op": "eq_fact",
+       "other": "CRLF1_user_norm_sha"
+      },
+      {
+       "id": "new-vendor",
+       "role": "check",
+       "fact": "CRLF1_new_is_vendor",
+       "op": "true"
+      },
+      {
+       "id": "eol-field",
+       "role": "check",
+       "fact": "CRLF1_pending_eol",
+       "op": "present"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "CW7-ENC.merged-md",
+     "probe": "s3_files",
+     "title": "a .md the vendor changed, edited only in its line endings (CRLF): merged - the vendor's content in the user's CRLF",
+     "checks": [
+      {
+       "id": "sel-CRLF2",
+       "role": "complete",
+       "fact": "CRLF2_listed",
+       "op": "eq",
+       "value": 1
+      },
+      {
+       "id": "base-record",
+       "role": "complete",
+       "fact": "manifest_present_before_install",
+       "op": "true",
+       "text": "the base's install record existed when the per-file rules ran (a merge needs it)"
+      },
+      {
+       "id": "vendor-changed",
+       "role": "complete",
+       "fact": "CRLF2_vendor_changed",
+       "op": "true"
+      },
+      {
+       "id": "merged",
+       "role": "complete",
+       "fact": "CRLF2_pending_kind",
+       "op": "eq",
+       "value": "merged",
+       "text": "the ledger says merged (the expectations below apply only to a merged file - RULINGS HC3)"
+      },
+      {
+       "id": "no-new",
+       "role": "check",
+       "fact": "CRLF2_new_sha",
+       "op": "none",
+       "text": "a merged file gets no .new"
+      },
+      {
+       "id": "capture",
+       "role": "check",
+       "fact": "CRLF2_capture_is_user",
+       "op": "true",
+       "text": "the pre-merge capture holds the user's exact bytes"
+      },
+      {
+       "id": "snapshot",
+       "role": "check",
+       "fact": "CRLF2_snapshot_is_user",
+       "op": "true",
+       "text": "the update snapshot holds the user's exact bytes"
+      },
+      {
+       "id": "user-lines",
+       "role": "check",
+       "fact": "CRLF2_user_added_in_live",
+       "op": "true",
+       "text": "every line the user added is in the live file"
+      },
+      {
+       "id": "vendor-lines",
+       "role": "check",
+       "fact": "CRLF2_vendor_added_in_live",
+       "op": "true",
+       "text": "every line the vendor changed is in the live file (structural - no other tool's merge hash)"
+      },
+      {
+       "id": "user-eol",
+       "role": "check",
+       "fact": "CRLF2_live_eol",
+       "op": "eq_fact",
+       "other": "CRLF2_user_eol",
+       "text": "a merged non-shell file has the user's line endings"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "CW7-ENC.merged-py",
+     "probe": "s3_files",
+     "title": "a .py the vendor changed, edited in content and line endings: merged - both sides' lines, the user's CRLF",
      "checks": [
       {
        "id": "sel-CRLF4",
@@ -2192,11 +2571,68 @@
        "value": 1
       },
       {
-       "id": "crlf4-content",
+       "id": "base-record",
+       "role": "complete",
+       "fact": "manifest_present_before_install",
+       "op": "true",
+       "text": "the base's install record existed when the per-file rules ran (a merge needs it)"
+      },
+      {
+       "id": "vendor-changed",
+       "role": "complete",
+       "fact": "CRLF4_vendor_changed",
+       "op": "true"
+      },
+      {
+       "id": "merged",
+       "role": "complete",
+       "fact": "CRLF4_pending_kind",
+       "op": "eq",
+       "value": "merged",
+       "text": "the ledger says merged (the expectations below apply only to a merged file - RULINGS HC3)"
+      },
+      {
+       "id": "no-new",
        "role": "check",
-       "fact": "CRLF4_live_norm_sha",
+       "fact": "CRLF4_new_sha",
+       "op": "none",
+       "text": "a merged file gets no .new"
+      },
+      {
+       "id": "capture",
+       "role": "check",
+       "fact": "CRLF4_capture_is_user",
+       "op": "true",
+       "text": "the pre-merge capture holds the user's exact bytes"
+      },
+      {
+       "id": "snapshot",
+       "role": "check",
+       "fact": "CRLF4_snapshot_is_user",
+       "op": "true",
+       "text": "the update snapshot holds the user's exact bytes"
+      },
+      {
+       "id": "user-lines",
+       "role": "check",
+       "fact": "CRLF4_user_added_in_live",
+       "op": "true",
+       "text": "every line the user added is in the live file"
+      },
+      {
+       "id": "vendor-lines",
+       "role": "check",
+       "fact": "CRLF4_vendor_added_in_live",
+       "op": "true",
+       "text": "every line the vendor changed is in the live file (structural - no other tool's merge hash)"
+      },
+      {
+       "id": "user-eol",
+       "role": "check",
+       "fact": "CRLF4_live_eol",
        "op": "eq_fact",
-       "other": "CRLF4_user_norm_sha"
+       "other": "CRLF4_user_eol",
+       "text": "a merged non-shell file has the user's line endings"
       }
      ],
      "class": "YES",
@@ -2204,52 +2640,71 @@
      "phase": 1
     },
     {
-     "id": "CW7-ENC.exact",
-     "probe": "s3_files",
-     "needs_units": [
-      "T2g"
-     ],
-     "run_when_absent": true,
-     "title": "kept non-shell text files keep the user's bytes exactly, no 'eol' field (RULINGS FT1 - the narrowed shell-script test; until a build contains it this is expected to fail exactly as in run 1)",
+     "id": "CW7-ENC.merged-shell",
+     "probe": "s6_variants",
+     "title": "the general shell script the vendor changed, edited only in its line endings (CRLF), on the control variant's fresh base: merged, no CR",
      "checks": [
       {
-       "id": "crlf2-exact",
-       "role": "check",
-       "fact": "CRLF2_live_sha",
-       "op": "eq_fact",
-       "other": "CRLF2_user_sha"
+       "id": "base",
+       "role": "complete",
+       "fact": "v_control_base_ok",
+       "op": "true"
       },
       {
-       "id": "crlf3-exact",
-       "role": "check",
-       "fact": "CRLF3_live_sha",
-       "op": "eq_fact",
-       "other": "CRLF3_user_sha"
+       "id": "runtime",
+       "role": "complete",
+       "fact": "v_control_runtime_ok",
+       "op": "true"
       },
       {
-       "id": "crlf4-exact",
-       "role": "check",
-       "fact": "CRLF4_live_sha",
-       "op": "eq_fact",
-       "other": "CRLF4_user_sha"
+       "id": "edited",
+       "role": "complete",
+       "fact": "v_control_SHM_edit_ok",
+       "op": "true"
       },
       {
-       "id": "crlf2-no-eol",
-       "role": "check",
-       "fact": "CRLF2_pending_eol",
-       "op": "none"
+       "id": "vendor-changed",
+       "role": "complete",
+       "fact": "v_control_SHM_vendor_changed",
+       "op": "true"
       },
       {
-       "id": "crlf3-no-eol",
-       "role": "check",
-       "fact": "CRLF3_pending_eol",
-       "op": "none"
+       "id": "merged",
+       "role": "complete",
+       "fact": "v_control_SHM_kind",
+       "op": "eq",
+       "value": "merged"
       },
       {
-       "id": "crlf4-no-eol",
+       "id": "no-cr",
        "role": "check",
-       "fact": "CRLF4_pending_eol",
-       "op": "none"
+       "fact": "v_control_SHM_live_has_cr",
+       "op": "false",
+       "text": "a merged shell script has no CR (design 4-11 ra)"
+      },
+      {
+       "id": "no-new",
+       "role": "check",
+       "fact": "v_control_SHM_new_present",
+       "op": "false"
+      },
+      {
+       "id": "capture",
+       "role": "check",
+       "fact": "v_control_SHM_capture_is_user",
+       "op": "true"
+      },
+      {
+       "id": "snapshot",
+       "role": "check",
+       "fact": "v_control_SHM_snapshot_is_user",
+       "op": "true"
+      },
+      {
+       "id": "vendor-lines",
+       "role": "check",
+       "fact": "v_control_SHM_vendor_added_in_live",
+       "op": "true"
       }
      ],
      "class": "YES",
@@ -3039,12 +3494,13 @@
    "subrows": [
     {
      "id": "DY3.dotdot",
+     "kind": "record",
      "probe": "s3_query",
      "needs_units": [
       "T5c"
      ],
      "run_when_absent": true,
-     "title": "'..' after a junction (T5c report 4): where a Git Bash write and a Win32 write land, and the query for both spellings",
+     "title": "'..' after a junction (T5c report 4): where a Git Bash write and a Win32 write land, and the query for both spellings - a recorded known gap (RULINGS HD5)",
      "checks": [
       {
        "id": "created",
@@ -3065,11 +3521,23 @@
        "op": "present"
       },
       {
-       "id": "msys-protects",
+       "id": "q-native",
        "role": "check",
+       "fact": "q_dotdot_native",
+       "op": "present"
+      },
+      {
+       "id": "q-msys",
+       "role": "check",
+       "fact": "q_dotdot_msys",
+       "op": "present"
+      },
+      {
+       "id": "msys-protects",
+       "role": "assumption",
        "fact": "dotdot_msys_protects",
        "op": "not_false",
-       "text": "a spelling whose write reaches the listed file is classified listed (None = it does not reach it)"
+       "assumption": "RULINGS HD5 / GAPS G20 / DEFERRED #134 (minor, not fixed in release 1): an MSYS spelling through a junction and `..` is classified by its lexical path - a Git Bash write through it reaches the listed file while the query answers general. Met (no finding) = a later tree answers listed: the gap is closed"
       },
       {
        "id": "native-protects",
@@ -3085,7 +3553,6 @@
       }
      ],
      "class": "YES",
-     "kind": "assert",
      "phase": 1
     }
    ],
@@ -3141,13 +3608,53 @@
      "needs_units": [
       "T2g"
      ],
-     "probe": null,
-     "why": "probe not built yet; becomes measurable when the unit is merged",
-     "title": "two writers of <rel>.user: every copy exists afterwards, the overlap recorded",
-     "class": "WAIT",
+     "probe": "s3_files",
+     "run_when_absent": true,
+     "title": "the product's copy step on NTFS - measured by T2G-COPY.equal / .different (RULINGS HC7): an equal copy at <rel>.user reused, a different one moved to a generation slot; two simultaneous writers are not produced on the runner",
+     "checks": [
+      {
+       "id": "pe-planted",
+       "role": "complete",
+       "fact": "PE_planted_read_back_ok",
+       "op": "true"
+      },
+      {
+       "id": "pd-planted",
+       "role": "complete",
+       "fact": "PD_planted_read_back_ok",
+       "op": "true"
+      },
+      {
+       "id": "pe-park",
+       "role": "check",
+       "fact": "PE_park_sha",
+       "op": "eq_fact",
+       "other": "PE_user_sha"
+      },
+      {
+       "id": "pe-no-generation",
+       "role": "check",
+       "fact": "PE_prev_parks",
+       "op": "eq",
+       "value": 0
+      },
+      {
+       "id": "pd-park",
+       "role": "check",
+       "fact": "PD_park_sha",
+       "op": "eq_fact",
+       "other": "PD_user_sha"
+      },
+      {
+       "id": "pd-earlier-kept",
+       "role": "check",
+       "fact": "PD_planted_in_prev",
+       "op": "true"
+      }
+     ],
+     "class": "YES",
      "kind": "assert",
-     "phase": 1,
-     "checks": []
+     "phase": 1
     }
    ],
    "kind": "assert",
@@ -3455,13 +3962,21 @@
     },
     {
      "id": "R-T2-SNAP.b",
-     "probe": null,
-     "why": "the snapshot step cannot be separated from the staged swap from outside the process",
+     "probe": "s2_update",
+     "why": "restated for the in-place update (RULINGS GH1, HC6): an existing pack is updated in place - no staged copy and no folder rename exist; the snapshot step itself cannot be stopped between its copy and the first write from outside the process, so what is measured is the live pack folder's identity through the whole update, snapshot step included",
      "title": "the snapshot step did not rename the live pack folder",
+     "checks": [
+      {
+       "id": "same-folder",
+       "role": "check",
+       "fact": "pack_dir_same_after_update",
+       "op": "true",
+       "text": "the pack folder's identity (volume serial + file index) is the same before and after the update"
+      }
+     ],
      "class": "PARTLY",
      "kind": "assert",
-     "phase": 1,
-     "checks": []
+     "phase": 1
     }
    ],
    "kind": "assert",
@@ -3909,6 +4424,13 @@
      "op": "true"
     },
     {
+     "id": "runtime",
+     "role": "complete",
+     "fact": "iph_runtime_ok",
+     "op": "true",
+     "text": "the base install left the runtime's Git Bash and Python (RULINGS HC6)"
+    },
+    {
      "id": "control",
      "role": "complete",
      "fact": "control_available",
@@ -4082,6 +4604,13 @@
      "role": "complete",
      "fact": "mh_cand_ok",
      "op": "true"
+    },
+    {
+     "id": "runtime",
+     "role": "complete",
+     "fact": "mh_runtime_ok",
+     "op": "true",
+     "text": "the base install left the runtime's Git Bash and Python (RULINGS HC6)"
     },
     {
      "id": "control",
@@ -4511,11 +5040,19 @@
        "value": "reviewer-codex|daemon"
       },
       {
+       "id": "wrapper-direct",
+       "role": "check",
+       "fact": "lib_role_wrapper_direct",
+       "op": "eq",
+       "value": "reviewer-codex",
+       "text": "cys_timeout_run called directly (the library discards the trace of its own role call - RULINGS HC4)"
+      },
+      {
        "id": "wrapper-ran",
        "role": "check",
        "fact": "lib_role_wrapper_traced_flags",
        "op": "true",
-       "text": "the trace shows the wrapper's interpreter started with -I -S -B -X utf8"
+       "text": "the trace of the direct call shows the wrapper's interpreter started with -I -S -B -X utf8"
       },
       {
        "id": "gate-daemon-deny",
@@ -4648,6 +5185,20 @@
        "op": "present"
       },
       {
+       "id": "shipped-pth",
+       "role": "check",
+       "fact": "shipped_pth_files",
+       "op": "present",
+       "text": "RULINGS HD3: the *.pth / *._pth files the SHIPPED runtime holds (root and Lib/site-packages)"
+      },
+      {
+       "id": "shipped-sys-path",
+       "role": "check",
+       "fact": "shipped_sys_path_under_flags",
+       "op": "not_none",
+       "text": "RULINGS HD3: sys.path of the shipped interpreter under -I -S -B -X utf8"
+      },
+      {
        "id": "S-keeps-site-out",
        "role": "assumption",
        "fact": "pth_S_sitecustomize_ran",
@@ -4682,7 +5233,7 @@
      "needs_units": [
       "T5c"
      ],
-     "title": "the capability gate's deny through `chcp 949`; the interpreter's stdout encoding with and without -X utf8",
+     "title": "the capability gate's deny through `cmd /d /c \"chcp 949 & bash gate < payload\"` against the identical call form without the code-page change (RULINGS HC5); the interpreter's stdout encoding with and without -X utf8",
      "checks": [
       {
        "id": "cp949",
@@ -4690,6 +5241,34 @@
        "fact": "cp949_active",
        "op": "true",
        "reason": "the console code page could not be set to 949"
+      },
+      {
+       "id": "ctl-call-form",
+       "role": "environment",
+       "fact": "cp949_ctl_deny",
+       "op": "true",
+       "reason": "the identical call form WITHOUT the code-page change fails too: the CALL FORM, not the code page (RULINGS HC5)"
+      },
+      {
+       "id": "ctl-exit",
+       "role": "control",
+       "fact": "cp949_ctl_exit",
+       "op": "eq",
+       "value": 0
+      },
+      {
+       "id": "inherited",
+       "role": "check",
+       "fact": "cp949_inherited_parse_failed",
+       "op": "present",
+       "text": "recorded: run 2's form (input through cmd's inherited stdin) with the code page"
+      },
+      {
+       "id": "inherited-ctl",
+       "role": "check",
+       "fact": "cp949_inherited_ctl_parse_failed",
+       "op": "present",
+       "text": "recorded: the same inherited-stdin form without the code page"
       },
       {
        "id": "exit",
@@ -4914,7 +5493,8 @@
      "role": "check",
      "fact": "compgen_child_empty",
      "op": "eq",
-     "value": "''"
+     "value": "None",
+     "text": "RULINGS HC4 / HD4: on Windows an exported-empty variable reaches the command as ABSENT (the C runtime removes a variable given an empty value)"
     }
    ],
    "kind": "assert",
@@ -5081,6 +5661,107 @@
    "checks": [],
    "class": "PARTLY",
    "probe": null
+  },
+  {
+   "id": "T5C-HANGUL",
+   "group": "ruling",
+   "probe": "s3_judges",
+   "title": "the capability gate decides correctly when the pack path and the payload's path contain Hangul",
+   "source": "RULINGS HD2",
+   "expected": "a copy of the installed pack's hooks under %RUNNER_TEMP%\\한글 사용자\\.cys\\pack, the seat's environment pointing there, the input handed to bash: a reviewer's forbidden write there -> a structured deny with the reason decoded as UTF-8; the allowed control (its verdict place) -> allow",
+   "checks": [
+    {
+     "id": "ready",
+     "role": "environment",
+     "fact": "hangul_pack_ready",
+     "op": "true",
+     "reason": "the hosted runner could not create or use a folder with a Hangul name under RUNNER_TEMP"
+    },
+    {
+     "id": "premise",
+     "role": "complete",
+     "fact": "hangul_forbidden_not_allowed_place",
+     "op": "true",
+     "text": "the forbidden write lies in no place the reviewer rule allows (the lesson of RULINGS HD1)"
+    },
+    {
+     "id": "ctl-exit",
+     "role": "control",
+     "fact": "hangul_allowed_exit",
+     "op": "eq",
+     "value": 0
+    },
+    {
+     "id": "ctl-allow",
+     "role": "control",
+     "fact": "hangul_allowed_deny",
+     "op": "false",
+     "text": "the reviewer's own verdict place under that pack is allowed"
+    },
+    {
+     "id": "ctl-no-crash",
+     "role": "control",
+     "fact": "hangul_allowed_traceback",
+     "op": "false"
+    },
+    {
+     "id": "exit",
+     "role": "check",
+     "fact": "hangul_forbidden_exit",
+     "op": "eq",
+     "value": 0
+    },
+    {
+     "id": "deny",
+     "role": "check",
+     "fact": "hangul_forbidden_deny",
+     "op": "true"
+    },
+    {
+     "id": "reason-utf8",
+     "role": "check",
+     "fact": "hangul_forbidden_reason_decoded",
+     "op": "true",
+     "text": "the reason, which names the Hangul pack path, decodes as UTF-8"
+    },
+    {
+     "id": "no-crash",
+     "role": "check",
+     "fact": "hangul_forbidden_traceback",
+     "op": "false"
+    },
+    {
+     "id": "nothing-written",
+     "role": "check",
+     "fact": "hangul_target_absent",
+     "op": "true"
+    },
+    {
+     "id": "removed",
+     "role": "check",
+     "fact": "hangul_removed",
+     "op": "true"
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "class": "YES"
+  },
+  {
+   "id": "T9-JOURNAL-TAKE",
+   "group": "ruling",
+   "needs_units": [
+    "T9"
+   ],
+   "probe": null,
+   "title": "taking a pack-update journal folder whose writer has exited (a rename of the folder) succeeds; with a file inside held open the take fails, nothing is touched, and the next entry takes it",
+   "source": "RULINGS HB5, HB2 (a)",
+   "why": "the journal's names and the verbs that take it come with the unit T9 (RULINGS HB2 (a)); the probe is written against them when T9 is merged",
+   "expected": "take = success; with a held file: the take fails, nothing touched, the next entry takes it",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "WAIT"
   }
  ]
 }

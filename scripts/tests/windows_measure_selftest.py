@@ -60,7 +60,7 @@ C = lambda cid, role, fact, op, **kw: dict({"id": cid, "role": role, "fact": fac
 class MatrixTests(unittest.TestCase):
     def test_real_matrix_is_valid(self):
         m = R.load_matrix(MATRIX)
-        self.assertEqual(len(m["rows"]), 74)
+        self.assertEqual(len(m["rows"]), 76)
 
     def test_class_counts_match_the_approved_plan(self):
         m = load()
@@ -69,7 +69,8 @@ class MatrixTests(unittest.TestCase):
             counts[r["class"]] = counts.get(r["class"], 0) + 1
         # push 2 (RULINGS GS2, GL4, GB5): +7 YES rows (IN-PLACE-HELD, MANIFEST-HELD, PACK-PREV, APP-RESTORE,
         # T5C-JUDGES, T5C-DANGLING, T5C-COMPGEN), +2 PARTLY (T5C-CP949, T2G-COPY), R-T3D-IDENT WAIT -> YES
-        self.assertEqual(counts, {"YES": 31, "PARTLY": 25, "NO": 8, "WAIT": 10})
+        # push 3 (RULINGS HB5, HD2): +1 YES (T5C-HANGUL), +1 WAIT (T9-JOURNAL-TAKE)
+        self.assertEqual(counts, {"YES": 32, "PARTLY": 25, "NO": 8, "WAIT": 11})
 
     def test_every_required_row_exists_once(self):
         ids = [r["id"] for r, _ in R.iter_rows(load())]
@@ -91,7 +92,8 @@ class MatrixTests(unittest.TestCase):
         "feature absent" - and its observation is still recorded (run_when_absent)."""
         m = {r["id"]: r for r, _ in R.iter_rows(load())}
         for rid, unit in (("CW7-LISTED", "T9a"), ("G01.nodelete", "T9a"), ("G01.variants-nodelete", "T9a"),
-                          ("CW7-HELD.nopartial", "T9a"), ("I-LISTEN.b", "T9a"), ("CW7-ENC.exact", "T2g"), ("DY3", "T5c")):
+                          ("CW7-HELD.nopartial", "T9a"), ("I-LISTEN.b", "T9a"), ("CW7-ENC.conflict-text", "T2g"),
+                          ("CW7-ENC.conflict-shell", "T2g"), ("DY3", "T5c")):
             self.assertIn(unit, m[rid]["needs_units"], rid)
             self.assertTrue(m[rid].get("run_when_absent"), rid)
             dec = R.decide_row(m[rid], load()["probes"], "updated", 1, {unit: {"merge_log": False}})
@@ -146,7 +148,7 @@ class MatrixTests(unittest.TestCase):
         self.assertTrue(any("needs the assumption" in x for x in e), e)
 
     def test_top_row_count_is_pinned(self):
-        e = self._errors_after(lambda m: m.__setitem__("expected_top_rows", 73))
+        e = self._errors_after(lambda m: m.__setitem__("expected_top_rows", 75))
         self.assertTrue(any("expected_top_rows" in x for x in e), e)
 
     def test_bad_probe_table_is_refused(self):
@@ -698,6 +700,125 @@ class Push2HelperTests(unittest.TestCase):
         sc = load()["scenario"]
         self.assertEqual({k: f(sc) for k, f in P._HELD_REL.items()},
                          {"bash": "hooks/save-state.sh", "python": "bin/javis_event.py", "early": "agents.json"})
+
+
+class Run2CorrectionTests(unittest.TestCase):
+    """The driver's corrections after run 2 (RULINGS HC3-HC7, HD2-HD5, HB5) - pure logic and the rows' decisions."""
+
+    def _row(self, rid):
+        return {r["id"]: r for r, _ in R.iter_rows(load())}[rid]
+
+    def _verdict(self, rid, facts):
+        return R.compute_verdict(self._row(rid), {"status": "ran", "facts": facts})
+
+    def test_line_endings_and_lines(self):
+        self.assertEqual(R.eol_kind(b"a\r\nb\r\n"), "crlf")
+        self.assertEqual(R.eol_kind(b"a\nb\n"), "lf")
+        self.assertEqual(R.eol_kind(b"a\r\nb\n"), "mixed")
+        self.assertEqual(R.eol_kind(b"ab"), "none")
+        self.assertIsNone(R.eol_kind(None))
+        self.assertEqual(R.text_lines(b"a\r\nb\n"), ["a", "b", ""])
+
+    def test_added_lines_and_presence(self):
+        base = b"one\ntwo\nthree\n"
+        user = b"one\r\ntwo\r\nthree\r\n# mine\r\n"           # CRLF + one appended line
+        vendor = b"one\nTWO\nthree\n"
+        self.assertEqual(R.added_lines(base, user), ["# mine"])
+        self.assertEqual(R.added_lines(base, vendor), ["TWO"])
+        self.assertEqual(R.added_lines(base, base.replace(b"\n", b"\r\n")), [])   # a line-ending-only edit adds nothing
+        merged = b"one\r\nTWO\r\nthree\r\n# mine\r\n"
+        self.assertTrue(R.lines_present(["# mine", "TWO"], merged))
+        self.assertFalse(R.lines_present(["# mine"], vendor))
+        self.assertIsNone(R.lines_present(None, merged))
+
+    def test_conflicting_edit_changes_a_line_the_vendor_changed(self):
+        base = b"a\nb\nc\n"
+        vendor = b"a\nB2\nc\n"
+        out, idx = R.conflicting_edit(base, vendor, "  # mine")
+        self.assertEqual(idx, 1)
+        self.assertEqual(out, b"a\nb  # mine\nc\n")
+        out, why = R.conflicting_edit(base, b"a\nb\nc\nd\n", " x")      # the vendor only inserted a line
+        self.assertIsNone(out)
+        self.assertIn("no existing", why)
+
+    def test_edited_outcome_is_structural(self):
+        import tw1_probes as P
+        base, user, vendor = b"x\ny\n", b"x\r\ny\r\nmine\r\n", b"x\nY\n"
+        merged = b"x\r\nY\r\nmine\r\n"
+        o = P.edited_outcome(merged, user, base, vendor, None)
+        self.assertEqual((o["live_eol"], o["user_eol"]), ("crlf", "crlf"))
+        self.assertTrue(o["user_added_in_live"] and o["vendor_added_in_live"] and o["vendor_changed"])
+        self.assertIsNone(o["new_is_vendor"])
+        lost = P.edited_outcome(vendor, user, base, vendor, vendor)       # the user's line lost, .new = vendor
+        self.assertFalse(lost["user_added_in_live"])
+        self.assertTrue(lost["new_is_vendor"])
+
+    def test_aggregate_reason_names_the_sub_row(self):
+        r = R.aggregate_reason(R.PASS, "all checks met", [("DY3.dotdot", R.FAIL), ("x", R.PASS)], R.FAIL)
+        self.assertIn("DY3.dotdot", r)
+        self.assertIn("all checks met", r)
+        self.assertEqual(R.aggregate_reason(R.PASS, "all checks met", [("x", R.PASS)], R.PASS), "all checks met")
+
+    def test_redact_tree_rewrites_text_only(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "a"))
+            with open(os.path.join(d, "a", "cysd.out"), "w", encoding="utf-8") as fh:
+                fh.write("pack at X:\\profiles\\runner-x\\.cys\\pack by runner-x\n")
+            with open(os.path.join(d, "b.bin"), "wb") as fh:
+                fh.write(b"\xff\xfe runner-x")
+            n = R.redact_tree(d, R.redaction_map({"USERPROFILE": "X:\\profiles\\runner-x", "USERNAME": "runner-x"}))
+            self.assertEqual(n, 1)
+            with open(os.path.join(d, "a", "cysd.out"), encoding="utf-8") as fh:
+                txt = fh.read()
+            self.assertNotIn("runner-x", txt)
+            self.assertIn("%USERPROFILE%", txt)
+            with open(os.path.join(d, "b.bin"), "rb") as fh:
+                self.assertEqual(fh.read(), b"\xff\xfe runner-x")
+
+    def test_kept_and_merged_rows_apply_only_to_their_kind(self):
+        kept = {"CF1_listed": 1, "CF1_vendor_changed": True, "CF1_conflict_line": 3, "manifest_present_before_install": True,
+                "CF1_pending_kind": "user-kept", "CF1_user_has_cr": True, "CF1_live_sha": "u", "CF1_user_sha": "u",
+                "CF1_new_is_vendor": True, "CF1_pending_eol": None, "CF1_pending_reason": "merge-conflict"}
+        self.assertEqual(self._verdict("CW7-ENC.conflict-text", kept)["verdict"], R.PASS)
+        merged = dict(kept, CF1_pending_kind="merged")
+        v = self._verdict("CW7-ENC.conflict-text", merged)
+        self.assertEqual(v["verdict"], R.NM)
+        self.assertIn("record incomplete", v["reason"])
+        g = {"G1_listed": 1, "CG_listed": 1, "CG_live_sha": "v", "CG_vendor_sha": "v", "CG_new_sha": None,
+             "manifest_present_before_install": True, "G1_vendor_changed": True, "G1_pending_kind": "merged",
+             "G1_new_sha": None, "G1_capture_is_user": True, "G1_snapshot_is_user": True, "G1_user_added_in_live": True,
+             "G1_vendor_added_in_live": True, "G1_live_eol": "lf", "G1_user_eol": "lf"}
+        self.assertEqual(self._verdict("CW7-GENERAL", g)["verdict"], R.PASS)
+        self.assertEqual(self._verdict("CW7-GENERAL", dict(g, G1_pending_kind="user-kept"))["verdict"], R.NM)
+        self.assertEqual(self._verdict("CW7-GENERAL", dict(g, G1_user_added_in_live=False))["verdict"], R.FAIL)
+
+    def test_dotdot_gap_is_a_finding_not_red_and_closing_it_is_not_red(self):
+        base = {"dotdot_junction_created": True, "dotdot_bash_lands": "physical", "dotdot_python_lands": "lexical",
+                "q_dotdot_native": 0, "q_dotdot_msys": 1, "dotdot_native_protects": None, "dotdot_removed": True}
+        open_gap = self._verdict("DY3.dotdot", dict(base, dotdot_msys_protects=False))
+        self.assertEqual(open_gap["verdict"], R.PASS)
+        self.assertEqual(len(open_gap["findings"]), 1)
+        self.assertIn("HD5", open_gap["findings"][0]["assumption"])
+        closed = self._verdict("DY3.dotdot", dict(base, q_dotdot_msys=0, dotdot_msys_protects=True))
+        self.assertEqual((closed["verdict"], closed["findings"]), (R.PASS, []))
+
+    def test_cp949_control_failing_says_call_form(self):
+        f = {"cp949_active": True, "cp949_ctl_deny": False, "cp949_ctl_exit": 2, "cp949_exit": 2, "cp949_deny": False}
+        v = self._verdict("T5C-CP949.utf8", f)
+        self.assertEqual(v["verdict"], R.NMH)
+        self.assertIn("CALL FORM", v["reason"])
+
+    def test_compgen_empty_is_absent_on_windows_and_new_rows(self):
+        c = [x for x in self._row("T5C-COMPGEN")["checks"] if x["id"] == "child-empty"][0]
+        self.assertEqual(c["value"], "None")
+        dec = R.decide_row(self._row("T9-JOURNAL-TAKE"), load()["probes"], "updated", 1, {"T9": {"merge_log": False}})
+        self.assertEqual(dec[1], R.NM)
+        self.assertTrue(dec[2].startswith(R.R_FEATURE_ABSENT))
+        v = self._verdict("T5C-HANGUL", {"hangul_pack_ready": False})
+        self.assertEqual(v["verdict"], R.NMH)
+        self.assertIn("Hangul", v["reason"])
+        self.assertEqual(load()["unit_markers"]["T7b"], ["repair", "gate", "--lane", "pack"])
 
 
 class WorkflowTests(unittest.TestCase):
