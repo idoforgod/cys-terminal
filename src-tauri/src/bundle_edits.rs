@@ -26,7 +26,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -478,6 +478,9 @@ pub(crate) struct CaptureInput {
     pub free_floor: u64,
     /// Free bytes of the volume holding a folder (`None` = could not be measured).
     pub free_space: fn(&Path) -> Option<u64>,
+    /// The folder the store's own path is held from without following links (RULINGS DB3): the
+    /// user's home in the product; every folder below it on the way to the store must be a real folder.
+    pub anchor: PathBuf,
     /// Called once between the scan and the copies with the runtime folder — does nothing in the
     /// product; tests change a file there after the scan (RULINGS DB2).
     pub between_scan_and_copy: fn(&Path),
@@ -504,6 +507,7 @@ impl CaptureInput {
             max_bytes: MAX_CAPTURE_BYTES,
             free_floor: MAX_CAPTURE_BYTES + FREE_SPACE_MARGIN,
             free_space: store_free_space,
+            anchor: cys::home_dir(),
             between_scan_and_copy: nothing_between,
         }
     }
@@ -649,32 +653,38 @@ pub(crate) fn store_free_space(dir: &Path) -> Option<u64> {
     }
 }
 
-/// Creates the capture folder with an exclusive create (`-<n>` appended on a collision, as O-C2-1
-/// does for vault slots), after creating the store parent.
-fn create_capture_dir(store_parent: &Path, leaf: &str) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(store_parent).map_err(|e| format!("보관 폴더를 만들 수 없음: {}: {e}", store_parent.display()))?;
+/// Creates the capture folder inside the held store with an exclusive create (`-<n>` appended on a
+/// collision, as O-C2-1 does for vault slots) and holds it without following links (RULINGS DB3).
+fn create_capture_dir(store: &HeldDir, leaf: &str) -> Result<HeldDir, String> {
     for n in 0..100u32 {
         let name = if n == 0 { leaf.to_string() } else { format!("{leaf}-{n}") };
-        let dir = store_parent.join(name);
-        match std::fs::create_dir(&dir) {
-            Ok(()) => return Ok(dir),
+        match store.create_dir_new(OsStr::new(&name)) {
+            Ok(dir) => return Ok(dir),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("보관 폴더를 만들 수 없음: {}: {e}", dir.display())),
+            Err(e) => return Err(format!("보관 폴더를 만들 수 없음: {}: {e}", store.path().join(&name).display())),
         }
     }
-    Err(format!("보관 폴더 이름이 모두 쓰이는 중: {}", store_parent.join(leaf).display()))
+    Err(format!("보관 폴더 이름이 모두 쓰이는 중: {}", store.path().join(leaf).display()))
 }
 
-/// `<dir>/runtime/<rel>` — refuses a component that could leave the folder.
-fn store_path(dir: &Path, rel: &str) -> Option<PathBuf> {
-    let mut p = dir.join(RUNTIME_DIR);
-    for c in rel.split('/') {
-        if c.is_empty() || c == "." || c == ".." || c.contains('\\') || c.contains(':') {
-            return None;
-        }
-        p.push(c);
+/// The folder that holds `<capture>/runtime/<rel>` — every folder made as needed and held without
+/// following links (RULINGS DB3) — and the leaf name; refuses a component that could leave the folder.
+fn store_place(capture: &HeldDir, rel: &str) -> Result<(HeldDir, String), String> {
+    let Some(mut parts) = safe_parts(rel) else {
+        return Err(format!("보관할 수 없는 경로: {rel}"));
+    };
+    let leaf = parts.pop().unwrap_or_default().to_string();
+    let mut held = match capture.child(OsStr::new(RUNTIME_DIR), true) {
+        Ok(h) => h,
+        Err(e) => return Err(format!("{}: {e}", capture.path().join(RUNTIME_DIR).display())),
+    };
+    for c in parts {
+        held = match held.child(OsStr::new(c), true) {
+            Ok(next) => next,
+            Err(e) => return Err(format!("{}: {e}", held.path().join(c).display())),
+        };
     }
-    Some(p)
+    Ok((held, leaf))
 }
 
 // ───────────────────────────── folders held without following links (RULINGS DB1, DB3) ─────────────────────────────
@@ -760,30 +770,130 @@ impl HeldDir {
         &self.path
     }
 
-    /// Holds the folder `name` directly below, never following a link.
-    pub(crate) fn child(&self, name: &OsStr) -> std::io::Result<HeldDir> {
+    /// Holds the folder `name` directly below, never following a link; with `create` a missing folder
+    /// is made first (Unix `mkdirat` through the handle).
+    pub(crate) fn child(&self, name: &OsStr, create: bool) -> std::io::Result<HeldDir> {
         let path = self.path.join(name);
         #[cfg(unix)]
         let file = {
             use std::os::fd::{AsRawFd, FromRawFd};
             use std::os::unix::ffi::OsStrExt;
             let c = std::ffi::CString::new(name.as_bytes()).map_err(std::io::Error::other)?;
-            let fd = unsafe {
-                libc::openat(self.handle.as_raw_fd(), c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            };
+            let dirfd = self.handle.as_raw_fd();
+            let open = || unsafe { libc::openat(dirfd, c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+            let mut fd = open();
+            if fd < 0 && create && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+                if unsafe { libc::mkdirat(dirfd, c.as_ptr(), 0o777) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(e);
+                    }
+                }
+                fd = open();
+            }
             if fd < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             unsafe { std::fs::File::from_raw_fd(fd) }
         };
         #[cfg(not(unix))]
-        let file = dir_options(true).open(&path)?;
+        let file = match dir_options(true).open(&path) {
+            Err(e) if create && e.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::create_dir(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e),
+                }
+                dir_options(true).open(&path)?
+            }
+            other => other?,
+        };
         if !is_real_folder(&file)? {
             return Err(std::io::Error::other(NOT_A_REAL_FOLDER));
         }
         let mut pins = self._pins.clone();
         pins.push(Arc::clone(&self.handle));
         Ok(HeldDir { path, handle: Arc::new(file), _pins: pins })
+    }
+
+    /// Makes the NEW folder `name` directly below (an existing name fails `AlreadyExists`) and holds it.
+    pub(crate) fn create_dir_new(&self, name: &OsStr) -> std::io::Result<HeldDir> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            let c = std::ffi::CString::new(name.as_bytes()).map_err(std::io::Error::other)?;
+            if unsafe { libc::mkdirat(self.handle.as_raw_fd(), c.as_ptr(), 0o777) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir(self.path.join(name))?;
+        }
+        self.child(name, false)
+    }
+
+    /// Creates the NEW regular file `name` directly below for writing (exclusive: an existing name —
+    /// a link included — fails, nothing is followed).
+    pub(crate) fn create_file(&self, name: &OsStr) -> std::io::Result<std::fs::File> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::ffi::OsStrExt;
+            let c = std::ffi::CString::new(name.as_bytes()).map_err(std::io::Error::other)?;
+            let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            let fd = unsafe { libc::openat(self.handle.as_raw_fd(), c.as_ptr(), flags, 0o666) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::OpenOptions::new().write(true).create_new(true).open(self.path.join(name))
+        }
+    }
+
+    /// Makes the link `name` → `target` directly below (Unix). Windows keeps no links (making one needs
+    /// a privilege the app does not ask for).
+    pub(crate) fn symlink(&self, target: &str, name: &OsStr) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            let c = std::ffi::CString::new(name.as_bytes()).map_err(std::io::Error::other)?;
+            let t = std::ffi::CString::new(target).map_err(std::io::Error::other)?;
+            if unsafe { libc::symlinkat(t.as_ptr(), self.handle.as_raw_fd(), c.as_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (target, name);
+            Err(std::io::Error::other("윈도우에서는 링크를 보관하지 않음"))
+        }
+    }
+
+    /// Renames `from` to `to`, both directly below.
+    pub(crate) fn rename(&self, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            let f = std::ffi::CString::new(from.as_bytes()).map_err(std::io::Error::other)?;
+            let t = std::ffi::CString::new(to.as_bytes()).map_err(std::io::Error::other)?;
+            let dirfd = self.handle.as_raw_fd();
+            if unsafe { libc::renameat(dirfd, f.as_ptr(), dirfd, t.as_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::rename(self.path.join(from), self.path.join(to))
+        }
     }
 
     /// Opens the regular file `name` directly below for reading, never following a link (a fifo
@@ -839,6 +949,57 @@ impl HeldDir {
             std::fs::read_link(self.path.join(name)).ok()?.into_os_string().into_string().ok()
         }
     }
+}
+
+/// Whether `p` itself is a link (Windows: any reparse point) — only for the wording of a refusal.
+fn is_link_like(p: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(p) else {
+        return false;
+    };
+    #[cfg(not(unix))]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    meta.file_type().is_symlink()
+}
+
+/// RULINGS DB3: holds the folder `target` without following links — from `anchor` (the user's home:
+/// trusted, opened by its path) when `target` lies below it, else from the root of `target`. Every
+/// folder on the way is opened through the handle of the one above with no link followed, and made
+/// when `create` and missing. A folder on the way that is a link — into the app bundle or anywhere
+/// else — or no folder is refused: the caller writes nothing there and the update goes on (AQ7).
+pub(crate) fn hold_path(anchor: &Path, target: &Path, create: bool) -> Result<HeldDir, String> {
+    let cannot = |p: &Path, e: &dyn std::fmt::Display| {
+        if is_link_like(p) {
+            format!("보관 폴더가 링크라 따라가지 않고 쓰지 않음: {}", p.display())
+        } else {
+            format!("보관 폴더를 만들 수 없음: {}: {e}", p.display())
+        }
+    };
+    let start: PathBuf = if anchor.is_absolute() && target.starts_with(anchor) {
+        anchor.to_path_buf()
+    } else {
+        target.components().take_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir)).collect()
+    };
+    let rest = match target.strip_prefix(&start) {
+        Ok(rest) if start.is_absolute() => rest,
+        _ => return Err(format!("보관 폴더를 만들 수 없음: {}: 절대 경로가 아님", target.display())),
+    };
+    let mut held = HeldDir::open_anchor(&start).map_err(|e| cannot(&start, &e))?;
+    for c in rest.components() {
+        let Component::Normal(name) = c else {
+            return Err(format!("보관 폴더를 만들 수 없음: {}: 따라갈 수 없는 경로", target.display()));
+        };
+        held = match held.child(name, create) {
+            Ok(next) => next,
+            Err(e) => return Err(cannot(&held.path.join(name), &e)),
+        };
+    }
+    Ok(held)
 }
 
 /// The components of an index / store path `a/b/c` — `None` for one that could leave the folder.
@@ -1017,7 +1178,7 @@ fn kept_copy_matches(capture: &HeldDir, rel: &str, kind: &str, sha256: Option<&s
     };
     let mut held: Option<HeldDir> = None;
     for folder in folders {
-        let next = held.as_ref().unwrap_or(capture).child(OsStr::new(folder));
+        let next = held.as_ref().unwrap_or(capture).child(OsStr::new(folder), false);
         match next {
             Ok(h) => held = Some(h),
             Err(_) => return false,
@@ -1034,51 +1195,39 @@ fn kept_copy_matches(capture: &HeldDir, rel: &str, kind: &str, sha256: Option<&s
     }
 }
 
-/// Copies one regular file into a NEW file — at most `expected` bytes, under the budget
-/// (`copy_stream`, RULINGS DB2) — and returns the bytes written with the sha256 of the stored copy.
-/// The source is opened without following links and re-checked through the handle.
-fn copy_exact(src: &Path, dst: &Path, expected: u64, budget: &Budget) -> (u64, Result<String, CopyStop>) {
+/// Copies one regular file into the NEW file `name` of a held folder — at most `expected` bytes,
+/// under the budget (`copy_stream`, RULINGS DB2) — and returns the bytes written with the sha256 of
+/// the stored copy. The source is opened without following links and re-checked through the handle.
+fn copy_exact(src: &Path, dst_dir: &HeldDir, name: &str, expected: u64, budget: &Budget) -> (u64, Result<String, CopyStop>) {
     let mut written = 0;
-    let result = copy_counted(src, dst, expected, budget, &mut written);
+    let result = copy_counted(src, dst_dir, name, expected, budget, &mut written);
     (written, result)
 }
 
 /// `copy_exact` with the bytes written reported through `written` (set however the copy ends).
-fn copy_counted(src: &Path, dst: &Path, expected: u64, budget: &Budget, written: &mut u64) -> Result<String, CopyStop> {
+fn copy_counted(src: &Path, dst_dir: &HeldDir, name: &str, expected: u64, budget: &Budget, written: &mut u64) -> Result<String, CopyStop> {
     let fail = |p: &Path, e: std::io::Error| CopyStop::Io(format!("{}: {e}", p.display()));
+    let dst = dst_dir.path().join(name);
     let mut input = open_no_follow(src).map_err(|e| fail(src, e))?;
     let permissions = input.metadata().map_err(|e| fail(src, e))?.permissions();
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| fail(parent, e))?;
-    }
-    let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(dst).map_err(|e| fail(dst, e))?;
+    let mut output = dst_dir.create_file(OsStr::new(name)).map_err(|e| fail(&dst, e))?;
     let (n, copied) = copy_stream(&mut input, &mut output, expected, budget);
     *written = n;
     let sha256 = copied?;
-    output.sync_all().map_err(|e| fail(dst, e))?;
+    output.sync_all().map_err(|e| fail(&dst, e))?;
     let _ = output.set_permissions(permissions);
     Ok(sha256)
 }
 
-/// Keeps a link as a link (Unix). Windows does not store links (making one needs a privilege the
-/// app does not ask for) — the edit is listed with `stored: false` (RULINGS AA5).
-fn store_link(target: &str, dst: &Path) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-        }
-        std::os::unix::fs::symlink(target, dst).map_err(|e| format!("{}: {e}", dst.display()))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (target, dst);
-        Err("윈도우에서는 링크를 보관하지 않음".to_string())
-    }
+/// Keeps a link as a link inside a held folder (Unix `symlinkat`). Windows does not store links
+/// (making one needs a privilege the app does not ask for) — the edit is listed with `stored: false`
+/// (RULINGS AA5).
+fn store_link(target: &str, dir: &HeldDir, name: &str) -> Result<(), String> {
+    dir.symlink(target, OsStr::new(name)).map_err(|e| format!("{}: {e}", dir.path().join(name).display()))
 }
 
-/// Writes `index.json` last, through a temporary name and a rename.
-fn write_index(dir: &Path, input: &CaptureInput, records: &[IndexRecord], same_as: Option<&str>) -> Result<(), String> {
+/// Writes `index.json` last, through a temporary name and a rename, inside the held capture folder.
+fn write_index(dir: &HeldDir, input: &CaptureInput, records: &[IndexRecord], same_as: Option<&str>) -> Result<(), String> {
     let files: Vec<Value> = records
         .iter()
         .map(|r| {
@@ -1102,17 +1251,14 @@ fn write_index(dir: &Path, input: &CaptureInput, records: &[IndexRecord], same_a
     });
     let mut bytes = serde_json::to_vec_pretty(&index).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
-    let tmp = dir.join(format!("{INDEX_FILE}.partial"));
-    let fin = dir.join(INDEX_FILE);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .map_err(|e| format!("{}: {e}", tmp.display()))?;
+    let partial = format!("{INDEX_FILE}.partial");
+    let tmp = dir.path().join(&partial);
+    let fin = dir.path().join(INDEX_FILE);
+    let mut f = dir.create_file(OsStr::new(&partial)).map_err(|e| format!("{}: {e}", tmp.display()))?;
     std::io::Write::write_all(&mut f, &bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
     f.sync_all().map_err(|e| format!("{}: {e}", tmp.display()))?;
     drop(f);
-    std::fs::rename(&tmp, &fin).map_err(|e| format!("{}: {e}", fin.display()))
+    dir.rename(OsStr::new(&partial), OsStr::new(INDEX_FILE)).map_err(|e| format!("{}: {e}", fin.display()))
 }
 
 /// The identity of an edit set for "already kept" (RULINGS AA4): path, kind, presence, scanned hash,
@@ -1131,11 +1277,10 @@ fn edit_set(records: &[IndexRecord]) -> Vec<EditKey> {
 /// its index lists the same entries, it points to no other capture, every present entry is stored
 /// there and every kept copy is verified against the index (RULINGS DB1: kind, content hash, link
 /// target — `kept_copy_matches`). Newest first; `None` when there is none.
-fn find_same_capture(input: &CaptureInput, records: &[IndexRecord], budget: &Budget) -> Option<PathBuf> {
+fn find_same_capture(store: &HeldDir, input: &CaptureInput, records: &[IndexRecord], budget: &Budget) -> Option<PathBuf> {
     let want = edit_set(records);
     let prefix = format!("{}-", input.from_version);
-    let store = HeldDir::open_anchor(&input.store_parent).ok()?;
-    let mut names: Vec<String> = std::fs::read_dir(&input.store_parent)
+    let mut names: Vec<String> = std::fs::read_dir(store.path())
         .ok()?
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().into_string().ok())
@@ -1147,7 +1292,7 @@ fn find_same_capture(input: &CaptureInput, records: &[IndexRecord], budget: &Bud
         if budget.check().is_err() {
             return None;
         }
-        let Ok(held) = store.child(OsStr::new(&name)) else {
+        let Ok(held) = store.child(OsStr::new(&name), false) else {
             continue;
         };
         let Ok(bytes) = held.read_capped(OsStr::new(INDEX_FILE), MAX_INDEX_BYTES) else {
@@ -1307,18 +1452,30 @@ pub(crate) fn capture(input: &CaptureInput, abandon: &AtomicBool) -> CaptureOutc
         .collect();
     let storable = edits.iter().filter(|rel| have.contains_key(**rel)).count();
 
+    // RULINGS DB3: the store's own path is held without following links — a store, or a folder above
+    // it, that is a link (into the app bundle or anywhere else) is refused: nothing is written, the
+    // update goes on and the reason is told.
+    let store = match hold_path(&input.anchor, &input.store_parent, true) {
+        Ok(store) => store,
+        Err(reason) => {
+            elapsed(&mut stats);
+            return CaptureOutcome::Incomplete { dir: None, edits: edits.len(), not_stored: storable, reason, stats };
+        }
+    };
+
     // RULINGS AA4 (1): the same edit set already kept by an earlier capture of this version — copy
     // nothing again, point to it.
-    if let Some(earlier) = find_same_capture(input, &records, &budget) {
+    if let Some(earlier) = find_same_capture(&store, input, &records, &budget) {
         let same_as = earlier.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let dir = match create_capture_dir(&input.store_parent, &input.leaf) {
+        let held = match create_capture_dir(&store, &input.leaf) {
             Ok(d) => d,
             Err(reason) => {
                 elapsed(&mut stats);
                 return CaptureOutcome::Incomplete { dir: None, edits: edits.len(), not_stored: storable, reason, stats };
             }
         };
-        let index = write_index(&dir, input, &records, Some(&same_as));
+        let dir = held.path().to_path_buf();
+        let index = write_index(&held, input, &records, Some(&same_as));
         elapsed(&mut stats);
         return match index {
             Ok(()) => CaptureOutcome::AlreadyKept { dir, same_as: earlier, edits: edits.len(), stats },
@@ -1344,13 +1501,14 @@ pub(crate) fn capture(input: &CaptureInput, abandon: &AtomicBool) -> CaptureOutc
         Some(_) => None,
     };
 
-    let dir = match create_capture_dir(&input.store_parent, &input.leaf) {
+    let held = match create_capture_dir(&store, &input.leaf) {
         Ok(d) => d,
         Err(reason) => {
             elapsed(&mut stats);
             return CaptureOutcome::Incomplete { dir: None, edits: edits.len(), not_stored: storable, reason, stats };
         }
     };
+    let dir = held.path().to_path_buf();
     let mut not_stored = 0usize;
     let mut first_reason: Option<String> = low_space.clone();
     let mut copied: u64 = 0;
@@ -1368,33 +1526,37 @@ pub(crate) fn capture(input: &CaptureInput, abandon: &AtomicBool) -> CaptureOutc
         }
         let result: Result<(), String> = if let Some(h) = halted {
             Err(halt_reason_ko(h, input.deadline))
+        } else if safe_parts(rel).is_none() {
+            Err(format!("보관할 수 없는 경로: {rel}"))
         } else {
-            match store_path(&dir, rel) {
-                None => Err(format!("보관할 수 없는 경로: {rel}")),
-                Some(dst) => match &found.entry {
-                    Entry::File { sha256, .. } => {
-                        if copied.saturating_add(found.len) > input.max_bytes {
-                            Err(format!("한 번에 보관하는 크기 상한({} MiB)을 넘음", input.max_bytes / (1024 * 1024)))
-                        } else {
-                            // RULINGS DB2: the cap counts the bytes really written (at most the scanned
-                            // length), whatever the end of the copy.
-                            let (written, copy) = copy_exact(&found.path, &dst, found.len, &budget);
-                            copied = copied.saturating_add(written);
-                            match copy {
-                                Ok(copy_sha) if &copy_sha == sha256 => Ok(()),
-                                Ok(_) => Err(format!("검사한 뒤에 바뀌어 검사한 내용과 다름: {rel}")),
-                                Err(CopyStop::Grew) => Err(format!("검사한 뒤에 커져서 보관하지 않음: {rel}")),
-                                Err(CopyStop::Halted(h)) => {
-                                    halted = Some(h);
-                                    Err(halt_reason_ko(h, input.deadline))
+            match &found.entry {
+                Entry::File { sha256, .. } => {
+                    if copied.saturating_add(found.len) > input.max_bytes {
+                        Err(format!("한 번에 보관하는 크기 상한({} MiB)을 넘음", input.max_bytes / (1024 * 1024)))
+                    } else {
+                        match store_place(&held, rel) {
+                            Err(e) => Err(e),
+                            Ok((parent, name)) => {
+                                // RULINGS DB2: the cap counts the bytes really written (at most the
+                                // scanned length), whatever the end of the copy.
+                                let (written, copy) = copy_exact(&found.path, &parent, &name, found.len, &budget);
+                                copied = copied.saturating_add(written);
+                                match copy {
+                                    Ok(copy_sha) if &copy_sha == sha256 => Ok(()),
+                                    Ok(_) => Err(format!("검사한 뒤에 바뀌어 검사한 내용과 다름: {rel}")),
+                                    Err(CopyStop::Grew) => Err(format!("검사한 뒤에 커져서 보관하지 않음: {rel}")),
+                                    Err(CopyStop::Halted(h)) => {
+                                        halted = Some(h);
+                                        Err(halt_reason_ko(h, input.deadline))
+                                    }
+                                    Err(CopyStop::Io(e)) => Err(e),
                                 }
-                                Err(CopyStop::Io(e)) => Err(e),
                             }
                         }
                     }
-                    Entry::Link { target } => store_link(target, &dst),
-                    Entry::Other { .. } => Err(format!("특수 파일은 보관하지 않음: {rel}")),
-                },
+                }
+                Entry::Link { target } => store_place(&held, rel).and_then(|(parent, name)| store_link(target, &parent, &name)),
+                Entry::Other { .. } => Err(format!("특수 파일은 보관하지 않음: {rel}")),
             }
         };
         match result {
@@ -1405,7 +1567,7 @@ pub(crate) fn capture(input: &CaptureInput, abandon: &AtomicBool) -> CaptureOutc
             }
         }
     }
-    let index = write_index(&dir, input, &records, None);
+    let index = write_index(&held, input, &records, None);
     elapsed(&mut stats);
     match (not_stored, index) {
         (0, Ok(())) => CaptureOutcome::Captured { dir, edits: edits.len(), stats },
@@ -1539,17 +1701,16 @@ pub(crate) fn pending_notice_path(notice_dir: &Path, leaf: &str) -> PathBuf {
 }
 
 /// Records a notice to be shown once at the next app start (write-once: an existing record is never
-/// overwritten).
-pub(crate) fn record_pending_notice(notice_dir: &Path, leaf: &str, notice: &Notice) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(notice_dir).map_err(|e| format!("{}: {e}", notice_dir.display()))?;
-    let path = pending_notice_path(notice_dir, leaf);
+/// overwritten). The notice folder and every folder above it are held without following links
+/// (RULINGS DB3): when one is a link, nothing is written and the caller says why on stderr (AQ7).
+pub(crate) fn record_pending_notice(anchor: &Path, store_parent: &Path, leaf: &str, notice: &Notice) -> Result<PathBuf, String> {
+    let notices = hold_path(anchor, &notice_dir_of(store_parent), true)?;
+    let path = pending_notice_path(notices.path(), leaf);
     let body = json!({"schema": 1, "leaf": leaf, "warn": notice.warn, "title": notice.title, "body": notice.body});
     let mut bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
+    let mut f = notices
+        .create_file(path.file_name().unwrap_or_default())
         .map_err(|e| format!("{}: {e}", path.display()))?;
     std::io::Write::write_all(&mut f, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     f.sync_all().map_err(|e| format!("{}: {e}", path.display()))?;
@@ -1558,9 +1719,14 @@ pub(crate) fn record_pending_notice(notice_dir: &Path, leaf: &str, notice: &Noti
 
 /// Takes every pending notice ONCE: each record is renamed to `shown-<leaf>.json` BEFORE it is
 /// returned (a record that cannot be renamed is not returned, so it can never be handed over twice);
-/// unreadable or malformed records are left alone. Nothing is deleted.
-pub(crate) fn take_pending_notices(notice_dir: &Path) -> Vec<Notice> {
-    let Ok(listing) = std::fs::read_dir(notice_dir) else {
+/// unreadable or malformed records are left alone. Nothing is deleted. The notice folder is held
+/// without following links (RULINGS DB3) — behind a link nothing is read or renamed; the listing
+/// only proposes names, each is opened and renamed through the held folder.
+pub(crate) fn take_pending_notices(anchor: &Path, store_parent: &Path) -> Vec<Notice> {
+    let Ok(notices) = hold_path(anchor, &notice_dir_of(store_parent), false) else {
+        return Vec::new();
+    };
+    let Ok(listing) = std::fs::read_dir(notices.path()) else {
         return Vec::new();
     };
     let mut names: Vec<String> = listing
@@ -1571,8 +1737,7 @@ pub(crate) fn take_pending_notices(notice_dir: &Path) -> Vec<Notice> {
     names.sort();
     let mut out = Vec::new();
     for name in names {
-        let path = notice_dir.join(&name);
-        let Ok(bytes) = read_capped(&path, MAX_NOTICE_BYTES) else {
+        let Ok(bytes) = notices.read_capped(OsStr::new(&name), MAX_NOTICE_BYTES) else {
             continue;
         };
         let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
@@ -1584,8 +1749,8 @@ pub(crate) fn take_pending_notices(notice_dir: &Path) -> Vec<Notice> {
             continue;
         };
         let leaf = &name[PENDING_NOTICE_PREFIX.len()..name.len() - ".json".len()];
-        let shown = notice_dir.join(format!("{SHOWN_NOTICE_PREFIX}{leaf}.json"));
-        if std::fs::rename(&path, &shown).is_ok() {
+        let shown = format!("{SHOWN_NOTICE_PREFIX}{leaf}.json");
+        if notices.rename(OsStr::new(&name), OsStr::new(&shown)).is_ok() {
             out.push(Notice { warn, title: title.to_string(), body: body.to_string() });
         }
     }
@@ -1658,7 +1823,7 @@ pub(crate) async fn capture_before_install(app: &tauri::AppHandle, to_version: &
         return;
     }
     let input = CaptureInput::for_this_app(to_version);
-    let (notice_dir, leaf) = (notice_dir_of(&input.store_parent), input.leaf.clone());
+    let (anchor, store_parent, leaf) = (input.anchor.clone(), input.store_parent.clone(), input.leaf.clone());
     let grace = match site {
         Site::CheckedLaunch => JOIN_GRACE - RECORD_LIMIT,
         Site::SingleCall => JOIN_GRACE,
@@ -1670,7 +1835,7 @@ pub(crate) async fn capture_before_install(app: &tauri::AppHandle, to_version: &
     };
     match site {
         Site::CheckedLaunch => {
-            match bounded_blocking(RECORD_LIMIT, move || record_pending_notice(&notice_dir, &leaf, &notice)).await {
+            match bounded_blocking(RECORD_LIMIT, move || record_pending_notice(&anchor, &store_parent, &leaf, &notice)).await {
                 Some(Ok(_)) => {}
                 Some(Err(e)) => eprintln!("[cys-app] bundle-edits: notice not recorded ({e})"),
                 None => eprintln!("[cys-app] bundle-edits: notice not recorded (no answer within {} s)", RECORD_LIMIT.as_secs()),
@@ -1686,7 +1851,7 @@ pub(crate) async fn capture_before_install(app: &tauri::AppHandle, to_version: &
 pub(crate) fn take_pending_notices_for_ui() -> Vec<Value> {
     let store = cys::repair::paths::bundle_edits_dir("0", "0");
     let store_parent = store.parent().map(Path::to_path_buf).unwrap_or(store);
-    take_pending_notices(&notice_dir_of(&store_parent))
+    take_pending_notices(&cys::home_dir(), &store_parent)
         .into_iter()
         .map(|n| json!({"warn": n.warn, "title": n.title, "body": n.body}))
         .collect()
@@ -2073,6 +2238,7 @@ mod tests {
             max_bytes: MAX_CAPTURE_BYTES,
             free_floor: MAX_CAPTURE_BYTES + FREE_SPACE_MARGIN,
             free_space: plenty, // AG4: a stub by default — no test depends on the temp volume's real free space
+            anchor: std::env::temp_dir(), // DB3: every temporary store lies below it (`Tmp`)
             between_scan_and_copy: nothing_between,
         }
     }
@@ -2510,11 +2676,13 @@ mod tests {
         }
         // (`nix::` of the app census is left out: the `nix` crate is no dependency of this crate and the
         // substring also matches `std::os::unix::`, which the exec-bit arm uses.)
-        // libc only for the no-follow open flags, the free-space query (AA4, AA6) and the folder-handle
-        // reads of a kept copy (DB1) — nothing else.
+        // libc only for the no-follow open flags, the free-space query (AA4, AA6) and the folder handles
+        // of the store: reads of a kept copy (DB1), folders / files / links / renames made through a
+        // held folder (DB3) — nothing else.
         let allowed = [
             "libc::O_NOFOLLOW", "libc::O_NONBLOCK", "libc::statvfs", "libc::O_DIRECTORY", "libc::O_RDONLY", "libc::O_CLOEXEC",
-            "libc::openat", "libc::readlinkat",
+            "libc::openat", "libc::readlinkat", "libc::mkdirat", "libc::symlinkat", "libc::renameat", "libc::O_WRONLY",
+            "libc::O_CREAT", "libc::O_EXCL",
         ];
         assert_eq!(code.matches("libc::").count(), allowed.iter().map(|a| code.matches(a).count()).sum::<usize>(), "a libc call beyond {allowed:?}");
         for w in [
@@ -2754,7 +2922,8 @@ mod tests {
             assert!(open_no_follow(&link).is_err() && read_capped(&link, 100).is_err(), "a link is not followed");
             let (flag, deadline) = unlimited();
             let budget = Budget { deadline, abandon: &flag };
-            assert!(copy_exact(&link, &t.path().join("copy"), 100, &budget).1.is_err(), "a copy source that is a link is refused");
+            let into = HeldDir::open_anchor(t.path()).unwrap();
+            assert!(copy_exact(&link, &into, "copy", 100, &budget).1.is_err(), "a copy source that is a link is refused");
             assert!(!t.path().join("copy").exists());
             let fifo = t.path().join("fifo");
             assert!(make_fifo(&fifo, 0o644));
@@ -2769,16 +2938,17 @@ mod tests {
         let t = Tmp::new("pending");
         let store = t.path().join("local").join("bundle-edits");
         let notices = notice_dir_of(&store);
+        let anchor = std::env::temp_dir();
         let n = Notice { warn: true, title: "앱 안쪽 수정 보관 실패".into(), body: "업데이트는 그대로 진행합니다".into() };
-        let p = record_pending_notice(&notices, LEAF, &n).unwrap();
+        let p = record_pending_notice(&anchor, &store, LEAF, &n).unwrap();
         assert_eq!(p, store.join(".notices").join(format!("pending-{LEAF}.json")), "inside the store (AG1)");
         let later = Notice { warn: false, title: "x".into(), body: "y".into() };
-        assert!(record_pending_notice(&notices, LEAF, &later).is_err(), "write-once: an existing record is never overwritten");
-        assert_eq!(take_pending_notices(&notices), vec![n.clone()]);
-        assert!(take_pending_notices(&notices).is_empty(), "handed over once");
+        assert!(record_pending_notice(&anchor, &store, LEAF, &later).is_err(), "write-once: an existing record is never overwritten");
+        assert_eq!(take_pending_notices(&anchor, &store), vec![n.clone()]);
+        assert!(take_pending_notices(&anchor, &store).is_empty(), "handed over once");
         assert!(!p.exists() && notices.join(format!("shown-{LEAF}.json")).exists(), "renamed, not deleted");
         std::fs::write(notices.join("pending-bad.json"), b"{").unwrap();
-        assert!(take_pending_notices(&notices).is_empty(), "a malformed record is never handed over");
+        assert!(take_pending_notices(&anchor, &store).is_empty(), "a malformed record is never handed over");
         assert!(notices.join("pending-bad.json").exists(), "and left alone");
         assert_eq!(listing(&t.path().join("local")).iter().filter(|r| !r.starts_with("bundle-edits/")).count(), 0, "nothing outside the store");
     }
@@ -2795,7 +2965,7 @@ mod tests {
         std::fs::write(&blocker, b"a plain file").unwrap();
         let input = input_for(&exe, &blocker);
         let n = notice_ko(&capture(&input, &AtomicBool::new(false))).unwrap();
-        assert!(record_pending_notice(&notice_dir_of(&input.store_parent), &input.leaf, &n).is_err());
+        assert!(record_pending_notice(&input.anchor, &input.store_parent, &input.leaf, &n).is_err());
         assert_eq!(listing(&local), vec!["bundle-edits".to_string()], "only the blocking file — nothing written");
         assert_eq!(std::fs::read(&blocker).unwrap(), b"a plain file");
     }
@@ -2838,7 +3008,7 @@ mod tests {
         assert_eq!(f.matches("deliver_notice(").count(), 1, "{f}");
         assert_eq!(f.matches("record_pending_notice(").count(), 1, "{f}");
         assert!(
-            f.contains("            match bounded_blocking(RECORD_LIMIT, move || record_pending_notice(&notice_dir, &leaf, &notice)).await {"),
+            f.contains("            match bounded_blocking(RECORD_LIMIT, move || record_pending_notice(&anchor, &store_parent, &leaf, &notice)).await {"),
             "the record write runs on the blocking pool under its own limit (AG2): {f}"
         );
         assert!(f.contains("        Site::SingleCall => deliver_notice(app, &notice),"), "{f}");
@@ -3180,5 +3350,78 @@ mod tests {
         assert!(reason.contains("커져서"), "{reason}");
         assert!(!kept_files(dir).contains(&"runtime/python/lib/site.py".to_string()));
         assert!(notice_ko(&o).unwrap().body.contains("업데이트는 그대로 진행합니다"));
+    }
+
+    // ───────── RULINGS DB3: the store's own path is held without following links ─────────
+
+    /// DB3 / verdict J8 M1: a store folder that is a link into the app bundle's `Resources/runtime` is
+    /// refused — nothing is written inside the bundle, the update goes on and the reason is told; a
+    /// notice record is not written there either.
+    #[test]
+    fn db3_a_store_linked_into_the_bundle_gets_nothing_written() {
+        if !cfg!(unix) {
+            return;
+        }
+        let t = Tmp::new("db3-store");
+        let (exe, res, top) = fixture_install(t.path(), "mac");
+        let local = t.path().join("home").join(".cys").join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        let store = local.join("bundle-edits");
+        assert!(make_link(&res.join(RUNTIME_DIR).to_string_lossy(), &store));
+        let before = snapshot(&top);
+        let input = input_for(&exe, &store);
+        let o = capture(&input, &AtomicBool::new(false));
+        let CaptureOutcome::Incomplete { dir: None, reason, .. } = &o else { panic!("{o:?}") };
+        assert!(reason.contains("링크"), "{reason}");
+        let n = notice_ko(&o).unwrap();
+        assert!(n.warn && n.body.contains("업데이트는 그대로 진행합니다"), "{}", n.body);
+        assert!(record_pending_notice(&input.anchor, &store, &input.leaf, &n).is_err());
+        assert_eq!(snapshot(&top), before, "nothing written inside the app bundle");
+    }
+
+    /// DB3: an ancestor of the store (`local`) that is a link anywhere is refused the same way.
+    #[test]
+    fn db3_a_linked_ancestor_of_the_store_gets_nothing_written() {
+        if !cfg!(unix) {
+            return;
+        }
+        let t = Tmp::new("db3-ancestor");
+        let (exe, _res, _top) = fixture_install(t.path(), "win");
+        let cys_dir = t.path().join("home").join(".cys");
+        std::fs::create_dir_all(&cys_dir).unwrap();
+        let elsewhere = t.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert!(make_link(&elsewhere.to_string_lossy(), &cys_dir.join("local")));
+        let store = cys_dir.join("local").join("bundle-edits");
+        let input = input_for(&exe, &store);
+        let o = capture(&input, &AtomicBool::new(false));
+        assert!(matches!(&o, CaptureOutcome::Incomplete { dir: None, reason, .. } if reason.contains("링크")), "{o:?}");
+        let n = notice_ko(&o).unwrap();
+        assert!(record_pending_notice(&input.anchor, &store, &input.leaf, &n).is_err());
+        assert!(listing(&elsewhere).is_empty(), "written through the link: {:?}", listing(&elsewhere));
+        assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none(), "no folder made through the link");
+    }
+
+    /// DB3: a `.notices` folder that is a link is refused both ways — no record is written through it,
+    /// and a record planted behind it is neither handed over nor renamed.
+    #[test]
+    fn db3_a_linked_notice_folder_is_refused_both_ways() {
+        if !cfg!(unix) {
+            return;
+        }
+        let t = Tmp::new("db3-notices");
+        let store = t.path().join("home").join(".cys").join("local").join("bundle-edits");
+        std::fs::create_dir_all(&store).unwrap();
+        let elsewhere = t.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert!(make_link(&elsewhere.to_string_lossy(), &notice_dir_of(&store)));
+        let anchor = std::env::temp_dir();
+        let n = Notice { warn: true, title: "앱 안쪽 수정 보관 실패".into(), body: "업데이트는 그대로 진행합니다".into() };
+        assert!(record_pending_notice(&anchor, &store, LEAF, &n).is_err());
+        assert!(listing(&elsewhere).is_empty(), "written through the link: {:?}", listing(&elsewhere));
+        let planted = elsewhere.join(format!("pending-{LEAF}.json"));
+        std::fs::write(&planted, br#"{"schema":1,"leaf":"x","warn":true,"title":"t","body":"b"}"#).unwrap();
+        assert!(take_pending_notices(&anchor, &store).is_empty(), "nothing is taken through a link");
+        assert!(planted.exists(), "the record behind the link is not renamed");
     }
 }
