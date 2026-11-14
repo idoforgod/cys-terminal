@@ -1455,8 +1455,12 @@ fn unregister_hook_rules() {
     assert!(ledger::list_ids_in(&r.root).is_empty());
 }
 
-/// RULINGS Y1: until T6's `hook_lines_step` lands, a commit whose record has a hook line is refused
-/// with the not-implemented sentence and the record is left exactly as before; no lane row appears.
+/// RULINGS Y1 / Y2(c) — T6 rewrite (the old pin: "until T6's `hook_lines_step` lands, a commit whose
+/// record has a hook line is refused with the not-implemented sentence and the record is left exactly
+/// as before; no lane row appears"). T6's step is real now: when it cannot complete (here the
+/// production step cannot see this rig's ledger — any registrar or record error behaves the same) the
+/// commit STANDS (the committed state was durable before the step ran — Y1 order) and this lane's row
+/// is `충돌` with the step's error — never a silent `검증됨`; the confirming case is `ak5_…` below.
 #[test]
 fn commit_with_hook_line_refused_while_step_is_stub() {
     let r = rig("hookcommit");
@@ -1494,20 +1498,19 @@ fn commit_with_hook_line_refused_while_step_is_stub() {
     )
     .unwrap();
     let before = r.record_of(&id);
-    let e = r
+    let c = r
         .call(T0 + 3.0, &w, "commit", json!({"repair": id}))
-        .unwrap_err();
-    assert_eq!(e.code, "repair_not_implemented", "{}", e.message);
-    assert!(e.message.contains("hook_lines_step"));
+        .unwrap();
+    assert!(c["hook_step"]["error"].is_string(), "{c}");
     let after = r.record_of(&id);
-    assert_eq!(after.state, RepairState::InProgress);
-    assert!(after.committed.is_empty());
+    assert_eq!(after.state, RepairState::Probation, "the commit stands");
+    assert!(!after.committed.is_empty());
     assert_eq!(after.files, before.files);
-    assert!(after.lock.is_some());
-    assert!(
-        !r.root.join(&id).join("lanes").exists(),
-        "no lane row for a refused commit"
-    );
+    assert!(!after.checks.iter().any(|(_, how)| how == "hook-registrar"), "never claimed");
+    let row = ledger::read_lane_in(&r.root, &after.id, &r.lane)
+        .unwrap()
+        .expect("this lane's row");
+    assert_eq!(row.state, LaneState::Conflict, "충돌 — Y2(c)");
     // the hook line is skipped by every file walker (W3(b))
     assert_eq!(
         cys::repair::ledger::candidate_states_in(&r.root, &after.id)
