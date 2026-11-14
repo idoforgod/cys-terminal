@@ -4262,11 +4262,14 @@ pub(crate) const INTAKE_LOCK_SHARDS: usize = 16;
 /// reserved separately and atomically (DA2). The ONE entry point for every intake writer: the
 /// `report` verb and the repeated-failure detector (`alerts.rs`, unit T3e). Poison is tolerated.
 pub(crate) fn intake_lock_for(signature: &str) -> std::sync::MutexGuard<'static, ()> {
-    static SHARDS: [Mutex<()>; INTAKE_LOCK_SHARDS] = [const { Mutex::new(()) }; INTAKE_LOCK_SHARDS];
-    SHARDS[intake_shard_of(signature)]
+    INTAKE_SHARDS[intake_shard_of(signature)]
         .lock()
         .unwrap_or_else(|e| e.into_inner())
 }
+
+/// The [`INTAKE_LOCK_SHARDS`] intake mutexes (RULINGS DA3; at module scope since RULINGS FF so that the test probe
+/// [`intake_lock_is_held`] reaches the same mutexes).
+static INTAKE_SHARDS: [Mutex<()>; INTAKE_LOCK_SHARDS] = [const { Mutex::new(()) }; INTAKE_LOCK_SHARDS];
 
 /// Which of the [`INTAKE_LOCK_SHARDS`] intake locks a signature takes (stable within a process).
 pub(crate) fn intake_shard_of(signature: &str) -> usize {
@@ -4274,6 +4277,13 @@ pub(crate) fn intake_shard_of(signature: &str) -> usize {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     signature.hash(&mut h);
     (h.finish() % INTAKE_LOCK_SHARDS as u64) as usize
+}
+
+/// RULINGS FF — tests only: is the intake mutex of `signature` held right now (by anyone, this thread included)?
+/// `try_lock` gives `WouldBlock`; a poisoned mutex that is free is not held.
+#[cfg(test)]
+pub(crate) fn intake_lock_is_held(signature: &str) -> bool {
+    matches!(INTAKE_SHARDS[intake_shard_of(signature)].try_lock(), Err(std::sync::TryLockError::WouldBlock))
 }
 
 /// RULINGS DA1 — what decides a target's class is the FILE, not its spelling. For a target outside

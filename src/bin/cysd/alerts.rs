@@ -1815,7 +1815,7 @@ pub fn flush_defect_intake(daemon: &Arc<Daemon>, root: &std::path::Path, cfg: &A
                 Ok(x) => x,
                 Err(_) => return RowOutcome::Corrupt,
             };
-            let new_row = existing.is_none();
+            let new_row = existing.is_none(); #[cfg(test)] defect_intake_tests::row_section_hook(&row.signature);
             let verdict = intake
                 .share
                 .lock()
@@ -2829,21 +2829,36 @@ mod defect_intake_tests {
         eprintln!("[t3e-dd3] {} texts: {whole} whole (same signature), {cut_n} cut (no row) + the two-boundary UTF-8 case", texts.len());
     }
 
-    /// RULINGS EZ / DO3 / DD4 (J7 I5, T3e round-2 I3) — ONE bounded lock set for both intake writers, proved by a
-    /// synchronized two-writer regression with NO clock: per cycle, two fresh signatures of one qualifying script on
-    /// different lock shards (the flush visits them in signature order — the "free" one first); the contended row
-    /// already exists (count 1, written by the manual report's own writer `intake::record_in`). A reporter thread takes
-    /// `repair::intake_lock_for(contended)`, the detector's flush starts on another thread, and only once the flush has
-    /// written the free row (it is then on its way to the contended one) does the reporter really update the row with
-    /// `record_in`. (a) Exclusion before release: the reporter's own read, still under the lock, shows only its update
-    /// (count 2). (b) Both increments survive: 1 + 1 (reporter) + 5 (detector) = 7. No per-signature lock state is left,
-    /// the set stays 16. (c) The detector's lock IS that set (pinned last — a different lock or none fails the test even
-    /// in a run whose interleaving happened to be harmless).
-    #[test]
-    fn dd4_the_detector_retains_no_lock_per_signature() {
+    /// RULINGS FE1 / FF2 — the test seam INSIDE the detector's row critical section. `flush_defect_intake` calls it from
+    /// ONE `#[cfg(test)]` statement appended to the line right after the row's read (`let new_row =
+    /// existing.is_none();`), before the quota decision and the write: it runs on the detector's own thread while the
+    /// row lock must be held. It acts only on a thread where a test installed a probe (thread-local) — no other test,
+    /// and no other thread, sees it; the product never compiles it.
+    pub(super) fn row_section_hook(sig: &str) {
+        ROW_PROBE.with(|p| {
+            if let Some(probe) = p.borrow().as_ref() {
+                probe(sig);
+            }
+        });
+    }
+
+    thread_local! {
+        static ROW_PROBE: std::cell::RefCell<Option<Box<dyn Fn(&str)>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// One cycle of the two-writer regression (RULINGS EZ, FE1, FE2) — NO clock, NO effect polling. Two fresh
+    /// signatures of one qualifying script on different lock shards; the contended row exists (count 1, written by
+    /// the manual report's own writer `intake::record_in`). The detector's flush runs on its own thread with the probe
+    /// installed there; inside each row section the probe records whether the shared lock of THAT signature is held
+    /// (`repair::intake_lock_is_held`, a try on the same mutex) and what the row holds, then waits for the test's go.
+    /// While the detector waits inside the FREE row's section, a reporter thread really updates the contended row with
+    /// `record_in` under `intake_lock_for` and releases; then the detector goes on to the contended row.
+    /// (a) inside both of the detector's sections the lock of the same signature is HELD — a missing lock, a wrong
+    /// lock and a guard dropped early fail here; (b) the detector read the reporter's update (2) and the row ends at
+    /// 1 + 1 + 5 = 7 — both increments preserved. Failure-aware (FE2): every wait ends with a failure if a worker dies
+    /// (channels whose only sender is the worker's thread-local probe close; workers are joined).
+    fn two_writer_cycle(daemon: &Arc<Daemon>, root: &std::path::Path, cycle: usize) {
         use std::hash::{Hash, Hasher};
-        let daemon = crate::team_gate_tests::tmp_daemon("t3e-dd4", false);
-        let root = tmp_root("dd4");
         let lane = LaneKey::of_socket(&daemon.socket_path);
         let x = bash("python3 ~/.cys/pack/bin/javis_x.py run");
         let report_of = |t: &str| intake::parse_report("bin/javis_x.py", t).unwrap();
@@ -2852,53 +2867,92 @@ mod defect_intake_tests {
             sig.hash(&mut h);
             (h.finish() % crate::repair::INTAKE_LOCK_SHARDS as u64) as usize
         };
-        let intake_keys = || daemon.repair_mutexes.lock().unwrap().keys().filter(|k| k.starts_with("intake:")).count();
+        let texts: Vec<String> = (0..64).map(|i| format!("Exit code 1\nC{cycle}-E{i}: x")).collect();
+        let a = texts[0].clone();
+        let b = texts.iter().find(|t| shard_of(&report_of(t).signature) != shard_of(&report_of(&a).signature)).expect("a second shard").clone();
+        let (free, contended) = if report_of(&a).signature < report_of(&b).signature { (a, b) } else { (b, a) };
+        let (free_rep, cont_rep) = (report_of(&free), report_of(&contended));
+        let cont_path = intake::row_path_in(root, &lane, &cont_rep.signature);
+        assert!(matches!(intake::record_in(root, &lane, &cont_rep, "worker", 100.0, 0, false, &contended).unwrap(), intake::Recorded::New(_)));
+        for t in [&free, &contended] {
+            for _ in 0..5 {
+                observe_tool_event(daemon, &pre(&x));
+                observe_tool_event(daemon, &fail(&x, Some(t.as_str())));
+            }
+        }
+        // the detector, with the in-section probe on ITS thread
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel::<(String, bool, Option<u64>)>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (d, f_root, p_root, p_lane) = (Arc::clone(daemon), root.to_path_buf(), root.to_path_buf(), lane.clone());
+        let flusher = std::thread::spawn(move || {
+            ROW_PROBE.with(|p| {
+                *p.borrow_mut() = Some(Box::new(move |sig: &str| {
+                    let held = crate::repair::intake_lock_is_held(sig);
+                    let count = intake::load_row(&intake::row_path_in(&p_root, &p_lane, sig)).ok().flatten().map(|r| r.count);
+                    if probe_tx.send((sig.to_string(), held, count)).is_ok() {
+                        let _ = go_rx.recv(); // the test's go (Err: the test is gone — go on, never hang)
+                    }
+                }));
+            });
+            flush_defect_intake(&d, &f_root, &AlertConfig::default(), crate::alert_route::Now::at(10.0 + cycle as f64))
+        });
+        // ① the detector is inside the FREE row's section and waits there
+        let first = match probe_rx.recv() {
+            Ok(m) => m,
+            Err(_) => panic!("cycle {cycle}: the flush ended before its first row section: {:?}", flusher.join().map(|r| format!("{r:?}"))),
+        };
+        // ② meanwhile the reporter really updates the contended row under the shared lock, and releases it
+        let (r_root, r_lane, r_rep, r_raw, r_path) = (root.to_path_buf(), lane.clone(), cont_rep.clone(), contended.clone(), cont_path.clone());
+        let reporter = std::thread::spawn(move || {
+            let _row_lock = crate::repair::intake_lock_for(&r_rep.signature);
+            intake::record_in(&r_root, &r_lane, &r_rep, "worker", 200.0, 0, false, &r_raw).unwrap();
+            intake::load_row(&r_path).unwrap().map(|r| r.count)
+        });
+        let reporter_count = reporter.join().unwrap_or_else(|_| panic!("cycle {cycle}: the reporter failed"));
+        // ③ the detector goes on to the contended row and is probed inside that section too
+        let _ = go_tx.send(());
+        let second = match probe_rx.recv() {
+            Ok(m) => m,
+            Err(_) => panic!("cycle {cycle}: the flush ended before the contended row's section: {:?}", flusher.join().map(|r| format!("{r:?}"))),
+        };
+        let _ = go_tx.send(());
+        drop(go_tx);
+        let rep = flusher.join().unwrap_or_else(|_| panic!("cycle {cycle}: the flush failed"));
+        let row = intake::load_row(&cont_path).unwrap().expect("the contended row");
+        assert_eq!(reporter_count, Some(2), "cycle {cycle}: the reporter's update");
+        // (a) exclusion, seen from INSIDE the detector's critical sections
+        assert_eq!((first.0.as_str(), first.1), (free_rep.signature.as_str(), true), "cycle {cycle}: the detector was inside the free row's section WITHOUT that row's lock");
+        assert_eq!((second.0.as_str(), second.1), (cont_rep.signature.as_str(), true), "cycle {cycle}: the detector was inside the contended row's section WITHOUT that row's lock");
+        // (b) both increments preserved
+        assert_eq!(second.2, Some(2), "cycle {cycle}: the detector read the row without the reporter's update");
+        assert_eq!(row.count, 7, "cycle {cycle}: an increment was lost — 1 + 1 (reporter) + 5 (detector) ({rep:?})");
+        assert!(row.reporters.iter().any(|r| r == "worker") && row.reporters.iter().any(|r| r == DETECTOR_REPORTER));
+        assert_eq!((rep.written_new, rep.updated), (1, 1), "cycle {cycle}: {rep:?}");
+    }
+
+    /// RULINGS FE1 / FF2 / EZ / DO3 / DD4 (J7 I5, T3e round-2 I3, round-3) — ONE bounded lock set for both intake
+    /// writers, proved from inside the detector's critical section (`two_writer_cycle`, 3 cycles with fresh
+    /// signatures); no per-signature lock state is left; the set stays 16; the seam sits between the row's read and
+    /// its write; the detector's lock is the report verb's set, chosen as this test chooses the shards.
+    #[test]
+    fn dd4_the_detector_retains_no_lock_per_signature() {
+        let daemon = crate::team_gate_tests::tmp_daemon("t3e-dd4", false);
+        let root = tmp_root("dd4");
         for cycle in 0..3 {
-            let texts: Vec<String> = (0..64).map(|i| format!("Exit code 1\nC{cycle}-E{i}: x")).collect();
-            let a = texts[0].clone();
-            let b = texts.iter().find(|t| shard_of(&report_of(t).signature) != shard_of(&report_of(&a).signature)).expect("a second shard").clone();
-            let (free, contended) = if report_of(&a).signature < report_of(&b).signature { (a, b) } else { (b, a) };
-            let (free_rep, cont_rep) = (report_of(&free), report_of(&contended));
-            let cont_path = intake::row_path_in(&root, &lane, &cont_rep.signature);
-            let free_path = intake::row_path_in(&root, &lane, &free_rep.signature);
-            assert!(matches!(intake::record_in(&root, &lane, &cont_rep, "worker", 100.0, 0, false, &contended).unwrap(), intake::Recorded::New(_)));
-            for t in [&free, &contended] {
-                for _ in 0..5 {
-                    observe_tool_event(&daemon, &pre(&x));
-                    observe_tool_event(&daemon, &fail(&x, Some(t.as_str())));
-                }
-            }
-            let (held_tx, held_rx) = std::sync::mpsc::channel();
-            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-            let (r_root, r_lane, r_rep, r_raw, r_path) = (root.clone(), lane.clone(), cont_rep.clone(), contended.clone(), cont_path.clone());
-            let reporter = std::thread::spawn(move || {
-                let _row_lock = crate::repair::intake_lock_for(&r_rep.signature);
-                held_tx.send(()).unwrap();
-                go_rx.recv().unwrap();
-                intake::record_in(&r_root, &r_lane, &r_rep, "worker", 200.0, 0, false, &r_raw).unwrap();
-                intake::load_row(&r_path).unwrap().map(|r| r.count) // still under the lock
-            });
-            held_rx.recv().unwrap();
-            let (d, f_root) = (Arc::clone(&daemon), root.clone());
-            let flusher = std::thread::spawn(move || {
-                flush_defect_intake(&d, &f_root, &AlertConfig::default(), crate::alert_route::Now::at(10.0 + cycle as f64))
-            });
-            while !free_path.exists() {
-                std::thread::yield_now(); // the flush is past the free row: the contended one is next
-            }
-            go_tx.send(()).unwrap();
-            let under_lock = reporter.join().unwrap();
-            let rep = flusher.join().unwrap();
-            assert_eq!(under_lock, Some(2), "cycle {cycle}: the detector wrote the row while the reporter held its lock");
-            let row = intake::load_row(&cont_path).unwrap().expect("the contended row");
-            assert_eq!(row.count, 7, "cycle {cycle}: an increment was lost — 1 + 1 (reporter) + 5 (detector) ({rep:?})");
-            assert!(row.reporters.iter().any(|r| r == "worker") && row.reporters.iter().any(|r| r == DETECTOR_REPORTER));
-            assert_eq!((rep.written_new, rep.updated), (1, 1), "cycle {cycle}: {rep:?}");
-            assert_eq!(intake_keys(), 0, "cycle {cycle}: per-signature lock state retained");
+            two_writer_cycle(&daemon, &root, cycle);
+            let retained = daemon.repair_mutexes.lock().unwrap().keys().filter(|k| k.starts_with("intake:")).count();
+            assert_eq!(retained, 0, "cycle {cycle}: per-signature lock state retained");
         }
         assert_eq!(crate::repair::INTAKE_LOCK_SHARDS, 16);
-        // (c) the detector's row lock IS the bounded set the report verb uses, chosen the way this test chose the shards
         let src = include_str!("alerts.rs");
+        let flush = src.split("pub fn flush_defect_intake(").nth(1).expect("flush_defect_intake");
+        let flush = &flush[..flush.find("\n}\n").expect("end")];
+        let (read, seam, write) = (
+            flush.find("load_row(&path)").expect("the row's read"),
+            flush.find("let new_row = existing.is_none(); #[cfg(test)] defect_intake_tests::row_section_hook(&row.signature);").expect("the seam"),
+            flush.find("cys::atomic_write_json(&path, &out)").expect("the row's write"),
+        );
+        assert!(read < seam && seam < write, "the seam is not between the row's read and its write");
         let wrm = src.split("fn with_row_mutex<").nth(1).expect("with_row_mutex");
         assert!(wrm[..wrm.find("\n}\n").expect("end")].contains("crate::repair::intake_lock_for(sig)"), "the detector left the bounded lock set");
         let repair = include_str!("repair.rs");
