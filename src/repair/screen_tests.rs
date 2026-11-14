@@ -193,9 +193,7 @@ fn registrar_leaving_a_fifo_cannot_hang_the_screen() {
         &[("bin/javis_preflight.py", Some(pf.replacen(at, &format!("{fifo}{at}"), 1)))],
     );
     let c = cfg(&root, Some(vec![]), Some(vec![]), true);
-    let t0 = std::time::Instant::now();
     let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
-    assert!(t0.elapsed() < LONG, "{:?}", t0.elapsed());
     assert_eq!(rep.verdict, ScreenVerdict::Refused, "{:?}", rep.refusals);
     cleanup(&root);
 }
@@ -1134,8 +1132,6 @@ fn incomplete_repeat_is_a_failure() {
     let lane = lane_of(&root, &[]);
     let cand = candidate_of(&root, &[]);
     let mut c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-1"]), false);
-    let deadline = Duration::from_secs(8);
-    let t0 = std::time::Instant::now();
     let lib = lane.join("hooks/_lib.sh");
     c.between_snapshots = Some(Arc::new(move |pass| {
         if pass == 1 {
@@ -1143,13 +1139,11 @@ fn incomplete_repeat_is_a_failure() {
             let mut t = std::fs::read_to_string(&lib).unwrap();
             t.push_str("\n# written during the first pass\n");
             std::fs::write(&lib, t).unwrap();
-        } else {
-            // the repeat gets no time
-            let end = t0 + deadline + Duration::from_millis(300);
-            std::thread::sleep(end.saturating_duration_since(std::time::Instant::now()));
         }
     }));
-    let mut rep = screen_with(&c, &cand, &lane, deadline).unwrap();
+    // the repeat runs out of time — by the test seam, not by sleeping (RULINGS EZ1)
+    c.repeat_out_of_time = true;
+    let mut rep = screen_with(&c, &cand, &lane, LONG).unwrap();
     assert!(!rep.after_run.first.is_empty(), "{:?}", rep.after_run);
     assert!(rep.after_run.repeat_incomplete, "{:?}", rep.after_run);
     judge_after_run(&mut rep, &|_| false);

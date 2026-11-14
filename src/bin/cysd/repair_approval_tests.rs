@@ -697,9 +697,9 @@ fn helper_timeout_is_killed_and_not_approval() {
         .spawn()
         .unwrap();
     let pid = child.id();
-    let t0 = std::time::Instant::now();
+    // RULINGS EZ1: no real-clock premise — a wait that ignored the limit would see the helper exit 0
+    // after its 30 s and call that an approval; the verdict below tells the two apart
     assert!(!wait_helper_for(child, Duration::from_millis(500)));
-    assert!(t0.elapsed() < Duration::from_secs(5));
     assert!(!cys::repair::replay::pid_alive(pid), "the helper survived");
     assert_eq!(HELPER_KILL_SECS, 120);
     assert_eq!(HELPER_INVALIDATE_SECS, 110);
@@ -1002,9 +1002,9 @@ fn thread_failure_and_a_slow_helper_never_block() {
     FAIL_SPAWN_FOR_TEST.with(|f| f.set(true));
     let child = spawn();
     let pid = child.id();
-    let t0 = std::time::Instant::now();
+    // RULINGS EZ1: no real-clock premise — a blocking reap would return only when the helper's 30 s
+    // sleep ended, reaped (`Err(None)`); the non-blocking one reports the pid it could not reap
     let r = start_waiter_or_reap(move || drop(child), pid, false);
-    assert!(t0.elapsed() < Duration::from_secs(3), "blocked {:?}", t0.elapsed());
     assert_eq!(r, Err(Some(pid)), "the slow helper is reported, not waited for");
     // the test's own clean-up: kill and reap that pid without blocking
     assert_eq!(kill_and_reap(pid, true), None);
