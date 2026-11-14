@@ -194,6 +194,39 @@ pub fn input_fingerprint(candidate: &ScreenCandidate, lane: &Path) -> Result<Str
     Ok(super::types::fingerprint(&lines))
 }
 
+/// RULINGS CZ5: [`input_fingerprint`]'s lines over the inputs as the screen READ them.
+fn fingerprint_of_read(v: &Variants) -> String {
+    let lines: Vec<(String, TargetState)> = v
+        .inputs_read
+        .iter()
+        .map(|(r, c)| (r.clone(), c.state()))
+        .collect();
+    super::types::fingerprint(&lines)
+}
+
+/// RULINGS CZ5 — the verdict to record at `submit` (AY5), or `None`: a refusal is never recorded, and
+/// neither is a verdict whose tested inputs the live lane no longer matches (the lane changed during
+/// the screen — the apply then screens again, as for any verdict that does not hold).
+pub fn recordable_verdict(
+    report: &ScreenReport,
+    candidate: &ScreenCandidate,
+    lane: &Path,
+) -> Result<Option<RecordedVerdict>, RepairError> {
+    if report.verdict == ScreenVerdict::Refused
+        || report.input_fingerprint != input_fingerprint(candidate, lane)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(RecordedVerdict {
+        schema: SCREEN_SCHEMA,
+        verdict: report.verdict,
+        input_fingerprint: report.input_fingerprint.clone(),
+        build_id: report.build_id.clone(),
+        notes: report.notes.clone(),
+        at: super::ledger::now_epoch(),
+    }))
+}
+
 /// The screen's build id (BD5): a recorded verdict with another build id is never reused.
 pub fn screen_build_id() -> String {
     // the embedded pack's hash ties the id to the RELEASED copies the screen compares against (a
@@ -349,6 +382,8 @@ pub(crate) struct ScreenConfig {
     pub threads: usize,
     /// Cap of one child's wall time.
     pub child_cap: Duration,
+    /// Test seam (RULINGS CZ5): runs right after the inputs were read, before any probe.
+    pub after_inputs_read: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ScreenConfig {
@@ -366,6 +401,7 @@ impl ScreenConfig {
                 .unwrap_or(2)
                 .clamp(1, 8),
             child_cap: Duration::from_secs(30),
+            after_inputs_read: None,
         }
     }
 
@@ -432,6 +468,9 @@ struct Variants {
     attribution: Files,
     /// The candidate's targets that are inputs, and whether each is byte-equal to RELEASED (BG1).
     touched: BTreeMap<String, bool>,
+    /// RULINGS CZ5: every input as the screen READ it — the candidate's content for a target, else
+    /// the lane's live content — the immutable inputs the recorded fingerprint is computed from.
+    inputs_read: Files,
 }
 
 fn group_key(f: &Files) -> String {
@@ -483,10 +522,15 @@ fn build_variants(
         clean: Files::new(),
         attribution: Files::new(),
         touched: BTreeMap::new(),
+        inputs_read: Files::new(),
     };
     for rel in rels {
         let released = (cfg.released)(rel).unwrap_or(LaidSource::Absent);
         let live = LaidSource::read(&lane.join(rel))?;
+        v.inputs_read.insert(
+            rel.clone(),
+            over.get(rel).cloned().unwrap_or_else(|| live.clone()),
+        );
         if SAME_FOR_ALL.contains(&rel.as_str()) {
             for f in [
                 &mut v.released,
@@ -2318,7 +2362,11 @@ pub(crate) fn screen_with(
     let inputs = inputs_by_test()?;
     let rels = all_input_rels()?;
     let v = build_variants(cfg, cand, lane, &rels)?;
-    let fingerprint = input_fingerprint(cand, lane)?;
+    // RULINGS CZ5: the fingerprint of the inputs the probes run on — never a second live read
+    let fingerprint = fingerprint_of_read(&v);
+    if let Some(hook) = &cfg.after_inputs_read {
+        hook();
+    }
     // the scoped after-run comparison (BK1): before
     let settings = replay::real_settings_targets(lane, &cfg.real_home);
     let before = replay::live_snapshot(lane, &settings);

@@ -857,6 +857,45 @@ fn i3_refuses_registrar_writing_another_hook_type() {
     );
 }
 
+/// RULINGS CZ5: the recorded fingerprint is the fingerprint of the inputs the probes ran on — a lane
+/// change made after the inputs were read (the seam runs right then) does not enter it; the verdict
+/// is then neither recordable (the live lane no longer matches) nor reusable.
+#[test]
+fn verdict_is_bound_to_the_inputs_tested() {
+    let root = test_root("cz5");
+    let lane = lane_of(&root, &[]);
+    let cand = candidate_of(&root, &[]);
+    let before = input_fingerprint(&cand, &lane).unwrap();
+    let mut c = cfg(&root, Some(vec![]), Some(vec![]), false);
+    let lib = lane.join("hooks/_lib.sh");
+    let lib2 = lib.clone();
+    c.after_inputs_read = Some(Arc::new(move || {
+        let mut t = std::fs::read_to_string(&lib2).unwrap();
+        t.push_str("\n# changed while the screen runs\n");
+        std::fs::write(&lib2, t).unwrap();
+    }));
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    assert_eq!(rep.input_fingerprint, before, "the fingerprint of what was read");
+    assert_ne!(input_fingerprint(&cand, &lane).unwrap(), before, "the lane did change");
+    assert!(recordable_verdict(&rep, &cand, &lane).unwrap().is_none(), "not recorded");
+    let rv = RecordedVerdict {
+        schema: SCREEN_SCHEMA,
+        verdict: rep.verdict,
+        input_fingerprint: rep.input_fingerprint.clone(),
+        build_id: rep.build_id.clone(),
+        notes: vec![],
+        at: 0.0,
+    };
+    assert!(!recorded_verdict_holds(&rv, &cand, &lane).unwrap(), "not reused");
+    // unchanged lane: recordable
+    let _ = lib;
+    let mut c2 = cfg(&root, Some(vec![]), Some(vec![]), false);
+    c2.after_inputs_read = None;
+    let rep2 = screen_with(&c2, &cand, &lane, LONG).unwrap();
+    assert!(recordable_verdict(&rep2, &cand, &lane).unwrap().is_some());
+    cleanup(&root);
+}
+
 /// I4: a candidate guard.sh whose backstop region differs from the released copy → REFUSED; a
 /// candidate whose region anchor is gone → REFUSED; a lane whose own copy differs and a candidate
 /// that does not touch guard.sh → a lane finding (BA4).
