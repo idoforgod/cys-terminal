@@ -1490,6 +1490,9 @@ class CrashProperty(Rig):
     def module(self, mode):
         ns = {"__name__": "ceo_py_property"}
         exec(self.code(), ns)
+        # 이름에 든 UTC 초를 고정한다 — 두 입구가 같은 초에 들었는지에 따라 이름 찾기 횟수(원시 연산 수)가 달라지면 계획한 호출
+        #   번호가 실행마다 밀린다(완전한 곱이 찾았다). 이름의 유일함은 초가 아니라 잠금 안의 존재 확인이 지킨다.
+        ns["stamp"] = lambda: "20260101T000000Z"
         if mode == "deposit":
             ns["exchange_fn"] = lambda: None
         ns["_MODE"][os.path.dirname(os.path.abspath(self.md))] = mode   # 방법 시험은 이 시나리오의 경로로 고정
