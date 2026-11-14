@@ -67,6 +67,18 @@ pub enum Point {
     AfterFirstMove,
     /// Everything done except closing the record.
     BeforeDone,
+    /// CT1 — inside the seal: the temporary entry exists (nothing written / a clone just made).
+    InSealCreated,
+    /// CT1 — inside the byte-copy seal: about half of the bytes written.
+    InSealPartial,
+    /// CT1 — inside the seal: complete and flushed, not yet placed under `sealed/<basename>`.
+    InSealWritten,
+    /// CT1 — inside the seal: placed, the folder not yet flushed.
+    InSealPlaced,
+    /// CT1 — inside the publication of `meta/sealed.json`: about half written.
+    InMetaPartial,
+    /// CT1 — `meta/sealed.json` complete and flushed, not yet placed.
+    InMetaWritten,
 }
 
 /// Fault injection (tests). `at` returns `true` to make the operation stop right there as if the
@@ -242,25 +254,10 @@ fn incoming_copy(
     Ok(p)
 }
 
-/// Writes a NEW file (never over anything) with exactly this mode, fully flushed.
+/// Writes a NEW file (never over anything) with exactly this mode, fully flushed — published
+/// complete (CT1: a temporary entry in the same folder, a full flush, a no-replace placement).
 pub fn write_new(p: &Path, bytes: &[u8], mode: u32) -> Result<(), RepairError> {
-    use std::io::Write;
-    let io = |e: std::io::Error| RepairError::Io(format!("{}: {e}", p.display()));
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(p)
-        .map_err(io)?;
-    f.write_all(bytes).map_err(io)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
-            .map_err(io)?;
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
-    super::durable::full_flush_file(&f).map_err(io)
+    vault::publish_new(p, bytes, mode)
 }
 
 /// The seal right after an exchange / deposit move (M2). Only a test's fault hook (a no-op call
@@ -269,7 +266,40 @@ fn seal_now(env: &OpEnv<'_>, slot: &Slot, live: &Path) -> Result<(), RepairError
     if env.faults.at(Point::AfterExchange, live, Some(slot)) {
         return Err(stop(Point::AfterExchange));
     }
-    vault::seal(slot)
+    seal_hooked(env, slot, live)
+}
+
+/// The seal with the test's crash points inside it (CT1).
+fn seal_hooked(env: &OpEnv<'_>, slot: &Slot, live: &Path) -> Result<(), RepairError> {
+    vault::seal_with(slot, &mut |step| {
+        let point = match step {
+            vault::PublishStep::Created => Point::InSealCreated,
+            vault::PublishStep::Partial => Point::InSealPartial,
+            vault::PublishStep::Written => Point::InSealWritten,
+            vault::PublishStep::Placed => Point::InSealPlaced,
+        };
+        if env.faults.at(point, live, Some(slot)) {
+            Err(stop(point))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+/// `meta/sealed.json` with the test's crash points inside its publication (CT1).
+fn finish_seal_hooked(env: &OpEnv<'_>, slot: &Slot, live: &Path) -> Result<vault::SealFacts, RepairError> {
+    vault::finish_seal_with(slot, env.now, &mut |step| {
+        let point = match step {
+            vault::PublishStep::Partial => Point::InMetaPartial,
+            vault::PublishStep::Written => Point::InMetaWritten,
+            _ => return Ok(()),
+        };
+        if env.faults.at(point, live, Some(slot)) {
+            Err(stop(point))
+        } else {
+            Ok(())
+        }
+    })
 }
 
 fn flush_parents(live: &Path, slot: &Slot) -> Result<(), RepairError> {
@@ -464,7 +494,7 @@ fn after_seal_exchange(
     depth: u8,
 ) -> Result<OpDone, RepairError> {
     flush_parents(live, slot)?;
-    let facts = vault::finish_seal(slot, env.now)?;
+    let facts = finish_seal_hooked(env, slot, live)?;
     wal::set_step(env.root, rec, "sealed", env.now)?;
     if env.faults.at(Point::AfterSeal, live, Some(slot)) {
         return Err(stop(Point::AfterSeal));
@@ -610,7 +640,7 @@ fn after_seal_move_in(
     depth: u8,
 ) -> Result<OpDone, RepairError> {
     flush_parents(live, slot)?;
-    let facts = vault::finish_seal(slot, env.now)?;
+    let facts = finish_seal_hooked(env, slot, live)?;
     wal::set_step(env.root, rec, "sealed", env.now)?;
     if env.faults.at(Point::AfterSeal, live, Some(slot)) {
         return Err(stop(Point::AfterSeal));
@@ -784,7 +814,7 @@ fn op_deposit_first(
     }
     seal_now(env, &slot, live)?;
     flush_parents(live, &slot)?;
-    vault::finish_seal(&slot, env.now)?;
+    finish_seal_hooked(env, &slot, live)?;
     wal::set_step(env.root, &mut rec, "moved", env.now)?;
     if env.faults.at(Point::AfterFirstMove, live, Some(&slot)) {
         return Err(stop(Point::AfterFirstMove));
@@ -842,7 +872,18 @@ fn second_move(
     if let Some(c) = &rec.incoming_copy {
         let _ = std::fs::remove_file(c);
     }
-    let note = match vault::deposit_of(slot) {
+    // CT1: the sealed deposit, else the moved-in payload itself when its hash is the one the record
+    // took of the live entry before the move (never a copy whose bytes nothing vouches for)
+    let deposit = vault::deposit_of(slot).or_else(|e| {
+        let want = rec.live_identity.as_ref().map(|i| i.sha256.clone());
+        match TargetState::read(&slot.payload()) {
+            Ok(st @ TargetState::File { .. }) if want.is_some() && matches!(&st, TargetState::File { sha256, .. } if Some(sha256) == want.as_ref()) => {
+                Ok((st, slot.payload()))
+            }
+            _ => Err(e),
+        }
+    });
+    let note = match deposit {
         Ok((st, holder)) => {
             let back = OpSpec {
                 id: rec.repair.clone(),
@@ -898,9 +939,18 @@ pub fn resume_op(env: &OpEnv<'_>, mut rec: OpRecord) -> Result<OpDone, RepairErr
             };
             let payload_entry = entry_identity(&slot.payload()).ok();
             if live_entry.as_ref().is_some_and(|e| same_entry(&staged, e)) {
-                // the exchange happened: seal what is found (M2 recovery), then step 4
-                vault::seal(&slot)?;
-                after_seal_exchange(env, &spec, &mut rec, &slot, &live, 0)
+                // the exchange happened: seal what is found (M2 recovery; CT1 — an unfinished
+                // temporary seal is discarded, a published one must agree with its record), then step 4
+                match seal_hooked(env, &slot, &live) {
+                    Err(RepairError::Superseded(m)) => {
+                        return supersede(&mut rec, &format!("봉인 사본이 기록과 맞지 않습니다 — 더 바꾸지 않고 워커 검토({m})"))
+                    }
+                    r => r?,
+                }
+                match after_seal_exchange(env, &spec, &mut rec, &slot, &live, 0) {
+                    Err(RepairError::Superseded(m)) => supersede(&mut rec, &format!("봉인 기록이 맞지 않습니다 — 더 바꾸지 않고 워커 검토({m})")),
+                    r => r,
+                }
             } else if payload_entry.as_ref().is_some_and(|e| same_entry(&staged, e)) {
                 abandon(&mut rec, "맞바꾸기 전에 끊긴 동작 — 살아 있는 파일은 바뀌지 않았습니다(그만둠)")
             } else {
@@ -911,7 +961,12 @@ pub fn resume_op(env: &OpEnv<'_>, mut rec: OpRecord) -> Result<OpDone, RepairErr
             let Some(slot) = slot else {
                 return supersede(&mut rec, "기록이 불완전합니다(칸 없음) — 워커 검토");
             };
-            let facts = vault::finish_seal(&slot, env.now)?;
+            let facts = match finish_seal_hooked(env, &slot, &live) {
+                Err(RepairError::Superseded(m)) => {
+                    return supersede(&mut rec, &format!("봉인 기록이 맞지 않습니다 — 더 바꾸지 않고 워커 검토({m})"))
+                }
+                r => r?,
+            };
             step4(env, &spec, &mut rec, &slot, &live, &facts.sealed_state, 0)
         }
         ("move-in", "staged") | ("deposit-first", "staged") => {
@@ -920,12 +975,41 @@ pub fn resume_op(env: &OpEnv<'_>, mut rec: OpRecord) -> Result<OpDone, RepairErr
             };
             let payload_entry = entry_identity(&slot.payload()).ok();
             if payload_entry.as_ref().is_some_and(|e| same_entry(&was, e)) {
-                vault::seal(&slot)?;
+                // CT1: an unfinished temporary seal is discarded; a published seal or record that
+                // disagrees is never blessed — the deposit-first form then abandons (OQ-D8) and puts
+                // back a copy only of bytes the record vouches for
+                let sealed_ok = match seal_hooked(env, &slot, &live) {
+                    Err(RepairError::Superseded(_)) => false,
+                    r => {
+                        r?;
+                        true
+                    }
+                };
                 if rec.form == "move-in" {
-                    after_seal_move_in(env, &spec, &mut rec, &slot, &live, 0)
+                    if !sealed_ok {
+                        return supersede(&mut rec, "봉인 사본이 기록과 맞지 않습니다 — 더 바꾸지 않고 워커 검토");
+                    }
+                    match after_seal_move_in(env, &spec, &mut rec, &slot, &live, 0) {
+                        Err(RepairError::Superseded(m)) => supersede(&mut rec, &format!("봉인 기록이 맞지 않습니다 — 더 바꾸지 않고 워커 검토({m})")),
+                        r => r,
+                    }
                 } else {
                     flush_parents(&live, &slot)?;
-                    vault::finish_seal(&slot, env.now)?;
+                    let meta_ok = sealed_ok
+                        && match finish_seal_hooked(env, &slot, &live) {
+                            Err(RepairError::Superseded(_)) => false,
+                            r => {
+                                r?;
+                                true
+                            }
+                        };
+                    if !meta_ok {
+                        // the copy is never placed (its deposit is not vouched for): abandon
+                        if let Some(c) = rec.incoming_copy.take() {
+                            let _ = std::fs::remove_file(&c);
+                        }
+                        rec.incoming_copy_identity = None;
+                    }
                     wal::set_step(env.root, &mut rec, "moved", env.now)?;
                     second_move(env, &mut rec, &slot, &live)
                 }

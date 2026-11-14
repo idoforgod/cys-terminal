@@ -9,6 +9,14 @@
 //! the staged payload (exact mode, fresh mtime — E2/E3) and `meta/pre.json`, all fully flushed — and
 //! then moved under its `<시각>` name with a no-replace rename; so a crash never leaves a half-made
 //! slot directory (the temporary sibling is not a slot and holds no displaced bytes).
+//!
+//! RULINGS CT1 — nothing in the vault is trusted because it exists: every entry written INTO a
+//! named slot afterwards (the seal `sealed/<basename>`, `meta/sealed.json`) and every non-slot copy
+//! the engine later reads as authoritative (an incoming copy) is written under a temporary name in
+//! the SAME directory (`.<name>.part-<pid>-<ns>`), fully flushed, and only then placed under its
+//! final name by a no-replace placement ([`publish_with`]). Recovery discards an unfinished temporary
+//! entry and never blesses a published seal by its presence alone: the hash recorded in
+//! `meta/sealed.json` is compared wherever it exists.
 
 use super::durable::{full_flush_dir, full_flush_file};
 use super::types::{LaneKey, RepairError, RepairId, TargetState};
@@ -115,6 +123,192 @@ fn create_new_with(path: &Path, bytes: &[u8], mode: u32) -> Result<(), RepairErr
     #[cfg(not(unix))]
     let _ = mode;
     full_flush_file(&f).map_err(|e| io(path, e))
+}
+
+/// The steps inside one publication (CT1) — where a test injects a crash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishStep {
+    /// The temporary entry exists, nothing written yet.
+    Created,
+    /// About half of the bytes are written.
+    Partial,
+    /// Every byte written and fully flushed; not yet placed.
+    Written,
+    /// Placed under the final name; the directory not yet flushed.
+    Placed,
+}
+
+/// A step hook: `Err` = stop right there (a test's simulated crash — the temporary entry is left
+/// exactly as a crash would leave it).
+pub type PublishHook<'a> = dyn FnMut(PublishStep) -> Result<(), RepairError> + 'a;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: take the byte-copy seal path even where `clonefile` exists (the path Windows and
+    /// every volume without copy-on-write always take — CT1's property test).
+    pub(crate) static FORCE_BYTE_COPY_SEAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn force_byte_copy() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_BYTE_COPY_SEAL.with(|c| c.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// The temporary name of `final_path` in its own directory (`.<name>.part-<pid>-<ns>`).
+pub fn temp_sibling(final_path: &Path) -> PathBuf {
+    let name = final_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("entry");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    final_path.with_file_name(format!(".{name}.part-{}-{nanos}", std::process::id()))
+}
+
+/// Whether a directory entry name is one of our temporary entries (`.<name>.part-<pid>-<ns>`,
+/// `.building-<pid>-<ns>`, `.screen-<pid>-<op>`) and the pid that made it.
+pub fn temp_owner_pid(name: &str) -> Option<u32> {
+    if !name.starts_with('.') {
+        return None;
+    }
+    let tail = if let Some(i) = name.rfind(".part-") {
+        &name[i + ".part-".len()..]
+    } else if let Some(t) = name.strip_prefix(".building-") {
+        t
+    } else if let Some(t) = name.strip_prefix(".screen-") {
+        t
+    } else {
+        return None;
+    };
+    tail.split('-').next()?.parse().ok()
+}
+
+/// CT1: writes `bytes` (exactly this mode) to `final_path`, which must not exist: a temporary entry
+/// in the same directory, every byte, a full flush, a no-replace placement, a directory flush. A
+/// hook error is returned at once (the temporary entry stays as a crash leaves it); any other
+/// failure removes our temporary entry. `Superseded` = something already holds the final name.
+pub fn publish_with(
+    final_path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    hook: &mut PublishHook<'_>,
+) -> Result<(), RepairError> {
+    use std::io::Write;
+    let tmp = temp_sibling(final_path);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| io(&tmp, e))?;
+    let cleanup = |e: RepairError| {
+        let _ = std::fs::remove_file(&tmp); // our own unfinished temporary entry — never a slot entry
+        e
+    };
+    hook(PublishStep::Created)?;
+    let half = bytes.len() / 2;
+    f.write_all(&bytes[..half]).map_err(|e| cleanup(io(&tmp, e)))?;
+    hook(PublishStep::Partial)?;
+    f.write_all(&bytes[half..]).map_err(|e| cleanup(io(&tmp, e)))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
+            .map_err(|e| cleanup(io(&tmp, e)))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    full_flush_file(&f).map_err(|e| cleanup(io(&tmp, e)))?;
+    drop(f);
+    hook(PublishStep::Written)?;
+    super::exchange::place_no_replace(&tmp, final_path).map_err(cleanup)?;
+    hook(PublishStep::Placed)?;
+    match final_path.parent() {
+        Some(d) => full_flush_dir(d),
+        None => Ok(()),
+    }
+}
+
+/// [`publish_with`] without a hook.
+pub fn publish_new(final_path: &Path, bytes: &[u8], mode: u32) -> Result<(), RepairError> {
+    publish_with(final_path, bytes, mode, &mut |_| Ok(()))
+}
+
+/// Removes our temporary entries left in ONE directory by an interrupted publication (CT1 —
+/// recovery discards an incomplete temporary entry). Only `.…part-…` names; never anything else.
+fn discard_temps_in(dir: &Path) {
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') && name.contains(".part-") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        if pid == 0 || pid > i32::MAX as u32 {
+            return false;
+        }
+        // SAFETY: signal 0 only checks the existence of the process.
+        let rc = unsafe { libc::kill(pid as i32, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true // never remove another process's temporary entry where liveness is not checked
+    }
+}
+
+/// The start pass's sweep (CT1, CT12, CU4): temporary entries — `.building-*` slot siblings,
+/// `.…part-*` publications, `.screen-*` views — whose making process is gone are removed from every
+/// repair's vault folder under `root` (and `root/.scratch`, the control copies). Never a slot, never
+/// an entry of a live process. Returns what was removed.
+pub fn sweep_stale_temps(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root.join("displaced"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    dirs.push(root.join(".scratch"));
+    for d in dirs {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let stale = match temp_owner_pid(&name) {
+                Some(pid) => !pid_alive(pid),
+                // `.scratch/<op>` control copies carry no pid: stale when older than a day
+                None => d.ends_with(".scratch")
+                    && e.metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age.as_secs() > 86_400),
+            };
+            if stale {
+                let p = e.path();
+                let removed = if p.is_dir() {
+                    std::fs::remove_dir_all(&p).is_ok()
+                } else {
+                    std::fs::remove_file(&p).is_ok()
+                };
+                if removed {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Reads a regular file without following a link (the source of a staged copy is read ONCE).
@@ -242,13 +436,24 @@ pub fn build_slot(
 /// H1 / M2 — THE SEAL: a copy-on-write clone (`clonefile`; a byte copy where unavailable) of the
 /// displaced entry `payload/<basename>` to `sealed/<basename>`. Called as the very FIRST filesystem
 /// operation after an exchange or a deposit move returns (no flush, no hash, no record update in
-/// between — the flushes follow). A link payload has nothing to seal (interpretation 30). Recovery
-/// after a crash seals what it finds; an existing sealed copy is never rewritten (write-once).
+/// between — the flushes follow). A link payload has nothing to seal (interpretation 30).
+///
+/// CT1: the clone or the byte copy is made under a temporary name in `sealed/`, fully flushed, and
+/// placed under `sealed/<basename>` by a no-replace placement — a crash never leaves a partial seal
+/// under the final name. Recovery first discards an unfinished temporary entry; an existing sealed
+/// copy is never rewritten and is accepted only when it agrees with the hash recorded in
+/// `meta/sealed.json` (where that exists).
 pub fn seal(slot: &Slot) -> Result<(), RepairError> {
+    seal_with(slot, &mut |_| Ok(()))
+}
+
+/// [`seal`] with a step hook (tests inject crashes inside the seal).
+pub fn seal_with(slot: &Slot, hook: &mut PublishHook<'_>) -> Result<(), RepairError> {
     let payload = slot.payload();
     let sealed = slot.sealed();
+    discard_temps_in(&slot.dir.join("sealed"));
     if std::fs::symlink_metadata(&sealed).is_ok() {
-        return Ok(());
+        return verify_published_seal(slot);
     }
     let m = match std::fs::symlink_metadata(&payload) {
         Ok(m) => m,
@@ -258,18 +463,33 @@ pub fn seal(slot: &Slot) -> Result<(), RepairError> {
         return Ok(());
     }
     #[cfg(target_os = "macos")]
-    {
+    if !force_byte_copy() {
         use std::os::unix::ffi::OsStrExt;
+        let tmp = temp_sibling(&sealed);
         let cs = std::ffi::CString::new(payload.as_os_str().as_bytes())
             .map_err(|_| io(&payload, "NUL in path"))?;
-        let cd = std::ffi::CString::new(sealed.as_os_str().as_bytes())
-            .map_err(|_| io(&sealed, "NUL in path"))?;
+        let cd = std::ffi::CString::new(tmp.as_os_str().as_bytes())
+            .map_err(|_| io(&tmp, "NUL in path"))?;
         // SAFETY: two NUL-terminated paths alive for the call; CLONE_NOFOLLOW = 0x0001.
         if unsafe { libc::clonefile(cs.as_ptr(), cd.as_ptr(), 0x0001) } == 0 {
-            return Ok(());
+            hook(PublishStep::Created)?;
+            let flushed = std::fs::File::open(&tmp)
+                .and_then(|f| full_flush_file(&f))
+                .map_err(|e| io(&tmp, e));
+            if let Err(e) = flushed {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+            hook(PublishStep::Written)?;
+            if let Err(e) = super::exchange::place_no_replace(&tmp, &sealed) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+            hook(PublishStep::Placed)?;
+            return full_flush_dir(&slot.dir.join("sealed"));
         }
     }
-    // no copy-on-write here: a byte copy made the same way (create_new — never over anything)
+    // no copy-on-write here: a byte copy published the same way (temporary entry → flush → place)
     let bytes = std::fs::read(&payload).map_err(|e| io(&payload, e))?;
     #[cfg(unix)]
     let mode = {
@@ -278,7 +498,39 @@ pub fn seal(slot: &Slot) -> Result<(), RepairError> {
     };
     #[cfg(not(unix))]
     let mode = 0u32;
-    create_new_with(&sealed, &bytes, mode)
+    publish_with(&sealed, &bytes, mode, hook)
+}
+
+/// A published seal agrees with the hash `meta/sealed.json` recorded for it (when recorded).
+fn verify_published_seal(slot: &Slot) -> Result<(), RepairError> {
+    let meta = slot.meta_sealed();
+    if std::fs::symlink_metadata(&meta).is_err() {
+        return Ok(()); // placed only when complete (CT1); its hash is recorded next
+    }
+    let recorded = read_sealed_meta(slot)?;
+    if let Some(want) = recorded.get("sealed_sha256").and_then(|v| v.as_str()) {
+        match TargetState::read(&slot.sealed())? {
+            TargetState::File { sha256, .. } if sha256 == want => {}
+            _ => {
+                return Err(RepairError::Superseded(format!(
+                    "{}: 봉인 사본이 기록된 해시와 다릅니다",
+                    slot.sealed().display()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `meta/sealed.json`, parsed (an unreadable one is never blessed: `Superseded`).
+fn read_sealed_meta(slot: &Slot) -> Result<serde_json::Value, RepairError> {
+    let meta = slot.meta_sealed();
+    std::fs::read(&meta)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .ok_or_else(|| {
+            RepairError::Superseded(format!("{}: 봉인 기록을 읽을 수 없습니다", meta.display()))
+        })
 }
 
 /// The post-seal facts written once into `meta/sealed.json` (K8 / L3).
@@ -294,8 +546,14 @@ pub struct SealFacts {
 /// hash of the payload recorded in the write-once `meta/sealed.json`. An existing `sealed.json`
 /// (recovery) is read back, never rewritten.
 pub fn finish_seal(slot: &Slot, now: f64) -> Result<SealFacts, RepairError> {
+    finish_seal_with(slot, now, &mut |_| Ok(()))
+}
+
+/// [`finish_seal`] with a step hook for the publication of `meta/sealed.json` (tests).
+pub fn finish_seal_with(slot: &Slot, now: f64, hook: &mut PublishHook<'_>) -> Result<SealFacts, RepairError> {
     let sealed = slot.sealed();
     let payload = slot.payload();
+    discard_temps_in(&slot.dir.join("meta"));
     let (sealed_state, sealed_sha) = if std::fs::symlink_metadata(&sealed).is_ok() {
         if let Ok(f) = std::fs::File::open(&sealed) {
             full_flush_file(&f).map_err(|e| io(&sealed, e))?;
@@ -312,7 +570,17 @@ pub fn finish_seal(slot: &Slot, now: f64) -> Result<SealFacts, RepairError> {
         (TargetState::read(&payload)?, None)
     };
     let meta = slot.meta_sealed();
-    if std::fs::symlink_metadata(&meta).is_err() {
+    if std::fs::symlink_metadata(&meta).is_ok() {
+        // recovery: the record is read back and must agree with the sealed copy (never rewritten)
+        let recorded = read_sealed_meta(slot)?;
+        let want = recorded.get("sealed_sha256").and_then(|v| v.as_str()).map(str::to_string);
+        if want != sealed_sha {
+            return Err(RepairError::Superseded(format!(
+                "{}: 봉인 기록이 봉인 사본과 다릅니다",
+                meta.display()
+            )));
+        }
+    } else {
         let slot_now = match TargetState::read(&payload)? {
             TargetState::File { sha256, .. } => serde_json::json!(sha256),
             TargetState::Link { target } => serde_json::json!(format!("link:{target}")),
@@ -331,8 +599,7 @@ pub fn finish_seal(slot: &Slot, now: f64) -> Result<SealFacts, RepairError> {
         });
         let mut bytes = serde_json::to_vec_pretty(&v).map_err(|e| RepairError::Io(e.to_string()))?;
         bytes.push(b'\n');
-        create_new_with(&meta, &bytes, 0o644)?;
-        full_flush_dir(&slot.dir.join("meta"))?;
+        publish_with(&meta, &bytes, 0o644, hook)?;
     }
     Ok(SealFacts {
         sealed_sha256: sealed_sha,

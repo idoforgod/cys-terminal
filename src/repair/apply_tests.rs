@@ -146,11 +146,47 @@ struct Inject {
     /// bytes that were live right after the injected writer wrote
     wrote_live: RefCell<Option<Vec<u8>>>,
     pack: PathBuf,
+    /// CU3: after the action fired, stop at this point of a NESTED operation (another slot than the
+    /// first one seen) — a crash inside the undo of a superseded exchange.
+    then_stop_at: Option<Point>,
+    outer_slot: RefCell<Option<PathBuf>>,
+    stopped_nested: Cell<bool>,
+}
+
+impl Inject {
+    fn new(point: Point, action: Action, held: Option<std::fs::File>, pack: &Path) -> Inject {
+        Inject {
+            point,
+            action,
+            fired: Cell::new(false),
+            held: RefCell::new(held),
+            wrote_live: RefCell::new(None),
+            pack: pack.to_path_buf(),
+            then_stop_at: None,
+            outer_slot: RefCell::new(None),
+            stopped_nested: Cell::new(false),
+        }
+    }
 }
 
 impl Faults for Inject {
-    fn at(&self, point: Point, live: &Path, _slot: Option<&Slot>) -> bool {
-        if point != self.point || self.fired.get() {
+    fn at(&self, point: Point, live: &Path, slot: Option<&Slot>) -> bool {
+        if let Some(s) = slot {
+            if self.outer_slot.borrow().is_none() {
+                *self.outer_slot.borrow_mut() = Some(s.dir.clone());
+            }
+        }
+        if self.fired.get() {
+            if let (Some(p), Some(s)) = (self.then_stop_at, slot) {
+                let nested = self.outer_slot.borrow().as_ref() != Some(&s.dir);
+                if p == point && nested && !self.stopped_nested.get() {
+                    self.stopped_nested.set(true);
+                    return true;
+                }
+            }
+            return false;
+        }
+        if point != self.point {
             return false;
         }
         self.fired.set(true);
@@ -207,133 +243,215 @@ fn make_state(r: &Rig, name: &str, spec: Option<(&[u8], u32, Option<&str>)>) -> 
     }
 }
 
-/// THE property (RULINGS K3 SA:120, C2 2.4): for every operation × injected point × action, after
-/// the operation and the recovery the next job run performs: (P1) every byte string that was live
-/// at the instant of an exchange / move is in the vault — the one stated residual is a write
-/// through an old descriptor in the instant between the exchange and the seal (G7 as reworded by
-/// M2), which is then part of the deposit; (P2) no slot directory that existed is gone and every
-/// slot is complete (O5 — never half-made); (P3) the live path is absent only for the move-in
-/// operation; (P4) every operation record is finished.
+/// THE property (RULINGS K3 SA:120, C2 2.4; CT1, CU3): for every operation × injected point ×
+/// action — the points include crashes INSIDE the seal and inside `meta/sealed.json` (CT1), on the
+/// byte-copy path as well as the clone path, a crash inside the nested undo of a superseded
+/// exchange, and a SECOND crash during the recovery (CU3) — after the operation and the recoveries
+/// the next job runs perform: (P0, CU3) the LIVE content is exactly one of the legitimate versions
+/// (the old bytes, the incoming state, a concurrent writer's bytes, the old bytes plus an old
+/// descriptor's write in the stated residual instant, or absent where a target state is absent) —
+/// never a truncated or foreign copy; (P1) every byte string that was live at the instant of an
+/// exchange / move is in the vault or live; (P2) no slot directory that existed is gone, every slot
+/// is complete (O5), no temporary entry (`.part-`) is left in a slot, and every published seal
+/// agrees with its record (CT1); (P3) the live path is absent only where a target state is absent;
+/// (P4) every operation record is finished.
 #[test]
 fn rule_one_property_every_op_every_point() {
     let points = [
         Point::AfterSlot,
         Point::AfterRecord,
         Point::AfterExchange,
+        Point::InSealCreated,
+        Point::InSealPartial,
+        Point::InSealWritten,
+        Point::InSealPlaced,
+        Point::InMetaPartial,
+        Point::InMetaWritten,
         Point::AfterSeal,
         Point::AfterFirstMove,
         Point::BeforeDone,
     ];
+    let inside_seal = |p: Point| {
+        matches!(
+            p,
+            Point::InSealCreated | Point::InSealPartial | Point::InSealWritten | Point::InSealPlaced | Point::InMetaPartial | Point::InMetaWritten
+        )
+    };
     let mut combos = 0;
+    let mut fired_inside_seal = 0;
     for case in CASES {
         for point in points {
             if point == Point::AfterFirstMove && case.form != ApplyForm::DepositFirst {
                 continue;
             }
-            for action in [
-                Action::Stop,
-                Action::ReplaceLive(b"OTHER-WRITER\n".to_vec()),
-                Action::OldFd(b"+late".to_vec()),
-                Action::BumpGeneration,
-            ] {
-                combos += 1;
-                let r = rig(&format!("prop-{}-{combos}", case.name));
-                let (expected, live_bytes) = match case.before {
-                    Some((b, m, None)) => (r.put(case.rel, b, m), Some(b.to_vec())),
-                    Some((_, _, Some(_))) => unreachable!(),
-                    None => (TargetState::Absent, None),
-                };
-                let (incoming, source) = make_state(&r, "incoming", case.incoming);
-                let held = live_bytes.as_ref().map(|_| {
-                    std::fs::OpenOptions::new().append(true).open(r.pack.join(case.rel)).unwrap()
-                });
-                let inj = Inject {
-                    point,
-                    action: action.clone(),
-                    fired: Cell::new(false),
-                    held: RefCell::new(held),
-                    wrote_live: RefCell::new(None),
-                    pack: r.pack.clone(),
-                };
-                let env = r.env(&inj, case.form);
-                let spec = OpSpec {
-                    id: rid("R-5"),
-                    rel: case.rel.to_string(),
-                    kind: "revert".into(),
-                    expected: expected.clone(),
-                    incoming: incoming.clone(),
-                    source,
-                    generation: None,
-                };
-                let first = run_op(&env, &spec);
-                if let Err(e) = &first {
-                    assert!(format!("{e:?}").contains(INJECTED_STOP), "{}/{point:?}: {e:?}", case.name);
+            for byte_copy in [false, true] {
+                if !inside_seal(point) && byte_copy != (combos % 2 == 1) {
+                    continue; // the other points run once, alternating the seal path
                 }
-                // the next job run
-                let calm = NoFaults;
-                let env2 = r.env(&calm, case.form);
-                resume_interrupted_in(&env2).unwrap();
-                let tag = format!("{} at {point:?} with {}", case.name, match &action {
-                    Action::Stop => "stop",
-                    Action::ReplaceLive(_) => "replace-live",
-                    Action::OldFd(_) => "old-fd",
-                    Action::BumpGeneration => "bump-generation",
-                });
-                // P1
-                let vault = r.vault_bytes();
-                let before_exchange = matches!(point, Point::AfterSlot | Point::AfterRecord);
-                let up_to_seal = before_exchange || point == Point::AfterExchange;
-                if let Some(b) = &live_bytes {
-                    // the bytes live at the instant of the exchange / first move: the initial bytes,
-                    // plus an old descriptor's write if it landed before the seal (the stated residual
-                    // G7/M2 between the exchange and the seal); another writer's rename-over BEFORE the
-                    // exchange replaced them (that writer's bytes are checked below)
-                    let replaced_before = matches!(action, Action::ReplaceLive(_)) && before_exchange;
-                    let want = if matches!(action, Action::OldFd(_)) && up_to_seal {
-                        let mut w = b.clone();
-                        w.extend_from_slice(b"+late");
-                        w
-                    } else {
-                        b.clone()
-                    };
-                    let live_now = std::fs::read(r.pack.join(case.rel)).ok();
-                    assert!(
-                        replaced_before || vault.contains(&want) || live_now.as_deref() == Some(want.as_slice()),
-                        "P1 {tag}: the bytes live at the exchange are neither in the vault nor live"
-                    );
-                }
-                if let Some(w) = inj.wrote_live.borrow().as_ref() {
-                    let live_now = std::fs::read(r.pack.join(case.rel)).ok();
-                    assert!(
-                        vault.contains(w) || live_now.as_deref() == Some(w.as_slice()),
-                        "P1 {tag}: the other writer's bytes were lost"
-                    );
-                }
-                // P2 / O5
-                for s in r.slots() {
-                    let name = s.file_name().unwrap().to_string_lossy().to_string();
-                    assert!(!name.starts_with(".building"), "P2 {tag}: half-made slot left: {name}");
-                    if crate::repair::ledger::is_slot_name(&name) {
-                        assert!(s.join("payload").is_dir() && s.join("sealed").is_dir() && s.join("meta/pre.json").is_file(), "O5 {tag}: incomplete slot {}", s.display());
+                for (action, nested_stop) in [
+                    (Action::Stop, None),
+                    (Action::ReplaceLive(b"OTHER-WRITER\n".to_vec()), None),
+                    (Action::OldFd(b"+late".to_vec()), None),
+                    (Action::BumpGeneration, None),
+                    (Action::ReplaceLive(b"OTHER-WRITER\n".to_vec()), Some(Point::AfterExchange)),
+                    (Action::ReplaceLive(b"OTHER-WRITER\n".to_vec()), Some(Point::InSealPartial)),
+                ] {
+                    if nested_stop.is_some() && point != Point::AfterRecord {
+                        continue;
                     }
-                }
-                // P3
-                if r.live(case.rel) == TargetState::Absent {
-                    assert!(
-                        case.incoming.is_none() || case.before.is_none(),
-                        "P3 {tag}: the live path ended absent"
+                    combos += 1;
+                    crate::repair::vault::FORCE_BYTE_COPY_SEAL.with(|c| c.set(byte_copy));
+                    let r = rig(&format!("prop-{}-{combos}", case.name));
+                    let (expected, live_bytes) = match case.before {
+                        Some((b, m, None)) => (r.put(case.rel, b, m), Some(b.to_vec())),
+                        Some((_, _, Some(_))) => unreachable!(),
+                        None => (TargetState::Absent, None),
+                    };
+                    let (incoming, source) = make_state(&r, "incoming", case.incoming);
+                    let held = live_bytes.as_ref().map(|_| {
+                        std::fs::OpenOptions::new().append(true).open(r.pack.join(case.rel)).unwrap()
+                    });
+                    let mut inj = Inject::new(point, action.clone(), held, &r.pack);
+                    inj.then_stop_at = nested_stop;
+                    let env = r.env(&inj, case.form);
+                    let spec = OpSpec {
+                        id: rid("R-5"),
+                        rel: case.rel.to_string(),
+                        kind: "revert".into(),
+                        expected: expected.clone(),
+                        incoming: incoming.clone(),
+                        source,
+                        generation: None,
+                    };
+                    let first = run_op(&env, &spec);
+                    if let Err(e) = &first {
+                        assert!(format!("{e:?}").contains(INJECTED_STOP), "{}/{point:?}: {e:?}", case.name);
+                        if inside_seal(point) {
+                            fired_inside_seal += 1;
+                        }
+                    }
+                    // CU3: a SECOND crash, at the same point, during the first recovery; then calm runs
+                    if matches!(action, Action::Stop) {
+                        let again = Inject::new(point, Action::Stop, None, &r.pack);
+                        let _ = resume_interrupted_in(&r.env(&again, case.form));
+                    }
+                    let calm = NoFaults;
+                    let env2 = r.env(&calm, case.form);
+                    resume_interrupted_in(&env2).unwrap();
+                    resume_interrupted_in(&env2).unwrap();
+                    crate::repair::vault::FORCE_BYTE_COPY_SEAL.with(|c| c.set(false));
+                    let tag = format!(
+                        "{} at {point:?} with {}{}{}",
+                        case.name,
+                        match &action {
+                            Action::Stop => "stop",
+                            Action::ReplaceLive(_) => "replace-live",
+                            Action::OldFd(_) => "old-fd",
+                            Action::BumpGeneration => "bump-generation",
+                        },
+                        if byte_copy { " (byte-copy seal)" } else { "" },
+                        nested_stop.map(|p| format!(" + nested stop at {p:?}")).unwrap_or_default()
                     );
-                }
-                // P4
-                let (ops, broken) = wal::list_in(&r.root, &rid("R-5"));
-                assert!(broken.is_empty(), "{tag}: {broken:?}");
-                for o in ops {
-                    assert!(o.finished, "P4 {tag}: unfinished record {} at {}", o.op, o.step);
+                    // P0 (CU3): the live content is one of the legitimate versions
+                    let live_state = r.live(case.rel);
+                    let mut legit: Vec<TargetState> = vec![expected.clone(), incoming.clone()];
+                    if let Some(b) = &live_bytes {
+                        let mode = match &expected {
+                            TargetState::File { mode, .. } => *mode,
+                            _ => 0o644,
+                        };
+                        let mut late = b.clone();
+                        late.extend_from_slice(b"+late");
+                        let p = r.src.join("late-version");
+                        std::fs::write(&p, &late).unwrap();
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+                        }
+                        legit.push(TargetState::read(&p).unwrap());
+                    }
+                    if let Some(w) = inj.wrote_live.borrow().as_ref() {
+                        let p = r.src.join("other-version");
+                        std::fs::write(&p, w).unwrap();
+                        legit.push(TargetState::read(&p).unwrap());
+                        // an other writer's file keeps the mode its rename gave it
+                        let live_p = r.pack.join(case.rel);
+                        if let Ok(TargetState::File { sha256, .. }) = TargetState::read(&live_p) {
+                            let w_sha: String = {
+                                use sha2::{Digest, Sha256};
+                                Sha256::digest(w).iter().map(|x| format!("{x:02x}")).collect()
+                            };
+                            if sha256 == w_sha {
+                                legit.push(TargetState::read(&live_p).unwrap());
+                            }
+                        }
+                    }
+                    if live_state != TargetState::Absent {
+                        assert!(legit.contains(&live_state), "P0 {tag}: the live content is not a legitimate version: {}", live_state.canon());
+                    }
+                    // P1
+                    let vault = r.vault_bytes();
+                    let before_exchange = matches!(point, Point::AfterSlot | Point::AfterRecord);
+                    let up_to_seal = before_exchange || point == Point::AfterExchange || inside_seal(point);
+                    if let Some(b) = &live_bytes {
+                        let replaced_before = matches!(action, Action::ReplaceLive(_)) && before_exchange;
+                        let late_possible = matches!(action, Action::OldFd(_)) && up_to_seal;
+                        let mut late = b.clone();
+                        late.extend_from_slice(b"+late");
+                        let live_now = std::fs::read(r.pack.join(case.rel)).ok();
+                        let found = |w: &Vec<u8>| vault.contains(w) || live_now.as_deref() == Some(w.as_slice());
+                        assert!(
+                            replaced_before || found(b) || (late_possible && found(&late)),
+                            "P1 {tag}: the bytes live at the exchange are neither in the vault nor live"
+                        );
+                    }
+                    if let Some(w) = inj.wrote_live.borrow().as_ref() {
+                        let live_now = std::fs::read(r.pack.join(case.rel)).ok();
+                        assert!(
+                            vault.contains(w) || live_now.as_deref() == Some(w.as_slice()),
+                            "P1 {tag}: the other writer's bytes were lost"
+                        );
+                    }
+                    // P2 / O5 / CT1
+                    for s in r.slots() {
+                        let name = s.file_name().unwrap().to_string_lossy().to_string();
+                        assert!(!name.starts_with(".building"), "P2 {tag}: half-made slot left: {name}");
+                        if crate::repair::ledger::is_slot_name(&name) {
+                            assert!(s.join("payload").is_dir() && s.join("sealed").is_dir() && s.join("meta/pre.json").is_file(), "O5 {tag}: incomplete slot {}", s.display());
+                            for sub in ["sealed", "meta"] {
+                                for e in std::fs::read_dir(s.join(sub)).unwrap().flatten() {
+                                    let n = e.file_name().to_string_lossy().to_string();
+                                    assert!(!n.contains(".part-"), "CT1 {tag}: unfinished temporary entry left in {}: {n}", s.display());
+                                }
+                            }
+                            let base = std::fs::read_dir(s.join("payload")).unwrap().flatten().next().map(|e| e.file_name().to_string_lossy().to_string());
+                            if let Some(base) = base {
+                                let slot = Slot { dir: s.clone(), basename: base };
+                                if std::fs::symlink_metadata(slot.sealed()).is_ok() && slot.meta_sealed().is_file() {
+                                    assert!(crate::repair::vault::deposit_of(&slot).is_ok(), "CT1 {tag}: a published seal disagrees with its record in {}", s.display());
+                                }
+                            }
+                        }
+                    }
+                    // P3
+                    if r.live(case.rel) == TargetState::Absent {
+                        assert!(
+                            case.incoming.is_none() || case.before.is_none(),
+                            "P3 {tag}: the live path ended absent"
+                        );
+                    }
+                    // P4
+                    let (ops, broken) = wal::list_in(&r.root, &rid("R-5"));
+                    assert!(broken.is_empty(), "{tag}: {broken:?}");
+                    for o in ops {
+                        assert!(o.finished, "P4 {tag}: unfinished record {} at {}", o.op, o.step);
+                    }
                 }
             }
         }
     }
-    assert!(combos >= 90, "only {combos} combinations ran");
+    assert!(combos >= 150, "only {combos} combinations ran");
+    assert!(fired_inside_seal >= 20, "the crashes inside the seal fired only {fired_inside_seal} times");
 }
 
 /// The normal outcomes of each form: applied, the displaced bytes sealed in the vault, E2 mode and
@@ -459,14 +577,7 @@ fn displaced_garbage_is_never_relived() {
         let r = rig("h6");
         r.put("schedule.json", b"{\"jobs\":[]}\n", 0o644);
         let (src, st) = r.source("s.json", b"{\"jobs\":[1]}\n", 0o644);
-        let inj = Inject {
-            point: Point::AfterRecord,
-            action: Action::ReplaceLive(other.clone()),
-            fired: Cell::new(false),
-            held: RefCell::new(None),
-            wrote_live: RefCell::new(None),
-            pack: r.pack.clone(),
-        };
+        let inj = Inject::new(Point::AfterRecord, Action::ReplaceLive(other.clone()), None, &r.pack);
         let own = move |_rel: &str, _p: &Path| Some(check_passes);
         let env = OpEnv { own_check: &own, ..r.env(&inj, ApplyForm::Exchange) };
         let d = run_op(&env, &OpSpec {
@@ -687,7 +798,7 @@ fn windows_interruption_between_the_two_moves_resume_or_abandon() {
         let r = rig("oqd8");
         r.put("bin/w.py", b"OLD\n", 0o644);
         let (src, st) = r.source("w.py", b"NEW\n", 0o644);
-        let inj = Inject { point: Point::AfterFirstMove, action: Action::Stop, fired: Cell::new(false), held: RefCell::new(None), wrote_live: RefCell::new(None), pack: r.pack.clone() };
+        let inj = Inject::new(Point::AfterFirstMove, Action::Stop, None, &r.pack);
         let env = r.env(&inj, ApplyForm::DepositFirst);
         let first = run_op(&env, &OpSpec { id: rid("R-9"), rel: "bin/w.py".into(), kind: "revert".into(), expected: r.live("bin/w.py"), incoming: st, source: Some(src), generation: None });
         assert!(first.is_err());
