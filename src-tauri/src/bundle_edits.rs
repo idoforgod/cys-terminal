@@ -25,6 +25,7 @@
 //!   written outside `bundle-edits/`.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -595,13 +596,7 @@ fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
 /// refused (RULINGS AA6: the manifest, earlier indexes and pending notices are size-capped).
 fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
     let file = open_no_follow(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut std::io::Read::take(file, cap + 1), &mut bytes)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    if bytes.len() as u64 > cap {
-        return Err(format!("{}: {} 바이트보다 커서 읽지 않음", path.display(), cap));
-    }
-    Ok(bytes)
+    capped_bytes(file, cap, path)
 }
 
 /// The nearest existing folder at or above `p` (the store may not exist yet).
@@ -673,6 +668,331 @@ fn store_path(dir: &Path, rel: &str) -> Option<PathBuf> {
         p.push(c);
     }
     Some(p)
+}
+
+// ───────────────────────────── folders held without following links (RULINGS DB1, DB3) ─────────────────────────────
+
+/// A folder held open through a handle. Every name below it is opened relative to that handle —
+/// Unix `openat` with `O_NOFOLLOW`; Windows through a path whose every folder is held open (without
+/// delete sharing, so it cannot be renamed or replaced meanwhile) and was checked to be no reparse
+/// point — so a folder replaced by a link after it was checked cannot redirect a read or a write.
+/// `path` is for messages and listings only; `_pins` keeps the folders above open.
+pub(crate) struct HeldDir {
+    path: PathBuf,
+    handle: Arc<std::fs::File>,
+    _pins: Vec<Arc<std::fs::File>>,
+}
+
+/// The error of a name that is a link (Windows: any reparse point) or no folder where one must be.
+const NOT_A_REAL_FOLDER: &str = "링크이거나 폴더가 아니라 따라가지 않음";
+
+/// Open options for a folder handle. Windows: list + read-attributes access, shared for read and
+/// write but NOT delete (while it is held the folder cannot be renamed or removed), backup semantics
+/// (needed to open a folder) and, for `no_follow`, the reparse point itself instead of its target.
+fn dir_options(no_follow: bool) -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.read(true).custom_flags(libc::O_DIRECTORY | if no_follow { libc::O_NOFOLLOW } else { 0 });
+    }
+    #[cfg(not(unix))]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_LIST_DIRECTORY: u32 = 0x0001;
+        const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+        const FILE_SHARE_READ: u32 = 0x0001;
+        const FILE_SHARE_WRITE: u32 = 0x0002;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options
+            .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | if no_follow { FILE_FLAG_OPEN_REPARSE_POINT } else { 0 });
+    }
+    options
+}
+
+/// Re-checks through the handle that it is a real folder: a folder, no link and (Windows) no reparse
+/// point of any kind (junction, mount point, symbolic link or other).
+fn is_real_folder(file: &std::fs::File) -> std::io::Result<bool> {
+    let meta = file.metadata()?;
+    #[cfg(not(unix))]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(meta.is_dir() && !meta.file_type().is_symlink())
+}
+
+/// Reads at most `cap` bytes of an open file; a longer file is refused (`shown` names it).
+fn capped_bytes(file: std::fs::File, cap: u64, shown: &Path) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, cap + 1), &mut bytes)
+        .map_err(|e| format!("{}: {e}", shown.display()))?;
+    if bytes.len() as u64 > cap {
+        return Err(format!("{}: {} 바이트보다 커서 읽지 않음", shown.display(), cap));
+    }
+    Ok(bytes)
+}
+
+impl HeldDir {
+    /// Holds `path` itself as a starting folder (its own path is followed — the caller trusts it).
+    pub(crate) fn open_anchor(path: &Path) -> std::io::Result<HeldDir> {
+        let file = dir_options(false).open(path)?;
+        if !file.metadata()?.is_dir() {
+            return Err(std::io::Error::other("폴더가 아님"));
+        }
+        Ok(HeldDir { path: path.to_path_buf(), handle: Arc::new(file), _pins: Vec::new() })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Holds the folder `name` directly below, never following a link.
+    pub(crate) fn child(&self, name: &OsStr) -> std::io::Result<HeldDir> {
+        let path = self.path.join(name);
+        #[cfg(unix)]
+        let file = {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::ffi::OsStrExt;
+            let c = std::ffi::CString::new(name.as_bytes()).map_err(std::io::Error::other)?;
+            let fd = unsafe {
+                libc::openat(self.handle.as_raw_fd(), c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            unsafe { std::fs::File::from_raw_fd(fd) }
+        };
+        #[cfg(not(unix))]
+        let file = dir_options(true).open(&path)?;
+        if !is_real_folder(&file)? {
+            return Err(std::io::Error::other(NOT_A_REAL_FOLDER));
+        }
+        let mut pins = self._pins.clone();
+        pins.push(Arc::clone(&self.handle));
+        Ok(HeldDir { path, handle: Arc::new(file), _pins: pins })
+    }
+
+    /// Opens the regular file `name` directly below for reading, never following a link (a fifo
+    /// cannot block: `O_NONBLOCK`), re-checked through the handle.
+    pub(crate) fn open_file(&self, name: &OsStr) -> std::io::Result<std::fs::File> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::ffi::OsStrExt;
+            let c = std::ffi::CString::new(name.as_bytes()).map_err(std::io::Error::other)?;
+            let fd = unsafe {
+                libc::openat(self.handle.as_raw_fd(), c.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            if !file.metadata()?.file_type().is_file() {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"));
+            }
+            Ok(file)
+        }
+        #[cfg(not(unix))]
+        {
+            open_no_follow(&self.path.join(name))
+        }
+    }
+
+    /// Reads at most `cap` bytes of the regular file `name` directly below (never through a link).
+    pub(crate) fn read_capped(&self, name: &OsStr, cap: u64) -> Result<Vec<u8>, String> {
+        let shown = self.path.join(name);
+        let file = self.open_file(name).map_err(|e| format!("{}: {e}", shown.display()))?;
+        capped_bytes(file, cap, &shown)
+    }
+
+    /// The target of the link `name` directly below (`None`: no link, unreadable or not UTF-8).
+    pub(crate) fn read_link(&self, name: &OsStr) -> Option<String> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            let c = std::ffi::CString::new(name.as_bytes()).ok()?;
+            let mut buf = vec![0u8; 4096];
+            let n = unsafe { libc::readlinkat(self.handle.as_raw_fd(), c.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n < 0 || n as usize >= buf.len() {
+                return None;
+            }
+            buf.truncate(n as usize);
+            String::from_utf8(buf).ok()
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::read_link(self.path.join(name)).ok()?.into_os_string().into_string().ok()
+        }
+    }
+}
+
+/// The components of an index / store path `a/b/c` — `None` for one that could leave the folder.
+fn safe_parts(rel: &str) -> Option<Vec<&str>> {
+    let parts: Vec<&str> = rel.split('/').collect();
+    if parts.iter().any(|c| c.is_empty() || *c == "." || *c == ".." || c.contains('\\') || c.contains(':')) {
+        return None;
+    }
+    Some(parts)
+}
+
+/// Reads into `buf`, retrying an interrupted read.
+fn read_some(input: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match std::io::Read::read(input, buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => return other,
+        }
+    }
+}
+
+/// SHA-256 (FIPS 180-4), streaming: this crate has no hashing dependency, and a copy is hashed while
+/// it is written (RULINGS DB2) and a kept copy re-hashed under the budget before it is reused (DB1).
+pub(crate) struct Sha256 {
+    state: [u32; 8],
+    block: [u8; 64],
+    filled: usize,
+    total: u64,
+}
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01,
+    0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+    0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08,
+    0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+impl Sha256 {
+    pub(crate) fn new() -> Sha256 {
+        Sha256 {
+            state: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19],
+            block: [0; 64],
+            filled: 0,
+            total: 0,
+        }
+    }
+
+    pub(crate) fn update(&mut self, mut data: &[u8]) {
+        self.total = self.total.wrapping_add(data.len() as u64);
+        while !data.is_empty() {
+            let take = (64 - self.filled).min(data.len());
+            self.block[self.filled..self.filled + take].copy_from_slice(&data[..take]);
+            self.filled += take;
+            data = &data[take..];
+            if self.filled == 64 {
+                let block = self.block;
+                self.compress(&block);
+                self.filled = 0;
+            }
+        }
+    }
+
+    fn compress(&mut self, block: &[u8; 64]) {
+        let mut w = [0u32; 64];
+        for (wi, c) in w.iter_mut().zip(block.chunks_exact(4)) {
+            *wi = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
+        for (k, wi) in SHA256_K.iter().zip(w.iter()) {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(*k).wrapping_add(*wi);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (s, v) in self.state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *s = s.wrapping_add(v);
+        }
+    }
+
+    /// The digest as lowercase hex (the form of the manifest and of `TargetState`).
+    pub(crate) fn finish_hex(mut self) -> String {
+        let bits = self.total.wrapping_mul(8);
+        self.update(&[0x80]);
+        while self.filled != 56 {
+            self.update(&[0]);
+        }
+        self.update(&bits.to_be_bytes());
+        self.state.iter().map(|v| format!("{v:08x}")).collect()
+    }
+}
+
+/// Bytes per chunk of a copy or a hash; the deadline and the abandon flag are checked before each
+/// (RULINGS DB1, DB2).
+pub(crate) const COPY_CHUNK: usize = 64 * 1024;
+
+/// The sha256 of an open file, read in chunks under the budget — `None` past `cap` bytes, on a read
+/// error or when the budget stops it (RULINGS DB1).
+fn hash_bounded(file: &mut std::fs::File, cap: u64, budget: &Budget) -> Option<String> {
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; COPY_CHUNK];
+    let mut seen: u64 = 0;
+    loop {
+        budget.check().ok()?;
+        let n = read_some(file, &mut buf).ok()?;
+        if n == 0 {
+            return Some(hasher.finish_hex());
+        }
+        seen += n as u64;
+        if seen > cap {
+            return None;
+        }
+        hasher.update(&buf[..n]);
+    }
+}
+
+/// RULINGS DB1: a kept copy is reused only when it still is what its index says — every folder on
+/// its way a real folder (no link followed), a file regular and with the indexed sha256 (read under
+/// the budget, at most `cap` bytes), a link with the indexed target. Anything else — changed,
+/// truncated, replaced, unreadable, cut off by the budget — is not reused: a new capture is made.
+fn kept_copy_matches(capture: &HeldDir, rel: &str, kind: &str, sha256: Option<&str>, link_target: Option<&str>, cap: u64, budget: &Budget) -> bool {
+    let Some(parts) = safe_parts(rel) else {
+        return false;
+    };
+    let Some((leaf, folders)) = parts.split_last() else {
+        return false;
+    };
+    let mut held: Option<HeldDir> = None;
+    for folder in folders {
+        let next = held.as_ref().unwrap_or(capture).child(OsStr::new(folder));
+        match next {
+            Ok(h) => held = Some(h),
+            Err(_) => return false,
+        }
+    }
+    let parent = held.as_ref().unwrap_or(capture);
+    match (kind, sha256, link_target) {
+        ("file", Some(want), _) => match parent.open_file(OsStr::new(leaf)) {
+            Ok(mut file) => hash_bounded(&mut file, cap, budget).as_deref() == Some(want),
+            Err(_) => false,
+        },
+        ("link", _, Some(want)) => parent.read_link(OsStr::new(leaf)).as_deref() == Some(want),
+        _ => false,
+    }
 }
 
 /// Copies one regular file byte for byte into a NEW file and returns the sha256 of the stored
@@ -770,10 +1090,12 @@ fn edit_set(records: &[IndexRecord]) -> Vec<EditKey> {
 
 /// An earlier capture folder of the same `from_version` that already HOLDS this exact edit set:
 /// its index lists the same entries, it points to no other capture, every present entry is stored
-/// there and every stored file still exists. Newest first; `None` when there is none.
+/// there and every kept copy is verified against the index (RULINGS DB1: kind, content hash, link
+/// target — `kept_copy_matches`). Newest first; `None` when there is none.
 fn find_same_capture(input: &CaptureInput, records: &[IndexRecord], budget: &Budget) -> Option<PathBuf> {
     let want = edit_set(records);
     let prefix = format!("{}-", input.from_version);
+    let store = HeldDir::open_anchor(&input.store_parent).ok()?;
     let mut names: Vec<String> = std::fs::read_dir(&input.store_parent)
         .ok()?
         .filter_map(|e| e.ok())
@@ -786,11 +1108,10 @@ fn find_same_capture(input: &CaptureInput, records: &[IndexRecord], budget: &Bud
         if budget.check().is_err() {
             return None;
         }
-        let dir = input.store_parent.join(&name);
-        if std::fs::symlink_metadata(&dir).map(|m| !m.file_type().is_dir()).unwrap_or(true) {
+        let Ok(held) = store.child(OsStr::new(&name)) else {
             continue;
-        }
-        let Ok(bytes) = read_capped(&dir.join(INDEX_FILE), MAX_INDEX_BYTES) else {
+        };
+        let Ok(bytes) = held.read_capped(OsStr::new(INDEX_FILE), MAX_INDEX_BYTES) else {
             continue;
         };
         let Ok(index) = serde_json::from_slice::<Value>(&bytes) else {
@@ -813,20 +1134,22 @@ fn find_same_capture(input: &CaptureInput, records: &[IndexRecord], budget: &Bud
             };
             let sha = f["sha256_found"].as_str().map(str::to_string);
             let target = f["link_target"].as_str().map(str::to_string);
-            if present {
-                let on_disk = rel
-                    .split('/')
-                    .fold(dir.clone(), |acc, c| acc.join(c));
-                if !stored || std::fs::symlink_metadata(&on_disk).is_err() {
-                    holds_all = false;
-                    break;
-                }
+            if present && !stored {
+                holds_all = false;
+                break;
             }
             theirs.push((rel.to_string(), kind.to_string(), present, sha, target));
         }
         theirs.sort();
-        if holds_all && theirs == want {
-            return Some(dir);
+        // RULINGS DB1: only an index that lists this edit set is worth the reads; then every kept copy
+        // is verified before it is reused.
+        if holds_all
+            && theirs == want
+            && theirs.iter().filter(|e| e.2).all(|(rel, kind, _, sha, target)| {
+                kept_copy_matches(&held, rel, kind, sha.as_deref(), target.as_deref(), input.max_bytes, budget)
+            })
+        {
+            return Some(held.path().to_path_buf());
         }
     }
     None
@@ -2140,8 +2463,12 @@ mod tests {
         }
         // (`nix::` of the app census is left out: the `nix` crate is no dependency of this crate and the
         // substring also matches `std::os::unix::`, which the exec-bit arm uses.)
-        // libc only for the no-follow open flags and the free-space query (AA4, AA6) — nothing else.
-        let allowed = ["libc::O_NOFOLLOW", "libc::O_NONBLOCK", "libc::statvfs"];
+        // libc only for the no-follow open flags, the free-space query (AA4, AA6) and the folder-handle
+        // reads of a kept copy (DB1) — nothing else.
+        let allowed = [
+            "libc::O_NOFOLLOW", "libc::O_NONBLOCK", "libc::statvfs", "libc::O_DIRECTORY", "libc::O_RDONLY", "libc::O_CLOEXEC",
+            "libc::openat", "libc::readlinkat",
+        ];
         assert_eq!(code.matches("libc::").count(), allowed.iter().map(|a| code.matches(a).count()).sum::<usize>(), "a libc call beyond {allowed:?}");
         for w in [
             "Command::new", ".spawn(", "process::exit", "std::process", "launchctl", "osascript", "rpc_oneshot(",
@@ -2587,5 +2914,141 @@ mod tests {
             }
         }
         h.iter().map(|x| format!("{x:08x}")).collect()
+    }
+
+    // ───────── the streaming SHA-256 the copies are hashed with (DB1, DB2) ─────────
+
+    fn sha256_hex_of(bytes: &[u8]) -> String {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        h.finish_hex()
+    }
+
+    /// FIPS 180-4 / NIST CAVP example vectors, and the same digests as the library's
+    /// `TargetState::read` (the `sha2` crate) for every length 0..=300 fed in uneven pieces.
+    #[test]
+    fn the_streaming_sha256_matches_the_standard_and_the_library() {
+        assert_eq!(sha256_hex_of(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(sha256_hex_of(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(
+            sha256_hex_of(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        let mut million = Sha256::new();
+        for _ in 0..1000 {
+            million.update(&[b'a'; 1000]);
+        }
+        assert_eq!(million.finish_hex(), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+        let t = Tmp::new("sha256");
+        for len in 0..=300usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 31 + len) as u8).collect();
+            let p = t.path().join(format!("f{len}"));
+            std::fs::write(&p, &bytes).unwrap();
+            let Ok(TargetState::File { sha256, .. }) = TargetState::read(&p) else { panic!("read {len}") };
+            let mut h = Sha256::new();
+            for piece in bytes.chunks(1 + len % 70) {
+                h.update(piece);
+            }
+            assert_eq!(h.finish_hex(), sha256, "length {len}");
+        }
+    }
+
+    // ───────── RULINGS DB1: a kept copy is reused only after it is verified ─────────
+
+    /// The kept copies (`kind: "file"`, stored) listed by a capture's index.
+    fn kept_files(dir: &Path) -> Vec<String> {
+        let index: Value = serde_json::from_slice(&std::fs::read(dir.join(INDEX_FILE)).unwrap()).unwrap();
+        index["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["kind"] == "file" && f["stored"] == true)
+            .map(|f| f["rel"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// DB1 / verdict J8 B1: an earlier capture whose kept copy was changed after it was written — same
+    /// length, truncated, replaced by a folder, replaced by a link to the live file — is never reused:
+    /// a new capture is made and its copy is byte for byte the file of the bundle, and the user is not
+    /// told "already kept".
+    #[test]
+    fn db1_a_changed_kept_copy_is_never_reused() {
+        let mut tampers = vec!["same-length", "truncated", "folder"];
+        if cfg!(unix) {
+            tampers.push("link-to-the-live-file");
+        }
+        for tamper in tampers {
+            let t = Tmp::new(&format!("db1-{tamper}"));
+            let (exe, res, _top) = fixture_install(t.path(), "mac");
+            let store = t.path().join("store");
+            let first = capture(&input_for(&exe, &store), &AtomicBool::new(false));
+            let CaptureOutcome::Captured { dir: first_dir, .. } = &first else { panic!("{tamper}: {first:?}") };
+            let rel = "runtime/python/lib/site.py";
+            assert!(kept_files(first_dir).contains(&rel.to_string()), "{tamper}: {:?}", kept_files(first_dir));
+            let kept = join_rel(first_dir, rel);
+            let live = join_rel(&res, rel);
+            let original = std::fs::read(&kept).unwrap();
+            assert_eq!(original, std::fs::read(&live).unwrap());
+            match tamper {
+                "same-length" => {
+                    let mut changed = original.clone();
+                    changed[0] ^= 0x20;
+                    std::fs::write(&kept, &changed).unwrap();
+                    assert_eq!(std::fs::metadata(&kept).unwrap().len(), original.len() as u64);
+                }
+                "truncated" => std::fs::OpenOptions::new().write(true).open(&kept).unwrap().set_len(0).unwrap(),
+                "folder" => {
+                    std::fs::remove_file(&kept).unwrap();
+                    std::fs::create_dir(&kept).unwrap();
+                }
+                _ => {
+                    std::fs::remove_file(&kept).unwrap();
+                    assert!(make_link(&live.to_string_lossy(), &kept), "a link whose target has the indexed content");
+                }
+            }
+            let mut again = input_for(&exe, &store);
+            again.leaf = "0.15.0-20261113T020000000000Z".to_string();
+            let second = capture(&again, &AtomicBool::new(false));
+            let CaptureOutcome::Captured { dir, .. } = &second else { panic!("{tamper}: a changed kept copy was reused: {second:?}") };
+            assert_ne!(dir, first_dir);
+            assert_eq!(std::fs::read(join_rel(dir, rel)).unwrap(), std::fs::read(&live).unwrap(), "{tamper}: a fresh exact copy");
+            let n = notice_ko(&second).unwrap();
+            assert!(!n.body.contains("다시 복사하지 않았습니다"), "{tamper}: {}", n.body);
+        }
+    }
+
+    /// DB1 for a kept link (Unix — the app keeps no links on Windows): a kept link whose target was
+    /// changed is never reused; an untouched one still is.
+    #[test]
+    fn db1_a_kept_link_with_another_target_is_never_reused() {
+        if !cfg!(unix) {
+            return;
+        }
+        let fx = fixture();
+        let c = case(&fx, "exec-bits-and-links");
+        let t = Tmp::new("db1-link");
+        let exe = t.path().join("cys.app/Contents/MacOS/cys-app");
+        let res = t.path().join("cys.app/Contents/Resources");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"app").unwrap();
+        assert!(materialize(&c["found"], &res.join(RUNTIME_DIR)));
+        std::fs::write(res.join(MANIFEST_BASENAME), serde_json::to_vec(&manifest_of(c)).unwrap()).unwrap();
+        let store = t.path().join("store");
+        let first = capture(&input_for(&exe, &store), &AtomicBool::new(false));
+        let CaptureOutcome::Captured { dir: first_dir, .. } = &first else { panic!("{first:?}") };
+        let with_leaf = |leaf: &str| {
+            let mut i = input_for(&exe, &store);
+            i.leaf = leaf.to_string();
+            i
+        };
+        let untouched = capture(&with_leaf("0.15.0-20261113T020000000000Z"), &AtomicBool::new(false));
+        assert!(matches!(&untouched, CaptureOutcome::AlreadyKept { same_as, .. } if same_as == first_dir), "{untouched:?}");
+        let kept = join_rel(first_dir, "runtime/dangling");
+        assert_eq!(std::fs::read_link(&kept).unwrap(), PathBuf::from("nowhere"));
+        std::fs::remove_file(&kept).unwrap();
+        assert!(make_link("elsewhere", &kept));
+        let changed = capture(&with_leaf("0.15.0-20261113T030000000000Z"), &AtomicBool::new(false));
+        let CaptureOutcome::Captured { dir, .. } = &changed else { panic!("a kept link with another target was reused: {changed:?}") };
+        assert_eq!(std::fs::read_link(join_rel(dir, "runtime/dangling")).unwrap(), PathBuf::from("nowhere"));
     }
 }
