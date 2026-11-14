@@ -1063,6 +1063,31 @@ fn restart_clears_an_unconsumed_approval() {
     assert_eq!((rec.pending_request, rec.approval), (None, None));
 }
 
+/// RULINGS DF5 / CZ2: the reconciliation clears an `approved` approval only when it was never
+/// consumed — a request this table saw end `Approved` (applied) keeps it even if its record still
+/// names the request (an end whose write failed).
+#[test]
+fn reconciliation_keeps_an_applied_approval() {
+    let r = rig("recon-applied");
+    let id = r.signed_repair();
+    let eff = effects();
+    let t = Mutex::new(ApprovalTable::default());
+    let rid = pending(&r, &t, &eff, T0);
+    let mut rec = r.rec(&id);
+    rec.approval = Some(ApprovalResult {
+        request_id: rid.clone(),
+        fingerprint_sha256: fp_of(&r, &id),
+        decided_at: T0 + 20.0,
+        approved: true,
+    });
+    t.lock().unwrap().find_mut(&rid).unwrap().state = ReqState::Approved;
+    let (changed, count) =
+        reconcile_stale_pending(T0 + 30.0, &t.lock().unwrap(), "R-1", &mut rec);
+    assert_eq!((changed, count), (true, None));
+    assert_eq!(rec.pending_request, None);
+    assert_eq!(rec.approval.map(|a| a.approved), Some(true), "the applied approval stays");
+}
+
 /// RULINGS CZ2 — deterministic interleaving: `first` runs on this thread; at its record write (after
 /// its claim, inside the repair lock) the `others` are started on their own threads and given up to
 /// 300 ms each before the write goes on — exactly the window the old check-then-act let a second end
