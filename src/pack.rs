@@ -4168,7 +4168,50 @@ fn exclusive_create_at(d: &DirFd, leaf_c: &std::ffi::CStr, bytes: &[u8], mode: O
             apply_mode_exact(&f, m)?;
         }
     }
-    f.sync_all()
+    sync_file_checked(&f, &leaf_c.to_string_lossy())
+}
+
+/// ★T2i(RULINGS GB2): 자리에 이미 있는 같은 바이트의 사본을 '보관된 사본'으로 다시 쓸 때 — 그 **파일**을 내린다(닻 내린 판독
+/// 기술자 · 링크 비추종 · 일반 파일만). 실패는 실패(내렸다고 가정하지 않는다). 윈도우: 내림(`FlushFileBuffers`)은 쓰기 권한
+/// 핸들이 필요해 쓰기 권한으로 연다(바이트는 쓰지 않는다 · 재해석 지점 비추종 · 일반 파일만).
+fn beneath_sync_file(root: &Path, rel_path: &str) -> std::io::Result<()> {
+    let parts = rel_parts(rel_path)?;
+    let leaf = parts[parts.len() - 1];
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::FromRawFd;
+        let d = anchor_dir(root, &parts[..parts.len() - 1], false, rel_path)?;
+        let c = c_name(leaf)?;
+        let fd = unsafe { libc::openat(d.0, c.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let f = unsafe { std::fs::File::from_raw_fd(fd) };
+        if !f.metadata()?.is_file() {
+            return Err(std::io::Error::other(format!("{rel_path} 가 일반 파일이 아닙니다")));
+        }
+        sync_file_checked(&f, leaf)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        sidecar_path_gate(root, rel_path).map_err(std::io::Error::other)?;
+        let path = parts.iter().fold(root.to_path_buf(), |p, c| p.join(c));
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)?;
+        if !f.metadata()?.is_file() {
+            return Err(std::io::Error::other(format!("{rel_path} 가 일반 파일이 아닙니다")));
+        }
+        sync_file_checked(&f, leaf)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, leaf);
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "파일 내림을 이 운영체제에서 쓸 수 없습니다"))
+    }
 }
 
 /// ★T2i(RULINGS EC7 · EC2): 닻 내린 폴더 기술자의 fsync — 시험 주입(`FAIL_DIR_SYNC_FOR`, 마지막 이름 단위) · '지원하지 않음'만 Ok.
@@ -4615,6 +4658,23 @@ thread_local! {
     static FAIL_NO_REPLACE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// ★T2i(RULINGS FP1) 시험 주입: 그 대체 길(마지막 이름의 배타 생성)도 실패한 것으로 한다.
     static FAIL_EXCLUSIVE_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// ★T2i(RULINGS GB2) 시험 주입: 이 이름의 파일 내림(fsync)이 실패한 것으로 한다(배타 생성의 대체 길 · 자리의 같은 사본 다시 내림).
+    static FAIL_FILE_SYNC_FOR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// ★T2i(RULINGS GB2): 파일 하나의 내림 — 시험 주입 · '지원하지 않음'만 Ok(EC7 의 규칙 그대로), 그 밖의 실패는 실패.
+fn sync_file_checked(f: &std::fs::File, leaf: &str) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        if FAIL_FILE_SYNC_FOR.with(|x| x.borrow().as_deref() == Some(leaf)) {
+            return Err(std::io::Error::other("injected file flush failure"));
+        }
+    }
+    let _ = leaf;
+    match f.sync_all() {
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+        other => other,
+    }
 }
 
 /// ★T2i(RULINGS EC7): 영속 쓰기의 부모 폴더 fsync — 실패를 돌려준다('지원하지 않음'만 Ok).
@@ -5247,6 +5307,9 @@ fn park_copy_at(
         match beneath_occupant(dir, &user_rel) {
             Occupant::Missing => continue,
             Occupant::File(Some(b)) if b == bytes => {
+                // ★T2i(RULINGS GB2): 자리에 이미 있는 같은 사본은 내려졌다고 가정하지 않는다 — 새로 쓴 사본과 같이 그 **파일**을 먼저
+                //   내리고(언제나), 영속 증명이 필요하면 폴더도. 실패는 실패 — 호출부는 살아 있는 파일을 바꾸지 않는다.
+                beneath_sync_file(dir, &user_rel).map_err(|e| format!("{user_rel} 기록 실패: {e}"))?;
                 if durable {
                     beneath_sync_parent(dir, &user_rel).map_err(|e| format!("{user_rel} 기록 실패: {e}"))?;
                 }
@@ -15504,6 +15567,44 @@ mod m11_tests {
         assert_eq!(rig.read(locked).as_deref(), Some("{\"keys\": [\"VENDOR\"]}\n"));
         assert_eq!(std::fs::read(rig.pack.join(format!("{locked}.user"))).unwrap(), b"\xff\xfe\x00keys\n", "사본이 있고 나서야 치유");
         assert_eq!(rig.kind(locked).as_deref(), Some("healed"));
+    }
+
+    /// ★T2i(RULINGS GB2): 자리에 이미 있는 같은 사본은 다시 내린다 — 대체 길(배타 생성)의 파일 내림이 실패해 사본이 내려지지
+    /// 않은 채 남으면, 다음 스윕의 같은 사본 재사용도 그 파일을 내려야 하고, 그 내림이 다시 실패하면 살아 있는 파일은 그대로다.
+    /// 내림이 되면 그때 진행한다. (unix 만 — 주입은 unix 함수에 걸린다 · 윈도우 경우는 TW1 의 행, RULINGS GB5.)
+    #[cfg(unix)]
+    #[test]
+    fn gb2_a_copy_found_in_place_is_flushed_again_before_live_changes() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FAIL_NO_REPLACE_RENAME.with(|f| f.set(false));
+                FAIL_FILE_SYNC_FOR.with(|f| *f.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+        let rig = Rig::new("gb2");
+        let rel = "hooks/inject.sh";
+        let src = || UpdateSources::none().with_boot_critical(bc_only(&["hooks/inject.sh"]));
+        let mine = "#!/bin/bash\necho MINE\n";
+        let v1 = "#!/bin/bash\necho V1\n";
+        rig.write(rel, mine.as_bytes());
+        FAIL_NO_REPLACE_RENAME.with(|f| f.set(true));
+        FAIL_FILE_SYNC_FOR.with(|f| *f.borrow_mut() = Some("inject.sh.user".into()));
+        // ① 대체 길이 사본을 쓰지만 그 파일 내림이 실패 → 보관 실패 → 살아 있는 파일 그대로(사본은 내려지지 않은 채 남음).
+        rig.install(&[(rel, v1)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(mine), "① 내림 실패 → 덮지 않음");
+        assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some(mine), "① 내려지지 않은 사본이 자리에 남음");
+        // ② 다음 스윕: 같은 사본을 다시 쓰려면 그 파일을 내려야 한다 — 다시 실패 → 그대로.
+        rig.install(&[(rel, v1)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(mine), "② 다시 내림 실패 → 덮지 않음");
+        assert_eq!(rig.kind(rel).as_deref(), Some("quarantined"));
+        // ③ 내림이 되면 진행.
+        FAIL_FILE_SYNC_FOR.with(|f| *f.borrow_mut() = None);
+        rig.install(&[(rel, v1)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(v1), "③ 내렸으면 vendor 우선");
+        assert_eq!(rig.kind(rel).as_deref(), Some("vendor-first"));
+        assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some(mine));
     }
 
     /// ★T2i(RULINGS EC7): vendor 우선의 선저장은 **영속이 증명돼야** 한다 — 원장 쓰기의 부모 폴더 fsync 가 실패하면(시험 주입)
