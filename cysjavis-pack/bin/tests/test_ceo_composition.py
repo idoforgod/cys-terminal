@@ -232,8 +232,14 @@ class Rig(unittest.TestCase):
                            encoding="utf-8", env=self.env, timeout=60)
         return r.returncode, r.stdout, r.stderr
 
+    def kept(self, reason="*"):
+        """보관 폴더(directives/.ceo-kept/)의 보관 사본들(곁 파일 *.kept 제외) — ★RULINGS EY1."""
+        return sorted(f for f in glob.glob(os.path.join(self.dirs, ".ceo-kept", "*.%s" % reason))
+                      if not f.endswith(".kept"))
+
     def captures(self, kind):
-        return sorted(glob.glob(self.p("MASTER_DIRECTIVE.md.%s.*" % kind)))
+        """시각 붙은 보관 사본 — EY1 부터 보관 폴더 안(<UTC>-<pid>-<n>.<kind>)."""
+        return self.kept(kind)
 
     def leftovers(self):
         return [f for f in os.listdir(self.dirs) if f.endswith(".tmp")]
@@ -302,19 +308,22 @@ class Composition(Rig):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), body, "강등이 구분선 뒤 바이트가 아니다")
         self.assertIsNone(self.read("MASTER_DIRECTIVE.md.pre-ceo"), "강등 뒤 .pre-ceo 가 남아 '승격 중'으로 보인다")
-        kept = sorted(glob.glob(self.p("MASTER_DIRECTIVE.md.pre-ceo.*")))
+        kept = sorted(self.kept("backup"))
         self.assertEqual(len(kept), 1, "다른 내용의 백업은 시각을 붙여 보관해야 한다: %r" % os.listdir(self.dirs))
         self.assertEqual(_slurp(kept[0], encoding="utf-8"), USER, "백업이 원본으로 쓰이지 않았는데 내용이 바뀌었다")
         self.assertIsNone(self.read(".ceo-receipt.json"))
         self.assertIn("CEO 강등", out + err)
 
-    def test_demotion_without_edits_removes_identical_backup(self):
+    def test_demotion_without_edits_keeps_the_identical_backup(self):
+        """★RULINGS EY1 로 다시 씀(종전: '같은 내용의 백업은 지운다'): 비교로 지우지 않는다 — 강등 뒤 .pre-ceo 는 같은 내용이어도
+        보관 폴더로 옮겨 남고, 디렉티브 폴더에는 .pre-ceo 가 없다(승격 중에만 있게)."""
         self.seed()
         self.assertEqual(self.run_dept("promote-ceo")[0], 0)
         rc, out, err = self.run_dept("down", "d0")
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER)
-        self.assertEqual(glob.glob(self.p("MASTER_DIRECTIVE.md.pre-ceo*")), [], "같은 내용의 백업은 지운다")
+        self.assertEqual(glob.glob(self.p("MASTER_DIRECTIVE.md.pre-ceo*")), [], "강등 뒤 .pre-ceo 가 디렉티브 폴더에 남았다")
+        self.assertEqual([_slurp(k, encoding="utf-8") for k in self.kept("backup")], [USER], "같은 내용의 백업을 지웠다(EY1)")
 
     def test_user_header_edit_is_captured_before_recomposition(self):
         """E-6-07: 사용자가 머리말 자체를 고쳤다 → 다시 조립하기 전에 시각을 붙여 보관(틀 전진·틀 동일 두 경우)."""
@@ -329,7 +338,7 @@ class Composition(Rig):
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER_V2 + SEP + USER + "USERFIX-E6-2\n")
         caps = self.captures("before-compose")
         self.assertEqual(len(caps), 1, "고친 머리말을 보관하지 않았다: %r" % os.listdir(self.dirs))
-        self.assertRegex(os.path.basename(caps[0]), r"\.before-compose\.\d{8}T\d{6}Z$")
+        self.assertRegex(os.path.basename(caps[0]), r"^\d{8}T\d{6}Z-\d+-\d+\.before-compose$")   # EY1: 보관 폴더의 이름
         self.assertEqual(_slurp(caps[0], encoding="utf-8"), live, "보관 사본이 조립 전 바이트가 아니다")
         self.assert_receipt_for(HEADER_V2, USER + "USERFIX-E6-2\n", self.read("MASTER_DIRECTIVE.md"))
         lines = self.pushes_prefix("CEO 지침 사본 보관(머리말) — ")
@@ -704,7 +713,7 @@ class ReceiptlessComposition(Rig):
         rc, out, err = self.run_dept("down", "d0")
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER + self.EDIT, "강등이 고친 본문을 돌려주지 않았다")
-        kept = glob.glob(self.p("MASTER_DIRECTIVE.md.pre-ceo.*"))
+        kept = self.kept("backup")
         self.assertEqual([_slurp(k, encoding="utf-8") for k in kept], [USER], "다른 내용의 백업은 시각을 붙여 보관한다")
         self.assertIsNone(self.read(".ceo-receipt.json"))
 
@@ -733,8 +742,105 @@ class ReceiptlessComposition(Rig):
         rc, out, err = self.run_dept("down", "d0")
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER + self.EDIT, "낡은 .pre-ceo 로 강등했다")
-        self.assertEqual([_slurp(k, encoding="utf-8") for k in glob.glob(self.p("MASTER_DIRECTIVE.md.pre-ceo.*"))],
+        self.assertEqual([_slurp(k, encoding="utf-8") for k in self.kept("backup")],
                          [stale])
+
+
+class KeptFolder(Rig):
+    """★RULINGS EY1·FA1 — 살아 있던 지침 파일은 지우지도 덮지도 않는다: 교체로 밀려난 파일·강등 뒤의 .pre-ceo 는 보관 폴더
+    (directives/.ceo-kept/)로 옮겨져 남고, 각자 보관 시각의 해시를 담은 곁 파일(.kept, 단독 생성)을 가진다. 교체 전에 열린
+    편집기 핸들이 교체 뒤에 저장하면 그 바이트는 보관 사본에 남고 preflight C03 가 파일마다 한 번 알린다(codex 순서 ①)."""
+    EDIT = "USERSAVE-EY1 교체 뒤 옛 핸들로 저장한 줄\n"
+
+    def c03(self):
+        env0 = dict(os.environ)
+        try:
+            os.environ["HOME"] = self.home
+            for k in pf.PACK_DIR_ENV_KEYS:
+                os.environ.pop(k, None)
+            p = pf.Preflight(fix=False, skips=[])
+            p.c03_content_pins()
+            return {r["id"]: r for r in p.results}
+        finally:
+            os.environ.clear()
+            os.environ.update(env0)
+
+    def late_save_through_an_old_handle(self, op):
+        md = self.p("MASTER_DIRECTIVE.md")
+        live = self.read("MASTER_DIRECTIVE.md")
+        fh = open(md, "r+b")                      # 편집기가 교체 전에 연 핸들
+        try:
+            ns = ceo_py_module()
+            if op == "demote":
+                rc = ns["do_demote"]([self.p("CEO_TEMPLATE.md"), md, ""])
+            else:
+                rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), md, sha(_slurp(self.p("CEO_TEMPLATE.md"), "rb")), ""])
+            self.assertIn(rc, (0, 12), "교체가 일어나지 않았다(시험 무효)")
+            fh.seek(0)
+            fh.write((live + self.EDIT).encode("utf-8"))
+            fh.truncate()
+        finally:
+            fh.close()
+        holders = [k for k in self.kept() if self.EDIT in _slurp(k, encoding="utf-8")]
+        self.assertEqual(len(holders), 1, "교체 뒤 옛 핸들의 저장이 어디에도 없다(지워진 파일에 들어갔다) — %r" % self.kept())
+        return holders[0]
+
+    def test_late_save_into_the_displaced_file_survives_demotion_and_is_reported_once(self):
+        self.seed()
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        holder = self.late_save_through_an_old_handle("demote")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER)
+        rows = self.c03()
+        self.assertEqual(rows["C03.ceo-kept"]["status"], pf.WARN, rows.get("C03.ceo-kept"))
+        self.assertIn(holder, rows["C03.ceo-kept"]["detail"])
+        self.assertIn("살아 있는 지침에는 없다", rows["C03.ceo-kept"]["detail"])
+        again = self.c03()["C03.ceo-kept"]
+        self.assertEqual(again["status"], pf.PASS, "같은 파일을 두 번 경고했다(파일마다 한 번)")
+        self.assertIn("이미 알림", again["detail"])
+
+    def test_late_save_into_the_displaced_file_survives_recomposition(self):
+        self.seed()
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        _write(self.p("CEO_TEMPLATE.md"), TEMPLATE_V2)             # 틀 전진 → 다시 조립(머리말이 영수증으로 증명됨)
+        self.late_save_through_an_old_handle("compose")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER_V2 + SEP + USER)
+
+    def test_nothing_that_was_live_is_deleted(self):
+        """승격 → 강등 → 승격: 밀려난 지침 파일과 강등 뒤의 .pre-ceo 가 모두 보관 폴더에 남는다(지운 것 0) · 곁 파일마다 보관
+        시각의 해시 · 승격·강등은 보관 사본을 지우지 않는다."""
+        self.seed()
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        self.assertEqual([_slurp(k, encoding="utf-8") for k in self.kept()], [USER], "밀려난 평문 MASTER 를 보관하지 않았다")
+        rc, out, err = self.run_dept("down", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn(os.path.join(".ceo-kept", ""), out + err, "강등 출력이 보관 사본을 말하지 않는다")
+        self.register()
+        rc, out, err = self.run_dept("promote-ceo")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn(os.path.join(".ceo-kept", ""), out + err, "승격 출력이 보관 사본을 말하지 않는다")
+        got = sorted(_slurp(k, encoding="utf-8") for k in self.kept())
+        self.assertEqual(got, sorted([USER, HEADER + SEP + USER, USER, USER]),
+                         "보관 사본이 빠졌다(밀려난 평문·조립본·강등 뒤 .pre-ceo·두 번째 평문): %r" % self.kept())
+        for k in self.kept():
+            side = json.loads(_slurp(k + ".kept", encoding="utf-8"))
+            self.assertEqual(side["sha256"], sha(_slurp(k, "rb")), "곁 파일의 해시가 보관 시각의 바이트가 아니다")
+
+    def test_sidecar_is_created_exclusively(self):
+        """곁 파일은 단독 생성이다 — 같은 이름이 이미 있으면 다른 보관 이름을 고른다(공유 원장을 다시 쓰지 않는다)."""
+        self.seed()
+        ns = ceo_py_module()
+        ns["stamp"] = lambda: "20260101T000000Z"
+        kd = os.path.join(self.dirs, ".ceo-kept")
+        os.makedirs(kd)
+        taken = os.path.join(kd, "20260101T000000Z-%d-1.test" % os.getpid())
+        _write(taken + ".kept", "{}")
+        src = self.p("MASTER_DIRECTIVE.md.scratch")
+        _write(src, "보관할 바이트\n")
+        kept, digest = ns["keep_file"](src, self.p("MASTER_DIRECTIVE.md"), "test")
+        self.assertNotEqual(kept, taken)
+        self.assertEqual(_slurp(taken + ".kept", encoding="utf-8"), "{}", "남의 곁 파일을 덮었다")
+        self.assertEqual(json.loads(_slurp(kept + ".kept", encoding="utf-8"))["sha256"], digest)
+        self.assertFalse(os.path.exists(src))
 
 
 class SaveDuringSwap(Rig):
@@ -749,6 +855,8 @@ class SaveDuringSwap(Rig):
         for f in os.listdir(self.dirs):
             if f.startswith("MASTER_DIRECTIVE.md") and not f.endswith(".lock") and os.path.isfile(self.p(f)):
                 out[f] = _slurp(self.p(f), encoding="utf-8")
+        for k in self.kept():
+            out[os.path.relpath(k, self.dirs)] = _slurp(k, encoding="utf-8")
         return out
 
     def hook_first_live_write(self, ns, save):
@@ -1320,7 +1428,7 @@ class LegacyShapes(Rig):
                 self.assertIn("다른 MASTER", lines[0])
                 self.assert_receipt_for(HEADER, tail, HEADER.encode() + SEP.encode() + tail)
                 self.demote_to(tail.decode("utf-8"))
-                kept = glob.glob(self.p("MASTER_DIRECTIVE.md.pre-ceo.*"))
+                kept = self.kept("backup")
                 self.assertEqual([_slurp(k, encoding="utf-8") for k in kept], [self.USER_OLD], "강등이 .pre-ceo 를 썼거나 지웠다")
 
     def test_copy_of_the_current_template_is_a_composition(self):

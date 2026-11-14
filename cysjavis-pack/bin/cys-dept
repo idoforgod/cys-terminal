@@ -1863,11 +1863,67 @@ def rename_away(path, dst):
     retry_sharing(os.rename, path, dst)
 
 
-def keep_displaced(disp, base):
-    """옮겨 둔 파일(교체 순간의 그 파일)을 시각 붙은 보관 이름으로 — 다시 쓰지 않고 이름만 바꾼다. 경로를 돌려준다."""
-    kept = side_name(base, "")
-    os.rename(disp, kept)
-    return kept
+KEPT_DIR = ".ceo-kept"
+
+
+def kept_dir(md):
+    return os.path.join(os.path.dirname(os.path.abspath(md)), KEPT_DIR)
+
+
+def move_noreplace(src, dst):
+    """src 를 dst 로 옮긴다 — dst 가 있으면 덮지 않고 FileExistsError. POSIX = 하드 링크 + 원래 이름 지우기(링크는 기존 이름을
+    덮지 않는다) · 하드 링크가 안 되면 같은 이름 검사 뒤의 이름 바꾸기(보관 폴더 안 · 잠금을 쥔 동안만 부른다). 윈도우 =
+    os.rename(대상이 있으면 FileExistsError · 공유 위반은 짧게 재시도). 바이트를 다시 쓰지 않는다 — 같은 파일 그대로다."""
+    if os.name == "posix":
+        try:
+            os.link(src, dst)
+        except FileExistsError:
+            raise
+        except OSError:
+            if os.path.lexists(dst):
+                raise FileExistsError(dst)
+            os.rename(src, dst)
+            return dst
+        os.unlink(src)
+        return dst
+    retry_sharing(os.rename, src, dst)
+    return dst
+
+
+def keep_file(src, md, reason):
+    """★RULINGS EY1 — 살아 있던 지침 파일(교체로 밀려난 것 · 되돌린 후보 · 강등 뒤의 .pre-ceo)을 보관 폴더 directives/.ceo-kept/
+    로 **옮긴다**(지우지 않는다 · 다시 쓰지 않는다 · 덮지 않는 이름 <UTC>-<pid>-<n>.<reason>). 옮긴 뒤 그 순간의 바이트 해시를
+    곁 파일 <이름>.kept 에 **단독 생성**(O_EXCL)으로 적는다 — 공유 원장을 다시 쓰지 않는다. 나중에 그 파일에 저장이 들어가면
+    (교체 전에 열린 편집기 핸들) preflight C03 이 해시로 알아보고 알린다(FA1). 이 사본을 지우는 것은 오너나 워커의 몫이다 —
+    승격·강등은 지우지 않는다. 돌려주는 값 = (보관 경로, 보관 시각의 sha256 | None(읽을 수 없는 항목))."""
+    kd = kept_dir(md)
+    os.makedirs(kd, exist_ok=True)
+    base = "%s-%d" % (stamp(), os.getpid())
+    for n in range(1, 1000):
+        kept = os.path.join(kd, "%s-%d.%s" % (base, n, reason))
+        if os.path.lexists(kept) or os.path.lexists(kept + ".kept"):
+            continue
+        try:
+            move_noreplace(src, kept)
+        except FileExistsError:
+            continue
+        break
+    else:
+        raise OSError("보관 이름을 만들지 못했다(%s)" % kd)
+    try:
+        data = read_bytes(kept) if os.path.isfile(kept) and not os.path.islink(kept) else None
+    except OSError:
+        data = None
+    digest = sha(data) if data is not None else None
+    side = {"schema": 1, "sha256": digest, "size": len(data) if data is not None else None, "reason": reason,
+            "from": os.path.basename(src), "kept_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    fd = os.open(kept + ".kept", os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o644)
+    with os.fdopen(fd, "wb") as f:
+        f.write((json.dumps(side, ensure_ascii=False) + "\n").encode("utf-8"))
+        f.flush()
+        os.fsync(f.fileno())
+    fsync_dir(kd)
+    return kept, digest
 
 
 class SourceChanged(Exception):
@@ -1938,19 +1994,14 @@ def take_lock(md):
 
 
 def settle_displaced(path, disp, old):
-    """옮겨 둔 옛 파일 정리 — 읽은 것과 같으면 지우고(새 저장이 그것을 대신한다), 다르면 사본으로 남긴다(지우지 않는다)."""
+    """옮겨 둔 옛 파일 — ★EY1: 지우지 않고 보관 폴더로 옮긴다(읽은 것과 다르면 'changed' 로 알린다)."""
     try:
-        if read_bytes(disp) == old:
-            os.unlink(disp)
-            return None
+        same = read_bytes(disp) == old
     except OSError:
-        pass
-    kept = side_name(path, "changed")
-    try:
-        os.rename(disp, kept)
-    except OSError:
-        kept = disp
-    err("교체 중에 저장된 다른 판을 %s 에 남겼다(지우지 않음)" % kept)
+        same = False
+    kept, _ = keep_file(disp, path, "displaced" if same else "changed")
+    if not same:
+        err("교체 중에 저장된 다른 판을 %s 에 남겼다(지우지 않음)" % kept)
     return kept
 
 
@@ -1964,18 +2015,16 @@ def undo_swap(path, disp, data):
     try:
         place_new(disp, path)
     except FileExistsError:
-        kept = side_name(path, "changed")
-        os.rename(disp, kept)
+        kept, _ = keep_file(disp, path, "changed")
         err("되돌리는 사이 또 저장됐다 — 그 파일이 살아 있고, 옮겨 둔 판은 %s 에 남겼다" % kept)
     if rej is not None:
         try:
             ours = read_bytes(rej) == data
         except OSError:
             ours = False
-        if ours:
-            os.unlink(rej)
-        else:
-            err("우리 후보 자리에 다른 바이트가 있었다 — %s 에 남겼다" % rej)
+        kept, _ = keep_file(rej, path, "rejected" if ours else "changed")   # ★EY1: 잠깐이라도 살아 있던 후보도 지우지 않는다
+        if not ours:
+            err("우리 후보 자리에 다른 바이트가 있었다 — %s 에 남겼다" % kept)
 
 
 _EXCHANGE = []
@@ -2054,11 +2103,8 @@ def swap_live(path, data, old, expect=None):
                     ours = read_bytes(disp) == data
                 except OSError:
                     ours = False
-                if ours:
-                    os.unlink(disp)
-                else:                       # 그 사이 또 저장됐다 — 지우지 않고 남긴다
-                    kept = side_name(path, "changed")
-                    os.rename(disp, kept)
+                kept, _ = keep_file(disp, path, "rejected" if ours else "changed")   # ★EY1: 지우지 않는다
+                if not ours:
                     err("되돌리는 사이 또 저장됐다 — 그 판은 %s 에 남겼다" % kept)
                 raise SourceChanged("읽은 뒤에 지침이 저장됐다")
             fsync_dir(os.path.dirname(os.path.abspath(path)))
@@ -2093,19 +2139,6 @@ def swap_live(path, data, old, expect=None):
         undo_swap(path, disp, data)
         raise SourceChanged("읽은 뒤에 지침이 저장됐다")
     return disp
-
-
-def set_aside(path):
-    """파일을 시각을 붙인 이름으로 옮긴다(덮지 않는다) — 옮긴 경로."""
-    first = "%s.%s" % (path, stamp())
-    p, n = first, 1
-    while os.path.lexists(p):
-        n += 1
-        if n > 999:
-            raise OSError("보관 이름을 만들지 못했다(%s)" % first)
-        p = "%s-%d" % (first, n)
-    os.rename(path, p)
-    return p
 
 
 def write_receipt(p, header, sep, body, composed):
@@ -2236,6 +2269,16 @@ def note(nf, title, body):
             f.write("NOTICE\t%s\t%s\n" % (clean(title), clean(body)))
     except OSError as e:
         err("알림 기록 실패(%s) — 결과는 그대로다: %s" % (e, title))
+
+
+def note_kept(nf, kept):
+    """보관 사본 경로를 bash 에 넘긴다(KEPT 줄 — 알림이 아니다: 자동 승격 알림 등이 이 경로를 사용자에게 말한다 · EY1)."""
+    if nf and kept:
+        try:
+            with open(nf, "a", encoding="utf-8") as f:
+                f.write("KEPT\t%s\t-\n" % kept.replace("\t", " ").replace("\n", " "))
+        except OSError as e:
+            err("보관 경로 전달 실패(%s): %s" % (e, kept))
 
 
 def best_effort(fn, *args):
@@ -2545,13 +2588,11 @@ def compose_once(tmpl, md, tsha, nf):
     # ★DC1: 교체 순간의 파일이 읽은 mb 와 같을 때만 남는다(아니면 SourceChanged → 다시 읽어 처음부터). 옮겨 둔 파일이 곧
     #   교체 순간의 그 파일이다 — 보관 사본·새 승격의 백업은 그 파일의 이름만 바꾼다(다시 쓰지 않는다).
     disp = swap_live(md, cand, mb, expect=lambda back: back == cand and split(back) == (H, S, body))
-    kept = None
-    if keep:
-        kept = best_effort(keep_displaced, disp, md + ".before-compose") or disp
-    elif new and pstate == "absent" and best_effort(place_new, disp, pre_p) is not None:
-        pass                            # 새 승격: 백업 = 교체 순간의 사용자 본부 지침 그 파일(조립된 바이트는 절대 아님 — D-5)
-    else:
-        best_effort(os.unlink, disp)    # 머리말이 증명된 다시 조립 · 배포본 그대로인 옛 사본 — 남길 사용자 바이트가 없다
+    # ★EY1: 밀려난 파일은 언제나 보관 폴더로(지우지 않는다) — 보관 사본 알림이 필요한 경우(고친 머리말·0.14.x 옛 지침)는
+    #   아래 알림이 그 경로를 말하고, 그 밖에도 출력·자동 승격 알림이 경로를 말한다.
+    kept = best_effort(lambda: keep_file(disp, md, "before-compose" if keep else "compose")[0]) or disp
+    note_kept(nf, kept)
+    print("[cys-dept] 이전 본부 지침 파일 보관: %s" % kept)
     if pstate == "absent" and not pre_present(pre_p):
         best_effort(write_new, pre_p, body)   # 백업 = 이 조립에 쓴 사용자 본부 지침(덮지 않는다)
     # ★DC2 — 이전을 끝내는 쓰기의 순서: 지침 교체(위) → 0.14 영수증 정리 → 새 영수증. 어느 쓰기 뒤에서 멈춰도 다음 승격 확인이
@@ -2561,7 +2602,7 @@ def compose_once(tmpl, md, tsha, nf):
     write_receipt(rec_p, H, S, body, cand)
     # ── 여기부터는 교체가 끝났다: 정리·알림의 실패는 결과(rc)를 바꾸지 않는다(CG2) ──
     differs = differs_check and pre_differs(pstate, pb, body, rs)
-    if kept:
+    if keep:
         print("[cys-dept] 조립 전 지침 사본 보관: %s" % kept)
         if keep == "header":
             # 알림 1건 — .pre-ceo 가 본문과 다르면 그 사실과 경로도 같은 알림에 싣는다(고친 0.14.x 머리말 + 0.14 영수증 없음
@@ -2585,20 +2626,13 @@ def compose_once(tmpl, md, tsha, nf):
     return 0 if new else 12
 
 
-def dispose_backup(pre_p, cur):
-    """강등 뒤 .pre-ceo — ★DC1: 먼저 **그 순간의 파일 그대로** 시각 붙은 이름으로 옮기고, 지금 지침과 같으면 그것을 지우고
-    다르거나 읽을 수 없으면 그 이름으로 남긴다(읽은 뒤에 고친 백업을 지우지 않는다 · 승격 중에만 .pre-ceo 가 있게)."""
+def dispose_backup(pre_p, md):
+    """강등 뒤 .pre-ceo — ★RULINGS EY1: 비교로 지우지 않는다. 그 순간의 파일 그대로 보관 폴더로 옮긴다(승격 중에만 .pre-ceo 가
+    있게 · 지우는 것은 오너나 워커의 몫)."""
     if not pre_present(pre_p):
         return None
-    moved = set_aside(pre_p)
-    try:
-        same = os.path.isfile(moved) and not os.path.islink(moved) and read_bytes(moved) == cur
-    except OSError:
-        same = False
-    if same:
-        os.unlink(moved)
-        return "삭제(지금 지침과 같음)"
-    return "보관 %s" % moved
+    kept, _ = keep_file(pre_p, md, "backup")
+    return "보관 %s" % kept
 
 
 def do_demote(a):
@@ -2671,7 +2705,7 @@ def demote_once(tmpl, md, nf):
             keep = "migration"
     else:
         # 조립되지 않은 MASTER — 강등할 것이 없다. 남은 백업·영수증만 정리한다(승격 중에만 .pre-ceo 가 있게).
-        moved = best_effort(dispose_backup, pre_p, mb)
+        moved = best_effort(dispose_backup, pre_p, md)
         best_effort(drop, rec_p)
         best_effort(drop_legacy, leg_p)
         if moved:
@@ -2679,17 +2713,15 @@ def demote_once(tmpl, md, nf):
         return 10
     disp = swap_live(md, new_md, mb, expect=lambda back: back == new_md)   # ★DC1 — 교체 순간의 파일이 읽은 mb 일 때만
     # ── 교체 끝: 정리·알림 실패는 결과를 바꾸지 않는다(CG2) ──
-    kept = None
-    if keep:
-        kept = best_effort(keep_displaced, disp, md + ".before-demote") or disp
-    else:
-        best_effort(os.unlink, disp)
-    moved = best_effort(dispose_backup, pre_p, new_md)
+    kept = best_effort(lambda: keep_file(disp, md, "before-demote" if keep else "demote")[0]) or disp   # ★EY1
+    note_kept(nf, kept)
+    shown = kept if keep else None      # 알림이 필요한 보관 사본(고친 머리말·0.14.x 옛 지침)만 아래 알림으로
+    moved = best_effort(dispose_backup, pre_p, md)
     best_effort(drop, rec_p)   # ★승격 영수증 삭제(G0 D3) — 강등=승격 사실 소멸. 강등 불능(rc 7)·보류(rc 6)에선 지우지 않는다.
     best_effort(drop_legacy, leg_p)
     print("[cys-dept] CEO 강등 원본: %s%s%s" % (via, " · CEO 지침 사본 %s" % kept if kept else "",
                                              " · .pre-ceo %s" % moved if moved else ""))
-    if kept:
+    if shown:
         note(nf, copy_title("강등", kept),
              "CEO 강등 때 본부 지침을 %s(으)로 되돌렸고, 강등 전 CEO 지침 전체를 %s 에 보관했습니다(배포된 틀과 다르거나 "
              "머리말을 고친 지침 — 자동으로 합치지 않습니다). 필요하면 워커에게 규칙 문서 수리로 다시 반영하게 하십시오."
@@ -2831,11 +2863,15 @@ ceo_demote_notices_close(){
   return 0
 }
 ceo_notices_from(){  # $1=알림 파일(없거나 비면 무동작) — 다 올린 뒤 지운다
+  # ★EY1: KEPT 줄은 알림이 아니라 보관 사본 경로다 — 부르는 쪽의 _CEO_KEPT 에 남긴다(자동 승격 알림이 그 경로를 말한다).
   local _k _t _b
   [ -n "${1:-}" ] || return 0
   if [ -s "$1" ]; then
     while IFS=$'\t' read -r _k _t _b; do
-      [ "$_k" = "NOTICE" ] && [ -n "$_t" ] && ceo_notice_once "$_t" "$_b"
+      case "$_k" in
+        NOTICE) [ -n "$_t" ] && ceo_notice_once "$_t" "$_b" ;;
+        KEPT) [ -n "$_t" ] && _CEO_KEPT="$_t" ;;
+      esac
     done < "$1"
   fi
   rm -f "$1" 2>/dev/null || true
@@ -2899,7 +2935,7 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
   #   때만'(swap_live) — 읽은 뒤에 저장된 편집은 살아 있는 파일이나 옆 이름의 파일에 남는다.
   #   임계 구간을 복사만큼 짧게(설계 §6-14 윈도우): 무거운 상위집합 검사(i)는 락 **밖**에서 한 번 하고, 락 안에서는
   #   틀의 해시가 검사 때와 같은지만 다시 본다(검사·조립 원자성 유지).
-  local _tsha="" _pre_rc=0 _nf=""
+  local _tsha="" _pre_rc=0 _nf="" _CEO_KEPT=""
   _nf="$(mktemp "${TMPDIR:-/tmp}/cys-ceo-notice.XXXXXX" 2>/dev/null)" || _nf=""
   _tsha="$(ceo_template_superset_ok "$ceo")" || _pre_rc=3
   _swap(){
@@ -2958,7 +2994,7 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
     #   가역 사실 근거: ceo_demote는 부서 0개(reg_count=0) 시 down/down-sock에서 자동 호출되어 구분선 뒤
     #   본문(사용자 본부 지침)으로 되돌린다(수동 강등 명령은 없음 — 환각 금지).
     env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 완료(자동)" \
-      --body "부서 생성 감지 — 제품 기본 정책에 따라 기본 데몬 master를 CEO로 자동 승격했습니다. CEO 지침은 생성된 머리말에 본부 지침을 그대로 붙인 조립이라 본부 지침에 고친 내용이 남습니다. 가역: 부서를 모두 정리해 0개가 되면 구분선 뒤 본문(본부 지침 — CEO 동안 고친 것 포함)으로 자동 강등(원복)됩니다." --kind ceo-notice >/dev/null 2>&1 \
+      --body "부서 생성 감지 — 제품 기본 정책에 따라 기본 데몬 master를 CEO로 자동 승격했습니다. CEO 지침은 생성된 머리말에 본부 지침을 그대로 붙인 조립이라 본부 지침에 고친 내용이 남습니다. 가역: 부서를 모두 정리해 0개가 되면 구분선 뒤 본문(본부 지침 — CEO 동안 고친 것 포함)으로 자동 강등(원복)됩니다.${_CEO_KEPT:+ 승격 전 본부 지침 파일은 ${_CEO_KEPT} 에 그대로 보관했습니다(지우지 않습니다).}" --kind ceo-notice >/dev/null 2>&1 \
       || echo "[cys-dept] 승격 완료 알림 push 실패(데몬 미기동?) — 승격 자체는 완료됨" >&2
   fi
 }
@@ -2971,7 +3007,7 @@ ceo_demote(){
   #   강등 뒤 .pre-ceo 는 지금 지침과 같으면 지우고 다르면 시각을 붙여 옮긴다(승격 중에만 .pre-ceo 가 있게 — A12·가드 4).
   #   승격과 같은 락(D-5) 안에서 한다 — 강등과 승격이 겹쳐도 섞인 파일이 생기지 않는다. ★DC1: 그 락은 ceo_py 안의 진짜
   #   잠금(상한 있는 대기 · 무잠금 진행 없음 — ceo_promote 의 주석) · 못 잡으면 rc 8 = 강등 보류(지침 무변경 · 알림 1건).
-  local _nf=""
+  local _nf="" _CEO_KEPT=""
   _nf="$(mktemp "${TMPDIR:-/tmp}/cys-ceo-notice.XXXXXX" 2>/dev/null)" || _nf=""
   _demote_swap(){ ceo_py demote "$ceo" "$md" "$_nf"; }
   local _rc=0

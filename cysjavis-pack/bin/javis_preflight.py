@@ -1047,6 +1047,12 @@ def gate_state_dir_for_pack(pack=None):
         else os.path.join(root, "report_gate")
 
 
+def c03_kept_warned_dir():
+    """★RULINGS FA1 — C03 이 '보관 뒤 저장'을 이미 알린 보관 사본마다 하나씩 단독 생성하는 표지 파일의 폴더(관측 원장 —
+    지문 원장과 같은 ~/.cys/state 관용 · 공유 파일을 다시 쓰지 않는다)."""
+    return os.path.join(os.path.expanduser("~"), ".cys", "state", "preflight-c03-kept-warned")
+
+
 def c03_fingerprint_path():
     """C03 상태 지문 원장 위치(스펙 v4 A6) — 기존 state 관용(~/.cys/state ·
     gate_state_dir_for_pack 과 동일 루트)을 따른다. base 팩 전용이다 — dept/CEO 팩은
@@ -2231,6 +2237,8 @@ class Preflight:
             self.add(gcid, grow[0], grow[1])
         # [배달 축] C03.boot-contract — 아래 참조. 핀/건전성 축과 독립(둘의 skip 여부 무관).
         self._c03_boot_contract(st)
+        # [보관 축] C03.ceo-kept — 조립·강등이 밀어낸 지침 파일의 보관 폴더(EY1 · FA1).
+        self._c03_ceo_kept_row()
         # [핀 축 — 그 외 역할 + CEO 템플릿] (master 는 위 승격 축 판정이 대체)
         for f, pins in CONTENT_PINS.items():
             if f == "MASTER_DIRECTIVE.md":
@@ -2250,6 +2258,61 @@ class Preflight:
                          % (f, "; ".join(lost), cause or _C03_RESTORE_GUIDE))
             else:
                 self.add(cid, PASS, "%s 핀 %d개 전부 존재" % (f, len(pins)))
+
+    _C03_CEO_KEPT_DIR = ".ceo-kept"
+
+    def _c03_ceo_kept_row(self):
+        """[보관 축] C03.ceo-kept — ★RULINGS EY1·FA1. cys-dept 는 살아 있던 지침 파일(교체로 밀려난 것 · 되돌린 후보 · 강등 뒤의
+        .pre-ceo)을 지우지 않고 directives/.ceo-kept/ 로 옮기며, 사본마다 보관 시각의 해시를 곁 파일 <이름>.kept 에 적는다.
+        이 행은 사본 수·합계 크기·최신 이름을 보이고(정보 · PASS), 보관 뒤에 사본의 바이트가 바뀐 것(교체 전에 열린 편집기
+        핸들의 저장 — codex 순서 ①)을 **파일마다 한 번** WARN 으로 알린다. 한 번은 c03_kept_warned_dir() 아래 사본 이름의 표지
+        파일을 단독 생성(O_EXCL)해 기억한다 — 공유 파일을 다시 쓰지 않는다. 표지를 만들 수 없으면 다시 알린다(안전한 쪽).
+        보관 폴더가 없거나 비었으면 행이 없다. C03 은 사본을 지우지 않는다(무-fix · 지우는 것은 오너나 워커의 몫)."""
+        cid = "C03.ceo-kept"
+        if self.skipped(cid):
+            return
+        kd = os.path.join(pack_dir(), "directives", self._C03_CEO_KEPT_DIR)
+        try:
+            names = sorted(n for n in os.listdir(kd) if not n.endswith(".kept"))
+        except OSError:
+            return
+        if not names:
+            return
+        total, changed = 0, []
+        for n in names:
+            path = os.path.join(kd, n)
+            try:
+                with open(path, "rb") as f:
+                    b = f.read()
+            except OSError:
+                continue
+            total += len(b)
+            try:
+                with open(path + ".kept", encoding="utf-8") as f:
+                    want = json.load(f).get("sha256")
+            except (OSError, ValueError, AttributeError):
+                continue
+            if want and hashlib.sha256(b).hexdigest() != want:
+                changed.append(path)
+        wd = c03_kept_warned_dir()
+        fresh, told = [], []
+        for path in changed:
+            mark = os.path.join(wd, os.path.basename(path))
+            try:
+                os.makedirs(wd, exist_ok=True)
+                os.close(os.open(mark, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))
+                fresh.append(path)
+            except FileExistsError:
+                told.append(path)
+            except OSError:
+                fresh.append(path)
+        info = ("보관 사본 %d개 · 합계 %.1f KB · 최신 %s — %s 에 있다. 승격·강등은 보관 사본을 지우지 않는다(지우는 것은 오너나 "
+                "워커의 몫)" % (len(names), total / 1024.0, names[-1], kd))
+        if fresh:
+            self.add(cid, WARN, "교체 뒤에 보관 사본 %s 에 저장이 들어갔다 — 살아 있는 지침에는 없다. 그 내용이 필요하면 오너 지시로 "
+                                "워커가 본문에 옮긴다 · %s" % (", ".join(fresh), info))
+        else:
+            self.add(cid, PASS, info + ("" if not told else " · 교체 뒤 저장 %d건은 이미 알림(%s)" % (len(told), ", ".join(told))))
 
     def _c03_boot_contract(self, st):
         """[배달 축] C03.boot-contract — P0-3 기계 래치(`result.retry_eligible`)의 **소비 권한
