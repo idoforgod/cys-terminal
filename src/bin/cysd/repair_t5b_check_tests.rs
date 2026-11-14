@@ -4,10 +4,10 @@
 use std::path::PathBuf;
 
 fn pack(name: &str) -> PathBuf {
-    let home = dirs::home_dir().expect("HOME");
-    let p = home
-        .join("t5b-cm3")
-        .join(format!("{name}-{}", std::process::id()))
+    // RULINGS DE6: inside the replay's own scratch base, never HOME
+    let p = cys::repair::rehearsal::scratch_base()
+        .join("tests.nosync")
+        .join(format!("cm3-{name}-{}", std::process::id()))
         .join("pack");
     std::fs::create_dir_all(p.join("hooks")).unwrap();
     p
