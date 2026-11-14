@@ -8620,13 +8620,13 @@ fn run_init_pack(force: bool, no_install_hook: bool, claude_settings: Option<Str
     // W0-d: cys init-pack CLI 핸들러는 라이브 팩 쓰기 프로덕션 진입점 — 인가 부여.
     // ★G3(--no-install-hook 일관성): 훅 억제는 개인 프로필(~/.claude*)뿐 아니라 격리 config dir
     // 훅 병합까지 일관 적용된다(install_hooks = !no_install_hook — 모든 계급의 훅 등록 억제).
-    // ★T2h(RULINGS CW2): init-pack 은 팩 적용 잠금(`with_apply_lock`) 안에서 — 기동 설치 · 팩 동사의 보존-후-쓰기와 겹치지 않는다.
-    let staged = with_apply_lock(&pack_state_base().join(".pack-apply.lock"), || {
-        cys::pack::install_staged(force, Some(cys::pack::PackWriteAuth::production()), !no_install_hook)
-    });
-    let (written, kept) = match staged {
-        Ok(Ok(wk)) => wk,
-        Ok(Err(e)) | Err(e) => {
+    let (written, kept) = match cys::pack::install_staged(
+        force,
+        Some(cys::pack::PackWriteAuth::production()),
+        !no_install_hook,
+    ) {
+        Ok(wk) => wk,
+        Err(e) => {
             eprintln!("error: {e}");
             return 1;
         }
@@ -27396,9 +27396,8 @@ fn run_pack_heal(rel: &str, yes: bool) -> i32 {
     // capture-failed) 의 .user 는 자동 병합 실패 때 살아남은 유일 원본이라, 아래 백업이 이를
     // 침묵 클로버하면 영구 소실이었다. 이번 백업 내용(현 디스크 바이트)과 다르면
     // .user.prev-<ts> 세대 개명 후 진행 · 개명 실패 = fail-closed 거부(무변경).
-    // ★T2h(RULINGS CW2): 세대 보존(⑤-0)과 백업(⑤)은 팩 적용 잠금(`with_apply_lock` · `pack_state_base()/.pack-apply.lock`) 안에서
-    //   — 기동 설치 · 다른 팩 동사의 같은 단계와 겹치지 않는다. 확인 질문은 이미 위에서 끝났다(잠금을 쥔 채 묻지 않는다).
-    let step = with_apply_lock(&pack_state_base().join(".pack-apply.lock"), || -> Result<(), String> {
+    // ⑤-0 · ⑤ (RULINGS EC1: 잠금을 새로 잡지 않는다 — 세대는 배타 자리 예약이 지킨다).
+    let step = (|| -> Result<(), String> {
         if target.exists() {
             match preserve_prior_user_generation(&dir, rel, std::fs::read(&target).ok().as_deref()) {
                 Ok(Some(prev)) => println!("기존 보존본 세대 보존: {}", prev.display()),
@@ -27416,13 +27415,10 @@ fn run_pack_heal(rel: &str, yes: bool) -> i32 {
             })?;
         }
         Ok(())
-    });
-    match step {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) | Err(e) => {
-            eprintln!("{e}");
-            return 1;
-        }
+    })();
+    if let Err(e) = step {
+        eprintln!("{e}");
+        return 1;
     }
     // ⑥ 복원 + 3중 전진(manifest·pristine ← embed).
     // H-08: 치유가 실행비트를 떨어뜨리지 않는다 — 쓰기 전 mode 를 읽어 규칙에 넘긴다.
@@ -27581,17 +27577,17 @@ fn run_pack_revert_merge(dir: &std::path::Path, rel: &str, yes: bool, sources: &
     let target = dir.join(rel);
     let merged_now = std::fs::read_to_string(&target).unwrap_or_default();
     // ★T4-fix(R1-적대 #2 동계열): 이전 세대 .user(병합 이전 치유·충돌의 보존본) 침묵 클로버 방지.
-    // ★T2h(RULINGS CW2): 보존-후-쓰기 단계는 팩 적용 잠금(`with_apply_lock` · `pack_state_base()/.pack-apply.lock`) 안에서.
-    let step = with_apply_lock(&pack_state_base().join(".pack-apply.lock"), || -> Result<Option<std::path::PathBuf>, String> {
+    // (RULINGS EC1: 잠금을 새로 잡지 않는다 — 세대는 배타 자리 예약이 지킨다.)
+    let step = (|| -> Result<Option<std::path::PathBuf>, String> {
         let prev = preserve_prior_user_generation(dir, rel, Some(merged_now.as_bytes()))?;
         cys::pack::write_atomic(&dir.join(format!("{rel}.user")), merged_now.as_bytes())
             .map_err(|e| format!("백업 쓰기 실패({e})"))?;
         Ok(prev)
-    });
+    })();
     match step {
-        Ok(Ok(Some(prev))) => println!("기존 보존본 세대 보존: {}", prev.display()),
-        Ok(Ok(None)) => {}
-        Ok(Err(e)) | Err(e) => {
+        Ok(Some(prev)) => println!("기존 보존본 세대 보존: {}", prev.display()),
+        Ok(None) => {}
+        Err(e) => {
             eprintln!("{e} — fail-closed 거부(무변경)");
             return 1;
         }
@@ -43299,6 +43295,29 @@ mod tests {
         std::os::unix::fs::symlink(td.join("hooks"), local.join("hooks")).unwrap();
         assert!(cys::pack::sidecar_path_gate(&local, rel).is_err(), "오버레이 자리 링크 → 거부");
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★RULINGS EC1(CW2 후반 철회): 팩 적용 잠금을 잡는 작성자의 집합은 태그(v0.14.56)와 **같다** — `with_apply_lock` 을 부르는
+    /// 곳은 `pack-update` 의 적용 · 자가치유와 저널 복구 셋뿐이고, 라이브러리(src/pack.rs)는 태그의 잠금 한 곳 밖에 `flock` 을
+    /// 잡지 않는다(데몬의 기동 설치 · pack-heal · 팩 동사 · init-pack 은 잠금을 새로 잡지 않는다 — 설계 §4 · 결정 49 · CONTRACTS
+    /// C2 2.8 · O-C2-4). T6 이 잠금을 라이브러리로 옮기면 이 집합은 그대로 옮겨 적는다.
+    #[test]
+    fn ec1_the_pack_apply_lock_takers_are_the_tags() {
+        let src = include_str!("cys.rs");
+        let prod = &src[..src.find("\nmod tests {").unwrap_or(src.len())];
+        let fn_of = |at: usize| -> String {
+            let head = &prod[..at];
+            let f = head.rfind("\nfn ").map(|p| p + 4).unwrap_or(0);
+            head[f..].split('(').next().unwrap_or("").to_string()
+        };
+        let mut takers: Vec<String> = prod.match_indices("with_apply_lock(").filter(|(i, _)| {
+            !prod[..*i].ends_with("fn ")
+        }).map(|(i, _)| fn_of(i)).collect();
+        takers.sort();
+        assert_eq!(takers, vec!["pack_update_from_dir".to_string(), "pack_update_from_dir".to_string(), "run_pack_update".to_string()],
+                   "팩 적용 잠금을 잡는 작성자가 태그와 다르다");
+        let pack = include_str!("../pack.rs");
+        assert_eq!(pack.matches("libc::flock(").count(), 1, "라이브러리의 flock 은 태그의 한 곳뿐");
     }
 
     /// RULINGS AB1: `cys pack-plan` 의 버킷 목록이 설치 계획의 **모든** 버킷을 보인다 — 신설 세 버킷(user-kept ·

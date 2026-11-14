@@ -4605,57 +4605,6 @@ fn preserve_prior_user_generation_at(
     Err(format!("기존 {rel}.user 세대 자리를 찾지 못했습니다"))
 }
 
-/// ★T2h(RULINGS CW2): 팩 적용 잠금(`<팩 부모>/.pack-apply.lock` — `cys` 바이너리의 `with_apply_lock` 과 **같은 파일 · 같은
-/// flock**)을 **유한 대기**로 잡고 f 를 실행한다 — 데몬의 기동 설치(`install`)가 쓴다. 시한 안에 잡지 못하거나 잠금 파일을 열 수
-/// 없으면 stderr 한 줄을 남기고 잠금 없이 진행한다(시작이 멈추지 않는다 · 세대는 배타 자리 예약이 따로 지킨다). 잠금 파일은
-/// 링크를 따르지 않고 막히지 않게 연다. 윈도우: 잠금 없이 실행한다(`with_apply_lock` 의 비unix 동작과 같다).
-pub fn with_pack_apply_lock_bounded<T>(
-    lock_path: &Path,
-    wait: std::time::Duration,
-    f: impl FnOnce() -> T,
-) -> T {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::io::AsRawFd;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(lock_path);
-        let Ok(file) = file else {
-            eprintln!("[init-pack] ⚠ 팩 적용 잠금 파일을 열 수 없어 잠금 없이 진행합니다: {}", lock_path.display());
-            return f();
-        };
-        let fd = file.as_raw_fd();
-        let deadline = std::time::Instant::now() + wait;
-        loop {
-            if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                let out = f();
-                unsafe {
-                    libc::flock(fd, libc::LOCK_UN);
-                }
-                return out;
-            }
-            if std::time::Instant::now() >= deadline {
-                eprintln!(
-                    "[init-pack] ⚠ 팩 적용 잠금을 {}초 안에 잡지 못해 잠금 없이 진행합니다(다른 팩 쓰기가 진행 중): {}",
-                    wait.as_secs(),
-                    lock_path.display()
-                );
-                return f();
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (lock_path, wait);
-        f()
-    }
-}
-
 /// 설치 실행부 전용 세대 보존: `{rel}.user` 가 **일반 파일**일 때만 이전 세대로 비켜 세운다. 그 자리에 파일이
 /// 아닌 것(디렉터리 등)이 있으면 세대가 아니라 장애물이다 — 옮기지 않고 Err(백업 불가 → 호출자는 덮지 않는다,
 /// 부록 A-2 #4). 부재 = Ok(할 일 없음).
@@ -5201,21 +5150,7 @@ pub fn restore_update_snapshot(
 /// force=false: 사용자 수정 파일 불가침 + **비수정 파일은 임베드 신버전으로 자동 갱신**
 /// (설치 매니페스트의 설치-당시 해시와 현재 파일 해시가 일치 = 비수정). 매니페스트가
 /// 없는 구설치본 파일은 종전대로 보존한다(안전측). 반환: (written, kept).
-/// ★T2h(RULINGS CW2): 이 설치는 팩 적용 잠금 안에서 돈다(유한 대기 — [`with_pack_apply_lock_bounded`]) — 같은 팩의 `pack-heal` ·
-/// 팩 동사 · `init-pack` · `pack-update` 와 보존-후-쓰기 단계가 겹치지 않는다.
 pub fn install(force: bool, auth: Option<PackWriteAuth>) -> Result<(usize, usize), String> {
-    let run = || install_unlocked(force, auth);
-    match pack_dir().parent() {
-        Some(base) => with_pack_apply_lock_bounded(
-            &base.join(".pack-apply.lock"),
-            std::time::Duration::from_secs(10),
-            run,
-        ),
-        None => run(),
-    }
-}
-
-fn install_unlocked(force: bool, auth: Option<PackWriteAuth>) -> Result<(usize, usize), String> {
     // 얇은 래퍼: embed PACK_ALL(git-추적 전체 트리)를 입력원으로 install_from_iter에 위임한다.
     // ★외부 동작(반환값·디스크 결과·부수효과)은 완전 불변 — C/D/E 호출처 무영향(§3 하위호환).
     // auth는 라이브 대상 쓰기 인가(W0-d) — install_from_iter가 pack_dir()에 쓰므로 그대로 전달한다.
@@ -14810,35 +14745,6 @@ mod m11_tests {
         assert_eq!(gens.len(), 3, "{gens:?}");
         // 다른 쓰는 쪽이 이미 옮겼다 → 보존할 것 없음.
         assert_eq!(preserve_prior_user_generation_at(&rig.pack, rel, None, 100, &mut |_| {}).unwrap(), None);
-    }
-
-    /// ★T2h(RULINGS CW2): 기동 설치의 팩 적용 잠금 — 쥔 쪽이 있으면 기다렸다가 그 뒤에 돈다(직렬화), 시한을 넘기면 잠금 없이
-    /// 진행한다(시작이 멈추지 않는다 · 시한 = 유한).
-    #[cfg(unix)]
-    #[test]
-    fn t2h_cw2_pack_apply_lock_serializes_and_never_blocks_the_start() {
-        let rig = Rig::new("cw2lock");
-        let lock = rig.base.join(".pack-apply.lock");
-        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
-        let run = |wait_ms: u64| {
-            let (held_tx, held_rx) = std::sync::mpsc::channel();
-            let (l1, k1) = (log.clone(), lock.clone());
-            let a = std::thread::spawn(move || {
-                with_pack_apply_lock_bounded(&k1, std::time::Duration::from_secs(5), || {
-                    l1.lock().unwrap().push("A-in");
-                    held_tx.send(()).unwrap();
-                    std::thread::sleep(std::time::Duration::from_millis(400));
-                    l1.lock().unwrap().push("A-out");
-                })
-            });
-            held_rx.recv().unwrap();
-            let l2 = log.clone();
-            with_pack_apply_lock_bounded(&lock, std::time::Duration::from_millis(wait_ms), || l2.lock().unwrap().push("B"));
-            a.join().unwrap();
-            std::mem::take(&mut *log.lock().unwrap())
-        };
-        assert_eq!(run(5_000), vec!["A-in", "A-out", "B"], "쥔 쪽이 끝난 뒤에 돈다");
-        assert_eq!(run(50), vec!["A-in", "B", "A-out"], "시한(50ms)을 넘기면 잠금 없이 진행한다");
     }
 
     /// ★T2h(RULINGS CW1): 닻 내린 쓰기와 경로 규칙 — 구성 요소가 링크면 쓰지 않는다(가리키는 곳에 아무것도 생기지 않는다),
