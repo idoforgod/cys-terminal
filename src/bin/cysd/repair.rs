@@ -1297,12 +1297,12 @@ mod ledger_verbs {
             .map_err(|e| VerbError::invalid(VerbError::from(e).message))?;
         let key = (ctx.root.clone(), ctx.lane.0.clone());
         let label = caller.label();
-        // DA2: whether the signature is new is read under the row's lock, and a new one RESERVES
-        // its place in the hour's quota in one step (check + take under the quota mutex); a write
-        // that fails returns the reservation.
-        let outcome = ctx.locked(
-            &format!("intake:{}", rep.signature),
-            || -> Result<intake::Recorded, VerbError> {
+        // DA3: the row's read-modify-write under the BOUNDED lock of its signature (a fixed set —
+        // no map entry per request). DA2: whether the signature is new is read under that lock, and
+        // a new one RESERVES its place in the hour's quota in one step (check + take under the
+        // quota mutex); a write that fails returns the reservation.
+        let outcome = {
+            let _row_lock = super::intake_lock_for(&rep.signature);
             let fresh = intake::excluded(&rep.rel, error, ctx.windows).is_none()
                 && intake::load_row(&intake::row_path_in(&ctx.root, &ctx.lane, &rep.signature))?
                     .is_none();
@@ -1325,9 +1325,8 @@ mod ledger_verbs {
             if reserved && !matches!(r, Ok(intake::Recorded::New(_))) {
                 release_intake(&key, ctx.now);
             }
-                Ok(r?)
-            },
-        )?;
+            r?
+        };
         let mut out = json!({
             "signature": rep.signature,
             "rel": rep.rel,
@@ -4087,6 +4086,23 @@ pub(crate) fn mark_app_typing(prompts: &Mutex<HashMap<u64, PromptOrigin>>, seat:
         .entry(seat)
         .or_default()
         .typing_mark = Some(at);
+}
+
+/// RULINGS DA3: how many intake locks exist — a FIXED number, whatever the callers report.
+pub(crate) const INTAKE_LOCK_SHARDS: usize = 16;
+
+/// RULINGS DA3 — the bounded intake lock: one of [`INTAKE_LOCK_SHARDS`] process-wide mutexes,
+/// chosen by the signature (a refused or unique report adds no entry to any map). Every
+/// read-modify-write of an intake row runs under the lock of its signature; the hour's quota is
+/// reserved separately and atomically (DA2). The ONE entry point for every intake writer: the
+/// `report` verb and the repeated-failure detector (`alerts.rs`, unit T3e). Poison is tolerated.
+pub(crate) fn intake_lock_for(signature: &str) -> std::sync::MutexGuard<'static, ()> {
+    use std::hash::{Hash, Hasher};
+    static SHARDS: [Mutex<()>; INTAKE_LOCK_SHARDS] = [const { Mutex::new(()) }; INTAKE_LOCK_SHARDS];
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    signature.hash(&mut h);
+    let i = (h.finish() % INTAKE_LOCK_SHARDS as u64) as usize;
+    SHARDS[i].lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// RULINGS DA1 — what decides a target's class is the FILE, not its spelling. For a target outside

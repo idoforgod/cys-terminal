@@ -3976,3 +3976,47 @@ fn da2_intake_quota_reserved_atomically() {
         .count();
     assert_eq!(rows, 200, "the hour's quota was exceeded");
 }
+
+/// RULINGS DA3: once the quota is full, a loop of reports with UNIQUE signatures adds no entry to
+/// the daemon's lock registry (a refusal costs nothing); intake holds one lock per lane.
+#[test]
+fn da3_refusal_loop_adds_no_lock_entry() {
+    let r = rig("da3");
+    let w = seat(3, "worker");
+    for i in 0..200 {
+        r.call(
+            T0,
+            &w,
+            "report",
+            json!({"file": "bin/a.py", "error": format!("E: fill {i}")}),
+        )
+        .unwrap();
+    }
+    let before = r.mutexes.lock().unwrap().len();
+    assert!(before <= 1, "intake made {before} locks for one lane");
+    for i in 0..100 {
+        let v = r
+            .call(
+                T0,
+                &w,
+                "report",
+                json!({"file": "bin/a.py", "error": format!("E: refused {i}")}),
+            )
+            .unwrap();
+        assert_eq!(v["over_quota"], true, "{i}: {v}");
+    }
+    assert_eq!(
+        r.mutexes.lock().unwrap().len(),
+        before,
+        "the lock registry grew under refusals"
+    );
+}
+
+/// RULINGS DA3: the intake lock set is FIXED and is the entry point other intake writers call
+/// (`intake_lock_for` — the repeated-failure detector, unit T3e).
+#[test]
+fn da3_intake_lock_set_is_fixed() {
+    assert_eq!(INTAKE_LOCK_SHARDS, 16);
+    drop(intake_lock_for("sig-a"));
+    drop(intake_lock_for("sig-a")); // released on drop: taking it twice in a row never blocks
+}
