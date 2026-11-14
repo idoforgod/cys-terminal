@@ -30,6 +30,11 @@ CENSUS_FILES = {
     "cysjavis-pack/bin/javis_dept_schedule.py", # 작성자 10(부서 심기 · mkstemp + os.replace · LF)
     "cysjavis-pack/bin/javis_report_gate.py",   # 읽기만
     "cysjavis-pack/bin/cys-dept",               # 작성자 10 호출
+    # 0.15.0 T6 등재(검토 결과): 수리 엔진은 schedule.json 을 대상으로 하는 승인된 수리·M10 되돌리기를
+    # 규칙 1(파일 전체 맞바꾸기)로 쓴다 — 팩 적용 잠금 아래, 살아 있는 바이트가 0단계에 기록된 기대
+    # 상태와 같을 때만(다르면 거절·대체됨) 바꾸므로 그 뒤에 다른 작성자가 넣은 항목은 지우지 않는다(D㉘).
+    "src/repair/apply.rs",               # 작성자 12(수리 엔진 · 규칙 1) — 이름은 H6(1) 자체 검사 주석
+    "src/bin/cysd/repair_job.rs",        # 읽기만 — H6(1) 자체 검사(스케줄러 검증)를 수리 엔진에 넘김
 }
 
 

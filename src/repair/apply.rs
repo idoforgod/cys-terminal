@@ -3594,8 +3594,8 @@ pub type RegistrarFn<'a> = dyn Fn(&Path, bool) -> Result<String, RepairError> + 
 /// Production registrar runner.
 pub fn run_registrar(pack: &Path, dry_run: bool) -> Result<String, RepairError> {
     let script = pack.join("bin").join("javis_preflight.py");
-    // SEAL-1: the one factory for a direct python spawn (PYTHONDONTWRITEBYTECODE — never a new
-    // unsealed spawn site; `bundled_python_spawn_sites_are_enumerated_and_sealed`)
+    // SEAL-1: the one sealed factory for a direct python spawn (the bytecode seal is set inside
+    // `python_command` — never a new unsealed spawn site; `bundled_python_spawn_sites_are_enumerated_and_sealed`)
     let mut cmd = crate::python_command("python3");
     cmd.arg(&script).arg("--reconcile-hooks").arg("--json");
     if dry_run {
