@@ -906,9 +906,16 @@ pub const I4_REGIONS: &[(&str, &str, &str)] = &[
     ("bash-backstop", "run_loose_backstop() {", "}"),
 ];
 
-/// The text of an I4 region in `text`, or `None` when an anchor cannot be found.
+/// The text of an I4 region in `text`, or `None` when an anchor cannot be found or is not unique
+/// (RULINGS DF5: each I4 anchor occurs exactly once — a second copy of an anchor line is no region a
+/// comparison may guess at). The end anchor is the first match after the start; a closing brace `}`
+/// (C4: "to its closing `}`") is by nature not unique in the file and is the first one after the start.
 pub fn i4_region<'a>(text: &'a str, first: &str, last: &str) -> Option<String> {
     let lines: Vec<&'a str> = text.split('\n').collect();
+    let once = |a: &str| lines.iter().filter(|l| l.trim_end() == a).count() == 1;
+    if !once(first) || (last != "}" && !once(last)) {
+        return None;
+    }
     let start = lines.iter().position(|l| l.trim_end() == first)?;
     let end = lines[start + 1..]
         .iter()

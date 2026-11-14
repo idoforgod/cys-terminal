@@ -307,6 +307,21 @@ fn census_iii_deny_rules_and_branches_pinned() {
     assert!(corpus::census_region(&doubled, "def _strip_hidden(s):", "PY").is_err());
 }
 
+/// RULINGS DF5: an I4 anchor that occurs twice gives no region (never the first copy's).
+#[test]
+fn i4_anchors_must_occur_exactly_once() {
+    let g = released("hooks/guard.sh");
+    for (name, first, last) in corpus::I4_REGIONS {
+        assert!(corpus::i4_region(&g, first, last).is_some(), "{name}");
+        let doubled = g.replacen(first, &format!("{first}\n{first}"), 1);
+        assert!(corpus::i4_region(&doubled, first, last).is_none(), "{name}: doubled start");
+        if *last != "}" {
+            let doubled = g.replacen(last, &format!("{last}\n{last}"), 1);
+            assert!(corpus::i4_region(&doubled, first, last).is_none(), "{name}: doubled end");
+        }
+    }
+}
+
 /// I4's anchors are found in the released guard.sh, and each region is non-trivial.
 #[test]
 fn i4_anchors_found_in_released_guard() {
