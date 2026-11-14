@@ -12967,6 +12967,201 @@ mod tests {
             let _ = std::fs::remove_dir_all(&base);
         }
 
+        // ─── GN2 — M1, M2, M3: MEASURED properties of the shared per-file install (`install_into_with` — the daemon's
+        // start install runs it in place at every update). OUT of T9a's scope (GN0); each test records the state after
+        // the sequence, after ONE further install and after ONE further version (printed with `[M#]`), and asserts only
+        // the safe outcome it measured: no user byte lost (live, parked or captured). What is not safe-but-wanted (a
+        // lost record, a vendor change not applied) is described in the report, not pinned here.
+
+        fn m_install(pd: &Path, items: &[(&str, &str)], version: &str, src: &UpdateSources) {
+            install_into_with(
+                pd.to_path_buf(), items.iter().copied(), false, version, false, false, PackScope::Base, None, None, src,
+            )
+            .unwrap();
+        }
+
+        fn read_opt(p: &Path) -> Option<String> {
+            std::fs::read_to_string(p).ok()
+        }
+
+        fn ledger_kind(pd: &Path, rel: &str) -> Option<String> {
+            load_merge_pending(pd).get(rel).and_then(|e| e["kind"].as_str()).map(str::to_string)
+        }
+
+        fn manifest_hash_of(pd: &Path, rel: &str) -> Option<String> {
+            let m: BTreeMap<String, String> =
+                serde_json::from_str(&std::fs::read_to_string(pd.join(INSTALL_MANIFEST)).ok()?).ok()?;
+            m.get(rel).cloned()
+        }
+
+        /// M1: a stop between a merge's writes (the merged bytes on disk, `.pristine` advanced) and its record (ledger
+        /// entry, manifest, `.pack-version` — saved after the loop). The stop is reproduced by putting the record files
+        /// back as they were before the run (what a stop at that point leaves).
+        #[test]
+        fn m1_stop_between_a_merge_write_and_its_record_loses_no_user_byte() {
+            let _g = PACK_ENV_LOCK.lock().unwrap();
+            let base = scratch("m1");
+            let pd = base.join("pack");
+            std::fs::create_dir_all(&pd).unwrap();
+            let cap_root = base.join("captures");
+            let _cap = EnvGuard::set("CYS_PACK_CAPTURES_DIR", &cap_root);
+            let src = UpdateSources::none();
+            let rel = "skills/m1/SKILL.md";
+            let e0 = "head-old\ncommon body\n";
+            let e1 = "head-new\ncommon body\n";
+            let e2 = "head-v2\ncommon body\n";
+            let ours = "head-old\ncommon body\nuser-tail-delta\n";
+            let merged = "head-new\ncommon body\nuser-tail-delta\n";
+            m_install(&pd, &[(rel, e0)], "1.0.0", &src);
+            std::fs::write(pd.join(rel), ours).unwrap();
+            let record = [INSTALL_MANIFEST, MERGE_PENDING_FILE, PACK_VERSION_FILE];
+            let before: Vec<Option<Vec<u8>>> = record.iter().map(|f| std::fs::read(pd.join(f)).ok()).collect();
+            m_install(&pd, &[(rel, e1)], "1.1.0", &src);
+            assert_eq!(read_opt(&pd.join(rel)).as_deref(), Some(merged), "premise: a clean merge");
+            for (f, b) in record.iter().zip(&before) {
+                match b {
+                    Some(bytes) => std::fs::write(pd.join(f), bytes).unwrap(),
+                    None => {
+                        let _ = std::fs::remove_file(pd.join(f));
+                    }
+                }
+            }
+            let state = |stage: &str| {
+                eprintln!(
+                    "[M1] {stage}: disk={:?} .new={:?} .user={:?} pristine={:?} manifest_is_e0={} manifest_is_e1={} \
+                     manifest_is_e2={} ledger={:?} capture={:?}",
+                    read_opt(&pd.join(rel)),
+                    read_opt(&pd.join(format!("{rel}.new"))),
+                    read_opt(&pd.join(format!("{rel}.user"))),
+                    read_opt(&pd.join(PRISTINE_DIR).join(rel)),
+                    manifest_hash_of(&pd, rel) == Some(content_hash(e0)),
+                    manifest_hash_of(&pd, rel) == Some(content_hash(e1)),
+                    manifest_hash_of(&pd, rel) == Some(content_hash(e2)),
+                    ledger_kind(&pd, rel),
+                    find_capture(&cap_root, rel),
+                );
+                let live_or_parked = [rel.to_string(), format!("{rel}.user")]
+                    .iter()
+                    .any(|r| read_opt(&pd.join(r)).is_some_and(|s| s.contains("user-tail-delta")));
+                assert!(live_or_parked, "[M1 {stage}] the user's change is live or parked");
+                assert_eq!(find_capture(&cap_root, rel).as_deref(), Some(ours), "[M1 {stage}] pre-merge bytes captured");
+            };
+            state("after the stop");
+            m_install(&pd, &[(rel, e1)], "1.1.0", &src);
+            state("after one further install");
+            m_install(&pd, &[(rel, e2)], "1.2.0", &src);
+            state("after one further version");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// M2: two installers with a stale pending map. A parks the user's copy of a boot-critical file (vendor-first)
+        /// and records it; B loaded the ledger (and manifest) before A saved them, sees the vendor bytes A wrote, and
+        /// saves its own map because another edited file dirtied it. The interleaving is reproduced by running B on
+        /// A's files with the ledger and manifest put back as B loaded them.
+        #[test]
+        fn m2_a_stale_pending_map_keeps_the_parked_user_copy() {
+            let _g = PACK_ENV_LOCK.lock().unwrap();
+            let base = scratch("m2");
+            let pd = base.join("pack");
+            std::fs::create_dir_all(&pd).unwrap();
+            let _cap = EnvGuard::set("CYS_PACK_CAPTURES_DIR", base.join("captures"));
+            let x = "bin/m2-boot.py";
+            let y = "skills/m2/y.md";
+            let src = UpdateSources::none().with_boot_critical(move |r: &str| r == x);
+            let (x0, x1, x2, y0) = ("# x vendor 0\n", "# x vendor 1\n", "# x vendor 2\n", "y vendor 0\n");
+            let (ux, uy) = ("# x: the user's repair\n", "y: the user's edit\n");
+            m_install(&pd, &[(x, x0), (y, y0)], "1.0.0", &src);
+            std::fs::write(pd.join(x), ux).unwrap();
+            std::fs::write(pd.join(y), uy).unwrap();
+            let stale: Vec<Option<Vec<u8>>> =
+                [INSTALL_MANIFEST, MERGE_PENDING_FILE].iter().map(|f| std::fs::read(pd.join(f)).ok()).collect();
+            m_install(&pd, &[(x, x1), (y, y0)], "1.1.0", &src); // A
+            assert_eq!(ledger_kind(&pd, x).as_deref(), Some("vendor-first"), "premise: A parked and recorded");
+            for (f, b) in [INSTALL_MANIFEST, MERGE_PENDING_FILE].iter().zip(&stale) {
+                match b {
+                    Some(bytes) => std::fs::write(pd.join(f), bytes).unwrap(),
+                    None => {
+                        let _ = std::fs::remove_file(pd.join(f));
+                    }
+                }
+            }
+            m_install(&pd, &[(x, x1), (y, y0)], "1.1.0", &src); // B
+            let state = |stage: &str| {
+                eprintln!(
+                    "[M2] {stage}: x={:?} x.user={:?} ledger(x)={:?} y={:?} ledger(y)={:?}",
+                    read_opt(&pd.join(x)),
+                    read_opt(&pd.join(format!("{x}.user"))),
+                    ledger_kind(&pd, x),
+                    read_opt(&pd.join(y)),
+                    ledger_kind(&pd, y),
+                );
+                assert_eq!(read_opt(&pd.join(format!("{x}.user"))).as_deref(), Some(ux), "[M2 {stage}] parked copy on disk");
+                assert_eq!(read_opt(&pd.join(y)).as_deref(), Some(uy), "[M2 {stage}] the other edit kept");
+            };
+            state("after the interleaving");
+            m_install(&pd, &[(x, x1), (y, y0)], "1.1.0", &src);
+            state("after one further install");
+            m_install(&pd, &[(x, x2), (y, y0)], "1.2.0", &src);
+            state("after one further version");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// M3: a refused manifest write (Windows: a reader holds `.install-manifest.json`). The non-transactional install
+        /// ignores it ("best effort … the next decision falls to PRESERVE") and still writes `.pack-version`. Reproduced by
+        /// putting the manifest back as it was before the run. Then the user edits another updated file. Measured: one
+        /// further install at the same version (what `cys init-pack` does — the daemon's gate is closed); one further
+        /// version from that state (the daemon's path, no init-pack in between). The stale-entry rule reads this binary's
+        /// static past-release table, which never lists the bytes this binary itself shipped — so the "next version" leg
+        /// here measures the case where the next binary's table does not know them; the case where it does (`Repaired` →
+        /// normal update) is the pure branch pinned by `c07_classify_stale_entry_six_branches`.
+        #[test]
+        fn m3_a_refused_manifest_write_preserves_or_converges() {
+            let _g = PACK_ENV_LOCK.lock().unwrap();
+            let base = scratch("m3");
+            let pd = base.join("pack");
+            std::fs::create_dir_all(&pd).unwrap();
+            let _cap = EnvGuard::set("CYS_PACK_CAPTURES_DIR", base.join("captures"));
+            let src = UpdateSources::none();
+            let (a, b) = ("skills/m3/a.md", "skills/m3/b.md");
+            let (a0, a1, a2, b0, b1, b2) = ("a0\n", "a1\n", "a2\n", "b0\n", "b1\n", "b2\n");
+            let ub = "b: the user's edit after the update\n";
+            m_install(&pd, &[(a, a0), (b, b0)], "1.0.0", &src);
+            let manifest_before = std::fs::read(pd.join(INSTALL_MANIFEST)).unwrap();
+            m_install(&pd, &[(a, a1), (b, b1)], "1.1.0", &src);
+            std::fs::write(pd.join(INSTALL_MANIFEST), &manifest_before).unwrap(); // the refused write
+            assert!(pack_current_in(&pd, "1.1.0"), "measured: the daemon's install gate is closed after the refusal");
+            std::fs::write(pd.join(b), ub).unwrap();
+            let after_stop = base.join("after-stop");
+            copy_dir_all(&pd, &after_stop).unwrap();
+            let state = |pd: &Path, stage: &str| {
+                eprintln!(
+                    "[M3] {stage}: a={:?} b={:?} b.new={:?} b.user={:?} manifest(a)=a0:{}/a1:{}/a2:{} ledger(b)={:?}",
+                    read_opt(&pd.join(a)),
+                    read_opt(&pd.join(b)),
+                    read_opt(&pd.join(format!("{b}.new"))),
+                    read_opt(&pd.join(format!("{b}.user"))),
+                    manifest_hash_of(pd, a) == Some(content_hash(a0)),
+                    manifest_hash_of(pd, a) == Some(content_hash(a1)),
+                    manifest_hash_of(pd, a) == Some(content_hash(a2)),
+                    ledger_kind(pd, b),
+                );
+                let kept = [b.to_string(), format!("{b}.user")].iter().any(|r| read_opt(&pd.join(r)).as_deref() == Some(ub));
+                assert!(kept, "[M3 {stage}] the user's edit is live or parked");
+            };
+            state(&pd, "after the refused write");
+            m_install(&pd, &[(a, a1), (b, b1)], "1.1.0", &src);
+            state(&pd, "after one further install");
+            let next = base.join("next-version");
+            copy_dir_all(&after_stop, &next).unwrap();
+            m_install(&next, &[(a, a2), (b, b2)], "1.2.0", &src);
+            state(&next, "after one further version (from the refused state)");
+            assert!(
+                [Some(a1), Some(a2)].contains(&read_opt(&next.join(a)).as_deref()),
+                "[M3] the unedited file holds a vendor text (kept in place or updated) — nothing else written over it"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
         /// GH1: the swap refuses a destination that exists — nothing is renamed, moved or deleted (the pack, a
         /// `pack.prev` and the staging stay byte-identical). On d01d9188 it moved the pack to `pack.prev` and published.
         #[test]
