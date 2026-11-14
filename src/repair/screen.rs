@@ -425,6 +425,8 @@ pub(crate) struct ScreenConfig {
     pub between_snapshots: Option<Arc<dyn Fn(u32) + Send + Sync>>,
     /// Test seam (RULINGS EL1): the first execution of the repeat fails to start.
     pub fail_first_spawn_in_repeat: bool,
+    /// Test seam (RULINGS CZ6 / EZ1): the repeat finds its time used up (no sleeping in the tests).
+    pub repeat_out_of_time: bool,
 }
 
 impl ScreenConfig {
@@ -445,6 +447,7 @@ impl ScreenConfig {
             after_inputs_read: None,
             between_snapshots: None,
             fail_first_spawn_in_repeat: false,
+            repeat_out_of_time: false,
         }
     }
 
@@ -740,6 +743,10 @@ impl<'a> Runner<'a> {
     }
 
     fn child_deadline(&self) -> Option<Duration> {
+        // out of time is sticky: no child starts after the pass ran out of its time
+        if self.out_of_time.load(Ordering::SeqCst) {
+            return None;
+        }
         let left = replay::left(self.until);
         if left < replay::MIN_CHILD_SLICE {
             self.out_of_time.store(true, Ordering::SeqCst);
@@ -2769,6 +2776,9 @@ fn run_all(
     r.use_cache = use_cache;
     if !use_cache && cfg.fail_first_spawn_in_repeat {
         r.inject_spawn_failure.store(true, Ordering::SeqCst);
+    }
+    if !use_cache && cfg.repeat_out_of_time {
+        r.out_of_time.store(true, Ordering::SeqCst);
     }
     let mut results = Vec::new();
     let empty = Vec::new();
