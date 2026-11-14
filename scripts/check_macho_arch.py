@@ -43,15 +43,18 @@ streaming pass in archive order — never by seeking back in a compressed stream
 reads of the real 0.14.56 archive rewound the gzip ~3,864 times, ~35 minutes per pass). The output line
 `archive read in one pass: <members> members, <read> of <size> compressed bytes` is measured from the real
 reads (`read` can only exceed `size` if something rewound).
-Links and names (RULINGS DL1 — one closed form; it replaces DB5, DI2, DI3, DI4):
-  (1) every member name, hard-link name and link target is brought to ONE normal form as it is read (`normal`):
-      split at `/`, drop empty and `.` components; an absolute path anywhere, or `..` in a member or hard-link
-      name, is not measurable (exit 2, naming the member);
+Links and names (RULINGS DN1–DN4, with DL1 (3)–(4) — the closed form that replaces DB5, DI2–DI4 and DL1 (1)–(2)):
+  (1) ONE spelling, nothing normalised: a member name, and a symbolic link's target, is accepted only as a relative
+      path whose components are all non-empty and not `.` (one leading `./` of a member name is dropped, as tar
+      writers produce it); a link target may also contain `..`. An absolute path, an empty component (`//`, a
+      trailing `/`), a `.` component, or `..` in a member name is not measurable (exit 2, naming the member);
+      ONE member per name: a repeated name of which one is not a directory is not measurable (DN2);
   (2) a symbolic link is resolved the way the kernel resolves a path (`resolve`, iterative): component by
       component, every intermediate component must be a directory of the archive (or a link to one), `..` steps
       to the real parent, at most MAXSYMLINKS (32, the macOS SDK's <sys/param.h>) link expansions in total, a
       revisit of the same link with the same remaining path is a loop; a REQUIRED entry point that does not
-      resolve FAILS with the reason (not a directory / missing component / too many links / loop / dangling);
+      resolve FAILS with the reason (not a directory / missing component / too many links / loop / dangling) —
+      unless its resolution stopped at a not-measurable path, which makes it not measurable (DN4);
   (3) EVERY tar hard-link member FAILS: the updater unpacks the updater archive (`cys.app.tar.gz`, the only tar
       this gate is given — release.yml, build-macos-signed.sh) with tauri-plugin-updater 2.10.1
       (`src/updater.rs:1236–1250`), whose `entry.unpack(<file>)` of the Rust `tar` crate 0.4.46
@@ -59,6 +62,8 @@ Links and names (RULINGS DL1 — one closed form; it replaces DB5, DI2, DI3, DI4
       directory, not the extraction folder — so the archive does not guarantee which file the link names; it
       depends on what exists outside the extraction folder;
   (4) the checker's own failure — recursion, memory, any unexpected exception — is exit 2, never exit 1.
+  Three result kinds, never mixed (DN4): proven wrong (exit 1) · not measurable (exit 2) · pass (0); exit 1 when
+  anything is proven wrong, else 2 when anything is not measurable, else 0.
 Every load command of every Mach-O is checked (RULINGS DI1, DL2): each must start and end inside `sizeofcmds`,
 read one by one and forward; the streaming reader keeps only the lookback the next read needs (its buffer stays
 around two 64 KiB chunks however many commands follow each other); a load-command area over 16 MiB, or a single
@@ -100,7 +105,8 @@ TARGETS = {
 SATISFIES = {"x86_64": ("x86_64",), "arm64": ("arm64", "arm64v8")}
 # entry points whose minimum macOS is printed (relative-path suffixes; Contents/MacOS/* is added by rule)
 ENTRY_SUFFIXES = ("python/bin/python3", "node/bin/node", "git/bin/git", "uv/uv")
-# RULINGS DL1 (3) — the sentence for EVERY hard-link member (the updater's extractor, tauri-plugin-updater 2.10.1
+# RULINGS DL1 (3) — the sentence for EVERY hard-link member (its stored target is shown VERBATIM: all hard links are
+# refused, so no spelling rule applies to it — DN5) (the updater's extractor, tauri-plugin-updater 2.10.1
 # src/updater.rs:1236–1250 → tar 0.4.46 src/entry.rs:203–204, 528–548, takes the stored name relative to the process's
 # working directory, not the extraction folder)
 HARD_LINK_WHY = ("%s: a tar hard link (to %s) — the archive does not guarantee which file this link names: the "
@@ -304,42 +310,76 @@ class CountingFile:
         self.f.close()
 
 
-# ── RULINGS DL1: ONE normal form for every name ───────────────────────────────────────────────────────
+# ── RULINGS DN1–DN4: ONE spelling, one member per name, three result kinds ─────────────────────────────
 
-def normal(path):
-    """THE normal form (DL1 (1)) of a member name, a hard-link name or a link target: split at `/`, drop empty and
-    `.` components (a leading `./`, an inner `./`, a repeated `/`). `..` is kept (it is meaningful in a link target)."""
-    return "/".join(c for c in path.split("/") if c not in ("", "."))
-
-
-def name_problem(name, kind):
-    """DL1 (1): an absolute path anywhere, or `..` in a member / hard-link name, is not measurable."""
+def spelling_problem(name, kind):
+    """DN1 — the ONE accepted spelling: a relative path whose components are all non-empty and not `.`; a symbolic
+    link's target may also contain `..`. → None, or why NAME is not measurable. (Nothing is normalised.)"""
     if name.startswith("/"):
         return "%s %r is an absolute path" % (kind, name)
-    if kind != "link target" and ".." in name.split("/"):
+    parts = name.split("/")
+    if any(p in ("", ".") for p in parts):
+        return "%s %r has an empty or `.` component" % (kind, name)
+    if kind != "link target" and ".." in parts:
         return "%s %r contains `..`" % (kind, name)
     return None
 
 
 class Tree:
-    """What one pass over a directory tree or an archive found, every name in the normal form."""
+    """What one pass over a directory tree or an archive found, in the accepted spelling only."""
 
     def __init__(self):
         self.records, self.links, self.files, self.problems = {}, {}, set(), []
-        self.hardlinks, self.dirs, self.absolute = {}, set(), set()
+        self.hardlinks, self.dirs = {}, set()
+        self.unmeasurable = {}      # path → why: a rejected link, a repeated name, where an odd member could land
+        self.uncertain = set()      # the parents of where an odd member could land (consulted only when a lookup fails)
+        self.kinds = {}             # name → "dir" | "other" (DN2)
+
+    def forget(self, rel):
+        for m in (self.records, self.links, self.hardlinks):
+            m.pop(rel, None)
+        self.files.discard(rel)
+        self.dirs.discard(rel)
+
+    def not_measurable(self, label, why, shadow=None):
+        self.problems.append("%s: not measurable — %s" % (label, why))
+        if shadow:
+            self.forget(shadow)
+            self.unmeasurable[shadow] = "%s (%s)" % (label, why)
+            parts = shadow.split("/")
+            self.uncertain.update("/".join(parts[:i]) for i in range(1, len(parts)))
+
+    def claim(self, rel, kind):
+        """DN2: one member per name — a second member of the same name, one of them not a directory, makes that
+        name not measurable (the gate does not model which one the extractor leaves). → True to go on."""
+        if rel in self.unmeasurable:
+            return False
+        prev = self.kinds.get(rel)
+        if prev is not None and (prev != "dir" or kind != "dir"):
+            self.not_measurable(rel, "%s occurs more than once in the archive (one of them not a directory)" % rel, rel)
+            return False
+        self.kinds[rel] = kind
+        return True
 
     def add_link(self, rel, target):
-        p = name_problem(target, "link target")
+        p = spelling_problem(target, "link target")
         if p:
-            self.problems.append("%s: not measurable — %s" % (rel, p))
-            self.absolute.add(rel)
-        self.links[rel] = normal(target)
+            self.not_measurable(rel, p)
+            self.unmeasurable[rel] = p
+            return
+        self.links[rel] = target
 
     def finish(self):
         for key in list(self.records) + list(self.files) + list(self.links) + list(self.hardlinks):
             parts = key.split("/")
             for i in range(1, len(parts)):       # every parent of a member exists after extraction
                 self.dirs.add("/".join(parts[:i]))
+
+
+def _shadow(name):
+    """Where a member with a rejected name could land after extraction (to call that place not measurable)."""
+    s = posixpath.normpath(name.lstrip("/")) if name.strip("/") else ""
+    return None if not s or s == "." or s.startswith("..") else s
 
 
 def scan_dir(root, target_arch):
@@ -349,7 +389,7 @@ def scan_dir(root, target_arch):
 
     def rel_of(full):
         rel = os.path.relpath(full, root).replace(os.sep, "/")
-        return normal(base + "/" + rel if base else rel)
+        return rel if not base else (base if rel == "." else base + "/" + rel)
 
     def one(full, rel):
         if os.path.islink(full):
@@ -367,9 +407,11 @@ def scan_dir(root, target_arch):
                 info = inspect(read, size, target_arch)
         except Unjudgeable as e:
             tree.problems.append("%s: %s" % (rel, e))
+            tree.unmeasurable[rel] = str(e)
             return
         except OSError as e:
             tree.problems.append("%s: unreadable (%s)" % (rel, e.strerror or e))
+            tree.unmeasurable[rel] = "unreadable"
             return
         if info is not None:
             tree.records[rel] = info
@@ -383,7 +425,7 @@ def scan_dir(root, target_arch):
         tree.problems.append("%s: unreadable directory (%s)" % (rel_of(e.filename) if e.filename else root, e.strerror or e))
 
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=onerror):
-        if rel_of(dirpath):
+        if rel_of(dirpath) != ".":
             tree.dirs.add(rel_of(dirpath))
         for name in sorted(filenames):
             full = os.path.join(dirpath, name)
@@ -397,8 +439,9 @@ def scan_dir(root, target_arch):
 
 
 def scan_tar(path, target_arch, out):
-    """ONE streaming pass in archive order (CA1) → Tree. Every name is brought to the normal form as it is met
-    (DL1 (1)); a hard-link member is recorded with its stored link name (DL1 (3))."""
+    """ONE streaming pass in archive order (CA1) → Tree. A member name is accepted in the one spelling of DN1 (one
+    leading `./` dropped); a repeated name is DN2; a hard-link member is kept with its stored target VERBATIM
+    (every hard link is refused — DL1 (3) — so its target needs no spelling rule)."""
     tree = Tree()
     raw = CountingFile(path)
     members = 0
@@ -406,13 +449,13 @@ def scan_tar(path, target_arch, out):
         with tarfile.open(fileobj=raw, mode="r|*") as tar:
             for m in tar:
                 members += 1
-                p = name_problem(m.name, "member name")
-                if m.islnk() and not p:
-                    p = name_problem(m.linkname, "hard-link name")
+                rel = m.name[2:] if m.name.startswith("./") else m.name
+                p = spelling_problem(rel, "member name")
                 if p:
-                    tree.problems.append("%s: not measurable — %s" % (m.name, p))
+                    tree.not_measurable(m.name, p, _shadow(rel))
                     continue
-                rel = normal(m.name)
+                if not tree.claim(rel, "dir" if m.isdir() else "other"):
+                    continue
                 if m.islnk():
                     tree.hardlinks[rel] = m.linkname
                     continue
@@ -430,6 +473,7 @@ def scan_tar(path, target_arch, out):
                     info = inspect(ForwardReader(fobj).read, m.size, target_arch)
                 except Unjudgeable as e:
                     tree.problems.append("%s: %s" % (rel, e))
+                    tree.unmeasurable[rel] = str(e)
                     continue
                 if info is not None:
                     tree.records[rel] = info
@@ -443,54 +487,60 @@ def scan_tar(path, target_arch, out):
     return tree
 
 
+WRONG, UNMEASURABLE = "wrong", "not measurable"
+
+
 def resolve(rel, tree):
-    """RULINGS DL1 (2) — REL resolved the way the kernel resolves a path, ITERATIVELY → (resolved key | None, why):
-    component by component; a component that is a symbolic-link member is replaced by its target (relative to the
-    link's directory); every INTERMEDIATE component must be a directory of the archive (or a link to one); `..`
-    steps to the real parent; at most MAXSYMLINKS link expansions in total; a revisit of the same link with the
-    same remaining path is a loop. A hard link anywhere on the way is DL1 (3)."""
-    pending = rel.split("/") if rel else []
+    """DN3 (= DL1 (2)) — REL resolved the way the kernel resolves a path, ITERATIVELY → (key | None, why, kind):
+    component by component; a symbolic-link member is replaced by its target (relative to its directory); every
+    INTERMEDIATE component must be a directory of the archive (or a link to one); `..` steps to the real parent;
+    at most MAXSYMLINKS link expansions; a revisit of the same link with the same remaining path is a loop.
+    KIND (DN4): "" resolved · WRONG proven wrong · UNMEASURABLE the resolution stopped at a not-measurable path."""
+    pending = rel.split("/")
     done, expansions, seen = [], 0, set()
     while pending:
         c = pending.pop(0)
         if c == "..":
             if not done:
-                return None, "outside the archive: `..` climbs above its root"
+                return None, "outside the archive: `..` climbs above its root", WRONG
             done.pop()
             continue
         cand = "/".join(done + [c])
+        if cand in tree.unmeasurable:
+            return None, "not measurable — %s" % tree.unmeasurable[cand], UNMEASURABLE
         if cand in tree.hardlinks:
-            return None, HARD_LINK_WHY % (cand, tree.hardlinks[cand])
+            return None, HARD_LINK_WHY % (cand, tree.hardlinks[cand]), WRONG
         if cand in tree.links:
-            if cand in tree.absolute:
-                return None, "absolute link target (not measurable — named below)"
             expansions += 1
             if expansions > MAXSYMLINKS:
                 return None, ("too many links: more than %d link expansions (the platform's MAXSYMLINKS) — the "
-                              "kernel would not resolve it" % MAXSYMLINKS)
+                              "kernel would not resolve it" % MAXSYMLINKS), WRONG
             state = (cand, tuple(pending))
             if state in seen:
-                return None, "link loop (%s is met again with the same remaining path)" % cand
+                return None, "link loop (%s is met again with the same remaining path)" % cand, WRONG
             seen.add(state)
-            target = tree.links[cand]
-            pending = (target.split("/") if target else []) + pending
+            pending = tree.links[cand].split("/") + pending
             continue
         if pending:
             if cand in tree.dirs:
                 done.append(c)
                 continue
             if cand in tree.files:
-                return None, "not a directory: %s is a file" % cand
-            return None, "missing component: %s" % cand
+                return None, "not a directory: %s is a file" % cand, WRONG
+            if cand in tree.uncertain:
+                return None, "not measurable — %s may be a directory of a member with a rejected name" % cand, UNMEASURABLE
+            return None, "missing component: %s" % cand, WRONG
         done.append(c)
     final = "/".join(done)
     if final in tree.records:
-        return final, ""
+        return final, "", ""
     if final in tree.files:
-        return None, "not a Mach-O file"
+        return None, "not a Mach-O file", WRONG
     if final in tree.dirs:
-        return None, "a directory, not a Mach-O file"
-    return None, "dangling link: no member %s" % final if final != rel else "missing"
+        return None, "a directory, not a Mach-O file", WRONG
+    if final in tree.uncertain:
+        return None, "not measurable — %s may be a directory of a member with a rejected name" % final, UNMEASURABLE
+    return None, ("dangling link: no member %s" % final if final != rel else "missing"), WRONG
 
 
 def check_one(path, target_arch, requires, quiet, out):
@@ -517,7 +567,7 @@ def _check_one(path, target_arch, requires, quiet, out):
         return EXIT_UNJUDGEABLE
     records, links, files, problems, hardlinks = tree.records, tree.links, tree.files, tree.problems, tree.hardlinks
     counts = {}
-    failures = []
+    failures = []                                     # DN4: proven wrong (exit 1) — `problems` are not measurable (2)
     for rel in sorted(records):
         info = records[rel]
         key = "+".join(info["archs"])
@@ -532,19 +582,22 @@ def _check_one(path, target_arch, requires, quiet, out):
     entries = []
     for rel in sorted(set([r for r in records if is_entry(r)] + [r for r in links if is_entry(r)]
                           + [r for r in hardlinks if is_entry(r)])):
-        real, _ = resolve(rel, tree)
+        real, _, _ = resolve(rel, tree)
         entries.append((rel, real, records.get(real)))
     for req in requires:
-        req = normal(req)
-        hits = sorted(r for r in set(records) | set(links) | files | set(hardlinks) if r == req or r.endswith("/" + req))
+        req = req.strip("/")
+        hits = sorted(r for r in set(records) | set(links) | files | set(hardlinks) | set(tree.unmeasurable)
+                      if r == req or r.endswith("/" + req))
         if not hits:
             failures.append("required entry point %s: missing" % req)
             continue
         for r in hits:
             if r in hardlinks:
                 continue                              # named above (DL1 (3))
-            real, why = resolve(r, tree)
-            if real is None:
+            real, why, kind = resolve(r, tree)
+            if kind == UNMEASURABLE:                  # DN4: stopped at a not-measurable path — never a proven failure
+                problems.append("required entry point %s: %s" % (r, why))
+            elif real is None:
                 failures.append("required entry point %s: %s" % (r, why))
             elif not records[real]["ok"]:
                 pass                                  # already named above with its architecture
