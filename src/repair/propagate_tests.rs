@@ -1317,3 +1317,31 @@ fn the_conflict_summary_is_one_line_over_all_lanes() {
     let line = conflict_summary_line_in(&r.root, &r.registry).unwrap();
     assert!(!line.contains('\n') && line.contains("R-1") && line.contains(&dept_key.0), "{line}");
 }
+
+
+/// I8 — the id file survives the product's per-file install (the daemon's boot install and, since
+/// GH1, `init-pack` on an existing pack run this same function in place) and its prune of stale
+/// manifest entries: byte-identical, the same mtime; the pass then answers Equal (no row demoted, the
+/// gate unchanged).
+#[test]
+fn the_id_file_survives_the_per_file_install_and_its_prune() {
+    let r = rig("i8");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    tick(&r, DEPT, &doubles(), &fid(1));
+    assert_eq!(gate_verdict_in(&r.root, &lane(DEPT)), GateVerdict::Open);
+    let idp = crate::repair::paths::pack_instance_path(&r.dept);
+    let (bytes, mtime) = (std::fs::read(&idp).unwrap(), std::fs::metadata(&idp).unwrap().modified().unwrap());
+    // two installs: the second drops an item (its manifest entry is pruned) and changes another
+    for items in [vec![("bin/x.py", "print(1)\n"), ("bin/y.py", "print(2)\n")], vec![("bin/x.py", "print(3)\n")]] {
+        crate::pack::install_into(r.dept.clone(), items, false, "0.15.0", false, false, crate::pack::PackScope::Dept, None, None).unwrap();
+    }
+    assert_eq!(std::fs::read(&idp).unwrap(), bytes, "byte-identical");
+    assert_eq!(std::fs::metadata(&idp).unwrap().modified().unwrap(), mtime, "not rewritten");
+    let l = lane(DEPT);
+    let no = |_: PassStep| false;
+    assert_eq!(pack_instance_pass_in(&pass_env(&r, &l, DEPT, &no), &fid(2)), PassOutcome::Equal);
+    assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Verified, "no row demoted");
+    assert_eq!(gate_verdict_in(&r.root, &lane(DEPT)), GateVerdict::Open, "the gate unchanged");
+}
