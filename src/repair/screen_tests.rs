@@ -92,7 +92,7 @@ fn decisions<'a>(r: &'a ScreenReport, class: &str) -> Vec<&'a ProbeResult> {
 }
 
 fn cleanup(root: &Path) {
-    replay::remove_tree(root);
+    replay::remove_tree(root).expect("the test root is removed");
 }
 
 // ───────────────────────────── parity, census (i) and (iii) ─────────────────────────────
