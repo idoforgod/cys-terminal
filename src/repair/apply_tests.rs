@@ -2565,11 +2565,28 @@ fn census_sources() -> Vec<(String, String)> {
             continue;
         }
         let src = std::fs::read_to_string(&p).unwrap();
-        let cut = ["\n#[cfg(test)]\nmod ", "\n#[cfg(test)]\n#[path"].iter().filter_map(|m| src.find(m)).min().unwrap_or(src.len());
-        out.push((name, src[..cut].to_string()));
+        out.push((name, census_prod(&src).to_string()));
     }
     out.sort();
     out
+}
+
+/// A file's production text: cut at its TEST module only — `#[cfg(test)]` followed by `mod tests` or
+/// by a `#[path = "…_tests.rs"]` — never at another test-only item (a test-only derivation module,
+/// an injection helper), so the production code after such an item is still counted.
+fn census_prod(src: &str) -> &str {
+    let mark = "\n#[cfg(test)]\n";
+    let mut at = 0;
+    while let Some(i) = src[at..].find(mark) {
+        let start = at + i;
+        let rest = &src[start + mark.len()..];
+        let first = rest.lines().next().unwrap_or("");
+        if rest.starts_with("mod tests") || (rest.starts_with("#[path = \"") && first.ends_with("_tests.rs\"]")) {
+            return &src[..start];
+        }
+        at = start + 1;
+    }
+    src
 }
 
 /// The function a `fn` line declares (visibility and qualifiers skipped).
@@ -2840,6 +2857,11 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("apply.rs", "step4", "conservative", 2, "sealed copy if present else payload — either is verified against the expected state before use"),
     ("apply.rs", "unreadable_intents_in", "reported", 1, "an unlistable root is reported by the recovery and the passes"),
     ("apply.rs", "unreadable_ledger_member", "display", 1, "a path shown relative when it can be"),
+    ("boot_critical.rs", "canonical_form", "outside", 2, "another track's file, not changed by T6"),
+    ("boot_critical.rs", "classify_path", "outside", 1, "another track's file, not changed by T6"),
+    ("boot_critical.rs", "file_identity", "outside", 2, "another track's file, not changed by T6"),
+    ("boot_critical.rs", "pack_roots", "outside", 2, "another track's file, not changed by T6"),
+    ("boot_critical.rs", "run_query", "outside", 2, "another track's file, not changed by T6"),
     ("boot_critical_derive.rs", "awakening_hooks", "outside", 2, "another track's file, not changed by T6"),
     ("boot_critical_derive.rs", "bindings_impl", "outside", 6, "another track's file, not changed by T6"),
     ("boot_critical_derive.rs", "by_construction_census", "outside", 5, "another track's file, not changed by T6"),
