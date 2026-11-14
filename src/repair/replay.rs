@@ -318,6 +318,9 @@ pub struct ChildOutcome {
     pub survivors: Vec<u32>,
     /// The child was not reaped within the kill grace — left to a detached reap (DR3).
     pub unreaped: bool,
+    /// RULINGS GA4 (b): a process enumeration failed or was cut at its cap — what the run left
+    /// behind could not be looked at whole; the run is not clean.
+    pub observation_incomplete: bool,
     /// Per output stream (RULINGS EL1 / EL4): the read reached the end of the pipe, how many bytes
     /// beyond the kept cap were counted and dropped, and whether a read failed. An output is WHOLE
     /// only with the end reached, nothing dropped and no read error.
@@ -361,6 +364,9 @@ impl ChildOutcome {
         if self.unreaped {
             return Some("the child did not die within the kill grace (left to a detached reap)".into());
         }
+        if self.observation_incomplete {
+            return Some("the process observation was incomplete (an enumeration failed or was cut)".into());
+        }
         None
     }
 }
@@ -391,17 +397,20 @@ mod procs {
     const PROC_PPID_ONLY: u32 = 6;
     const SZOMB: u32 = 5;
 
-    fn list(kind: u32, arg: u32) -> Vec<u32> {
-        let mut buf: Vec<libc::pid_t> = vec![0; 512];
+    /// (pids, the enumeration was COMPLETE): a failed call, or a buffer filled to its last slot (the
+    /// answer may have been cut), is not complete (RULINGS GA4 (b)).
+    fn list(kind: u32, arg: u32) -> (Vec<u32>, bool) {
+        let mut buf: Vec<libc::pid_t> = vec![0; 4096];
         let bytes = (buf.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
         // SAFETY: proc_listpids(3) fills at most `bytes` bytes of pid slots and returns the bytes used.
         let n = unsafe { libc::proc_listpids(kind, arg, buf.as_mut_ptr().cast(), bytes) };
-        if n <= 0 {
-            return Vec::new();
+        if n < 0 {
+            return (Vec::new(), false);
         }
         let count = (n as usize / std::mem::size_of::<libc::pid_t>()).min(buf.len());
+        let complete = count < buf.len();
         buf.truncate(count);
-        buf.into_iter().filter(|p| *p > 0).map(|p| p as u32).collect()
+        (buf.into_iter().filter(|p| *p > 0).map(|p| p as u32).collect(), complete)
     }
 
     /// The start time of `pid` while it is a live process (not a zombie, not gone).
@@ -423,11 +432,11 @@ mod procs {
             .then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
     }
 
-    pub fn children(pid: u32) -> Vec<u32> {
+    pub fn children(pid: u32) -> (Vec<u32>, bool) {
         list(PROC_PPID_ONLY, pid)
     }
 
-    pub fn group(pgid: u32) -> Vec<u32> {
+    pub fn group(pgid: u32) -> (Vec<u32>, bool) {
         list(PROC_PGRP_ONLY, pgid)
     }
 }
@@ -446,14 +455,16 @@ mod procs {
         Some((state, ppid, pgrp, start))
     }
 
-    fn all() -> Vec<u32> {
-        std::fs::read_dir("/proc")
-            .map(|rd| {
+    fn all() -> (Vec<u32>, bool) {
+        match std::fs::read_dir("/proc") {
+            Ok(rd) => (
                 rd.flatten()
                     .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+                    .collect(),
+                true,
+            ),
+            Err(_) => (Vec::new(), false),
+        }
     }
 
     pub fn alive_since(pid: u32) -> Option<(u64, u64)> {
@@ -461,18 +472,14 @@ mod procs {
         (state != 'Z' && state != 'X').then_some((start, 0))
     }
 
-    pub fn children(pid: u32) -> Vec<u32> {
-        all()
-            .into_iter()
-            .filter(|p| stat(*p).is_some_and(|s| s.1 == pid))
-            .collect()
+    pub fn children(pid: u32) -> (Vec<u32>, bool) {
+        let (a, ok) = all();
+        (a.into_iter().filter(|p| stat(*p).is_some_and(|s| s.1 == pid)).collect(), ok)
     }
 
-    pub fn group(pgid: u32) -> Vec<u32> {
-        all()
-            .into_iter()
-            .filter(|p| stat(*p).is_some_and(|s| s.2 == pgid))
-            .collect()
+    pub fn group(pgid: u32) -> (Vec<u32>, bool) {
+        let (a, ok) = all();
+        (a.into_iter().filter(|p| stat(*p).is_some_and(|s| s.2 == pgid)).collect(), ok)
     }
 }
 
@@ -481,51 +488,87 @@ mod procs {
     pub fn alive_since(_pid: u32) -> Option<(u64, u64)> {
         None
     }
-    pub fn children(_pid: u32) -> Vec<u32> {
-        Vec::new()
+    pub fn children(_pid: u32) -> (Vec<u32>, bool) {
+        (Vec::new(), false)
     }
-    pub fn group(_pgid: u32) -> Vec<u32> {
-        Vec::new()
+    pub fn group(_pgid: u32) -> (Vec<u32>, bool) {
+        (Vec::new(), false)
     }
 }
 
-/// Records every descendant of `root` alive now (children, recursively; at most 256) and every
-/// member of its process group, with its start time, into `seen` (RULINGS CZ4 / DR3: a process that
-/// leaves the group is still the child's descendant while the child lives — the runner samples the
-/// tree on every turn of its loop).
-fn sample_tree(root: u32, seen: &mut Vec<SeenProcess>) {
-    let mut stack: Vec<u32> = procs::children(root);
-    stack.extend(procs::group(root));
-    let mut visited = 0usize;
-    while let Some(p) = stack.pop() {
-        visited += 1;
-        if visited > 256 {
-            break;
-        }
-        if p == root || seen.iter().any(|(q, _)| *q == p) {
-            continue;
-        }
-        if let Some(t) = procs::alive_since(p) {
-            seen.push((p, t));
-            stack.extend(procs::children(p));
+/// Most processes one sample traverses; reaching it makes the observation incomplete.
+const TREE_CAP: usize = 1024;
+
+/// RULINGS GA4 — one sample of the child's process tree: every descendant of `root` alive now
+/// (children, recursively) and every member of its process group, each new one recorded with its
+/// start time in `seen`. (a) A process seen before is FOLLOWED: its children are asked at EVERY sample
+/// for as long as it is the same live process ("seen" is an identity memory, never a reason to skip
+/// the traversal). (b) Returns whether the sample was COMPLETE — a failed or capped enumeration, or a
+/// traversal cut at [`TREE_CAP`], is not, and the runner says so ([`ChildOutcome`]'s
+/// `observation_incomplete`). (d) What sampling cannot guarantee: a process that leaves its parent
+/// inside one sampling turn, or is started through the system's launcher, is not seen (GAPS G17).
+fn sample_tree(root: u32, seen: &mut Vec<SeenProcess>) -> bool {
+    let mut complete = true;
+    let ask = |p: u32, stack: &mut Vec<u32>, complete: &mut bool| {
+        let (kids, ok) = procs::children(p);
+        *complete &= ok;
+        stack.extend(kids);
+    };
+    let mut stack: Vec<u32> = Vec::new();
+    ask(root, &mut stack, &mut complete);
+    let (members, ok) = procs::group(root);
+    complete &= ok;
+    stack.extend(members);
+    // the processes seen before are asked again too (they may have left the group and the root)
+    for (p, t) in seen.clone() {
+        if procs::alive_since(p) == Some(t) {
+            stack.push(p);
         }
     }
+    let mut visited: Vec<u32> = Vec::new();
+    while let Some(p) = stack.pop() {
+        if p == root || visited.contains(&p) {
+            continue;
+        }
+        if visited.len() >= TREE_CAP {
+            complete = false;
+            break;
+        }
+        visited.push(p);
+        let Some(t) = procs::alive_since(p) else {
+            continue;
+        };
+        match seen.iter().find(|(q, _)| *q == p) {
+            Some((_, t0)) if *t0 != t => continue, // the pid now names another process
+            Some(_) => {}
+            None => seen.push((p, t)),
+        }
+        ask(p, &mut stack, &mut complete);
+    }
+    complete
 }
 
 /// The processes of `seen` (and of the group `pgid`, the leader excepted) that are STILL the same
-/// live processes.
-fn still_alive(seen: &[SeenProcess], pgid: u32) -> Vec<u32> {
+/// live processes; the bool says whether the group enumeration was complete.
+fn still_alive(seen: &[SeenProcess], pgid: u32) -> (Vec<u32>, bool) {
     let mut out: Vec<u32> = seen
         .iter()
         .filter(|(p, t)| procs::alive_since(*p) == Some(*t))
         .map(|(p, _)| *p)
         .collect();
-    for p in procs::group(pgid) {
+    let (members, ok) = procs::group(pgid);
+    for p in members {
         if p != pgid && !out.contains(&p) && procs::alive_since(p).is_some() {
             out.push(p);
         }
     }
-    out
+    (out, ok)
+}
+
+/// RULINGS GA4 (c): the start time of `pid` while it is a live process — the identity (pid + start
+/// time) a test observes a process's disappearance with, from OUTSIDE the runner.
+pub fn process_identity(pid: u32) -> Option<(u64, u64)> {
+    procs::alive_since(pid)
 }
 
 /// How long the output pipes of an ENDED child are still read (never past the run's deadline) before
@@ -679,7 +722,9 @@ pub fn run_child_with(
         pump_out(&mut serr, &mut out.stderr, &mut out.stderr_state);
         if ended_at.is_none() {
             // the child's descendants while it lives (a process that leaves the group is still one)
-            sample_tree(pid as u32, &mut seen);
+            if !sample_tree(pid as u32, &mut seen) {
+                out.observation_incomplete = true;
+            }
         }
         let now = Instant::now();
         if ended_at.is_none() && exited_no_reap(pid) {
@@ -711,8 +756,10 @@ pub fn run_child_with(
         std::thread::sleep(Duration::from_millis(10)); // a descendant that has just closed its pipes
     }
     let me = pid as u32;
-    let alive_now = |seen: &[SeenProcess]| -> Vec<u32> {
-        let mut v = still_alive(seen, me);
+    let mut group_seen_whole = true;
+    let mut alive_now = |seen: &[SeenProcess]| -> Vec<u32> {
+        let (mut v, ok) = still_alive(seen, me);
+        group_seen_whole &= ok;
         for p in marked_processes(&mark) {
             if !v.contains(&p) {
                 v.push(p);
@@ -751,6 +798,9 @@ pub fn run_child_with(
     while !out.survivors.is_empty() && Instant::now() < settle_until {
         std::thread::sleep(Duration::from_millis(20));
         out.survivors = alive_now(&seen);
+    }
+    if !group_seen_whole {
+        out.observation_incomplete = true;
     }
     // the outputs, once more without blocking; still open → held by something the kill did not reach
     pump_out(&mut sout, &mut out.stdout, &mut out.stdout_state);
