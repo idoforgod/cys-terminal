@@ -520,7 +520,8 @@ fn every_form_applies_with_mode_and_fresh_mtime() {
         bound: Bound::now(&r.pack),
     })
     .unwrap();
-    assert!(matches!(d.outcome, ApplyOutcome::Superseded(_)));
+    // GV1 (old expectation: Superseded): an occupied path is another writer's — a conflict
+    assert!(matches!(d.outcome, ApplyOutcome::Declined(_)), "{:?}", d.outcome);
     assert_eq!(std::fs::read(r.pack.join("hooks/p.sh")).unwrap(), b"SOMEONE\n");
     assert!(wal::unfinished_for_lane(&r.root, &r.lane).is_empty());
 }
@@ -605,7 +606,8 @@ fn displaced_garbage_is_never_relived() {
             bound: Bound::now(&r.pack),
         })
         .unwrap();
-        assert!(matches!(d.outcome, ApplyOutcome::Superseded(_)), "{:?}", d.outcome);
+        // GV1 (old expectation: Superseded): another writer's bytes at the door — a conflict
+        assert!(matches!(d.outcome, ApplyOutcome::Declined(_)), "{:?}", d.outcome);
         let _ = relived;
         let live = std::fs::read(r.pack.join("schedule.json")).unwrap();
         assert_eq!(live, other, "the other writer's bytes stay live, untouched");
@@ -772,9 +774,13 @@ fn revert_of_created_deleted_and_moved_on_files() {
     committed_general(&r, &moved, "hooks/m.sh", Some(b"A\n"), Some(b"B\n"));
     r.put("hooks/m.sh", b"UPDATE-WROTE\n", 0o755);
     let rep = revert_in(&env, &moved, RevertCaller::Human, &no_hooks, &no_repair_lock).unwrap();
-    assert!(matches!(rep.outcome, ApplyOutcome::Superseded(_)));
+    // GV1 (old expectations: Superseded, the record Superseded): in the same pack generation the
+    // bytes are another writer's — a CONFLICT: nothing changed, the record stays in force, the row
+    // 충돌 with its report owed
+    assert!(matches!(rep.outcome, ApplyOutcome::Declined(_)), "{:?}", rep.outcome);
     assert_eq!(std::fs::read(r.pack.join("hooks/m.sh")).unwrap(), b"UPDATE-WROTE\n", "nothing changed");
-    assert_eq!(ledger::read_record_in(&r.root, &moved).unwrap().unwrap().state, RepairState::Superseded);
+    assert_eq!(ledger::read_record_in(&r.root, &moved).unwrap().unwrap().state, RepairState::Probation);
+    assert_eq!(ledger::read_lane_in(&r.root, &moved, &r.lane).unwrap().unwrap().state, LaneState::Conflict);
 }
 
 /// Windows (run here through the form switch): automatic return is OFF; a human / worker revert of
@@ -860,7 +866,9 @@ fn staged_pack_swap_during_an_operation_then_second_install() {
     let f = Swap(&r, Cell::new(false));
     let env = r.env(&f, ApplyForm::Exchange);
     let d = run_op(&env, &OpSpec { id: rid("R-10"), rel: "hooks/a.sh".into(), kind: "apply".into(), expected: Recorded::for_test(r.live("hooks/a.sh")), incoming: st, source: Source::Fresh(src), bound: Bound::now(&r.pack) }).unwrap();
-    assert!(matches!(d.outcome, ApplyOutcome::Superseded(_)), "{:?}", d.outcome);
+    // GV1 (old expectation: Superseded): the swapped-in pack states the same generation, so its file
+    // is another writer's bytes — a conflict
+    assert!(matches!(d.outcome, ApplyOutcome::Declined(_)), "{:?}", d.outcome);
     // second install: the pack swapped again (pack.prev deleted by the installer)
     let _ = std::fs::remove_dir_all(r.base.join("pack.prev"));
     let vault = r.vault_bytes();
