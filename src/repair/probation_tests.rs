@@ -157,7 +157,7 @@ fn probation_rechecks_only_repaired_files() {
     let lock = r.base.join(".pack-apply.lock");
     let mut report = TickReport::default();
     let env = job(&r, &d, ApplyForm::Exchange, NOW, &lock);
-    probation_pass(&env, &mut report).unwrap();
+    probation_pass(&env, &mut report);
     assert_eq!(*seen.borrow(), vec!["hooks/a.sh".to_string()]);
 }
 
