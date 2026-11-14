@@ -231,6 +231,9 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 check_feed_aging(&daemon, &mut feed_reminded);
                 check_feed_backlog(&daemon, &mut feed_backlog_alerted);
                 check_approval_stall(&daemon, &mut approval_stall_fired);
+                // 「스스로 해결」 C5 5.14: the final-approval requests' expiry inside the watchdog (never a
+                //   scheduled job — the built-in-job version trap); no `.await`, no lock held across it.
+                crate::repair_approval::watchdog_sweep(&daemon);
                 check_role_deadman(&daemon, &mut deadman);
                 // 저빈도 검사(15초): 파일 stat·화면 렌더 — 5초마다 돌릴 필요 없음
                 if tick_no.is_multiple_of(3) {
