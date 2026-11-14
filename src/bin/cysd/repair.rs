@@ -474,7 +474,7 @@ pub(crate) fn handle(
     let d = daemon.clone();
     let check = move |rel: &str, live: &Path, dl: std::time::Duration| {
         production_check_with(rel, live, dl, &|c| {
-            crate::repair_approval::comparison_consequence(&d, rel, live, c)
+            crate::repair_approval::comparison_consequence(&d, rel, c)
         })
     };
     let product_pause = || product_pause_in_force(daemon, &cys::pack::pack_dir());
@@ -519,7 +519,7 @@ pub(crate) fn with_daemon_ctx<T>(daemon: &Arc<Daemon>, f: impl FnOnce(&Ctx<'_>) 
     let d = daemon.clone();
     let check = move |rel: &str, live: &Path, dl: std::time::Duration| {
         production_check_with(rel, live, dl, &|c| {
-            crate::repair_approval::comparison_consequence(&d, rel, live, c)
+            crate::repair_approval::comparison_consequence(&d, rel, c)
         })
     };
     let ctx = Ctx {
@@ -541,18 +541,54 @@ pub(crate) fn with_daemon_ctx<T>(daemon: &Arc<Daemon>, f: impl FnOnce(&Ctx<'_>) 
     f(&ctx)
 }
 
+/// RULINGS GA8 — the intake ledger's answer for one row the daemon files: the ledger is the
+/// obligation AND the memory ("already told" follows from a NEW row, never from a set in memory).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Filed {
+    /// a NEW row (the ledger's first count) — the only answer a pointer to the master may follow
+    New,
+    /// the ledger already held the row (counted again) or declined it by its own rule (its hourly
+    /// quota, an excluded file)
+    NotNew,
+    /// the row could not be written — nothing is marked; the next identical check files it again
+    Failed(String),
+}
+
+impl Filed {
+    /// The ledger has answered for the row (durable, or deliberately not kept) — a cache in memory may
+    /// follow only then (GA8 (2)).
+    pub(crate) fn settled(&self) -> bool {
+        !matches!(self, Filed::Failed(_))
+    }
+}
+
 /// Track T5b — one intake row filed by the daemon itself (a lane finding of the protection screen,
-/// C4 AY1: "one intake row naming the protection"), through the `report` verb's own body.
-pub(crate) fn file_intake(daemon: &Arc<Daemon>, file: &str, error: &str) {
+/// C4 AY1: "one intake row naming the protection"; a comparison's finding — GA8), through the
+/// `report` verb's own body; returns the ledger's answer.
+pub(crate) fn file_intake(daemon: &Arc<Daemon>, file: &str, error: &str) -> Filed {
+    with_daemon_ctx(daemon, |ctx| file_intake_in(ctx, file, error))
+}
+
+/// [`file_intake`] in a given context (the `report` verb's answer: `accepted` and the row's `count`,
+/// which is 1 exactly for a new row).
+pub(crate) fn file_intake_in(ctx: &Ctx<'_>, file: &str, error: &str) -> Filed {
     let caller = Caller {
         kind: CallerKind::Detached,
         role: None,
         app_token: false,
         bound_family: None,
     };
-    with_daemon_ctx(daemon, |ctx| {
-        let _ = handle_with(ctx, &caller, "report", &serde_json::json!({"file": file, "error": error}));
-    });
+    match handle_with(ctx, &caller, "report", &serde_json::json!({"file": file, "error": error})) {
+        Ok(v) if v.get("accepted").and_then(Value::as_bool) == Some(true) => {
+            if v.get("count").and_then(Value::as_u64) == Some(1) {
+                Filed::New
+            } else {
+                Filed::NotNew
+            }
+        }
+        Ok(_) => Filed::NotNew,
+        Err(e) => Filed::Failed(e.message),
+    }
 }
 
 /// The verb dispatcher behind [`handle`]: role table first, then the body.

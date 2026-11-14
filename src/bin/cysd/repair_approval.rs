@@ -125,10 +125,9 @@ pub(crate) struct ApprovalTable {
     /// The first sweep of this daemon incarnation resolved the requests a previous one left in the
     /// records (V2(d): expired if their time had passed, else voided by the restart).
     pub(crate) restart_resolved: bool,
-    /// RULINGS EL5: the repairs whose unknown approval was already reported (one finding each).
+    /// RULINGS EL5: the repairs whose unknown approval was already reported (one finding each) —
+    /// RULINGS GA8 (2): a cache, written only AFTER the ledger answered for the row.
     pub(crate) unknown_reported: std::collections::BTreeSet<String>,
-    /// RULINGS EO5 (b): (repair, candidate fingerprint) whose escape refusal the owner was told of.
-    pub(crate) escape_told: std::collections::BTreeSet<(String, String)>,
 }
 
 impl ApprovalTable {
@@ -153,6 +152,10 @@ pub(crate) trait Effects: Send + Sync {
     fn deliver(&self, seat: u64, text: String);
     /// The lane master's one line to the owner (budget exhausted — once).
     fn tell_master(&self, text: String);
+    /// RULINGS GA8 (4): a POINTER to a new intake row for the lane master — ONE attempt, never
+    /// retried; no master or a failed send ends it (the row is the record; `cys repair status` shows
+    /// it — a retry loop towards an absent master would be the queue-flood class).
+    fn point_master(&self, text: String);
     /// An event on the existing bus (`repair.approval.created` / `.resolved`).
     fn publish(&self, name: &str, payload: Value);
     /// Spawns the OS-verification helper (the daemon's own child).
@@ -166,8 +169,9 @@ pub(crate) trait Effects: Send + Sync {
     ) -> Result<cys::repair::apply::ApplyOutcome, RepairError>;
     /// Step 3: the rehearsal re-run and the protection screen (`Err` = returned to the worker).
     fn step3(&self, s3: &Step3Input) -> Result<Step3Ok, Step3Err>;
-    /// Files one intake row (a lane finding of the screen).
-    fn intake(&self, file: &str, error: &str);
+    /// Files one intake row (a lane finding of the screen, a comparison's finding) — the ledger's
+    /// answer (RULINGS GA8).
+    fn intake(&self, file: &str, error: &str) -> crate::repair::Filed;
     /// RULINGS EL5 / EP — the seam: was the approval `approval_ref` consumed by an apply?
     fn approval_consumed(
         &self,
@@ -191,10 +195,12 @@ pub(crate) struct Step3Input {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Step3Err {
     pub why: String,
-    /// RULINGS DE1 / BK1 / EO5: the intake rows of the comparison — its refusal's ONE row, and a noted
-    /// difference's row (never dropped when step 3 later fails) …
+    /// RULINGS DE1 / BK1 / GA8: the intake rows step 3 WROTE (first, when found) for its comparisons —
+    /// the refusal's ONE row and a noted difference's row; every later error carries them; the caller
+    /// never files them again …
     pub intake: Vec<(String, String)>,
-    /// … and the owner's one line, through the lane master — nothing more, never per tick.
+    /// … and the pointer for the lane master, present only when the ledger answered that the refusal's
+    /// row is NEW (GA8 (2)) — sent once, one attempt.
     pub owner_line: Option<String>,
 }
 
@@ -214,14 +220,17 @@ impl From<&str> for Step3Err {
 }
 
 impl Step3Err {
-    /// A refusal by the scoped after-run comparison (the rehearsal's or the screen's): the reason,
-    /// ONE intake row naming the candidate's first target, the owner's one line.
-    fn escaped(repair: &RepairId, rel: &str, line: String) -> Self {
+    /// A refusal by the scoped after-run comparison (the rehearsal's or the screen's), whose ONE
+    /// intake row naming the candidate's first target was already written (`filed` = the ledger's
+    /// answer): the reason, that row, and the master's pointer only for a NEW row.
+    fn escaped(repair: &RepairId, rel: &str, line: String, filed: &crate::repair::Filed) -> Self {
         Self {
-            owner_line: Some(format!(
-                "수리 {} 의 제출 검사에서 예행이 실제 환경을 건드려 후보를 돌려보냈습니다 — {line}",
-                repair.as_str()
-            )),
+            owner_line: (*filed == crate::repair::Filed::New).then(|| {
+                format!(
+                    "수리 {} 의 제출 검사에서 예행이 실제 환경을 건드려 후보를 돌려보냈습니다 — 접수 장부({rel})에 남겼습니다(`cys repair status` · `cys repair list`)",
+                    repair.as_str()
+                )
+            }),
             intake: vec![(rel.to_string(), line.clone())],
             why: line,
         }
@@ -533,9 +542,22 @@ pub(crate) fn submit(
         Ok((out, Some(s3)))
     });
     if let Some((file, line)) = found {
-        eff.intake(&file, &line);
+        report_unknown(table, eff, id.as_str(), &file, &line);
     }
     out
+}
+
+/// RULINGS EL5 / GA8 (2): files the unknown-approval finding — the repair is remembered as reported
+/// only AFTER the ledger answered for the row (a failed write marks nothing; the next sweep or
+/// submit files it again).
+fn report_unknown(table: &Mutex<ApprovalTable>, eff: &dyn Effects, repair: &str, file: &str, line: &str) {
+    if eff.intake(file, line).settled() {
+        table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unknown_reported
+            .insert(repair.to_string());
+    }
 }
 
 /// RULINGS CZ2: is the record's durable pending request THIS request (identity = fingerprint +
@@ -783,7 +805,8 @@ fn unknown_finding(
     rec: &RepairRecord,
     why: &str,
 ) -> Option<(String, String)> {
-    if !tbl.unknown_reported.insert(repair.to_string()) {
+    // RULINGS GA8 (2): only a cache of rows the ledger already answered for ([`report_unknown`])
+    if tbl.unknown_reported.contains(repair) {
         return None;
     }
     let rel = ledger::file_targets(rec)
@@ -831,20 +854,11 @@ pub(crate) fn run_step3(
                 RepairState::InProgress,
                 RecApproval::Keep,
             );
-            // RULINGS DE1: the comparison's rows (its refusal's ONE row, a noted difference's row)
-            for (file, line) in &err.intake {
-                eff.intake(file, line);
-            }
-            // EO5 (b): the owner's line for an escape refusal — once per (repair, candidate fingerprint)
+            // RULINGS GA8: step 3 wrote its comparisons' rows FIRST (`err.intake` lists them — never
+            // filed again here); the master's pointer exists only for a row the ledger answered NEW,
+            // and goes out once, one attempt
             if let Some(line) = err.owner_line {
-                let first = {
-                    let mut tbl = table.lock().unwrap_or_else(|e| e.into_inner());
-                    tbl.escape_told
-                        .insert((s3.repair.as_str().to_string(), cys::repair::fingerprint(&s3.states)))
-                };
-                if first {
-                    eff.tell_master(line);
-                }
+                eff.point_master(line);
             }
         }
         Ok(ok) => {
@@ -882,9 +896,12 @@ pub(crate) fn run_step3(
 /// the lane's pack with the candidate laid in — INSIDE the scoped after-run comparison (RULINGS CZ3 /
 /// DE1) — then the protection screen (its own comparison). The screen's verdict is recorded
 /// (`screen.json`) when it accepts and the live inputs still match (CZ5).
-pub(crate) fn production_step3(s3: &Step3Input) -> Result<Step3Ok, Step3Err> {
+pub(crate) fn production_step3(
+    s3: &Step3Input,
+    file: &dyn Fn(&str, &str) -> crate::repair::Filed,
+) -> Result<Step3Ok, Step3Err> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    production_step3_with(s3, &home)
+    production_step3_with(s3, &home, file)
 }
 
 /// One rehearsal pass: a fresh scratch copy of the lane's pack with the candidate's states laid in,
@@ -982,10 +999,13 @@ fn rehearse_once(
     }
 }
 
-/// [`production_step3`] with the HOME whose real settings files the comparisons watch.
+/// [`production_step3`] with the HOME whose real settings files the comparisons watch. RULINGS GA8:
+/// what a comparison finds is written to the intake ledger through `file` FIRST — when it is found,
+/// before any later step can fail — and every later error carries the found list (one exit).
 pub(crate) fn production_step3_with(
     s3: &Step3Input,
     real_home: &std::path::Path,
+    file: &dyn Fn(&str, &str) -> crate::repair::Filed,
 ) -> Result<Step3Ok, Step3Err> {
     use cys::repair::rehearsal::{self, Comparison};
     use cys::repair::screen::{self, ScreenCandidate, ScreenVerdict};
@@ -1005,70 +1025,81 @@ pub(crate) fn production_step3_with(
         // RULINGS GA3: complete = the pass's plan carried out whole (one function)
         rehearse_once(s3, &staging, started)
     });
-    let mut notes: Vec<String> = Vec::new();
     let mut found: Vec<(String, String)> = Vec::new();
-    match cmp {
-        Comparison::Refused(line) => return Err(Step3Err::escaped(&s3.repair, &first_rel, line)),
-        Comparison::Noted(line) => {
-            found.push((first_rel.clone(), line.clone()));
-            notes.push(line);
+    let result = (|| -> Result<Step3Ok, Step3Err> {
+        let mut notes: Vec<String> = Vec::new();
+        match cmp {
+            Comparison::Refused(line) => {
+                let filed = file(&first_rel, &line);
+                return Err(Step3Err::escaped(&s3.repair, &first_rel, line, &filed));
+            }
+            Comparison::Noted(line) => {
+                file(&first_rel, &line);
+                found.push((first_rel.clone(), line.clone()));
+                notes.push(line);
+            }
+            Comparison::Clean => {}
         }
-        Comparison::Clean => {}
-    }
-    // EO5 (a): a noted difference stays on its intake row even when step 3 fails after it
-    let with_found = |mut e: Step3Err| {
+        let mut summary = rehearsed.map_err(Step3Err::from)?;
+        // (b) the protection screen (C4 — every boot-critical and protection-related submit, AT2)
+        let cand = ScreenCandidate {
+            files: staging.clone(),
+            targets: s3.states.clone(),
+        };
+        let left = STEP3_DEADLINE.saturating_sub(started.elapsed());
+        let rep = screen::screen_protections(&cand, &s3.pack, left)
+            .map_err(|e| Step3Err::from(format!("보호장치 심사를 끝내지 못했습니다 — {e:?}")))?;
+        // RULINGS DE1: a refusal by the screen's own after-run comparison has the same consequences
+        if let Some(line) = screen::after_run_refusal(&rep) {
+            let filed = file(&first_rel, &line);
+            return Err(Step3Err::escaped(&s3.repair, &first_rel, line, &filed));
+        }
+        // … and its noted difference is written now, whatever the screen's verdict
+        let noted = screen::after_run_note(&rep);
+        if let Some(line) = &noted {
+            file(&first_rel, line);
+            found.push((first_rel.clone(), line.clone()));
+        }
+        if rep.verdict == ScreenVerdict::Refused {
+            return Err(format!("보호장치 심사 거부 — {}", rep.refusals.join(" / ")).into());
+        }
+        // RULINGS CZ5: recorded only while the live inputs still match what the screen tested
+        notes.extend(rep.notes.iter().cloned());
+        match screen::recordable_verdict(&rep, &cand, &s3.pack)
+            .map_err(|e| Step3Err::from(format!("심사 결과를 기록할지 판단하지 못했습니다 — {e:?}")))?
+        {
+            Some(verdict) => screen::write_verdict_in(&s3.root, &s3.repair, &verdict)
+                .map_err(|e| Step3Err::from(format!("심사 결과를 기록하지 못했습니다 — {e:?}")))?,
+            None => notes.push(
+                "심사하는 동안 레인의 입력이 바뀌어 심사 결과를 기록하지 않았습니다 — 적용할 때 다시 심사합니다".into(),
+            ),
+        }
+        summary.push(format!("보호장치 심사 {}ms", rep.duration_ms));
+        let device_of = |line: &str| -> String {
+            if line.contains("guard.sh") {
+                "hooks/guard.sh".into()
+            } else if line.contains("C28") {
+                "bin/javis_preflight.py".into()
+            } else {
+                "hooks/role-capability-gate.sh".into()
+            }
+        };
+        // the screen's own lane findings (the comparison's noted line was already written above)
+        Ok(Step3Ok {
+            rehearsal_summary: summary.join(" · "),
+            screen_notes: notes,
+            lane_findings: rep
+                .lane_findings
+                .iter()
+                .filter(|l| noted.as_deref() != Some(l.as_str()))
+                .map(|l| (device_of(l), l.clone()))
+                .collect(),
+        })
+    })();
+    // EO5 (a) / GA8 (1): every error after a finding carries the found list
+    result.map_err(|mut e| {
         e.intake.extend(found.iter().cloned());
         e
-    };
-    let mut summary = rehearsed.map_err(|why| with_found(Step3Err::from(why)))?;
-    // (b) the protection screen (C4 — every boot-critical and protection-related submit, AT2)
-    let cand = ScreenCandidate {
-        files: staging.clone(),
-        targets: s3.states.clone(),
-    };
-    let left = STEP3_DEADLINE.saturating_sub(started.elapsed());
-    let rep = screen::screen_protections(&cand, &s3.pack, left).map_err(|e| {
-        with_found(Step3Err::from(format!(
-            "보호장치 심사를 끝내지 못했습니다 — {e:?}"
-        )))
-    })?;
-    // RULINGS DE1: a refusal by the screen's own after-run comparison has the same consequences
-    if let Some(line) = screen::after_run_refusal(&rep) {
-        return Err(with_found(Step3Err::escaped(&s3.repair, &first_rel, line)));
-    }
-    if rep.verdict == ScreenVerdict::Refused {
-        return Err(with_found(
-            format!("보호장치 심사 거부 — {}", rep.refusals.join(" / ")).into(),
-        ));
-    }
-    // RULINGS CZ5: recorded only while the live inputs still match what the screen tested
-    notes.extend(rep.notes.iter().cloned());
-    match screen::recordable_verdict(&rep, &cand, &s3.pack)
-        .map_err(|e| Step3Err::from(format!("심사 결과를 기록할지 판단하지 못했습니다 — {e:?}")))?
-    {
-        Some(verdict) => screen::write_verdict_in(&s3.root, &s3.repair, &verdict)
-            .map_err(|e| Step3Err::from(format!("심사 결과를 기록하지 못했습니다 — {e:?}")))?,
-        None => notes.push(
-            "심사하는 동안 레인의 입력이 바뀌어 심사 결과를 기록하지 않았습니다 — 적용할 때 다시 심사합니다".into(),
-        ),
-    }
-    summary.push(format!("보호장치 심사 {}ms", rep.duration_ms));
-    let device_of = |line: &str| -> String {
-        if line.contains("guard.sh") {
-            "hooks/guard.sh".into()
-        } else if line.contains("C28") {
-            "bin/javis_preflight.py".into()
-        } else {
-            "hooks/role-capability-gate.sh".into()
-        }
-    };
-    Ok(Step3Ok {
-        rehearsal_summary: summary.join(" · "),
-        screen_notes: notes,
-        lane_findings: found
-            .into_iter()
-            .chain(rep.lane_findings.iter().map(|l| (device_of(l), l.clone())))
-            .collect(),
     })
 }
 
@@ -1681,7 +1712,7 @@ fn resolve_after_restart(ctx: &Ctx<'_>, table: &Mutex<ApprovalTable>, eff: &dyn 
         });
         // after every lock (the report verb takes its own)
         if let Some((file, line)) = found {
-            eff.intake(&file, &line);
+            report_unknown(table, eff, id.as_str(), &file, &line);
         }
         if matches!(res, Ok(true)) && count == Some(MAX_RESUBMITS + 1) {
             eff.tell_master(budget_line(id.as_str(), &ctx.lane.0));
@@ -1759,6 +1790,20 @@ thread_local! {
 }
 
 /// One enqueue attempt without waiting (the fallback when no delivery thread could be made).
+/// RULINGS GA8 (4): the lane master's pointer — one enqueue attempt on the calling thread, never
+/// retried; no master → nothing.
+fn point_master_now(daemon: &Arc<Daemon>, text: String) {
+    let sid = daemon
+        .roles
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get("master")
+        .copied();
+    if let Some(sid) = sid {
+        deliver_now(daemon, sid, text);
+    }
+}
+
 fn deliver_now(daemon: &Arc<Daemon>, seat: u64, text: String) {
     use crate::alert_route::{enqueue_into_seat, FreezeGuard};
     let _ = enqueue_into_seat(
@@ -1804,6 +1849,10 @@ impl Effects for DaemonEffects {
         }
     }
 
+    fn point_master(&self, text: String) {
+        point_master_now(&self.daemon, text);
+    }
+
     fn publish(&self, name: &str, payload: Value) {
         self.daemon.bus.publish(name, "repair", None, payload);
     }
@@ -1822,11 +1871,11 @@ impl Effects for DaemonEffects {
     }
 
     fn step3(&self, s3: &Step3Input) -> Result<Step3Ok, Step3Err> {
-        production_step3(s3)
+        production_step3(s3, &|f, l| self.intake(f, l))
     }
 
-    fn intake(&self, file: &str, error: &str) {
-        crate::repair::file_intake(&self.daemon, file, error);
+    fn intake(&self, file: &str, error: &str) -> crate::repair::Filed {
+        crate::repair::file_intake(&self.daemon, file, error)
     }
 
     fn approval_consumed(
@@ -2127,44 +2176,44 @@ pub(crate) fn route(
     }))
 }
 
-/// RULINGS EO5 (a) / DE1: what the scoped after-run comparison around the worker's `check` found has
-/// the same consequences as in step 3 — ONE intake row (a noted difference too) and, for a refusal, the
-/// lane master's ONE line — the line once per (file, live state) (EO5 (b)). Filed on its own thread:
-/// the check may run under a repair lock that the intake verb would wait for.
+/// RULINGS EO5 (a) / DE1 / GA8: what the scoped after-run comparison around the worker's `check`
+/// found has the same consequences as in step 3 — ONE intake row (a noted difference too), written
+/// FIRST and within this bounded step (no helper thread: the report verb's lock is `intake:<…>`, never
+/// a repair lock), and for a refusal whose row the ledger answered NEW the lane master's pointer —
+/// once, one attempt. Nothing is remembered in memory: a restart asks the ledger again.
 pub(crate) fn comparison_consequence(
     daemon: &Arc<Daemon>,
     rel: &str,
-    live: &std::path::Path,
     c: &cys::repair::rehearsal::Comparison,
 ) {
+    check_consequence(
+        rel,
+        c,
+        &|f, l| crate::repair::file_intake(daemon, f, l),
+        &|text| point_master_now(daemon, text),
+    );
+}
+
+/// [`comparison_consequence`]'s body over a given intake filing and pointer (the ledger's answer).
+pub(crate) fn check_consequence(
+    rel: &str,
+    c: &cys::repair::rehearsal::Comparison,
+    file: &dyn Fn(&str, &str) -> crate::repair::Filed,
+    point: &dyn Fn(String),
+) -> Option<crate::repair::Filed> {
     use cys::repair::rehearsal::Comparison;
-    static TOLD: std::sync::OnceLock<Mutex<std::collections::BTreeSet<(String, String)>>> =
-        std::sync::OnceLock::new();
     let (line, refused) = match c {
-        Comparison::Clean => return,
-        Comparison::Noted(l) => (l.clone(), false),
-        Comparison::Refused(l) => (l.clone(), true),
+        Comparison::Clean => return None,
+        Comparison::Noted(l) => (l, false),
+        Comparison::Refused(l) => (l, true),
     };
-    // RULINGS GA5: the bounded no-follow reader, never the shared type's unbounded hash loop
-    let state = cys::repair::replay::LaidSource::read(live)
-        .map(|s| s.state().canon())
-        .unwrap_or_default();
-    let tell = refused
-        && TOLD
-            .get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
-            .lock()
-            .map(|mut t| t.insert((rel.to_string(), state)))
-            .unwrap_or(true);
-    let (d, rel) = (daemon.clone(), rel.to_string());
-    let _ = spawn_thread("check-compared", move || {
-        crate::repair::file_intake(&d, &rel, &line);
-        if tell {
-            let eff = DaemonEffects { daemon: d.clone() };
-            eff.tell_master(format!(
-                "{rel} 의 검사(`check`)에서 예행이 실제 환경을 건드려 검사를 통과시키지 않았습니다 — {line}"
-            ));
-        }
-    });
+    let filed = file(rel, line);
+    if refused && filed == crate::repair::Filed::New {
+        point(format!(
+            "{rel} 의 검사(`check`)에서 예행이 실제 환경을 건드려 검사를 통과시키지 않았습니다 — 접수 장부에 남겼습니다(`cys repair status` · `cys repair list`)"
+        ));
+    }
+    Some(filed)
 }
 
 /// RULINGS DF3: the repairs of `lane` whose owner HAS A CARD now — a request past step 3 whose
