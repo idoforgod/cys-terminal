@@ -15539,6 +15539,11 @@ mod m11_tests {
     /// 막히면: vendor 우선은 덮지 않는다(격리). 잠금 보안 자산(L0)은 무결성 우선 — 두 갈래(판독 가능 · 판독 불가) 모두 치유는 가고,
     /// 기록은 없는 사본을 이름 대지 않는다(backup: failed + 사유). `--missing-only` 의 쓰기(`write_pack_file_beneath` · 덮지 않음)도 그
     /// 길로 만든다.
+    /// ★T2i(RULINGS GB5): unix 만 — 주입(`FAIL_NO_REPLACE_RENAME` · `FAIL_EXCLUSIVE_FALLBACK`)은 unix 의 `no_replace_renameat` ·
+    /// `exclusive_create_at` 에만 걸린다. 윈도우의 같은 경우(덮지 않는 이동이 '지원하지 않음' → CREATE_NEW 로 만들기 · 그것도 막히면
+    /// 살아 있는 파일 그대로 · 자리에 있는 사본 보존)는 Windows 측정(TW1)의 행이다 — 어느 Windows 작업도 이 시험을 돌리지 않는다
+    /// (`.github/workflows`: 전체 `cargo test --lib` 는 macOS 레그만, Windows 는 필터 `factory_reset::` · `merge3::` 등).
+    #[cfg(unix)]
     #[test]
     fn fp1_without_the_no_replace_rename_the_copy_is_still_parked_and_nothing_live_is_overwritten_without_it() {
         struct Inject;
