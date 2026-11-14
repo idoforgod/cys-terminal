@@ -103,7 +103,7 @@ pub(crate) fn trigger_with(
         cys::repair::probation::take_notices_in(root, &lane)
             .unwrap_or_default()
             .into_iter()
-            .map(|f| json!({"rel": f.rel, "kind": f.kind, "sha256": f.sha256, "note": f.note, "slot": f.slot}))
+            .map(|f| json!({"rel": f.rel, "kind": f.kind, "sha256": f.sha256, "kept_copy": f.kept_copy, "note": f.note, "slot": f.slot}))
             .collect()
     } else {
         Vec::new()

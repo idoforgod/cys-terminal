@@ -160,15 +160,24 @@ mod tests {
         held_rx.recv().unwrap();
         // a request handler does not block: the lock is busy
         assert_eq!(try_with_apply_lock(&lock, || 7).unwrap(), None);
-        // a blocking taker waits until the holder releases
+        // a blocking taker waits until the holder releases: it can only get the lock AFTER the holder
+        // set `released` (causal order, no wall-clock premise)
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (got_tx, got_rx) = mpsc::channel();
         let l3 = lock.clone();
+        let seen = std::sync::Arc::clone(&released);
         let waiter = std::thread::spawn(move || {
-            with_apply_lock(&l3, || got_tx.send(()).unwrap()).unwrap();
+            with_apply_lock(&l3, || {
+                got_tx
+                    .send(seen.load(std::sync::atomic::Ordering::SeqCst))
+                    .unwrap()
+            })
+            .unwrap();
         });
-        assert!(got_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "did not wait");
+        released.store(true, std::sync::atomic::Ordering::SeqCst);
         release_tx.send(()).unwrap();
-        got_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("never got the lock");
+        let saw_released = got_rx.recv().expect("the waiter never got the lock");
+        assert!(saw_released, "the waiter got the lock while the holder still held it");
         holder.join().unwrap();
         waiter.join().unwrap();
         assert_eq!(try_with_apply_lock(&lock, || 7).unwrap(), Some(7));

@@ -489,3 +489,71 @@ fn m10_unknown_original_uses_the_install_manifest_for_unchanged_only() {
     let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
     assert!(f.iter().any(|x| x.rel == rel && x.kind == "kept"), "{f:?}");
 }
+
+/// RULINGS CP1 (a) — FINDABLE: a put-back finding carries the kept copy's path (the SEALED copy in the
+/// M10 sub-ledger) and sha256, and its sentence names that path and the legitimate way back — an
+/// ordinary repair (`cys repair begin --files <rel> --trigger …` → rehearsal, signatures, the owner's
+/// final approval); it never tells anyone to copy the file back by hand. Pinned.
+#[cfg(target_os = "macos")]
+#[test]
+fn m10_finding_names_the_kept_copy_and_the_repair_route() {
+    let Some(rel) = listed() else {
+        return;
+    };
+    let r = rig("m10findable");
+    let broken = b"#!/bin/bash\nbroken(\n".to_vec();
+    r.put(rel, &broken, 0o755);
+    let fails = |x: &str, _: &Path, _: Duration| if x == rel { outcome(CheckResult::Fail("bad".into()), 5) } else { outcome(CheckResult::Pass, 5) };
+    let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let rev = f.iter().find(|x| x.kind == "reverted").expect("a put-back");
+    let kept = rev.kept_copy.clone().expect("the kept copy's path");
+    assert!(kept.starts_with(m10_root_in(&r.root, &r.lane)), "in the lane's M10 sub-ledger: {}", kept.display());
+    assert_eq!(std::fs::read(&kept).unwrap(), broken, "the kept copy holds the changed bytes");
+    let sha: String = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&broken).iter().map(|x| format!("{x:02x}")).collect()
+    };
+    assert_eq!(rev.sha256, sha);
+    assert!(rev.note.contains(&kept.display().to_string()), "{}", rev.note);
+    assert!(rev.note.contains(&format!("cys repair begin --files {rel} --trigger")), "{}", rev.note);
+    assert!(rev.note.contains("주인 최종 승인"), "{}", rev.note);
+    for hand in ["복사", "cp ", "copy", "옮겨 놓", "덮어"] {
+        assert!(!rev.note.contains(hand), "the sentence tells a hand copy ({hand}): {}", rev.note);
+    }
+    // the findings file is `repairs/m10/<lane>.json` and holds the same fields
+    let file = std::fs::read_to_string(r.root.join("m10").join(format!("{}.json", r.lane.0))).unwrap();
+    assert!(file.contains("kept_copy") && file.contains(&sha));
+}
+
+/// RULINGS CP1 (b): rule one holds in the M10 sub-ledger exactly as in the vault — every put-back
+/// takes a FRESH slot; an earlier slot (its sealed copy and its payload) is never deleted, moved or
+/// overwritten by a later put-back of the same file. (Growth: one slot per put-back — DEFERRED #97.)
+#[cfg(target_os = "macos")]
+#[test]
+fn m10_each_put_back_takes_a_fresh_slot() {
+    let Some(rel) = listed() else {
+        return;
+    };
+    let r = rig("m10fresh");
+    let fails = |x: &str, _: &Path, _: Duration| if x == rel { outcome(CheckResult::Fail("bad".into()), 5) } else { outcome(CheckResult::Pass, 5) };
+    let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    r.put(rel, b"#!/bin/bash\nfirst(\n", 0o755);
+    let a = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let slot_a = a.iter().find(|x| x.kind == "reverted").unwrap().slot.clone().unwrap();
+    let kept_a = a.iter().find(|x| x.kind == "reverted").unwrap().kept_copy.clone().unwrap();
+    r.put(rel, b"#!/bin/bash\nsecond(\n", 0o755);
+    let b = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0, &lock)).unwrap();
+    let slot_b = b.iter().find(|x| x.kind == "reverted").unwrap().slot.clone().unwrap();
+    assert_ne!(slot_a, slot_b, "a fresh slot per put-back");
+    assert_eq!(std::fs::read(&kept_a).unwrap(), b"#!/bin/bash\nfirst(\n", "the earlier deposit is untouched");
+    assert!(slot_a.join("payload").is_dir() && slot_a.join("meta/pre.json").is_file());
+    let slots = std::fs::read_dir(slot_a.parent().unwrap()).unwrap().filter_map(Result::ok)
+        .filter(|e| crate::repair::ledger::is_slot_name(&e.file_name().to_string_lossy())).count();
+    assert_eq!(slots, 2, "one slot per put-back, none removed");
+    assert!(crate::repair::wal::unfinished_for_lane(&m10_root_in(&r.root, &r.lane), &r.lane).is_empty());
+}

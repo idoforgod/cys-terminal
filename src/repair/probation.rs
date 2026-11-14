@@ -629,6 +629,10 @@ pub struct Finding {
     /// Whether that one notice was given (the preflight's `repair.sweep` reply carries it once).
     pub notified: bool,
     pub slot: Option<PathBuf>,
+    /// RULINGS CP1 (a): the path of the copy this finding is about — for `reverted` the SEALED copy of
+    /// the changed bytes in the M10 sub-ledger's slot, otherwise the live file — with `sha256` above.
+    #[serde(default)]
+    pub kept_copy: Option<PathBuf>,
     pub note: String,
 }
 
@@ -639,9 +643,52 @@ struct FindingsFile {
     findings: Vec<Finding>,
 }
 
-/// `<root>/m10/<lane>.findings.json`
+/// `<root>/m10/<lane>.json` (RULINGS CP1 — beside the lane's sub-ledger folder `<root>/m10/<lane>/`).
 pub fn findings_path_in(root: &Path, lane: &LaneKey) -> PathBuf {
-    root.join("m10").join(format!("{}.findings.json", lane.0))
+    root.join("m10").join(format!("{}.json", lane.0))
+}
+
+/// The ONE way back for a changed boot-critical file (RULINGS CP1 (a)): an ordinary repair — never a
+/// hand copy.
+pub fn m10_way_back(rel: &str) -> String {
+    format!("cys repair begin --files {rel} --trigger <계기> → 예행·검토 서명 → 주인 최종 승인")
+}
+
+/// RULINGS CP1 (a): fills the finding's kept copy (path + the sha256 it carries) and its sentence — the
+/// path of that copy and the legitimate way to bring the change back (an ordinary repair). The
+/// detail found by the scan stays at the end of the sentence.
+fn finalize_finding(f: &mut Finding, pack: &Path) {
+    let kept = match (&f.kind[..], &f.slot) {
+        ("reverted", Some(dir)) => {
+            let slot = super::vault::Slot::at(dir, &f.rel);
+            if std::fs::symlink_metadata(slot.sealed()).is_ok() {
+                slot.sealed()
+            } else {
+                slot.payload()
+            }
+        }
+        _ => pack.join(&f.rel),
+    };
+    let short = f.sha256.get(..12).unwrap_or(&f.sha256).to_string();
+    let detail = f.note.clone();
+    f.note = match f.kind.as_str() {
+        "reverted" => format!(
+            "자체 검사에 실패해 지금 세대의 원본(또는 승인본)으로 되돌렸습니다 — 바뀐 사본은 {} (sha256 {short}…)에 보관되어 있습니다. 그 변경을 다시 살리는 길은 수리입니다: {} ({detail})",
+            kept.display(),
+            m10_way_back(&f.rel)
+        ),
+        "kept" => format!(
+            "승인 없이 바뀌었지만 자체 검사를 통과해 그대로 둡니다 — 지금 파일 {} (sha256 {short}…). 이 변경을 승인된 것으로 남기는 길은 수리입니다: {}",
+            kept.display(),
+            m10_way_back(&f.rel)
+        ),
+        _ => format!(
+            "{detail} — 지금 파일 {} (sha256 {short}…). 고치는 길은 수리입니다: {}",
+            kept.display(),
+            m10_way_back(&f.rel)
+        ),
+    };
+    f.kept_copy = Some(kept);
 }
 
 /// The lane's own M10 ledger (a sub-ledger under `repairs/m10/<lane>/`): M10 puts a file back with
@@ -764,6 +811,7 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
                         notice: !lf_only,
                         notified: false,
                         slot: None,
+                        kept_copy: None,
                         note: if lf_only {
                             "줄바꿈만 다름 — 장부에만 기록".into()
                         } else {
@@ -786,6 +834,7 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
                             notice: false,
                             notified: false,
                             slot: None,
+                            kept_copy: None,
                             note: m,
                         });
                     }
@@ -807,6 +856,7 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
                     notice,
                     notified: false,
                     slot: None,
+                    kept_copy: None,
                     note: format!("자체 검사 실패 — 이 운영체제에서는 기록·알림만 합니다: {why}"),
                 });
             }
@@ -835,6 +885,7 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
                     notice,
                     notified: false,
                     slot: None,
+                    kept_copy: None,
                     note: format!("자체 검사 실패, 그러나 지금 세대의 원본·승인본을 알지 못해 되돌리지 않았습니다: {why}"),
                 });
             }
@@ -868,7 +919,7 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
         let _ = std::fs::remove_file(&src_file); // our own source copy (the slot holds what went live)
         let r = r?;
         let (kind, note) = match &r.outcome {
-            ApplyOutcome::Applied => ("reverted", format!("자체 검사 실패 — 지금 세대의 원본으로 되돌림(바뀐 사본은 보관소에): {why}")),
+            ApplyOutcome::Applied => ("reverted", format!("검사 결과: {why}")),
             ApplyOutcome::Superseded(m) => ("superseded", format!("검사와 되돌리기 사이에 바뀜 — 되돌리지 않고 다음 검사로: {m}")),
             ApplyOutcome::Declined(m) => ("declined", format!("되돌리지 못함(아무것도 바꾸지 않음): {m}")),
         };
@@ -880,8 +931,12 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
             notice,
             notified: false,
             slot: r.slot,
+            kept_copy: None,
             note,
         });
+    }
+    for f in new_findings.iter_mut() {
+        finalize_finding(f, pack);
     }
     if !new_findings.is_empty() {
         existing.extend(new_findings.iter().cloned());
