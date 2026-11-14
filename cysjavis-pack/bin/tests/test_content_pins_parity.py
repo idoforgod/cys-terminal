@@ -1200,5 +1200,55 @@ class MasterMayFileAReport(unittest.TestCase):
                       "않는다), 읽기(", m)
         self.assertNotIn("장부를 바꾸지 않는다", m, "an intake record IS a ledger row (design §4-4, RULINGS BZ4)")
 
+
+class ProgramBodyLimitStated(unittest.TestCase):
+    """RULINGS DH1 / DH2 (CE2 applied to the rule sentences and the manual): release 1 does not repair the program body
+    (`cysd`, the app). Rule 7 of the compiled common block names that case (work around, file it, say truthfully what blocks)
+    while rule 1 and EX-2 stay word for word; MASTER §1-B (and the generated CEO template) say the same in the repair flow;
+    the manual's paragraphs keep the pack scope and the stated limit — reverting any of them to the old promise fails here."""
+    RULE7 = "이번 판이 못 고치는 본체(cysd·앱) 결함도 이와 같이 하고 장부에 적는다."
+    FLOW = ("이번 판이 못 고치는 프로그램 본체(cysd·앱)의 결함은 우회할 수 있는 데까지 우회하고 접수(`cys repair report`)한 뒤, "
+            "무엇이 막고 있고 오너가 무엇을 하면 풀리는지 사실대로 알린다.")
+    MANUAL_KEEP = (
+        "팩 파일(지침·도구·훅·스킬)에서 생긴 버그·오류는 이 자비스가 스스로 고치며(「스스로 해결」), 고친 것은 `cys repair` 수리 "
+        "장부에 남습니다. 프로그램 본체(앱·`cys`·`cysd`)의 결함은 1차 릴리스가 고치지 않습니다.",
+        "이 동작은 프로그램 본체(`cysd`) 안에 있어 1차 릴리스의 자비스는 고치지 않으며",
+        "그 밖에는 자동으로 계속 다시 확인하며 그동안 공통 안내(준비 중 → 3분 뒤 다시 시도 중)를 보입니다.",
+        "프로그램 본체의 결함이면 이번 판에서는 고치지 못한다는 것과 남은 일을 사실대로 말합니다.",
+    )
+    MANUAL_GONE = (
+        "화면이 스스로 고칩니다.",
+        "이 자비스의 버그·오류는 이 자비스가 스스로 고치며",
+        "자비스가 스스로 고칩니다(끄는 법은 위 노브)",
+        "무엇이 막고 있는지 화면에 알립니다",
+        "그래도 안 되면 「자비스에게 이 증상을 말해 주세요 — 자비스가 스스로 고칩니다.」",
+    )
+
+    def test_rule7_names_the_program_body_and_rule1_ex2_stay(self):
+        import re
+        rules = repo_text(os.path.join("src", "repair", "rules.rs"))
+        common = re.search(r'pub const RULES_COMMON: &str = r#"(.*?)"#;', rules, re.S).group(1)
+        rule7 = next(l for l in common.splitlines() if l.startswith("7. "))
+        self.assertIn(self.RULE7, rule7)
+        self.assertTrue(rule7.startswith("7. " + TIER1_EX[1] + ". " + self.RULE7), "EX-2 stays first and verbatim")
+        self.assertIn("1. 이 자비스에서 생긴 버그·기능 오류·에러·사용 불편은 이 자비스가 스스로 고친다. " + TIER1_EX[0] + ".", common)
+
+    def test_master_and_ceo_name_it_in_the_repair_flow(self):
+        for f in ("MASTER_DIRECTIVE.md", "CEO_TEMPLATE.md"):
+            with open(os.path.join(DIRECTIVES_DIR, f), encoding="utf-8") as fh:
+                flow = next(l for l in fh.read().splitlines() if l.startswith("- 흐름: 접수(`cys repair report`"))
+            self.assertIn(self.FLOW, flow, f)
+
+    def test_the_clauses_are_no_deferral(self):
+        for s in (self.RULE7, self.FLOW):
+            self.assertEqual(tier1_sentence_hits(s), [], s)
+
+    def test_manual_keeps_the_pack_scope_and_the_stated_limit(self):
+        m = norm(repo_text("USER-MANUAL.md"))
+        for keep in self.MANUAL_KEEP:
+            self.assertIn(keep, m)
+        for gone in self.MANUAL_GONE:
+            self.assertNotIn(gone, m)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

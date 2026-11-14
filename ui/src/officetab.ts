@@ -63,7 +63,7 @@ export const OFFICE_POLL_FAST_WINDOW_MS = 180000;
 
 export const OFFICE_TEXT_PREPARING = "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.";
 export const OFFICE_TEXT_LONG =
-  "오피스가 아직 열리지 않습니다. 자동으로 계속 다시 시도합니다. 오래 열리지 않으면 컴퓨터를 다시 시작해 보시고, 그래도 안 되면 자비스에게 이 증상을 말해 주세요 — 자비스가 스스로 고칩니다.";
+  "오피스가 3분이 지나도 열리지 않습니다 — 오피스 상태 확인이 답하지 않거나 문제를 알립니다. 자동으로 계속 다시 시도합니다. 오래 가면 컴퓨터를 다시 시작해 보세요. 자비스에게 이 증상을 말하면 원인을 찾아, 팩 파일의 결함은 고치고 프로그램 본체의 결함이면 이번 판에서는 고치지 못한다는 것과 남은 일을 사실대로 말합니다.";
 export const OFFICE_TEXT_REPAIRING = "오피스 화면 파일을 복구하고 있습니다…";
 export const OFFICE_TEXT_REPAIR_FAILED = "복구하지 못했습니다.";
 export const OFFICE_TEXT_ASSETS_BUTTON = "오피스 화면 파일이 없습니다.";
