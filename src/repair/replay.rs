@@ -317,9 +317,34 @@ pub struct ChildOutcome {
     pub survivors: Vec<u32>,
     /// The child was not reaped within the kill grace — left to a detached reap (DR3).
     pub unreaped: bool,
+    /// Per output stream (RULINGS EL1 / EL4): the read reached the end of the pipe, how many bytes
+    /// beyond the kept cap were counted and dropped, and whether a read failed. An output is WHOLE
+    /// only with the end reached, nothing dropped and no read error.
+    pub stdout_state: StreamState,
+    pub stderr_state: StreamState,
+}
+
+/// How one output stream of a run was read (RULINGS EL1 / EL4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamState {
+    pub eof: bool,
+    pub dropped: u64,
+    pub read_error: bool,
+}
+
+impl StreamState {
+    /// The output was observed WHOLE (EL1): its end reached, nothing dropped, no read error.
+    pub fn whole(&self) -> bool {
+        self.eof && self.dropped == 0 && !self.read_error
+    }
 }
 
 impl ChildOutcome {
+    /// RULINGS EL1: the child's standard output was observed whole.
+    pub fn stdout_whole(&self) -> bool {
+        self.stdout_state.whole()
+    }
+
     /// RULINGS CZ4: a run that left something behind (a process, a held pipe) did not end cleanly —
     /// its answer is not measurable, whatever it printed.
     pub fn left_something(&self) -> Option<String> {
@@ -339,8 +364,14 @@ impl ChildOutcome {
     }
 }
 
-/// Largest output kept per stream (the rest is dropped; a probe's verdict never needs more).
-const MAX_CAPTURE: usize = 1 << 20;
+/// Largest output kept per stream (the rest is counted and dropped, and the outcome says so — the
+/// output is then not WHOLE, RULINGS EL1 / EL4).
+pub const MAX_CAPTURE: usize = 1 << 20;
+
+/// At most this many bytes are read (or written) per pipe per turn of the runner's loop, so that the
+/// one deadline is looked at between reads even while a child writes without pause (RULINGS EJ2 /
+/// EL4).
+const PER_TURN: usize = 64 * 1024;
 
 /// A process of a run as the runner saw it: its pid and its start time (a pid that a later, unrelated
 /// process reuses never matches).
@@ -592,15 +623,42 @@ pub fn run_child_with(
     let mut sin = child.stdin.take();
     let mut sout = child.stdout.take();
     let mut serr = child.stderr.take();
-    for fd in [
+    // RULINGS EJ2 / EL4: a pipe that cannot be made non-blocking means the child is not run — it is
+    // killed at once and the runner returns saying so (fail closed)
+    let all_nonblocking = [
         sin.as_ref().map(|s| s.as_raw_fd()),
         sout.as_ref().map(|s| s.as_raw_fd()),
         serr.as_ref().map(|s| s.as_raw_fd()),
     ]
     .into_iter()
     .flatten()
-    {
-        set_nonblocking(fd);
+    .all(set_nonblocking);
+    if !all_nonblocking {
+        // SAFETY: kill(2) on our own child's process group (not reaped yet).
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        drop((sin, sout, serr));
+        let grace = Instant::now() + KILL_GRACE;
+        let mut reaped = false;
+        while Instant::now() < grace {
+            if let Ok(Some(_)) = child.try_wait() {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !reaped {
+            out.unreaped = true;
+            let _ = std::thread::Builder::new()
+                .name("replay-reap".into())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
+        }
+        out.spawn_error = Some("non-blocking set-up of a pipe failed — the child was not run".into());
+        out.elapsed = started.elapsed();
+        return out;
     }
     let mut written = 0usize;
     if stdin.is_empty() {
@@ -611,8 +669,8 @@ pub fn run_child_with(
     let mut seen: Vec<SeenProcess> = Vec::new();
     loop {
         pump_stdin(&mut sin, stdin, &mut written);
-        pump_out(&mut sout, &mut out.stdout);
-        pump_out(&mut serr, &mut out.stderr);
+        pump_out(&mut sout, &mut out.stdout, &mut out.stdout_state);
+        pump_out(&mut serr, &mut out.stderr, &mut out.stderr_state);
         if ended_at.is_none() {
             // the child's descendants while it lives (a process that leaves the group is still one)
             sample_tree(pid as u32, &mut seen);
@@ -689,8 +747,8 @@ pub fn run_child_with(
         out.survivors = alive_now(&seen);
     }
     // the outputs, once more without blocking; still open → held by something the kill did not reach
-    pump_out(&mut sout, &mut out.stdout);
-    pump_out(&mut serr, &mut out.stderr);
+    pump_out(&mut sout, &mut out.stdout, &mut out.stdout_state);
+    pump_out(&mut serr, &mut out.stderr, &mut out.stderr_state);
     out.pipe_held = held_at_drain || sout.is_some() || serr.is_some();
     drop(sout);
     drop(serr);
@@ -745,14 +803,22 @@ pub fn run_child(
 }
 
 #[cfg(unix)]
-fn set_nonblocking(fd: std::os::fd::RawFd) {
+fn set_nonblocking(fd: std::os::fd::RawFd) -> bool {
+    #[cfg(test)]
+    if FAIL_NONBLOCK_FOR_TEST.with(|f| f.get()) {
+        return false;
+    }
     // SAFETY: fcntl(2) on a pipe descriptor this process owns.
     unsafe {
         let fl = libc::fcntl(fd, libc::F_GETFL);
-        if fl >= 0 {
-            libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
-        }
+        fl >= 0 && libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) == 0
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam of RULINGS EJ2 / EL4: the non-blocking set-up fails on this thread.
+    pub(crate) static FAIL_NONBLOCK_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Writes what the (non-blocking) stdin pipe takes now; done or broken → the pipe is closed.
@@ -762,8 +828,9 @@ fn pump_stdin(sin: &mut Option<std::process::ChildStdin>, input: &[u8], written:
     let Some(s) = sin.as_mut() else {
         return;
     };
-    while *written < input.len() {
-        match s.write(&input[*written..]) {
+    let turn_end = (*written + PER_TURN).min(input.len());
+    while *written < turn_end {
+        match s.write(&input[*written..turn_end]) {
             Ok(0) => break,
             Ok(n) => *written += n,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
@@ -779,28 +846,33 @@ fn pump_stdin(sin: &mut Option<std::process::ChildStdin>, input: &[u8], written:
     }
 }
 
-/// Reads what a (non-blocking) output pipe holds now; EOF or an error → the pipe is closed.
+/// Reads what a (non-blocking) output pipe holds now — at most [`PER_TURN`] bytes, then back to the
+/// clock (RULINGS EJ2 / EL4); kept up to [`MAX_CAPTURE`], the rest counted and dropped; EOF or a read
+/// error closes the pipe and is recorded in `st`.
 #[cfg(unix)]
-fn pump_out<R: std::io::Read>(p: &mut Option<R>, buf: &mut Vec<u8>) {
+fn pump_out<R: std::io::Read>(p: &mut Option<R>, buf: &mut Vec<u8>, st: &mut StreamState) {
     let Some(r) = p.as_mut() else {
         return;
     };
     let mut chunk = [0u8; 8192];
-    loop {
+    let mut this_turn = 0usize;
+    while this_turn < PER_TURN {
         match r.read(&mut chunk) {
             Ok(0) => {
+                st.eof = true;
                 *p = None;
                 return;
             }
             Ok(n) => {
-                if buf.len() < MAX_CAPTURE {
-                    let take = n.min(MAX_CAPTURE - buf.len());
-                    buf.extend_from_slice(&chunk[..take]);
-                }
+                this_turn += n;
+                let take = n.min(MAX_CAPTURE.saturating_sub(buf.len()));
+                buf.extend_from_slice(&chunk[..take]);
+                st.dropped += (n - take) as u64;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => {
+                st.read_error = true;
                 *p = None;
                 return;
             }
