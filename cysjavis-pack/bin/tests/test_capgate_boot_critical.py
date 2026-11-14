@@ -156,6 +156,9 @@ class GateWithStub(_Env):
                 self.assertEqual(dec, "deny", "%s/%s 가 거부되지 않았다: %r %r" % (role, tool, r.stdout, r.stderr))
                 self.assertIn(REL, reason)
                 self.assertIn("기동 필수", reason)
+                # RULINGS CY2 — the sentence says what is true: startup OR a hook's essential function
+                self.assertIn("망가지면 제품이 켜지지 않거나, 훅이 하는 필수 기능이 꺼질 수 있다", reason)
+                self.assertNotIn("(망가지면 제품이 켜지지 않는다)", reason)
                 if role == "worker":     # RULINGS AI5 — the worker opens the repair and submits it
                     self.assertIn("cys repair begin --files %s" % REL, reason)
                     self.assertIn("cys repair submit", reason)

@@ -3735,6 +3735,40 @@ mod tests {
         );
     }
 
+    /// RULINGS CY2 — the settings-writer census sees a `hooks` table write in either quote; a new
+    /// Python file writing one fails the build (negative control), the known writers pass.
+    #[test]
+    fn settings_writer_census_reads_both_quotes() {
+        for spelled in [
+            "s.setdefault(\"hooks\", {})",
+            "s.setdefault('hooks', {})",
+            "s.setdefault( 'hooks' , {})",
+        ] {
+            assert!(derive::writes_hooks_table(spelled), "{spelled}");
+            let body = format!("def reg(s):\n    {spelled}\n");
+            let e = derive_edited(&|_, t| t, &[("bin/t5c_new_registrar.py", body.as_str())])
+                .unwrap_err();
+            assert!(
+                e.contains("`bin/t5c_new_registrar.py` writes a settings `hooks` table"),
+                "{spelled}: {e}"
+            );
+        }
+        for not_a_write in [
+            "s.setdefault('hookss', {})",
+            "s.get('hooks')",
+            "# s.setdefault('hooks', {})",
+        ] {
+            assert!(
+                !derive::writes_hooks_table(not_a_write) || not_a_write.starts_with('#'),
+                "{not_a_write}"
+            );
+        }
+        assert!(
+            derive_edited(&|_, t| t, &[]).is_ok(),
+            "the known writers pass"
+        );
+    }
+
     #[test]
     fn census_fails_on_a_new_registrar_def() {
         let e = derive_edited(

@@ -3219,7 +3219,7 @@ def _bc_own_pack():
 def _bc_text(seat, rel, lane_pack):
     """RULINGS AI5 — what THIS role can do, and which lane's pack the file is in."""
     head = ("[기동 필수 파일 — 직접 쓰기 보류] `%s` 은(는) 본체에 컴파일된 기동 필수 목록에 든 파일이다"
-            "(망가지면 제품이 켜지지 않는다)." % rel)
+            "(망가지면 제품이 켜지지 않거나, 훅이 하는 필수 기능이 꺼질 수 있다)." % rel)
     lane = ""
     if isinstance(lane_pack, str) and lane_pack and \
             _bc_fold(lane_pack).rstrip("/") != _bc_fold(_bc_own_pack()).rstrip("/"):
