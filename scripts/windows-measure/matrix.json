@@ -1,0 +1,2763 @@
+{
+ "schema": 1,
+ "title": "TW1 Windows measurement matrix (plan impl/plans/TW1.md section 4; RULINGS CW7, EQ1-EQ6)",
+ "base": {
+  "version": "0.14.56",
+  "installer": "cys_0.14.56_x64-setup.exe",
+  "sha256": "cfe534b46c5eaaea946f58cd32f55ab0b5d102f97c8bf7c16075d37a1032a78e",
+  "sha256_source": "the v0.14.56 release's SHA256SUMS.txt (pinned) + the downloaded SHA256SUMS.txt (checked)"
+ },
+ "units": [
+  "T6",
+  "T5b",
+  "T7b",
+  "T2g",
+  "T2h",
+  "T5c",
+  "T3d",
+  "T3e",
+  "T7c",
+  "T8b",
+  "T4b",
+  "T1d",
+  "T1e",
+  "T11b",
+  "T2d",
+  "T9",
+  "TV1"
+ ],
+ "unit_markers": {
+  "T6": [
+   "repair",
+   "revert",
+   "R-0000"
+  ],
+  "T5b": [
+   "repair",
+   "submit",
+   "R-0000"
+  ],
+  "T7b": [
+   "repair",
+   "gate"
+  ]
+ },
+ "scenario": {
+  "listed_changed": [
+   "bin/javis_bootstrap.py",
+   "hooks/session-start.sh",
+   "hooks/role-capability-gate.sh",
+   "hooks/guard.sh",
+   "hooks/pack-guard.sh",
+   "bin/javis_preflight.py",
+   "bin/javis_formation.py",
+   "bin/javis_mission.py",
+   "bin/javis_teamtoken.py",
+   "bin/javis_orchestra.py"
+  ],
+  "listed_unchanged": [
+   "hooks/inject-context.sh",
+   "hooks/role-bootstrap.sh",
+   "hooks/_lib.sh",
+   "hooks/grill-gate.sh"
+  ],
+  "general_changed_py": [
+   "bin/javis_vibecheck.py",
+   "bin/javis_waiver.py",
+   "bin/javis_report.py",
+   "bin/javis_compete.py",
+   "bin/javis_org.py",
+   "bin/javis_channel_watch.py",
+   "bin/javis_dept_schedule.py",
+   "bin/javis_report_gate.py"
+  ],
+  "general_changed_sh": [
+   "bin/javis_org_e2e.sh"
+  ],
+  "general_changed_md": [
+   "hooks/README.md",
+   "skills/vibecoding/SKILL.md",
+   "skills/harness-creator/SKILL.md"
+  ],
+  "holder_hook": "save-state.sh",
+  "holder_module": "javis_event",
+  "query_listed_rel": "hooks/session-start.sh",
+  "update_mode_limit_s": 600,
+  "app_pack_wait_s": 240,
+  "next_version_marker": {
+   "py": "# tw1 next-version marker (TNV build only, never committed)",
+   "sh": "# tw1 next-version marker (TNV build only, never committed)",
+   "md": "<!-- tw1 next-version marker (TNV build only, never committed) -->"
+  }
+ },
+ "expected_top_rows": 65,
+ "order": [
+  "s0_env",
+  "s1_base",
+  "s2_update",
+  "s3_cli",
+  "s3_files",
+  "s3_jobs_hooks",
+  "s3_query",
+  "s3_home",
+  "s3_diff",
+  "s3_dy1",
+  "s3_intake",
+  "s3_listen",
+  "s3_siblings"
+ ],
+ "probes": {
+  "s0_env": {
+   "stage": "S0",
+   "time_limit_s": 1500,
+   "requires_state": "clean",
+   "leaves_state": "clean",
+   "read_only": false,
+   "does": "environment facts; obtains the three installers; switches Defender real-time protection on (D8)"
+  },
+  "s1_base": {
+   "stage": "S1",
+   "time_limit_s": 1200,
+   "requires_state": "clean",
+   "leaves_state": "base",
+   "read_only": false,
+   "does": "v0.14.56 /S + its own init-pack + its daemon + a master surface + the scenario's edits (D12)"
+  },
+  "s2_update": {
+   "stage": "S2",
+   "time_limit_s": 2100,
+   "requires_state": "base",
+   "leaves_state": "updated",
+   "read_only": false,
+   "does": "holders + watcher; candidate installer with /P /R /UPDATE /ARGS (D9, /S fallback); pack application (app or driver-reproduced); daemon rotation"
+  },
+  "s3_cli": {
+   "stage": "S3",
+   "time_limit_s": 300,
+   "requires_state": "updated",
+   "leaves_state": "same",
+   "read_only": true,
+   "does": "help exits; seatless refusal; unit behaviour markers"
+  },
+  "s3_files": {
+   "stage": "S3",
+   "time_limit_s": 300,
+   "requires_state": "updated",
+   "leaves_state": "same",
+   "read_only": true,
+   "does": "the edited files and their controls after the update"
+  },
+  "s3_jobs_hooks": {
+   "stage": "S3",
+   "time_limit_s": 300,
+   "requires_state": "updated",
+   "leaves_state": "same",
+   "read_only": false,
+   "does": "built-in jobs and lifeline hooks after the update, then after the product's narrow registrar"
+  },
+  "s3_query": {
+   "stage": "S3",
+   "time_limit_s": 300,
+   "requires_state": "updated",
+   "leaves_state": "same",
+   "read_only": false,
+   "does": "cys repair boot-critical through every spelling, two junctions inside the pack (removed after)"
+  },
+  "s3_home": {
+   "stage": "S3",
+   "time_limit_s": 300,
+   "requires_state": "updated",
+   "leaves_state": "same",
+   "read_only": true,
+   "does": "home resolution of the binary and of the bundled Python under a changed USERPROFILE / HOME"
+  },
+  "s3_diff": {
+   "stage": "S3",
+   "time_limit_s": 300,
+   "requires_state": "any",
+   "leaves_state": "same",
+   "read_only": true,
+   "does": "file-watcher search over the v0.14.56..HEAD diff"
+  },
+  "s3_dy1": {
+   "stage": "S3",
+   "time_limit_s": 400,
+   "requires_state": "updated",
+   "leaves_state": "same",
+   "read_only": true,
+   "does": "isolation flags of the bundled embeddable Python against planted modules"
+  },
+  "s3_intake": {
+   "stage": "S3",
+   "time_limit_s": 300,
+   "requires_state": "updated",
+   "leaves_state": "same",
+   "read_only": false,
+   "does": "cys repair report twice from a plain shell; the master's queue before / after"
+  },
+  "s3_listen": {
+   "stage": "S3",
+   "time_limit_s": 900,
+   "requires_state": "updated",
+   "leaves_state": "same",
+   "read_only": true,
+   "does": "the new daemon's pid and pipe until 600 s after its start"
+  },
+  "s3_siblings": {
+   "stage": "S3",
+   "time_limit_s": 240,
+   "requires_state": "any",
+   "leaves_state": "same",
+   "read_only": true,
+   "does": "conclusions of the other workflow runs at this commit (REST)"
+  }
+ },
+ "setup": [
+  {
+   "probe": "s0_env",
+   "checks": [
+    {
+     "id": "base-obtained",
+     "role": "identity",
+     "fact": "base_installer_obtained",
+     "op": "true"
+    },
+    {
+     "id": "base-pinned-sha",
+     "role": "identity",
+     "fact": "base_sha_pinned_match",
+     "op": "true",
+     "text": "sha256 == the value pinned from the v0.14.56 release's SHA256SUMS.txt"
+    },
+    {
+     "id": "base-sums-sha",
+     "role": "identity",
+     "fact": "base_sha_sums_match",
+     "op": "true",
+     "text": "sha256 == the downloaded SHA256SUMS.txt line (two independent sources agree)"
+    },
+    {
+     "id": "cand-obtained",
+     "role": "identity",
+     "fact": "candidate_obtained",
+     "op": "true"
+    },
+    {
+     "id": "cand-version-agrees",
+     "role": "identity",
+     "fact": "candidate_version",
+     "op": "eq_fact",
+     "other": "candidate_version_filename",
+     "text": "tauri.conf.json at this commit == the version in the installer's file name"
+    },
+    {
+     "id": "cand-newer",
+     "role": "identity",
+     "fact": "candidate_version",
+     "op": "version_gt_fact",
+     "other": "base_version",
+     "text": "RULINGS EQ1 / plan F1: the candidate must be newer than v0.14.56 or nothing is swapped"
+    }
+   ]
+  },
+  {
+   "probe": "s1_base",
+   "checks": [
+    {
+     "id": "base-marker",
+     "role": "identity",
+     "fact": "base_marker",
+     "op": "eq_fact",
+     "other": "base_version"
+    },
+    {
+     "id": "base-cys-vi",
+     "role": "identity",
+     "fact": "base_cys_version",
+     "op": "eq_fact",
+     "other": "base_version4"
+    },
+    {
+     "id": "base-daemon",
+     "role": "identity",
+     "fact": "base_daemon_ready",
+     "op": "true"
+    },
+    {
+     "id": "base-selection",
+     "role": "identity",
+     "fact": "selection_ok",
+     "op": "true"
+    },
+    {
+     "id": "base-edits",
+     "role": "identity",
+     "fact": "edits_applied",
+     "op": "true"
+    }
+   ]
+  },
+  {
+   "probe": "s2_update",
+   "checks": [
+    {
+     "id": "cand-marker",
+     "role": "identity",
+     "fact": "cand_marker",
+     "op": "eq_fact",
+     "other": "candidate_version",
+     "text": "cys-installed-version.txt == the candidate's version (the NSIS hook writes it only after every gate)"
+    },
+    {
+     "id": "cand-cys-vi",
+     "role": "identity",
+     "fact": "cand_cys_version",
+     "op": "eq_fact",
+     "other": "candidate_version4"
+    },
+    {
+     "id": "cand-cysd-vi",
+     "role": "identity",
+     "fact": "cand_cysd_version",
+     "op": "eq_fact",
+     "other": "candidate_version4"
+    },
+    {
+     "id": "cand-cys-bytes",
+     "role": "identity",
+     "fact": "cand_hash_match_cys",
+     "op": "not_false",
+     "text": "installed cys.exe == the cys.exe inside the candidate installer (None = extraction unavailable, stated)"
+    },
+    {
+     "id": "cand-cysd-bytes",
+     "role": "identity",
+     "fact": "cand_hash_match_cysd",
+     "op": "not_false"
+    },
+    {
+     "id": "cand-newer",
+     "role": "identity",
+     "fact": "candidate_version",
+     "op": "version_gt_fact",
+     "other": "base_version",
+     "text": "RULINGS EQ1: candidate version <= base version -> no update row is counted, the run is red"
+    },
+    {
+     "id": "new-daemon",
+     "role": "identity",
+     "fact": "new_daemon_ready",
+     "op": "true"
+    }
+   ]
+  }
+ ],
+ "rows": [
+  {
+   "id": "G01",
+   "group": "gate",
+   "title": "pack-folder rename while files are held: does it fall back to copy-then-delete and delete only part?",
+   "source": "design 8-2 #1 (line 1281); 2-6 step 5 (src/pack.rs staged swap); 4-15 ra; testplan WIN-16 WIN-01",
+   "why": "the Defender holder depends on Defender being able to scan on the runner (D8); the repetitions per holder set are stage S6",
+   "expected": "no partial state: every path of the installed manifest exists after the update; the fallback, if taken, is named (WIN-01: record complete; a partial deletion = FAIL)",
+   "subrows": [
+    {
+     "id": "G01.all",
+     "kind": "record",
+     "probe": "s2_update",
+     "title": "the S2 update with the Git Bash and Python holders (and a Defender scan when available)",
+     "checks": [
+      {
+       "id": "cand-marker",
+       "role": "identity",
+       "fact": "cand_marker",
+       "op": "eq_fact",
+       "other": "candidate_version",
+       "text": "cys-installed-version.txt == the candidate's version (the NSIS hook writes it only after every gate)"
+      },
+      {
+       "id": "cand-cys-vi",
+       "role": "identity",
+       "fact": "cand_cys_version",
+       "op": "eq_fact",
+       "other": "candidate_version4"
+      },
+      {
+       "id": "cand-cysd-vi",
+       "role": "identity",
+       "fact": "cand_cysd_version",
+       "op": "eq_fact",
+       "other": "candidate_version4"
+      },
+      {
+       "id": "cand-cys-bytes",
+       "role": "identity",
+       "fact": "cand_hash_match_cys",
+       "op": "not_false",
+       "text": "installed cys.exe == the cys.exe inside the candidate installer (None = extraction unavailable, stated)"
+      },
+      {
+       "id": "cand-cysd-bytes",
+       "role": "identity",
+       "fact": "cand_hash_match_cysd",
+       "op": "not_false"
+      },
+      {
+       "id": "cand-newer",
+       "role": "identity",
+       "fact": "candidate_version",
+       "op": "version_gt_fact",
+       "other": "base_version",
+       "text": "RULINGS EQ1: candidate version <= base version -> no update row is counted, the run is red"
+      },
+      {
+       "id": "holders",
+       "role": "complete",
+       "fact": "bash_holder_started",
+       "op": "true"
+      },
+      {
+       "id": "holders-py",
+       "role": "complete",
+       "fact": "py_holder_started",
+       "op": "true"
+      },
+      {
+       "id": "no-partial",
+       "role": "check",
+       "fact": "manifest_missing",
+       "op": "empty",
+       "text": "every path the installed manifest names exists"
+      },
+      {
+       "id": "pack-version",
+       "role": "check",
+       "fact": "pack_version_after",
+       "op": "eq_fact",
+       "other": "candidate_version"
+      },
+      {
+       "id": "leftovers-recorded",
+       "role": "check",
+       "fact": "pack_leftovers",
+       "op": "present"
+      }
+     ],
+     "class": "YES",
+     "phase": 1
+    },
+    {
+     "id": "G01.bash",
+     "why": "stage S6",
+     "probe": null,
+     "title": "Git Bash holder alone (fresh base)",
+     "class": "PARTLY",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G01.py",
+     "why": "stage S6",
+     "probe": null,
+     "title": "Python holder alone (fresh base)",
+     "class": "PARTLY",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G01.ctl",
+     "why": "stage S6",
+     "probe": null,
+     "title": "control: the same update without holders",
+     "class": "PARTLY",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY",
+   "probe": null
+  },
+  {
+   "id": "G02",
+   "group": "gate",
+   "title": "the eleven steps of the Windows upgrade checklist on a real previous -> new upgrade",
+   "source": "design 8-2 #2 (line 1282); docs/WINDOWS-UPGRADE-ATOMICITY-CHECKLIST.md P1-P11; WIN-16 WIN-02",
+   "why": "P8 (in-app updater) needs a served signed update (GAPS G2); every other step is stage S5",
+   "expected": "each step at the checklist's own expected value",
+   "subrows": [
+    {
+     "id": "G02.P1",
+     "probe": null,
+     "title": "checklist P1",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G02.P2",
+     "probe": null,
+     "title": "checklist P2",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G02.P3",
+     "probe": null,
+     "title": "checklist P3",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G02.P4",
+     "probe": null,
+     "title": "checklist P4",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G02.P5",
+     "probe": null,
+     "title": "checklist P5",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G02.P6a",
+     "probe": null,
+     "title": "checklist P6a",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G02.P6b",
+     "probe": null,
+     "title": "checklist P6b",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G02.P7",
+     "probe": null,
+     "title": "checklist P7",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G02.P9",
+     "probe": null,
+     "title": "checklist P9",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G02.P10a",
+     "probe": null,
+     "title": "checklist P10a",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G02.P10b",
+     "probe": null,
+     "title": "checklist P10b",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G02.P11",
+     "probe": null,
+     "title": "checklist P11",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G02.P8",
+     "probe": null,
+     "title": "checklist P8 (in-app updater)",
+     "why": "the updater reads only the public latest release and checks its signature: no served signed newer version exists before publication (GAPS G2)",
+     "class": "NO",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY",
+   "probe": null
+  },
+  {
+   "id": "G03",
+   "group": "gate",
+   "title": "installer framework (Tauri 2.11.4) update mode: dialogs, relaunch after interruption, exit code",
+   "source": "design 8-2 #3 (line 1283); src/update_launch.rs nsis_update_params; WIN-16 WIN-03",
+   "why": "(c) cancelling a dialog needs a human; whether a window is visible depends on the runner's session (recorded)",
+   "expected": "record: exit code, windows shown, relaunch yes / no per case",
+   "subrows": [
+    {
+     "id": "G03.a",
+     "kind": "record",
+     "probe": "s2_update",
+     "title": "(a) /P /R /UPDATE /ARGS to completion",
+     "checks": [
+      {
+       "id": "um-finished",
+       "role": "environment",
+       "fact": "update_mode_finished",
+       "op": "true",
+       "reason": "the update-mode installer did not finish on the runner within its limit; the chain was measured with /S (RULINGS EQ4 D9)"
+      },
+      {
+       "id": "um-exit",
+       "role": "check",
+       "fact": "um_exit",
+       "op": "present"
+      },
+      {
+       "id": "um-windows",
+       "role": "check",
+       "fact": "um_windows",
+       "op": "present"
+      },
+      {
+       "id": "um-relaunch",
+       "role": "check",
+       "fact": "app_relaunched",
+       "op": "present"
+      }
+     ],
+     "class": "YES",
+     "phase": 1
+    },
+    {
+     "id": "G03.b",
+     "probe": null,
+     "title": "(b) the installer killed mid-way (stage S5)",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G03.c",
+     "probe": null,
+     "title": "(c) a dialog cancelled",
+     "why": "needs a human click; no operator on a hosted runner",
+     "class": "NO",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY",
+   "probe": null
+  },
+  {
+   "id": "G04",
+   "group": "gate",
+   "kind": "record",
+   "probe": null,
+   "title": "runtime-folder hash time with antivirus on",
+   "source": "design 8-2 #4 (line 1284); WIN-16 WIN-04",
+   "why": "antivirus-on only if Defender real-time can be on (D8); the app's own detection is not reachable, so a sha256 walk of the installed runtime is timed (the gate is 'whatever the storage design')",
+   "expected": "record: ms, files, bytes; median / max per condition",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "G05",
+   "group": "gate",
+   "kind": "record",
+   "probe": "s3_home",
+   "title": "home lookup of the binary and of Python vs a changed USERPROFILE",
+   "source": "design 8-2 #5 (line 1285); design line 424; WIN-16 WIN-05",
+   "expected": "record; design line 424 assumes the binary ignores the variable",
+   "checks": [
+    {
+     "id": "default-root",
+     "role": "control",
+     "fact": "lp_real_default",
+     "op": "eq_fact",
+     "other": "real_pack_dir",
+     "text": "without an override the query names the real pack as the lane root (the probe can see the root)"
+    },
+    {
+     "id": "bin-override-observed",
+     "role": "check",
+     "fact": "lp_real_under_override",
+     "op": "present"
+    },
+    {
+     "id": "bin-home-override-observed",
+     "role": "check",
+     "fact": "lp_real_under_home",
+     "op": "present"
+    },
+    {
+     "id": "py-default",
+     "role": "check",
+     "fact": "py_home_default",
+     "op": "not_none"
+    },
+    {
+     "id": "py-override",
+     "role": "check",
+     "fact": "py_home_under_override",
+     "op": "not_none"
+    },
+    {
+     "id": "bin-ignores-userprofile",
+     "role": "assumption",
+     "fact": "lp_real_under_override",
+     "op": "eq_fact",
+     "other": "real_pack_dir",
+     "assumption": "design line 424: 윈도우의 프로그램 본체는 홈 폴더 환경 변수를 무시하므로 (the binary ignores USERPROFILE)"
+    }
+   ],
+   "phase": 1,
+   "class": "YES"
+  },
+  {
+   "id": "G06",
+   "group": "gate",
+   "kind": "record",
+   "probe": null,
+   "title": "Git Bash running a hook that is renamed / rewritten in place; Python file replaced while imported",
+   "source": "design 8-2 #6 (line 1286); WIN-16 WIN-06",
+   "expected": "record per action; control: un-held files",
+   "phase": 1,
+   "checks": [],
+   "class": "YES"
+  },
+  {
+   "id": "G07",
+   "group": "gate",
+   "probe": "s3_diff",
+   "title": "change-notification overflow - no file watcher is added in release 1",
+   "source": "design 8-2 #7 (line 1287); 4-10 'no watcher'; TESTPLAN_RULINGS Q-W1",
+   "expected": "not applicable: the v0.14.56..HEAD diff adds no file-watching API",
+   "checks": [
+    {
+     "id": "base-ref",
+     "role": "complete",
+     "fact": "base_ref_found",
+     "op": "true"
+    },
+    {
+     "id": "search-reads-diff",
+     "role": "control",
+     "fact": "control_hits",
+     "op": "gt",
+     "value": 0,
+     "text": "a token known to be added by release 1 is found (the search reads the diff)"
+    },
+    {
+     "id": "no-watcher",
+     "role": "check",
+     "fact": "watcher_hits",
+     "op": "empty"
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "class": "YES"
+  },
+  {
+   "id": "G08",
+   "group": "gate",
+   "kind": "record",
+   "probe": null,
+   "title": "Job-object inheritance: pane process, daemon child, Task-Scheduler-started daemon's children",
+   "source": "design 8-2 #8 (line 1288); 4-9 job conditions; WIN-16 WIN-08",
+   "why": "the re-check job's timed-out child is T6; the rest is stage S8",
+   "expected": "record: membership table, survivors of a daemon kill",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "G09",
+   "group": "gate",
+   "title": "record files across a VM power cut (with / without immediate flush)",
+   "source": "design 8-2 #9 (line 1289); WIN-16 WIN-09",
+   "why": "a hosted VM cannot be powered off and resumed inside a job",
+   "fail_safe": "write-ahead records are flushed (file and directory) before the live file changes (RULINGS EC7); sub-rows probe the flush primitive and a killed writer (process death only, not power loss)",
+   "subrows": [
+    {
+     "id": "G09.flush",
+     "probe": null,
+     "title": "FlushFileBuffers on a file and on a directory handle on NTFS (stage S7)",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G09.kill",
+     "probe": null,
+     "title": "a writer killed mid-record leaves a parsable ledger (stage S7)",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "NO",
+   "probe": null
+  },
+  {
+   "id": "G10",
+   "group": "gate",
+   "title": "Windows Hello in the app and how the daemon identifies the app",
+   "source": "design 8-2 #10 (line 1290); 4-16 line 982; src/repair/platform.rs Windows row; GAPS G14; WIN-16 WIN-10",
+   "why": "Windows Server: no Hello, no PIN enrolment, no interactive user",
+   "fail_safe": "boot-critical repairs WAIT on Windows (platform table: Pending(PENDING_WINDOWS)); sub-rows: the pending answer (T5b) and the Hello availability fact",
+   "subrows": [
+    {
+     "id": "G10.pending",
+     "needs_units": [
+      "T5b"
+     ],
+     "phase": 2,
+     "probe": null,
+     "why": "T5b's submit is absent at the base; seats are phase 2",
+     "title": "a boot-critical submit answers pending; nothing applied",
+     "class": "WAIT",
+     "kind": "assert",
+     "checks": []
+    },
+    {
+     "id": "G10.hello",
+     "probe": null,
+     "title": "UserConsentVerifier availability recorded (stage S8)",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "NO",
+   "probe": null
+  },
+  {
+   "id": "G11",
+   "group": "gate",
+   "title": "Smart App Control blocks newly installed unsigned executables",
+   "source": "design 8-2 #11 (line 1291); 4-11 ka; WIN-16 WIN-11",
+   "why": "Smart App Control exists only on Windows 11 client clean installs",
+   "fail_safe": "the release notes' limit-22 sentence gives the manual route; sub-rows attach the Code Integrity log and windows-build's PE signature census",
+   "subrows": [
+    {
+     "id": "G11.ci",
+     "probe": null,
+     "title": "Code Integrity event log of the run (stage S8)",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "NO",
+   "probe": null
+  },
+  {
+   "id": "G12",
+   "group": "gate",
+   "kind": "record",
+   "probe": null,
+   "title": "office bridge bound twice with a second HQ-classified daemon",
+   "source": "design 8-2 #12 (line 1292); WIN-16 WIN-12",
+   "expected": "record: who holds the port; control: one daemon",
+   "phase": 1,
+   "checks": [],
+   "class": "YES"
+  },
+  {
+   "id": "G13",
+   "group": "gate",
+   "kind": "record",
+   "probe": null,
+   "title": "Korean and long user-name paths: bundle store, snapshot, records, ledger",
+   "source": "design 8-2 #13 (line 1293); WIN-16 WIN-13",
+   "why": "the bundle capture is unreachable (GAPS G2); repair verbs need seats (phase 2); local users per D8 (stage S8)",
+   "expected": "every file where expected, names intact, read back",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "G14",
+   "group": "gate",
+   "probe": null,
+   "title": "cp949 console without UTF-8 mode and the daemon environment, for every new Python tool",
+   "source": "design 8-2 #14 (line 1294); design line 865; WIN-16 WIN-14",
+   "why": "the system code page cannot become 949 without a reboot: cp1252 native is real, cp949 only through a console code page / shim (stage S8)",
+   "expected": "no Unicode error; documented exit codes; LF for writers of boot-critical files",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "G15",
+   "group": "gate",
+   "needs_units": [
+    "T6"
+   ],
+   "probe": null,
+   "title": "restart storm: no false revert; re-check only after readiness",
+   "source": "design 8-2 #15 (line 1295); TESTPLAN_RULINGS OQ-D5; WIN-16 WIN-15",
+   "why": "the re-check job is T6",
+   "expected": "0 pack files changed; first re-check <= 150 s after readiness, none before",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "WAIT"
+  },
+  {
+   "id": "G16",
+   "group": "gate",
+   "title": "propagation and human / worker revert (Windows form) on held files; the empty gap; automatic revert really off",
+   "source": "design 8-2 #16 (line 1296); 4-9 Windows form (line 836); 4-16; WIN-16 WIN-16",
+   "why": "the product legs are T6 (revert, automatic return) and T7b (propagation); the OS primitive is measurable now (stage S7)",
+   "needs_units": [
+    "T6",
+    "T7b"
+   ],
+   "expected": "stopped with nothing deleted + notice, or success; no automatic revert; gap distribution recorded",
+   "subrows": [
+    {
+     "id": "G16.prim",
+     "why": "Defender holder depends on D8",
+     "probe": null,
+     "title": "MoveFileExW without REPLACE_EXISTING on held files + 50 two-move gaps (stage S7)",
+     "class": "PARTLY",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "G16.product",
+     "needs_units": [
+      "T6",
+      "T7b"
+     ],
+     "probe": null,
+     "why": "probe not built yet; becomes measurable when the unit is merged",
+     "title": "the product's propagation and revert on held files",
+     "class": "WAIT",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "WAIT",
+   "probe": null
+  },
+  {
+   "id": "CW7-UPD",
+   "group": "cw7",
+   "probe": "s2_update",
+   "title": "the isolated update v0.14.56 -> candidate is real (the build under test is installed)",
+   "source": "RULINGS CW7, EQ1; checklist P1 / P2",
+   "expected": "installer exit 0; marker / binaries / pack version = candidate; no failure file; CLI never absent beyond the checklist's bound",
+   "checks": [
+    {
+     "id": "cand-marker",
+     "role": "identity",
+     "fact": "cand_marker",
+     "op": "eq_fact",
+     "other": "candidate_version",
+     "text": "cys-installed-version.txt == the candidate's version (the NSIS hook writes it only after every gate)"
+    },
+    {
+     "id": "cand-cys-vi",
+     "role": "identity",
+     "fact": "cand_cys_version",
+     "op": "eq_fact",
+     "other": "candidate_version4"
+    },
+    {
+     "id": "cand-cysd-vi",
+     "role": "identity",
+     "fact": "cand_cysd_version",
+     "op": "eq_fact",
+     "other": "candidate_version4"
+    },
+    {
+     "id": "cand-cys-bytes",
+     "role": "identity",
+     "fact": "cand_hash_match_cys",
+     "op": "not_false",
+     "text": "installed cys.exe == the cys.exe inside the candidate installer (None = extraction unavailable, stated)"
+    },
+    {
+     "id": "cand-cysd-bytes",
+     "role": "identity",
+     "fact": "cand_hash_match_cysd",
+     "op": "not_false"
+    },
+    {
+     "id": "cand-newer",
+     "role": "identity",
+     "fact": "candidate_version",
+     "op": "version_gt_fact",
+     "other": "base_version",
+     "text": "RULINGS EQ1: candidate version <= base version -> no update row is counted, the run is red"
+    },
+    {
+     "id": "before-was-base",
+     "role": "control",
+     "fact": "marker_before",
+     "op": "eq_fact",
+     "other": "base_version",
+     "text": "before the update the marker said v0.14.56 (the update had something to change)"
+    },
+    {
+     "id": "exit0",
+     "role": "check",
+     "fact": "installer_final_exit",
+     "op": "eq",
+     "value": 0
+    },
+    {
+     "id": "no-failure-file",
+     "role": "check",
+     "fact": "failure_file_present",
+     "op": "false"
+    },
+    {
+     "id": "pack-version",
+     "role": "check",
+     "fact": "pack_version_after",
+     "op": "eq_fact",
+     "other": "candidate_version"
+    },
+    {
+     "id": "manifest-complete",
+     "role": "check",
+     "fact": "manifest_missing",
+     "op": "empty"
+    },
+    {
+     "id": "cli-window",
+     "role": "check",
+     "fact": "cli_absent_max_consecutive",
+     "op": "le",
+     "value": 9,
+     "text": "checklist P1: 10+ consecutive 200-ms samples without cys.exe while the installer succeeds = FAIL"
+    },
+    {
+     "id": "cli-window-design",
+     "role": "assumption",
+     "fact": "cli_absent_max_consecutive",
+     "op": "le",
+     "value": 2,
+     "assumption": "checklist P1: the design's transition window is at most 2 samples (~0.4 s); 3-9 = to be investigated"
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "class": "YES"
+  },
+  {
+   "id": "CW7-NEXT",
+   "group": "cw7",
+   "probe": null,
+   "title": "a following transition candidate -> next version (binary exchange with the daemon stopped)",
+   "source": "RULINGS CW7; EQ2 (D4); design 8-1 C 'two legs'; design 4-11 sa; 7 rows 1, 12",
+   "why": "not a next-version installer: the two binaries built at the next version are exchanged with the daemon stopped and recorded as exactly that (stage S4)",
+   "expected": "leg-1 edits preserved per their rule; listed files vendor-first again with the earlier parked copy in .user.prev-*; general files user live + .new",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "CW7-LISTED",
+   "group": "cw7",
+   "probe": "s3_files",
+   "title": "an edited listed (boot-critical) file -> vendor-first with the parked copy",
+   "source": "RULINGS CW7; design 4-11 na (line 875); 7 row 1; src/pack.rs classify_update",
+   "expected": "E-L1 / E-L2: live = candidate vendor bytes, <rel>.user = the user's bytes, ledger kind vendor-first; E-L3 (vendor unchanged): the user's bytes stay live (kept-drift, from the code - the design names only the conflict case)",
+   "checks": [
+    {
+     "id": "sel-L1",
+     "role": "complete",
+     "fact": "L1_listed",
+     "op": "eq",
+     "value": 0,
+     "text": "E-L1 is on the compiled list (installed query)"
+    },
+    {
+     "id": "sel-L2",
+     "role": "complete",
+     "fact": "L2_listed",
+     "op": "eq",
+     "value": 0
+    },
+    {
+     "id": "sel-L3",
+     "role": "complete",
+     "fact": "L3_listed",
+     "op": "eq",
+     "value": 0
+    },
+    {
+     "id": "sel-CL",
+     "role": "complete",
+     "fact": "CL_listed",
+     "op": "eq",
+     "value": 0
+    },
+    {
+     "id": "ctl-live",
+     "role": "control",
+     "fact": "CL_live_sha",
+     "op": "eq_fact",
+     "other": "CL_vendor_sha",
+     "text": "the untouched listed file with changed vendor bytes is vendor-updated"
+    },
+    {
+     "id": "ctl-nopark",
+     "role": "control",
+     "fact": "CL_park_sha",
+     "op": "none",
+     "text": "... and is not parked (the park detector discriminates)"
+    },
+    {
+     "id": "L1-live",
+     "role": "check",
+     "fact": "L1_live_sha",
+     "op": "eq_fact",
+     "other": "L1_vendor_sha"
+    },
+    {
+     "id": "L1-park",
+     "role": "check",
+     "fact": "L1_park_sha",
+     "op": "eq_fact",
+     "other": "L1_user_sha"
+    },
+    {
+     "id": "L1-kind",
+     "role": "check",
+     "fact": "L1_pending_kind",
+     "op": "eq",
+     "value": "vendor-first"
+    },
+    {
+     "id": "L2-live",
+     "role": "check",
+     "fact": "L2_live_sha",
+     "op": "eq_fact",
+     "other": "L2_vendor_sha"
+    },
+    {
+     "id": "L2-park",
+     "role": "check",
+     "fact": "L2_park_sha",
+     "op": "eq_fact",
+     "other": "L2_user_sha"
+    },
+    {
+     "id": "L2-kind",
+     "role": "check",
+     "fact": "L2_pending_kind",
+     "op": "eq",
+     "value": "vendor-first"
+    },
+    {
+     "id": "L3-kept",
+     "role": "check",
+     "fact": "L3_live_sha",
+     "op": "eq_fact",
+     "other": "L3_user_sha"
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "class": "YES"
+  },
+  {
+   "id": "CW7-GENERAL",
+   "group": "cw7",
+   "probe": "s3_files",
+   "title": "an edited general file is kept",
+   "source": "RULINGS CW7; design 4-11 ga (line 871); 7 row 1",
+   "expected": "live = the user's bytes; <rel>.new = candidate vendor bytes; ledger kind user-kept",
+   "checks": [
+    {
+     "id": "sel-G1",
+     "role": "complete",
+     "fact": "G1_listed",
+     "op": "eq",
+     "value": 1
+    },
+    {
+     "id": "sel-CG",
+     "role": "complete",
+     "fact": "CG_listed",
+     "op": "eq",
+     "value": 1
+    },
+    {
+     "id": "ctl-live",
+     "role": "control",
+     "fact": "CG_live_sha",
+     "op": "eq_fact",
+     "other": "CG_vendor_sha"
+    },
+    {
+     "id": "ctl-nonew",
+     "role": "control",
+     "fact": "CG_new_sha",
+     "op": "none"
+    },
+    {
+     "id": "G1-live",
+     "role": "check",
+     "fact": "G1_live_sha",
+     "op": "eq_fact",
+     "other": "G1_user_sha"
+    },
+    {
+     "id": "G1-new",
+     "role": "check",
+     "fact": "G1_new_sha",
+     "op": "eq_fact",
+     "other": "G1_vendor_sha"
+    },
+    {
+     "id": "G1-kind",
+     "role": "check",
+     "fact": "G1_pending_kind",
+     "op": "eq",
+     "value": "user-kept"
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "class": "YES"
+  },
+  {
+   "id": "CW7-HELD",
+   "group": "cw7",
+   "probe": "s2_update",
+   "title": "held handles: a running Git Bash holding a pack hook, a Python tool with a pack module imported and a pack file open",
+   "source": "RULINGS CW7; design 2-6 step 5",
+   "expected": "the update completes; no partial pack; the holders' fate is recorded",
+   "checks": [
+    {
+     "id": "cand-marker",
+     "role": "identity",
+     "fact": "cand_marker",
+     "op": "eq_fact",
+     "other": "candidate_version",
+     "text": "cys-installed-version.txt == the candidate's version (the NSIS hook writes it only after every gate)"
+    },
+    {
+     "id": "cand-cys-vi",
+     "role": "identity",
+     "fact": "cand_cys_version",
+     "op": "eq_fact",
+     "other": "candidate_version4"
+    },
+    {
+     "id": "cand-cysd-vi",
+     "role": "identity",
+     "fact": "cand_cysd_version",
+     "op": "eq_fact",
+     "other": "candidate_version4"
+    },
+    {
+     "id": "cand-cys-bytes",
+     "role": "identity",
+     "fact": "cand_hash_match_cys",
+     "op": "not_false",
+     "text": "installed cys.exe == the cys.exe inside the candidate installer (None = extraction unavailable, stated)"
+    },
+    {
+     "id": "cand-cysd-bytes",
+     "role": "identity",
+     "fact": "cand_hash_match_cysd",
+     "op": "not_false"
+    },
+    {
+     "id": "cand-newer",
+     "role": "identity",
+     "fact": "candidate_version",
+     "op": "version_gt_fact",
+     "other": "base_version",
+     "text": "RULINGS EQ1: candidate version <= base version -> no update row is counted, the run is red"
+    },
+    {
+     "id": "bash",
+     "role": "complete",
+     "fact": "bash_holder_started",
+     "op": "true"
+    },
+    {
+     "id": "py",
+     "role": "complete",
+     "fact": "py_holder_started",
+     "op": "true"
+    },
+    {
+     "id": "exit0",
+     "role": "check",
+     "fact": "installer_final_exit",
+     "op": "eq",
+     "value": 0
+    },
+    {
+     "id": "no-partial",
+     "role": "check",
+     "fact": "manifest_missing",
+     "op": "empty"
+    },
+    {
+     "id": "pack-version",
+     "role": "check",
+     "fact": "pack_version_after",
+     "op": "eq_fact",
+     "other": "candidate_version"
+    },
+    {
+     "id": "bash-fate",
+     "role": "check",
+     "fact": "bash_holder_alive_after",
+     "op": "present"
+    },
+    {
+     "id": "py-fate",
+     "role": "check",
+     "fact": "py_holder_alive_after",
+     "op": "present"
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "class": "YES"
+  },
+  {
+   "id": "CW7-ENC",
+   "group": "cw7",
+   "probe": "s3_files",
+   "title": "CP949 / CRLF content",
+   "source": "RULINGS CW7; design 4-11 ga-2 (line 873), ra (line 879); 7 row 3",
+   "expected": "CP949 system file: byte backup at <rel>.user, vendor bytes live; CRLF general shell script: no CR live; CRLF .md: the user's bytes kept",
+   "checks": [
+    {
+     "id": "enc-invalid",
+     "role": "complete",
+     "fact": "ENC1_user_invalid_utf8",
+     "op": "true",
+     "text": "the CP949 edit really is unreadable as UTF-8"
+    },
+    {
+     "id": "sel-ENC1",
+     "role": "complete",
+     "fact": "ENC1_listed",
+     "op": "eq",
+     "value": 1
+    },
+    {
+     "id": "sel-CRLF1",
+     "role": "complete",
+     "fact": "CRLF1_listed",
+     "op": "eq",
+     "value": 1
+    },
+    {
+     "id": "sel-CRLF2",
+     "role": "complete",
+     "fact": "CRLF2_listed",
+     "op": "eq",
+     "value": 1
+    },
+    {
+     "id": "crlf1-had-cr",
+     "role": "control",
+     "fact": "CRLF1_user_has_cr",
+     "op": "true",
+     "text": "the user's shell script had CR (the CR detector can see one)"
+    },
+    {
+     "id": "enc-live",
+     "role": "check",
+     "fact": "ENC1_live_sha",
+     "op": "eq_fact",
+     "other": "ENC1_vendor_sha"
+    },
+    {
+     "id": "enc-backup",
+     "role": "check",
+     "fact": "ENC1_park_sha",
+     "op": "eq_fact",
+     "other": "ENC1_user_sha"
+    },
+    {
+     "id": "crlf1-no-cr",
+     "role": "check",
+     "fact": "CRLF1_live_has_cr",
+     "op": "false"
+    },
+    {
+     "id": "crlf2-kept",
+     "role": "check",
+     "fact": "CRLF2_live_sha",
+     "op": "eq_fact",
+     "other": "CRLF2_user_sha"
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "class": "YES"
+  },
+  {
+   "id": "CW7-WFAIL",
+   "group": "cw7",
+   "probe": null,
+   "title": "a write failure during the update",
+   "source": "RULINGS CW7, CW5, EC7",
+   "why": "the 'record durable before the live file is replaced' rule is T2g / T2h; the deny-write / held-file leg is a later stage",
+   "expected": "the file is named (failure / warning / ledger), others proceed, nothing deleted",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "CW7-INTR",
+   "group": "cw7",
+   "probe": null,
+   "title": "an interruption between the installer's steps (installer killed; init-pack killed)",
+   "source": "RULINGS CW7; checklist P4; design 2-6 step 5",
+   "expected": "CLI present and working; pack old or new, never partial; next run completes",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "YES"
+  },
+  {
+   "id": "C-RT",
+   "group": "8-1",
+   "probe": "s2_update",
+   "title": "first update with an edited runtime file proceeds",
+   "source": "design 8-1 C (line 1268); decision 24; testplan C-sp1-01",
+   "expected": "the upgrade completes (no exit-4 stall); the install works; whether the edit survived is recorded (no guarantee)",
+   "checks": [
+    {
+     "id": "cand-marker",
+     "role": "identity",
+     "fact": "cand_marker",
+     "op": "eq_fact",
+     "other": "candidate_version",
+     "text": "cys-installed-version.txt == the candidate's version (the NSIS hook writes it only after every gate)"
+    },
+    {
+     "id": "cand-cys-vi",
+     "role": "identity",
+     "fact": "cand_cys_version",
+     "op": "eq_fact",
+     "other": "candidate_version4"
+    },
+    {
+     "id": "cand-cysd-vi",
+     "role": "identity",
+     "fact": "cand_cysd_version",
+     "op": "eq_fact",
+     "other": "candidate_version4"
+    },
+    {
+     "id": "cand-cys-bytes",
+     "role": "identity",
+     "fact": "cand_hash_match_cys",
+     "op": "not_false",
+     "text": "installed cys.exe == the cys.exe inside the candidate installer (None = extraction unavailable, stated)"
+    },
+    {
+     "id": "cand-cysd-bytes",
+     "role": "identity",
+     "fact": "cand_hash_match_cysd",
+     "op": "not_false"
+    },
+    {
+     "id": "cand-newer",
+     "role": "identity",
+     "fact": "candidate_version",
+     "op": "version_gt_fact",
+     "other": "base_version",
+     "text": "RULINGS EQ1: candidate version <= base version -> no update row is counted, the run is red"
+    },
+    {
+     "id": "rt-edited",
+     "role": "complete",
+     "fact": "rt_edit_sha",
+     "op": "not_none"
+    },
+    {
+     "id": "exit0",
+     "role": "check",
+     "fact": "installer_final_exit",
+     "op": "eq",
+     "value": 0
+    },
+    {
+     "id": "no-failure-file",
+     "role": "check",
+     "fact": "failure_file_present",
+     "op": "false"
+    },
+    {
+     "id": "survival-recorded",
+     "role": "check",
+     "fact": "rt_survived",
+     "op": "present"
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "class": "YES"
+  },
+  {
+   "id": "C-CAP",
+   "group": "8-1",
+   "title": "the app-side bundle capture works after 0.15.0",
+   "source": "design 8-1 C; 4-16 line 979; GAPS G2",
+   "why": "the capture runs only inside the app's update handler after the updater downloads a served, signed newer version",
+   "fail_safe": "it never blocks the update (code-level pins of T7a / T7c); the release note states the limit",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "NO",
+   "probe": null
+  },
+  {
+   "id": "C-CAPFAIL",
+   "group": "8-1",
+   "title": "a failed copy lets the update proceed and a notice goes out",
+   "source": "design 8-1 C; GAPS G11",
+   "why": "same reachability as C-CAP; on Windows the notice is a pending record (GAPS G11 stated limit)",
+   "fail_safe": "the update path is not blocked by the capture (pins); the stated limit G11",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "NO",
+   "probe": null
+  },
+  {
+   "id": "C-LEGACY",
+   "group": "8-1",
+   "probe": null,
+   "title": "a copy formerly pushed to .user is listed once",
+   "source": "design 8-1 C; 4-11 cha (line 904); RULINGS CW4 / EC6",
+   "why": "'once across runs' depends on T2h's durable de-duplication; the worker's evaluation needs seats",
+   "expected": "listed exactly once; not restored automatically",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "D10",
+   "group": "8-1",
+   "needs_units": [
+    "T5b"
+   ],
+   "phase": 2,
+   "probe": null,
+   "title": "a boot-critical repair waits on Windows and says so",
+   "source": "design 8-1 D (10) (line 1269); GAPS G14",
+   "why": "T5b's submit is absent at the base (exit 99); seats are phase 2",
+   "expected": "the pending sentence; nothing applied; the live file unchanged",
+   "kind": "assert",
+   "checks": [],
+   "class": "WAIT"
+  },
+  {
+   "id": "E7",
+   "group": "8-1",
+   "phase": 2,
+   "probe": null,
+   "title": "worker repair of a non-boot-critical file: begin's copy in the vault, the check at commit, a refused commit leaves the file",
+   "source": "design 8-1 E (7) (line 1270)",
+   "why": "needs a worker seat and a reviewer1 seat driven through the product's panes (phase 2, D11)",
+   "expected": "vault copy = pre-image; failing check -> commit refused, file unchanged",
+   "kind": "assert",
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "E8",
+   "group": "8-1",
+   "needs_units": [
+    "T7b",
+    "T6"
+   ],
+   "probe": null,
+   "title": "propagation deposit-first and its interruption between the two moves",
+   "source": "design 8-1 E (8)",
+   "why": "T7b is not built",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "WAIT"
+  },
+  {
+   "id": "E10",
+   "group": "8-1",
+   "needs_units": [
+    "T7b"
+   ],
+   "probe": null,
+   "title": "propagation of a file-creating repair",
+   "source": "design 8-1 E (10)",
+   "why": "T7b is not built",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "WAIT"
+  },
+  {
+   "id": "E11",
+   "group": "8-1",
+   "needs_units": [
+    "T7b"
+   ],
+   "probe": null,
+   "title": "propagation of a file-deleting repair",
+   "source": "design 8-1 E (11)",
+   "why": "T7b is not built",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "WAIT"
+  },
+  {
+   "id": "I-QUEUE",
+   "group": "8-1",
+   "probe": null,
+   "title": "messages queued to the master per update are bounded",
+   "source": "design 8-1 I (line 1275); testplan I-F1-05; TESTPLAN_RULINGS I-F1-05",
+   "why": "two update cycles on one lane (1 conflict vs many); per-entry origin tags may be missing (later stage)",
+   "expected": "N(many) = N(one) and N <= 2 per update per lane",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "I-JOBS",
+   "group": "8-1",
+   "probe": "s3_jobs_hooks",
+   "title": "built-in scheduled jobs and the six lifeline hooks are present after the update",
+   "source": "design 8-1 I; 4-11 ma (lines 883-885); 7 rows 8-9; RULINGS CW6",
+   "expected": "the job the user removed is back (the daemon re-ensures it); the lifeline hook the user removed is registered again by the product's registrar; every base built-in job and lifeline registration present",
+   "checks": [
+    {
+     "id": "job-removed-seen",
+     "role": "control",
+     "fact": "ejob_detected_missing",
+     "op": "true",
+     "text": "right after the user's removal the detector reported the job missing"
+    },
+    {
+     "id": "hook-removed-seen",
+     "role": "control",
+     "fact": "ehook_detected_missing",
+     "op": "true"
+    },
+    {
+     "id": "registrar-ran",
+     "role": "complete",
+     "fact": "registrar_exit",
+     "op": "eq",
+     "value": 0,
+     "text": "the product's narrow registrar (javis_preflight.py --reconcile-hooks, RULINGS CW6) ran to exit 0 with the PATH seats get"
+    },
+    {
+     "id": "jobs",
+     "role": "check",
+     "fact": "jobs_missing_after",
+     "op": "empty"
+    },
+    {
+     "id": "job-back",
+     "role": "check",
+     "fact": "ejob_back",
+     "op": "true"
+    },
+    {
+     "id": "hooks",
+     "role": "check",
+     "fact": "hooks_missing_after_registrar",
+     "op": "empty"
+    },
+    {
+     "id": "hook-back",
+     "role": "check",
+     "fact": "ehook_back_after_registrar",
+     "op": "true"
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "class": "YES"
+  },
+  {
+   "id": "I-LISTEN",
+   "group": "8-1",
+   "title": "the daemon listens with a boot-critical file in conflict",
+   "source": "design 8-1 I; testplan I-F4-01",
+   "expected": "ready (pipe answers) and the same pid >= 600 s; live files = vendor bytes; user copies kept (seat readiness needs agent CLIs - stated)",
+   "subrows": [
+    {
+     "id": "I-LISTEN.a",
+     "probe": "s3_listen",
+     "title": "the new daemon stays up >= 600 s with the same pid",
+     "checks": [
+      {
+       "id": "ready",
+       "role": "complete",
+       "fact": "new_daemon_ready",
+       "op": "true"
+      },
+      {
+       "id": "alive",
+       "role": "check",
+       "fact": "alive_at_end",
+       "op": "true"
+      },
+      {
+       "id": "stable",
+       "role": "check",
+       "fact": "stable_s",
+       "op": "ge",
+       "value": 600
+      },
+      {
+       "id": "no-restart",
+       "role": "check",
+       "fact": "pid_changes",
+       "op": "eq",
+       "value": 0
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "I-LISTEN.b",
+     "probe": "s3_files",
+     "title": "the conflicted listed files are vendor bytes and the user copies are kept",
+     "checks": [
+      {
+       "id": "L1-live",
+       "role": "check",
+       "fact": "L1_live_sha",
+       "op": "eq_fact",
+       "other": "L1_vendor_sha"
+      },
+      {
+       "id": "L1-park",
+       "role": "check",
+       "fact": "L1_park_sha",
+       "op": "eq_fact",
+       "other": "L1_user_sha"
+      },
+      {
+       "id": "L2-live",
+       "role": "check",
+       "fact": "L2_live_sha",
+       "op": "eq_fact",
+       "other": "L2_vendor_sha"
+      },
+      {
+       "id": "L2-park",
+       "role": "check",
+       "fact": "L2_park_sha",
+       "op": "eq_fact",
+       "other": "L2_user_sha"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "YES",
+   "probe": null
+  },
+  {
+   "id": "I-ONEDAEMON",
+   "group": "8-1",
+   "title": "no second daemon",
+   "source": "design 8-1 I",
+   "expected": "exactly one cysd.exe at each quiescent point",
+   "subrows": [
+    {
+     "id": "I-ONEDAEMON.base",
+     "probe": "s1_base",
+     "title": "after the base daemon started",
+     "checks": [
+      {
+       "id": "none-before",
+       "role": "control",
+       "fact": "cysd_count_before_base_start",
+       "op": "eq",
+       "value": 0,
+       "text": "the counter sees no daemon before the start (it distinguishes 0 from 1)"
+      },
+      {
+       "id": "one",
+       "role": "check",
+       "fact": "cysd_count_after_base_start",
+       "op": "eq",
+       "value": 1
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "I-ONEDAEMON.rotated",
+     "probe": "s2_update",
+     "title": "after the daemon rotation",
+     "checks": [
+      {
+       "id": "one",
+       "role": "check",
+       "fact": "cysd_count_after_rotation",
+       "op": "eq",
+       "value": 1
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "I-ONEDAEMON.end",
+     "probe": "s3_listen",
+     "title": "at the end of stage S3",
+     "checks": [
+      {
+       "id": "one",
+       "role": "check",
+       "fact": "cysd_count_end",
+       "op": "eq",
+       "value": 1
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "YES",
+   "probe": null
+  },
+  {
+   "id": "I-AUTOOFF",
+   "group": "8-1",
+   "needs_units": [
+    "T6"
+   ],
+   "probe": null,
+   "title": "automatic return stays off on Windows",
+   "source": "design 8-1 I; D (23); 4-16 line 983; WIN-16 WIN-16 (d)",
+   "why": "its consumers (re-check job, M10) are T6",
+   "expected": "no file changed; a ledger entry and a notice each",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "WAIT"
+  },
+  {
+   "id": "DY1",
+   "group": "ruling",
+   "title": "the judge's interpreter starts isolated: flags on the bundled embeddable Python with its ._pth",
+   "source": "RULINGS DY1; EQ5",
+   "expected": "no planted code runs with -I -S -B; the interpreter accepts the flags; UTF-8 mode is given back by -X utf8",
+   "subrows": [
+    {
+     "id": "DY1.interp",
+     "probe": "s3_dy1",
+     "title": "planted-module controls against the bundled interpreter",
+     "checks": [
+      {
+       "id": "found",
+       "role": "complete",
+       "fact": "bundled_python_found",
+       "op": "true"
+      },
+      {
+       "id": "flags-accepted",
+       "role": "check",
+       "fact": "flags_accepted_exit",
+       "op": "eq",
+       "value": 0
+      },
+      {
+       "id": "allowed",
+       "role": "check",
+       "fact": "allowed_ok",
+       "op": "true",
+       "text": "an allowed action (stdlib import + output) passes"
+      },
+      {
+       "id": "utf8",
+       "role": "check",
+       "fact": "utf8_flag",
+       "op": "eq",
+       "value": 1
+      },
+      {
+       "id": "blocked-pp_abs",
+       "role": "check",
+       "fact": "bundled_flags_pp_abs",
+       "op": "false"
+      },
+      {
+       "id": "blocked-pp_rel",
+       "role": "check",
+       "fact": "bundled_flags_pp_rel",
+       "op": "false"
+      },
+      {
+       "id": "blocked-cwd_c",
+       "role": "check",
+       "fact": "bundled_flags_cwd_c",
+       "op": "false"
+      },
+      {
+       "id": "blocked-script_dir",
+       "role": "check",
+       "fact": "bundled_flags_script_dir",
+       "op": "false"
+      },
+      {
+       "id": "blocked-startup",
+       "role": "check",
+       "fact": "bundled_flags_startup",
+       "op": "false"
+      },
+      {
+       "id": "blocked-userbase",
+       "role": "check",
+       "fact": "bundled_flags_userbase",
+       "op": "false"
+      },
+      {
+       "id": "blocked-sitecustomize",
+       "role": "check",
+       "fact": "bundled_flags_sitecustomize",
+       "op": "false"
+      },
+      {
+       "id": "home-ignored",
+       "role": "check",
+       "fact": "bundled_flags_home_ok",
+       "op": "true",
+       "text": "PYTHONHOME pointing into a writable folder does not stop or redirect the isolated start"
+      },
+      {
+       "id": "plant-works-pp_abs",
+       "role": "control",
+       "fact": "runner_plain_pp_abs",
+       "op": "true",
+       "text": "the same plant runs on the runner's Python without flags (the plant is valid)"
+      },
+      {
+       "id": "plant-works-pp_rel",
+       "role": "control",
+       "fact": "runner_plain_pp_rel",
+       "op": "true",
+       "text": "the same plant runs on the runner's Python without flags (the plant is valid)"
+      },
+      {
+       "id": "plant-works-cwd_c",
+       "role": "control",
+       "fact": "runner_plain_cwd_c",
+       "op": "true",
+       "text": "the same plant runs on the runner's Python without flags (the plant is valid)"
+      },
+      {
+       "id": "plant-works-script_dir",
+       "role": "control",
+       "fact": "runner_plain_script_dir",
+       "op": "true",
+       "text": "the same plant runs on the runner's Python without flags (the plant is valid)"
+      },
+      {
+       "id": "plant-works-startup",
+       "role": "control",
+       "fact": "runner_plain_startup",
+       "op": "true",
+       "text": "the same plant runs on the runner's Python without flags (the plant is valid)"
+      },
+      {
+       "id": "plant-works-userbase",
+       "role": "control",
+       "fact": "runner_plain_userbase",
+       "op": "true",
+       "text": "the same plant runs on the runner's Python without flags (the plant is valid)"
+      },
+      {
+       "id": "plant-works-sitecustomize",
+       "role": "control",
+       "fact": "runner_plain_sitecustomize",
+       "op": "true",
+       "text": "the same plant runs on the runner's Python without flags (the plant is valid)"
+      },
+      {
+       "id": "home-plant-works",
+       "role": "control",
+       "fact": "runner_plain_home_effect",
+       "op": "true"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "DY1.product",
+     "needs_units": [
+      "T5c"
+     ],
+     "probe": null,
+     "why": "probe not built yet; becomes measurable when the unit is merged",
+     "title": "the capability gate's own judge command line uses those flags",
+     "class": "WAIT",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "YES",
+   "probe": null
+  },
+  {
+   "id": "DY3",
+   "group": "ruling",
+   "probe": "s3_query",
+   "title": "an in-pack junction and MSYS spellings against the compiled list",
+   "source": "RULINGS DY3; GAPS last line; EQ5",
+   "expected": "a listed hook is never classified General (exit 1) through a junction or an MSYS spelling",
+   "checks": [
+    {
+     "id": "junction",
+     "role": "complete",
+     "fact": "junction_created",
+     "op": "true"
+    },
+    {
+     "id": "junction-removed",
+     "role": "complete",
+     "fact": "junction_removed",
+     "op": "true"
+    },
+    {
+     "id": "general-is-1",
+     "role": "control",
+     "fact": "q_general_backslash",
+     "op": "eq",
+     "value": 1,
+     "text": "a general file answers 1 (the query does distinguish)"
+    },
+    {
+     "id": "via-junction",
+     "role": "check",
+     "fact": "q_listed_junction",
+     "op": "in",
+     "value": [
+      0,
+      2
+     ]
+    },
+    {
+     "id": "msys",
+     "role": "check",
+     "fact": "q_listed_msys",
+     "op": "in",
+     "value": [
+      0,
+      2
+     ]
+    },
+    {
+     "id": "msys-cygdrive",
+     "role": "check",
+     "fact": "q_listed_cygdrive",
+     "op": "in",
+     "value": [
+      0,
+      2
+     ]
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "class": "YES"
+  },
+  {
+   "id": "EC2",
+   "group": "ruling",
+   "title": "no-replace placement on NTFS; two writers of <rel>.user - every copy exists afterwards",
+   "source": "RULINGS EC2, EF; EQ5",
+   "why": "the two-writer product leg is T2g / T2h; the primitive is stage S7",
+   "expected": "MoveFileExW without replace onto an existing target fails and changes nothing; with two writers every copy exists",
+   "subrows": [
+    {
+     "id": "EC2.prim",
+     "probe": null,
+     "title": "MoveFileExW without REPLACE_EXISTING (stage S7)",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "EC2.product",
+     "needs_units": [
+      "T2g"
+     ],
+     "probe": null,
+     "why": "probe not built yet; becomes measurable when the unit is merged",
+     "title": "two writers of <rel>.user: every copy exists afterwards, the overlap recorded",
+     "class": "WAIT",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY",
+   "probe": null
+  },
+  {
+   "id": "EC4",
+   "group": "ruling",
+   "title": "the one-link rule taken from the open handle; a hard-link alias of the audit ledger",
+   "source": "RULINGS EC4, EF; EQ5",
+   "why": "the product refusal is T2g / T2h; the primitive is stage S7",
+   "expected": "nNumberOfLinks from the handle = 2 for a hard link; the alias is refused by the product",
+   "subrows": [
+    {
+     "id": "EC4.prim",
+     "probe": null,
+     "title": "GetFileInformationByHandle / GetFinalPathNameByHandleW (stage S7)",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "EC4.product",
+     "needs_units": [
+      "T2g"
+     ],
+     "probe": null,
+     "why": "probe not built yet; becomes measurable when the unit is merged",
+     "title": "a hard-link alias of the audit ledger is refused",
+     "class": "WAIT",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY",
+   "probe": null
+  },
+  {
+   "id": "EC5",
+   "group": "ruling",
+   "needs_units": [
+    "T2g"
+   ],
+   "probe": null,
+   "title": "special files on the daemon's start path (a directory in place of a file, an oversized file, reserved names)",
+   "source": "RULINGS EC5; EQ5",
+   "why": "the bounded reader is T2g / T2h",
+   "expected": "the start completes; the reads say 'unreadable'",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "WAIT"
+  },
+  {
+   "id": "T7C",
+   "group": "ruling",
+   "title": "the bundle capture's folder handle against the installer's rename",
+   "source": "RULINGS DB3 (T7c); EQ5",
+   "why": "the capture itself is unreachable (GAPS G2); the primitive is stage S7",
+   "expected": "T7c's INFERRED claims confirmed or refuted",
+   "subrows": [
+    {
+     "id": "T7C.prim",
+     "probe": null,
+     "title": "a folder held without FILE_SHARE_DELETE (stage S7)",
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    },
+    {
+     "id": "T7C.capture",
+     "probe": null,
+     "title": "the capture in the app's update handler",
+     "why": "unreachable on a runner (GAPS G2)",
+     "class": "NO",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY",
+   "probe": null
+  },
+  {
+   "id": "R-T0-HELP",
+   "group": "report",
+   "probe": "s3_cli",
+   "title": "release cys.exe --help at the Windows default 1 MiB stack",
+   "source": "reports/T0-report.md:166-170",
+   "expected": "exit 0 each",
+   "checks": [
+    {
+     "id": "root",
+     "role": "check",
+     "fact": "help_exit_root",
+     "op": "eq",
+     "value": 0
+    },
+    {
+     "id": "queue",
+     "role": "check",
+     "fact": "help_exit_queue",
+     "op": "eq",
+     "value": 0
+    },
+    {
+     "id": "repair",
+     "role": "check",
+     "fact": "help_exit_repair",
+     "op": "eq",
+     "value": 0
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "class": "YES"
+  },
+  {
+   "id": "R-T0-TS",
+   "group": "report",
+   "needs_units": [
+    "T6"
+   ],
+   "probe": null,
+   "title": "TargetState::read: reparse-point open and regular re-check through the handle",
+   "source": "reports/T0-report.md:140",
+   "why": "the callers a probe can reach are T6's apply / revert",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "WAIT"
+  },
+  {
+   "id": "R-T1B-CI",
+   "group": "report",
+   "probe": "s3_siblings",
+   "title": "the other Windows CI legs at this commit (windows-build incl. the template hash step, windows-health)",
+   "source": "reports/T1b-report.md:232",
+   "expected": "recorded; a red sibling run is a FAIL of this row",
+   "checks": [
+    {
+     "id": "found",
+     "role": "complete",
+     "fact": "siblings_found",
+     "op": "ge",
+     "value": 1
+    },
+    {
+     "id": "completed",
+     "role": "complete",
+     "fact": "siblings_completed",
+     "op": "true"
+    },
+    {
+     "id": "green",
+     "role": "check",
+     "fact": "siblings_red",
+     "op": "empty"
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "class": "YES"
+  },
+  {
+   "id": "R-T1D-PATHS",
+   "group": "report",
+   "probe": null,
+   "title": "session-start hook paths line via cygpath -w; long paths after the block",
+   "source": "reports/T1d-report.md:81",
+   "why": "the hook's full pane context is not reproduced",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "R-T2-SNAP",
+   "group": "report",
+   "title": "the pre-update snapshot on Windows is built by copying only",
+   "source": "reports/T2-report.md:178; design 4-11 a (line 900); testplan C-p13-02",
+   "expected": "a snapshot with its meta exists after the update; the live pack folder is not renamed by the snapshot step",
+   "subrows": [
+    {
+     "id": "R-T2-SNAP.a",
+     "probe": "s2_update",
+     "title": "a new snapshot with meta.json exists after the update",
+     "checks": [
+      {
+       "id": "new",
+       "role": "check",
+       "fact": "snapshot_new_count",
+       "op": "ge",
+       "value": 1
+      },
+      {
+       "id": "meta",
+       "role": "check",
+       "fact": "snapshot_new_meta_ok",
+       "op": "true"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "R-T2-SNAP.b",
+     "probe": null,
+     "why": "the snapshot step cannot be separated from the staged swap from outside the process",
+     "title": "the snapshot step did not rename the live pack folder",
+     "class": "PARTLY",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "YES",
+   "probe": null
+  },
+  {
+   "id": "R-T2-LF",
+   "group": "report",
+   "probe": null,
+   "title": "LF writers on a real Windows text mode",
+   "source": "reports/T2-report.md:178; design line 865",
+   "why": "only the writers that run on the runner",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "R-T2G-DIRFLUSH",
+   "group": "report",
+   "probe": null,
+   "title": "'durable includes the name' on NTFS (directory flush)",
+   "source": "reports/T2g-report.md; RULINGS EC7",
+   "why": "the product leg is T2g / T2h; the primitive is G09.flush (stage S7)",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "R-T3-SEATLESS",
+   "group": "report",
+   "probe": "s3_cli",
+   "title": "a seatless command line on Windows is refused for cleanup with the app-button sentence",
+   "source": "reports/T3-report.md:174; RULINGS M4; src/bin/cysd/repair.rs WINDOWS_SEATLESS_REFUSAL_KO",
+   "expected": "the refusal sentence; a read verb from the same shell is not refused that way",
+   "checks": [
+    {
+     "id": "sentence-known",
+     "role": "complete",
+     "fact": "seatless_sentence_expected",
+     "op": "nonempty"
+    },
+    {
+     "id": "read-not-refused",
+     "role": "control",
+     "fact": "status_has_sentence",
+     "op": "false",
+     "text": "cys repair status (a read verb, any caller) does not get the sentence"
+    },
+    {
+     "id": "refused",
+     "role": "check",
+     "fact": "cleanup_has_sentence",
+     "op": "true"
+    },
+    {
+     "id": "refused-exit",
+     "role": "check",
+     "fact": "cleanup_exit",
+     "op": "ne",
+     "value": 0
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "class": "YES"
+  },
+  {
+   "id": "R-T3-ALIAS",
+   "group": "report",
+   "phase": 2,
+   "probe": null,
+   "title": "begin refuses Windows aliases (trailing dot / space, ':')",
+   "source": "reports/T3-report.md:235 (AK6)",
+   "why": "needs a worker seat (phase 2)",
+   "kind": "assert",
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "R-T3B-INTAKE",
+   "group": "report",
+   "probe": "s3_intake",
+   "title": "defect intake from a plain shell on Windows",
+   "source": "reports/T3b-report.md:125, :193; RULINGS O2",
+   "expected": "both reports accepted (any caller); the master's queue does not grow per call",
+   "checks": [
+    {
+     "id": "queue-observed",
+     "role": "complete",
+     "fact": "master_queue_before",
+     "op": "not_none"
+    },
+    {
+     "id": "r1",
+     "role": "check",
+     "fact": "report1_exit",
+     "op": "eq",
+     "value": 0
+    },
+    {
+     "id": "r2",
+     "role": "check",
+     "fact": "report2_exit",
+     "op": "eq",
+     "value": 0
+    },
+    {
+     "id": "no-flood",
+     "role": "assumption",
+     "fact": "queue_growth",
+     "op": "le",
+     "value": 1,
+     "assumption": "T3b / AK6 (INFERRED): two identical reports do not queue two lines for the master"
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "class": "YES"
+  },
+  {
+   "id": "R-T3D-IDENT",
+   "group": "report",
+   "needs_units": [
+    "T3d"
+   ],
+   "phase": 2,
+   "probe": null,
+   "title": "a directory's identity is read on Windows; begin notes/a.txt then notes/A.txt with neither existing -> the second refused",
+   "source": "reports/T3d-report.md:38; RULINGS EG1, EG2; EQ5",
+   "why": "T3d is not merged; needs a worker seat",
+   "expected": "the second begin refused with the 'could not be determined / same file' sentence",
+   "kind": "assert",
+   "checks": [],
+   "class": "WAIT"
+  },
+  {
+   "id": "R-T4-CLAIM",
+   "group": "report",
+   "title": "the autonomous-start claim placement with MoveFileExW",
+   "source": "reports/T4-report.md:127",
+   "why": "the claim is placed only after the owner's own typing turns the grant on; machine input cannot arm it by design",
+   "fail_safe": "the primitive is measured by EC2.prim",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "NO",
+   "probe": null
+  },
+  {
+   "id": "R-T5A-NORM",
+   "group": "report",
+   "title": "boot-critical query on a real install: Git Bash paths, case, 8.3 short names",
+   "source": "reports/T5a-report.md:168",
+   "expected": "listed -> 0 (or 2), general -> 1, consistent across spellings",
+   "subrows": [
+    {
+     "id": "R-T5A-NORM.spell",
+     "probe": "s3_query",
+     "title": "backslash, forward slash, upper case",
+     "checks": [
+      {
+       "id": "general-is-1",
+       "role": "control",
+       "fact": "q_general_backslash",
+       "op": "eq",
+       "value": 1
+      },
+      {
+       "id": "bs",
+       "role": "check",
+       "fact": "q_listed_backslash",
+       "op": "eq",
+       "value": 0
+      },
+      {
+       "id": "fs",
+       "role": "check",
+       "fact": "q_listed_slash",
+       "op": "eq",
+       "value": 0
+      },
+      {
+       "id": "upper",
+       "role": "check",
+       "fact": "q_listed_upper",
+       "op": "in",
+       "value": [
+        0,
+        2
+       ]
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "R-T5A-NORM.short",
+     "why": "8.3 names may be disabled on the runner's volume",
+     "probe": "s3_query",
+     "title": "an 8.3 short-name spelling",
+     "checks": [
+      {
+       "id": "short-available",
+       "role": "environment",
+       "fact": "short_name_available",
+       "op": "true",
+       "reason": "8.3 short names are not available on this volume"
+      },
+      {
+       "id": "general-is-1",
+       "role": "control",
+       "fact": "q_general_backslash",
+       "op": "eq",
+       "value": 1
+      },
+      {
+       "id": "short",
+       "role": "check",
+       "fact": "q_listed_short",
+       "op": "in",
+       "value": [
+        0,
+        2
+       ]
+      }
+     ],
+     "class": "PARTLY",
+     "kind": "assert",
+     "phase": 1
+    }
+   ],
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "YES",
+   "probe": null
+  },
+  {
+   "id": "R-T6-TICKSHELL",
+   "group": "report",
+   "needs_units": [
+    "T6"
+   ],
+   "probe": null,
+   "title": "the job's command 'CYS_NO_AUTOSTART=1 cys repair tick' under the Windows scheduler",
+   "source": "reports/T6-report.md:86",
+   "why": "the tick job is T6",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "WAIT"
+  },
+  {
+   "id": "R-T7A-PARITY",
+   "group": "report",
+   "probe": null,
+   "title": "the Windows exec-bit rule vs a manifest emitted by Windows CPython (Python leg of the parity on Windows)",
+   "source": "reports/T7a-report.md:183",
+   "why": "the test may assume POSIX (INFERRED)",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "R-T7A-NOTIFY",
+   "group": "report",
+   "title": "the OS notification when the app exits right after launching the installer",
+   "source": "reports/T7a-report.md:184",
+   "why": "needs the app's update flow (GAPS G2) and an observer of the notification area",
+   "fail_safe": "the pending notice record of T7a (shown at the next start)",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "NO",
+   "probe": null
+  },
+  {
+   "id": "R-T8-DEPT",
+   "group": "report",
+   "phase": 2,
+   "probe": null,
+   "title": "cys-dept promotion / demotion on Windows: os.replace sharing violations, mkdir lock fallback",
+   "source": "reports/T8-report.md:281",
+   "why": "departments on the runner (phase 2); T8b's new lock path not merged",
+   "kind": "assert",
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "R-T8B-LOCK",
+   "group": "report",
+   "probe": null,
+   "title": "msvcrt.locking(LK_NBLCK) exclusion between two processes",
+   "source": "reports/T8b-report.md:39",
+   "why": "the product leg is T8b; the primitive is a later stage",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "R-T8B-AWK",
+   "group": "report",
+   "probe": null,
+   "title": "Git Bash 'LC_ALL=C awk' compares two Hangul titles bytewise",
+   "source": "reports/T8b-report.md:76",
+   "why": "the product filters are in T8b; the primitive is a later stage",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "PARTLY"
+  },
+  {
+   "id": "R-T10-VERDICTDIR",
+   "group": "report",
+   "probe": null,
+   "title": "os.makedirs for a Windows pack path in ensure_verdict_dir",
+   "source": "reports/T10-report.md:155",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "YES"
+  },
+  {
+   "id": "R-GAP-G11",
+   "group": "report",
+   "title": "the user is told nothing when the bundle-edit store cannot be created",
+   "source": "GAPS G11",
+   "why": "the capture is unreachable on a runner (GAPS G2)",
+   "fail_safe": "the stated limit G11",
+   "kind": "assert",
+   "phase": 1,
+   "checks": [],
+   "class": "NO",
+   "probe": null
+  }
+ ]
+}
