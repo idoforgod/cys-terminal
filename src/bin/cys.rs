@@ -28411,7 +28411,7 @@ fn prev_copy(
     }
 }
 
-/// ★T2g(RULINGS CL1): 업데이트가 vendor 우선으로 보관한 파일(원장 vendor-first)의 되돌리기 사실 — 문장이 이 경우에 참인
+/// ★T2g(RULINGS CL1 · CR1): 업데이트가 vendor 우선으로 보관한 파일(원장 vendor-first)의 되돌리기 사실 — 문장이 이 경우에 참인
 /// 것만 말하게 하는 재료. 원장에 vendor-first 기록이 없으면 None.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParkedFacts {
@@ -28438,15 +28438,20 @@ fn parked_facts(
     if e.get("kind").and_then(|k| k.as_str()) != Some("vendor-first") {
         return None;
     }
-    let embed = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| c.as_bytes());
-    let live = std::fs::read(dir.join(rel)).ok();
     Some(ParkedFacts {
         update_ver: e.get("version").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
         prev_ver: prev_ver.to_string(),
         cur_ver: cur_ver.to_string(),
-        live_is_embed: live.is_some() && live.as_deref() == embed,
+        live_is_embed: live_is_embedded(dir, rel),
         parked_present: dir.join(format!("{rel}.user")).is_file(),
     })
+}
+
+/// 살아 있는 파일이 이 바이너리의 내장본(지금의 출시본)과 같은가.
+fn live_is_embedded(dir: &std::path::Path, rel: &str) -> bool {
+    let embed = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| c.as_bytes());
+    let live = std::fs::read(dir.join(rel)).ok();
+    live.is_some() && live.as_deref() == embed
 }
 
 /// ★T2g(RULINGS CL1 · CN2): 보관된 내 수정본을 다시 입히는 길 — 두 경우와 그 조건(`pack::parked_copy_routes`), 그리고 그 뒤의
@@ -28478,20 +28483,23 @@ fn parked_copy_line(rel: &str, p: &ParkedFacts) -> String {
     }
 }
 
-/// ★T2g(RULINGS CL1 (b)): vendor-first 파일인데 되돌리기 원천의 사본이 출시본 바이트가 아닐 때의 거부 문장 — 변조·새 서명
-/// 팩 문장(BV2)이 아니라 이 경우에 참인 것: 이 파일은 지금 그대로 남고(다른 파일을 되돌리면 팩이 섞인다), 내 수정본은
-/// 보관되어 있고, 다시 입히는 길은 수리 흐름이다(RULINGS CN2: 수리로 고친 파일 → `reapply`, 직접 고친 파일 → `begin --trigger update`).
-fn rollback_parked_refusal(rel: &str, source: &str, p: &ParkedFacts) -> String {
+/// ★T2g(RULINGS CL1 (b) · CR1): vendor-first 파일(업데이트가 출시본을 먼저 살리고 내 수정본을 `.user` 에 보관)의 되돌리기 거부
+/// 문장 — 되돌리기는 이런 파일을 **언제나** 거부한다(원천의 사본이 출시본이어도 · 강행이어도): 되돌린 바이트는 그다음 설치에서
+/// 디스크가 설치 기록과도 새 출시본과도 달라 다시 vendor 우선이 되고, `park_user_copy` 가 진짜 내 수정본을 `.user.prev-<시각>`
+/// 으로 밀어내며 되돌린 바이트를 내 사본으로 보관한다(T2g 보고서 STOP 절). 문장은 이 경우에 참인 것: 이 파일만 지금 그대로 남아
+/// 팩이 섞인다는 것, 내 수정본이 있는지, 다시 입히는 두 길(RULINGS CN2).
+fn rollback_parked_refusal(rel: &str, p: &ParkedFacts) -> String {
     let stays = if p.live_is_embed {
-        format!("이 파일은 지금의 출시본({}) 그대로 남습니다", p.cur_ver)
+        format!("새 출시본({})으로", p.cur_ver)
     } else {
-        "이 파일은 지금의 바이트 그대로 남습니다".to_string()
+        "지금의 바이트로".to_string()
     };
     format!(
         "⛔ 되돌리지 않음: '{rel}' 은 기동 필수·보호 목록 파일이고, 업데이트({})가 이 파일의 출시본을 먼저 살리면서 그때 디스크에 \
-         있던 사본(내 수정본)을 {rel}.user 에 보관했습니다. {source}에 있는 이 파일의 사본은 출시본 바이트가 아니고(이 바이너리의 \
-         내장본·과거 출시 해시 표에 없음), 되돌리기는 이 파일에 출시본 바이트만 씁니다 — 아무것도 쓰지 않았습니다.\n\
-         \x20  {stays}: 다른 파일을 팩 {} 으로 되돌려도 이 파일은 되돌려지지 않아, 팩은 {} 의 파일과 이 파일이 섞인 상태가 됩니다.\n\
+         있던 사본(내 수정본)을 {rel}.user 에 보관했습니다. 그 사본이 다시 입혀지기 전에는 되돌리기가 이 파일에 아무것도 쓰지 \
+         않습니다 — 보관본이 출시본이어도, 강행해도(그러면 그다음 설치가 되돌린 바이트를 내 사본으로 잘못 보관합니다). 아무것도 \
+         쓰지 않았습니다.\n\
+         \x20  다른 파일을 팩 {} 으로 되돌리면 이 파일만 {stays} 남아, 팩은 {} 의 파일과 이 파일이 섞인 상태가 됩니다.\n\
          \x20  {} {}",
         p.update_ver,
         p.prev_ver,
@@ -28501,8 +28509,8 @@ fn rollback_parked_refusal(rel: &str, source: &str, p: &ParkedFacts) -> String {
     )
 }
 
-/// ★T2g(RULINGS CL2): 등재 파일(또는 vendor-first 기록 파일)의 원천 사본이 링크일 때의 거부 문장 — 변조·새 서명 팩 문장은
-/// 링크에 참이 아니다(검토자 F4 · F5 (d)).
+/// ★T2g(RULINGS CL2): 등재 파일의 원천 사본이 링크일 때의 거부 문장 — 변조·새 서명 팩 문장은 링크에 참이 아니다(검토자 F4 ·
+/// F5 (d)).
 fn rollback_link_refusal(rel: &str, source: &str, target: &str) -> String {
     format!(
         "⛔ 되돌리지 않음: '{rel}' 은 기동 필수·보호 목록 파일이고, {source}에 있는 이 파일의 사본은 링크(→ {target})라 출시본 \
@@ -28512,43 +28520,35 @@ fn rollback_link_refusal(rel: &str, source: &str, target: &str) -> String {
     )
 }
 
-/// ★T2g(RULINGS CL1 · CL2): 등재 파일(또는 vendor-first 기록 파일)에 원천의 사본을 쓰지 않을 때 이 경우에 참인 거부 문장 —
-/// 출시본 바이트면 None(써도 된다). 링크 → 링크 문장, vendor-first → 보관 문장, 그 밖 → BV2 문장(변조 또는 새 서명 팩).
-fn guarded_rollback_refusal(
-    rel: &str,
-    copy: &GuardedCopy,
-    parked: Option<&ParkedFacts>,
-    source: &str,
-    unknown_what: &str,
-) -> Option<String> {
-    match (copy, parked) {
-        (GuardedCopy::Released, _) => None,
-        (GuardedCopy::Link(t), _) => Some(rollback_link_refusal(rel, source, t)),
-        (GuardedCopy::NotReleased, Some(p)) => Some(rollback_parked_refusal(rel, source, p)),
-        (GuardedCopy::NotReleased, None) => Some(cys::pack::unknown_release_refusal(rel, unknown_what)),
+/// ★T2g(RULINGS CL2): vendor-first 기록이 없는 등재 파일에 원천의 사본을 쓰지 않을 때 이 경우에 참인 거부 문장 — 출시본 바이트면
+/// None(써도 된다 — T2f 규칙 그대로). 링크 → 링크 문장, 그 밖 → BV2 문장(변조 또는 새 서명 팩).
+fn guarded_rollback_refusal(rel: &str, copy: &GuardedCopy, source: &str, unknown_what: &str) -> Option<String> {
+    match copy {
+        GuardedCopy::Released => None,
+        GuardedCopy::Link(t) => Some(rollback_link_refusal(rel, source, t)),
+        GuardedCopy::NotReleased => Some(cys::pack::unknown_release_refusal(rel, unknown_what)),
     }
 }
 
-/// ★T2g(RULINGS CL1 (a) · CL2): 등재 파일(또는 vendor-first 기록 파일)을 출시본 바이트로 되돌린 뒤의 문장 — 그 파일에서 거부되는
-/// 동사를 권하지 않는다(`pack-heal` 은 system 파일에서만 · 병합 문장 없음 — 이 목록의 파일은 업데이트가 병합하지 않는다).
-fn rollback_guarded_restored(rel: &str, source: &str, parked: Option<&ParkedFacts>, system: bool) -> String {
+/// ★T2g(RULINGS CL2): 등재 파일을 출시본 바이트로 되돌린 뒤의 문장 — 그 파일에서 거부되는 동사를 권하지 않는다(`pack-heal` 은
+/// system 파일에서만 · 병합 문장 없음 — 이 목록의 파일은 업데이트가 병합하지 않는다).
+fn rollback_guarded_restored(rel: &str, source: &str, system: bool) -> String {
     let head = format!("✅ {rel} 복원({source}의 출시본 바이트 · 기동 필수·보호 목록 파일).");
-    match parked {
-        Some(p) if p.parked_present => format!("{head} {} {}", parked_copy_line(rel, p), parked_reapply_way(rel)),
-        Some(p) => format!("{head} {}", parked_copy_line(rel, p)),
-        None if system => format!(
+    if system {
+        format!(
             "{head} 이 바이너리의 내장본으로 돌아가는 길은 cys pack-heal {rel} 이고, 그 밖의 변경은 수리 흐름입니다: 워커가 \
              `cys repair begin --files {rel} --trigger …` → 예행·검사 → 주인 승인."
-        ),
-        None => format!(
+        )
+    } else {
+        format!(
             "{head} 이 파일을 바꾸는 길은 수리 흐름입니다: 워커가 `cys repair begin --files {rel} --trigger …` → 예행·검사 → 주인 승인."
-        ),
+        )
     }
 }
 
-/// 스냅샷 보관본이 기록(해시 · 링크 대상)과 다를 때 거부 문장의 끝 줄. ★T2g(RULINGS CL2): 기동 필수·보호 목록 파일(또는
-/// vendor-first 기록 파일)이면 `--force-vendor` 를 권하지 않는다 — 이 파일에는 강행이 없다(RULINGS BO2 (b)). 윈도우에서는
-/// 스냅샷이 링크를 보관하지 못해(링크를 만들지 않는다) 링크 항목이 언제나 이 갈래로 온다.
+/// 스냅샷 보관본이 기록(해시 · 링크 대상)과 다를 때 거부 문장의 끝 줄. ★T2g(RULINGS CL2): 기동 필수·보호 목록 파일이면
+/// `--force-vendor` 를 권하지 않는다 — 이 파일에는 강행이 없다(RULINGS BO2 (b)). 윈도우에서는 스냅샷이 링크를 보관하지 못해
+/// (링크를 만들지 않는다) 링크 항목이 언제나 이 갈래로 온다.
 fn snapshot_mismatch_how(system: bool, guarded: bool) -> &'static str {
     if guarded {
         "기동 필수·보호 목록 파일은 기록과 다른 보관본을 쓰지 않습니다(강행 없음 — 검증된 되돌리기)."
@@ -28559,29 +28559,33 @@ fn snapshot_mismatch_how(system: bool, guarded: bool) -> &'static str {
     }
 }
 
-/// ★T2g(RULINGS CL1 (c)): 목록(파일을 고르기 전)이 미리 밝히는 표시 — 등재 파일(또는 vendor-first 기록 파일)의 줄 끝.
-fn rollback_list_note(rel: &str, copy: &GuardedCopy, vendor_first: bool) -> String {
-    match (copy, vendor_first) {
-        (GuardedCopy::Released, true) => format!(
-            " — 기동 필수·보호 목록 파일 · 보관본은 출시본 바이트(되돌릴 수 있음) · 업데이트가 보관한 내 수정본 {rel}.user 은 그대로 둠"
-        ),
-        (GuardedCopy::Released, false) => String::new(),
-        (GuardedCopy::Link(t), _) => format!(" — 되돌리지 않음: 기동 필수·보호 목록 파일 · 보관본이 링크(→ {t})"),
-        (GuardedCopy::NotReleased, true) => format!(
-            " — 되돌리지 않음: 업데이트가 출시본을 먼저 살리고 내 수정본을 {rel}.user 에 보관한 기동 필수·보호 목록 파일 · \
-             보관본이 출시본 바이트가 아님 · 이 파일은 지금 그대로 남음"
-        ),
-        (GuardedCopy::NotReleased, false) => " — 출시본 아님(되돌리기 불가)".to_string(),
+/// ★T2g(RULINGS CL1 (c) · CR1): 목록(파일을 고르기 전)이 미리 밝히는 vendor-first 파일의 표시 — 되돌리기는 이 파일을 언제나
+/// 거부하므로(사본이 무엇이든) 결과를 그대로 말한다: 다른 파일을 되돌리면 이 파일만 남는다.
+fn parked_list_note(rel: &str, live_is_embed: bool) -> String {
+    let stays = if live_is_embed { "새 출시본으로" } else { "지금의 바이트로" };
+    format!(
+        " — 되돌리지 않음: 업데이트가 출시본을 먼저 살리고 내 수정본을 {rel}.user 에 보관한 기동 필수·보호 목록 파일 · 다른 파일을 \
+         되돌리면 이 파일만 {stays} 남음"
+    )
+}
+
+/// ★T2g(RULINGS CL2): 목록이 미리 밝히는 등재 파일(vendor-first 기록 없음)의 표시 — `--file` 과 같은 판정.
+fn rollback_list_note(copy: &GuardedCopy) -> String {
+    match copy {
+        GuardedCopy::Released => String::new(),
+        GuardedCopy::Link(t) => format!(" — 되돌리지 않음: 기동 필수·보호 목록 파일 · 보관본이 링크(→ {t})"),
+        GuardedCopy::NotReleased => " — 출시본 아님(되돌리기 불가)".to_string(),
     }
 }
 
-/// ★T2g(RULINGS CL1 (c)): 되돌릴 출시본 사본이 없는 vendor-first 파일이 하나라도 있으면 목록 끝에 — 다른 파일을 되돌리면
-/// 팩이 섞인다는 것을 무엇이든 되돌리기 **전에** 말한다.
-fn rollback_mixed_warning(stuck: &[String], prev_ver: &str, source: &str) -> String {
+/// ★T2g(RULINGS CL1 (c) · CR1): vendor-first 파일이 하나라도 있으면 목록 끝에 — 다른 파일을 되돌리면 그 파일들만 남아 팩이
+/// 섞인다는 것을 무엇이든 되돌리기 **전에** 말한다(되돌리기 거부 문장도 같은 결과를 다시 말한다).
+fn rollback_mixed_warning(stuck: &[String], prev_ver: &str) -> String {
     format!(
         "⚠ 되돌리지 않는 기동 필수·보호 목록 파일 {}건: {} — 업데이트가 이 파일들의 출시본을 먼저 살리고 내 수정본을 <파일>.user 에 \
-         보관했고, {source}에는 이 파일들의 출시본 바이트가 없습니다. 다른 파일을 팩 {prev_ver} 으로 되돌려도 이 파일들은 지금 그대로 \
-         남아, 팩은 {prev_ver} 의 파일과 이 파일들이 섞인 상태가 됩니다. {}",
+         보관했고, 그 사본이 다시 입혀지기 전에는 되돌리기가 이 파일들에 아무것도 쓰지 않습니다. 다른 파일을 팩 {prev_ver} 으로 \
+         되돌리면 이 파일들만 업데이트 뒤의 바이트(새 출시본, 또는 그 뒤에 손으로 고친 바이트)로 남아, 팩은 {prev_ver} 의 파일과 이 \
+         파일들이 섞인 상태가 됩니다. {}",
         stuck.len(),
         stuck.join(", "),
         parked_reapply_way("<파일>")
@@ -28589,7 +28593,7 @@ fn rollback_mixed_warning(stuck: &[String], prev_ver: &str, source: &str) -> Str
 }
 
 /// ★0.15.0 M11 아 · T2g(RULINGS CL1 (c)): 스냅샷 목록 모드의 줄들 — 기록된 상태와 현재 팩이 다른 파일(복원 후보, 최대 200줄)과
-/// 그 줄의 표시, 안내 한 줄, 그리고 되돌릴 출시본 사본이 없는 vendor-first 파일의 경고. 읽기 전용.
+/// 그 줄의 표시, 안내 한 줄, 그리고 vendor-first 파일의 경고. 읽기 전용.
 fn snapshot_listing_lines(
     dir: &std::path::Path,
     snap: &std::path::Path,
@@ -28612,14 +28616,13 @@ fn snapshot_listing_lines(
         }
         let own = cys::pack::ownership_name_scoped(&f.rel, dir);
         let vendor_first = pending.get(&f.rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str()) == Some("vendor-first");
-        // ★RULINGS AC1: system 파일은 출시본 바이트일 때만 되돌린다 — 아닌 항목은 목록에서 미리 밝힌다. ★T2g: 등재 파일·vendor-first
-        // 파일은 `--file` 과 같은 판정(다시 잰 출시본 · 링크 아님)으로 밝힌다.
-        let note = if vendor_first || sources.is_listed(&f.rel) {
-            let copy = snapshot_copy(dir, snap, f, sources);
-            if vendor_first && copy != GuardedCopy::Released {
-                stuck.push(f.rel.clone());
-            }
-            rollback_list_note(&f.rel, &copy, vendor_first)
+        // ★RULINGS AC1: system 파일은 출시본 바이트일 때만 되돌린다 — 아닌 항목은 목록에서 미리 밝힌다. ★T2g: vendor-first 파일은
+        // 언제나 되돌리지 않고(CR1), 등재 파일은 `--file` 과 같은 판정(다시 잰 출시본 · 링크 아님)으로 밝힌다.
+        let note = if vendor_first {
+            stuck.push(f.rel.clone());
+            parked_list_note(&f.rel, live_is_embedded(dir, &f.rel))
+        } else if sources.is_listed(&f.rel) {
+            rollback_list_note(&snapshot_copy(dir, snap, f, sources))
         } else if own == "system" && !f.released {
             " — 출시본 아님(되돌리기 불가)".to_string()
         } else {
@@ -28643,13 +28646,13 @@ fn snapshot_listing_lines(
         );
     }
     if !stuck.is_empty() {
-        out.push(rollback_mixed_warning(&stuck, prev_ver, "이 스냅샷"));
+        out.push(rollback_mixed_warning(&stuck, prev_ver));
     }
     out
 }
 
-/// ★T2g(RULINGS CL1 (c)): pack.prev 목록의 한 줄 표시 — 등재 파일·vendor-first 파일만(그 밖은 빈 표시 = 지금 동작). 둘째 값 =
-/// 되돌릴 출시본 사본이 없는 vendor-first 파일인가(경고 대상).
+/// ★T2g(RULINGS CL1 (c) · CR1): pack.prev 목록의 한 줄 표시 — vendor-first 파일 · 등재 파일만(그 밖은 빈 표시 = 지금 동작).
+/// 둘째 값 = vendor-first 파일인가(경고 대상).
 fn prev_listing_note(
     dir: &std::path::Path,
     prev: &std::path::Path,
@@ -28657,8 +28660,10 @@ fn prev_listing_note(
     sources: &cys::pack::UpdateSources,
     pending: &serde_json::Map<String, serde_json::Value>,
 ) -> (String, bool) {
-    let vendor_first = pending.get(rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str()) == Some("vendor-first");
-    if !vendor_first && !sources.is_listed(rel) {
+    if pending.get(rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str()) == Some("vendor-first") {
+        return (parked_list_note(rel, live_is_embedded(dir, rel)), true);
+    }
+    if !sources.is_listed(rel) {
         return (String::new(), false);
     }
     let src = prev.join(rel);
@@ -28669,8 +28674,7 @@ fn prev_listing_note(
             Err(_) => GuardedCopy::NotReleased,
         },
     };
-    let stuck = vendor_first && copy != GuardedCopy::Released;
-    (rollback_list_note(rel, &copy, vendor_first), stuck)
+    (rollback_list_note(&copy), false)
 }
 
 /// [`run_pack_rollback`] 의 입력원 주입판 — 기동 필수 질의·과거 출시 해시 표(RULINGS AJ2)를 입력원에서 읽는다.
@@ -28777,7 +28781,7 @@ fn run_pack_rollback_with(
         }
         if !stuck.is_empty() {
             stuck.sort();
-            println!("{}", rollback_mixed_warning(&stuck, prev_ver.trim(), "pack.prev"));
+            println!("{}", rollback_mixed_warning(&stuck, prev_ver.trim()));
         }
         return 0;
     };
@@ -28810,13 +28814,16 @@ fn run_pack_rollback_with(
         }
         return 1;
     }
-    // ★RULINGS AC1(규칙 나 · 부록 A-2 #12) → T2g(RULINGS CL1 이 좁혔다): vendor-first 기록이 있는 파일(업데이트가 출시본을
-    // 먼저 살리고 내 수정본을 `.user` 에 보관)에 되돌리기는 **출시본 바이트만** 쓴다 — 보관본이 스냅샷이든 pack.prev 든,
-    // --force-vendor 여도 그 밖의 바이트는 거부한다(링크도). 원천의 사본이 출시본이면 그것을 되돌리고 보관된 내 수정본은
-    // 그대로 둔다(CL1 (a)); 아니면 이 경우에 참인 문장으로 거부한다(CL1 (b)). 내 수정본을 다시 입히는 길은 언제나 수리 흐름
-    // (수리로 고친 파일 → 워커 `cys repair reapply`, 직접 고친 파일 → `cys repair begin --trigger update` · 주인 최종 승인 —
-    // RULINGS CN2)이다 — 되돌리기는 규칙 나를 돌아가는 길이 아니다.
-    let parked = parked_facts(&dir, &rel, &pending, prev_ver.trim(), cur_ver.trim());
+    // ★RULINGS AC1(규칙 나 · 부록 A-2 #12) · T2g(RULINGS CR1 — CL1 (a) 철회): vendor-first 기록이 있는 파일(업데이트가 출시본을
+    // 먼저 살리고 내 수정본을 `.user` 에 보관)은 되돌리기가 **언제나** 거부한다 — 원천이 스냅샷이든 pack.prev 든, 그 사본이
+    // 출시본이어도, --force-vendor 여도. 되돌린 바이트는 그다음 설치에서 다시 vendor 우선이 되어 진짜 내 수정본을
+    // `.user.prev-<시각>` 으로 밀어내고 자기가 내 사본 자리에 앉는다(T2g 보고서 STOP 절). 문장은 이 경우에 참인 것(CL1 (b)):
+    // 다른 파일을 되돌리면 이 파일만 남아 팩이 섞인다 · 내 수정본은 보관되어 있다 · 다시 입히는 두 길(RULINGS CN2) — 되돌리기는
+    // 규칙 나를 돌아가는 길이 아니다.
+    if let Some(p) = parked_facts(&dir, &rel, &pending, prev_ver.trim(), cur_ver.trim()) {
+        eprintln!("{}", rollback_parked_refusal(&rel, &p));
+        return 1;
+    }
     // ★0.15.0 M11 아: 스냅샷에 이 파일이 있으면 스냅샷이 원천이다 — 기록 해시(링크면 링크 대상)로 검증한 뒤에만
     // 쓴다(복원 계약). 어긋나면 거부(user 파일만 --force-vendor 로 강행 — M4 와 같은 규칙). 링크는 링크로 되살린다.
     // ★RULINGS AC1: system 파일은 그 항목이 **출시본**(바꾸기 전 설치 기록 또는 과거 출시 해시 표와 같은 바이트)일 때만
@@ -28841,8 +28848,8 @@ fn run_pack_rollback_with(
     // ★T2f(RULINGS BD4): 되돌리기의 단일 술어 호출 지점 — 두 원천(스냅샷 · pack.prev) 모두에서, 기동 필수·보호 목록에
     // 있는 파일은 출시본 바이트만 되돌린다(--force-vendor 로도 예외 없음 · 링크는 출시본이 아니다).
     let listed = sources.is_listed(&rel);
-    // ★T2g(RULINGS CL1): vendor-first 기록이 있으면 목록이 바뀌었어도 등재 파일과 같이 다룬다(출시본만 — 보수 방향).
-    let guarded = listed || parked.is_some();
+    // (vendor-first 기록이 있는 파일은 위에서 이미 거부했다 — 여기의 '지키는 파일'은 등재 파일이다.)
+    let guarded = listed;
     let snap_source = format!("업데이트 전 스냅샷(팩 {})", prev_ver.trim());
     let content: Vec<u8> = if let Some((sp, f)) = &snap_entry {
         let verified = cys::pack::verify_snapshot_entry(sp, f);
@@ -28851,7 +28858,7 @@ fn run_pack_rollback_with(
         if let (true, Ok(bytes)) = (guarded, &verified) {
             let copy = verified_copy(&dir, &rel, f.link_target.as_deref(), bytes, sources);
             if let Some(refusal) =
-                guarded_rollback_refusal(&rel, &copy, parked.as_ref(), &snap_source, "업데이트 전 스냅샷의 보관본")
+                guarded_rollback_refusal(&rel, &copy, &snap_source, "업데이트 전 스냅샷의 보관본")
             {
                 eprintln!("{refusal}");
                 return 1;
@@ -28930,7 +28937,7 @@ fn run_pack_rollback_with(
         if guarded {
             let copy = prev_copy(&dir, &rel, &src, &c, sources);
             let prev_source = format!("pack.prev(팩 {})", prev_ver.trim());
-            if let Some(refusal) = guarded_rollback_refusal(&rel, &copy, parked.as_ref(), &prev_source, "pack.prev 의 보관본") {
+            if let Some(refusal) = guarded_rollback_refusal(&rel, &copy, &prev_source, "pack.prev 의 보관본") {
                 eprintln!("{refusal}");
                 return 1;
             }
@@ -29048,16 +29055,11 @@ fn run_pack_rollback_with(
             eprintln!("⚠ 감사 원장 기록 실패(복원은 완료): {e}");
         }
     }
-    // ★T2g(RULINGS CL1 (a) · CL2): 등재 파일·vendor-first 파일은 그 파일에 참인 문장 — 거부되는 동사를 권하지 않는다.
+    // ★T2g(RULINGS CL2): 등재 파일은 그 파일에 참인 문장 — 거부되는 동사를 권하지 않는다.
     if guarded {
         println!(
             "{}",
-            rollback_guarded_restored(
-                &rel,
-                &format!("{source_name}(팩 {})", prev_ver.trim()),
-                parked.as_ref(),
-                own == "system"
-            )
+            rollback_guarded_restored(&rel, &format!("{source_name}(팩 {})", prev_ver.trim()), own == "system")
         );
         return 0;
     }
@@ -41944,8 +41946,8 @@ mod tests {
 
     /// ★0.15.0 M11 아 + RULINGS AC1: pack-rollback 은 이 레인의 업데이트 전 스냅샷이 있으면 그것을 원천으로 쓰고, 기록 해시로
     /// 검증한 뒤에만 쓴다. system 파일은 그 항목이 **출시본**일 때만 되돌린다(부록 A-2 #12 — 사용자 수정본은 강행으로도
-    /// 거부), vendor-first 기록이 있는 파일은 이 바이너리가 출시본으로 아는 사본만 되돌린다(규칙 나 — 다시 입히기는 수리 흐름 ·
-    /// ★T2g: RULINGS CL1 이 '언제나 거부'를 좁혔다). user 파일은 종전대로.
+    /// 거부), vendor-first 기록이 있는 파일은 언제나 거부한다(규칙 나 — 다시 입히기는 수리 흐름 · ★T2g: RULINGS CR1 이 CL1 (a) 를
+    /// 거두어 다시 '언제나'다 — 출시본 사본이 있어도). user 파일은 종전대로.
     /// ★r2 재작성(종전: system 보관본을 출시본 여부 없이 복원 — reviewer1 BLOCKING · 스냅샷 생성 함수의 인자도 바뀌었다).
     #[test]
     fn m11_pack_rollback_restores_from_update_snapshot_with_verification() {
@@ -42010,8 +42012,8 @@ mod tests {
         assert_eq!(run_pack_rollback(Some(rel.clone()), true, false, false), 1, "출시본 아님 → 거부");
         assert_eq!(run_pack_rollback(Some(rel.clone()), true, true, false), 1, "--force-vendor 로도 거부");
         assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed, "수정본을 되살리지 않았다");
-        // ★AC1 핀(★T2g: RULINGS CL1 이 좁혔다): vendor-first 기록 → 이 바이너리가 출시본으로 모르는 보관본이면(색인이 출시본이라고
-        //   해도) --force-vendor 여도 거부(규칙 나). 출시본 사본을 되돌리는 갈래는 `t2g_vendor_first_rollback_*` 가 잰다.
+        // ★AC1 핀(★T2g: RULINGS CR1): vendor-first 기록 → 보관본이 무엇이든 --force-vendor 여도 거부(규칙 나). 출시본 사본이
+        //   있어도 거부하는 갈래는 `t2g_vendor_first_rollback_is_refused_*` 가 잰다.
         std::fs::write(td.join(&rel), old).unwrap();
         let _snap3 = cys::pack::create_update_snapshot(
             &td, &root, "base", "0.14.58", &m, &[rel.clone()], cys::pack::PackScope::Base, &none, caps,
@@ -42019,7 +42021,7 @@ mod tests {
         .unwrap();
         std::fs::write(td.join(&rel), &embed).unwrap();
         t4_write_ledger(&td, &rel, serde_json::json!({"kind": "vendor-first", "side": format!("{rel}.user"), "version": "x", "ts": 0}));
-        assert_eq!(run_pack_rollback(Some(rel.clone()), true, true, false), 1, "vendor-first · 출시본 아닌 보관본 → 거부");
+        assert_eq!(run_pack_rollback(Some(rel.clone()), true, true, false), 1, "vendor-first → 언제나 거부");
         assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed);
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
     }
@@ -42669,13 +42671,13 @@ mod tests {
             .expect("an unlisted system pack file")
     }
 
-    /// ★T2g(RULINGS CL1 (a) · (b)): vendor-first 파일(업데이트가 출시본을 먼저 살리고 내 수정본을 `.user` 에 보관)의 되돌리기 —
-    /// 원천의 사본이 **출시본**이면(이 바이너리의 표가 아는 바이트 — 그 뒤 업데이트가 손대지 않은 파일을 바꿀 때 스냅샷에 남는
-    /// 사본) 그것을 되돌리고 보관된 내 수정본과 원장 기록은 그대로 둔다(a). 원천의 사본이 출시본이 아니면(그 업데이트의 스냅샷 =
-    /// 내 수정본) --force-vendor 여도 거부하고 아무것도 쓰지 않는다(b) — 두 원천(스냅샷 · pack.prev) 모두. 실제 술어(이음새 없음)와
-    /// 과거 출시 표의 이음새(출시본 바이트를 시험이 만들 수 있게)로 잰다.
+    /// ★T2g(RULINGS CR1 · CR2 (ii)): vendor-first 파일(업데이트가 출시본을 먼저 살리고 내 수정본을 `.user` 에 보관)의 되돌리기는
+    /// **두 원천 모두에서, 출시본 사본이 있어도** 거부되고 아무것도 쓰지 않는다 — 스냅샷의 사본이 출시본(색인 · 다시 잰 판정
+    /// 둘 다)일 때 그대로 · 강행, 출시본이 아닐 때, pack.prev 의 출시본 사본(보존본 매니페스트도 맞음) · 아닌 사본. `.user` 와
+    /// 원장 기록은 그대로다. 대조군: 같은 출시본 사본 · vendor-first 기록 없는 등재 파일은 되돌아간다(T2f 규칙 그대로). 실제
+    /// 술어(이음새 없음)와 과거 출시 표의 이음새(출시본 바이트를 시험이 만들 수 있게)로 잰다.
     #[test]
-    fn t2g_vendor_first_rollback_restores_a_released_copy_and_keeps_the_parked_copy() {
+    fn t2g_vendor_first_rollback_is_refused_from_both_sources_even_for_a_released_copy() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (td, _sys, _embed, _env) = t4_system_fixture("t2gvf");
         let (rel, embed) = t2g_listed_system_row(&td);
@@ -42694,33 +42696,45 @@ mod tests {
         let l1 = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
         let mut m = std::collections::BTreeMap::new();
         m.insert(rel.clone(), cys::pack::content_hash_pub(old));
-        // (a) 스냅샷의 사본 = 출시본(그 업데이트가 바꾼 것은 손대지 않은 이 파일의 이전 출시본이다).
+        let ledger = || {
+            t4_write_ledger(&td, &rel, serde_json::json!({"kind": "vendor-first", "side": format!("{rel}.user"), "version": "0.14.50", "ts": 0}))
+        };
+        let untouched = |what: &str| {
+            assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed, "{what}: 새 출시본 그대로");
+            assert_eq!(std::fs::read_to_string(td.join(format!("{rel}.user"))).unwrap(), edit, "{what}: 보관본 그대로");
+            assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("vendor-first"), "{what}: 기록 그대로");
+        };
+        // 스냅샷의 사본 = 출시본(그 뒤의 업데이트가 손대지 않은 이 파일의 이전 출시본 — 색인 · 다시 잰 판정 둘 다 출시본).
         std::fs::write(td.join(&rel), old).unwrap();
-        let _s1 = cys::pack::create_update_snapshot(
+        let s1 = cys::pack::create_update_snapshot(
             &td, &local.join("update-snapshots"), "base", "0.14.56", &m, &[rel.clone()], cys::pack::PackScope::Base, &none_fn, caps,
         )
         .unwrap();
         std::fs::write(td.join(&rel), &embed).unwrap();
         std::fs::write(td.join(format!("{rel}.user")), edit).unwrap();
-        t4_write_ledger(&td, &rel, serde_json::json!({"kind": "vendor-first", "side": format!("{rel}.user"), "version": "0.14.50", "ts": 0}));
-        assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, false, false, &src), 0, "(a) 출시본 사본은 되돌린다");
-        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), old, "이전 출시본 바이트");
-        assert_eq!(std::fs::read_to_string(td.join(format!("{rel}.user"))).unwrap(), edit, "보관된 내 수정본은 그대로");
-        assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("vendor-first"), "다시 입히기 기록은 그대로(수리 흐름)");
-        // (b) 그 업데이트의 스냅샷 = 내 수정본(출시본 아님) → 거부, 강행도 거부, 아무것도 쓰지 않는다.
+        ledger();
+        let meta1 = cys::pack::read_update_snapshot_meta(&s1.path).unwrap();
+        assert!(meta1.files[0].released, "색인 = 출시본");
+        assert_eq!(snapshot_copy(&td, &s1.path, &meta1.files[0], &src), GuardedCopy::Released, "다시 잰 판정 = 출시본");
+        assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, false, false, &src), 1, "출시본 사본이어도 거부");
+        assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, true, false, &src), 1, "강행도 거부");
+        untouched("snapshot · released");
+        // 대조군: 같은 스냅샷 · vendor-first 기록 없음 → 등재 파일의 출시본 사본은 되돌아간다(T2f — 그대로).
+        t4_write_ledger(&td, "other.sh", serde_json::json!({"kind": "kept-drift", "side": "other.sh", "version": "x", "ts": 0}));
+        assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, false, false, &src), 0, "기록 없는 등재 파일 → 출시본 되돌림");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), old);
+        std::fs::write(td.join(&rel), &embed).unwrap();
+        ledger();
+        // 스냅샷의 사본 = 내 수정본(그 업데이트의 스냅샷) → 거부.
         std::fs::write(td.join(&rel), edit).unwrap();
-        let s2 = cys::pack::create_update_snapshot(
+        let _s2 = cys::pack::create_update_snapshot(
             &td, &local.join("update-snapshots"), "base", "0.14.57", &m, &[rel.clone()], cys::pack::PackScope::Base, &none_fn, caps,
         )
         .unwrap();
         std::fs::write(td.join(&rel), &embed).unwrap();
-        assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, false, false, &src), 1, "(b) 출시본 아닌 사본 → 거부");
-        assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, true, false, &src), 1, "(b) 강행도 거부");
-        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed, "새 출시본 그대로");
-        // 거부 문장 = 이 경우에 참인 문장(BV2 의 '변조 · 새 서명 팩' 문장이 아니다).
-        let meta2 = cys::pack::read_update_snapshot_meta(&s2.path).unwrap();
-        let copy = snapshot_copy(&td, &s2.path, &meta2.files[0], &src);
-        assert_eq!(copy, GuardedCopy::NotReleased);
+        assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, true, false, &src), 1, "출시본 아닌 사본 → 거부");
+        untouched("snapshot · not released");
+        // 거부 문장 = 이 경우에 참인 문장(RULINGS CL1 (b) · CR1 · CN2).
         let parked = parked_facts(&td, &rel, &cys::pack::load_merge_pending(&td), "0.14.57", "0.15.0").expect("vendor-first");
         assert_eq!(
             parked,
@@ -42732,31 +42746,29 @@ mod tests {
                 parked_present: true
             }
         );
-        let src_name = "업데이트 전 스냅샷(팩 0.14.57)";
-        let refusal = guarded_rollback_refusal(&rel, &copy, Some(&parked), src_name, "업데이트 전 스냅샷의 보관본").unwrap();
-        assert_eq!(refusal, rollback_parked_refusal(&rel, src_name, &parked));
-        assert!(!refusal.contains("변조") && refusal.contains("cys repair reapply"), "{refusal}");
-        // pack.prev 원천(이 레인에 스냅샷 없음): 출시본 아닌 사본 → 거부 · 출시본 사본 → 되돌림.
+        let refusal = rollback_parked_refusal(&rel, &parked);
+        assert!(!refusal.contains("변조") && refusal.contains("--trigger update") && refusal.contains("섞인 상태"), "{refusal}");
+        // pack.prev 원천(이 레인에 스냅샷 없음): 출시본 사본(보존본 매니페스트도 맞음) · 아닌 사본 — 둘 다 거부.
         drop(l1);
         let _l2 = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", td.parent().unwrap().join("local-empty"));
         let prev = cys::pack::pack_prev_dir(&td);
         std::fs::create_dir_all(prev.join(&rel).parent().unwrap()).unwrap();
         std::fs::write(prev.join(".pack-version"), "0.14.56\n").unwrap();
-        std::fs::write(prev.join(&rel), edit).unwrap();
-        assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, true, false, &src), 1, "pack.prev (b)");
-        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed);
-        assert_eq!(prev_copy(&td, &rel, &prev.join(&rel), edit.as_bytes(), &src), GuardedCopy::NotReleased);
         std::fs::write(prev.join(&rel), old).unwrap();
         std::fs::write(prev.join(cys::pack::INSTALL_MANIFEST), serde_json::to_string(&m).unwrap()).unwrap();
-        assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, false, false, &src), 0, "pack.prev (a)");
-        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), old);
-        assert_eq!(std::fs::read_to_string(td.join(format!("{rel}.user"))).unwrap(), edit);
+        assert_eq!(prev_copy(&td, &rel, &prev.join(&rel), old.as_bytes(), &src), GuardedCopy::Released);
+        assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, false, false, &src), 1, "pack.prev · 출시본 사본 → 거부");
+        assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, true, false, &src), 1, "pack.prev · 강행 → 거부");
+        untouched("pack.prev · released");
+        std::fs::write(prev.join(&rel), edit).unwrap();
+        assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, true, false, &src), 1, "pack.prev · 출시본 아닌 사본 → 거부");
+        untouched("pack.prev · not released");
         let _ = std::fs::remove_dir_all(&prev);
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
     }
 
-    /// ★T2g(RULINGS CL1 (c)): 목록(무엇이든 되돌리기 **전**)이 되돌릴 출시본 사본이 없는 vendor-first 파일을 그 줄에 표시하고,
-    /// 다른 파일을 되돌리면 그 파일만 지금 그대로 남아 팩이 섞인다고 경고한다 — 다른 파일을 되돌린 뒤에도 같은 경고. 실제 술어 ·
+    /// ★T2g(RULINGS CL1 (c) · CR1): 목록(무엇이든 되돌리기 **전**)이 vendor-first 파일(되돌리기가 언제나 거부)을 그 줄에 표시하고,
+    /// 다른 파일을 되돌리면 그 파일만 새 출시본으로 남아 팩이 섞인다고 경고한다 — 다른 파일을 되돌린 뒤에도 같은 경고. 실제 술어 ·
     /// 실제 과거 출시 표(이음새 없음). pack.prev 목록의 표시도 같은 판정이다.
     #[test]
     fn t2g_listing_marks_a_vendor_first_file_before_anything_is_restored() {
@@ -42793,8 +42805,8 @@ mod tests {
         let pending = cys::pack::load_merge_pending(&td);
         let footer = "복원: cys pack-rollback --file <경로> (스냅샷의 기록 해시로 검증한 뒤에만 씁니다 · system 파일은 출시본일 때만 · \
                       기동 필수 vendor 우선 보관 파일은 수리 흐름으로만)";
-        let vf_line = format!("  [system] {vf}{}", rollback_list_note(&vf, &GuardedCopy::NotReleased, true));
-        let warning = rollback_mixed_warning(std::slice::from_ref(&vf), "0.14.56", "이 스냅샷");
+        let vf_line = format!("  [system] {vf}{}", parked_list_note(&vf, true));
+        let warning = rollback_mixed_warning(std::slice::from_ref(&vf), "0.14.56");
         assert_eq!(
             snapshot_listing_lines(&td, &snap.path, &meta, "0.14.56", &none, &pending),
             vec![vf_line.clone(), format!("  [system] {other}"), footer.to_string(), warning.clone()],
@@ -42813,10 +42825,7 @@ mod tests {
         let prev = cys::pack::pack_prev_dir(&td);
         std::fs::create_dir_all(prev.join(&vf).parent().unwrap()).unwrap();
         std::fs::write(prev.join(&vf), edit).unwrap();
-        assert_eq!(
-            prev_listing_note(&td, &prev, &vf, &none, &pending),
-            (rollback_list_note(&vf, &GuardedCopy::NotReleased, true), true)
-        );
+        assert_eq!(prev_listing_note(&td, &prev, &vf, &none, &pending), (parked_list_note(&vf, true), true));
         assert_eq!(prev_listing_note(&td, &prev, &other, &none, &pending), (String::new(), false), "등재 아님 → 지금 동작");
         let _ = std::fs::remove_dir_all(&prev);
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
@@ -42860,7 +42869,7 @@ mod tests {
         let copy = snapshot_copy(&td, &snap.path, &meta.files[0], &none);
         assert_eq!(copy, GuardedCopy::Link(dot_s.clone()));
         let src_name = "업데이트 전 스냅샷(팩 0.14.56)";
-        let refusal = guarded_rollback_refusal(rel, &copy, None, src_name, "업데이트 전 스냅샷의 보관본").unwrap();
+        let refusal = guarded_rollback_refusal(rel, &copy, src_name, "업데이트 전 스냅샷의 보관본").unwrap();
         assert_eq!(refusal, rollback_link_refusal(rel, src_name, &dot_s));
         assert!(!refusal.contains("변조") && refusal.contains("링크"), "{refusal}");
         let own = cys::pack::ownership_name_scoped(rel, &td);
@@ -42932,7 +42941,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
     }
 
-    /// ★T2g: 새 문장은 글자 그대로 핀이다 — 되돌리기(CL1 (a)(b)(c) · CL2 링크) · 기동 필수·보호 목록 파일의 안내(CL2: 그 파일에서
+    /// ★T2g: 새 문장은 글자 그대로 핀이다 — 되돌리기(CL1 (b)(c) · CR1 · CL2 링크) · 기동 필수·보호 목록 파일의 안내(CL2: 그 파일에서
     /// 거부되는 동사 `pack-adopt` · `--revert-merge` · `--ai` 를 권하지 않고 수리 흐름을 이름 댄다). 목록에 없는 파일의 안내는 그대로다.
     #[test]
     fn t2g_new_sentences_are_pinned_word_for_word() {
@@ -42947,12 +42956,6 @@ mod tests {
             parked_present: true,
         };
         let src = "업데이트 전 스냅샷(팩 0.14.56)";
-        let head = "⛔ 되돌리지 않음: 'hooks/guard.sh' 은 기동 필수·보호 목록 파일이고, 업데이트(0.15.0)가 이 파일의 출시본을 먼저 살리면서 \
-                    그때 디스크에 있던 사본(내 수정본)을 hooks/guard.sh.user 에 보관했습니다. 업데이트 전 스냅샷(팩 0.14.56)에 있는 이 파일의 \
-                    사본은 출시본 바이트가 아니고(이 바이너리의 내장본·과거 출시 해시 표에 없음), 되돌리기는 이 파일에 출시본 바이트만 \
-                    씁니다 — 아무것도 쓰지 않았습니다.\n   ";
-        let mixed = ": 다른 파일을 팩 0.14.56 으로 되돌려도 이 파일은 되돌려지지 않아, 팩은 0.14.56 의 파일과 이 파일이 섞인 상태가 \
-                     됩니다.\n   ";
         // ★RULINGS CN1 · CN2: 보관된 사본을 다시 입히는 두 길과 그 조건 — `reapply` 혼자는 쓰지 않는다.
         let routes = "수리로 고친 파일이면 `cys repair reapply <수리번호>`, 직접 고친 파일이면 `cys repair begin --files hooks/guard.sh \
                       --trigger update`";
@@ -42962,22 +42965,22 @@ mod tests {
              다시 입힙니다."
         );
         assert_eq!(parked_reapply_way(rel), reapply);
+        // ★RULINGS CR1: vendor-first 파일의 되돌리기는 언제나 거부 — 그 문장(사본이 무엇이든 같은 문장).
+        let head = "⛔ 되돌리지 않음: 'hooks/guard.sh' 은 기동 필수·보호 목록 파일이고, 업데이트(0.15.0)가 이 파일의 출시본을 먼저 살리면서 \
+                    그때 디스크에 있던 사본(내 수정본)을 hooks/guard.sh.user 에 보관했습니다. 그 사본이 다시 입혀지기 전에는 되돌리기가 \
+                    이 파일에 아무것도 쓰지 않습니다 — 보관본이 출시본이어도, 강행해도(그러면 그다음 설치가 되돌린 바이트를 내 사본으로 \
+                    잘못 보관합니다). 아무것도 쓰지 않았습니다.\n   다른 파일을 팩 0.14.56 으로 되돌리면 이 파일만 ";
+        let mixed = " 남아, 팩은 0.14.56 의 파일과 이 파일이 섞인 상태가 됩니다.\n   ";
         assert_eq!(
-            rollback_parked_refusal(rel, src, &p),
-            format!(
-                "{head}이 파일은 지금의 출시본(0.15.0) 그대로 남습니다{mixed}내 수정본은 hooks/guard.sh.user 에 그대로 보관되어 \
-                 있습니다. {reapply}"
-            )
+            rollback_parked_refusal(rel, &p),
+            format!("{head}새 출시본(0.15.0)으로{mixed}내 수정본은 hooks/guard.sh.user 에 그대로 보관되어 있습니다. {reapply}")
         );
         let present = p.clone();
         p.live_is_embed = false;
         p.parked_present = false;
         assert_eq!(
-            rollback_parked_refusal(rel, src, &p),
-            format!(
-                "{head}이 파일은 지금의 바이트 그대로 남습니다{mixed}업데이트가 보관한 내 수정본(hooks/guard.sh.user)은 지금 없습니다. \
-                 {reapply}"
-            )
+            rollback_parked_refusal(rel, &p),
+            format!("{head}지금의 바이트로{mixed}업데이트가 보관한 내 수정본(hooks/guard.sh.user)은 지금 없습니다. {reapply}")
         );
         assert_eq!(
             rollback_link_refusal("agents.json", src, "/home/me/dotfiles/agents.json"),
@@ -42986,41 +42989,36 @@ mod tests {
              되돌리지 않습니다 — 아무것도 쓰지 않았습니다. 이 파일은 지금 그대로 남습니다. 이 파일을 바꾸는 길은 수리 흐름입니다: \
              워커가 `cys repair begin --files agents.json --trigger …` → 예행·검사 → 주인 승인."
         );
+        assert_eq!(guarded_rollback_refusal(rel, &GuardedCopy::Released, src, "x"), None, "등재 파일 · 출시본 → 쓴다(T2f)");
+        assert_eq!(
+            guarded_rollback_refusal(rel, &GuardedCopy::NotReleased, src, "업데이트 전 스냅샷의 보관본"),
+            Some(cys::pack::unknown_release_refusal(rel, "업데이트 전 스냅샷의 보관본"))
+        );
         let done = "✅ hooks/guard.sh 복원(업데이트 전 스냅샷(팩 0.14.56)의 출시본 바이트 · 기동 필수·보호 목록 파일).";
         assert_eq!(
-            rollback_guarded_restored(rel, src, Some(&present), true),
-            format!("{done} 내 수정본은 hooks/guard.sh.user 에 그대로 보관되어 있습니다. {reapply}")
-        );
-        assert_eq!(
-            rollback_guarded_restored(rel, src, Some(&p), true),
-            format!("{done} 업데이트가 보관한 내 수정본(hooks/guard.sh.user)은 지금 없습니다.")
-        );
-        assert_eq!(
-            rollback_guarded_restored(rel, src, None, true),
+            rollback_guarded_restored(rel, src, true),
             format!(
                 "{done} 이 바이너리의 내장본으로 돌아가는 길은 cys pack-heal hooks/guard.sh 이고, 그 밖의 변경은 수리 흐름입니다: \
                  워커가 `cys repair begin --files hooks/guard.sh --trigger …` → 예행·검사 → 주인 승인."
             )
         );
         assert_eq!(
-            rollback_guarded_restored(rel, src, None, false),
+            rollback_guarded_restored(rel, src, false),
             format!("{done} 이 파일을 바꾸는 길은 수리 흐름입니다: 워커가 `cys repair begin --files hooks/guard.sh --trigger …` → 예행·검사 → 주인 승인.")
         );
         assert_eq!(
-            rollback_list_note(rel, &GuardedCopy::Released, true),
-            " — 기동 필수·보호 목록 파일 · 보관본은 출시본 바이트(되돌릴 수 있음) · 업데이트가 보관한 내 수정본 hooks/guard.sh.user 은 그대로 둠"
-        );
-        assert_eq!(rollback_list_note(rel, &GuardedCopy::Released, false), "");
-        assert_eq!(
-            rollback_list_note(rel, &GuardedCopy::Link("/x".into()), false),
-            " — 되돌리지 않음: 기동 필수·보호 목록 파일 · 보관본이 링크(→ /x)"
-        );
-        assert_eq!(
-            rollback_list_note(rel, &GuardedCopy::NotReleased, true),
+            parked_list_note(rel, true),
             " — 되돌리지 않음: 업데이트가 출시본을 먼저 살리고 내 수정본을 hooks/guard.sh.user 에 보관한 기동 필수·보호 목록 파일 · \
-             보관본이 출시본 바이트가 아님 · 이 파일은 지금 그대로 남음"
+             다른 파일을 되돌리면 이 파일만 새 출시본으로 남음"
         );
-        assert_eq!(rollback_list_note(rel, &GuardedCopy::NotReleased, false), " — 출시본 아님(되돌리기 불가)");
+        assert_eq!(
+            parked_list_note(rel, false),
+            " — 되돌리지 않음: 업데이트가 출시본을 먼저 살리고 내 수정본을 hooks/guard.sh.user 에 보관한 기동 필수·보호 목록 파일 · \
+             다른 파일을 되돌리면 이 파일만 지금의 바이트로 남음"
+        );
+        assert_eq!(rollback_list_note(&GuardedCopy::Released), "");
+        assert_eq!(rollback_list_note(&GuardedCopy::Link("/x".into())), " — 되돌리지 않음: 기동 필수·보호 목록 파일 · 보관본이 링크(→ /x)");
+        assert_eq!(rollback_list_note(&GuardedCopy::NotReleased), " — 출시본 아님(되돌리기 불가)");
         assert_eq!(
             snapshot_mismatch_how(false, true),
             "기동 필수·보호 목록 파일은 기록과 다른 보관본을 쓰지 않습니다(강행 없음 — 검증된 되돌리기)."
@@ -43032,13 +43030,14 @@ mod tests {
         );
         assert_eq!(snapshot_mismatch_how(false, false), "강행하려면 --force-vendor 를 명시하십시오.");
         assert_eq!(
-            rollback_mixed_warning(&["hooks/a.sh".to_string(), "hooks/b.sh".to_string()], "0.14.56", "이 스냅샷"),
+            rollback_mixed_warning(&["hooks/a.sh".to_string(), "hooks/b.sh".to_string()], "0.14.56"),
             format!(
                 "⚠ 되돌리지 않는 기동 필수·보호 목록 파일 2건: hooks/a.sh, hooks/b.sh — 업데이트가 이 파일들의 출시본을 먼저 살리고 \
-                 내 수정본을 <파일>.user 에 보관했고, 이 스냅샷에는 이 파일들의 출시본 바이트가 없습니다. 다른 파일을 팩 0.14.56 으로 \
-                 되돌려도 이 파일들은 지금 그대로 남아, 팩은 0.14.56 의 파일과 이 파일들이 섞인 상태가 됩니다. 다시 입히는 길은 수리 \
-                 흐름입니다: 수리로 고친 파일이면 `cys repair reapply <수리번호>`, 직접 고친 파일이면 `cys repair begin --files <파일> \
-                 --trigger update` — 워커가 그 사본으로 새 수리를 열어 예행·검사를 거치고 주인 최종 승인 뒤에 다시 입힙니다."
+                 내 수정본을 <파일>.user 에 보관했고, 그 사본이 다시 입혀지기 전에는 되돌리기가 이 파일들에 아무것도 쓰지 않습니다. \
+                 다른 파일을 팩 0.14.56 으로 되돌리면 이 파일들만 업데이트 뒤의 바이트(새 출시본, 또는 그 뒤에 손으로 고친 바이트)로 \
+                 남아, 팩은 0.14.56 의 파일과 이 파일들이 섞인 상태가 됩니다. 다시 입히는 길은 수리 흐름입니다: 수리로 고친 파일이면 \
+                 `cys repair reapply <수리번호>`, 직접 고친 파일이면 `cys repair begin --files <파일> --trigger update` — 워커가 그 \
+                 사본으로 새 수리를 열어 예행·검사를 거치고 주인 최종 승인 뒤에 다시 입힙니다."
             )
         );
         // ── RULINGS CN2: 보관된 사본으로 보내는 그 밖의 문장 — 두 길과 그 조건 ──
@@ -43175,8 +43174,9 @@ mod tests {
         for kind in ["new-pending", "merged", "conflicted", "user-kept", "vendor-first", "kept-drift"] {
             texts.push(line(rel, serde_json::json!({"kind": kind, "reason": "x"}), true));
         }
-        texts.push(rollback_guarded_restored(rel, src, None, true));
-        texts.push(rollback_parked_refusal(rel, src, &present));
+        texts.push(rollback_guarded_restored(rel, src, true));
+        texts.push(rollback_parked_refusal(rel, &present));
+        texts.push(parked_list_note(rel, true));
         texts.push(snapshot_mismatch_how(false, true).to_string());
         for t in &texts {
             for refused in ["pack-adopt", "--revert-merge", "--ai", "--force-vendor"] {
@@ -43188,8 +43188,7 @@ mod tests {
         reapply_texts.extend([
             cys::pack::listed_file_refusal(rel, "cys pack-adopt"),
             vendor_first_merge_refusal(rel),
-            rollback_mixed_warning(&["hooks/a.sh".to_string()], "0.14.56", "이 스냅샷"),
-            rollback_guarded_restored(rel, src, Some(&present), true),
+            rollback_mixed_warning(&["hooks/a.sh".to_string()], "0.14.56"),
             plan_vf.to_string(),
         ]);
         for t in reapply_texts.iter().filter(|t| t.contains("cys repair reapply")) {

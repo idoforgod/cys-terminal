@@ -149,7 +149,10 @@ class LedgerKinds(Rig):
         self.assertIn("bin/a.py", detail)
         self.assertIn("suspect:Empty", detail)
         self.assertIn("vendor-first", detail)
-        self.assertIn("cys repair reapply", detail)
+        # ★T2g(RULINGS CN2 · CR3): 두 길과 그 조건 — 글자 그대로.
+        self.assertIn("★기동 필수 vendor 우선(vendor-first) 1건 — vendor 본을 먼저 살리고 내 수정본은 <파일>.user 에 보관"
+                      "(다시 입히기 = 워커가 승인 절차로: 수리로 고친 파일이면 `cys repair reapply <수리번호>`, 직접 고친 "
+                      "파일이면 `cys repair begin --files <파일> --trigger update`): hooks/b.sh", detail)
 
     def _wake_rig(self):
         wk = os.path.join(self.pack, "bin")
@@ -190,6 +193,10 @@ class LedgerKinds(Rig):
         self.assertIn(k(w[0]).rsplit("-", 1)[1], self.delivered().get("parked-merge", ""), "지문이 레인 상태에 기록된다")
         self.assertIn("master", w[0], "master 큐 — master 가 워커에게 위임")
         self.assertTrue(any("직접 병합 금지" in a for a in w[0]))
+        # ★T2g(RULINGS CN2 · CR3): vendor-first 의 두 길과 그 조건 — 글자 그대로.
+        self.assertTrue(any("vendor-first 는 승인 절차로 다시 입히기(수리로 고친 파일이면 cys repair reapply <수리번호>, "
+                            "직접 고친 파일이면 cys repair begin --files <파일> --trigger update · 주인 승인). master 직접 "
+                            "병합 금지" in a for a in w[0]), w[0])
         self.ledger({"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "version": "0.15.0", "ts": 1},
                      "bin/c.py": {"kind": "user-kept", "side": "bin/c.py.new", "version": "0.15.0", "ts": 1}})
         self.run_check("c62_pack_heal_ledger", "C62")

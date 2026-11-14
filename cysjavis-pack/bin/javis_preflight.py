@@ -6406,8 +6406,11 @@ class Preflight:
                          % (len(user_kept), ", ".join(user_kept[:8]),
                             " 외 %d건" % (len(user_kept) - 8) if len(user_kept) > 8 else ""))
         if vendor_first:
+            # ★T2g(RULINGS CN2 · CR3): 다시 입히는 두 길과 그 조건 — `reapply` 는 수리가 만든 수정만 받는다.
             parts.append("★기동 필수 vendor 우선(vendor-first) %d건 — vendor 본을 먼저 살리고 내 수정본은 "
-                         "<파일>.user 에 보관(다시 입히기 = 워커가 승인 절차로 · cys repair reapply): %s%s"
+                         "<파일>.user 에 보관(다시 입히기 = 워커가 승인 절차로: 수리로 고친 파일이면 "
+                         "`cys repair reapply <수리번호>`, 직접 고친 파일이면 "
+                         "`cys repair begin --files <파일> --trigger update`): %s%s"
                          % (len(vendor_first), ", ".join(vendor_first[:8]),
                             " 외 %d건" % (len(vendor_first) - 8) if len(vendor_first) > 8 else ""))
         if healed:
@@ -6465,7 +6468,8 @@ class Preflight:
             jobs.append(("parked-merge",
                          "업데이트가 보관한 수정 %d건(%s) — 워커 1명에게 부서당 과제 하나로 배정하라: "
                          "user-kept 는 합치기(cys pack-merge), vendor-first 는 승인 절차로 다시 입히기"
-                         "(cys repair reapply · 주인 승인). master 직접 병합 금지"
+                         "(수리로 고친 파일이면 cys repair reapply <수리번호>, 직접 고친 파일이면 "
+                         "cys repair begin --files <파일> --trigger update · 주인 승인). master 직접 병합 금지"
                          % (len(parked), lane),
                          "parked-merge-%s-%s" % (lane, fp)))
         if legacy:

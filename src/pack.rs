@@ -3409,6 +3409,10 @@ pub const LEDGER_KINDS: [&str; 9] = [
 /// - kept-drift 인입 + 기존 kind∈LINEAGE → kind 불변, `state:"at-rest"` 만 갱신(멱등 — 이미
 ///   at-rest 면 no-op·dirty 미발생). 정적 재스윕이 merged/conflicted 계보·캡처 포인터를 지우지
 ///   않는다(v2 §4 KeepDrift arm 쓰기 0 규칙 · merged_kind_not_clobbered 핀).
+/// - ★T2g(RULINGS CQ1 · CR2): kept-drift 인입 + 기존 kind = `vendor-first` → **항목 그대로**(no-op · dirty 미발생). 그 기록은
+///   "업데이트가 내 사본을 `<rel>.user` 에 보관했고 아직 다시 입히지 않았다"는 계보다 — 살아 있는 파일이 같은 버전에서
+///   달라졌다고(손으로 고침) 사라지면 `cys repair reapply` 가 그 사본을 찾지 못한다. 장부만의 규칙이다: 팩 파일 쓰기 ·
+///   스윕 순서 · 살아 있는 파일의 판정은 그대로다.
 /// - 그 외 kind 인입 = kind 전환 허용하되 **capture·base_side 는 신 항목에 승계**(신 항목이 자체
 ///   값을 갖지 않는 필드만 — 소실 금지. 크래시 창 재스윕 healed 가 영속된 merged 항목의 캡처
 ///   포인터를 지우는 창의 봉인 · v2 §4). 승계는 old kind 무관 — 한 번 실린 증거 포인터는 어떤
@@ -3434,6 +3438,10 @@ pub fn upsert_pending_v2(
         "미등재 원장 kind 쓰기: {new_kind:?} — src/pack.rs LEDGER_KINDS 에 등재 후 사용(계상 SOT)"
     );
     if let Some(ok) = old_kind {
+        // ★T2g(RULINGS CQ1 · CR2): 보관된 사본의 기록은 같은 버전의 드리프트가 바꾸지 않는다(항목 그대로 — rewrite 0).
+        if ok == "vendor-first" && new_kind == "kept-drift" {
+            return;
+        }
         if LINEAGE_KINDS.contains(&ok) && new_kind == "kept-drift" {
             // kind 불변 — state:"at-rest" 만(멱등 · no-op 시 dirty 미발생 = 원장 rewrite 0).
             let mut e = old.unwrap();
@@ -14127,6 +14135,70 @@ mod m11_tests {
             .collect();
         assert_eq!(prev.len(), 1, "첫 수정본 세대 1개");
         assert_eq!(std::fs::read_to_string(prev[0].path()).unwrap(), "#!/bin/bash\necho USER-A\n", "A 가 B 로 덮이지 않았다");
+    }
+
+    /// ★T2g(RULINGS CQ1 · CR2): vendor-first 기록은 같은 버전의 스윕이 **손으로 고친** 살아 있는 파일을 kept-drift 로 볼 때도
+    /// 그대로 남는다(종전: kept-drift 가 그 기록을 바꿔 써서 `cys repair reapply` 가 보관본을 찾지 못했다). 그 상태에서 진짜
+    /// 다음 업데이트는 **새로 고친 사본**을 `.user` 에 보관하고 앞서 보관한 사본을 `.user.prev-*` 로 옮긴다(오늘과 같다) — 세대마다
+    /// 바이트와 기록의 모양(`kind: vendor-first` · `side` = 실재하는 `<rel>.user` — T6 의 `reapply` 가 읽는 모양)을 잰다.
+    #[test]
+    fn t2g_cq1_vendor_first_record_survives_a_same_version_sweep_after_a_hand_edit() {
+        let rig = Rig::new("cq1");
+        let rel = "hooks/inject.sh";
+        let src = || UpdateSources::none().with_boot_critical(bc_only(&["hooks/inject.sh"]));
+        let v1 = "#!/bin/bash\necho V1\n";
+        let edit_a = "#!/bin/bash\necho USER-A\n";
+        let edit_b = "#!/bin/bash\necho USER-B — a hand edit after the update\n";
+        let v2 = "#!/bin/bash\necho V2\n";
+        let shape = |want_user: &str| {
+            let e = rig.entry(rel).expect("기록");
+            assert_eq!(e["kind"], "vendor-first", "{e}");
+            let side = e["side"].as_str().expect("side");
+            assert_eq!(side, format!("{rel}.user"));
+            assert!(rig.pack.join(side).is_file(), "side 는 실재하는 파일");
+            assert_eq!(rig.read(side).as_deref(), Some(want_user), "side 의 바이트 = 내 사본");
+        };
+        // 업데이트 1: 내 수정 A → vendor 우선(살아 있는 파일 = V1, A 는 .user).
+        rig.write(rel, edit_a.as_bytes());
+        rig.install(&[(rel, v1)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(v1));
+        shape(edit_a);
+        // 손으로 고침 B → 같은 버전의 스윕(V1 그대로): KeepDrift — 살아 있는 파일 무접촉, 기록 그대로(rewrite 0).
+        rig.write(rel, edit_b.as_bytes());
+        let before = std::fs::read_to_string(rig.pack.join(MERGE_PENDING_FILE)).unwrap();
+        assert_eq!(rig.plan(&[(rel, v1)], false, &src()).kept_drift, vec![rel.to_string()], "판정은 그대로 kept-drift");
+        rig.install(&[(rel, v1)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(edit_b), "살아 있는 파일 무접촉");
+        assert_eq!(std::fs::read_to_string(rig.pack.join(MERGE_PENDING_FILE)).unwrap(), before, "기록 그대로 — rewrite 0");
+        shape(edit_a);
+        assert!(load_merge_pending(&rig.pack).contains_key(rel), "병합 대기 목록이 이 파일을 보인다");
+        // 진짜 다음 업데이트(V2): 새로 고친 B 를 .user 에, 앞서 보관한 A 는 .user.prev-* 로(오늘과 같다).
+        rig.install(&[(rel, v2)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(v2), "기동 필수 = vendor 먼저");
+        shape(edit_b);
+        let prev: Vec<_> = std::fs::read_dir(rig.pack.join("hooks"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("inject.sh.user.prev-"))
+            .collect();
+        assert_eq!(prev.len(), 1, "앞선 세대 1개");
+        assert_eq!(std::fs::read_to_string(prev[0].path()).unwrap(), edit_a, "A 는 한 세대 뒤에 그대로");
+        // 대조: 같은 버전의 kept-drift 가 merged 계보에는 state 만 붙이고(종전 규칙 그대로), 기록 없는 파일에는 kept-drift 를 쓴다.
+        let mut p = serde_json::Map::new();
+        let mut dirty = false;
+        let kd = |r: &str| match serde_json::json!({"kind": "kept-drift", "side": r, "version": "x", "ts": 1}) {
+            serde_json::Value::Object(o) => o,
+            _ => unreachable!(),
+        };
+        p.insert("a".into(), serde_json::json!({"kind": "vendor-first", "side": "a.user", "version": "x", "ts": 0}));
+        upsert_pending_v2(&mut p, &mut dirty, "a", kd("a"));
+        assert!(!dirty, "vendor-first: no-op");
+        assert_eq!(p["a"], serde_json::json!({"kind": "vendor-first", "side": "a.user", "version": "x", "ts": 0}), "항목 그대로");
+        p.insert("m".into(), serde_json::json!({"kind": "merged", "capture": "c", "version": "x", "ts": 0}));
+        upsert_pending_v2(&mut p, &mut dirty, "m", kd("m"));
+        assert_eq!((p["m"]["kind"].as_str(), p["m"]["state"].as_str()), (Some("merged"), Some("at-rest")));
+        upsert_pending_v2(&mut p, &mut dirty, "n", kd("n"));
+        assert_eq!(p["n"]["kind"], "kept-drift");
     }
 
     /// 부록 A-2 #4(백업이 없으면 덮지 않는다): 기동 필수 파일의 사용자본을 보관할 수 없으면 vendor 본을 쓰지 않고 격리.
