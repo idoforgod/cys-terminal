@@ -1,5 +1,6 @@
-"""Hermetic controls for scripts/check_macho_arch.py — the bundle architecture gate (0.15.0 · track T11 ·
-RULINGS BQ1(b), CA1–CA2 · owner order addendum 11: the Intel installer must never carry an Apple-silicon-only python).
+"""Hermetic controls for scripts/check_macho_arch.py — the bundle architecture gate (0.15.0 · tracks T11, T11b ·
+RULINGS BQ1(b), CA1–CA2, DB4–DB5 · owner order addendum 11: the Intel installer must never carry an Apple-silicon-only
+python).
 
 Every case builds SYNTHETIC Mach-O / fat headers in a temp dir (no real binary needed, no lipo, no network): thin
 x86_64 / arm64, 32-bit (i386) and big-endian (ppc) thin headers, fat with both, fat without the target, fat64, the
@@ -9,7 +10,11 @@ minimum macOS from LC_BUILD_VERSION and LC_VERSION_MIN_MACOSX; a fake cys.app wh
 link to an arm64-only python3.12 (the owner's reported case); the same tree as a .tar.gz (the updater archive);
 required entry points that are missing, dangling, looping or not Mach-O; an unreadable directory and file; and a
 large archive whose single streaming pass is MEASURED (compressed bytes read ≤ archive size — any rewind of the
-gzip stream would read more; RULINGS CA1). A red case differs from its green control only in the planted fact.
+gzip stream would read more; RULINGS CA1). T11b (RULINGS DB4): a universal file whose fat table disagrees with a
+slice's OWN header (CPU or subtype), a header / load commands that run past their slice, a load command past
+sizeofcmds, a table listed out of offset order inside a streamed archive. T11b (RULINGS DB5): tar HARD-LINK members —
+a required entry point packed as a hard link (target before it, `./` names, a chain), a hard link before its target,
+a dangling one, a wrong-architecture target. A red case differs from its green control only in the planted fact.
 
     python3 scripts/tests/test_check_macho_arch.py
 """
@@ -59,20 +64,30 @@ def thin(cputype, minos=None, legacy=None, subtype=None, bits=64, endian="<"):
     return hdr + cmds + b"\0" * 64
 
 
-def fat(slices, fat64=False):
-    """A big-endian universal header; SLICES = [(cputype, thin bytes[, subtype])] at 4096-aligned offsets."""
+def fat(slices, fat64=False, reverse_table=False):
+    """A big-endian universal header; SLICES = [(cputype, thin bytes[, subtype])] at 4096-aligned offsets. The TABLE
+    entry carries SLICES' cputype / subtype — the thin bytes may say something else (the DB4 controls).
+    REVERSE_TABLE lists the entries in the opposite order of their offsets."""
     entry_fmt = ">IIQQII" if fat64 else ">IIIII"
-    off, table, body = 4096, b"", b""
+    off, entries, body = 4096, [], b""
     for s in slices:
         cputype, data = s[0], s[1]
         sub = s[2] if len(s) > 2 else SUB.get(cputype, 0)
         pad = b"\0" * (-len(data) % 4096)
-        table += struct.pack(entry_fmt, cputype, sub, off, len(data), 12, 0) if fat64 else \
-            struct.pack(entry_fmt, cputype, sub, off, len(data), 12)
+        entries.append(struct.pack(entry_fmt, cputype, sub, off, len(data), 12, 0) if fat64 else
+                       struct.pack(entry_fmt, cputype, sub, off, len(data), 12))
         body += data + pad
         off += len(data) + len(pad)
+    table = b"".join(reversed(entries) if reverse_table else entries)
     head = struct.pack(">II", 0xCAFEBABF if fat64 else 0xCAFEBABE, len(slices)) + table
     return head + b"\0" * (4096 - len(head)) + body
+
+
+def with_slice_size(data, index, ssize):
+    """DATA (a 32-bit fat file) with the SIZE field of table entry INDEX set to SSIZE."""
+    b = bytearray(data)
+    struct.pack_into(">I", b, 8 + 20 * index + 12, ssize)
+    return bytes(b)
 
 
 JAVA_CLASS = b"\xca\xfe\xba\xbe\x00\x00\x00\x34" + b"\x00" * 40        # Java 8 class: version where nfat would be
@@ -250,6 +265,60 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 2, out)
         self.assertIn("fat table cut short", out)
 
+    # -- T11b · RULINGS DB4: each slice's OWN header, within the slice's own bounds --
+    def test_a_fat_table_that_says_x86_64_over_an_arm64_slice_fails(self):
+        # the reviewer's M2: the table entry says x86_64/ALL, the bytes at its offset are a valid arm64 thin header
+        rc, out = self.one(fat([(X86_64, thin(ARM64))]))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL f: fat table entry 0 says x86_64 but the slice's own header is arm64", out)
+        self.assertIn("FAIL f: arm64 (no slice that runs on every x86_64 Mac)", out)
+        # beside a correct arm64 slice, for the arm64 target: still a mis-assembled file → FAIL
+        rc, out = self.one(fat([(X86_64, thin(ARM64)), (ARM64, thin(ARM64))]), "aarch64-apple-darwin", "g")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL g: fat table entry 0 says x86_64 but the slice's own header is arm64", out)
+        # green control: the same two slices, table == headers
+        self.assertEqual(self.one(fat([(X86_64, thin(X86_64)), (ARM64, thin(ARM64))]), name="h")[0], 0)
+
+    def test_a_fat_subtype_that_differs_from_the_slice_header_fails(self):
+        # table x86_64 (ALL), header x86_64h — the table would satisfy the target, the slice would not
+        rc, out = self.one(fat([(X86_64, thin(X86_64, subtype=X86_64H), 3)]))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL f: fat table entry 0 says x86_64 but the slice's own header is x86_64h", out)
+        # capability bits differ only (masked on both sides) → not a mismatch
+        self.assertEqual(self.one(fat([(X86_64, thin(X86_64, subtype=0x80000003), 3)]), name="g")[0], 0)
+
+    def test_a_slice_header_or_its_load_commands_past_the_slice_cannot_be_judged(self):
+        data = fat([(X86_64, thin(X86_64, minos="10.15")), (ARM64, thin(ARM64))])
+        rc, out = self.one(with_slice_size(data, 0, 16))           # the 32-byte header does not fit in 16 bytes
+        self.assertEqual(rc, 2, out)
+        self.assertIn("Mach-O header runs past the end of fat slice 0", out)
+        rc, out = self.one(with_slice_size(data, 0, 40), name="g")  # header fits, its 24 bytes of commands do not
+        self.assertEqual(rc, 2, out)
+        self.assertIn("load commands (24 bytes) run past the end of fat slice 0", out)
+        self.assertEqual(self.one(with_slice_size(data, 0, 56), name="h")[0], 0)   # exactly header + commands: fits
+
+    def test_a_load_command_past_sizeofcmds_cannot_be_judged(self):
+        data = bytearray(thin(X86_64, minos="10.15"))
+        struct.pack_into("<I", data, 32 + 4, 200)                  # LC_BUILD_VERSION claims 200 bytes of 24
+        rc, out = self.one(bytes(data))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("load command 0 (200 bytes) runs past sizeofcmds", out)
+
+    def test_every_slice_is_read_forward_in_a_streamed_archive_whatever_the_table_order(self):
+        # the table lists the arm64 slice (at the higher offset) first; the streamed member can only be read forward
+        self.put("t/cys.app/Contents/MacOS/cys", fat([(X86_64, thin(X86_64, minos="10.15")),
+                                                      (ARM64, thin(ARM64) + os.urandom(70000))], reverse_table=True))
+        arc = self.make_tar("rev.tar.gz", os.path.join(self.tmp, "t", "cys.app"))
+        for target in ("x86_64-apple-darwin", "aarch64-apple-darwin"):
+            rc, out = self.gate("--target", target, arc)
+            self.assertEqual(rc, 0, out)
+            self.assertIn("arm64+x86_64 1", out)                   # table order, each name from the slice's header
+        bad = fat([(X86_64, thin(ARM64) + os.urandom(70000)), (ARM64, thin(ARM64))], reverse_table=True)
+        self.put("u/cys.app/Contents/MacOS/cys", bad)
+        rc, out = self.gate("--target", "aarch64-apple-darwin", self.make_tar("rev-bad.tar.gz", os.path.join(self.tmp, "u", "cys.app")))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("fat table entry 1 says x86_64 but the slice's own header is arm64", out)
+
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads everything")
     def test_an_unreadable_directory_or_file_cannot_be_judged(self):
         self.put("d/ok", thin(X86_64))
@@ -363,6 +432,69 @@ class Gate(unittest.TestCase):
         self.assertEqual(read, size, "every compressed byte must pass through the counting reader exactly once")
         self.assertIn("x86_64 ", out)
         self.assertRegex(out, r"python3 -> python3\.12\s+x86_64\s+min 10\.15")
+
+    # -- T11b · RULINGS DB5: tar HARD-LINK members --
+    def hard_tar(self, name, plan, python_cpu=X86_64, prefix=""):
+        """The fake app as a .tar.gz whose runtime/python/bin/python3 is packed by PLAN instead of a symbolic link:
+        PLAN = [("before"|"after", member rel, linkname rel)] — hard-link members written before or after the tree."""
+        self.app(python_cpu=python_cpu)
+        os.remove(os.path.join(self.tmp, "cys.app/Contents/Resources/runtime/python/bin/python3"))
+        arc = os.path.join(self.tmp, name)
+        py = "cys.app/Contents/Resources/runtime/python/bin/"
+
+        def hard(t, rel, target):
+            ti = tarfile.TarInfo(prefix + py + rel)
+            ti.type, ti.linkname, ti.mode = tarfile.LNKTYPE, prefix + py + target, 0o755
+            t.addfile(ti)
+        with tarfile.open(arc, "w:gz") as t:
+            for when, rel, target in plan:
+                if when == "before":
+                    hard(t, rel, target)
+            t.add(os.path.join(self.tmp, "cys.app"), arcname=prefix + "cys.app")
+            for when, rel, target in plan:
+                if when == "after":
+                    hard(t, rel, target)
+        return arc
+
+    def test_a_required_entry_point_packed_as_a_hard_link_is_found(self):
+        # the reviewer's M3: python3.12 a regular member, python3 a hard link to it (after it, as every tar writes)
+        arc = self.hard_tar("hard.tar.gz", [("after", "python3", "python3.12")])
+        rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
+        self.assertEqual(rc, 0, out)
+        self.assertRegex(out, r"runtime/python/bin/python3 -> python3\.12\s+x86_64\s+min 10\.15")
+        self.assertIn("x86_64 7", out)                             # the hard link is the same file, counted once
+        # the same with `./` member names (tar's own normalisation)
+        arc = self.hard_tar("hard-dot.tar.gz", [("after", "python3", "python3.12")], prefix="./")
+        rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
+        self.assertEqual(rc, 0, out)
+
+    def test_a_chain_of_hard_links_resolves(self):
+        arc = self.hard_tar("chain.tar.gz", [("after", "python3.1", "python3.12"), ("after", "python3", "python3.1")])
+        rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
+        self.assertEqual(rc, 0, out)
+        self.assertRegex(out, r"runtime/python/bin/python3 -> python3\.12\s+x86_64")
+
+    def test_a_hard_link_before_its_target_fails(self):
+        # tar's own rule (tarfile, libarchive, GNU tar, the Rust tar crate): a hard link names an ALREADY archived
+        # member — an extractor creates it from the file it already wrote; this one would be missing after extraction
+        arc = self.hard_tar("early.tar.gz", [("before", "python3", "python3.12")])
+        rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL required entry point cys.app/Contents/Resources/runtime/python/bin/python3: hard link "
+                      "before its target cys.app/Contents/Resources/runtime/python/bin/python3.12", out)
+
+    def test_a_dangling_hard_link_fails(self):
+        arc = self.hard_tar("dangling.tar.gz", [("after", "python3", "python3.13")])
+        rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL required entry point cys.app/Contents/Resources/runtime/python/bin/python3: dangling hard link", out)
+
+    def test_a_hard_link_to_a_wrong_architecture_file_fails(self):
+        arc = self.hard_tar("wrong.tar.gz", [("after", "python3", "python3.12")], python_cpu=ARM64)
+        rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL cys.app/Contents/Resources/runtime/python/bin/python3.12: arm64 (no slice", out)
+        self.assertRegex(out, r"runtime/python/bin/python3 -> python3\.12\s+arm64")
 
     # -- cannot judge is never a pass --
     def test_cannot_judge_cases_exit_2(self):
