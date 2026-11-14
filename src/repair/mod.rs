@@ -153,12 +153,20 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".github")
             .join("workflows");
-        for wf in [
-            "release.yml",
-            "pack-release.yml",
-            "windows-build.yml",
-            "ci-branch.yml",
-        ] {
+        // RULINGS DF5: EVERY workflow file (windows-health.yml and the other non-release ones run
+        // cargo too), the four named release / branch workflows among them
+        let mut all: Vec<String> = std::fs::read_dir(&root)
+            .unwrap_or_else(|e| panic!("cannot list {}: {e}", root.display()))
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".yml") || n.ends_with(".yaml"))
+            .collect();
+        all.sort();
+        for wf in ["release.yml", "pack-release.yml", "windows-build.yml", "ci-branch.yml"] {
+            assert!(all.iter().any(|n| n == wf), "{wf} is not under .github/workflows");
+        }
+        assert!(all.len() >= 8, "only {} workflow files found: {all:?}", all.len());
+        for wf in &all {
             let path = root.join(wf);
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
