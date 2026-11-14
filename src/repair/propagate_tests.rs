@@ -221,6 +221,8 @@ struct Doubles {
     bytes_calls: Cell<u32>,
     class: Cell<Classification>,
     form: Cell<ApplyForm>,
+    /// HH1: (rel, content hash) this test's previous-release table knows (`with_prev_vendor`).
+    vendor: std::cell::RefCell<Option<(String, String)>>,
 }
 
 fn doubles() -> Doubles {
@@ -232,6 +234,16 @@ fn doubles() -> Doubles {
         bytes_calls: Cell::new(0),
         class: Cell::new(Classification::General),
         form: Cell::new(ApplyForm::Exchange),
+        vendor: std::cell::RefCell::new(None),
+    }
+}
+
+/// HH1: the sources the doubles name (the real embedded copies always; the previous-release table
+/// replaced by the one entry the test names).
+fn sources_of(d: &Doubles) -> crate::pack::UpdateSources {
+    match d.vendor.borrow().clone() {
+        Some((vrel, h)) => crate::pack::UpdateSources::none().with_prev_vendor(move |rel: &str| if rel == vrel { vec![h.clone()] } else { Vec::new() }),
+        None => crate::pack::UpdateSources::none().with_prev_vendor(|_: &str| Vec::new()),
     }
 }
 
@@ -262,6 +274,7 @@ fn tick_with(r: &Rig, which: &str, d: &Doubles, fresh: &str, faults: &dyn Faults
         committed_copy_in(&r.root, rec, rel)
     };
     let lock_file = r.base.join(".pack-apply.lock");
+    let sources = sources_of(d);
     let env = LaneEnv {
         op: OpEnv { root: &r.root, pack: &pack, lane: &l, now: T0, form: d.form.get(), faults, own_check: &|_, _| None },
         check: &check,
@@ -269,6 +282,7 @@ fn tick_with(r: &Rig, which: &str, d: &Doubles, fresh: &str, faults: &dyn Faults
         locked: &apply::no_repair_lock,
         hooks: &hooks,
         result_bytes: &bytes,
+        sources: &sources,
         apply_lock: &lock_file,
         pass_stop: stop,
     };
@@ -710,6 +724,105 @@ fn deletion_only_at_the_pre_image_state_and_tombstoned_here() {
     }
 }
 
+/// Whether any vault slot of `id` holds a file with exactly `bytes` (HH1's "moved into a fresh slot").
+fn a_slot_holds(r: &Rig, id: &RepairId, bytes: &[u8]) -> bool {
+    fn walk(d: &Path, bytes: &[u8]) -> bool {
+        std::fs::read_dir(d).into_iter().flatten().flatten().any(|e| {
+            let p = e.path();
+            match std::fs::symlink_metadata(&p) {
+                Ok(m) if m.is_dir() => walk(&p, bytes),
+                Ok(m) if m.is_file() => std::fs::read(&p).is_ok_and(|b| b == bytes),
+                _ => false,
+            }
+        })
+    }
+    ledger::list_slots_in(&r.root, id).iter().any(|s| walk(&s.dir, bytes))
+}
+
+/// RULINGS HH1 (C11 11.3, design 4-14 "알려진 원본 판과 바이트까지 같을 때만"): a deletion where this
+/// lane's bytes are not the origin's pre-image but ARE a known vendor version (`Recorded::released` —
+/// `pack::released_bytes`) → the file is moved into a fresh vault slot, tombstoned in THIS lane's
+/// file, the row 검증됨.
+#[test]
+fn a_deletion_of_known_vendor_bytes_moves_them_to_a_fresh_slot_and_tombstones_here() {
+    let r = rig("hh1a");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/gone.py", Some((b"origin's own\n", 0o644)), None);
+    r.put(DEPT, "bin/gone.py", b"vendor v1\n", 0o644);
+    let d = doubles();
+    *d.vendor.borrow_mut() = Some(("bin/gone.py".into(), crate::pack::content_hash_pub("vendor v1\n")));
+    tick(&r, DEPT, &d, &fid(1));
+    assert_eq!(r.live(DEPT, "bin/gone.py"), TargetState::Absent);
+    assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Verified);
+    assert!(a_slot_holds(&r, &id, b"vendor v1\n"), "the vendor bytes are kept in a fresh slot");
+    let t = crate::repair::tombstones::load_in(&r.root, &lane(DEPT)).unwrap();
+    assert!(t.iter().any(|t| t.rel == "bin/gone.py" && t.repair == id), "{t:?}");
+    assert!(crate::repair::tombstones::load_in(&r.root, &lane(HQ)).unwrap().is_empty(), "never another lane's file");
+}
+
+/// HH1: one byte different from every known vendor version (and from the pre-image) → 충돌; nothing
+/// moved, no tombstone.
+#[test]
+fn a_deletion_of_bytes_one_byte_off_vendor_is_a_conflict_and_nothing_moves() {
+    let r = rig("hh1b");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/gone.py", Some((b"origin's own\n", 0o644)), None);
+    r.put(DEPT, "bin/gone.py", b"vendor v2\n", 0o644);
+    let d = doubles();
+    *d.vendor.borrow_mut() = Some(("bin/gone.py".into(), crate::pack::content_hash_pub("vendor v1\n")));
+    tick(&r, DEPT, &d, &fid(1));
+    assert_eq!(std::fs::read(r.dept.join("bin/gone.py")).unwrap(), b"vendor v2\n");
+    assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Conflict);
+    assert!(!a_slot_holds(&r, &id, b"vendor v2\n"), "nothing moved");
+    assert!(crate::repair::tombstones::load_in(&r.root, &lane(DEPT)).unwrap().is_empty());
+}
+
+/// HH1: the vendor file replaced by another writer between `Recorded::released`'s read and the act →
+/// the door refuses (GK2 / GV1: 충돌), the other writer's bytes stay, no tombstone.
+#[test]
+fn a_vendor_file_replaced_before_the_act_is_refused_by_the_door() {
+    struct Replace;
+    impl Faults for Replace {
+        fn at(&self, p: Point, live: &Path, _: Option<&Slot>) -> bool {
+            if p == Point::AfterRecord {
+                std::fs::write(live, b"someone else\n").unwrap();
+            }
+            false
+        }
+    }
+    let r = rig("hh1c");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/gone.py", Some((b"origin's own\n", 0o644)), None);
+    r.put(DEPT, "bin/gone.py", b"vendor v1\n", 0o644);
+    let d = doubles();
+    *d.vendor.borrow_mut() = Some(("bin/gone.py".into(), crate::pack::content_hash_pub("vendor v1\n")));
+    tick_with(&r, DEPT, &d, &fid(1), &Replace, &|_| false).unwrap();
+    assert_eq!(std::fs::read(r.dept.join("bin/gone.py")).unwrap(), b"someone else\n");
+    assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Conflict);
+    assert!(crate::repair::tombstones::load_in(&r.root, &lane(DEPT)).unwrap().is_empty());
+}
+
+/// RULINGS HI2 / P6: the copy sealed at the commit is a slot an in-force repair still depends on (T3's
+/// `cleanup` never removes it while R is in force); a copy of OTHER bytes (a refused commit's) is not
+/// needed; once R is out of force the copy is not kept for it any more.
+#[test]
+fn the_committed_copy_is_kept_while_the_repair_is_in_force() {
+    let r = rig("p6");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    let copy = committed_copy_in(&r.root, &ledger::read_record_in(&r.root, &id).unwrap().unwrap(), "bin/a.py").unwrap();
+    let copy_slot = copy.parent().unwrap().parent().unwrap().to_path_buf();
+    r.put(HQ, "bin/a.py", b"other\n", 0o644);
+    let other = seal_committed_copy_in(&r.root, &id, &lane(HQ), "bin/a.py", &r.hq.join("bin/a.py"), T0).unwrap();
+    let needed = apply::slots_needed_in_force_in(&r.root, &id).unwrap();
+    assert!(needed.contains(&copy_slot), "{needed:?}");
+    assert!(!needed.contains(&other.slot), "a copy of other bytes is not needed");
+    let mut rec = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
+    rec.state = RepairState::Reverted;
+    ledger::write_record_durable_in(&r.root, &rec).unwrap();
+    assert!(!apply::slots_needed_in_force_in(&r.root, &id).unwrap().contains(&copy_slot), "out of force");
+}
+
 /// HI2 / HJ2: a committed file target without a readable, matching committed copy → 충돌 with the true
 /// reason; nothing live changed.
 #[test]
@@ -1004,6 +1117,7 @@ fn recheck(r: &Rig, id: &RepairId, d: &Doubles, seat: u64, note: &str) -> Result
     let hooks = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> { Ok(ReconcileReport { hooks: Vec::new() }) };
     let bytes = |_: &RepairRecord, _: &str| -> Result<PathBuf, String> { Err("none".into()) };
     let lock_file = r.base.join(".pack-apply.lock");
+    let sources = sources_of(d);
     let env = LaneEnv {
         op: OpEnv { root: &r.root, pack: &r.dept, lane: &l, now: T0, form: ApplyForm::Exchange, faults: &NoFaults, own_check: &|_, _| None },
         check: &check,
@@ -1011,6 +1125,7 @@ fn recheck(r: &Rig, id: &RepairId, d: &Doubles, seat: u64, note: &str) -> Result
         locked: &apply::no_repair_lock,
         hooks: &hooks,
         result_bytes: &bytes,
+        sources: &sources,
         apply_lock: &lock_file,
         pass_stop: &|_| false,
     };
