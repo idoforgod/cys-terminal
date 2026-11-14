@@ -1752,22 +1752,35 @@ def fsync_dir(d):
         os.close(fd)
 
 
-def replace_retry(src, dst):
-    # 윈도우: 다른 프로세스가 대상을 막 읽는 중이면 공유 위반(PermissionError) — 짧게 다시 해 본다(그래도 안 되면 무변경 실패).
+def retry_sharing(fn, *args):
+    # 윈도우: 다른 프로세스가 대상을 막 읽는 중이면 공유 위반(PermissionError) — 짧게 다시 해 본다(6회 · 0.1 s — 그래도 안
+    #   되면 예외: 호출부가 보류한다).
     for n in range(6):
         try:
-            os.replace(src, dst)
-            return
+            return fn(*args)
         except PermissionError:
             if n == 5:
                 raise
             time.sleep(0.1)
 
 
-def write_atomic(path, data, expect=None):
-    """같은 폴더 임시 파일 → flush·fsync → (expect) 다시 읽어 확인 → 원자 교체. 실패 = 살아 있는 파일 무변경."""
+def silent_unlink(p):
+    try:
+        os.unlink(p)
+    except OSError:
+        pass
+
+
+def read_bytes(p):
+    with open(p, "rb") as f:
+        return f.read()
+
+
+def write_temp(path, data, expect=None):
+    """같은 폴더 임시 파일에 다 쓰고 flush·fsync, (expect) 다시 읽어 확인 — 그 경로. 실패하면 임시 파일을 남기지 않는다."""
     d = os.path.dirname(os.path.abspath(path))
     fd, tmp = tempfile.mkstemp(dir=d, prefix="." + os.path.basename(path) + ".", suffix=".tmp")
+    done = False
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
@@ -1780,39 +1793,223 @@ def write_atomic(path, data, expect=None):
                 os.chmod(tmp, 0o644)
             except OSError:
                 pass
-        if expect is not None:
-            with open(tmp, "rb") as f:
-                back = f.read()
-            if not expect(back):
-                raise ValueError("다시 읽은 후보가 조립 결과와 다르다(반쪽 기록 — 교체하지 않음)")
-        replace_retry(tmp, path)
-        tmp = None
-        fsync_dir(d)
+        if expect is not None and not expect(read_bytes(tmp)):
+            raise ValueError("다시 읽은 후보가 조립 결과와 다르다(반쪽 기록 — 교체하지 않음)")
+        done = True
+        return tmp
     finally:
-        if tmp is not None:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+        if not done:
+            silent_unlink(tmp)
 
 
-def keep_copy(base, data):
-    """시각을 붙인 사본 — 덮지 않는다(같은 초에 또 있으면 -2, -3 …). 경로를 돌려준다."""
-    first = "%s.%s" % (base, stamp())
-    p = first
-    for n in range(2, 1000):
+def write_atomic(path, data, expect=None):
+    """우리 것(영수증)의 원자 교체 — 임시 파일 → 원자 교체. 실패 = 살아 있는 파일 무변경."""
+    tmp = write_temp(path, data, expect)
+    try:
+        retry_sharing(os.replace, tmp, path)
+    except BaseException:
+        silent_unlink(tmp)
+        raise
+    fsync_dir(os.path.dirname(os.path.abspath(path)))
+
+
+def place_new(src, dst):
+    """src 를 dst 자리에 놓는다 — dst 가 이미 있으면 **덮지 않고** FileExistsError. POSIX = 하드 링크(기존 이름을 덮지 않는다)
+    + 원래 이름 지우기 · 하드 링크가 안 되는 파일 시스템은 O_EXCL 로 만들어 바이트를 옮겨 쓴다. 윈도우 = os.rename(대상이
+    있으면 FileExistsError · 공유 위반은 짧게 재시도)."""
+    if os.name == "posix":
         try:
-            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o644)
-            break
+            os.link(src, dst)
         except FileExistsError:
-            p = "%s-%d" % (first, n)
+            raise
+        except OSError:
+            data = read_bytes(src)
+            fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, os.stat(src).st_mode & 0o7777)
+            with os.fdopen(fd, "wb") as g:
+                g.write(data)
+                g.flush()
+                os.fsync(g.fileno())
+        os.unlink(src)
     else:
-        raise OSError("보관 사본 이름을 만들지 못했다(%s)" % first)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
+        retry_sharing(os.rename, src, dst)
+    fsync_dir(os.path.dirname(os.path.abspath(dst)))
+    return dst
+
+
+def write_new(path, data):
+    """없는 파일을 새로 만든다(덮지 않는다 — 그 사이 누가 만들었으면 FileExistsError, 그 파일은 그대로)."""
+    tmp = write_temp(path, data)
+    try:
+        return place_new(tmp, path)
+    except BaseException:
+        silent_unlink(tmp)
+        raise
+
+
+def side_name(path, kind):
+    """덮지 않는 옆 이름 — <path>.<kind>.<UTC>[-n]."""
+    first = "%s.%s.%s" % (path, kind, stamp()) if kind else "%s.%s" % (path, stamp())
+    p, n = first, 1
+    while os.path.lexists(p):
+        n += 1
+        if n > 999:
+            raise OSError("옆 이름을 만들지 못했다(%s)" % first)
+        p = "%s-%d" % (first, n)
     return p
+
+
+def rename_away(path, dst):
+    """살아 있는 이름의 파일을 **그 순간 그대로** 옆 이름으로 옮긴다(공유 위반은 짧게 재시도)."""
+    retry_sharing(os.rename, path, dst)
+
+
+def keep_displaced(disp, base):
+    """옮겨 둔 파일(교체 순간의 그 파일)을 시각 붙은 보관 이름으로 — 다시 쓰지 않고 이름만 바꾼다. 경로를 돌려준다."""
+    kept = side_name(base, "")
+    os.rename(disp, kept)
+    return kept
+
+
+class SourceChanged(Exception):
+    """조립·강등이 읽은 뒤에 살아 있는 지침이 바뀌었다 — 지침은 바꾸지 않았다(또는 되돌렸다). 다시 읽어 처음부터 한다."""
+
+
+class LockBusy(Exception):
+    """승격·강등 잠금을 정해진 시간 안에 잡지 못했다 — 잠금 없이 진행하지 않는다(보류)."""
+
+
+LOCK_WAIT_DEFAULT_S = 10.0
+SWAP_ATTEMPTS = 3
+
+
+def lock_wait_s():
+    raw = os.environ.get("CYS_CEO_LOCK_WAIT_S", "")
+    try:
+        v = float(raw) if raw else LOCK_WAIT_DEFAULT_S
+    except ValueError:
+        v = LOCK_WAIT_DEFAULT_S
+    return min(max(v, 0.0), 120.0)
+
+
+def take_lock(md):
+    """★RULINGS DC1 — 본부 지침의 제품 쓰기(조립·강등)를 직렬화하는 진짜 잠금(D-5 동시 승격 락의 뜻 그대로 · 대기에 상한).
+    잠금 파일 = <md>.promote.lock(종전 flock 과 같은 파일). POSIX(맥·리눅스) = fcntl.flock(LOCK_EX|LOCK_NB) 를 상한까지
+    되풀이 — 커널이 쥐는 잠금이라 프로세스가 죽으면 풀린다(맥에는 flock 명령이 없지만 flock(2) 시스템 호출은 있다 · 리눅스의
+    flock 명령과 같은 잠금이라 섞여 돌아도 서로 막는다). 윈도우(Git Bash + 번들 파이썬, flock 명령 없음) = msvcrt.locking
+    (LK_NBLCK) — 같은 파일 첫 바이트의 OS 잠금, 핸들이 닫히면(프로세스가 끝나면) 풀린다. 시간 안에 못 잡으면 LockBusy —
+    '잠금 없이 진행'은 없다(호출부가 보류하고 알림 1건). 돌려준 파일 객체를 닫거나 프로세스가 끝나면 풀린다."""
+    f = open(md + ".promote.lock", "a+b")
+    try:
+        import fcntl
+
+        def attempt():
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                return False
+    except ImportError:
+        import msvcrt
+
+        def attempt():
+            try:
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError:
+                return False
+    deadline = time.monotonic() + lock_wait_s()
+    try:
+        while not attempt():
+            if time.monotonic() >= deadline:
+                raise LockBusy(md + ".promote.lock")
+            time.sleep(0.05)
+    except BaseException:
+        f.close()
+        raise
+    return f
+
+
+def settle_displaced(path, disp, old):
+    """옮겨 둔 옛 파일 정리 — 읽은 것과 같으면 지우고(새 저장이 그것을 대신한다), 다르면 사본으로 남긴다(지우지 않는다)."""
+    try:
+        if read_bytes(disp) == old:
+            os.unlink(disp)
+            return None
+    except OSError:
+        pass
+    kept = side_name(path, "changed")
+    try:
+        os.rename(disp, kept)
+    except OSError:
+        kept = disp
+    err("교체 중에 저장된 다른 판을 %s 에 남겼다(지우지 않음)" % kept)
+    return kept
+
+
+def undo_swap(path, disp, data):
+    """swap_live ④의 되돌리기 — 우리가 놓은 후보를 옆으로 치우고, 옮겨 둔 파일(읽은 뒤 저장된 바이트)을 제자리로(덮지 않음)."""
+    rej = side_name(path, "rejected")
+    try:
+        rename_away(path, rej)
+    except FileNotFoundError:
+        rej = None
+    try:
+        place_new(disp, path)
+    except FileExistsError:
+        kept = side_name(path, "changed")
+        os.rename(disp, kept)
+        err("되돌리는 사이 또 저장됐다 — 그 파일이 살아 있고, 옮겨 둔 판은 %s 에 남겼다" % kept)
+    if rej is not None:
+        try:
+            ours = read_bytes(rej) == data
+        except OSError:
+            ours = False
+        if ours:
+            os.unlink(rej)
+        else:
+            err("우리 후보 자리에 다른 바이트가 있었다 — %s 에 남겼다" % rej)
+
+
+def swap_live(path, data, old, expect=None):
+    """★RULINGS DC1 — 살아 있는 지침을 data 로 바꾸되, **바꾸는 순간의 파일**이 읽었던 old 와 같을 때만 남긴다.
+    ① 후보를 같은 폴더 임시 파일에 다 쓴다(fsync · expect 로 다시 읽어 확인) ② 살아 있는 파일을 그 순간 그대로 옆 이름
+    (<path>.displaced.<UTC>)으로 옮긴다 ③ 후보를 덮지 않는 방식으로 제자리에 놓는다 — 그 사이 편집기가 새 파일을 만들었으면
+    그것이 이긴다 ④ 옮긴 파일을 old 와 대조 — 다르면(읽은 뒤에 저장됨) 되돌린다. ③·④ 의 경우 SourceChanged(호출부가 다시
+    읽어 처음부터 · 상한 뒤 보류). 저장된 바이트는 언제나 살아 있는 파일이나 옆 이름의 파일에 있다 — 어느 쪽에도 없는 경우는
+    없다. ②와 ③ 사이(이름 바꾸기 두 번 — 그 사이 다른 일 없음) 아주 짧게 살아 있는 이름이 비어 있다.
+    돌려주는 값 = 옮겨 둔 파일(교체 순간의 그 파일, old 와 같은 바이트) — 호출부가 백업·사본으로 쓰거나 지운다."""
+    tmp = write_temp(path, data, expect)
+    disp = side_name(path, "displaced")
+    try:
+        rename_away(path, disp)
+    except FileNotFoundError:
+        silent_unlink(tmp)
+        raise SourceChanged("살아 있는 지침이 사라졌다")
+    except BaseException:
+        silent_unlink(tmp)
+        raise
+    try:
+        place_new(tmp, path)
+    except FileExistsError:
+        silent_unlink(tmp)
+        settle_displaced(path, disp, old)
+        raise SourceChanged("교체 순간 새 지침이 저장됐다")
+    except BaseException:
+        try:
+            place_new(disp, path)       # 놓지 못했다 — 옮긴 파일을 제자리로(덮지 않음)
+        except OSError:
+            pass
+        silent_unlink(tmp)
+        raise
+    try:
+        same = read_bytes(disp) == old
+    except OSError:
+        same = False
+    if not same:
+        undo_swap(path, disp, data)
+        raise SourceChanged("읽은 뒤에 지침이 저장됐다")
+    return disp
 
 
 def set_aside(path):
@@ -1970,6 +2167,10 @@ def best_effort(fn, *args):
 T_HOLD_UNPROVEN = "CEO 승격 보류(본부 지침에 조립 구분선 — 승격 기록 없음)"
 T_HOLD_CHECK = "CEO 승격 보류(본부 지침 확인 필요)"
 T_DEMOTE_HOLD = "CEO 강등 보류(본부 지침 확인 필요)"
+T_HOLD_BUSY = "CEO 승격 보류(다른 승격·강등이 진행 중)"
+T_DEMOTE_BUSY = "CEO 강등 보류(다른 승격·강등이 진행 중)"
+T_HOLD_CHANGING = "CEO 승격 보류(본부 지침이 조립 중에 계속 바뀜)"
+T_DEMOTE_CHANGING = "CEO 강등 보류(본부 지침이 강등 중에 계속 바뀜)"
 SEP_LINE = "# [본문 — 표준 MASTER 운영 계약 전문]"
 
 
@@ -2105,12 +2306,44 @@ def pre_differs_text(pre_p):
             "본문에 반영하십시오." % pre_p)
 
 
+def locked_attempts(md, nf, once, busy_title, changing_title, action):
+    """★RULINGS DC1 — 잠금(상한 있는 대기) 안에서 once() 를 SourceChanged 가 나지 않을 때까지(최대 SWAP_ATTEMPTS 번) 다시 한다.
+    잠금을 못 잡으면 rc 8, 원본이 매번 바뀌면 rc 9 — 둘 다 보류(지침 무변경 · 알림 1건 · 호출부는 0 으로 끝난다)."""
+    try:
+        lk = take_lock(md)
+    except LockBusy:
+        err("CEO %s 보류: 승격 잠금(%s.promote.lock)을 %.0f 초 안에 잡지 못했다 — 다른 승격·강등이 진행 중이다. 잠금 없이 "
+            "진행하지 않는다(다음 확인 때 다시)" % (action, md, lock_wait_s()))
+        note(nf, busy_title, "본부 지침의 CEO %s을(를) 하려 했으나 다른 승격·강등이 잠금을 쥐고 있어 %.0f 초 안에 잡지 못했습니다. "
+                             "아무것도 바꾸지 않았고, 다음 승격 확인(부서 켜기·대기 틱) 때 다시 합니다. 같은 일이 계속되면 "
+                             "잠금 파일 %s.promote.lock 을 쥔 프로세스를 확인하십시오." % (action, lock_wait_s(), md))
+        return 8
+    try:
+        for n in range(SWAP_ATTEMPTS):
+            try:
+                return once()
+            except SourceChanged as e:
+                err("CEO %s: %s — 다시 읽어 처음부터 한다(%d/%d)" % (action, e, n + 1, SWAP_ATTEMPTS))
+        err("CEO %s 보류: 본부 지침이 %d번 연달아 읽은 뒤에 바뀌었다 — 아무것도 쓰지 않았다" % (action, SWAP_ATTEMPTS))
+        note(nf, changing_title, "본부 지침의 CEO %s을(를) 하는 동안 지침이 %d번 연달아 저장되어(편집 중) 아무것도 바꾸지 않고 "
+                                 "보류했습니다. 저장한 내용은 그대로 살아 있습니다. 편집을 마치면 다음 승격 확인 때 다시 "
+                                 "합니다." % (action, SWAP_ATTEMPTS))
+        return 9
+    finally:
+        lk.close()
+
+
 def do_compose(a):
     # a = tmpl md tmpl_sha(락 밖 상위집합 검사를 통과한 틀의 해시) [notice-file]
     # rc: 0 새 승격 · 12 다시 조립(머리말 갱신 · 0.14.x 이전) · 10 이미 현행 · 11 영수증/백업만 기록(지침 무변경)
     #     2 판독 불능 · 3 틀이 검사 뒤 바뀜 · 6 보류(지침 무변경 — 이유는 stderr + 알림)
+    #     8 잠금 대기 상한 초과 · 9 원본이 읽은 뒤에 계속 바뀜(★DC1 — 둘 다 보류: 지침 무변경 + 알림)
     tmpl, md, tsha = a[0], a[1], a[2]
     nf = a[3] if len(a) > 3 else ""
+    return locked_attempts(md, nf, lambda: compose_once(tmpl, md, tsha, nf), T_HOLD_BUSY, T_HOLD_CHANGING, "조립")
+
+
+def compose_once(tmpl, md, tsha, nf):
     d = os.path.dirname(md)
     pre_p, rec_p, leg_p = md + ".pre-ceo", os.path.join(d, RECEIPT), os.path.join(d, LEGACY_RECEIPT)
     if held_symlink(nf, md, pre_p, T_HOLD_CHECK):       # CB5 — 링크를 일반 파일로 바꾸지 않는다
@@ -2165,9 +2398,8 @@ def do_compose(a):
                 if not (rs == "valid" and rd["header_sha256"] == sha(H) and rd["separator"].encode("utf-8") == ms):
                     write_receipt(rec_p, H, ms, tail, mb)
                     wrote.append("영수증")
-                if pstate == "absent":
-                    write_atomic(pre_p, tail)   # A12·가드 4 불변식: 승격 중 .pre-ceo 는 실재한다(백업 = 지금 본문)
-                    wrote.append(".pre-ceo")
+                if pstate == "absent" and best_effort(write_new, pre_p, tail) is not None:
+                    wrote.append(".pre-ceo")    # 승격 중 .pre-ceo = 지금 본문(덮지 않는다 — 그 사이 생긴 것은 그대로)
                 if wrote and best_effort(drop, leg_p):
                     wrote.append("옛 영수증 정리")
                 # 현행 머리말 = 이 0.15.0 조립 자신의 결과다 — .pre-ceo 는 그때의 백업이고 CEO 동안 고친 본문과 다른 것이
@@ -2206,15 +2438,23 @@ def do_compose(a):
     if cand == mb:
         # 살아 있는 파일이 이미 그 조립 결과다 — 바이트를 옮기지 않고 영수증·백업만 맞춘다(rc 11 · 재주입 없음).
         if pstate == "absent":
-            write_atomic(pre_p, body)
+            best_effort(write_new, pre_p, body)
         write_receipt(rec_p, H, S, body, cand)
         best_effort(drop, leg_p)
         print("[cys-dept] CEO 지침은 그대로(이미 그 조립 결과) — 영수증 기록")
         return 11
-    kept = keep_copy(md + ".before-compose", mb) if keep else None
-    if pstate == "absent":
-        write_atomic(pre_p, body)       # 백업 = 이 조립에 쓴 사용자 본부 지침(조립된 바이트는 절대 넣지 않는다 — D-5)
-    write_atomic(md, cand, expect=lambda back: back == cand and split(back) == (H, S, body))
+    # ★DC1: 교체 순간의 파일이 읽은 mb 와 같을 때만 남는다(아니면 SourceChanged → 다시 읽어 처음부터). 옮겨 둔 파일이 곧
+    #   교체 순간의 그 파일이다 — 보관 사본·새 승격의 백업은 그 파일의 이름만 바꾼다(다시 쓰지 않는다).
+    disp = swap_live(md, cand, mb, expect=lambda back: back == cand and split(back) == (H, S, body))
+    kept = None
+    if keep:
+        kept = best_effort(keep_displaced, disp, md + ".before-compose") or disp
+    elif new and pstate == "absent" and best_effort(place_new, disp, pre_p) is not None:
+        pass                            # 새 승격: 백업 = 교체 순간의 사용자 본부 지침 그 파일(조립된 바이트는 절대 아님 — D-5)
+    else:
+        best_effort(os.unlink, disp)    # 머리말이 증명된 다시 조립 · 배포본 그대로인 옛 사본 — 남길 사용자 바이트가 없다
+    if pstate == "absent" and not pre_present(pre_p):
+        best_effort(write_new, pre_p, body)   # 백업 = 이 조립에 쓴 사용자 본부 지침(덮지 않는다)
     write_receipt(rec_p, H, S, body, cand)
     # ── 여기부터는 교체가 끝났다: 정리·알림의 실패는 결과(rc)를 바꾸지 않는다(CG2) ──
     best_effort(drop, leg_p)
@@ -2243,22 +2483,31 @@ def do_compose(a):
     return 0 if new else 12
 
 
-def dispose_backup(pre_p, pstate, pb, cur):
-    """강등 뒤 .pre-ceo — 지금 지침과 같으면 지우고, 다르거나 읽을 수 없으면 시각을 붙여 옮겨 둔다(백업일 뿐 · 승격 중에만
-    .pre-ceo 가 있게)."""
-    if pstate == "absent":
+def dispose_backup(pre_p, cur):
+    """강등 뒤 .pre-ceo — ★DC1: 먼저 **그 순간의 파일 그대로** 시각 붙은 이름으로 옮기고, 지금 지침과 같으면 그것을 지우고
+    다르거나 읽을 수 없으면 그 이름으로 남긴다(읽은 뒤에 고친 백업을 지우지 않는다 · 승격 중에만 .pre-ceo 가 있게)."""
+    if not pre_present(pre_p):
         return None
-    if pstate == "ok" and pb == cur:
-        drop(pre_p)
+    moved = set_aside(pre_p)
+    try:
+        same = os.path.isfile(moved) and not os.path.islink(moved) and read_bytes(moved) == cur
+    except OSError:
+        same = False
+    if same:
+        os.unlink(moved)
         return "삭제(지금 지침과 같음)"
-    return "보관 %s" % set_aside(pre_p)
+    return "보관 %s" % moved
 
 
 def do_demote(a):
     # a = tmpl md [notice-file] — rc: 0 강등 · 10 강등할 것 없음 · 6 보류(지침 무변경 + 알림) · 7 강등 불능(구분선·백업 없음)
-    #   · 2 판독 불능
+    #   · 2 판독 불능 · 8 잠금 대기 상한 초과 · 9 원본이 읽은 뒤에 계속 바뀜(★DC1 — 보류: 지침 무변경 + 알림)
     tmpl, md = a[0], a[1]
     nf = a[2] if len(a) > 2 else ""
+    return locked_attempts(md, nf, lambda: demote_once(tmpl, md, nf), T_DEMOTE_BUSY, T_DEMOTE_CHANGING, "강등")
+
+
+def demote_once(tmpl, md, nf):
     d = os.path.dirname(md)
     pre_p, rec_p, leg_p = md + ".pre-ceo", os.path.join(d, RECEIPT), os.path.join(d, LEGACY_RECEIPT)
     if held_symlink(nf, md, pre_p, T_DEMOTE_HOLD):      # CB5
@@ -2319,16 +2568,20 @@ def do_demote(a):
             keep = "migration"
     else:
         # 조립되지 않은 MASTER — 강등할 것이 없다. 남은 백업·영수증만 정리한다(승격 중에만 .pre-ceo 가 있게).
-        moved = best_effort(dispose_backup, pre_p, pstate, pb, mb)
+        moved = best_effort(dispose_backup, pre_p, mb)
         best_effort(drop, rec_p)
         best_effort(drop, leg_p)
         if moved:
             print("[cys-dept] 승격 백업 정리(지침은 이미 표준 MASTER): .pre-ceo %s" % moved)
         return 10
-    kept = keep_copy(md + ".before-demote", mb) if keep else None
-    write_atomic(md, new_md, expect=lambda back: back == new_md)
+    disp = swap_live(md, new_md, mb, expect=lambda back: back == new_md)   # ★DC1 — 교체 순간의 파일이 읽은 mb 일 때만
     # ── 교체 끝: 정리·알림 실패는 결과를 바꾸지 않는다(CG2) ──
-    moved = best_effort(dispose_backup, pre_p, pstate, pb, new_md)
+    kept = None
+    if keep:
+        kept = best_effort(keep_displaced, disp, md + ".before-demote") or disp
+    else:
+        best_effort(os.unlink, disp)
+    moved = best_effort(dispose_backup, pre_p, new_md)
     best_effort(drop, rec_p)   # ★승격 영수증 삭제(G0 D3) — 강등=승격 사실 소멸. 강등 불능(rc 7)·보류(rc 6)에선 지우지 않는다.
     best_effort(drop, leg_p)
     print("[cys-dept] CEO 강등 원본: %s%s%s" % (via, " · CEO 지침 사본 %s" % kept if kept else "",
@@ -2438,7 +2691,7 @@ CEO_NOTICE_CLOSE_DECISION="ceo-promoted"
 ceo_notices_close(){
   local ids id n=0
   ids="$(env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
-    | awk -F'\t' '$2=="[pending]" && ($4=="CEO 승격 보류(부트 필요)" || $4=="CEO 승격 대기" || $4=="CEO 승격 보류(템플릿 상위집합 검사 실패)" || $4=="CEO 승격 보류(영수증 손상)" || $4=="CEO 승격 보류(본부 지침에 조립 구분선 — 승격 기록 없음)" || $4=="CEO 승격 보류(본부 지침 확인 필요)"){print $1}')" \
+    | LC_ALL=C awk -F'\t' '$2=="[pending]" && ($4=="CEO 승격 보류(부트 필요)" || $4=="CEO 승격 대기" || $4=="CEO 승격 보류(템플릿 상위집합 검사 실패)" || $4=="CEO 승격 보류(영수증 손상)" || $4=="CEO 승격 보류(본부 지침에 조립 구분선 — 승격 기록 없음)" || $4=="CEO 승격 보류(본부 지침 확인 필요)" || $4=="CEO 승격 보류(다른 승격·강등이 진행 중)" || $4=="CEO 승격 보류(본부 지침이 조립 중에 계속 바뀜)"){print $1}')" \
     || return 0
   for id in $ids; do
     [ "$n" -lt 20 ] || break
@@ -2450,9 +2703,12 @@ ceo_notices_close(){
 }
 # ★0.15.0 T8(RULINGS CB2·CB3·CB5): ceo_py 가 남긴 알림(파일 한 줄 = NOTICE\t제목\t본문)을 제목 완전일치 dedupe 로
 #   1건만 올린다(A11 동형 · kind=ceo-notice · 조회 실패 = fail-open). 파일 경로는 인자로만 넘긴다(MSYS 경로 변환은 argv 뿐).
+# ★T8b: 제목 비교는 바이트 그대로(LC_ALL=C) — 맥의 /usr/bin/awk(20200816)는 en_US.UTF-8 에서 문자열 == 을 strcoll 로 비교해
+#   한글만 다른 두 제목('CEO 승격 보류(…)' 와 'CEO 강등 보류(…)')을 같다고 본다(실측: 이 맥 · LC_ALL=en_US.UTF-8 → MATCH,
+#   C·ko_KR.UTF-8 → no). 그러면 다른 알림이 '이미 보관 중'으로 잘못 걸러지거나 닫힌다. 이 파일의 제목 비교 awk 는 전부 LC_ALL=C.
 ceo_notice_once(){  # $1=제목 $2=본문
   if ! env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
-       | awk -F'\t' -v t="$1" '$4==t{found=1} END{exit !found}'; then
+       | LC_ALL=C awk -F'\t' -v t="$1" '$4==t{found=1} END{exit !found}'; then
     env -u CYS_SOCKET "$CYS" feed push --title "$1" --body "$2" --kind ceo-notice >/dev/null 2>&1 || true
   fi
   return 0
@@ -2461,7 +2717,7 @@ ceo_notice_once(){  # $1=제목 $2=본문
 ceo_demote_notices_close(){
   local ids id n=0
   ids="$(env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
-    | awk -F'\t' '$2=="[pending]" && ($4=="CEO 강등 보류(본부 지침 확인 필요)" || $4=="CEO 강등 불능(구분선·백업 없음)"){print $1}')" \
+    | LC_ALL=C awk -F'\t' '$2=="[pending]" && ($4=="CEO 강등 보류(본부 지침 확인 필요)" || $4=="CEO 강등 불능(구분선·백업 없음)" || $4=="CEO 강등 보류(다른 승격·강등이 진행 중)" || $4=="CEO 강등 보류(본부 지침이 강등 중에 계속 바뀜)"){print $1}')" \
     || return 0
   for id in $ids; do
     [ "$n" -lt 20 ] || break
@@ -2511,7 +2767,7 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
     #   구 kind=permission 잔존 항목도 제목으로 잡는다) + kind=ceo-notice(**기존** --kind 플래그 — 구 바이너리도 앎 →
     #   모르는 플래그 폴백 폭주 0). 조회 실패(데몬 미기동) = fail-open(종전대로 발행).
     if ! env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
-         | awk -F'\t' '$4=="CEO 승격 보류(부트 필요)"{found=1} END{exit !found}'; then
+         | LC_ALL=C awk -F'\t' '$4=="CEO 승격 보류(부트 필요)"{found=1} END{exit !found}'; then
       env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 보류(부트 필요)" \
         --body "부서가 생성되었으나 base master가 아직 부트되지 않았습니다. base에서 '너는 마스터다' 또는 '마스터 시작' 버튼으로 부트를 완료하면 명령 팔레트의 'CEO 승격 진행'으로 승인할 수 있습니다." --kind ceo-notice >/dev/null 2>&1 || true
     fi
@@ -2525,9 +2781,12 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
   if [ "$_composed" -eq 0 ] && ! ceo_pre_present "$md.pre-ceo" && [ "${1:-}" != "consented" ]; then _auto=1; fi
   # ★동시 승격 직렬화(2026-07-15 적대검증 D-5): 두 promote가 겹치면 두 번째가 "pre-ceo 없음"을
   # 읽은 뒤 첫 번째의 cp(ceo→md) 이후 실행돼 CEO 템플릿을 .pre-ceo로 복사→ceo_demote 원복 불능.
-  # flock으로 백업+교체를 원자화(flock 미설치 환경은 그대로 진행 — 인간 페이스 더블클릭은 저위험).
-  # ★0.15.0 T8: 조립은 .pre-ceo 를 '조립되지 않은 MASTER 바이트'로만 쓰고(조립된 바이트는 절대 백업에 넣지 않는다),
-  #   지침·영수증은 원자 교체라 락이 없어도 섞인 파일이 생기지 않는다 — 락은 그대로 둔다(같은 입력이면 같은 바이트).
+  # ★0.15.0 T8b(RULINGS DC1): 그 직렬화는 이제 ceo_py 안의 **진짜 잠금**이다 — 모든 플랫폼에서, 대기에 상한(기본 10 초 ·
+  #   CYS_CEO_LOCK_WAIT_S)이 있고 '잠금 없이 진행'하는 갈래가 없다(종전: 맥·윈도우는 flock 명령이 없어 mkdir 잠금을 쓰고, 못
+  #   잡으면 경고 뒤 무잠금 진행 · 리눅스 flock 은 대기 상한 없음). POSIX = 잠금 파일 $md.promote.lock 의 flock(2)(맥 포함 ·
+  #   리눅스 flock 명령과 같은 잠금), 윈도우 = msvcrt.locking(같은 파일) — 둘 다 프로세스가 끝나면 풀린다. 못 잡으면 rc 8 =
+  #   보류(지침 무변경 · 알림 1건) — 아래 보류 블록이 받고 이 함수는 그래도 0 이다. 교체는 '교체 순간의 파일이 읽은 바이트일
+  #   때만'(swap_live) — 읽은 뒤에 저장된 편집은 살아 있는 파일이나 옆 이름의 파일에 남는다.
   #   임계 구간을 복사만큼 짧게(설계 §6-14 윈도우): 무거운 상위집합 검사(i)는 락 **밖**에서 한 번 하고, 락 안에서는
   #   틀의 해시가 검사 때와 같은지만 다시 본다(검사·조립 원자성 유지).
   local _tsha="" _pre_rc=0 _nf=""
@@ -2541,20 +2800,7 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
     ceo_py compose "$ceo" "$md" "$_tsha" "$_nf"
   }
   local _swap_rc=0
-  if command -v flock >/dev/null 2>&1; then
-    ( flock 9; _swap ) 9>"$md.promote.lock" || _swap_rc=$?
-  else
-    # ★A13(win): PortableGit엔 flock CLI가 없어 종전엔 무락(D-5 동시 승격 레이스 방어 부재) —
-    #   mkdir 원자 락 폴백(원자적 mkdir 성공=락 획득). 획득 실패=경고 후 진행(현행 무락보다 강화·
-    #   인간 페이스 더블클릭은 저위험이라 차단하지 않는다 — 잔존 락은 수동 rmdir 안내).
-    if mkdir "$md.promote.lock.d" 2>/dev/null; then
-      _swap || _swap_rc=$?
-      rmdir "$md.promote.lock.d" 2>/dev/null || true
-    else
-      echo "[cys-dept] WARN: 승격 락($md.promote.lock.d) 획득 실패 — 동시 승격 의심, 무락 진행(잔존 락은 rmdir로 정리)" >&2
-      _swap || _swap_rc=$?
-    fi
-  fi
+  _swap || _swap_rc=$?   # ★DC1: 잠금은 ceo_py compose 안(take_lock — 상한 있는 대기 · 무잠금 진행 없음)
   # ★T8: 조립 rc 10·11·12 도 성공이다(지침 무변경·영수증/백업 기록·머리말 재조립) — 보류 판정은 그 밖의 rc 만 본다.
   #   조립 rc 자체는 아래 성공 문구·재주입·자동 알림 판정이 쓴다.
   local _comp_rc="$_swap_rc"
@@ -2579,12 +2825,12 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
       echo "[cys-dept] ★CEO 승격 보류(DCE-3 상위집합 검사 실패) — CEO_TEMPLATE 이 '생성된 머리말(CEO 표지 3핀) + 조립 구분선 + 표준 MASTER 전문'이 아니다(스텁/반쪽 틀 의심 — 반쪽마스터 재발 차단 · 위 stderr 에 이유). 조립은 사용자 본부 지침을 그대로 쓰므로 본부 지침을 고친 것은 보류 사유가 아니다. 해소: 팩 갱신(cys init-pack) 또는 scripts/gen_ceo_template.py 재합성으로 틀을 되살린 뒤 재시도. 지침·.pre-ceo·영수증은 그대로다. PENDING 유지." >&2
       # 비대기 feed — 제목 완전일치 dedupe(A11 동형): 주기 집행 틱이 10분마다 재밀어도 적체 0.
       if ! env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
-           | awk -F'\t' '$4=="CEO 승격 보류(템플릿 상위집합 검사 실패)"{found=1} END{exit !found}'; then
+           | LC_ALL=C awk -F'\t' '$4=="CEO 승격 보류(템플릿 상위집합 검사 실패)"{found=1} END{exit !found}'; then
         env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 보류(템플릿 상위집합 검사 실패)" \
           --body "CEO_TEMPLATE.md 가 '생성된 머리말 + 조립 구분선 + 표준 MASTER 전문'이 아니어서(스텁·반쪽 틀) 승격을 보류했습니다 — 반쪽마스터 재발 경로 차단. 승격은 이 틀의 머리말에 사용자 본부 지침을 그대로 붙이는 조립이라, 본부 지침을 고친 것은 보류 사유가 아닙니다. 해소: 팩 갱신(cys init-pack) 또는 gen_ceo_template.py 재합성으로 틀을 되살린 뒤 재시도. 본부 지침은 바뀌지 않았고 승격 대기(PENDING)는 유지됩니다." --kind ceo-notice >/dev/null 2>&1 || true
       fi
     else
-      echo "[cys-dept] WARN: CEO 조립 미완(rc=$_swap_rc) — 승격 보류·PENDING 유지. 위 stderr 의 이유(판독·쓰기 오류, 승격 기록 없는 구분선 줄, 심볼릭 링크, 사용자 본부 지침 불명 — rc 6 은 알림 1건도 남긴다)를 점검한 뒤 재시도. 지침은 원자 교체로만 바뀌므로 반쪽 파일은 없다." >&2
+      echo "[cys-dept] WARN: CEO 조립 미완(rc=$_swap_rc) — 승격 보류·PENDING 유지. 위 stderr 의 이유(판독·쓰기 오류, 승격 기록 없는 구분선 줄, 심볼릭 링크, 사용자 본부 지침 불명 · rc 8 = 다른 승격·강등이 잠금을 쥐고 있어 대기 상한 초과 · rc 9 = 지침이 조립 중에 계속 저장됨 — rc 6·8·9 는 알림 1건도 남긴다)를 점검한 뒤 재시도. 지침은 교체 순간의 파일이 읽은 바이트일 때만 바뀌므로 반쪽 파일도, 사라진 저장도 없다." >&2
     fi
     return 0
   fi
@@ -2615,20 +2861,13 @@ ceo_demote(){
   # ★0.15.0 T8(C11 11.8 · 설계 §4-14): 강등 = 구분선 뒤의 바이트(CEO 동안 고친 본문도 남는다). .pre-ceo 는 백업일 뿐
   #   원본이 아니다 — 쓰이는 것은 구분선이 없는 옛 CEO 사본(먼저 시각 붙여 보관)과 0.14.x 통째 복사본이 그대로인 경우뿐.
   #   강등 뒤 .pre-ceo 는 지금 지침과 같으면 지우고 다르면 시각을 붙여 옮긴다(승격 중에만 .pre-ceo 가 있게 — A12·가드 4).
-  #   승격과 같은 락(D-5) 안에서 한다 — 강등과 승격이 겹쳐도 섞인 파일이 생기지 않는다.
+  #   승격과 같은 락(D-5) 안에서 한다 — 강등과 승격이 겹쳐도 섞인 파일이 생기지 않는다. ★DC1: 그 락은 ceo_py 안의 진짜
+  #   잠금(상한 있는 대기 · 무잠금 진행 없음 — ceo_promote 의 주석) · 못 잡으면 rc 8 = 강등 보류(지침 무변경 · 알림 1건).
   local _nf=""
   _nf="$(mktemp "${TMPDIR:-/tmp}/cys-ceo-notice.XXXXXX" 2>/dev/null)" || _nf=""
   _demote_swap(){ ceo_py demote "$ceo" "$md" "$_nf"; }
   local _rc=0
-  if command -v flock >/dev/null 2>&1; then
-    ( flock 9; _demote_swap ) 9>"$md.promote.lock" || _rc=$?
-  elif mkdir "$md.promote.lock.d" 2>/dev/null; then
-    _demote_swap || _rc=$?
-    rmdir "$md.promote.lock.d" 2>/dev/null || true
-  else
-    echo "[cys-dept] WARN: 승격 락($md.promote.lock.d) 획득 실패 — 동시 승격·강등 의심, 무락 진행(잔존 락은 rmdir로 정리)" >&2
-    _demote_swap || _rc=$?
-  fi
+  _demote_swap || _rc=$?
   ceo_notices_from "$_nf"   # ★CB5: 강등 보류(rc 6)·보관 사본도 알림 1건(제목 dedupe) — stderr 만으로 끝내지 않는다
   case "$_rc" in
     0)
@@ -2646,7 +2885,7 @@ ceo_demote(){
         --body "부서 0개 도달로 CEO 강등을 시도했으나 본부 지침이 구분선 없는 옛 CEO 지침이고 승격 전 본부 지침 백업(MASTER_DIRECTIVE.md.pre-ceo)도 없어 표준 master로 원복하지 못했습니다. 지침은 바뀌지 않았습니다. preflight C03 의 MASTER 핀 행이 빠진 조항과 '★복원 절차'(먼저 사본을 남기고 오너에게 보고해 지시에 따라 복구)를 보입니다 — 그 절차를 따르십시오." --kind ceo-notice >/dev/null 2>&1 \
         || echo "[cys-dept] WARN: 강등 불능 알림 push 실패(데몬 미기동?) — 위 stderr 경보가 유일 흔적" >&2 ;;
     *)
-      echo "[cys-dept] WARN: CEO 강등 보류(rc=$_rc) — 위 stderr 의 이유를 점검하라(rc 6 은 알림 'CEO 강등 보류(본부 지침 확인 필요)' 1건도 남긴다). 지침은 그대로다(부서 흐름 불파괴)" >&2 ;;
+      echo "[cys-dept] WARN: CEO 강등 보류(rc=$_rc) — 위 stderr 의 이유를 점검하라(rc 6 은 알림 'CEO 강등 보류(본부 지침 확인 필요)', rc 8 은 '…(다른 승격·강등이 진행 중)', rc 9 는 '…(본부 지침이 강등 중에 계속 바뀜)' 1건도 남긴다). 지침은 그대로다(부서 흐름 불파괴)" >&2 ;;
   esac
   return 0
 }
@@ -4034,7 +4273,7 @@ EOF
         #   `id\t[status]\tkind\ttitle\tdecision=x`(javis_cycle_verifier.parse_feed_list 실측 형식 —
         #   제목=4번째 탭 필드). 조회 실패(데몬 미기동 등)=fail-open(현행대로 재발행).
         if env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
-             | awk -F'\t' '$4=="CEO 승격 대기"{found=1} END{exit !found}'; then
+             | LC_ALL=C awk -F'\t' '$4=="CEO 승격 대기"{found=1} END{exit !found}'; then
           echo "[cys-dept] CEO 승격 대기 알림 이미 pending — 재발행 생략(A11 dedupe)"
         else
           # ★(0.14.41 U4 C2 ⑤) push 실패를 '발행' 으로 적지 않는다 — 종전 `|| true` 뒤 무조건

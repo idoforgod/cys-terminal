@@ -123,6 +123,18 @@ def extract_shell_function(src, name):
     return m.group(0)
 
 
+def ceo_py_module():
+    """cys-dept 의 ceo_py 파이썬 원문(heredoc)을 그대로 모듈로 싣는다 — 마지막 `sys.exit(main(sys.argv))` 한 줄만 뺀다.
+    시험이 그 안의 함수 하나를 감싸 '읽은 뒤·쓰기 전'에 사용자 저장을 끼워 넣을 수 있게(결정론 끼어들기 · 제품 시험 이음매 없음)."""
+    src = extract_shell_function(_slurp(DEPT, encoding="utf-8"), "ceo_py")
+    body = src.split("<<'PY'\n", 1)[1].rsplit("\nPY\n", 1)[0]
+    tail = "sys.exit(main(sys.argv))"
+    assert body.rstrip().endswith(tail), "ceo_py 원문의 끝이 바뀌었다"
+    ns = {"__name__": "ceo_py_under_test"}
+    exec(compile(body.rstrip()[: -len(tail)], DEPT + ":ceo_py", "exec"), ns)
+    return ns
+
+
 class Rig(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ceo-comp-")
@@ -479,47 +491,49 @@ class Composition(Rig):
         self.assertEqual(self.leftovers(), [])
 
     def test_concurrent_promotion_lock_is_taken(self):
-        """H-14-N2-01: 동시 승격 락(D-5) — flock 이 있으면 잡힌 락 뒤에서 기다리고, 없으면(mac·PortableGit) mkdir 락을
-        잡으며, 남이 쥔 락은 경고 후 무락 진행(종전 계약)한다. 락을 지우는 변이는 이 시험이 잡는다."""
+        """H-14-N2-01 ★RULINGS DC1 로 다시 씀: 동시 승격 락(D-5)은 모든 플랫폼에서 진짜 잠금이다 — 잡힌 잠금 뒤에서 상한까지
+        기다리고, 그 안에 풀리면 이어서 조립한다. (종전 시험의 mkdir 갈래 — '남이 쥔 락이면 경고 뒤 무락 진행'을 성공으로
+        기대 — 은 DC1 이 금지한 동작이라 지웠다: 잡혀 있으면 이제 보류다 → LockIsReal.) 실제 ceo_py 코드를 싣고, 잠금 대기의
+        첫 쉼(time.sleep)을 사건으로 받아 '기다리는 중'을 판정한다 — 시간이 아니라."""
+        import threading
+        try:
+            import fcntl
+        except ImportError:
+            self.skipTest("fcntl 없는 플랫폼")
         self.seed()
         md = self.p("MASTER_DIRECTIVE.md")
-        path_dirs = [self.bindir, "/opt/homebrew/bin", "/usr/local/bin"] + self.env["PATH"].split(os.pathsep)
-        if shutil.which("flock", path=os.pathsep.join(path_dirs)):
-            import fcntl
-            fd = os.open(md + ".promote.lock", os.O_RDWR | os.O_CREAT, 0o644)
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            proc = subprocess.Popen(["bash", DEPT, "promote-ceo"], env=self.env,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            try:
-                # 사건으로 판정한다(시간이 아니라): 승격 프로세스 트리에 `flock` 이 나타나면 그 순간 승격은 락 앞에서
-                # 막혀 있다 — 락을 쥔 동안 끝날 수도, 지침을 바꿀 수도 없다. 락을 지우는 변이는 `flock` 이 끝내 안 나타난다.
-                deadline = time.monotonic() + 60
-                while "flock" not in _descendant_names(proc.pid):
-                    self.assertIsNone(proc.poll(), "락이 잡혀 있는데 승격이 락 없이 끝났다(락 제거)")
-                    self.assertLess(time.monotonic(), deadline, "승격이 락에 닿지 않았다")  # wallclock: guard the promotion always reaches its lock; 60 s only ends a hang
-                    time.sleep(0.05)
-                self.assertIsNone(proc.poll(), "락이 잡혀 있는데 승격이 끝났다(락 없음)")
-                self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "락 밖에서 지침이 바뀌었다")
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
-            self.assertEqual(proc.wait(timeout=120), 0)
-            proc.stdout.close()
-            proc.stderr.close()
-        else:
-            os.mkdir(md + ".promote.lock.d")       # 남이 쥔 락
-            rc, out, err = self.run_dept("promote-ceo")
-            self.assertEqual(rc, 0, out + err)
-            self.assertIn("승격 락(", err, "mkdir 락을 시도하지 않았다(락 제거 변이)")
-            self.assertTrue(os.path.isdir(md + ".promote.lock.d"), "남의 락을 지웠다")
-            os.rmdir(md + ".promote.lock.d")
-            # 강등도 같은 락을 잡는다.
-            os.mkdir(md + ".promote.lock.d")
-            rc, out, err = self.run_dept("down", "d0")
-            self.assertEqual(rc, 0, out + err)
-            self.assertIn("승격 락(", err)
-            os.rmdir(md + ".promote.lock.d")
-        self.assertFalse(os.path.exists(md + ".promote.lock.d"), "제 락을 풀지 않았다")
+        fd = os.open(md + ".promote.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        ns = ceo_py_module()
+        waiting = threading.Event()
+        real_time = ns["time"]
+
+        class Clock:
+            def __getattr__(self, name):
+                return getattr(real_time, name)
+
+            @staticmethod
+            def sleep(s):
+                waiting.set()
+                real_time.sleep(s)
+        ns["time"] = Clock()
+        os.environ["CYS_CEO_LOCK_WAIT_S"] = "60"
+        self.addCleanup(os.environ.pop, "CYS_CEO_LOCK_WAIT_S", None)
+        out = {}
+        t = threading.Thread(target=lambda: out.setdefault("rc", ns["do_compose"](
+            [self.p("CEO_TEMPLATE.md"), md, sha(TEMPLATE), ""])))
+        t.start()
+        try:
+            self.assertTrue(waiting.wait(60), "조립이 잠금에 닿지 않았다")  # wallclock: guard 60 s only ends a hang; the verdict is the event
+            self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "잠금이 잡혀 있는데 지침을 바꿨다(잠금 없음)")
+            self.assertTrue(t.is_alive(), "잠금이 잡혀 있는데 조립이 끝났다")
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            t.join(120)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(out.get("rc"), 0, "잠금이 풀린 뒤 조립하지 않았다")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER)
 
     def test_concurrent_promotions_give_one_valid_composition(self):
         """E-6-11: 동시에 여러 번 승격해도 결과는 한 가지 조립이고 백업은 사용자 지침(CEO 사본 아님 — D-5) · 전부 exit 0."""
@@ -568,6 +582,21 @@ class Composition(Rig):
         self.assertIn("cys feed reply rid-r ceo-promoted", self.calls(), "남은 보류 알림을 닫지 않았다")
         self.assert_receipt_for(HEADER, USER, self.read("MASTER_DIRECTIVE.md"))
         self.assertFalse(os.path.exists(self.pending_path()), "승격된 기계의 PENDING 이 남았다")
+
+    def test_title_dedupe_is_bytewise(self):
+        """★T8b: 알림 제목 비교는 바이트 그대로다 — 맥의 /usr/bin/awk 는 en_US.UTF-8 에서 문자열 == 을 strcoll 로 비교해 한글만
+        다른 두 제목을 같다고 봤다(보관 중인 'CEO 승격 보류(…)' 때문에 'CEO 강등 보류(…)' 를 올리지 않음). 그 로캘로 잰다."""
+        self.seed()
+        self.env["LC_ALL"] = "en_US.UTF-8"
+        _write(self.feedlist, "rid-p\t[pending]\tceo-notice\tCEO 승격 보류(다른 승격·강등이 진행 중)\tdecision=-\n")
+        funcs = extract_shell_function(_slurp(DEPT, encoding="utf-8"), "ceo_notice_once")
+        r = subprocess.run(["bash", "-c", "CYS=cys\n" + funcs + 'ceo_notice_once "$1" "본문"\n', DEPT,
+                            "CEO 강등 보류(다른 승격·강등이 진행 중)"], capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.pushes("CEO 강등 보류(다른 승격·강등이 진행 중)"), 1, "다른 제목을 같은 제목으로 걸렀다(strcoll)")
+        r = subprocess.run(["bash", "-c", "CYS=cys\n" + funcs + 'ceo_notice_once "$1" "본문"\n', DEPT,
+                            "CEO 승격 보류(다른 승격·강등이 진행 중)"], capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertEqual(self.pushes("CEO 승격 보류(다른 승격·강등이 진행 중)"), 0, "보관 중인 같은 제목을 또 올렸다")
 
     def test_successful_demotion_closes_demote_hold_notices(self):
         """★CG2: 강등이 끝나면 '강등 보류'·'강등 불능' 알림의 사유가 사라진다 — 비허가 결정(ceo-demoted)으로 닫는다.
@@ -706,6 +735,186 @@ class ReceiptlessComposition(Rig):
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER + self.EDIT, "낡은 .pre-ceo 로 강등했다")
         self.assertEqual([_slurp(k, encoding="utf-8") for k in glob.glob(self.p("MASTER_DIRECTIVE.md.pre-ceo.*"))],
                          [stale])
+
+
+class SaveDuringSwap(Rig):
+    """★RULINGS DC1 — 승격·강등은 이제 살아 있는 지침이 아닌 본문을 쓰지 않는다: 원본을 읽은 뒤·교체 전에 사용자 저장이
+    끼어들면 그 새 바이트는 살아 있는 파일이나 백업 어딘가에 있다(어느 쪽에도 없는 경우는 없다). 실제 ceo_py 코드를 모듈로
+    싣고 교체 직전의 함수를 감싸 저장을 결정론으로 끼워 넣는다."""
+    EDIT = "USERSAVE-DC1 교체 직전에 저장한 줄\n"
+
+    def everywhere(self):
+        """살아 있는 파일 + 디렉티브 폴더의 모든 백업·사본(이름이 MASTER_DIRECTIVE.md 로 시작하는 파일) 바이트."""
+        out = {}
+        for f in os.listdir(self.dirs):
+            if f.startswith("MASTER_DIRECTIVE.md") and not f.endswith(".lock") and os.path.isfile(self.p(f)):
+                out[f] = _slurp(self.p(f), encoding="utf-8")
+        return out
+
+    def hook_first_live_write(self, ns, save):
+        """살아 있는 MASTER 를 처음 건드리는 함수(지금 코드: swap_live · 종전 코드: write_atomic)에 들어가기 직전 save() 1회."""
+        md = self.p("MASTER_DIRECTIVE.md")
+        name = "swap_live" if "swap_live" in ns else "write_atomic"
+        orig = ns[name]
+        fired = []
+
+        def wrapped(path, *a, **kw):
+            if os.path.abspath(path) == os.path.abspath(md) and not fired:
+                fired.append(1)
+                save()
+            return orig(path, *a, **kw)
+        ns[name] = wrapped
+        return fired
+
+    def save_in_place(self, text):
+        with open(self.p("MASTER_DIRECTIVE.md"), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def save_by_rename(self, text):
+        tmp = self.p("MASTER_DIRECTIVE.md.editor-tmp")
+        _write(tmp, text)
+        os.replace(tmp, self.p("MASTER_DIRECTIVE.md"))
+
+    def test_save_between_read_and_promotion_write_is_never_lost(self):
+        for how in ("in-place", "rename"):
+            with self.subTest(save=how):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                ns = ceo_py_module()
+                saver = self.save_in_place if how == "in-place" else self.save_by_rename
+                fired = self.hook_first_live_write(ns, lambda: saver(USER + self.EDIT))
+                rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), ""])
+                self.assertEqual(fired, [1], "끼어들기가 일어나지 않았다(시험 무효)")
+                held = [k for k, v in self.everywhere().items() if self.EDIT in v]
+                self.assertTrue(held, "교체 직전 저장(%s)이 살아 있는 파일에도 백업에도 없다: rc=%r %r"
+                                % (how, rc, self.everywhere()))
+                live = self.read("MASTER_DIRECTIVE.md")
+                if rc in (0, 12):
+                    self.assertIn(self.EDIT, live, "승격이 끝났는데 살아 있는 지침이 저장 전 본문이다(DC1)")
+                    self.assertEqual(live, HEADER + SEP + USER + self.EDIT)
+                    self.assertEqual(self.read("MASTER_DIRECTIVE.md.pre-ceo"), USER + self.EDIT,
+                                     "백업이 저장 전 본문이다 — 승격 전 본부 지침은 저장된 것이다")
+                else:
+                    self.assertEqual(live, USER + self.EDIT, "보류했는데 저장한 파일이 살아 있지 않다")
+
+    def test_save_while_the_live_name_is_empty_wins(self):
+        """교체의 두 단계 사이(살아 있는 이름이 비어 있는 순간)에 편집기가 새 파일을 만들면 그 파일이 이긴다 — 덮지 않는다."""
+        self.seed()
+        ns = ceo_py_module()
+        self.assertIn("place_new", ns, "교체가 '덮지 않는 자리 놓기'를 쓰지 않는다")
+        orig = ns["place_new"]
+        md = self.p("MASTER_DIRECTIVE.md")
+        fired = []
+
+        def wrapped(src, dst):
+            if os.path.abspath(dst) == os.path.abspath(md) and not fired:
+                fired.append(1)
+                _write(md, USER + self.EDIT)
+            return orig(src, dst)
+        ns["place_new"] = wrapped
+        rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), md, sha(TEMPLATE), ""])
+        self.assertEqual(fired, [1])
+        self.assertEqual(rc, 0, "다시 읽어 저장된 본문으로 승격해야 한다")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER + self.EDIT)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md.pre-ceo"), USER + self.EDIT)
+        self.assertEqual([f for f in os.listdir(self.dirs) if ".displaced" in f], [], "옮겨 둔 옛 파일이 남았다")
+
+    def test_save_between_read_and_demotion_write_is_never_lost(self):
+        self.seed()
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        composed = self.read("MASTER_DIRECTIVE.md")
+        ns = ceo_py_module()
+        fired = self.hook_first_live_write(ns, lambda: self.save_in_place(composed + self.EDIT))
+        rc = ns["do_demote"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), ""])
+        self.assertEqual(fired, [1])
+        held = [k for k, v in self.everywhere().items() if self.EDIT in v]
+        self.assertTrue(held, "강등 직전 저장이 살아 있는 파일에도 백업에도 없다: rc=%r %r" % (rc, self.everywhere()))
+        if rc == 0:
+            self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER + self.EDIT,
+                             "강등이 저장 전 본문을 돌려줬다(DC1)")
+
+    def test_retries_are_bounded_and_end_in_a_hold(self):
+        """원본이 매번 바뀌면 정해진 횟수만 다시 하고 보류한다(아무것도 쓰지 않음 · 알림 1건) — 끝없는 재시도 없음."""
+        self.seed()
+        ns = ceo_py_module()
+        orig = ns["swap_live"]
+        n = []
+
+        def always_changing(path, *a, **kw):
+            n.append(1)
+            self.save_in_place(USER + "CHANGE %d\n" % len(n))
+            return orig(path, *a, **kw)
+        ns["swap_live"] = always_changing
+        nf = os.path.join(self.tmp, "nf.txt")
+        rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), nf])
+        self.assertEqual(rc, 9, "계속 바뀌는 원본에서 보류(rc 9)가 아니다")
+        self.assertLessEqual(len(n), 3, "재시도 상한이 없다")
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER + "CHANGE %d\n" % len(n), "마지막 저장이 살아 있지 않다")
+        self.assertIsNone(self.read(".ceo-receipt.json"))
+        self.assertIn("CEO 승격 보류(본부 지침이 조립 중에 계속 바뀜)", _slurp(nf, encoding="utf-8"))
+
+
+class LockIsReal(Rig):
+    """★RULINGS DC1 — 승격·강등은 진짜 잠금(POSIX: 잠금 파일의 flock(2) · 윈도우: msvcrt.locking)을 상한 있는 대기로 잡는다.
+    시간 안에 못 잡으면 '잠금 없이 진행'하지 않고 보류한다(알림 1건 · 지침 무변경) — 스크립트는 그래도 0 으로 끝난다."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import fcntl  # noqa: F401
+        except ImportError:
+            self.skipTest("fcntl 없는 플랫폼 — 윈도우의 msvcrt 잠금은 이 맥에서 잴 수 없다")
+        self.env["CYS_CEO_LOCK_WAIT_S"] = "1"
+
+    def hold_lock(self):
+        import fcntl
+        fd = os.open(self.p("MASTER_DIRECTIVE.md.promote.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+        return fd
+
+    def test_a_held_lock_holds_promotion_and_demotion(self):
+        import fcntl
+        self.seed()
+        fd = self.hold_lock()
+        title = "CEO 승격 보류(다른 승격·강등이 진행 중)"
+        for args in (("promote-ceo",), ("launch", "d0")):
+            rc, out, err = self.run_dept(*args)
+            self.assertEqual(rc, 5 if args == ("promote-ceo",) else 0, out + err)
+            self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "잠금을 못 잡았는데 지침을 바꿨다(무잠금 진행)")
+            self.assertIsNone(self.read("MASTER_DIRECTIVE.md.pre-ceo"))
+            self.register()
+        self.assertEqual(self.pushes(title), 2, "보류 알림이 없다(데몬이 보관 중이 아니면 매번 1건)")
+        _write(self.feedlist, "rid-l\t[pending]\tceo-notice\t%s\tdecision=-\n" % title)
+        self.assertEqual(self.run_dept("launch", "d0")[0], 0)
+        self.assertEqual(self.pushes(title), 2, "보관 중인 보류 알림을 또 올렸다(폭주)")
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        rc, out, err = self.run_dept("promote-ceo")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER)
+        self.assertIn("cys feed reply rid-l ceo-promoted", self.calls(), "잠금 보류 알림이 승격 뒤에 남았다")
+        # 강등도 같은 잠금 — 잡혀 있으면 보류(지침 무변경 · 알림), 풀리면 강등.
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        rc, out, err = self.run_dept("down", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER, "잠금을 못 잡았는데 강등했다")
+        self.assertEqual(self.pushes("CEO 강등 보류(다른 승격·강등이 진행 중)"), 1)
+        self.assertNotIn("무락 진행", out + err, "'잠금 없이 진행' 갈래가 남았다")
+
+    def test_the_lock_is_taken_by_the_real_code(self):
+        """잠금을 지우는 변이는 이 시험이 잡는다: 잠금이 잡혀 있으면 do_compose 는 상한 안에 rc 8(보류)로 끝난다."""
+        self.seed()
+        self.hold_lock()
+        ns = ceo_py_module()
+        nf = os.path.join(self.tmp, "nf.txt")
+        os.environ["CYS_CEO_LOCK_WAIT_S"] = "0.3"
+        self.addCleanup(os.environ.pop, "CYS_CEO_LOCK_WAIT_S", None)
+        rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), nf])
+        self.assertEqual(rc, 8)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER)
+        self.assertIn("CEO 승격 보류(다른 승격·강등이 진행 중)", _slurp(nf, encoding="utf-8"))
+        rc = ns["do_demote"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), nf])
+        self.assertEqual(rc, 8)
 
 
 class LegacyShapes(Rig):
