@@ -5157,7 +5157,7 @@ fn create_capture_segment(
 /// 가드는 비UTF-8 .user 에서 항상 불일치 판정이라 재사용 불가 — 바이트 경로는 무조건 복사한다
 /// (치유 성공 후 L1 재도달 없음 — 재복사는 재손상 시에만).
 /// ★T4 CLI 동사 소비(pack-heal 판독 불가 파일 바이트 백업) — 재구현 금지.
-pub fn byte_backup_user(dir: &Path, rel: &str, src: &Path) -> Result<(), String> {
+pub fn byte_backup_user(dir: &Path, rel: &str, src: &Path) -> Result<ParkOutcome, String> {
     // ★T2h(RULINGS CW3): 시작 경로에서 FIFO · 장치 · 상한 초과 파일을 읽지 않는다 — 막히지 않게 연 핸들이 일반 파일일 때만
     // 그 바이트를 백업한다(아니면 백업 실패 = 호출부의 격리 · 보안 자산은 종전 '무결성 우선' 예외 그대로).
     let bytes = match read_start_live(src) {
@@ -5167,7 +5167,7 @@ pub fn byte_backup_user(dir: &Path, rel: &str, src: &Path) -> Result<(), String>
     };
     // ★T2i(RULINGS EC4 (2) · EC2): 고정 임시 이름(`<rel>.user.tmp-<pid>` — 이미 있으면 따라가 자르고 썼다)을 쓰지 않는다 — 보관은
     //   [`park_copy`](배타 임시 파일 · 덮지 않는 놓기 · 차 있으면 세대 자리로).
-    park_copy(dir, rel, &bytes, false).map(|_| ())
+    park_copy(dir, rel, &bytes, false)
 }
 
 /// ★T3(D9 · v2 §2 원칙 3): 검증 base lazy 로드 — `.pristine/<rel>` 을 읽어
@@ -7078,9 +7078,36 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     // best-effort 그대로이되, 이전 세대를 덮지 않는다(사 — `.user.prev-<시각>`).
                     if let Some(d) = disk.as_deref() {
                         let user_path = dir.join(format!("{rel}.user"));
-                        if read_start_meta(&user_path).text().as_deref() != Some(d) {
-                            // ★T2i(RULINGS EC2 · FP1): 덮지 않는 보관 — 보관이 안 되면 덮지 않는다(잠금 파일도: 이번 기동은 격리).
-                            if let Err(e) = park_copy(&dir, rel, d.as_bytes(), false) {
+                        // ★T2i(RULINGS EC2): 덮지 않는 보관(이전 세대는 덮지 않는다) · 사본이 있는 곳을 안다.
+                        let side: Result<String, String> = if read_start_meta(&user_path).text().as_deref() == Some(d) {
+                            Ok(format!("{rel}.user"))
+                        } else {
+                            park_copy(&dir, rel, d.as_bytes(), false).map(|p| p.at)
+                        };
+                        match side {
+                            // ★T3(D7): healed upsert 는 계보 인지 헬퍼 경유 — 크래시 창 재스윕 healed 가
+                            // 영속된 merged 항목의 capture 포인터를 지우는 창의 봉인(v2 §4 공통 적용 규칙).
+                            Ok(side) => {
+                                if let serde_json::Value::Object(entry) = serde_json::json!({
+                                    "kind": "healed", "side": side,
+                                    "version": target_version, "ts": now_ts,
+                                }) {
+                                    upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                                }
+                            }
+                            // ★T2i(RULINGS GD1): 잠금 보안 자산(L0)은 무결성 우선 — 사본을 보관하지 못해도 치유는 간다(설계 §7 5행 ·
+                            //   주인 결정 12 · 출시본 그대로). 기록은 참이다: 사본이 없으니 사본을 이름 대지 않고, 보관 실패와 그 사유를 적는다.
+                            Err(e) if system_locked(rel) => {
+                                eprintln!("[init-pack] ⚠ 보안 자산 {rel}: 사용자 수정본 보관 실패({e}) — 무결성 우선으로 치유 강행(v2 §2 원칙 4 예외)");
+                                if let serde_json::Value::Object(entry) = serde_json::json!({
+                                    "kind": "healed", "backup": "failed", "backup_error": e,
+                                    "version": target_version, "ts": now_ts,
+                                }) {
+                                    upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                                }
+                            }
+                            // ★T2i(RULINGS FP1): 그 밖의 파일은 보관 없이는 덮지 않는다(이번 기동은 격리).
+                            Err(e) => {
                                 eprintln!("[init-pack] ⚠ 격리(quarantined): {rel} — 사용자 수정본을 보관하지 못했습니다({e}). 파일 무접촉 보존 — 보관 가능 회복 후 재스윕 시 정상 치유 대상.");
                                 if let serde_json::Value::Object(entry) = serde_json::json!({
                                     "kind": "quarantined", "reason": "backup-failed", "side": rel,
@@ -7092,14 +7119,6 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                                 continue;
                             }
                         }
-                        // ★T3(D7): healed upsert 는 계보 인지 헬퍼 경유 — 크래시 창 재스윕 healed 가
-                        // 영속된 merged 항목의 capture 포인터를 지우는 창의 봉인(v2 §4 공통 적용 규칙).
-                        if let serde_json::Value::Object(entry) = serde_json::json!({
-                            "kind": "healed", "side": format!("{rel}.user"),
-                            "version": target_version, "ts": now_ts,
-                        }) {
-                            upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
-                        }
                     } else if exists {
                         // ★T3 L0/L1 실행부(v2 §3 · §2 원칙 4 · D4·D11): 판독 불가(disk=None) —
                         // 문자열 백업이 구조적으로 못 뜨던 유일 무백업 파괴 edge 를 바이트 백업
@@ -7109,16 +7128,26 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         // ★T2i(RULINGS EC2): 세대 보존과 백업이 하나다(`byte_backup_user` → `park_copy`).
                         let backup = byte_backup_user(&dir, rel, &path);
                         match backup {
-                            Ok(()) => {
+                            Ok(parked) => {
                                 if let serde_json::Value::Object(entry) = serde_json::json!({
-                                    "kind": "healed", "side": format!("{rel}.user"),
+                                    "kind": "healed", "side": parked.at,
                                     "version": target_version, "ts": now_ts,
                                 }) {
                                     upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
                                 }
                             }
-                            // ★T2i(RULINGS FP1): 잠금 보안 자산도 보관 없이는 덮지 않는다(종전 '무결성 우선 치유 강행'
-                            //   예외를 거둔다) — 이번 기동은 격리 · 보관 가능 회복 후 재스윕이 치유한다.
+                            // ★L0(v2 §3) · ★T2i(RULINGS GD1 — FP1 의 이 갈래를 거둠): 보안 자산은 백업 실패에도 치유 강행(무결성>보존 —
+                            //   §2 원칙 4 의 명시 예외 · 주인 결정 12). 원장 side 는 실백업 성공 시에만 — 실패는 side 없이
+                            //   backup:"failed" 와 그 사유(존재하지 않는 .user 를 '보존됨'으로 오보하지 않는다 · D11).
+                            Err(e) if system_locked(rel) => {
+                                eprintln!("[init-pack] ⚠ 보안 자산 {rel}: 바이트 백업 실패({e}) — 무결성 우선으로 치유 강행(v2 §2 원칙 4 예외)");
+                                if let serde_json::Value::Object(entry) = serde_json::json!({
+                                    "kind": "healed", "backup": "failed", "backup_error": e,
+                                    "version": target_version, "ts": now_ts,
+                                }) {
+                                    upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                                }
+                            }
                             Err(e) => {
                                 // ★D11 quarantined 전이(fail-closed): 백업 없이는 덮지 않는다 —
                                 // write/manifest.insert/ensure_pristine/written 증가 전부 스킵.
@@ -10752,8 +10781,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// ★T3(v2 §3 L0 · D11) → ★T2i(RULINGS FP1): 잠금 보안 자산(trusted-keys.json) — 바이트 백업 선행. 백업이 실패하면 덮지 않고
-    /// 격리한다(종전의 '무결성 우선 치유 강행' 예외는 FP1 이 거뒀다). 원장 side 는 실백업 성공 시에만 `.user`.
+    /// ★T3(v2 §3 L0 · D11): 잠금 보안 자산(trusted-keys.json) — 백업 선행 시도하되, 백업 실패
+    /// 시에도 치유를 강행한다(무결성>보존 — §2 원칙 4 의 유일 예외 · ★T2i RULINGS GD1 로 되살림). 원장 side 는 **실백업 성공
+    /// 시에만** 기록(실패 시 side 부재 + backup:"failed" + 그 사유 — 존재하지 않는 .user 를 '보존됨'으로 오보하지 않는다).
     #[test]
     fn unreadable_locked_byte_backup() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
@@ -10789,12 +10819,15 @@ mod tests {
             std::fs::write(pd2.join(rel), CP949).unwrap();
             std::fs::create_dir_all(pd2.join(format!("{rel}.user"))).unwrap(); // rename 결정론 실패
             install_from_iter([(rel, vendor)], false, "1.0.0", false, None).unwrap();
-            // ★T2i(RULINGS FP1 — 기대가 바뀜): 보관된 사본 없이는 살아 있는 파일을 덮지 않는다 — 잠금 파일도(종전: '무결성 우선'
-            //   치유 강행 + backup:"failed"). 이번 기동은 격리, 기록은 사본을 이름 대지 않는다.
-            assert_eq!(std::fs::read(pd2.join(rel)).unwrap(), CP949, "②★FP1: 백업 실패 → 덮지 않음");
+            assert_eq!(std::fs::read_to_string(pd2.join(rel)).unwrap(), vendor,
+                       "②★L0: 백업 실패에도 치유 강행(무결성>보존)");
             let p2 = load_merge_pending(&pd2);
-            assert_eq!(p2.get(rel).and_then(|e| e["kind"].as_str()), Some("quarantined"));
-            assert_eq!(p2.get(rel).and_then(|e| e["side"].as_str()), Some(rel), "②side = 그 파일 — 없는 사본을 이름 대지 않는다");
+            assert_eq!(p2.get(rel).and_then(|e| e["kind"].as_str()), Some("healed"));
+            assert!(p2.get(rel).and_then(|e| e.get("side")).is_none(),
+                    "②side 부재 — 실패한 백업을 '보존됨'으로 오보 금지");
+            assert_eq!(p2.get(rel).and_then(|e| e["backup"].as_str()), Some("failed"));
+            // ★T2i(RULINGS GD1): 보관 실패의 사유도 적는다.
+            assert!(p2.get(rel).and_then(|e| e["backup_error"].as_str()).is_some_and(|s| !s.is_empty()), "② 사유");
         }
         let _ = std::fs::remove_dir_all(&base1);
         let _ = std::fs::remove_dir_all(&base2);
@@ -15501,10 +15534,11 @@ mod m11_tests {
         assert_eq!(rig.read("hooks/n.sh").as_deref(), Some("OLD"));
     }
 
-    /// ★T2i(RULINGS FP1): 덮지 않는 이름 바꾸기를 파일 시스템이 지원하지 않아도(시험 주입) 사본은 다른 길로 보관된다 — 마지막 이름의
-    /// 배타 생성. 자리에 다른 사본이 있으면 그것은 그대로 두고 이 사본은 자기 세대 자리에(겹침 기록). 그 다른 길마저 막히면 아무것도
-    /// 덮지 않는다: vendor 우선 · 잠금 파일 치유의 두 갈래(판독 가능 · 판독 불가) 모두 격리, 사본을 이름 대는 기록 없음.
-    /// `--missing-only` 의 쓰기(`write_pack_file_beneath` · 덮지 않음)도 그 길로 만든다.
+    /// ★T2i(RULINGS FP1 · GD1 · GB5): 덮지 않는 이름 바꾸기를 파일 시스템이 지원하지 않아도(시험 주입) 사본은 다른 길로 보관된다 —
+    /// 마지막 이름의 배타 생성. 자리에 다른 사본이 있으면 그것은 그대로 두고 이 사본은 자기 세대 자리에(겹침 기록). 그 다른 길마저
+    /// 막히면: vendor 우선은 덮지 않는다(격리). 잠금 보안 자산(L0)은 무결성 우선 — 두 갈래(판독 가능 · 판독 불가) 모두 치유는 가고,
+    /// 기록은 없는 사본을 이름 대지 않는다(backup: failed + 사유). `--missing-only` 의 쓰기(`write_pack_file_beneath` · 덮지 않음)도 그
+    /// 길로 만든다.
     #[test]
     fn fp1_without_the_no_replace_rename_the_copy_is_still_parked_and_nothing_live_is_overwritten_without_it() {
         struct Inject;
@@ -15544,29 +15578,35 @@ mod m11_tests {
         assert_eq!(rig.read(vf).as_deref(), Some("#!/bin/bash\necho MINE\n"), "vendor 우선: 보관 없이는 덮지 않는다");
         assert_eq!(rig.kind(vf).as_deref(), Some("quarantined"));
         assert!(!rig.pack.join(format!("{vf}.user")).exists(), "사본 없음");
-        // 잠금 파일(판독 가능): 보관 실패 → 덮지 않음 · 격리 · '.user' 를 이름 대는 기록 없음.
+        // ★T2i(RULINGS GD1): 잠금 파일(판독 가능) — 보관 실패여도 무결성 우선으로 치유하고, 기록은 없는 사본을 이름 대지 않는다.
         let locked = "trusted-keys.json";
         rig.write(locked, b"{\"keys\": [\"MINE\"]}\n");
         rig.manifest(&[(locked, "{\"keys\": []}\n")]);
         // 기준선이 맞아야(설치 기록 = .pristine) C-07 의 제자리 보존이 아니라 L0 치유 갈래에 닿는다.
         rig.pristine(locked, "{\"keys\": []}\n");
         rig.install(&[(locked, "{\"keys\": [\"VENDOR\"]}\n")], false, &UpdateSources::none());
-        assert_eq!(rig.read(locked).as_deref(), Some("{\"keys\": [\"MINE\"]}\n"), "잠금 파일도 보관 없이는 덮지 않는다");
+        assert_eq!(rig.read(locked).as_deref(), Some("{\"keys\": [\"VENDOR\"]}\n"), "L0: 무결성 우선 — 치유는 간다");
         let e = rig.entry(locked).unwrap();
-        assert_eq!(e["kind"], "quarantined", "{e}");
-        assert_ne!(e["side"], serde_json::json!(format!("{locked}.user")), "없는 사본을 이름 대지 않는다");
+        assert_eq!((e["kind"].as_str(), e["backup"].as_str()), (Some("healed"), Some("failed")), "{e}");
+        assert!(e.get("side").is_none(), "없는 사본을 이름 대지 않는다: {e}");
+        assert!(!rig.pack.join(format!("{locked}.user")).exists());
         // 잠금 파일(판독 불가 — UTF-8 아님): 같은 규칙.
         rig.write(locked, b"\xff\xfe\x00keys\n");
         rig.install(&[(locked, "{\"keys\": [\"VENDOR\"]}\n")], false, &UpdateSources::none());
-        assert_eq!(std::fs::read(rig.pack.join(locked)).unwrap(), b"\xff\xfe\x00keys\n", "판독 불가 잠금 파일도 덮지 않는다");
-        assert_eq!(rig.kind(locked).as_deref(), Some("quarantined"));
-        // 주입을 풀면 같은 스윕이 보관하고 치유한다.
+        assert_eq!(rig.read(locked).as_deref(), Some("{\"keys\": [\"VENDOR\"]}\n"), "판독 불가 L0 도 치유는 간다");
+        let e = rig.entry(locked).unwrap();
+        assert_eq!((e["kind"].as_str(), e["backup"].as_str()), (Some("healed"), Some("failed")), "{e}");
+        assert!(e.get("side").is_none(), "{e}");
+        rig.write(locked, b"\xff\xfe\x00keys\n");
+        // 주입을 풀면 같은 스윕이 보관하고 치유한다(기록은 그 사본을 이름 댄다).
         FAIL_NO_REPLACE_RENAME.with(|f| f.set(false));
         FAIL_EXCLUSIVE_FALLBACK.with(|f| f.set(false));
         rig.install(&[(locked, "{\"keys\": [\"VENDOR\"]}\n")], false, &UpdateSources::none());
         assert_eq!(rig.read(locked).as_deref(), Some("{\"keys\": [\"VENDOR\"]}\n"));
-        assert_eq!(std::fs::read(rig.pack.join(format!("{locked}.user"))).unwrap(), b"\xff\xfe\x00keys\n", "사본이 있고 나서야 치유");
-        assert_eq!(rig.kind(locked).as_deref(), Some("healed"));
+        assert_eq!(std::fs::read(rig.pack.join(format!("{locked}.user"))).unwrap(), b"\xff\xfe\x00keys\n", "사본을 보관했다");
+        let e = rig.entry(locked).unwrap();
+        assert_eq!((e["kind"].as_str(), e["side"].as_str()), (Some("healed"), Some("trusted-keys.json.user")), "기록은 있는 사본을 이름 댄다");
+        assert!(e.get("backup").is_none(), "{e}");
     }
 
     /// ★T2i(RULINGS GB2): 자리에 이미 있는 같은 사본은 다시 내린다 — 대체 길(배타 생성)의 파일 내림이 실패해 사본이 내려지지
