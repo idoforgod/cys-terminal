@@ -7,15 +7,18 @@
   2  데몬이 허용(rule-doc-allowed 종료 코드 0)하면 그 Write/Edit 만 통과하고, 조회는
      `cys --socket <s> repair rule-doc-allowed --path <파일>` 하나이며 CYS_NO_AUTOSTART=1 로 간다.
   3  소켓 없음 · 옛 데몬(93) · 거부(95) · 시간 초과 → 오늘의 동작(차단). 시간 초과는 답하지 않고 막혀 있는
-     스텁(가드가 죽일 때까지)으로 재고, 벽시계 여유가 아니라 **거부**와 스텁이 남지 않음을 확인한다.
+     스텁으로 재며, 스텁이 막혔다는 **증거**(pid 와 "blocked" 표지)를 본 경우에만 통과한다 — 거부 + 증거 + 그
+     프로세스가 끝났음(RULINGS EM1). 증거가 없으면(기동이 예산보다 느렸으면) 조용히 통과하지 않고 실패한다.
   4  Bash 로 규칙 문서를 쓰는 경로(tee·sed -i·리다이렉트)는 표가 있어도 막힌다.
   5  corpus G 의 대표 호출(외부 발행·외부 전송·영구 삭제)은 표가 있든 없든 막힌다(AT9).
   6  규칙 문서가 아닌 쓰기는 조회 없이 통과한다(평시 동작 무변화).
 밀폐: 가짜 `cys` 스텁(PATH 선두) · 임시 디렉터리의 진짜 unix 소켓 파일 · GUARD_TEST_MODE 로 자율주행 깃발을
 임시 경로에 둔다 · HOME 임시. 데몬·라이브 팩 무접촉.
-결정론(RULINGS EH1 · EA2 — 시간 규칙을 벽시계 여유로 증명하지 않는다): 허용·거부 경우는 가드의 테스트 예산을
-크게(`GUARD_TEST_GATE_BUDGET_MS=20000`) 주어 스텁의 기동 시간이 판정을 가르지 못하게 하고, 시간 초과 경우만
-작은 예산(300ms)과 막혀 있는 스텁을 쓴다. `STUB_START_DELAY=<초>` 로 스텁의 느린 기동을 주입할 수 있다(부하 재현).
+시간 관용도(RULINGS EH1 · EA2 · EM1 — "타이밍과 무관"이 아니라 **관용도를 키웠다**): 허용·거부 경우는 가드의
+테스트 예산을 크게(`GUARD_TEST_GATE_BUDGET_MS=20000`) 주어 스텁의 기동이 20초 안이면 판정을 가르지 못하고,
+시간 초과 경우는 5초 예산과 끝내 답하지 않는 스텁을 쓴다(기동이 5초 안이면 증거를 남긴다). 벽시계 의존은
+남아 있다: 기동이 그보다 느린 극단적 부하에서는 테스트가 **크게 실패**하고 다시 돌린다 — 조용히 통과하지
+않는다. `STUB_START_DELAY=<초>` 로 스텁의 느린 기동을 주입할 수 있다(부하 재현).
 출력: PASS/FAIL 행 · 실패 시 exit 1 · 전부 통과 시 GUARD-OWNER-TOKEN-OK.
 """
 import json
@@ -47,8 +50,9 @@ printf '%s|NO_AUTOSTART=%s\n' "$*" "${CYS_NO_AUTOSTART:-}" >> "$STUB_LOG"
 case "$*" in
   *"repair rule-doc-allowed"*)
     if [ -n "${STUB_BLOCK_PIDFILE:-}" ]; then
-      echo $$ > "$STUB_BLOCK_PIDFILE"
-      exec sleep 3600   # never answers: blocks until the guard kills it
+      echo $$ > "$STUB_BLOCK_PIDFILE"            # evidence 1: the pid of the process that blocks
+      : > "$STUB_BLOCK_PIDFILE.blocked"           # evidence 2: it reached the blocking branch
+      exec sleep 3600   # never answers (same pid): blocks until the guard kills it
     fi
     exit "${STUB_RULEDOC_RC:-95}" ;;
 esac
@@ -58,7 +62,8 @@ exit 1
 # RULINGS EH1: a budget so large that the stub's start-up cannot decide a case (the guard's test
 # knob raises its per-query cap with it, up to the guard's ceiling); the time-out case uses a small one
 BIG_BUDGET_MS = "20000"
-SMALL_BUDGET_MS = "300"
+# the time-out case: generous enough for the stub's start-up (EM1), then the stub never answers
+TIMEOUT_BUDGET_MS = "5000"
 
 
 def main():
@@ -141,22 +146,32 @@ def main():
         check("3a 소켓 없음 → 조회 없이 차단", p.returncode == 2 and not calls, repr((p.returncode, calls)))
         p, _, _ = run({"file_path": soul, "content": "x"}, rc=93)
         check("3b 옛 데몬(93) → 차단", p.returncode == 2)
-        # 3c — the daemon's answer never comes: a stub that blocks until it is killed, a small budget →
-        # REFUSED (no wall-clock bound), and the guard leaves no stub behind
+        # 3c/3d — the daemon's answer never comes (RULINGS EM1): the stub publishes its pid and a
+        # "blocked" marker, then blocks until the guard kills it. The case passes ONLY with that evidence:
+        # refused, the published pid, the marker, and that pid gone afterwards. Missing evidence = FAIL
+        # (a start-up slower than the budget, or a budget spent before the query, never passes silently).
         pidfile = os.path.join(root, "blocked.pid")
-        p, _, _ = run({"file_path": soul, "content": "x"}, rc=0, block=pidfile, budget_ms=SMALL_BUDGET_MS)
-        check("3c 시간 초과 → 차단(막혀 있는 스텁 · 작은 예산)", p.returncode == 2
-              and "헌법파일(soul.md) Write 차단" in p.stderr, repr((p.returncode, p.stderr[-200:])))
-        left_alive = False
-        if os.path.exists(pidfile):
+        p, calls, _ = run({"file_path": soul, "content": "x"}, rc=0, block=pidfile, budget_ms=TIMEOUT_BUDGET_MS)
+        try:
+            pid = int(open(pidfile).read().strip())
+        except (OSError, ValueError):
+            pid = None
+        blocked = os.path.exists(pidfile + ".blocked")
+        check("3c 시간 초과 → 차단 — 스텁이 막힌 것을 본 뒤의 거부(pid=%s · blocked 표지 %s)" % (pid, "있음" if blocked else "없음"),
+              p.returncode == 2 and "헌법파일(soul.md) Write 차단" in p.stderr and pid is not None and blocked
+              and len(calls) == 1 and "repair rule-doc-allowed" in calls[0],
+              repr((p.returncode, pid, blocked, calls, p.stderr[-160:])))
+        gone = False
+        if pid is not None:
             try:
-                os.kill(int(open(pidfile).read().strip() or "0"), 0)
-                left_alive = True
-            except (ProcessLookupError, ValueError):
-                pass
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                gone = True
             except PermissionError:
-                left_alive = True
-        check("3d 막혀 있던 스텁은 남지 않는다(가드가 죽였다)", not left_alive)
+                gone = False
+        ok = pid is not None and gone
+        check("3d 막혀 있던 스텁(pid=%s)은 가드가 돌아온 뒤 더는 없다" % pid, ok,
+              "" if ok else ("pid 증거 없음" if pid is None else "그 pid 가 아직 살아 있다"))
         # 4 — Bash writers of rule documents stay denied with a token
         for cmd in ("tee %s < /dev/null" % soul, "sed -i 's/a/b/' %s" % soul, "echo x > %s" % soul):
             p, _, _ = run({"command": cmd}, tool="Bash", rc=0)
