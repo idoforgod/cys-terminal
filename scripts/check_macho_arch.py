@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """check_macho_arch.py — every Mach-O file of a macOS bundle must carry the target architecture
-(0.15.0 · tracks T11, T11b · RULINGS BQ1(b), CA1–CA2, DB4–DB5 · owner order addendum 11).
+(0.15.0 · tracks T11, T11b · RULINGS BQ1(b), CA1–CA2, DB4–DB5, EB1–EB3, EI1–EI4 · owner order addendum 11).
+
+SCOPE (RULINGS EI1). This gate answers one question about OUR OWN build output (owner order 11): did our pipeline
+put a wrong-architecture binary into what it ships? What it reads was written by our own bundler in the same
+pipeline, and the product installs an update archive only after verifying OUR signature on it (tauri-plugin-updater
+2.10.1: `Update::download` calls `verify_signature(&buffer, &self.signature, &self.config.pubkey)` before returning
+the bytes — src/updater.rs:712, :1453–1461 — and every install path of ours takes those bytes: `download_and_install`
+:723–730, our src-tauri/src/main.rs:8372 and :8460–8479, the JS command `install` only accepts bytes the `download`
+command produced, src/commands.rs:122–150; the public key is src-tauri/tauri.conf.json:49) — whoever could craft the
+archive could change this gate as well. Therefore: (a) the measured real shape is judged correctly; (b) every form an
+HONEST cause produces — another tool or tool version writing the archive, a truncated or corrupted file, a compression
+member appended by a tool — ends in exit 2 (or 1), never in PASS; (c) forms that only a deliberate construction
+produces to make two readers disagree are out of scope and are not chased.
 
 Why: the Intel (x86_64) macOS leg is a CROSS build on an arm64 runner, the runtime tree
 (`src-tauri/runtime`: python, node, git, uv) is downloaded per target, and nothing checked the
@@ -500,20 +512,44 @@ class RecordCensus:
 
     def __init__(self, f):
         self.f, self.base, self.buf, self.next = f, 0, b"", 0
-        self.zeros, self.done, self.records, self.bad = 0, False, 0, []
+        self.zeros, self.done, self.stopped, self.records, self.bad = 0, False, False, 0, []
+        self.label = "(start)"
+        self.after, self.hard = 0, []
 
     def read(self, n=-1):
         b = self.f.read(n)
-        if b and not self.done:
+        if b:
             self._feed(b)
         return b
 
     def _feed(self, b):
+        if self.done or self.stopped:
+            self.after += len(b) if self.done else 0
+            return
         self.buf += b
         self._cut()
-        while not self.done and self.base == self.next and len(self.buf) >= 512:
+        while not (self.done or self.stopped) and self.base == self.next and len(self.buf) >= 512:
             self._header(self.buf[:512])
             self._cut()
+        if self.done:                          # EI2 I2: the real archives end right after the two zero blocks
+            self.after += len(self.buf)
+            self.buf = b""
+
+    def _stop(self, why):
+        self.bad.append((self.records, self.label, why))
+        self.stopped = True
+
+    def close(self):
+        """EI2 I2 — the archive must END as the measured ones do: the last member complete, the two end-of-archive
+        blocks present, nothing after them."""
+        if self.stopped:
+            return
+        if not self.done:
+            self.bad.append((self.records + 1, "(end)", "the archive ends before its end-of-archive blocks — it is "
+                             "truncated (the real archives end with two zero blocks)"))
+        elif self.after:
+            self.bad.append((self.records + 1, "(end)", "%d bytes follow the end-of-archive blocks (the real archives "
+                             "end right after them)" % self.after))
 
     def _cut(self):
         if self.next > self.base:
@@ -529,16 +565,23 @@ class RecordCensus:
         self.zeros = 0
         self.records += 1
         name, prefix = h[0:100].split(b"\0", 1)[0], h[345:500].split(b"\0", 1)[0]
-        label = (prefix + b"/" + name if prefix else name).decode("utf-8", "replace")
+        label = self.label = (prefix + b"/" + name if prefix else name).decode("utf-8", "replace")
         kind, magic = h[156:157], h[257:265]
-        try:
-            if h[124] & 0x80:
-                raise ValueError("a base-256 size")
-            size = int(h[124:136].split(b"\0", 1)[0].strip() or b"0", 8)
-        except ValueError as e:
-            self.bad.append((self.records, label, "its size field cannot be read (%s)" % e))
-            self.done = True
-            return
+        ck = h[148:156]                         # EI2 I2: measured form — six octal digits, NUL, space; unsigned sum
+        if not (ck[6:8] == b"\0 " and all(48 <= c <= 55 for c in ck[:6])):
+            return self._stop("its checksum field %r is not in the measured form (six octal digits, NUL, space)" % ck)
+        if int(ck[:6], 8) != sum(h[:148]) + 8 * 32 + sum(h[156:]):
+            return self._stop("its header checksum does not match — the header is corrupted")
+        sf = h[124:136]                         # EI2 I3: measured form — eleven octal digits and a space
+        if not (sf[11:12] == b" " and all(48 <= c <= 55 for c in sf[:11])):
+            return self._stop("its size field %r is not eleven octal digits and a space (the measured form)" % sf)
+        size = int(sf[:11], 8)
+        if kind != b"0" and size != 0:          # EI2 I1: every record that is not a regular file has size 0
+            self.bad.append((self.records, label, "a %r record with size %d — every record that is not a regular file "
+                             "has size 0 in the real archives" % (kind.decode("latin-1"), size)))
+        if kind == b"1":                        # EB3: a hard link is proven wrong — seen here even where tarfile stops
+            self.hard.append((label[2:] if label.startswith("./") else label,
+                              h[157:257].split(b"\0", 1)[0].decode("utf-8", "replace")))
         if magic != USTAR_MAGIC:
             self.bad.append((self.records, label, "its header format %r is not POSIX ustar" % magic))
         if kind in (b"x", b"g"):
@@ -551,39 +594,59 @@ class RecordCensus:
         elif kind != b"1" and kind not in ALLOWED_KINDS:
             self.bad.append((self.records, label, "its record kind %r is not in the allow-list (regular '0', directory "
                              "'5', symbolic link '2' — what the published archives contain)" % kind.decode("latin-1")))
-        self.next = self.base + 512 + (size + 511) // 512 * 512
+        nxt = self.base + 512 + (size + 511) // 512 * 512
+        if nxt <= self.base:                    # EI2 I3: every step advances (it always does with digits only)
+            return self._stop("the census would not advance")
+        self.next = nxt
 
 
 class Decompressed:
-    """The archive's tar bytes from a gzip file (or a plain tar), read forward once from RAW."""
+    """The archive's tar bytes from ONE gzip member, read forward once from RAW (EI2 I4: the product's flate2
+    `GzDecoder` reads only the first member — flate2-1.1.9 src/gz/read.rs:103, :208–243 — while tarfile reads every
+    member; the real archives are exactly one member with nothing after it). `problem` says what is not that shape;
+    the bytes after the first member are counted, never decompressed."""
 
     def __init__(self, raw):
-        self.raw, self.d, self.pending = raw, None, b""
+        self.raw, self.extra, self.problem, self.pending = raw, 0, None, b""
         head = raw.read(1 << 16)
-        if head[:2] == b"\x1f\x8b":
-            self.d = zlib.decompressobj(16 + zlib.MAX_WBITS)
-            self.pending = self.d.decompress(head)
-        else:
-            self.pending = head
+        if head[:2] != b"\x1f\x8b":
+            self.d = None
+            self.problem = "it is not a gzip file (the real archives are one gzip member)"
+            self.extra = len(head)
+            return
+        self.d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        self._take(head)
+
+    def _take(self, chunk):
+        if self.d.eof:
+            self.extra += len(chunk)
+            return
+        self.pending += self.d.decompress(chunk)
+        if self.d.eof and self.d.unused_data:
+            self.extra += len(self.d.unused_data)
 
     def read(self, n=-1):
         want = (1 << 16) if n is None or n < 0 else n
         while len(self.pending) < want:
             chunk = self.raw.read(1 << 16)
             if not chunk:
-                if self.d is not None:
+                if self.d is None:
+                    break
+                if not self.d.eof:
                     self.pending += self.d.flush()
+                    self.problem = self.problem or "the gzip stream ends before its end — the file is truncated"
                 break
             if self.d is None:
-                self.pending += chunk
+                self.extra += len(chunk)
                 continue
-            self.pending += self.d.decompress(chunk)
-            while self.d.eof and self.d.unused_data:          # a further gzip member
-                rest = self.d.unused_data
-                self.d = zlib.decompressobj(16 + zlib.MAX_WBITS)
-                self.pending += self.d.decompress(rest)
+            self._take(chunk)
         out, self.pending = self.pending[:want], self.pending[want:]
         return out
+
+    def close(self):
+        if self.d is not None and self.extra and not self.problem:
+            self.problem = ("%d bytes follow the gzip member — a second member or trailing data (the real archives are "
+                            "exactly one member; the product's GzDecoder reads only the first)" % self.extra)
 
 
 def scan_tar(path, target_arch, out):
@@ -595,7 +658,8 @@ def scan_tar(path, target_arch, out):
     members = 0
     library_error = None
     try:
-        census = RecordCensus(Decompressed(raw))
+        dec = Decompressed(raw)
+        census = RecordCensus(dec)
         try:
             tar = tarfile.open(fileobj=census, mode="r|")
         except tarfile.TarError as e:
@@ -655,12 +719,20 @@ def scan_tar(path, target_arch, out):
                 pass
         except zlib.error as e:
             library_error = library_error or e
+            dec.problem = dec.problem or "the gzip stream is corrupted (%s)" % e
+        census.close()
+        dec.close()
+        if dec.problem:
+            census.bad.append((census.records + 2, "(compression)", dec.problem))
+        for name, target in census.hard:  # EB3: a hard link the raw records hold is proven wrong
+            if all(name != n for n, _ in tree.hard):
+                tree.hard.append((name, target))
     finally:
         raw.close()
     if library_error is not None and not census.bad:
         raise library_error             # unreadable — and no raw record names a reason: exit 2 as before
     for index, label, why in census.bad:  # EB1 — decided on the raw records: it comes first
-        tree.shape.append(((0, index), "record %d %s: not measurable — %s (RULINGS EB1)" % (index, label, why)))
+        tree.shape.append(((0, index), "record %d %s: not measurable — %s (RULINGS EB1, EI2)" % (index, label, why)))
     out.append("  archive read in one pass: %d members, %d of %d compressed bytes"
                % (members, raw.read_bytes, os.path.getsize(path)))
     tree.finish()
