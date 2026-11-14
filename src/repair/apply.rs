@@ -3318,7 +3318,7 @@ pub fn run_registrar(pack: &Path, dry_run: bool) -> Result<String, RepairError> 
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     run_bounded(cmd, RECONCILE_DEADLINE)
 }
 
@@ -3343,11 +3343,40 @@ pub fn run_bounded(mut cmd: std::process::Command, deadline: Duration) -> Result
     // measured NOW (spawn returns after exec — the session already made): once the child is reaped
     // its pid no longer answers, but its group still exists under that id
     let leads = leads_own_group(pid);
-    let mut pipe = OutPipe::new(child.stdout.take());
+    // EJ2: non-blocking mode on EVERY pipe, or the child does not run — killed at once
+    let pipes = OutPipe::new(child.stdout.take().map(PipeEnd::Out)).and_then(|o| Ok((o, OutPipe::new(child.stderr.take().map(PipeEnd::Err))?)));
+    let (mut pipe, mut errp) = match pipes {
+        Ok(p) => p,
+        Err(why) => {
+            let mut problems = vec![format!("출력 파이프를 비차단으로 만들 수 없어 실행하지 않고 바로 멈췄습니다: {why}")];
+            if leads {
+                if let Err(e) = kill_group_of(pid) {
+                    problems.push(format!("프로세스 그룹(pgid {pid})을 멈추지 못했습니다: {e}"));
+                }
+            }
+            if let Err(e) = child.kill() {
+                problems.push(format!("자식(pid {pid})을 멈추지 못했습니다: {e}"));
+            }
+            let reaped = (0..50).any(|_| {
+                let done = matches!(child.try_wait(), Ok(Some(_)));
+                if !done {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                done
+            });
+            if !reaped {
+                let _ = std::thread::Builder::new().name("cys-bounded-reap".into()).spawn(move || {
+                    let _ = child.wait();
+                });
+                problems.push(format!("자식(pid {pid})을 바로 거두지 못해 따로 거두게 두었습니다"));
+            }
+            return Err(RepairError::CheckFailed(problems.join(" · ")));
+        }
+    };
     let mut status: Option<std::process::ExitStatus> = None;
     let mut problems: Vec<String> = Vec::new();
     loop {
-        pipe.pump();
+        let read = pipe.pump() + errp.pump();
         if status.is_none() {
             match child.try_wait() {
                 Ok(st) => status = st,
@@ -3357,17 +3386,19 @@ pub fn run_bounded(mut cmd: std::process::Command, deadline: Duration) -> Result
                 }
             }
         }
-        if status.is_some() && pipe.eof {
+        if status.is_some() && pipe.eof && errp.eof {
             break;
         }
         if start.elapsed() >= run_until {
             break;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        if read == 0 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     let timed_out = status.is_none();
     let group_alive = leads && group_has_members(pid);
-    if status.is_none() || !pipe.eof || group_alive || !problems.is_empty() {
+    if status.is_none() || !pipe.eof || !errp.eof || group_alive || !problems.is_empty() {
         if leads {
             match kill_group_of(pid) {
                 Ok(()) if group_alive && status.is_some() => {
@@ -3384,23 +3415,32 @@ pub fn run_bounded(mut cmd: std::process::Command, deadline: Duration) -> Result
         }
         // the short fixed grace: poll the exit and drain the output — never past the deadline
         while start.elapsed() < deadline {
-            pipe.pump();
+            let read = pipe.pump() + errp.pump();
             if status.is_none() {
                 if let Ok(Some(st)) = child.try_wait() {
                     status = Some(st);
                 }
             }
-            if status.is_some() && pipe.eof {
+            if status.is_some() && pipe.eof && errp.eof {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            if read == 0 {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
-        if !pipe.eof {
+        if !pipe.eof || !errp.eof {
             problems.push("출력 파이프를 그룹 밖의 자손이 아직 쥐고 있어 기한에 읽기를 그만두었습니다".to_string());
         }
     }
     let got = String::from_utf8_lossy(&pipe.buf).to_string();
     let shown: String = got.chars().take(400).collect();
+    // EJ2: the cap on kept output is reported, never hidden
+    if pipe.dropped > 0 || errp.dropped > 0 {
+        problems.push(format!(
+            "출력이 한도({}바이트)를 넘어 표준출력 {}바이트·표준오류 {}바이트를 세기만 하고 버렸습니다",
+            OUTPUT_KEEP_CAP, pipe.dropped, errp.dropped
+        ));
+    }
     let Some(st) = status else {
         // not reaped within the deadline: a detached reap, never waited for by this thread
         let _ = std::thread::Builder::new()
@@ -3440,40 +3480,77 @@ pub fn run_bounded(mut cmd: std::process::Command, deadline: Duration) -> Result
     Ok(got)
 }
 
-/// The child's stdout read WITHOUT blocking (DR3).
+/// EJ2: at most this many bytes are read from ONE pipe in one turn of the runner's loop.
+pub const PIPE_TURN_BYTES: usize = 64 * 1024;
+/// EJ2: at most this many bytes of a pipe's output are kept; the rest is counted and dropped.
+pub const OUTPUT_KEEP_CAP: usize = 256 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only (EJ2): setting a pipe non-blocking fails.
+    pub(crate) static FAIL_NONBLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One end of the child's output.
+enum PipeEnd {
+    Out(std::process::ChildStdout),
+    Err(std::process::ChildStderr),
+}
+
+impl std::io::Read for PipeEnd {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            PipeEnd::Out(p) => p.read(b),
+            PipeEnd::Err(p) => p.read(b),
+        }
+    }
+}
+
+/// A child's pipe read WITHOUT blocking and WITH bounds (DR3 / EJ2).
 struct OutPipe {
     #[cfg(unix)]
-    pipe: Option<std::process::ChildStdout>,
+    pipe: Option<PipeEnd>,
     #[cfg(not(unix))]
     rx: Option<std::sync::mpsc::Receiver<Option<Vec<u8>>>>,
     buf: Vec<u8>,
+    dropped: u64,
     eof: bool,
 }
 
 impl OutPipe {
-    fn new(out: Option<std::process::ChildStdout>) -> OutPipe {
-        let eof = out.is_none();
+    /// `Err` when the pipe cannot be made non-blocking (the runner then does not run the child).
+    fn new(end: Option<PipeEnd>) -> Result<OutPipe, String> {
+        let eof = end.is_none();
         #[cfg(unix)]
         {
-            if let Some(o) = &out {
+            if let Some(e) = &end {
                 use std::os::unix::io::AsRawFd;
-                let fd = o.as_raw_fd();
-                // SAFETY: fcntl on a descriptor we own for the lifetime of `o`.
-                unsafe {
+                let fd = match e {
+                    PipeEnd::Out(p) => p.as_raw_fd(),
+                    PipeEnd::Err(p) => p.as_raw_fd(),
+                };
+                #[cfg(test)]
+                if FAIL_NONBLOCK.with(|c| c.get()) {
+                    return Err("O_NONBLOCK 설정 실패(시험 주입)".into());
+                }
+                // SAFETY: fcntl on a descriptor we own for the lifetime of `e`.
+                let ok = unsafe {
                     let fl = libc::fcntl(fd, libc::F_GETFL);
-                    if fl >= 0 {
-                        libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
-                    }
+                    fl >= 0 && libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) == 0
+                };
+                if !ok {
+                    return Err(format!("O_NONBLOCK 설정 실패: {}", std::io::Error::last_os_error()));
                 }
             }
-            OutPipe { pipe: out, buf: Vec::new(), eof }
+            Ok(OutPipe { pipe: end, buf: Vec::new(), dropped: 0, eof })
         }
         #[cfg(not(unix))]
         {
-            let rx = out.map(|mut o| {
-                let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+            let rx = end.map(|mut o| {
+                // a bounded channel: the reader thread waits when the loop has not taken its chunks
+                let (tx, rx) = std::sync::mpsc::sync_channel::<Option<Vec<u8>>>(8);
                 let _ = std::thread::Builder::new().name("cys-bounded-pipe".into()).spawn(move || {
-                    let mut chunk = [0u8; 8192];
+                    let mut chunk = vec![0u8; 8192];
                     loop {
                         match std::io::Read::read(&mut o, &mut chunk) {
                             Ok(0) | Err(_) => {
@@ -3490,54 +3567,70 @@ impl OutPipe {
                 });
                 rx
             });
-            OutPipe { rx, buf: Vec::new(), eof }
+            Ok(OutPipe { rx, buf: Vec::new(), dropped: 0, eof })
         }
     }
 
-    /// Takes whatever output is available now; never waits.
-    fn pump(&mut self) {
+    fn keep(&mut self, bytes: &[u8]) {
+        let room = OUTPUT_KEEP_CAP.saturating_sub(self.buf.len());
+        let take = room.min(bytes.len());
+        self.buf.extend_from_slice(&bytes[..take]);
+        self.dropped += (bytes.len() - take) as u64;
+    }
+
+    /// Takes at most [`PIPE_TURN_BYTES`] of output available NOW; never waits. Returns the bytes read.
+    fn pump(&mut self) -> usize {
         if self.eof {
-            return;
+            return 0;
         }
         #[cfg(unix)]
         {
             let Some(p) = self.pipe.as_mut() else {
                 self.eof = true;
-                return;
+                return 0;
             };
-            let mut chunk = [0u8; 8192];
+            let mut chunk = vec![0u8; PIPE_TURN_BYTES];
             loop {
                 match std::io::Read::read(p, &mut chunk) {
                     Ok(0) => {
                         self.eof = true;
-                        return;
+                        return 0;
                     }
-                    Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                    Ok(n) => {
+                        let got = chunk[..n].to_vec();
+                        self.keep(&got);
+                        return n;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return 0,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => {
                         self.eof = true;
-                        return;
+                        return 0;
                     }
                 }
             }
         }
         #[cfg(not(unix))]
         {
-            let Some(rx) = self.rx.as_ref() else {
-                self.eof = true;
-                return;
-            };
-            loop {
+            let mut read = 0usize;
+            while read < PIPE_TURN_BYTES {
+                let Some(rx) = self.rx.as_ref() else {
+                    self.eof = true;
+                    return read;
+                };
                 match rx.try_recv() {
-                    Ok(Some(c)) => self.buf.extend_from_slice(&c),
+                    Ok(Some(c)) => {
+                        read += c.len();
+                        self.keep(&c);
+                    }
                     Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         self.eof = true;
-                        return;
+                        return read;
                     }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => return read,
                 }
             }
+            read
         }
     }
 }

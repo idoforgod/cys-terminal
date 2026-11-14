@@ -2267,3 +2267,46 @@ fn the_generation_string_is_read_in_one_place() {
         }
     }
 }
+
+// ───────────────────────────── RULINGS EJ2 — every step of the runner is bounded ─────────────────────────────
+
+/// EJ2 (codex r3 I3): a child that writes WITHOUT PAUSE — on stdout, and on stderr — never keeps the
+/// runner reading: each turn reads at most a fixed amount per pipe, the one deadline is looked at,
+/// the kept output is capped and the rest counted and reported. Without EJ2 the pump drained until
+/// WouldBlock (never) and the deadline was never checked.
+#[cfg(unix)]
+#[test]
+fn a_child_writing_without_pause_never_holds_the_runner() {
+    use crate::SpawnPolicy as _;
+    for script in ["yes", "yes >&2"] {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(script);
+        cmd.spawn_policy(crate::ChildLifetime::GroupScoped);
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let t = std::time::Instant::now();
+        let res = run_bounded(cmd, Duration::from_secs(2));
+        assert!(t.elapsed() < Duration::from_secs(6), "{script}: returned at its deadline");
+        let msg = format!("{res:?}");
+        assert!(matches!(res, Err(RepairError::CheckTimeout(_))), "{script}: {msg}");
+        assert!(msg.contains("세기만 하고 버렸습니다"), "{script}: the cap is reported: {msg}");
+    }
+}
+
+/// EJ2: when a pipe cannot be made non-blocking, the child is not run on — it is killed at once and
+/// the runner says so.
+#[cfg(unix)]
+#[test]
+fn a_failed_non_blocking_setup_does_not_run_the_child() {
+    use crate::SpawnPolicy as _;
+    let mut cmd = std::process::Command::new("/bin/sleep");
+    cmd.arg("30");
+    cmd.spawn_policy(crate::ChildLifetime::GroupScoped);
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    FAIL_NONBLOCK.with(|c| c.set(true));
+    let t = std::time::Instant::now();
+    let res = run_bounded(cmd, Duration::from_secs(10));
+    FAIL_NONBLOCK.with(|c| c.set(false));
+    assert!(t.elapsed() < Duration::from_secs(5), "killed at once, not run to its deadline");
+    let msg = format!("{res:?}");
+    assert!(msg.contains("비차단") && msg.contains("멈췄습니다"), "{msg}");
+}
