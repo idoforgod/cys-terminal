@@ -1870,18 +1870,43 @@ class ApprovalWaitingLine(unittest.TestCase):
     def test_collect_counts_own_lane_awaiting_approval(self):
         d = tempfile.mkdtemp(prefix="fake-cys-list-")
         self.addCleanup(__import__("shutil").rmtree, d, True)
-        doc = {"lane": "base", "repairs": [
+        # RULINGS DF3: the set is the daemon's `approval_cards` (requests past step 3, the owner's
+        # decision pending) — never the records' 승인 대기 state (R-4: in step 3 or expired, no card)
+        doc = {"lane": "base", "approval_cards": ["R-1"], "repairs": [
             {"repair": "R-1", "state": "awaiting_approval", "origin_lane": "base"},
             {"repair": "R-2", "state": "in_progress", "origin_lane": "base"},
             {"repair": "R-3", "state": "awaiting_approval", "origin_lane": "dept-1"},
+            {"repair": "R-4", "state": "awaiting_approval", "origin_lane": "base"},
         ]}
-        p = os.path.join(d, "cys")
-        with open(p, "w", encoding="utf-8") as f:
-            f.write("#!/bin/sh\ncat <<'JSON'\n%s\nJSON\n" % json.dumps(doc))
-        os.chmod(p, 0o755)
-        self.assertEqual(G.collect_awaiting_approval(p), (True, "base", ["R-1"]))
+
+        def fake(doc):
+            p = os.path.join(d, "cys")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\ncat <<'JSON'\n%s\nJSON\n" % json.dumps(doc))
+            os.chmod(p, 0o755)
+            return p
+        self.assertEqual(G.collect_awaiting_approval(fake(doc)), (True, "base", ["R-1"]))
+        doc.pop("approval_cards")  # a daemon without the key → nothing is sent
+        self.assertEqual(G.collect_awaiting_approval(fake(doc)), (False, None, []))
         self.assertEqual(G.collect_awaiting_approval("/nonexistent/cys"), (False, None, []))
         self.assertIsNone(G.approval_wake("base", []))
+
+    @unittest.skipIf(os.name == "nt", "shell fake")
+    def test_resubmit_cycle_refused_by_step3_sends_nothing(self):
+        """RULINGS DF3: submit → step 3 refuses → fixed → submit → step 3 refuses again: the records say
+        승인 대기 / 진행 중 in turn, the daemon never shows a card — the master is sent nothing."""
+        d = tempfile.mkdtemp(prefix="fake-cys-list-")
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        p = os.path.join(d, "cys")
+        sent = []
+        for state in ("awaiting_approval", "in_progress", "awaiting_approval", "in_progress"):
+            doc = {"lane": "base", "approval_cards": [],
+                   "repairs": [{"repair": "R-7", "state": state, "origin_lane": "base"}]}
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\ncat <<'JSON'\n%s\nJSON\n" % json.dumps(doc))
+            os.chmod(p, 0o755)
+            sent += self.run_once(lambda: G.collect_awaiting_approval(p))
+        self.assertEqual(sent, [])
 
 
 if __name__ == "__main__":
