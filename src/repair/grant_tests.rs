@@ -337,13 +337,32 @@ fn pick_up_after_closure_counted_once() {
 /// B4: any owner input pauses at once (`Paused`, no new round); the pause ends by itself after 30
 /// minutes without owner input; nothing is written while the grant is off; a clock set back keeps
 /// the pause; `grant on` with the answer's time pauses too (the answer is an owner input).
+/// T4d (RULINGS DM1, the batch-1 rust-lib failure at this test's old line 348): an input seen while
+/// the grant is off is not written, but it stays in the daemon's memory as "not yet visible"; the
+/// first check after `grant on` writes it and answers paused. The mark covers THE INPUT's time + W
+/// (the time the caller passed, not the moment of the write): an input 10 minutes before the check
+/// pauses until input + 5 s + 30 min. (Old expectation: after an input while off, `grant on` left a
+/// new round open at the same time — `may_open_new_round_in(&r, t)` true.)
 #[test]
 fn owner_input_pauses_and_resumes() {
-    let r = root("pause");
     let lane = LaneKey("dept-4".into());
     let t = t0();
-    assert!(!note_owner_input_in(&r, &lane, t).unwrap(), "off: nothing to pause");
-    assert!(!pause_path_in(&r, &lane).exists());
+    // off: nothing is written; the input is remembered, and written by the first check after `grant on`
+    let off = root("pause-off");
+    let earlier = t - 600.0;
+    assert!(!note_owner_input_in(&off, &lane, earlier).unwrap(), "off: nothing to pause");
+    assert!(!pause_path_in(&off, &lane).exists(), "off: nothing written");
+    grant_on(&off, 5);
+    assert!(!may_open_new_round_in(&off, t).unwrap(), "the remembered input pauses once the grant is on");
+    let p = pause_path_in(&off, &lane);
+    let mark: PauseMark = parse_versioned(&p, &std::fs::read(&p).unwrap()).unwrap();
+    assert_eq!(mark.covered_through, Some(earlier + PAUSE_COVER_SECS), "covered through the input's time + W");
+    assert_eq!(mark.paused_at, earlier);
+    assert!(is_paused_in(&off, earlier + 1_804.5));
+    assert!(!is_paused_in(&off, earlier + 1_805.5), "30 minutes after the input's covered time, not after the write");
+    assert!(!note_owner_input_in(&off, &lane, earlier).unwrap(), "already covered: no second write");
+    // on: an input pauses at once
+    let r = root("pause");
     grant_on(&r, 5);
     assert!(may_open_new_round_in(&r, t).unwrap());
     assert!(note_owner_input_in(&r, &lane, t).unwrap());
