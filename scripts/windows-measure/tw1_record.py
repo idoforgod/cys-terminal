@@ -62,7 +62,7 @@ ENV_VALUE_ALLOW = (
     "OS", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "RUNNER_OS", "RUNNER_ARCH", "ImageOS", "ImageVersion",
     "GITHUB_SHA", "GITHUB_REF_NAME", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_EVENT_NAME", "GITHUB_WORKFLOW",
     "PYTHONUTF8", "PYTHONIOENCODING", "PYTHONDONTWRITEBYTECODE", "TW1_PHASE", "TW1_BUILD_RUN_ID",
-    "TW1_BUILD_CONCLUSION", "TW1_TNV_RESULT", "TW1_DL_OUTCOME",
+    "TW1_BUILD_CONCLUSION", "TW1_BUILD_REASON", "TW1_TNV_RESULT", "TW1_DL_OUTCOME",
 )
 
 
@@ -301,15 +301,18 @@ def decide_row(row, probes, state, phase, units):
     if row.get("phase", 1) > phase:
         return False, NM, R_PHASE
     probe = row.get("probe")
-    if probe is None:
-        return False, NM, R_PROBE_NOT_BUILT
-    for u in row.get("needs_units", []) or []:
+    needs = row.get("needs_units", []) or []
+    # an absent unit is the truer reason even where the probe is not built yet ("feature absent in this build")
+    for u in needs:
         st = unit_status(u, units)
         if st == "absent":
-            return bool(row.get("run_when_absent")), NM, "%s: %s" % (R_FEATURE_ABSENT, u)
+            return bool(row.get("run_when_absent")) and probe is not None, NM, "%s: %s" % (R_FEATURE_ABSENT, u)
         if st == "disagree":
             return False, NM, "%s: %s %r" % (R_UNIT_DISAGREE, u, (units or {}).get(u))
-        if st == "unknown":
+    if probe is None:
+        return False, NM, R_PROBE_NOT_BUILT
+    for u in needs:
+        if unit_status(u, units) == "unknown":
             return False, NM, "%s: %s" % (R_UNIT_UNKNOWN, u)
     need = probes[probe]["requires_state"]
     if need != "any" and state != need:
@@ -682,3 +685,23 @@ def row_result(row, parent, decision, outcome):
                  "checks": res["checks"]})
     base["evidence"] = list((outcome or {}).get("evidence", []))
     return base
+
+
+# ───────────────────────────── the windows-build run at this commit ─────────────────────────────
+
+def select_build_run(runs, sha):
+    """The windows-build run that built THIS commit: head_sha equal, a push run preferred, the newest first.
+    -> run dict or None. Pure (the REST listing is passed in)."""
+    same = [r for r in (runs or []) if isinstance(r, dict) and r.get("head_sha") == sha]
+    if not same:
+        return None
+    pushes = [r for r in same if r.get("event") == "push"]
+    pool = pushes or same
+    return max(pool, key=lambda r: (r.get("created_at") or "", r.get("run_number") or 0, r.get("id") or 0))
+
+
+def build_wait_decision(run):
+    """-> "found" (completed), "wait" (queued / in progress) or "absent"."""
+    if run is None:
+        return "absent"
+    return "found" if run.get("status") == "completed" else "wait"

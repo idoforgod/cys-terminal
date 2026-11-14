@@ -42,6 +42,54 @@
    "gate"
   ]
  },
+ "scenario": {
+  "listed_changed": [
+   "bin/javis_bootstrap.py",
+   "hooks/session-start.sh",
+   "hooks/role-capability-gate.sh",
+   "hooks/guard.sh",
+   "hooks/pack-guard.sh",
+   "bin/javis_preflight.py",
+   "bin/javis_formation.py",
+   "bin/javis_mission.py",
+   "bin/javis_teamtoken.py",
+   "bin/javis_orchestra.py"
+  ],
+  "listed_unchanged": [
+   "hooks/inject-context.sh",
+   "hooks/role-bootstrap.sh",
+   "hooks/_lib.sh",
+   "hooks/grill-gate.sh"
+  ],
+  "general_changed_py": [
+   "bin/javis_vibecheck.py",
+   "bin/javis_waiver.py",
+   "bin/javis_report.py",
+   "bin/javis_compete.py",
+   "bin/javis_org.py",
+   "bin/javis_channel_watch.py",
+   "bin/javis_dept_schedule.py",
+   "bin/javis_report_gate.py"
+  ],
+  "general_changed_sh": [
+   "bin/javis_org_e2e.sh"
+  ],
+  "general_changed_md": [
+   "hooks/README.md",
+   "skills/vibecoding/SKILL.md",
+   "skills/harness-creator/SKILL.md"
+  ],
+  "holder_hook": "save-state.sh",
+  "holder_module": "javis_event",
+  "query_listed_rel": "hooks/session-start.sh",
+  "update_mode_limit_s": 600,
+  "app_pack_wait_s": 240,
+  "next_version_marker": {
+   "py": "# tw1 next-version marker (TNV build only, never committed)",
+   "sh": "# tw1 next-version marker (TNV build only, never committed)",
+   "md": "<!-- tw1 next-version marker (TNV build only, never committed) -->"
+  }
+ },
  "expected_top_rows": 65,
  "order": [
   "s0_env",
@@ -1671,7 +1719,9 @@
      "id": "registrar-ran",
      "role": "complete",
      "fact": "registrar_exit",
-     "op": "present"
+     "op": "eq",
+     "value": 0,
+     "text": "the product's narrow registrar (javis_preflight.py --reconcile-hooks, RULINGS CW6) ran to exit 0 with the PATH seats get"
     },
     {
      "id": "jobs",
