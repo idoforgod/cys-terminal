@@ -829,11 +829,12 @@ fn one_unreadable_record_never_stops_the_job() {
     let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), true).unwrap();
     assert!(checked.borrow().contains(&"hooks/c1.sh".to_string()) && checked.borrow().contains(&"hooks/c3.sh".to_string()), "{:?}", checked.borrow());
     assert!(read_job_state_in(&r.root, &r.lane).is_some(), "the job state is written");
-    assert_eq!(filed.borrow().len(), 1, "one intake row: {:?}", filed.borrow());
+    // EJ3 / EN4: one row for the repair's fault, one for the cause of the suspended scan
+    assert_eq!(filed.borrow().iter().filter(|(_, l)| l.contains("처리하지 못함")).count(), 1, "one fault row: {:?}", filed.borrow());
     assert!(rep.lines.iter().any(|l| l.starts_with("R-2:")), "{:?}", rep.lines);
     // the next probation run: logged again, filed no more
     let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 700.0, &lock), false).unwrap();
-    assert_eq!(filed.borrow().len(), 1, "filed once per repair");
+    assert_eq!(filed.borrow().iter().filter(|(_, l)| l.contains("처리하지 못함")).count(), 1, "filed once per repair");
 }
 
 /// CU1: a failing re-check whose revert errors every time ends in a truthful FAILED state — the row
@@ -950,9 +951,13 @@ fn a_report_is_marked_filed_only_after_the_intake_accepted_it() {
     std::fs::write(ledger::record_path_in(&r.root, &rid("R-1")), b"{ broken").unwrap();
     let accept = std::cell::Cell::new(false);
     let calls = std::cell::Cell::new(0);
-    let intake = |_: &str, _: &str| {
-        calls.set(calls.get() + 1);
-        accept.get()
+    // (EJ3: the unreadable record also suspends the scan — its ONE cause row is a different duty;
+    // only this repair's fault attempts are counted)
+    let intake = |_: &str, line: &str| {
+        if line.contains("처리하지 못함") {
+            calls.set(calls.get() + 1);
+        }
+        accept.get() || !line.contains("처리하지 못함")
     };
     let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &intake, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
@@ -969,47 +974,55 @@ fn a_report_is_marked_filed_only_after_the_intake_accepted_it() {
 
 // ───────────────────────────── RULINGS DR6 — a finding is notified once, for ever ─────────────────────────────
 
-/// DR6: more than 500 put-backs (the display window keeps 500), then repeated sweeps — no old
-/// finding is reconstructed or notified again; an operation whose finding was never recorded is
-/// reconstructed exactly once. Without DR6 every sweep re-created the evicted ones as new notices.
+/// EJ3 / DR6 (REWRITTEN — old version: 501 operations with hand-written `acks/<op>.json` files, three
+/// sweeps return nothing, one unacknowledged operation rebuilt once). Now through the PRODUCTION path:
+/// 501 put-back operations completed by `wal::finish` (which writes `notice: due` in that same write),
+/// the sweep's view rebuilt, the notices consumed by `take_notices_in` (which marks each operation
+/// `delivered`): all 501 are delivered exactly once — none lost to the 500-row window, none repeated.
 #[test]
 fn a_finding_is_notified_once_for_ever() {
-    let r = rig("dr6acks");
+    let r = rig("ej3notice");
     let sub = m10_root_in(&r.root, &r.lane);
-    let ops_dir = crate::repair::wal::ops_dir_in(&sub, &m10_bucket());
-    std::fs::create_dir_all(&ops_dir).unwrap();
-    let ack_dir = ledger::repair_dir_in(&sub, &m10_bucket()).join("acks");
-    std::fs::create_dir_all(&ack_dir).unwrap();
-    let mk = |i: usize| {
-        let op = format!("m10-{i:04}");
-        let v = serde_json::json!({
-            "schema": 1, "op": op, "repair": "R-1", "lane_key": r.lane.0, "kind": "m10-revert", "form": "exchange",
-            "rel": "hooks/z.sh", "pre_existed": true, "expected": format!("file:{}:0755", format!("{i:064x}")),
-            "incoming": format!("file:{}:0755", "a".repeat(64)), "pack_generation": null,
-            "slot": sub.join("displaced/R-1").join(format!("slot-{i}")), "slot_identity": null, "live_identity": null,
-            "incoming_copy": null, "incoming_copy_identity": null, "step": "sealed", "hooks": [], "finished": true,
-            "outcome": "applied", "note": "", "created_at": 1.0, "updated_at": 1.0
-        });
-        std::fs::write(ops_dir.join(format!("{op}.json")), serde_json::to_vec(&v).unwrap()).unwrap();
-        op
-    };
-    // 501 historical put-backs whose findings were recorded (acknowledged); the window keeps 500
     for i in 0..501 {
-        let op = mk(i);
-        std::fs::write(ack_dir.join(format!("{op}.json")), b"{}").unwrap();
+        let mut op = crate::repair::wal::OpRecord {
+            schema: 1,
+            op: format!("m10-{i:04}"),
+            repair: m10_bucket(),
+            lane_key: r.lane.clone(),
+            kind: "m10-revert".into(),
+            form: "exchange".into(),
+            rel: "hooks/z.sh".into(),
+            pre_existed: true,
+            expected: format!("file:{:064x}:0755", i),
+            incoming: format!("file:{}:0755", "a".repeat(64)),
+            pack_generation: None,
+            slot: Some(sub.join("displaced/R-1").join(format!("slot-{i}"))),
+            slot_identity: None,
+            live_identity: None,
+            incoming_copy: None,
+            incoming_copy_identity: None,
+            step: "sealed".into(),
+            hooks: Vec::new(),
+            finished: false,
+            outcome: None,
+            note: String::new(),
+            created_at: 1.0,
+            updated_at: 1.0,
+            notice: None,
+        };
+        crate::repair::wal::finish(&sub, &mut op, "applied", "", 2.0).unwrap();
+        assert_eq!(op.notice.as_deref(), Some("due"), "the completing write carries the duty");
     }
     let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
-    for k in 0..3 {
+    let _view = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let delivered = take_notices_in(&r.root, &r.lane).unwrap();
+    assert_eq!(delivered.iter().filter(|f| f.kind == "reverted").count(), 501, "every put-back delivered once");
+    assert!(take_notices_in(&r.root, &r.lane).unwrap().is_empty(), "never twice");
+    for k in 1..3 {
         let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0 * k as f64, &lock)).unwrap();
-        assert!(f.is_empty(), "sweep {k}: an old finding came back: {}", f.len());
+        assert!(f.is_empty(), "sweep {k}: a delivered finding came back: {}", f.len());
     }
-    // one operation whose finding was never recorded → reconstructed exactly once
-    mk(9999);
-    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 4.0 * 3600.0, &lock)).unwrap();
-    assert_eq!(f.len(), 1, "{f:?}");
-    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 5.0 * 3600.0, &lock)).unwrap();
-    assert!(f.is_empty(), "never again: {f:?}");
 }
 
 // ───────────────────────────── RULINGS DR2 — one resolution, three answers ─────────────────────────────
@@ -1164,4 +1177,39 @@ fn an_unreadable_ledger_suspends_the_put_back_with_one_finding() {
     assert!(f.iter().all(|x| x.kind == "ledger-unreadable"), "no finding per file: {f:?}");
     let again = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0, &lock)).unwrap();
     assert!(again.is_empty(), "not again next hour: {again:?}");
+}
+
+/// EJ3 / EN1: the duty to file a failed probation's intake row IS its closure — when the write that
+/// would close it fails, the event is not final (no row, no closure) and the next tick (after a
+/// "restart") closes it and files exactly ONE row; later ticks file nothing more.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_failing_closure_write_then_a_restart_files_once() {
+    let r = rig("ej3closure");
+    let a = rid("R-1");
+    committed_general(&r, &a, "hooks/k.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let fails = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Fail("bad".into()), 5);
+    let filed = RefCell::new(Vec::<String>::new());
+    let intake = |_: &str, line: &str| {
+        filed.borrow_mut().push(line.to_string());
+        true
+    };
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &intake, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    // the closure write fails: the lane rows' folder is read-only
+    let lanes_dir = ledger::lane_path_in(&r.root, &a, &r.lane).parent().unwrap().to_path_buf();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&lanes_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let _ = run_tick(&job(&r, &d, ApplyForm::DepositFirst, NOW, &lock), false);
+    std::fs::set_permissions(&lanes_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.is_none(), "not final");
+    assert!(!filed.borrow().iter().any(|l| l.contains("시험 기간 재검사 실패")), "no closure row before the closure");
+    // the restart: the next probation tick closes it and files ONE row
+    let _ = run_tick(&job(&r, &d, ApplyForm::DepositFirst, NOW + 700.0, &lock), false);
+    let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
+    assert!(closed.starts_with("실패"), "{closed}");
+    let n = |f: &RefCell<Vec<String>>| f.borrow().iter().filter(|l| l.contains("시험 기간 재검사 실패")).count();
+    assert_eq!(n(&filed), 1);
+    let _ = run_tick(&job(&r, &d, ApplyForm::DepositFirst, NOW + 1400.0, &lock), false);
+    assert_eq!(n(&filed), 1, "never filed twice");
 }

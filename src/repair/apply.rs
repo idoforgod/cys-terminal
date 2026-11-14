@@ -424,6 +424,7 @@ fn new_record(env: &OpEnv<'_>, spec: &OpSpec, op: &str, form: &str, gen: &PackGe
         note: String::new(),
         created_at: env.now,
         updated_at: env.now,
+        notice: None,
     }
 }
 
@@ -1465,6 +1466,18 @@ pub fn pre_image_for(
     }
 }
 
+/// RULINGS EN1 — the closures that ARE the duty to file an intake row: written by the closing code,
+/// re-derived from these constants at every tick (never a parse of free text).
+pub const CLOSED_FAILED: &str = "실패";
+pub const CLOSED_REVERTED: &str = "되돌려짐";
+pub const BY_DAEMON_AUTO: &str = "데몬(자동)";
+
+/// Whether a lane row's closure is one that owes an intake row (EN1): the probation closed FAILED,
+/// or closed by the daemon's automatic return.
+pub fn closure_owes_intake(closed: &str) -> bool {
+    closed.starts_with(&format!("{CLOSED_FAILED} — ")) || closed == format!("{CLOSED_REVERTED} — {BY_DAEMON_AUTO}")
+}
+
 /// DX1 — THE definition of "revertible in this lane" (`revert_in` accepts exactly these; the app's
 /// "직전 수리 되돌리기" picks among them): the lane row still applies something (a file state or a
 /// hook line), it is not closed 되돌려짐 / 대체됨, and — in the origin lane — the record is in force or
@@ -1708,7 +1721,7 @@ pub fn revert_in(
     let by_label = match by {
         RevertCaller::Human => "사람".to_string(),
         RevertCaller::TicketedWorker { seat } => format!("워커 좌석 {seat}"),
-        RevertCaller::DaemonAuto => "데몬(자동)".to_string(),
+        RevertCaller::DaemonAuto => BY_DAEMON_AUTO.to_string(),
     };
     // DR7: the repair-level intent is durable BEFORE the first restoring exchange
     let op_tag = wal::new_op_id(env.now, "revert");
@@ -1783,7 +1796,7 @@ fn finish_revert(
     let complete = all_applied && !hook_failed;
     let nothing_changed = !any_applied && hook_step.is_none() && planned > 0;
     let label = if complete {
-        "되돌려짐"
+        CLOSED_REVERTED
     } else if nothing_changed {
         "대체됨"
     } else {
@@ -3939,6 +3952,7 @@ pub fn hook_lines_step_in(
         note: String::new(),
         created_at: now,
         updated_at: now,
+        notice: None,
     };
     let _live = wal::LiveOp::enter(&op.op); // DR9: owned until the step returns
     wal::write_in(root, &op)?;
@@ -3997,6 +4011,20 @@ pub fn resume_hook_steps_in(
     locked: &RepairLock<'_>,
     now: f64,
 ) -> u32 {
+    resume_hook_steps_report_in(root, pack, lane, registrar, locked, now).0
+}
+
+/// [`resume_hook_steps_in`] that also returns each resumed hook step that failed (EJ3: recorded by
+/// the job like every recovery error).
+pub fn resume_hook_steps_report_in(
+    root: &Path,
+    pack: &Path,
+    lane: &LaneKey,
+    registrar: &RegistrarFn<'_>,
+    locked: &RepairLock<'_>,
+    now: f64,
+) -> (u32, Vec<(RepairId, String)>) {
+    let mut errors = Vec::new();
     let mut n = 0;
     for mut op in wal::unfinished_for_lane(root, lane).into_iter().filter(|r| r.form == "hook") {
         // DR9: a hook step running now (it holds no pack-apply lock by design) is never resumed
@@ -4006,15 +4034,17 @@ pub fn resume_hook_steps_in(
         let Ok(Some(rec)) = ledger::read_record_in(root, &op.repair) else {
             continue;
         };
-        if finish_hook_op(root, pack, &rec, &mut op, registrar, now).is_ok() {
-            n += 1;
-        } else {
-            // CT7: a resumed hook operation that fails marks the lane 충돌 (as the first run would)
-            mark_lane_conflict(root, &rec.id, lane, now, locked);
-            n += u32::from(op.finished);
+        match finish_hook_op(root, pack, &rec, &mut op, registrar, now) {
+            Ok(_) => n += 1,
+            Err(e) => {
+                // CT7: a resumed hook operation that fails marks the lane 충돌 (as the first run would)
+                mark_lane_conflict(root, &rec.id, lane, now, locked);
+                errors.push((rec.id.clone(), format!("끊긴 훅 단계를 마치지 못했습니다({e:?})")));
+                n += u32::from(op.finished);
+            }
         }
     }
-    n
+    (n, errors)
 }
 
 /// The lane row of `id` → 충돌 (a hook step that could not complete — CT7).

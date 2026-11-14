@@ -67,6 +67,11 @@ pub struct OpRecord {
     pub note: String,
     pub created_at: f64,
     pub updated_at: f64,
+    /// RULINGS EN2 / EJ3 — the duty to notify of this operation's outcome (an M10 put-back):
+    /// `due`, written by the SAME write that completes the operation, until its reader consumed it
+    /// (`delivered`). Absent = no notice due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
 }
 
 /// `<root>/R-<n>/ops/`
@@ -216,6 +221,10 @@ pub fn finish(
     rec.step = "done".to_string();
     rec.finished = true;
     rec.outcome = Some(outcome.to_string());
+    // EJ3: a completed put-back owes its notice — in THIS write, the one that makes it final
+    if rec.kind == "m10-revert" && outcome == "applied" && rec.notice.is_none() {
+        rec.notice = Some("due".to_string());
+    }
     if !note.is_empty() {
         rec.note = note.chars().take(1000).collect();
     }

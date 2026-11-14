@@ -1732,6 +1732,7 @@ fn resumed_hook_step_failure_marks_the_lane_conflict() {
         note: String::new(),
         created_at: 1.0,
         updated_at: 1.0,
+        notice: None,
     };
     wal::write_in(&r.root, &op).unwrap();
     let failing = |_: &Path, _: bool| -> Result<String, RepairError> { Err(RepairError::CheckFailed("registrar down".into())) };
@@ -2035,6 +2036,7 @@ fn recovery_never_touches_a_live_operation() {
         note: String::new(),
         created_at: 1.0,
         updated_at: 1.0,
+        notice: None,
     };
     wal::write_in(&r.root, &op).unwrap();
     let ok = |_: &Path, _: bool| -> Result<String, RepairError> { Ok(report_json(&[("Stop", "l.sh", "unregistered", &[])])) };

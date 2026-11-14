@@ -177,10 +177,15 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
             Err(e) if injected(&e) => return Err(e),
             Err(e) => lines.push(format!("끊긴 동작을 마저 하지 못했습니다 — 다음 차례에 다시({e:?})")),
         }
-        n += apply::resume_hook_steps_in(root, env.op.pack, lane, env.registrar, env.locked, now);
+        let (hk, hook_errors) = apply::resume_hook_steps_report_in(root, env.op.pack, lane, env.registrar, env.locked, now);
+        n += hk;
+        faults.extend(hook_errors);
         if m10_root.exists() {
-            match apply::resume_interrupted_in(&m10_env) {
-                Ok(k) => n += k,
+            match apply::resume_interrupted_report_in(&m10_env) {
+                Ok((k, errors)) => {
+                    n += k;
+                    faults.extend(errors.into_iter().map(|(_, why)| (m10_bucket(), format!("M10: {why}"))));
+                }
                 Err(e) if injected(&e) => return Err(e),
                 Err(e) => lines.push(format!("M10 의 끊긴 동작을 마저 하지 못했습니다 — 다음 차례에 다시({e:?})")),
             }
@@ -223,8 +228,13 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
     }
     if d.sweep {
         let deferred = std::cell::Cell::new(false);
-        let swept = m10_sweep_with(env, &deferred);
+        let cause = std::cell::Cell::new(None);
+        let swept = m10_sweep_full(env, &deferred, &cause);
         report.deferred_sweep = deferred.get();
+        if let Some(c) = cause.take() {
+            let line = format!("장부의 {c} 을(를) 읽을 수 없어 이 부서의 한 시간마다 되돌리기를 멈췄습니다");
+            file_once(env, &format!("ledger:{c}"), &c, &line, &mut report);
+        }
         match swept {
             Ok(f) => report.m10 = f,
             Err(e) => report.lines.push(format!("미승인 변경 검사를 마치지 못했습니다 — 다음 차례에 다시({e:?})")),
@@ -242,97 +252,64 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
     Ok(report)
 }
 
-/// `<root>/lanes/<lane>.job-faults.json` — this lane's job's fault reports, keyed `<R-id>:<kind>`:
-/// `pending` until the intake ACKNOWLEDGED the row, then `filed` (RULINGS CU1 / DR5).
-fn faults_path_in(root: &Path, lane: &LaneKey) -> PathBuf {
-    root.join("lanes").join(format!("{}.job-faults.json", lane.0))
+/// `<root>/lanes/<lane>.job-acks.json` — ONLY acknowledgements (EN1 / EJ3): the keys whose intake
+/// row the intake accepted. The duties themselves are never stored apart: a closure that owes a row
+/// is re-derived from the row (`apply::closure_owes_intake`), a recurring fault from the condition
+/// re-detected each tick. A lost acknowledgement re-files the same signature (the intake merges it).
+fn acks_path_in(root: &Path, lane: &LaneKey) -> PathBuf {
+    root.join("lanes").join(format!("{}.job-acks.json", lane.0))
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct FaultEntry {
-    rel: String,
-    line: String,
-    state: String,
-}
-
-fn load_faults(root: &Path, lane: &LaneKey) -> std::collections::BTreeMap<String, FaultEntry> {
-    std::fs::read(faults_path_in(root, lane))
+fn load_acks(root: &Path, lane: &LaneKey) -> std::collections::BTreeMap<String, f64> {
+    std::fs::read(acks_path_in(root, lane))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
-/// Tries the intake of one pending fault (once per tick per key); `filed` is written only AFTER the
-/// intake acknowledged it.
-fn try_file(env: &JobEnv<'_>, key: &str, report: &mut TickReport) {
-    if report.intake_tried.iter().any(|k| k == key) {
+/// Files the intake row of one duty `key` unless already acknowledged — at most once per tick; the
+/// acknowledgement is written only AFTER the intake accepted it.
+fn file_once(env: &JobEnv<'_>, key: &str, rel: &str, line: &str, report: &mut TickReport) {
+    if report.intake_tried.iter().any(|k| k == key) || load_acks(env.op.root, env.op.lane).contains_key(key) {
         return;
     }
     report.intake_tried.push(key.to_string());
-    let mut all = load_faults(env.op.root, env.op.lane);
-    let Some(entry) = all.get(key).cloned() else {
-        return;
-    };
-    if entry.state == "filed" {
+    if !(env.intake)(rel, line) {
+        report.lines.push(format!("{key}: 보고가 아직 접수되지 않았습니다(한도 초과나 오류) — 다음 차례에 다시"));
         return;
     }
-    if (env.intake)(&entry.rel, &entry.line) {
-        all.insert(key.to_string(), FaultEntry { state: "filed".into(), ..entry });
-        if let Err(e) = super::durable::write_json_durable(&faults_path_in(env.op.root, env.op.lane), &all) {
-            report.lines.push(format!("{key}: 접수된 보고를 '보고함'으로 적지 못했습니다 — 다음 차례에 다시 확인({e:?})"));
-        }
-    } else {
-        report.lines.push(format!("{key}: 보고가 아직 접수되지 않았습니다(한도 초과나 오류) — 다음 차례에 다시"));
+    let mut acks = load_acks(env.op.root, env.op.lane);
+    acks.insert(key.to_string(), env.op.now);
+    if let Err(e) = super::durable::write_json_durable(&acks_path_in(env.op.root, env.op.lane), &acks) {
+        report.lines.push(format!("{key}: 접수 확인을 적지 못했습니다 — 다음 차례에 같은 보고가 합쳐집니다({e:?})"));
     }
 }
 
-/// CU1 / DR5: a repair the job could not handle — logged in the tick's lines every time, recorded
-/// `pending` (durably) the first time, and filed as ONE intake row: marked `filed` only after the
-/// intake acknowledged it; a pending one is retried at later ticks.
+/// A recurring fault of one repair (unreadable record / row, a re-check or recovery error): a line
+/// every tick, ONE intake row until acknowledged.
 fn fault_once(env: &JobEnv<'_>, id: &RepairId, kind: &str, rel: &str, line: &str, report: &mut TickReport) {
     report.lines.push(format!("{}: {line} — 이 수리는 건너뛰고 나머지는 계속합니다", id.as_str()));
     let key = format!("{}:{kind}", id.as_str());
-    let mut all = load_faults(env.op.root, env.op.lane);
-    if !all.contains_key(&key) {
-        all.insert(
-            key.clone(),
-            FaultEntry {
-                rel: rel.to_string(),
-                line: format!("자체 해결 작업이 수리 {}를 처리하지 못함 — {}", id.as_str(), line.chars().take(300).collect::<String>()),
-                state: "pending".into(),
-            },
-        );
-        if let Err(e) = super::durable::write_json_durable(&faults_path_in(env.op.root, env.op.lane), &all) {
-            report.lines.push(format!("{key}: 보고 대기를 기록하지 못했습니다({e:?})"));
-        }
-    }
-    try_file(env, &key, report);
+    let text = format!("자체 해결 작업이 수리 {}를 처리하지 못함 — {}", id.as_str(), line.chars().take(300).collect::<String>());
+    file_once(env, &key, rel, &text, report);
 }
 
-/// DR5: every pending report of this lane is retried (once per tick per key).
-fn retry_pending_faults(env: &JobEnv<'_>, report: &mut TickReport) {
-    let pending: Vec<String> = load_faults(env.op.root, env.op.lane)
-        .into_iter()
-        .filter(|(_, e)| e.state == "pending")
-        .map(|(k, _)| k)
-        .collect();
-    for key in pending {
-        try_file(env, &key, report);
-    }
-}
-
-/// A report filed through the same acknowledged path, with its own description (the probation's
-/// failure reports — DR5 / DR8).
-fn report_once(env: &JobEnv<'_>, id: &RepairId, kind: &str, rel: &str, description: &str, report: &mut TickReport) {
-    let key = format!("{}:{kind}", id.as_str());
-    let mut all = load_faults(env.op.root, env.op.lane);
-    if !all.contains_key(&key) {
-        all.insert(key.clone(), FaultEntry { rel: rel.to_string(), line: description.to_string(), state: "pending".into() });
-        if let Err(e) = super::durable::write_json_durable(&faults_path_in(env.op.root, env.op.lane), &all) {
-            report.lines.push(format!("{key}: 보고 대기를 기록하지 못했습니다({e:?})"));
+/// EN1: every lane row whose closure owes an intake row (closed 실패, or 되돌려짐 by the daemon's
+/// automatic return) files it until acknowledged — re-derived at every tick from the closures.
+fn closure_obligations(env: &JobEnv<'_>, report: &mut TickReport) {
+    for id in ledger::list_ids_in(env.op.root) {
+        let Ok(Some(row)) = ledger::read_lane_in(env.op.root, &id, env.op.lane) else {
+            continue;
+        };
+        let Some(closed) = row.probation.as_ref().and_then(|p| p.closed.clone()) else {
+            continue;
+        };
+        if !apply::closure_owes_intake(&closed) {
+            continue;
         }
+        let rel = row.applied.first().map(|(r, _)| r.clone()).unwrap_or_else(|| format!("repairs/{}/record.json", id.as_str()));
+        file_once(env, &format!("{}:closure", id.as_str()), &rel, &format!("시험 기간 재검사 실패 — 수리 {} · {closed}", id.as_str()), report);
     }
-    try_file(env, &key, report);
 }
 
 // ───────────────────────────── the start-time pass (AK7 + DEFERRED #49) ─────────────────────────────
@@ -676,7 +653,7 @@ fn note_timeouts(env: &JobEnv<'_>, id: &RepairId, timeouts: &[(String, f64)]) ->
 fn probation_pass(env: &JobEnv<'_>, report: &mut TickReport) {
     let root = env.op.root;
     let lane = env.op.lane;
-    retry_pending_faults(env, report);
+    closure_obligations(env, report);
     for id in ledger::list_ids_in(root) {
         let ledger_rel = format!("repairs/{}/record.json", id.as_str());
         let row = match ledger::read_lane_in(root, &id, lane) {
@@ -725,7 +702,7 @@ fn close_failed(env: &JobEnv<'_>, id: &RepairId, why: &str) -> Result<(), Repair
             row.state = super::types::LaneState::Conflict;
             if let Some(p) = row.probation.as_mut() {
                 if p.closed.is_none() {
-                    p.closed = Some(format!("실패 — {why}").chars().take(400).collect());
+                    p.closed = Some(format!("{} — {why}", apply::CLOSED_FAILED).chars().take(400).collect());
                 }
             }
             row.updated_at = now;
@@ -834,7 +811,10 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, repor
                 Ok(x) => format!("되돌리지 못함({:?})", x.outcome),
                 Err(e) => format!("되돌리지 못함({e:?})"),
             };
-            report_once(env, id, "probation-failed", first_rel, &format!("시험 기간 재검사 실패 — 수리 {} {outcome_text} — {why}", id.as_str()), report);
+            // EN1: the intake row is owed by the CLOSURE this revert / failure writes (filed by
+            // `closure_obligations`), never by a separate pending entry
+            report.lines.push(format!("{}: 시험 기간 재검사 실패 — {outcome_text} — {why}", id.as_str()));
+            let _ = first_rel;
             match r {
                 Ok(r) if r.outcome == ApplyOutcome::Applied => {
                     report.reverted.push(id.clone());
@@ -860,7 +840,7 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, repor
             // Windows 0.15.0: automatic return is off — ONE intake row and a FAILED end of this
             // probation (CU4: never 사용 중 later; the row closed, so it is not re-filed every check)
             note_timeouts(env, id, &timeouts)?;
-            report_once(env, id, "probation-failed", first_rel, &format!("시험 기간 재검사 실패(이 운영체제에서는 자동으로 되돌리지 않음) — 수리 {} · {why}", id.as_str()), report);
+            let _ = first_rel;
             close_failed(env, id, &format!("재검사 실패(이 운영체제에서는 자동으로 되돌리지 않음 — 기록·알림) · {why} — 워커 검토"))?;
             report.reported_only.push((id.clone(), why.clone()));
             report.lines.push(format!("{}: 재검사 실패 — 이 운영체제에서는 자동으로 되돌리지 않고 실패로 기록·알림만 합니다 · {why}", id.as_str()));
@@ -978,7 +958,16 @@ fn save_findings(root: &Path, lane: &LaneKey, findings: &[Finding]) -> Result<()
     let f = FindingsFile {
         schema: super::REPAIR_SCHEMA,
         lane: lane.0.clone(),
-        findings: findings.iter().rev().take(500).rev().cloned().collect(),
+        // EJ3: a view never evicts an undelivered notice; only delivered / notice-less entries age out
+        findings: {
+            let keep_old = findings.len().saturating_sub(500);
+            findings
+                .iter()
+                .enumerate()
+                .filter(|(i, f)| *i >= keep_old || (f.notice && !f.notified))
+                .map(|(_, f)| f.clone())
+                .collect()
+        },
     };
     super::durable::write_json_durable(&findings_path_in(root, lane), &f)
 }
@@ -996,6 +985,31 @@ pub fn take_notices_in(root: &Path, lane: &LaneKey) -> Result<Vec<Finding>, Repa
     }
     if !out.is_empty() {
         save_findings(root, lane, &all)?;
+    }
+    // EJ3: every completed put-back whose notice is DUE is delivered here — its operation record is
+    // marked `delivered` (the receiver's acknowledgement), independent of any view
+    let sub = m10_root_in(root, lane);
+    let (ops, _) = super::wal::list_in(&sub, &m10_bucket());
+    for mut op in ops.into_iter().filter(|o| o.lane_key == *lane && o.notice.as_deref() == Some("due")) {
+        let sha = match apply::state_of_canon(&op.expected) {
+            Some(TargetState::File { sha256, .. }) => sha256,
+            _ => String::new(),
+        };
+        let mut f = Finding {
+            rel: op.rel.clone(),
+            sha256: sha,
+            kind: "reverted".into(),
+            at: op.updated_at,
+            notice: true,
+            notified: true,
+            slot: op.slot.clone(),
+            kept_copy: None,
+            note: "검사 결과: 실패".into(),
+        };
+        finalize_finding(&mut f, Path::new(""));
+        op.notice = Some("delivered".into());
+        super::wal::write_in(&sub, &op)?;
+        out.push(f);
     }
     Ok(out)
 }
@@ -1023,14 +1037,18 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
 
 /// [`m10_sweep`]; `report_deferred_sweep` is set when a put-back was skipped for the lock (DX3).
 fn m10_sweep_with(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool>) -> Result<Vec<Finding>, RepairError> {
+    m10_sweep_full(env, report_deferred_sweep, &std::cell::Cell::new(None))
+}
+
+/// [`m10_sweep_with`]; `unreadable_cause` is set to the unreadable ledger member that suspended the
+/// scan (EN4 — the tick files ONE intake row for it).
+fn m10_sweep_full(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool>, unreadable_cause: &std::cell::Cell<Option<String>>) -> Result<Vec<Finding>, RepairError> {
     let root = env.op.root;
     let lane = env.op.lane;
     let pack = env.op.pack;
     let mut existing = load_findings(root, lane);
     let mut new_findings = Vec::new();
-    // DR6: the operations whose finding is recorded in this sweep — acknowledged write-once next to
-    // the operation's own record AFTER the findings are saved
-    let mut to_ack: Vec<String> = Vec::new();
+    // EJ3: the findings file is a VIEW; a put-back's notice duty lives on its operation record
     let mut ledger_unreadable: Option<(String, Vec<String>)> = None;
     // CT9: a put-back's finding survives a crash between the exchange and the findings write — it is
     // rebuilt idempotently from the completed operation records of the M10 sub-ledger
@@ -1039,16 +1057,14 @@ fn m10_sweep_with(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
     for op in done_ops.into_iter().filter(|o| {
         o.finished && o.outcome.as_deref() == Some("applied") && o.kind == "m10-revert" && o.lane_key == *lane
     }) {
-        // DR6: an operation whose finding was ever recorded carries its write-once acknowledgement —
-        // independent of the 500-row display window; it is never reconstructed again
-        if m10_ack_path(&sub_root, &op.op).exists() {
+        // EJ3: the view is rebuilt only for a put-back whose notice is still DUE and that the view
+        // does not show; a delivered one never comes back
+        if op.notice.as_deref() != Some("due") {
             continue;
         }
         if existing.iter().chain(new_findings.iter()).any(|f: &Finding| f.slot.is_some() && f.slot == op.slot) {
-            to_ack.push(op.op.clone());
             continue;
         }
-        to_ack.push(op.op.clone());
         let sha = match apply::state_of_canon(&op.expected) {
             Some(TargetState::File { sha256, .. }) => sha256,
             _ => continue,
@@ -1058,7 +1074,7 @@ fn m10_sweep_with(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
             sha256: sha,
             kind: "reverted".into(),
             at: op.updated_at,
-            notice: true,
+            notice: false, // a view: the duty is the operation's `notice`
             notified: false,
             slot: op.slot.clone(),
             kept_copy: None,
@@ -1334,9 +1350,6 @@ fn m10_sweep_with(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
             });
             continue;
         };
-        if let Some(op_id) = &r.op {
-            to_ack.push(op_id.clone());
-        }
         let (kind, note) = match &r.outcome {
             ApplyOutcome::Applied => ("reverted", format!("검사 결과: {why}")),
             ApplyOutcome::Superseded(m) => ("superseded", format!("검사와 되돌리기 사이에 바뀜 — 되돌리지 않고 다음 검사로: {m}")),
@@ -1347,7 +1360,9 @@ fn m10_sweep_with(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
             sha256: sha,
             kind: kind.to_string(),
             at: env.op.now,
-            notice,
+            // EJ3: a completed put-back's notice is its operation's duty (`notice: due`); the view
+            // entry carries none; an attempt that put nothing back is noticed through the view
+            notice: notice && kind != "reverted",
             notified: false,
             slot: r.slot,
             kept_copy: None,
@@ -1358,6 +1373,9 @@ fn m10_sweep_with(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
         finalize_finding(f, pack);
     }
     // EN4: ONE finding for the CAUSE of a suspended scan (the unreadable record, the files inside it)
+    if let Some((cause, _)) = &ledger_unreadable {
+        unreadable_cause.set(Some(cause.clone()));
+    }
     if let Some((cause, rels)) = ledger_unreadable {
         let key = sha_hex(cause.as_bytes());
         if !existing.iter().chain(new_findings.iter()).any(|f| f.kind == "ledger-unreadable" && f.sha256 == key) {
@@ -1381,24 +1399,9 @@ fn m10_sweep_with(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
         existing.extend(new_findings.iter().cloned());
         save_findings(root, lane, &existing)?;
     }
-    for op_id in to_ack {
-        let p = m10_ack_path(&sub_root, &op_id);
-        if let Some(d) = p.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        match super::vault::publish_new(&p, b"{\"finding\": \"recorded\"}\n", 0o644) {
-            Ok(()) | Err(RepairError::Superseded(_)) => {}
-            Err(e) => return Err(e),
-        }
-    }
     Ok(new_findings)
 }
 
-/// DR6: the write-once acknowledgement that an M10 operation's finding was recorded —
-/// `<sub-ledger>/R-1/acks/<op>.json`, next to the operation's own record.
-fn m10_ack_path(sub_root: &Path, op: &str) -> PathBuf {
-    ledger::repair_dir_in(sub_root, &m10_bucket()).join("acks").join(format!("{op}.json"))
-}
 
 /// The resolved restore content of M10 for `rel` in a pack: the binary's embedded copy, only when
 /// the pack's generation is this binary's own (version = this build's version, free channel) —
