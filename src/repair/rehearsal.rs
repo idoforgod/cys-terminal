@@ -122,22 +122,37 @@ fn run_kind(
     }
 }
 
+/// The bytes of a file the check reads — ONE no-follow, non-blocking handle (RULINGS DF5: in the
+/// worker's `check` the root is the live pack, and a FIFO there must not hang the request).
+fn read_plain(file: &Path) -> Result<Vec<u8>, RepairError> {
+    match replay::read_stamped(file)? {
+        (replay::LaidSource::Bytes { bytes, .. }, _) => Ok(bytes),
+        _ => Err(RepairError::Precondition(format!(
+            "{}: not a regular file",
+            file.display()
+        ))),
+    }
+}
+
 fn json_parse(file: &Path, rel: &str) -> CheckResult {
-    match std::fs::read(file) {
+    match read_plain(file) {
         Ok(b) => match serde_json::from_slice::<serde_json::Value>(&b) {
             Ok(_) => CheckResult::Pass,
             Err(e) => CheckResult::Fail(format!("{rel}: JSON 으로 읽히지 않습니다 — {e}")),
         },
-        Err(e) => CheckResult::Fail(format!("{rel}: 읽을 수 없습니다 — {e}")),
+        Err(e) => CheckResult::Fail(format!("{rel}: 읽을 수 없습니다 — {e:?}")),
     }
 }
 
 fn first_line(file: &Path) -> String {
-    use std::io::{BufRead, BufReader};
-    std::fs::File::open(file)
+    read_plain(file)
         .ok()
-        .and_then(|f| BufReader::new(f).lines().next())
-        .and_then(|l| l.ok())
+        .and_then(|b| {
+            String::from_utf8_lossy(&b)
+                .lines()
+                .next()
+                .map(str::to_string)
+        })
         .unwrap_or_default()
 }
 
@@ -445,10 +460,7 @@ fn executed(
                 }
             }
             let recorded = match &req.recorded_input {
-                Some(p) => Some(
-                    std::fs::read(p)
-                        .map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?,
-                ),
+                Some(p) => Some(read_plain(p)?),
                 None => None,
             };
             let events: Vec<&str> = events

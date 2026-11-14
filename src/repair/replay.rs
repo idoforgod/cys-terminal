@@ -815,25 +815,101 @@ pub fn real_settings_targets(lane: &Path, home: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The change stamp of a compared item (BL1): inode + modification time. A write — the same bytes
-/// included — moves the modification time; a replacement moves the inode; a mode change moves the
-/// state. The inode-change time (ctime) is NOT part of it: system services change it without any
-/// write (measured: the iCloud file provider re-stamped every file of a Desktop-backed test folder
-/// seconds after it was created — every candidate would then have been "written again").
+/// Opens `p` without following a link and without blocking (a FIFO swapped in cannot hang the
+/// thread — the class of RULINGS CW3); the caller re-checks the kind on the handle.
 #[cfg(unix)]
-fn stamp_of(p: &Path) -> String {
-    use std::os::unix::fs::MetadataExt;
-    match std::fs::symlink_metadata(p) {
-        Ok(m) => format!("ino={} mtime={}.{}", m.ino(), m.mtime(), m.mtime_nsec()),
-        Err(_) => "absent".into(),
-    }
+fn open_nofollow_nonblock(p: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(p)
 }
 
 #[cfg(not(unix))]
-fn stamp_of(p: &Path) -> String {
-    match std::fs::symlink_metadata(p) {
-        Ok(m) => format!("len={} mtime={:?}", m.len(), m.modified().ok()),
-        Err(_) => "absent".into(),
+fn open_nofollow_nonblock(p: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(p)
+}
+
+/// The change stamp of a compared item from its metadata (BL1).
+#[cfg(unix)]
+fn stamp_from(m: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!("ino={} mtime={}.{}", m.ino(), m.mtime(), m.mtime_nsec())
+}
+
+#[cfg(not(unix))]
+fn stamp_from(m: &std::fs::Metadata) -> String {
+    format!("len={} mtime={:?}", m.len(), m.modified().ok())
+}
+
+/// Largest file a replayed / compared read takes (a pack file or a settings file is far smaller).
+const MAX_READ: u64 = 64 * 1024 * 1024;
+
+/// RULINGS DF5: ONE read of a replayed or compared path — its content, mode and change stamp all from
+/// the SAME no-follow, non-blocking handle (a link is reported as a link from `lstat`; a missing
+/// path is absent; anything that is not a regular file on the opened handle is refused). Nothing is
+/// opened twice, so the bytes laid out, hashed and compared are the bytes that were stamped.
+pub fn read_stamped(p: &Path) -> Result<(LaidSource, String), RepairError> {
+    let io = |e: std::io::Error| RepairError::Io(format!("{}: {e}", p.display()));
+    let lmeta = match std::fs::symlink_metadata(p) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((LaidSource::Absent, "absent".into()))
+        }
+        Err(e) => return Err(io(e)),
+    };
+    if lmeta.file_type().is_symlink() {
+        let target = std::fs::read_link(p).map_err(io)?;
+        let target = target.into_os_string().into_string().map_err(|_| {
+            RepairError::Io(format!("{}: link target is not valid UTF-8", p.display()))
+        })?;
+        return Ok((LaidSource::Link(target), stamp_from(&lmeta)));
+    }
+    if !lmeta.file_type().is_file() {
+        return Err(RepairError::Precondition(format!(
+            "{}: not a regular file or symbolic link",
+            p.display()
+        )));
+    }
+    let f = open_nofollow_nonblock(p).map_err(io)?;
+    let meta = f.metadata().map_err(io)?;
+    if !meta.file_type().is_file() {
+        return Err(RepairError::Precondition(format!(
+            "{}: changed while being read (no longer a regular file)",
+            p.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(meta.len().min(MAX_READ) as usize);
+    std::io::Read::read_to_end(&mut std::io::Read::take(&f, MAX_READ + 1), &mut bytes)
+        .map_err(io)?;
+    if bytes.len() as u64 > MAX_READ {
+        return Err(RepairError::Precondition(format!(
+            "{}: larger than {MAX_READ} bytes",
+            p.display()
+        )));
+    }
+    Ok((
+        LaidSource::Bytes {
+            bytes,
+            mode: permission_bits(&meta),
+        },
+        stamp_from(&meta),
+    ))
+}
+
+#[cfg(unix)]
+fn permission_bits(m: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    m.permissions().mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn permission_bits(m: &std::fs::Metadata) -> u32 {
+    if m.permissions().readonly() {
+        0o444
+    } else {
+        0o644
     }
 }
 
@@ -851,18 +927,18 @@ pub fn live_snapshot(lane: &Path, settings: &[PathBuf]) -> Vec<LiveItem> {
     let mut out = Vec::new();
     for rel in rels {
         let p = lane.join(rel);
-        let state = TargetState::read(&p)
-            .map(|s| s.canon())
-            .unwrap_or_else(|e| format!("unreadable: {e:?}"));
+        let (state, stamp) = match read_stamped(&p) {
+            Ok((c, stamp)) => (c.state().canon(), stamp),
+            Err(e) => (format!("unreadable: {e:?}"), "unreadable".into()),
+        };
         out.push(LiveItem {
             item: p.to_string_lossy().into_owned(),
             state,
-            stamp: stamp_of(&p),
+            stamp,
         });
     }
     for s in settings {
-        let (hooks, status) = settings_sections(s);
-        let stamp = stamp_of(s);
+        let (hooks, status, stamp) = settings_sections(s);
         out.push(LiveItem {
             item: format!("{}#hooks", s.to_string_lossy()),
             state: hooks,
@@ -877,18 +953,16 @@ pub fn live_snapshot(lane: &Path, settings: &[PathBuf]) -> Vec<LiveItem> {
     out
 }
 
-/// (`hooks` section, `statusLine` section) of a settings file, each canonical JSON or a marker.
-fn settings_sections(p: &Path) -> (String, String) {
-    let Ok(meta) = std::fs::symlink_metadata(p) else {
-        return ("absent".into(), "absent".into());
+/// (`hooks` section, `statusLine` section, change stamp) of a settings file, each section canonical
+/// JSON or a marker — read through ONE no-follow, non-blocking handle ([`read_stamped`], DF5).
+fn settings_sections(p: &Path) -> (String, String, String) {
+    let (bytes, stamp) = match read_stamped(p) {
+        Ok((LaidSource::Absent, st)) => return ("absent".into(), "absent".into(), st),
+        Ok((LaidSource::Link(_), st)) => return ("not-a-file".into(), "not-a-file".into(), st),
+        Ok((LaidSource::Bytes { bytes, .. }, st)) => (bytes, st),
+        Err(_) => return ("unreadable".into(), "unreadable".into(), "unreadable".into()),
     };
-    if !meta.file_type().is_file() || meta.len() > 8 * 1024 * 1024 {
-        return ("not-a-file".into(), "not-a-file".into());
-    }
-    let Ok(text) = std::fs::read(p) else {
-        return ("unreadable".into(), "unreadable".into());
-    };
-    match serde_json::from_slice::<serde_json::Value>(&text) {
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
         Ok(v) => (
             v.get("hooks")
                 .map(|h| h.to_string())
@@ -896,12 +970,13 @@ fn settings_sections(p: &Path) -> (String, String) {
             v.get("statusLine")
                 .map(|h| h.to_string())
                 .unwrap_or_else(|| "none".into()),
+            stamp,
         ),
         Err(_) => {
             use sha2::{Digest, Sha256};
-            let h = Sha256::digest(&text);
+            let h = Sha256::digest(&bytes);
             let hex: String = h.iter().map(|b| format!("{b:02x}")).collect();
-            (format!("invalid-json:{hex}"), format!("invalid-json:{hex}"))
+            (format!("invalid-json:{hex}"), format!("invalid-json:{hex}"), stamp)
         }
     }
 }
@@ -989,17 +1064,10 @@ pub enum LaidSource {
 }
 
 impl LaidSource {
-    /// Reads a live path with `lstat` semantics (a link is a link).
+    /// Reads a live path with `lstat` semantics (a link is a link) — the content and mode from ONE
+    /// no-follow, non-blocking handle ([`read_stamped`], RULINGS DF5).
     pub fn read(p: &Path) -> Result<Self, RepairError> {
-        match TargetState::read(p)? {
-            TargetState::Absent => Ok(LaidSource::Absent),
-            TargetState::Link { target } => Ok(LaidSource::Link(target)),
-            TargetState::File { mode, .. } => {
-                let bytes = std::fs::read(p)
-                    .map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
-                Ok(LaidSource::Bytes { bytes, mode })
-            }
-        }
+        read_stamped(p).map(|(c, _)| c)
     }
 
     /// The `TargetState` of this content (sha256 of the bytes).

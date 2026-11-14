@@ -236,10 +236,14 @@ pub fn write_verdict_in(
 /// has a higher schema → `Err(Corrupt)` (never a verdict that holds).
 pub fn read_verdict_in(root: &Path, id: &RepairId) -> Result<Option<RecordedVerdict>, RepairError> {
     let p = verdict_path_in(root, id);
-    let bytes = match std::fs::read(&p) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(RepairError::Corrupt(format!("{}: {e}", p.display()))),
+    // one no-follow, non-blocking read (a FIFO in its place cannot hang the apply — RULINGS DF5)
+    let bytes = match replay::read_stamped(&p) {
+        Ok((LaidSource::Absent, _)) => return Ok(None),
+        Ok((LaidSource::Bytes { bytes, .. }, _)) => bytes,
+        Ok((LaidSource::Link(_), _)) => {
+            return Err(RepairError::Corrupt(format!("{}: a link, not a verdict", p.display())))
+        }
+        Err(e) => return Err(RepairError::Corrupt(format!("{}: {e:?}", p.display()))),
     };
     let v: RecordedVerdict = serde_json::from_slice(&bytes)
         .map_err(|e| RepairError::Corrupt(format!("{}: {e}", p.display())))?;
