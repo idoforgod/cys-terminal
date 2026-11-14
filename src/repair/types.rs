@@ -451,6 +451,44 @@ pub fn system_locked_entry(rel: &str) -> Option<&'static str> {
         .find(|l| fold_name(l) == folded)
 }
 
+/// RULINGS DA1: the pack-relative names of the pack's locked security files
+/// (`crate::pack::SYSTEM_LOCKED`), for the identity comparison of the daemon's verbs.
+pub fn system_locked_names() -> &'static [&'static str] {
+    crate::pack::SYSTEM_LOCKED
+}
+
+/// RULINGS DA1: how many names (hard links) the file at `path` has (a link is followed); `None`
+/// when it cannot be read. Unix `st_nlink`; Windows `nNumberOfLinks` of
+/// `GetFileInformationByHandle` (the same call as `boot_critical::file_identity`).
+pub fn link_count(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| m.nlink())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let f = std::fs::File::open(path).ok()?;
+        // SAFETY: a zeroed BY_HANDLE_FILE_INFORMATION is a valid out-parameter; the handle is
+        // owned by `f`, which outlives the call.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) };
+        if ok == 0 {
+            return None;
+        }
+        Some(u64::from(info.nNumberOfLinks))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// RULINGS BJ3 / CD1 — the ONE name comparison of protected names: Unicode case folding by
 /// upper- then lower-casing every character, REPEATED until the result no longer changes (a
 /// fixpoint: `ſ` → `S` → `s`, the Kelvin sign `K` → `k`, `ß` → `ss`, the `st` ligature U+FB06 →
