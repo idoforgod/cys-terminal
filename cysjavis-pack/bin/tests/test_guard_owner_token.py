@@ -24,18 +24,24 @@
   6  규칙 문서가 아닌 쓰기는 조회 없이 통과한다(평시 동작 무변화).
 밀폐: 가짜 `cys` 스텁(PATH 선두) · 임시 디렉터리의 진짜 unix 소켓 파일 · GUARD_TEST_MODE 로 자율주행 깃발을
 임시 경로에 둔다 · HOME 임시. 데몬·라이브 팩 무접촉.
-시간: 한도에 대한 판정은 가드가 밝힌 값만 읽는다 — 어떤 걸린 시간도 판정하지 않는다(RULINGS FV1). 넉넉한 예산을
-쓰는 곳은 둘뿐이다: 허용·거부 경우(20초 — 스텁이 늦게 떠도 답이 그 안에 온다)와 시간 초과 경우(8초 — 스텁이
-뜨고 하트비트를 남길 시간). 부하는 이 경우들을 느리게 만들 뿐 판정을 바꾸지 않는다.
+시간(RULINGS FV1 · FZ3): 어떤 경과 시간도 한도와 비교하지 않는다 — 한도에 대한 판정은 가드가 밝힌 값만 읽는다.
+다만 실제 경로를 보는 경우는 스텁이 남은 예산 안에 떠야 한다: 허용·거부 경우는 20초 안에 답해야 하고, 시간 초과
+경우(3c)는 8초 안에 떠서 하트비트를 남겨야 한다. 그보다 늦게 뜰 만큼 부하가 크면 맞는 가드에서도 그 경우가 실패한다.
+정리(RULINGS FZ2): 훅은 자기 세션에서 돈다 — 그 프로세스 그룹에 셸·parser·parser 가 띄운 스텁이 모두 있다. 훅이
+120초 안에 끝나지 않으면 감시가 그 그룹 전체를 끝내고 거둔다(정리일 뿐 한도에 대해 아무것도 판정하지 않는다).
+대조 9vii: 막고 있는 스텁을 남긴 채 멈춘 훅을 그 정리로 끝내면 스텁도 사라진다. 10: 테스트가 띄운 스텁은 끝에 모두
+사라졌다.
 출력: PASS/FAIL 행 · 실패 시 exit 1 · 전부 통과 시 GUARD-OWNER-TOKEN-OK.
 """
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 
 SELF = os.path.dirname(os.path.abspath(__file__))
 PACK = os.path.dirname(os.path.dirname(SELF))
@@ -82,10 +88,12 @@ if mode == "block-fails":
 sys.exit(int(os.environ.get("STUB_RULEDOC_RC", "95")))
 """
 
-# the allow / deny cases get a large budget: the stub's answer arrives well within it even when the stub starts
-# late; the time-out case gets a budget long enough for the stub to start and leave heartbeats (RULINGS FV1)
+# no elapsed time is compared with a limit (RULINGS FV1 / FZ3); the path cases assume the stub STARTS inside the
+# remaining budget: the allow / deny cases answer within 20 s, the time-out case starts and leaves heartbeats within 8 s
 BIG_BUDGET_MS = "20000"
 TIMEOUT_BUDGET_MS = "8000"
+# RULINGS FZ2: a hook still running after this long is ended with its whole process group — clean-up only
+WATCHDOG_S = 120
 LIMITS_VAR = "GUARD_TEST_REPORT_LIMITS"
 
 
@@ -149,6 +157,19 @@ def main():
 
         def run(tool_input, tool="Write", rc=None, sock_path=sock, active=False,
                 budget_ms=BIG_BUDGET_MS, test_mode=True, extra=None):
+            env = hook_env(rc=rc, sock_path=sock_path, active=active, budget_ms=budget_ms, test_mode=test_mode,
+                           extra=extra)
+            payload = json.dumps({"tool_name": tool, "tool_input": tool_input})
+            proc = start_hook(env)
+            try:
+                out, err = proc.communicate(payload, timeout=WATCHDOG_S)
+            except subprocess.TimeoutExpired:
+                end_group(proc)                       # clean-up only; the case then fails on its rc
+                out, err = proc.communicate()
+            calls = open(log).read().splitlines() if os.path.exists(log) else []
+            return subprocess.CompletedProcess(proc.args, proc.returncode, out, err), calls
+
+        def hook_env(rc=None, sock_path=sock, active=False, budget_ms=BIG_BUDGET_MS, test_mode=True, extra=None):
             env = {k: v for k, v in os.environ.items()
                    if not k.startswith(("CYS_", "JAVIS_", "AITERM_", "AUTOPILOT_", "GUARD_"))}
             env.update({
@@ -173,10 +194,22 @@ def main():
                 os.remove(act)
             if os.path.exists(log):
                 os.remove(log)
-            p = subprocess.run([BASH, GUARD], input=json.dumps({"tool_name": tool, "tool_input": tool_input}),
-                               capture_output=True, text=True, env=env, timeout=120)
-            calls = open(log).read().splitlines() if os.path.exists(log) else []
-            return p, calls
+            return env
+
+        def start_hook(env):
+            """The hook in a session of its own (RULINGS FZ2): its process group holds the shell, the parser and any
+            stub the parser starts."""
+            return subprocess.Popen([BASH, GUARD], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
+
+        def end_group(proc):
+            """Clean-up only — it decides nothing about the limit (RULINGS FZ2): terminate the hook's whole process
+            group (the shell, the parser, any stub) and reap the shell."""
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
 
         # 1 — no token: the released deny, same sentence
         p, calls = run({"file_path": soul, "content": "x"}, rc=95)
@@ -207,6 +240,7 @@ def main():
         check("3b 옛 데몬(93) → 차단", p.returncode == 2)
         # evidence helpers: the stub's own record
         seq = [0]
+        stub_pids = []
 
         def ev_path():
             seq[0] += 1
@@ -229,7 +263,17 @@ def main():
                        extra={"STUB_EVIDENCE": base, "STUB_MODE": mode})
             lines = open(base).read().splitlines() if os.path.exists(base) else []
             ev = parse_evidence(lines)
+            if ev[1] is not None:
+                stub_pids.append(ev[1])
             return p, ev, gone(ev[1])
+
+        def gone_soon(pid, within=5.0):
+            """A killed orphan may stay a zombie until it is reaped by the system: look again for a few seconds
+            (clean-up verification of an event that is certain — nothing about the limit)."""
+            end = time.monotonic() + within
+            while not gone(pid) and time.monotonic() < end:
+                time.sleep(0.05)
+            return gone(pid)
 
         def show(p, ev):
             return "rc=%d start=%s pid=%s heartbeats=%d answered=%s" % ((p.returncode,) + tuple(ev))
@@ -289,6 +333,36 @@ def main():
         check("9vi 한도 줄이 두 줄인 출력 → 한도 판정 실패",
               not limits_ok("GUARD-LIMITS budget_s=0.300 probe_cap_s=0.300\n" * 2, "0.300", "0.300"))
 
+        # 9vii — RULINGS FZ2: a hook stuck with a stub still blocking is ended by the clean-up, and the stub is gone
+        base = ev_path()
+        env = hook_env(rc=0, budget_ms=BIG_BUDGET_MS, extra={"STUB_EVIDENCE": base, "STUB_MODE": "block"})
+        proc = start_hook(env)
+        payload = json.dumps({"tool_name": "Write", "tool_input": {"file_path": soul, "content": "x"}})
+        ev = parse_evidence([])
+        end = time.monotonic() + WATCHDOG_S          # wait for the stub to start (clean-up bound only)
+        while time.monotonic() < end:
+            try:
+                proc.communicate(payload, timeout=0.2)
+                break                                 # the hook ended by itself: the control is void (fails below)
+            except subprocess.TimeoutExpired:
+                payload = None
+            ev = parse_evidence(open(base).read().splitlines() if os.path.exists(base) else [])
+            if ev[1] is not None and ev[2] >= 1:
+                break
+        alive_before = ev[1] is not None and not gone(ev[1]) and proc.poll() is None
+        end_group(proc)
+        # judged BEFORE draining the pipes: a parser left alive keeps the hook's stderr open, and draining would wait
+        # until the guard's own time-out (about 20 s) had ended the stub — the 5 s look is well inside that
+        stub_gone = ev[1] is not None and gone_soon(ev[1])
+        proc.communicate()
+        if ev[1] is not None:
+            stub_pids.append(ev[1])
+        cleaned = alive_before and stub_gone and proc.returncode == -signal.SIGKILL
+        check("9vii 막고 있는 스텁(pid %s · 하트비트 %d개)을 남긴 채 멈춘 훅을 정리(프로세스 그룹 종료)하면 그 스텁도 "
+              "사라진다" % (ev[1], ev[2]), cleaned,
+              "" if cleaned else "alive_before=%s hook rc=%s stub gone within 5 s of the clean-up=%s" % (
+                  alive_before, proc.returncode, stub_gone))
+
         # 4 — Bash writers of rule documents stay denied with a token
         for cmd in ("tee %s < /dev/null" % soul, "sed -i 's/a/b/' %s" % soul, "echo x > %s" % soul):
             p, _ = run({"command": cmd}, tool="Bash", rc=0)
@@ -304,6 +378,9 @@ def main():
         # 6 — non-rule writes: no query, allowed as before
         p, calls = run({"file_path": os.path.join(pack, "bin", "a.py"), "content": "x"}, rc=95)
         check("6 규칙 문서가 아닌 쓰기 — 조회 없이 통과", p.returncode == 0 and not calls, repr((p.returncode, calls)))
+        # 10 — RULINGS FZ2: every stub this test started is gone at its end
+        left = [pid for pid in stub_pids if not gone_soon(pid)]
+        check("10 테스트가 띄운 스텁 %d개가 끝에 모두 사라졌다" % len(stub_pids), not left, "" if not left else repr(left))
     finally:
         if srv is not None:
             srv.close()
