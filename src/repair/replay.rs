@@ -457,6 +457,9 @@ pub fn base_env(home: &Path, tmpdir: &Path, path_dirs: &[PathBuf]) -> Vec<(Strin
         ("SHELL".into(), "/bin/sh".into()),
         ("LANG".into(), "en_US.UTF-8".into()),
         ("LC_ALL".into(), "en_US.UTF-8".into()),
+        // an ordinary seat inherits the daemon's bytecode seal (SEAL-1 — `seal_python_bytecode_in_process`):
+        // no replay may leave a `__pycache__` in a laid-out pack
+        ("PYTHONDONTWRITEBYTECODE".into(), "1".into()),
     ]
 }
 
