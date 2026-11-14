@@ -1197,16 +1197,19 @@ pub(crate) fn finish_verification(
             RecApproval::Clear,
         );
     }
+    // RULINGS DE3: EVERY approved target goes to the apply — a deletion (nothing staged at its path)
+    // and a link (a link staged there) as well as a file; the apply reads each staged state itself
+    // and refuses a list that is not the record's whole target set
     let staging = ledger::staging_dir_in(&ctx.root, &id);
     let files: Vec<cys::repair::apply::CandidateFile> = states
         .iter()
-        .filter_map(|(rel, st)| match st {
-            TargetState::File { mode, .. } => Some(cys::repair::apply::CandidateFile {
-                rel: rel.clone(),
-                staged: staging.join(rel),
-                mode: *mode,
-            }),
-            _ => None,
+        .map(|(rel, st)| cys::repair::apply::CandidateFile {
+            rel: rel.clone(),
+            staged: staging.join(rel),
+            mode: match st {
+                TargetState::File { mode, .. } => *mode,
+                _ => 0,
+            },
         })
         .collect();
     match eff.apply(&id, &ctx.lane, &files) {
