@@ -15485,6 +15485,8 @@ mod m11_tests {
         let locked = "trusted-keys.json";
         rig.write(locked, b"{\"keys\": [\"MINE\"]}\n");
         rig.manifest(&[(locked, "{\"keys\": []}\n")]);
+        // 기준선이 맞아야(설치 기록 = .pristine) C-07 의 제자리 보존이 아니라 L0 치유 갈래에 닿는다.
+        rig.pristine(locked, "{\"keys\": []}\n");
         rig.install(&[(locked, "{\"keys\": [\"VENDOR\"]}\n")], false, &UpdateSources::none());
         assert_eq!(rig.read(locked).as_deref(), Some("{\"keys\": [\"MINE\"]}\n"), "잠금 파일도 보관 없이는 덮지 않는다");
         let e = rig.entry(locked).unwrap();
