@@ -2014,7 +2014,9 @@ fn settings_doc(path: &Path, run: &Path) -> Option<SettingsDoc> {
         LaidSource::Link(t) => return Some(SettingsDoc::Link(t)),
         LaidSource::Bytes { bytes, .. } => bytes,
     };
-    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+    // RULINGS GA6: the same decoded-name reader as the deny grammar — a document with a key twice
+    // is not the released registrar's document
+    let Some(mut v) = replay::parse_unique(&bytes) else {
         return Some(SettingsDoc::NotJson(bytes));
     };
     let mut roots = vec![run.to_string_lossy().into_owned()];
