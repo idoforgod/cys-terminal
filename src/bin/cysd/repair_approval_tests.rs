@@ -1088,6 +1088,59 @@ fn check_comparison_writes_the_row_and_points_once() {
     );
 }
 
+/// RULINGS GR5 — a worker's staged candidate far over the size limit (a 64 GiB sparse file) is refused
+/// by `submit` at once with a sentence that says so (the old reader hashed it to its end while
+/// holding the repair lock AND the approval table).
+#[test]
+fn submit_refuses_a_candidate_over_the_size_limit() {
+    let r = rig("gr5-huge");
+    let id = r.signed_repair();
+    let t = Mutex::new(ApprovalTable::default());
+    let eff = effects();
+    let f = std::fs::OpenOptions::new().write(true).open(r.staged(&id)).unwrap();
+    f.set_len(64 * 1024 * 1024 * 1024).unwrap();
+    drop(f);
+    let e = submit(&r.ctx(T0), &worker(), &json!({"repair": "R-1"}), &t, &eff, Ok(())).unwrap_err();
+    assert!(e.message.contains("over the size limit"), "{}", e.message);
+    assert!(t.lock().unwrap().requests.is_empty());
+}
+
+/// RULINGS GR5 — while `submit` reads a candidate (a reader made slow by a test double: it waits for
+/// the test's release, no real time), the approval table is NOT held: the approval list and the sweep
+/// answer. (The old `submit` read the candidate holding the table — both would have waited.)
+#[test]
+fn a_slow_candidate_read_holds_neither_the_list_nor_the_sweep() {
+    let r = rig("gr5-slow");
+    r.signed_repair();
+    let t = Mutex::new(ApprovalTable::default());
+    let eff = effects();
+    // the restart's first sweep (which visits every repair under its lock) is done before
+    sweep(&r.ctx(T0), &t, &eff);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|s| {
+        let h = s.spawn(|| {
+            BEFORE_CANDIDATE_READ.with(|b| {
+                *b.borrow_mut() = Some(Box::new(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }))
+            });
+            submit(&r.ctx(T0 + 1.0), &worker(), &json!({"repair": "R-1"}), &t, &eff, Ok(()))
+        });
+        entered_rx.recv().unwrap();
+        // inside the candidate read now: the table is free, the list and the sweep answer
+        assert!(t.try_lock().is_ok(), "the approval table is held during the candidate read");
+        let l = approval_list(&r.ctx(T0 + 1.0), &t);
+        assert!(l["requests"].as_array().is_some_and(|a| a.is_empty()), "{l}");
+        sweep(&r.ctx(T0 + 2.0), &t, &eff);
+        release_tx.send(()).unwrap();
+        let out = h.join().unwrap();
+        assert!(out.is_ok(), "{:?}", out.err().map(|e| e.message));
+    });
+    assert_eq!(t.lock().unwrap().requests.len(), 1);
+}
+
 /// RULINGS GA8 (2) on the unknown-approval finding: the repair is remembered as reported only after
 /// the ledger answered — a failed write (the restart's first sweep) is tried again by the next submit,
 /// then nothing more.
