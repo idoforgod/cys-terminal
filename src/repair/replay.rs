@@ -374,6 +374,11 @@ pub const MAX_CAPTURE: usize = 1 << 20;
 /// EL4).
 const PER_TURN: usize = 64 * 1024;
 
+/// At most this many read (or write) ATTEMPTS per pipe per turn — an attempt answered "interrupted"
+/// included — so that even a pipe that answers "interrupted" for ever returns to the one deadline
+/// (RULINGS GA9 / DW1).
+const ATTEMPTS_PER_TURN: usize = 64;
+
 /// A process of a run as the runner saw it: its pid and its start time (a pid that a later, unrelated
 /// process reuses never matches).
 pub type SeenProcess = (u32, (u64, u64));
@@ -830,7 +835,13 @@ fn pump_stdin(sin: &mut Option<std::process::ChildStdin>, input: &[u8], written:
         return;
     };
     let turn_end = (*written + PER_TURN).min(input.len());
+    let mut attempts = 0usize;
     while *written < turn_end {
+        // RULINGS GA9: every attempt — an interrupted one included — is behind the turn's budget
+        attempts += 1;
+        if attempts > ATTEMPTS_PER_TURN {
+            return;
+        }
         match s.write(&input[*written..turn_end]) {
             Ok(0) => break,
             Ok(n) => *written += n,
@@ -851,13 +862,19 @@ fn pump_stdin(sin: &mut Option<std::process::ChildStdin>, input: &[u8], written:
 /// clock (RULINGS EJ2 / EL4); kept up to [`MAX_CAPTURE`], the rest counted and dropped; EOF or a read
 /// error closes the pipe and is recorded in `st`.
 #[cfg(unix)]
-fn pump_out<R: std::io::Read>(p: &mut Option<R>, buf: &mut Vec<u8>, st: &mut StreamState) {
+pub(crate) fn pump_out<R: std::io::Read>(p: &mut Option<R>, buf: &mut Vec<u8>, st: &mut StreamState) {
     let Some(r) = p.as_mut() else {
         return;
     };
     let mut chunk = [0u8; 8192];
     let mut this_turn = 0usize;
+    let mut attempts = 0usize;
     while this_turn < PER_TURN {
+        // RULINGS GA9: every read attempt — an interrupted one included — is behind the turn's budget
+        attempts += 1;
+        if attempts > ATTEMPTS_PER_TURN {
+            return;
+        }
         match r.read(&mut chunk) {
             Ok(0) => {
                 st.eof = true;
