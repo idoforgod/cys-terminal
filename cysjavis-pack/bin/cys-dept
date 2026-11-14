@@ -2284,6 +2284,7 @@ INTENT = ".ceo-intent.json"
 INTENT_SCHEMA = 2
 OPS = ("compose", "demote")
 STEPS = ("run", "swap", "swapped")
+PURPOSES = ("op", "restore")            # 'swap' 단계의 교체가 하는 일 — 동작의 교체 · 새 진실 되돌리기(속성 시험의 단계표가 이것을 읽는다)
 _IID = [0]
 
 
@@ -2376,7 +2377,7 @@ def read_intent(md):
         return "bad"
     if rec["step"] != "run":
         sw = rec.get("swap")
-        if (not isinstance(sw, dict) or sw.get("purpose") not in ("op", "restore")
+        if (not isinstance(sw, dict) or sw.get("purpose") not in PURPOSES
                 or sw.get("mode") not in ("exchange", "deposit") or not isinstance(sw.get("reason"), str)
                 or not _plain_name(sw.get("candidate")) or not _plain_name(sw.get("kept"))
                 or any(not (isinstance(sw.get(k), str) and HEX64.fullmatch(sw[k]))

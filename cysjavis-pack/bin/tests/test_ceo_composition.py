@@ -1496,6 +1496,15 @@ class CrashProperty(Rig):
         if mode == "deposit":
             ns["exchange_fn"] = lambda: None
         ns["_MODE"][os.path.dirname(os.path.abspath(self.md))] = mode   # 방법 시험은 이 시나리오의 경로로 고정
+        orig_pub = ns["publish_notice"]
+
+        def pub(md, key, title, body):
+            # ★GQ2a — 빚진 알림 하나하나를 그 안정된 키로 센다(넣었다고 답했는지 · 그때 기록이 디스크에 있었는지)
+            there = os.path.lexists(self.p(".ceo-intent.json"))
+            ok = orig_pub(md, key, title, body)
+            self.published.append((key, ok, there, title))
+            return ok
+        ns["publish_notice"] = pub
         return ns
 
     # ── 관찰 ──
@@ -1529,6 +1538,8 @@ class CrashProperty(Rig):
             return "bad"
         if not isinstance(rec, dict):
             return "bad"
+        if rec.get("closing"):
+            return str(rec.get("step"))         # 알림만 남은 기록 — 그 단계 그대로
         if rec.get("step") == "swap" and isinstance(rec.get("swap"), dict):
             sw = rec["swap"]
             post = os.path.lexists(os.path.join(self.dirs, ".ceo-kept", str(sw.get("kept"))))
@@ -1584,6 +1595,7 @@ class CrashProperty(Rig):
             shutil.rmtree(self.outbox(), ignore_errors=True)
         self.observed, self.excused, self.saved, self._seen = set(), set(), None, None
         self.save_phase = "none"
+        self.published, self.owed_all = [], []
         self.observe()
 
     def entry(self, op, mode, kind, door_args):
@@ -1606,6 +1618,33 @@ class CrashProperty(Rig):
                 res = "error"               # main 이면 rc 2(판독·쓰기 오류) — 기록은 남고 다음 입구가 이어 간다
         return res, door, err.getvalue()
 
+    def in_box(self, key):
+        name = key + ".notice"
+        return (os.path.exists(os.path.join(self.outbox(), name))
+                or os.path.exists(os.path.join(self.outbox(), "sent", name)))
+
+    def owed_keys(self):
+        try:
+            with open(self.p(".ceo-intent.json"), "rb") as f:
+                rec = json.loads(f.read().decode("utf-8"))
+        except (OSError, ValueError):
+            return set()
+        return {o.get("key") for o in rec.get("owed") or []} if isinstance(rec, dict) else set()
+
+    def check_notices(self, pubs, errs, where):
+        """★GQ2a·GQ1 — 이 입구가 빚진 알림 **하나하나**를 키로: 넣었다면 알림함이나 sent/ 에 그 키가 있다 · 못 넣었고 그때 기록이
+        있었다면 기록이 그 키를 담고 남았다 · 기록이 없던 보류면 stderr 가 말한다. 다른 키의 옛 알림은 아무것도 채우지 않는다."""
+        for key, ok, there, title in pubs:
+            if ok:
+                self.assertTrue(self.in_box(key), "I3: 넣었다는 알림(%s · %s)이 알림함에 없다 — %s" % (title, key, where))
+            elif there:
+                self.assertIn(key, self.owed_keys(),
+                              "GQ1: 넣지 못한 알림(%s)을 기록이 담고 있지 않다(기록이 닫혔다) — %s" % (title, where))
+            else:
+                self.assertIn("알림 기록 실패", errs, "I3: 기록 없는 보류의 넣지 못한 알림이 stderr 에도 없다 — %s" % where)
+            if ok or there:
+                self.owed_all.append((key, title))
+
     def note_count(self):
         return len(self.outbox_files()) + len(self.outbox_files(sent=True))
 
@@ -1625,7 +1664,10 @@ class CrashProperty(Rig):
             self.phases.append([self.phase()])
             args = {"crash_at": crash_at, "save_at": save_at, "fail": fail, "lasting": lasting,
                     "save": self.make_save(op, how) if save_at else None}
+            self.published = []
+            gap_before = not os.path.lexists(self.md)           # 맡기고 먼저의 빈 이름(FA4)이 이 입구 앞에 이미 있었다
             res, door, errs = self.entry(op, mode, kind, args)
+            pubs = self.published
             out["calls"].append(door.calls)
             self.planned += bool(crash_at) + bool(save_at) + bool(fail)
             self.reached += door.crashed + door.saved + door.failed
@@ -1636,29 +1678,34 @@ class CrashProperty(Rig):
             self.observe()
             if i == 0:
                 out["p1"], out["ps"] = self.phase(), (self.save_phase if save_at else "none")
+            if save_at:
+                out["save_phase"] = self.save_phase
             if res == "crash":
                 continue
+            self.check_notices(pubs, errs, where)
             if res == "error":
                 self.assertTrue(fail and fail[1] == "flush", "입구 %d 가 예외로 끝났다(끼운 flush 실패가 아니다) — %s" % (i, where))
                 continue
             live = self.md_bytes()
             held = res in (6, 9) or (kind == "tick" and os.path.lexists(intent) and had)
             if held:
-                self.assertIsNotNone(live, "I2: 보류 뒤 살아 있는 이름이 없다 — %s" % where)
-                if door.outbox_failed:
-                    self.assertIn("알림 기록 실패", errs, "I3: 알림함에 넣지 못한 보류가 stderr 에도 없다 — %s" % where)
-                else:
-                    self.assertGreater(self.note_count(), 0, "I3: 보류(rc %s)의 알림이 영속 알림함에 없다 — %s" % (res, where))
-                    if door.unknown:
-                        self.assertIn("CEO 지침 보류(파일을 읽지 못함)", self.notices_text(),
-                                      "I3: 읽기 실패 보류의 알림이 없다 — %s" % where)
+                # I2: 보류한 입구 뒤에도 살아 있는 이름이 있다 — 단, 그 이름이 입구 **앞에** 이미 비어 있었으면(FA4 의 멈춤 틈) 그것을
+                #   채우는 데 필요한 읽기가 실패한 보류(FY1)는 틈을 그대로 둔다: 채움은 다음에 읽을 수 있는 입구의 몫이다(보고서).
+                if not gap_before:
+                    self.assertIsNotNone(live, "I2: 보류 뒤 살아 있는 이름이 없다 — %s" % where)
+                self.assertTrue(pubs or self.owed_keys(), "I3: 보류(rc %s)가 알림을 빚지 않았다 — %s" % (res, where))
+                if door.unknown and not door.outbox_failed:
+                    self.assertIn("CEO 지침 보류(파일을 읽지 못함)", [t for *_x, t in pubs],
+                                  "I3: 읽기 실패 보류가 그 알림을 내지 않았다 — %s" % where)
                 if lasting and door.unknown and i < len(plan):
                     # 계속 실패하는 읽기: 다시 와도 보류이고 아무것도 더 옮기지 않는다(다음 입구가 다시 읽는다 — 그대로).
                     #   ★FY1 그대로: 기록은 그대로 · 이미 있던 것은 하나도 바뀌거나 사라지지 않는다 · 알림은 그 하나(같은 키). 새로
                     #   생길 수 있는 것은 앞 입구가 남긴 후보를 '쓰이지 않은 후보'로 보관한 사본뿐이다(FL2 — 다시 시도하는 입구의 정상
                     #   걸음). 입구마다 새로 짓는 이름의 실패는 다음 입구가 다시 만날 때만 잰다.
                     before, notes0 = self.snapshot(), self.note_count()
-                    again, d2, _e = self.entry(op, mode, kind, {"lasting": lasting})
+                    self.published = []
+                    again, d2, e2 = self.entry(op, mode, kind, {"lasting": lasting})
+                    self.check_notices(self.published, e2, where)
                     if d2.unknown:
                         self.assertTrue(again in (6, 9) or kind == "tick", "계속 실패하는 읽기인데 보류가 아니다 — %s" % where)
                         after = self.snapshot()
@@ -1674,6 +1721,8 @@ class CrashProperty(Rig):
                 self.assertIn(live, (self.expected(op),) + ((self.saved,) if self.saved else ()),
                               "I2/I3: 끝난 입구 %d 뒤의 지침이 낡았거나 동작이 끝나지 않았다 — %s" % (i, where))
         self.final(op, where)
+        for key, title in self.owed_all:
+            self.assertTrue(self.in_box(key), "I3/GQ1: 빚진 알림(%s · %s)이 끝내 알림함에 들어가지 않았다 — %s" % (title, key, where))
         self.scenarios += 1
         return out
 
@@ -1695,42 +1744,57 @@ class CrashProperty(Rig):
             self.assertIsNone(r, "I3: 강등을 끝냈는데 영수증이 남았다 — %s" % where)
 
     def test_every_primitive_call_second_fault_save_and_failure_keeps_s1_to_s3(self):
+        """★GQ2 — 칸(class)의 정의(보고서의 한 문장): 첫 고장의 단계 × 저장의 단계 × 두 번째 고장의 단계 × 고장의 종류. 단계 = 디스크의
+        기록 상태를 코드 자신의 단계표(STEPS · PURPOSES — 기록 없음 · run · swap:<op|restore>:<pre|post> · swapped)로 읽은 것, 종류 =
+        멈춤 · 읽기 오류 · flush 실패. 시험은 고르기 **전에** 모든 첫 단계(모든 호출 뒤의 멈춤 · 모든 호출 앞의 저장과 그 뒤 모든 멈춤 ·
+        복구 입구의 모든 호출 앞의 저장)를 돌려 칸의 전체 집합을 세우고, 칸마다 첫 시나리오를 골라 돌린 뒤 모든 칸이 시나리오를 가졌고
+        계획 = 도달임을 단언한다. 이 정의로 완전하다 — 이 릴리스에서 더 넓히지 않는다(GQ2)."""
         complete = os.environ.get("CYS_T8_FL7_COMPLETE") == "1"
         self.md, self.tmpl = self.p("MASTER_DIRECTIVE.md"), self.p("CEO_TEMPLATE.md")
         base = ceo_py_module()
+        table = ({"none"} | {x for x in base["STEPS"] if x != "swap"}
+                 | {"swap:%s:%s" % (pp, q) for pp in base["PURPOSES"] for q in ("pre", "post")})
         modes = (["exchange"] if base["exchange_fn"]() is not None else []) + ["deposit"]
         if base["noreplace_fn"]() is None and os.name == "posix":
             modes.remove("deposit")
         hows = ("in-place", "rename")
-        st = {"crash points": 0, "read failures": 0, "flush failures": 0, "saves": 0, "second faults": 0,
-              "classes": 0}
+        st = {"crash points": 0, "read failures": 0, "flush failures": 0, "saves": 0, "first stages": 0,
+              "second faults": 0, "classes": 0}
         self.planned = self.reached = self.scenarios = 0
         t0 = time.monotonic()               # wallclock: guard 측정만 — 이 시험의 판정은 시간에 기대지 않는다(실행 시간 보고)
         for op in ("compose", "demote"):
             for mode in modes:
-                classes = set()
+                universe, plans = {}, []
 
-                def second(base_plan, kind2, phases2, p1, ps):
-                    for k2, p2 in enumerate(phases2[1:], 1):        # phases2[k] = 호출 k 뒤의 단계 = 그 뒤에서 멈춘 상태
-                        cls = (kind2, p1, ps, p2)
-                        if complete or cls not in classes:
-                            classes.add(cls)
-                            self.scenario(op, mode, base_plan + [(kind2, k2, None, None, None)])
-                            st["second faults"] += 1
+                def offer(kind2, p1, ps, run, first, save=None):
+                    """그 실행의 둘째 입구(복구 경로)의 호출마다, 그 원시 연산이 가질 수 있는 고장 종류마다 칸 하나."""
+                    calls2, phs2 = run["calls"][1], run["phases"][1]
+                    lo = save[0] if save else 1                     # 저장이 연 경로 — 그 저장 뒤의 호출들
+                    for k2 in range(lo, len(calls2) + 1):
+                        prim = calls2[k2 - 1][0]
+                        for fk in ("stop",) + (("read",) if prim in READS else ()) + (("flush",) if prim in FLUSHES else ()):
+                            cls = (kind2, p1, ps, phs2[k2], fk)
+                            self.assertTrue({p1, ps.split(":", 1)[-1], phs2[k2]} <= table | {"none"},
+                                            "코드의 단계표 밖의 단계: %r" % (cls,))
+                            second = (kind2, k2 if fk == "stop" else None, save[0] if save else None,
+                                      save[1] if save else None,
+                                      None if fk == "stop" else (k2, "read-once" if fk == "read" else "flush"))
+                            if cls not in universe:
+                                universe[cls] = first + [second]
+                            elif complete:
+                                plans.append(first + [second])
                 dry = self.scenario(op, mode, [("op", None, None, None, None)])
-                calls1, ph1 = dry["calls"][0], dry["phases"][0]
-                n1 = len(calls1)
+                calls1, n1 = dry["calls"][0], len(dry["calls"][0])
                 self.assertGreater(n1, 10, "시험 무효: 감싼 원시 연산이 없다")
                 rec2 = {}
-                # ① 단일 멈춤 — 첫 입구의 모든 호출 뒤 · 다음 입구는 같은 동작과 틱 둘 다(두 번째 고장의 단계를 함께 잰다)
-                for k1 in range(1, n1 + 1):
+                # ── 첫 단계(전부 — 칸의 전체 집합을 세운다; 그 자체가 단일 고장 쓸기다) ──
+                for k1 in range(1, n1 + 1):                         # ① 첫 입구의 모든 호출 뒤 멈춤 × 다음 입구 둘
                     st["crash points"] += 1
                     for kind2 in ("op", "tick"):
-                        r = self.scenario(op, mode, [("op", k1, None, None, None), (kind2, None, None, None, None)])
-                        rec2[k1, kind2] = r
-                        second([("op", k1, None, None, None)], kind2, r["phases"][1], r["p1"], "none")
-                # ② 멈춤 없는 실패 — 첫 입구의 모든 읽기(한 번 · 계속)와 모든 flush
-                for k, (prim, _path) in enumerate(calls1, 1):
+                        first = [("op", k1, None, None, None)]
+                        r = rec2[k1, kind2] = self.scenario(op, mode, first + [(kind2, None, None, None, None)])
+                        offer(kind2, r["p1"], "none", r, first)
+                for k, (prim, _path) in enumerate(calls1, 1):       # ② 첫 입구의 모든 읽기 오류(한 번 · 계속)와 flush 실패
                     kind2 = "tick" if k % 2 else "op"
                     if prim in READS:
                         for how in ("read-once", "read-lasting"):
@@ -1739,41 +1803,51 @@ class CrashProperty(Rig):
                     if prim in FLUSHES:
                         self.scenario(op, mode, [("op", None, None, None, (k, "flush")), (kind2, None, None, None, None)])
                         st["flush failures"] += 1
-                # ③ 첫 입구의 모든 호출 앞의 저장 — 혼자(단계를 잰다), 그리고 그 뒤 멈춤(칸마다 · 완전이면 모두) + 두 번째 고장
-                for s in range(1, n1 + 1):
-                    how = hows[s % 2]
-                    r = self.scenario(op, mode, [("op", None, s, how, None)])
+                for s_ in range(1, n1 + 1):                         # ③ 첫 입구의 모든 호출 앞 저장 — 혼자, 그 뒤의 멈춤
+                    how = hows[s_ % 2]
+                    r = self.scenario(op, mode, [("op", None, s_, how, None)])
                     st["saves"] += 1
-                    ps, phs = r["ps"], r["phases"][0]
-                    for k1 in range(s, len(phs)):
-                        cls = ("save-crash", ps, phs[k1])
-                        if not complete and cls in classes:
-                            continue
-                        classes.add(cls)
+                    #   멈춤 자리: 저장한 그 호출 뒤 + 그 뒤의 상태를 바꾸는 호출마다. 읽기 바로 뒤의 멈춤은 그 앞 호출 뒤의 멈춤과 디스크가
+                    #   같다(읽기는 아무것도 바꾸지 않는다 · 멈춘 프로세스는 기억이 없다) — 칸의 전체 집합은 줄지 않는다(모든 호출 뒤의
+                    #   멈춤은 ① 의 단일 고장 쓸기가 돈다).
+                    calls_s = r["calls"][0]
+                    stops = [k1 for k1 in range(s_, len(calls_s) + 1)
+                             if k1 == s_ or calls_s[k1 - 1][0] not in READS + ("fs_lock",)]
+                    for k1 in stops:
                         kind2 = "tick" if k1 % 2 else "op"
-                        r2 = self.scenario(op, mode, [("op", k1, s, how, None), (kind2, None, None, None, None)])
-                        st["saves"] += 1
-                        second([("op", k1, s, how, None)], kind2, r2["phases"][1], r2["p1"], r2["ps"])
-                # ④ 복구 입구의 모든 호출 앞의 저장(멈춘 지점마다 — 칸마다 · 완전이면 모두)
-                for k1 in range(1, n1 + 1):
+                        first = [("op", k1, s_, how, None)]
+                        r2 = self.scenario(op, mode, first + [(kind2, None, None, None, None)])
+                        st["first stages"] += 1
+                        offer(kind2, r2["p1"], "e1:" + r2["ps"], r2, first)
+                for k1 in range(1, n1 + 1):                         # ④ 복구 입구의 모든 호출 앞 저장(멈춘 지점마다)
                     kind2 = "tick" if k1 % 2 else "op"
-                    phs2 = rec2[k1, kind2]["phases"][1]
-                    for s2 in range(1, len(phs2)):
-                        cls = ("recovery-save", kind2, rec2[k1, kind2]["p1"], phs2[s2 - 1])
-                        if not complete and cls in classes:
-                            continue
-                        classes.add(cls)
-                        self.scenario(op, mode, [("op", k1, None, None, None), (kind2, None, s2, hows[(k1 + s2) % 2], None)])
+                    for s2 in range(1, len(rec2[k1, kind2]["calls"][1]) + 1):
+                        how = hows[(k1 + s2) % 2]
+                        first = [("op", k1, None, None, None)]
+                        r = self.scenario(op, mode, first + [(kind2, None, s2, how, None)])
                         st["saves"] += 1
-                st["classes"] += len(classes)
+                        offer(kind2, r["p1"], "e2:" + r["save_phase"], r, first, save=(s2, how))
+                # ── 둘째 단계: 칸마다 첫 시나리오(완전이면 모두) ──
+                covered = set()
+                for cls, plan in universe.items():
+                    self.scenario(op, mode, plan)
+                    covered.add(cls)
+                    st["second faults"] += 1
+                for plan in plans:
+                    self.scenario(op, mode, plan)
+                    st["second faults"] += 1
+                self.assertEqual(covered, set(universe), "시나리오가 없는 칸이 있다")
+                st["classes"] += len(universe)
         secs = time.monotonic() - t0        # wallclock: guard 실행 시간 보고만
-        sys.stderr.write("\n[FL7/FY4] %s · paths %s · crash points %d · second faults %d · read failures %d · flush failures "
-                         "%d · saves %d · classes %d · scenarios %d · injections planned %d = reached %d · %.0f s\n"
-                         % ("COMPLETE" if complete else "suite (single-fault sweep + stratified)", "+".join(modes),
-                            st["crash points"], st["second faults"], st["read failures"], st["flush failures"], st["saves"],
-                            st["classes"], self.scenarios, self.planned, self.reached, secs))
+        sys.stderr.write("\n[FL7/FY4/GQ2] %s · paths %s · crash points %d · read failures %d · flush failures %d · saves %d · "
+                         "save-then-stop first stages %d · classes %d (each with a scenario) · second faults %d · scenarios %d"
+                         " · injections planned %d = reached %d · %.0f s\n"
+                         % ("COMPLETE" if complete else "suite (all first stages + one scenario per class)",
+                            "+".join(modes), st["crash points"], st["read failures"], st["flush failures"], st["saves"],
+                            st["first stages"], st["classes"], st["second faults"], self.scenarios, self.planned,
+                            self.reached, secs))
         self.assertEqual(self.planned, self.reached)
-        self.assertGreater(st["second faults"], 0)
+        self.assertGreater(st["classes"], 0)
 
 
 class ReadUnknown(Rig):
