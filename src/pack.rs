@@ -5062,8 +5062,11 @@ pub struct ParkOutcome {
     pub at: String,
     /// 자리에 있던 다른 사본을 옮긴 세대 자리들(팩 상대).
     pub moved: Vec<String>,
-    /// 자리가 끝내 비지 않아 자기 세대 자리에 놓았고 감사 원장에 겹침을 적었다.
+    /// 자리가 끝내 비지 않아 자기 세대 자리에 놓았다(겹침).
     pub overlap: bool,
+    /// ★T2i(RULINGS FH5): 겹침을 감사 원장에 적지 못한 사유 — 사본의 안전(위 `at`)과 겹침의 기록은 서로 다른 결과다. 겹침이
+    /// 없거나 적었으면 None.
+    pub overlap_record_error: Option<String>,
 }
 
 /// ★T2i(RULINGS EC2): 보관의 끼어들기 지점(시험 전용 — 제품은 빈 함수).
@@ -5105,7 +5108,7 @@ fn park_copy_at(
     for attempt in 0..PARK_PLACE_TRIES {
         hook(ParkStep::BeforePlace(attempt));
         match beneath_write(dir, &user_rel, bytes, None, false, Place::NoReplace, durable) {
-            Ok(()) => return Ok(ParkOutcome { at: user_rel, moved, overlap: false }),
+            Ok(()) => return Ok(ParkOutcome { at: user_rel, moved, overlap: false, overlap_record_error: None }),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
                 return Err(format!("{user_rel}: {e} — 덮지 않고 놓을 수 없어 보관하지 않았습니다"))
@@ -5118,7 +5121,7 @@ fn park_copy_at(
                 if durable {
                     beneath_sync_parent(dir, &user_rel).map_err(|e| format!("{user_rel} 기록 실패: {e}"))?;
                 }
-                return Ok(ParkOutcome { at: user_rel, moved, overlap: false });
+                return Ok(ParkOutcome { at: user_rel, moved, overlap: false, overlap_record_error: None });
             }
             Occupant::File(_) => {}
             Occupant::Obstacle(why) => {
@@ -5151,10 +5154,14 @@ fn park_copy_at(
     let entry = serde_json::json!({
         "ts": ts, "file": rel, "action": "park-overlap", "slot": slot, "moved": moved, "flags": [],
     });
-    if let Err(e) = append_merge_audit(dir, &entry) {
-        eprintln!("[pack] ⚠ {rel}: 보관 자리 겹침을 감사 원장에 적지 못했습니다({e}) — 사본은 {slot} 에 있습니다");
-    }
-    Ok(ParkOutcome { at: slot, moved, overlap: true })
+    let overlap_record_error = match append_merge_audit(dir, &entry) {
+        Ok(()) => None,
+        Err(e) => {
+            eprintln!("[pack] ⚠ {rel}: 보관 자리 겹침을 감사 원장에 적지 못했습니다({e}) — 사본은 {slot} 에 있습니다");
+            Some(e)
+        }
+    };
+    Ok(ParkOutcome { at: slot, moved, overlap: true, overlap_record_error })
 }
 
 /// ★T2i(RULINGS EC7): `rel_path` 의 부모 폴더 fsync(닻 내린 기술자 — 윈도우는 '지원하지 않음').
@@ -6517,6 +6524,10 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                             //   (겹침은 감사 원장에도).
                             if parked.overlap {
                                 entry.insert("overlap_slot".into(), serde_json::json!(parked.at));
+                                // ★FH5: 감사 원장에 겹침을 적지 못했으면 그 사실도(사본은 위 자리에 안전하다).
+                                if let Some(e) = parked.overlap_record_error.as_deref() {
+                                    entry.insert("overlap_audit_error".into(), serde_json::json!(e));
+                                }
                             }
                             upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
                         }
@@ -15197,6 +15208,23 @@ mod m11_tests {
         let audit = std::fs::read_to_string(rig.pack.join(MERGE_AUDIT_FILE)).unwrap();
         let e: serde_json::Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
         assert_eq!((e["action"].as_str(), e["file"].as_str(), e["slot"].as_str()), (Some("park-overlap"), Some(rel), Some(out.at.as_str())));
+        assert_eq!(out.overlap_record_error, None, "겹침을 적었다");
+        // ★T2i(RULINGS FH5): 감사 원장을 쓸 수 없으면(폴더) 사본은 자기 세대 자리에 안전하지만 '기록 실패'가 따로 돌아온다.
+        reset(&rig);
+        std::fs::create_dir_all(rig.pack.join(MERGE_AUDIT_FILE)).unwrap();
+        let pack = rig.pack.clone();
+        let mut k = 0;
+        let out = park_copy_at(&rig.pack, rel, b"W\n", false, 100, &mut |s| {
+            if let ParkStep::BeforePlace(_) = s {
+                k += 1;
+                park_copy_at(&pack, rel, format!("Y{k}\n").as_bytes(), false, 300, &mut |_| {}).unwrap();
+            }
+        })
+        .unwrap();
+        assert!(out.overlap);
+        assert!(out.overlap_record_error.as_deref().is_some_and(|e| e.contains("감사 원장")), "{out:?}");
+        assert_eq!(std::fs::read_to_string(rig.pack.join(&out.at)).unwrap(), "W\n", "사본은 안전하다");
+        std::fs::remove_dir_all(rig.pack.join(MERGE_AUDIT_FILE)).unwrap();
         // 파일이 아닌 자리(폴더) = 장애물 → 보관하지 않는다(호출부의 격리 갈래).
         reset(&rig);
         std::fs::remove_file(rig.pack.join(format!("{rel}.user"))).unwrap();

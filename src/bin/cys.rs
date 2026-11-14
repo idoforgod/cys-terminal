@@ -27338,15 +27338,29 @@ fn heal_prompt_line(kind: Option<&str>, ts: Option<u64>, rel: &str) -> String {
 
 /// ★T2i(RULINGS EC2): 보관 결과의 사람용 줄 — 자리의 다른 사본을 옮긴 세대 자리 · 겹침.
 fn print_park_outcome(dir: &std::path::Path, rel: &str, parked: &cys::pack::ParkOutcome) {
-    for s in &parked.moved {
-        println!("기존 보존본 세대 보존: {}", dir.join(s).display());
+    for line in park_outcome_lines(dir, rel, parked) {
+        println!("{line}");
     }
+}
+
+/// ★T2i(RULINGS EC2 · FH5): 보관 결과의 문장 — 사본의 안전과 겹침의 기록은 두 결과다: 감사 원장에 적었을 때만 '기록'이라고 말한다.
+fn park_outcome_lines(dir: &std::path::Path, rel: &str, parked: &cys::pack::ParkOutcome) -> Vec<String> {
+    let mut out: Vec<String> = parked.moved.iter().map(|s| format!("기존 보존본 세대 보존: {}", dir.join(s).display())).collect();
     if parked.overlap {
-        println!(
-            "⚠ '{rel}' 보관 자리({rel}.user)가 다른 쓰기와 겹쳐, 이번 사본은 {} 에 두었습니다(감사 원장에 기록) — 어느 사본도 덮이지 않았습니다",
-            dir.join(&parked.at).display()
-        );
+        let at = dir.join(&parked.at);
+        out.push(match parked.overlap_record_error.as_deref() {
+            None => format!(
+                "⚠ '{rel}' 보관 자리({rel}.user)가 다른 쓰기와 겹쳐, 이번 사본은 {} 에 두었습니다(감사 원장에 기록) — 어느 사본도 덮이지 않았습니다",
+                at.display()
+            ),
+            Some(e) => format!(
+                "⚠ '{rel}' 보관 자리({rel}.user)가 다른 쓰기와 겹쳐, 이번 사본은 {} 에 두었습니다 — 어느 사본도 덮이지 않았습니다. 다만 이 \
+                 겹침을 감사 원장에 적지 못했습니다({e}).",
+                at.display()
+            ),
+        });
     }
+    out
 }
 
 /// ★T4(v2 §5): 명시 치유 동사 — 드리프트 system 파일을 embed 본으로 복원(백업 선행 · 3중 전진 ·
@@ -43065,6 +43079,36 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "pack-verb write sites that open an existing path: {bad:?}");
+    }
+
+    /// ★T2i(RULINGS FH5): 보관 결과 문장 — 겹침을 감사 원장에 적었을 때만 '감사 원장에 기록'이라고 말하고, 적지 못했으면 그렇게
+    /// 말한다(사본은 어느 쪽이든 자기 세대 자리에 안전하다).
+    #[test]
+    fn fh5_overlap_sentence_says_recorded_only_when_it_was() {
+        let dir = std::path::Path::new("/p");
+        let mut parked = cys::pack::ParkOutcome {
+            at: "hooks/x.sh.user.prev-100".into(),
+            moved: vec!["hooks/x.sh.user.prev-100-2".into()],
+            overlap: true,
+            overlap_record_error: None,
+        };
+        assert_eq!(
+            park_outcome_lines(dir, "hooks/x.sh", &parked),
+            vec![
+                "기존 보존본 세대 보존: /p/hooks/x.sh.user.prev-100-2".to_string(),
+                "⚠ 'hooks/x.sh' 보관 자리(hooks/x.sh.user)가 다른 쓰기와 겹쳐, 이번 사본은 /p/hooks/x.sh.user.prev-100 에 두었습니다(감사 \
+                 원장에 기록) — 어느 사본도 덮이지 않았습니다"
+                    .to_string(),
+            ]
+        );
+        parked.overlap_record_error = Some("감사 원장 열기 실패 /p/.merge-audit.jsonl: Is a directory".into());
+        let lines = park_outcome_lines(dir, "hooks/x.sh", &parked);
+        assert_eq!(
+            lines[1],
+            "⚠ 'hooks/x.sh' 보관 자리(hooks/x.sh.user)가 다른 쓰기와 겹쳐, 이번 사본은 /p/hooks/x.sh.user.prev-100 에 두었습니다 — 어느 \
+             사본도 덮이지 않았습니다. 다만 이 겹침을 감사 원장에 적지 못했습니다(감사 원장 열기 실패 /p/.merge-audit.jsonl: Is a directory)."
+        );
+        assert!(!lines[1].contains("감사 원장에 기록"));
     }
 
     /// ★T2i(RULINGS FH4): 원본이 없는 보관 사본도 목록에 보인다(종전: 원본이 없으면 건너뛰어 원장이 비면 '정합'이라 했다).
