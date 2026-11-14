@@ -305,9 +305,10 @@ pub struct ChildOutcome {
     /// The child could not be started at all.
     pub spawn_error: Option<String>,
     pub elapsed: Duration,
-    /// Processes of the run still alive after the run's group was killed: a member of the group, or
-    /// a process carrying the run's environment marker that left the group (RULINGS CZ4 / DF5 —
-    /// each found one is killed by its exact pid and still reported).
+    /// Processes of the run still alive when the child had ended (or at the deadline), the child
+    /// itself excepted: a member of its group, a descendant the runner saw while the child lived
+    /// (one that left the group included), on Linux any process carrying the run's environment
+    /// marker (RULINGS CZ4 / DR3 / DF5) — each killed by its exact pid and reported.
     pub leftovers: Vec<u32>,
     /// A pipe of the run (stdout / stderr) was still held open after the group was killed and
     /// drained — a process outside the group kept it (RULINGS CZ4): the output may be incomplete.
@@ -340,6 +341,155 @@ impl ChildOutcome {
 
 /// Largest output kept per stream (the rest is dropped; a probe's verdict never needs more).
 const MAX_CAPTURE: usize = 1 << 20;
+
+/// A process of a run as the runner saw it: its pid and its start time (a pid that a later, unrelated
+/// process reuses never matches).
+pub type SeenProcess = (u32, (u64, u64));
+
+/// The process table views the runner needs (RULINGS CZ4 / DR3 / DF5): a process's start time while
+/// it is alive (a zombie counts as gone), its children, the members of a process group.
+#[cfg(target_os = "macos")]
+mod procs {
+    const PROC_PGRP_ONLY: u32 = 2;
+    const PROC_PPID_ONLY: u32 = 6;
+    const SZOMB: u32 = 5;
+
+    fn list(kind: u32, arg: u32) -> Vec<u32> {
+        let mut buf: Vec<libc::pid_t> = vec![0; 512];
+        let bytes = (buf.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        // SAFETY: proc_listpids(3) fills at most `bytes` bytes of pid slots and returns the bytes used.
+        let n = unsafe { libc::proc_listpids(kind, arg, buf.as_mut_ptr().cast(), bytes) };
+        if n <= 0 {
+            return Vec::new();
+        }
+        let count = (n as usize / std::mem::size_of::<libc::pid_t>()).min(buf.len());
+        buf.truncate(count);
+        buf.into_iter().filter(|p| *p > 0).map(|p| p as u32).collect()
+    }
+
+    /// The start time of `pid` while it is a live process (not a zombie, not gone).
+    pub fn alive_since(pid: u32) -> Option<(u64, u64)> {
+        // SAFETY: a zeroed plain C struct, filled by proc_pidinfo(3) up to its own size.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: as above.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        (n == size && info.pbi_status != SZOMB)
+            .then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
+    }
+
+    pub fn children(pid: u32) -> Vec<u32> {
+        list(PROC_PPID_ONLY, pid)
+    }
+
+    pub fn group(pgid: u32) -> Vec<u32> {
+        list(PROC_PGRP_ONLY, pgid)
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod procs {
+    /// (state, ppid, pgrp, starttime) from `/proc/<pid>/stat`.
+    fn stat(pid: u32) -> Option<(char, u32, u32, u64)> {
+        let t = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = &t[t.rfind(')')? + 1..];
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        let state = f.first()?.chars().next()?;
+        let ppid = f.get(1)?.parse().ok()?;
+        let pgrp = f.get(2)?.parse().ok()?;
+        let start = f.get(19)?.parse().ok()?;
+        Some((state, ppid, pgrp, start))
+    }
+
+    fn all() -> Vec<u32> {
+        std::fs::read_dir("/proc")
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn alive_since(pid: u32) -> Option<(u64, u64)> {
+        let (state, _, _, start) = stat(pid)?;
+        (state != 'Z' && state != 'X').then_some((start, 0))
+    }
+
+    pub fn children(pid: u32) -> Vec<u32> {
+        all()
+            .into_iter()
+            .filter(|p| stat(*p).is_some_and(|s| s.1 == pid))
+            .collect()
+    }
+
+    pub fn group(pgid: u32) -> Vec<u32> {
+        all()
+            .into_iter()
+            .filter(|p| stat(*p).is_some_and(|s| s.2 == pgid))
+            .collect()
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+mod procs {
+    pub fn alive_since(_pid: u32) -> Option<(u64, u64)> {
+        None
+    }
+    pub fn children(_pid: u32) -> Vec<u32> {
+        Vec::new()
+    }
+    pub fn group(_pgid: u32) -> Vec<u32> {
+        Vec::new()
+    }
+}
+
+/// Records every descendant of `root` alive now (children, recursively; at most 256) and every
+/// member of its process group, with its start time, into `seen` (RULINGS CZ4 / DR3: a process that
+/// leaves the group is still the child's descendant while the child lives — the runner samples the
+/// tree on every turn of its loop).
+fn sample_tree(root: u32, seen: &mut Vec<SeenProcess>) {
+    let mut stack: Vec<u32> = procs::children(root);
+    stack.extend(procs::group(root));
+    let mut visited = 0usize;
+    while let Some(p) = stack.pop() {
+        visited += 1;
+        if visited > 256 {
+            break;
+        }
+        if p == root || seen.iter().any(|(q, _)| *q == p) {
+            continue;
+        }
+        if let Some(t) = procs::alive_since(p) {
+            seen.push((p, t));
+            stack.extend(procs::children(p));
+        }
+    }
+}
+
+/// The processes of `seen` (and of the group `pgid`, the leader excepted) that are STILL the same
+/// live processes.
+fn still_alive(seen: &[SeenProcess], pgid: u32) -> Vec<u32> {
+    let mut out: Vec<u32> = seen
+        .iter()
+        .filter(|(p, t)| procs::alive_since(*p) == Some(*t))
+        .map(|(p, _)| *p)
+        .collect();
+    for p in procs::group(pgid) {
+        if p != pgid && !out.contains(&p) && procs::alive_since(p).is_some() {
+            out.push(p);
+        }
+    }
+    out
+}
 
 /// How long the output pipes of an ENDED child are still read (never past the run's deadline) before
 /// a still-open one is reported as held.
@@ -458,10 +608,15 @@ pub fn run_child_with(
     }
     // THE loop: one deadline, non-blocking I/O on every pipe, the exit polled
     let mut ended_at: Option<Instant> = None;
+    let mut seen: Vec<SeenProcess> = Vec::new();
     loop {
         pump_stdin(&mut sin, stdin, &mut written);
         pump_out(&mut sout, &mut out.stdout);
         pump_out(&mut serr, &mut out.stderr);
+        if ended_at.is_none() {
+            // the child's descendants while it lives (a process that leaves the group is still one)
+            sample_tree(pid as u32, &mut seen);
+        }
         let now = Instant::now();
         if ended_at.is_none() && exited_no_reap(pid) {
             ended_at = Some(now);
@@ -486,17 +641,26 @@ pub fn run_child_with(
     // that outlived it — the output may be incomplete (CZ4)
     let held_at_drain = ended_at.is_some() && (sout.is_some() || serr.is_some());
     // what is still alive of the run NOW besides the child itself (an ended leader is a zombie and is
-    // not listed): a descendant in the group or one that left it — killed by exact pid and reported
+    // not listed): a descendant seen during the run or a member of the group — and, on Linux, any
+    // process carrying the run's marker — killed by exact pid and reported
     if ended_at.is_some() {
         std::thread::sleep(Duration::from_millis(10)); // a descendant that has just closed its pipes
     }
-    for p in marked_processes(&mark) {
-        if p == pid as u32 {
-            continue; // the timed-out child itself: the group kill below
+    let me = pid as u32;
+    let alive_now = |seen: &[SeenProcess]| -> Vec<u32> {
+        let mut v = still_alive(seen, me);
+        for p in marked_processes(&mark) {
+            if !v.contains(&p) {
+                v.push(p);
+            }
         }
+        v.retain(|p| *p != me);
+        v
+    };
+    for p in alive_now(&seen) {
         if kill == KillMode::Kill {
-            // SAFETY: kill(2) of a process that carries THIS run's random marker — a process of
-            // the run, by its exact pid.
+            // SAFETY: kill(2) of a process of THIS run (seen as the child's descendant with this start
+            // time, a member of its group, or carrying its marker), by its exact pid.
             unsafe {
                 libc::kill(p as libc::pid_t, libc::SIGKILL);
             }
@@ -516,13 +680,13 @@ pub fn run_child_with(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    // what the kill did not reach: marked processes still alive once the kill has had a moment to land
-    // (a killed process is torn down asynchronously — re-read for at most SETTLE)
+    // what the kill did not reach, once the kill has had a moment to land (a killed process is torn
+    // down asynchronously — re-read for at most SETTLE)
     let settle_until = Instant::now() + SETTLE;
-    out.survivors = marked_processes(&mark);
+    out.survivors = alive_now(&seen);
     while !out.survivors.is_empty() && Instant::now() < settle_until {
         std::thread::sleep(Duration::from_millis(20));
-        out.survivors = marked_processes(&mark);
+        out.survivors = alive_now(&seen);
     }
     // the outputs, once more without blocking; still open → held by something the kill did not reach
     pump_out(&mut sout, &mut out.stdout);
@@ -540,24 +704,11 @@ pub fn run_child_with(
             Ok(None) => out.unreaped = true,
             Err(e) => out.spawn_error = Some(format!("wait: {e}")),
         }
-        // a member of the group still alive after the kill (every platform — where no marker scan
-        // exists this is the only sight beyond the child)
-        // SAFETY: kill(2) with signal 0 sends nothing.
-        if !out.unreaped && kill == KillMode::Kill {
-            let settle_until = Instant::now() + SETTLE;
-            // SAFETY: kill(2) with signal 0 sends nothing.
-            let mut member = unsafe { libc::kill(-pid, 0) } == 0;
-            while member && Instant::now() < settle_until {
-                std::thread::sleep(Duration::from_millis(20));
-                // SAFETY: as above.
-                member = unsafe { libc::kill(-pid, 0) } == 0;
-            }
-            if member && !out.survivors.contains(&(pid as u32)) {
-                out.survivors.push(pid as u32);
-            }
-        }
     } else {
         out.unreaped = true;
+    }
+    if out.unreaped && !out.survivors.contains(&me) {
+        out.survivors.push(me); // the child itself did not die within the grace
     }
     if out.unreaped {
         // a child that does not die (stuck in the kernel): reported; reaped by a detached thread —
@@ -695,60 +846,18 @@ fn wait_io(
     }
 }
 
-/// The processes (pid) whose environment carries `<RUN_MARK_VAR>=<mark>` (RULINGS DF5). macOS: the
-/// kernel's argument + environment area of every process of this user (`KERN_PROCARGS2`); Linux:
-/// `/proc/<pid>/environ`. Elsewhere none is found — the limit is the process group (stated in the
-/// report).
+/// The processes (pid) whose environment carries `<RUN_MARK_VAR>=<mark>` (RULINGS DF5) — Linux
+/// (`/proc/<pid>/environ`) only: macOS does not show another process's environment (measured on this
+/// Mac: `ps -E` lists none, `KERN_PROCARGS2` gives the arguments only), so there the runner tracks the
+/// child's process TREE instead ([`sample_tree`]); elsewhere none is found.
 pub fn marked_processes(mark: &str) -> Vec<u32> {
     let needle = format!("{RUN_MARK_VAR}={mark}");
     marked_processes_by(needle.as_bytes())
 }
 
+#[cfg(target_os = "linux")]
 fn has_entry(area: &[u8], needle: &[u8]) -> bool {
     area.split(|b| *b == 0).any(|e| e == needle)
-}
-
-#[cfg(target_os = "macos")]
-fn marked_processes_by(needle: &[u8]) -> Vec<u32> {
-    let me = std::process::id() as libc::pid_t;
-    // SAFETY: proc_listallpids(3) with a null buffer returns the number of pids.
-    let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-    if n <= 0 {
-        return Vec::new();
-    }
-    let mut pids: Vec<libc::pid_t> = vec![0; n as usize + 128];
-    let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
-    // SAFETY: the buffer holds `bytes` bytes of pid_t slots.
-    let got = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
-    if got <= 0 {
-        return Vec::new();
-    }
-    pids.truncate((got as usize).min(pids.len()));
-    let mut area = vec![0u8; 1 << 20];
-    let mut out = Vec::new();
-    for pid in pids {
-        if pid <= 0 || pid == me {
-            continue;
-        }
-        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
-        let mut size = area.len();
-        // SAFETY: sysctl(3) reads at most `size` bytes into `area`; a process of another user (or
-        // one that is gone) answers an error and is skipped.
-        let r = unsafe {
-            libc::sysctl(
-                mib.as_mut_ptr(),
-                3,
-                area.as_mut_ptr().cast(),
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if r == 0 && has_entry(&area[..size.min(area.len())], needle) {
-            out.push(pid as u32);
-        }
-    }
-    out
 }
 
 #[cfg(target_os = "linux")]
@@ -773,7 +882,7 @@ fn marked_processes_by(needle: &[u8]) -> Vec<u32> {
     out
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(target_os = "linux"))]
 fn marked_processes_by(_needle: &[u8]) -> Vec<u32> {
     Vec::new()
 }
