@@ -255,6 +255,26 @@ fn compared_reads_use_one_nonblocking_handle() {
     replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
+/// RULINGS DE2 (BL1): a compared item's stamp holds inode, change time and modification time — a
+/// mode change alone (no write, the modification time untouched) is a change of the item.
+#[test]
+fn stamp_holds_inode_ctime_and_mtime() {
+    let r = root("de2");
+    put(&r, "x", "same bytes\n");
+    let p = r.join("x");
+    let (_, s1) = replay::read_stamped(&p).unwrap();
+    assert!(s1.contains("ino=") && s1.contains("ctime=") && s1.contains("mtime="), "{s1}");
+    // the change time moves on a metadata change while the modification time stays
+    std::thread::sleep(Duration::from_millis(20));
+    let (mode_before, _) = (std::fs::metadata(&p).unwrap(), ());
+    let _ = mode_before;
+    replay::set_mode(&p, 0o600);
+    replay::set_mode(&p, 0o644);
+    let (_, s2) = replay::read_stamped(&p).unwrap();
+    assert_ne!(s1, s2, "a ctime-only change is a change of the stamp");
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
 /// RULINGS CZ4: a cleanup error or a leftover scratch tree is RETURNED, never swallowed.
 #[test]
 fn cleanup_errors_are_returned() {
