@@ -2189,7 +2189,8 @@ def candidate_path(md, iid):
 
 
 def write_candidate(cand_p, data, like, expect=None):
-    """후보를 덮지 않는 새 파일로 **다** 쓴다(fsync · 권한은 살아 있는 파일과 같게 · expect 로 다시 읽어 확인). 실패하면 남기지 않는다."""
+    """후보를 덮지 않는 새 파일로 **다** 쓴다(fsync · 권한은 살아 있는 파일과 같게 · expect 로 다시 읽어 확인). 실패하면 그 반쪽
+    후보는 보관 폴더로 옮긴다(★FL2 — 지우지 않는다)."""
     fd = os.open(cand_p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o644)
     done = False
     try:
@@ -2206,7 +2207,7 @@ def write_candidate(cand_p, data, like, expect=None):
         done = True
     finally:
         if not done:
-            silent_unlink(cand_p)
+            discard_candidate(cand_p, cand_p)
     fsync_dir(os.path.dirname(cand_p))
 
 
@@ -2291,21 +2292,28 @@ def remove_intent(md):
 
 
 def discard_candidate(md, p):
-    """살아 있던 적 없는 후보(바꾸기 전에 멈춤 · 놓이지 않음)를 치운다(FA2)."""
-    silent_unlink(p)
+    """★RULINGS FL2 — 이 코드는 아무것도 지우지 않는다: 살아 있지 않고 필요 없는 후보(바꾸기 전에 멈춤 · 놓이지 않음 · 반쪽 ·
+    기록이 이름 대지 않음)도 보관 폴더로 옮긴다(이유 unused-candidate · 곁 파일). 옮기지 못하면 그 자리에 둔다(다음 입구가
+    다시 옮긴다)."""
+    try:
+        keep_file(p, md, "unused-candidate")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        err("쓰이지 않은 후보를 보관 폴더로 옮기지 못해 그 자리에 두었다(%s): %s" % (e, p))
 
 
-def remove_orphan_candidates(md):
-    """★FA2 — 의도 기록이 이름 대지 않는 후보는 살아 있던 적이 없다(의도가 교체보다 먼저 남는다). 잠금 안에서, 의도 기록이
-    없을 때만 부른다."""
+def park_unnamed_candidates(md, named=()):
+    """★RULINGS FL2(FA2 철회) — 읽을 수 있는 기록이 이름 대지 않는 후보(멈춘 쓰기의 남은 것)를 보관 폴더로 옮긴다 — 지우지 않는다.
+    잠금 안에서만 부른다. 읽을 수 없는 기록이 있으면 부르지 않는다(장벽 — 무엇이 필요한지 모른다)."""
     d = os.path.dirname(os.path.abspath(md))
     pre = "." + os.path.basename(md) + "."
     try:
         names = os.listdir(d)
     except OSError:
         return
-    for n in names:
-        if n.startswith(pre) and n.endswith(".candidate"):
+    for n in sorted(names):
+        if n.startswith(pre) and n.endswith(".candidate") and n not in named:
             discard_candidate(md, os.path.join(d, n))
 
 
@@ -2354,11 +2362,14 @@ def hold_record(md, nf, title, body):
 
 
 def unreadable_record(md, nf):
-    """기록을 읽을 수 없다 — 보관 폴더로 옮기고 알림 1건(FA2)."""
-    parked, _ = keep_file(intent_path(md), md, "intent-unreadable")
-    note(nf, T_INTENT_CHECK, "끝나지 않은 본부 지침 교체 기록을 읽을 수 없어 아무것도 바꾸지 않았습니다. 그 기록은 %s 에, "
-                             "살아 있던 판들은 %s 에 있습니다 — 오너 지시로 확인하십시오." % (parked, kept_dir(md)))
-    raise HoldSwap("unreadable intent")
+    """★RULINGS FL2 — 읽을 수 없는 기록은 '없음'이 아니라 **장벽**이다: 기록도 후보도 그 무엇도 옮기거나 지우지 않고(무엇이 살아
+    있던 판인지 모른다) 조립·강등을 보류한다 — 알림은 그 기록에 한 번(hold_record). 어느 입구도 '읽을 수 있는 기록이 없다'를
+    '아무 일도 없었다'로 다루지 않는다(codex B3: 기록을 치운 뒤 다음 입구가 밀려난 판을 '이름 없는 후보'로 지웠다)."""
+    hold_record(md, nf, T_INTENT_CHECK,
+                "끝나지 않은 본부 지침 교체 기록(%s)을 읽을 수 없어 아무것도 바꾸지 않고 CEO 지침의 조립·강등을 멈췄습니다. "
+                "기록과 후보 파일은 그대로 두었습니다(지운 것 없음 — 그중에 살아 있던 판이 있을 수 있습니다). 오너 지시로 워커가 "
+                "기록을 확인해 고치거나 치울 때까지 승격·강등은 보류됩니다. 살아 있던 판들은 %s 와 지침 폴더의 후보 파일"
+                "(.MASTER_DIRECTIVE.md.*.candidate)에 있습니다." % (intent_path(md), kept_dir(md)))
 
 
 def swap_unit(md, data, expect_sha, op, reason, expect=None, nf="", rec=None, notices=None, done=None):
@@ -2625,11 +2636,12 @@ def close_intent(md, nf, op=None, args=None):
     끝나야 지워진다). 다른 동작의 입구·틱이면 기록에 적힌 인자로 그 동작을 끝까지 한다. 돌려주는 값 = (이어 갈 기록 | None,
     끝낸 동작의 rc | None, 기록의 동작 | None)."""
     rec = read_intent(md)
-    if rec is None:
-        remove_orphan_candidates(md)
-        return None, None, None
     if rec == "bad":
-        unreadable_record(md, nf)
+        unreadable_record(md, nf)           # 장벽 — 아무것도 옮기지 않는다
+    named = (rec["swap"]["candidate"],) if isinstance(rec, dict) and isinstance(rec.get("swap"), dict) else ()
+    park_unnamed_candidates(md, named)      # ★FL2 — 기록이 이름 대지 않는 후보는 보관 폴더로(지우지 않는다)
+    if rec is None:
+        return None, None, None
     rc = run_record(md, nf, rec, rec["args"], until_run=(op == rec["op"]))
     if rc is None:
         return rec, None, rec["op"]

@@ -2368,8 +2368,9 @@ class Preflight:
             if not isinstance(rec, dict):
                 raise ValueError("not an object")
         except (OSError, ValueError):
-            self.add(cid, WARN, "끝나지 않은 CEO 지침 교체 기록(%s)을 읽을 수 없다 — 다음 승격 확인이 그 기록을 보관 폴더로 옮기고 "
-                                "알림 1건을 남긴다(지침은 그대로). 살아 있던 판들은 %s 에 있다"
+            self.add(cid, WARN, "끝나지 않은 CEO 지침 교체 기록(%s)을 읽을 수 없다 — 장벽: 승격·강등은 보류되고(알림 1건) 기록도 "
+                                "후보도 옮기거나 지우지 않는다. 오너 지시로 워커가 기록을 확인해 고치거나 치울 때까지 그대로다. 살아 "
+                                "있던 판들은 %s 와 지침 폴더의 후보 파일(.MASTER_DIRECTIVE.md.*.candidate)에 있다"
                      % (ip, os.path.join(d, self._C03_CEO_KEPT_DIR)))
             return
         live = os.path.join(d, "MASTER_DIRECTIVE.md")

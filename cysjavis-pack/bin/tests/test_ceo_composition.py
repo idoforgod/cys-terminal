@@ -1183,13 +1183,54 @@ class IntentRecovery(Rig):
         self.assertEqual(rows["C03.ceo-intent"]["status"], pf.WARN)
         self.assertIn("끝나지 않은 CEO 지침 교체", rows["C03.ceo-intent"]["detail"])
 
-    def test_orphan_candidate_is_removed_only_without_an_intent(self):
-        """FA2 — 의도가 이름 대지 않는 후보는 살아 있던 적이 없다 → 잠금 안에서, 의도 기록이 없을 때만 지운다."""
+    # ── ★RULINGS FL2(FA2 철회) — 이 코드는 아무것도 지우지 않는다 ──
+    def test_an_orphan_candidate_goes_to_the_kept_folder(self):
+        """기록이 이름 대지 않는 후보도 지우지 않고 보관 폴더로 옮긴다(이유 unused-candidate). 종전 FA2 는 '살아 있던 적이 없다'며
+        지웠다 — 읽을 수 없는 기록을 치운 뒤에는 그것이 밀려난 판일 수 있었다(codex B3). 이 시험이 FA2 의 시험을 대신한다."""
         self.seed()
         orphan = self.p(".MASTER_DIRECTIVE.md.20260101T000000Z-1-1.candidate")
         _write(orphan, "never live\n")
         self.assertEqual(self.run_dept("promote-ceo")[0], 0)
-        self.assertFalse(os.path.exists(orphan), "의도 없는 후보를 지우지 않았다")
+        self.assertFalse(os.path.exists(orphan), "이름 없는 후보가 지침 폴더에 남았다")
+        self.assertEqual([_slurp(k, encoding="utf-8") for k in self.kept("unused-candidate")], ["never live\n"],
+                         "이름 없는 후보를 지웠다(보관 폴더에 없다)")
+
+    def test_a_cancelled_swap_keeps_its_candidate(self):
+        """바꾸기 전에 멈춘 교체의 후보도 지우지 않는다 — 다음 입구가 그것을 보관 폴더로 옮기고 동작을 끝낸다."""
+        for mode in ("exchange", "deposit"):
+            with self.subTest(mode=mode):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                ns = self.ns_mode(mode)
+                self.crash_after(ns, "write_intent")
+                with self.assertRaises(SystemExit):
+                    self.compose(ns)
+                self.assert_recovered_composed(USER)
+                self.assertEqual([_slurp(k, encoding="utf-8") for k in self.kept("unused-candidate")], [HEADER + SEP + USER],
+                                 "바꾸기 전에 멈춘 교체의 후보를 지웠다")
+
+    def test_an_unreadable_record_is_a_barrier(self):
+        """codex B3 — 맞바꾼 뒤 멈춰 밀려난 판이 후보 이름에 있는데 기록을 읽을 수 없다. 종전: 첫 입구가 기록을 보관 폴더로 치우고
+        다음 입구가 '이름 없는 후보'로 그 판을 지웠다. 이제 장벽이다: 아무것도 옮기거나 지우지 않고 조립·강등을 보류하며(알림
+        한 번), 몇 번을 다시 와도(지명·틱) 그대로다."""
+        ns = self.ns_mode("exchange")
+        self.seed()
+        self.crash_after(ns, "prim_exchange")
+        with self.assertRaises(SystemExit):
+            self.compose(ns)
+        _write(self.p(".ceo-intent.json"), "{ 반쪽 기록")
+        snap = lambda: {f: _slurp(self.p(f), "rb") for f in os.listdir(self.dirs) if os.path.isfile(self.p(f))}
+        before = snap()
+        self.assertIn(USER.encode(), before.values(), "시험 전제: 밀려난 판(평문 MASTER)이 후보 이름에 있다")
+        for args in (("promote-ceo",), ("promote-ceo",), ("promote-if-pending",)):
+            rc, out, err = self.run_dept(*args)
+            self.assertIn(rc, (0, 5), out + err)
+        after = snap()
+        for f, b in before.items():
+            self.assertEqual(after.get(f), b, "장벽인데 %s 가 바뀌거나 사라졌다" % f)
+        self.assertIn(USER.encode(), after.values(), "밀려난 판이 지워졌다(codex B3)")
+        self.assertEqual(self.kept(), [], "장벽인데 무언가를 옮겼다")
+        self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), 1, "장벽 알림이 한 번이 아니다(틱마다 보내지 않는다 — FA3)")
 
 
 class SafePrimitives(Rig):
