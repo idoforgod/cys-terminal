@@ -1123,12 +1123,15 @@ pub(crate) enum CopyStop {
     Io(String),
 }
 
-/// RULINGS DB2: copies at most `expected` bytes (the length the scan saw) in chunks of `COPY_CHUNK`,
-/// hashing them as they pass. Before every chunk the deadline and the abandon flag are checked, so a
-/// copy does not go on after the timeout. At `expected` one more byte is read to see whether the
-/// source grew; that byte is never written and the copy ends `Grew`. Returns the bytes written —
-/// counted however the copy ends, so the capture cap holds for what is really on disk — and the
-/// sha256 of the written bytes.
+/// RULINGS DB2 / DP1: copies at most `expected` bytes (the length the scan saw) in chunks of
+/// `COPY_CHUNK`, hashing them as they are written. The deadline and the abandon flag are checked before
+/// every read and before EVERY write call — after a read returns, between the partial writes of one
+/// chunk and before each retry of an interrupted write — so no write starts after the timeout. At
+/// `expected` one more byte is read to see whether the source grew; that byte is never written and
+/// the copy ends `Grew`. Returns the bytes written — only what the write calls returned, however the
+/// copy ends, so the capture cap holds for what is really on disk — and the sha256 of the written
+/// bytes. Limit: a read or write call already inside the operating system cannot be cancelled; at
+/// most that one call completes after the deadline (the caller's own wait stays bounded).
 pub(crate) fn copy_stream(input: &mut impl std::io::Read, output: &mut impl std::io::Write, expected: u64, budget: &Budget) -> (u64, Result<String, CopyStop>) {
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; COPY_CHUNK];
@@ -1148,11 +1151,23 @@ pub(crate) fn copy_stream(input: &mut impl std::io::Read, output: &mut impl std:
         if room == 0 {
             return (written, Err(CopyStop::Grew));
         }
-        written += n as u64;
-        if let Err(e) = std::io::Write::write_all(output, &buf[..n]) {
-            return (written, Err(CopyStop::Io(e.to_string())));
+        let mut done = 0;
+        while done < n {
+            if let Err(h) = budget.check() {
+                return (written, Err(CopyStop::Halted(h)));
+            }
+            match std::io::Write::write(output, &buf[done..n]) {
+                Ok(0) => return (written, Err(CopyStop::Io(std::io::Error::from(std::io::ErrorKind::WriteZero).to_string()))),
+                Ok(k) => {
+                    let k = k.min(n - done);
+                    hasher.update(&buf[done..done + k]);
+                    done += k;
+                    written += k as u64;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return (written, Err(CopyStop::Io(e.to_string()))),
+            }
         }
-        hasher.update(&buf[..n]);
     }
 }
 
@@ -3304,8 +3319,10 @@ mod tests {
         }
     }
 
-    /// DB2: the deadline and the abandon flag are checked before every chunk — after the outer timeout
-    /// set the flag at most the chunk already read is written, and past the deadline nothing is.
+    /// DB2 / DP1: the deadline and the abandon flag are checked after a read returns and before any
+    /// write — the outer timeout setting the flag during a read means nothing of that chunk is written
+    /// (was, before DP1: `(COPY_CHUNK as u64, COPY_CHUNK), "one chunk, then the flag stops the copy"`),
+    /// and past the deadline nothing is.
     #[test]
     fn db2_no_chunk_is_written_after_the_timeout() {
         let flag = AtomicBool::new(false);
@@ -3314,12 +3331,84 @@ mod tests {
         let mut out = Vec::new();
         let (written, result) = copy_stream(&mut FlagOnFirstRead { flag: &flag, left: total }, &mut out, total as u64, &budget);
         assert_eq!(result, Err(CopyStop::Halted(Halt::Abandoned)));
-        assert_eq!((written, out.len()), (COPY_CHUNK as u64, COPY_CHUNK), "one chunk, then the flag stops the copy");
+        assert_eq!((written, out.len()), (0, 0), "the flag set during the read stops the copy before its write");
         let calm = AtomicBool::new(false);
         let expired = Budget { deadline: Instant::now(), abandon: &calm };
         let mut out = Vec::new();
         let (written, result) = copy_stream(&mut &vec![1u8; total][..], &mut out, total as u64, &expired);
         assert_eq!((written, out.len(), result), (0, 0, Err(CopyStop::Halted(Halt::Deadline))));
+    }
+
+    /// What the test's writer does on one call.
+    #[derive(Clone, Copy)]
+    enum WriteStep {
+        Take,
+        TakeThenAbandon,
+        InterruptThenAbandon,
+        Fail,
+    }
+
+    /// The test's writer: takes at most `per_call` bytes per call and follows `steps` call by call
+    /// (`Take` after the script ends); counts its calls.
+    struct ScriptedWriter<'a> {
+        flag: &'a AtomicBool,
+        per_call: usize,
+        steps: Vec<WriteStep>,
+        calls: usize,
+        out: Vec<u8>,
+    }
+    impl std::io::Write for ScriptedWriter<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let step = self.steps.get(self.calls).copied().unwrap_or(WriteStep::Take);
+            self.calls += 1;
+            match step {
+                WriteStep::Fail => Err(std::io::Error::other("the disk is full (test)")),
+                WriteStep::InterruptThenAbandon => {
+                    self.flag.store(true, Ordering::SeqCst);
+                    Err(std::io::ErrorKind::Interrupted.into())
+                }
+                WriteStep::Take | WriteStep::TakeThenAbandon => {
+                    let n = buf.len().min(self.per_call);
+                    self.out.extend_from_slice(&buf[..n]);
+                    if matches!(step, WriteStep::TakeThenAbandon) {
+                        self.flag.store(true, Ordering::SeqCst);
+                    }
+                    Ok(n)
+                }
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// DP1: between the partial writes and the `Interrupted` retries of one chunk the budget is checked
+    /// again — the flag set during a partial write or an interrupted write means no further write call.
+    #[test]
+    fn dp1_no_write_call_follows_the_flag_inside_a_chunk() {
+        let data = vec![7u8; 2 * COPY_CHUNK];
+        for (steps, kept) in [(vec![WriteStep::TakeThenAbandon], 1000usize), (vec![WriteStep::InterruptThenAbandon], 0)] {
+            let flag = AtomicBool::new(false);
+            let budget = Budget { deadline: Instant::now() + Duration::from_secs(3_600), abandon: &flag };
+            let mut w = ScriptedWriter { flag: &flag, per_call: 1000, steps, calls: 0, out: Vec::new() };
+            let (written, result) = copy_stream(&mut &data[..], &mut w, data.len() as u64, &budget);
+            assert_eq!(result, Err(CopyStop::Halted(Halt::Abandoned)));
+            assert_eq!(w.calls, 1, "no write call after the flag");
+            assert_eq!((written, w.out.len()), (kept as u64, kept));
+        }
+    }
+
+    /// DP1: the counter adds only what a write call returned — a partial write then an error reports
+    /// exactly the bytes really written.
+    #[test]
+    fn dp1_the_counter_is_the_bytes_really_written() {
+        let data = vec![9u8; 2 * COPY_CHUNK];
+        let (flag, deadline) = unlimited();
+        let budget = Budget { deadline, abandon: &flag };
+        let mut w = ScriptedWriter { flag: &flag, per_call: 4096, steps: vec![WriteStep::Take, WriteStep::Fail], calls: 0, out: Vec::new() };
+        let (written, result) = copy_stream(&mut &data[..], &mut w, data.len() as u64, &budget);
+        assert!(matches!(&result, Err(CopyStop::Io(e)) if e.contains("the disk is full")), "{result:?}");
+        assert_eq!((written, w.out.len(), w.calls), (4096, 4096, 2));
     }
 
     /// Between the scan and the copies the edited `site.py` grows by 3 MiB.
