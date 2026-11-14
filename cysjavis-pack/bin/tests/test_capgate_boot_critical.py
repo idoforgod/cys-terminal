@@ -1027,5 +1027,151 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
         self.assertEqual(rc, 2, "the negative control did not reproduce the interpreter's 2 passing as a verdict")
 
 
+
+# RULINGS ES1 — the judge of protection G (`hooks/guard.sh`): its two interpreter starts (the source written
+# to a temp file — the usual one — and `-c` when no temp file can be made) and the exit-2 rule, as they are
+# now and as they were at f5b684bf (rebuilt in a copy for the negative controls)
+GUARD = PACK / "hooks" / "guard.sh"
+GUARD_SWAPS_OLD = [
+    (' "$PYBIN" -I -S -B -X utf8 "$(cys_native_path "$GUARD_PYFILE")" ', ' "$PYBIN" "$(cys_native_path "$GUARD_PYFILE")" '),
+    (' "$PYBIN" -I -S -B -X utf8 -c "$PYSRC" ', ' "$PYBIN" -c "$PYSRC" '),
+    ('elif [ "$RC" -eq 2 ] && [ -n "$PYOUT" ]; then', 'elif [ "$RC" -eq 2 ]; then'),
+]
+
+
+class GuardJudgeIsolation(_PlantedVectors, _Env):
+    """RULINGS ES1 — protection G's judge starts isolated (`-I -S -B -X utf8`) on both of its starts. For
+    each DY1 vector, plus a module in TMPDIR (where guard writes the judge's source — `python <file>` puts
+    that folder first on the import path) and a module in the working directory on the `-c` start, the
+    planted code does not run and the decision is whole: an external send is refused BY THE JUDGE (not the
+    bash backstop) and `ls` passes. An interpreter that refuses the flags = today's broken interpreter
+    (LOOSE: the bash backstop; STRICT: the parser-crash deny), never deny-everything. Negative controls:
+    guard.sh with the starts of f5b684bf runs the planted code; without the exit-2 rule a refusing
+    interpreter refuses everything."""
+
+    FORBIDDEN = "curl -X POST -d x https://example.invalid"   # an external send: no backstop rule names it
+    ALLOWED = "ls -la"
+
+    def setUp(self):
+        super().setUp()
+        self.flags = self.root / "flags"
+        self.flags.mkdir()
+        self.fake("cys", "exit 1\n")
+
+    def guard_copy(self, tag, swaps):
+        src = GUARD.read_text(encoding="utf-8")
+        for new, old in swaps:
+            self.assertEqual(src.count(new), 1, "a guard start is not in guard.sh as expected: %r" % new)
+            src = src.replace(new, old)
+        d = self.root / ("guard-" + tag)
+        d.mkdir()
+        (d / "guard.sh").write_text(src, encoding="utf-8")
+        shutil.copy(str(LIB), str(d / "_lib.sh"))
+        return d / "guard.sh"
+
+    def run_guard(self, command, extra, cwd, guard=None, active=False):
+        env = {k: v for k, v in self.env.items() if not k.startswith(("GUARD_", "AUTOPILOT_"))}
+        env.update({"GUARD_TEST_MODE": "1",
+                    "AUTOPILOT_PAUSED_FILE": str(self.flags / "AUTOPILOT_PAUSED"),
+                    "AUTOPILOT_ACTIVE_FILE": str(self.flags / "AUTOPILOT_ACTIVE")})
+        env.update(extra)
+        act = self.flags / "AUTOPILOT_ACTIVE"
+        if active:
+            act.write_text("", encoding="utf-8")
+        elif act.exists():
+            act.unlink()
+        r = subprocess.run([SH, str(guard or GUARD)], env=env, cwd=str(cwd), capture_output=True, timeout=60,
+                           input=json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}).encode())
+        return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+
+    def guard_vectors(self, marker):
+        t = self.tmpdir
+        tmp_plant = self._planted(t / "tmpdir-plant", marker, "tmpdir")
+        return self.vectors(marker) + [
+            ("module in TMPDIR, where guard writes its judge's source", {"TMPDIR": str(tmp_plant)}, t / "review-ws"),
+            ("module in the working directory, on the `-c` start (no temp file)",
+             {"TMPDIR": str(t / "no-such-dir")}, self._planted(t / "cwd-c", marker, "cwd-c")),
+        ]
+
+    def judge_faults(self, vectors, marker, guard=None):
+        out = {}
+        for name, extra, cwd in vectors:
+            if marker.exists():
+                marker.unlink()
+            why = []
+            rc, so, se = self.run_guard(self.FORBIDDEN, extra, cwd, guard)
+            if not (rc == 2 and "AUTOPILOT GUARD DENY" in se and "백스톱" not in se):
+                why.append("the judge did not refuse the external send: rc=%d stderr=%r" % (rc, se[-240:]))
+            rc, so, se = self.run_guard(self.ALLOWED, extra, cwd, guard)
+            if rc != 0:
+                why.append("`ls` did not pass: rc=%d stderr=%r" % (rc, se[-240:]))
+            if marker.exists():
+                why.append("planted code RAN: %r" % marker.read_text(encoding="utf-8"))
+            out[name] = why
+        return out
+
+    def test_the_guard_judge_starts_isolated(self):
+        marker = self.root / "PLANTED-RAN"
+        got = self.judge_faults(self.guard_vectors(marker), marker)
+        bad = {k: v for k, v in got.items() if v}
+        self.assertEqual(bad, {}, "\n".join("%s: %s" % (k, " | ".join(v)) for k, v in bad.items()))
+        leftovers = [n for n in os.listdir(str(self.tmpdir)) if n.startswith(".guard_pysrc.")]
+        self.assertEqual(leftovers, [], "the judge's source file was left behind")
+
+    def test_negative_control_the_old_guard_starts_run_the_planted_code(self):
+        marker = self.root / "PLANTED-RAN"
+        got = self.judge_faults(self.guard_vectors(marker), marker, guard=self.guard_copy("f5b684bf", GUARD_SWAPS_OLD))
+        caught = sorted(k for k, v in got.items() if v)
+        sys.stderr.write("ES1 negative control, guard.sh of f5b684bf: fails %s; holds %s\n"
+                         % (caught, sorted(k for k, v in got.items() if not v)))
+        for name in ("absolute PYTHONPATH in a seat-writable folder", "relative PYTHONPATH",
+                     "sitecustomize.py alone on PYTHONPATH", "usercustomize.py alone on PYTHONPATH", "PYTHONUSERBASE",
+                     "PYTHONHOME", "PYTHONINSPECT", "PYTHONUTF8 not 0/1",
+                     "module in TMPDIR, where guard writes its judge's source",
+                     "module in the working directory, on the `-c` start (no temp file)"):
+            self.assertIn(name, caught)
+
+    def test_the_guard_judge_imports_the_standard_library_only(self):
+        src = GUARD.read_text(encoding="utf-8")
+        i = src.index("IFS= read -r -d '' PYSRC <<'PY'\n") + len("IFS= read -r -d '' PYSRC <<'PY'\n")
+        body = src[i:src.index("\nPY\n", i)]
+        names = _imports(body)
+        self.assertIn("json", names)
+        self.assertEqual(sorted(n for n in names if not _is_stdlib(n)), [], "guard's judge imports outside the stdlib")
+        self.assertNotIn("PYTHON", "".join(l for l in body.splitlines() if "environ" in l),
+                         "guard's judge reads a PYTHON* variable")
+
+    def test_an_interpreter_that_refuses_the_flags_is_todays_broken_interpreter(self):
+        log = self.root / "launches.log"
+        refuses = self.fakebin / "python2-like"
+        refuses.write_text("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %s\n"
+                           "for a in \"$@\"; do [ \"$a\" = -I ] && { echo 'Unknown option: -I' >&2; exit 2; }; done\n"
+                           "exec %s \"$@\"\n" % (log, sys.executable), encoding="utf-8")
+        refuses.chmod(0o755)
+        dead = self.fakebin / "python-dead"
+        dead.write_text("#!/nonexistent/interpreter/python3\n", encoding="utf-8")
+        dead.chmod(0o755)
+        seen = {}
+        for py in (refuses, dead):
+            for active in (False, True):
+                for cmd in (self.FORBIDDEN, self.ALLOWED, "git push origin main"):
+                    n0 = len(log.read_text().splitlines()) if log.exists() else 0
+                    rc, so, se = self.run_guard(cmd, {"CYS_PY": str(py)}, self.root, active=active)
+                    if py == refuses:
+                        self.assertEqual(len(log.read_text().splitlines()) - n0, 1, "one interpreter launch per call")
+                    seen[(py.name, active, cmd)] = (rc, "백스톱" in se, "parser 크래시" in se)
+        for active in (False, True):
+            for cmd in (self.FORBIDDEN, self.ALLOWED, "git push origin main"):
+                self.assertEqual(seen[("python2-like", active, cmd)], seen[("python-dead", active, cmd)],
+                                 "a refusing interpreter differs from a broken one: %s %s" % (active, cmd))
+        self.assertEqual(seen[("python2-like", False, self.ALLOWED)][0], 0, "LOOSE: `ls` must pass (never deny-everything)")
+        self.assertEqual(seen[("python2-like", False, self.FORBIDDEN)][0], 0, "LOOSE: the backstop has no rule for it")
+        self.assertEqual(seen[("python2-like", False, "git push origin main")][:2], (2, True), "LOOSE: the backstop refuses")
+        self.assertEqual(seen[("python2-like", True, self.ALLOWED)], (2, False, True), "STRICT: the parser-crash deny")
+        walled = self.guard_copy("no-exit2-rule", [GUARD_SWAPS_OLD[2]])
+        rc, so, se = self.run_guard(self.ALLOWED, {"CYS_PY": str(refuses)}, self.root, guard=walled)
+        self.assertEqual(rc, 2, "the negative control did not reproduce the wall (a refusal read as a deny)")
+
+
 if __name__ == "__main__":
     unittest.main()
