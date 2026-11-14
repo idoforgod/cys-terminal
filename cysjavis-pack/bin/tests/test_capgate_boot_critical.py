@@ -432,8 +432,11 @@ class GateWithBuiltBinary(_Env):
         """RULINGS CY1 — the J3 counterexample end to end through the gate and the built binary: a
         shell redirection (and a Write) to a listed file through an alias INSIDE the pack — an alias
         directory, a chain of two links, an alias of the file, `..` after a link — is denied for a
-        worker and a master, and the live file is untouched; an alias pointing OUT of the pack names
-        no row of this lane."""
+        worker and a master; an alias pointing OUT of the pack names no row of this lane.
+        RULINGS DY2 — "the live file is untouched" is backed by real attempts: every call is followed
+        by what the harness does with it (the tool runs unless the hook blocks or denies), so a missed
+        deny writes the live file; the out-of-pack call, not denied, runs and its write is observed
+        (positive control: the emulation really writes)."""
         p = self.pack
         (p / "hooks" / "sub").mkdir(exist_ok=True)
         (p / "notes").mkdir(exist_ok=True)
@@ -444,7 +447,9 @@ class GateWithBuiltBinary(_Env):
         os.symlink(str(p / "hooks" / "sub"), str(p / "notes" / "sub-link"))
         os.symlink(str(self.outside), str(p / "out-alias"))
         before = (p / REL).read_text(encoding="utf-8")
+        self.assertNotEqual(before, "x")
         leaf = REL.rsplit("/", 1)[1]
+        missed = []
         for spelled in ("hooks-alias/" + leaf, "a1/" + leaf, "notes/ic-copy.sh", "notes/sub-link/../" + leaf):
             target = "%s/%s" % (p, spelled)
             for role in ("worker", "master"):
@@ -452,12 +457,27 @@ class GateWithBuiltBinary(_Env):
                                  ("Write", {"file_path": target, "content": "x"})):
                     r, _ = self.run_hook(tool, ti, CYS_ROLE=role)
                     dec, reason = self.decision(r)
-                    self.assertEqual(dec, "deny", "%s %s %s 가 거부되지 않았다: %r %r"
-                                     % (role, tool, spelled, r.stdout, r.stderr[-300:]))
-                    self.assertIn(REL, reason)
+                    if self.attempt(tool, ti, r) or REL not in reason:
+                        missed.append("%s %s %s: %r %r" % (role, tool, spelled, r.stdout, r.stderr[-300:]))
+        self.assertEqual(missed, [], "거부되지 않았다(또는 사유가 행을 가리키지 않는다)")
         self.assertEqual((p / REL).read_text(encoding="utf-8"), before, "살아 있는 파일이 바뀌었다")
-        r, _ = self.run_hook("Bash", {"command": "printf x > %s/out-alias/%s" % (p, leaf)})
+        ti = {"command": "printf x > %s/out-alias/%s" % (p, leaf)}
+        r, _ = self.run_hook("Bash", ti)
         self.assertNotEqual(self.decision(r)[0], "deny", "팩 밖을 가리키는 별칭은 이 레인의 행이 아니다")
+        self.assertTrue(self.attempt("Bash", ti, r), "the out-of-pack call was not run")
+        self.assertEqual((self.outside / leaf).read_text(encoding="utf-8"), "x",
+                         "positive control: the harness emulation did not write")
+
+    def attempt(self, tool, ti, r):
+        """What the harness does with a PreToolUse answer: the tool runs unless the hook blocked (exit 2)
+        or denied. Runs it for real (Bash through the shell, Write as a file write); True if it ran."""
+        if r.returncode == 2 or self.decision(r)[0] == "deny":
+            return False
+        if tool == "Bash":
+            subprocess.run([SH, "-c", ti["command"]], cwd=str(self.root), capture_output=True, timeout=30)
+        elif tool == "Write":
+            Path(ti["file_path"]).write_text(ti["content"], encoding="utf-8")
+        return True
 
     def test_control_variants_allowed(self):
         rel = "hooks/README.md"
