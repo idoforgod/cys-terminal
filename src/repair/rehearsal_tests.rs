@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::repair::replay;
+use crate::repair::types::TargetState;
 
 fn root(name: &str) -> PathBuf {
     let home = dirs::home_dir().expect("HOME");
@@ -219,6 +220,38 @@ fn runner_returns_when_an_escaped_descendant_holds_the_pipes() {
     assert!(o.left_something().is_some());
     std::thread::sleep(Duration::from_millis(200));
     assert!(!replay::pid_alive(esc), "the escaped process {esc} was killed by its exact pid");
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
+/// RULINGS DF5: a replayed or compared path is read ONCE through a no-follow, non-blocking handle — a
+/// FIFO in its place is refused at once (never a hang), a link stays a link, and the bytes, mode and
+/// stamp all come from that handle. No second `std::fs::read` of the same path remains.
+#[test]
+fn compared_reads_use_one_nonblocking_handle() {
+    let r = root("df5");
+    let fifo = r.join("fifo");
+    let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+    // SAFETY: mkfifo(3) on a path inside this test's folder.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let t0 = std::time::Instant::now();
+    assert!(replay::read_stamped(&fifo).is_err());
+    assert!(replay::LaidSource::read(&fifo).is_err());
+    assert!(t0.elapsed() < Duration::from_secs(2));
+    put(&r, "f.sh", "#!/bin/sh\necho hi\n");
+    replay::set_mode(&r.join("f.sh"), 0o750);
+    let (c, stamp) = replay::read_stamped(&r.join("f.sh")).unwrap();
+    assert_eq!(
+        c,
+        replay::LaidSource::Bytes { bytes: b"#!/bin/sh\necho hi\n".to_vec(), mode: 0o750 }
+    );
+    assert_eq!(c.state(), TargetState::read(&r.join("f.sh")).unwrap());
+    assert!(stamp.contains("ino="), "{stamp}");
+    std::os::unix::fs::symlink("f.sh", r.join("l")).unwrap();
+    assert_eq!(replay::read_stamped(&r.join("l")).unwrap().0, replay::LaidSource::Link("f.sh".into()));
+    let src = include_str!("replay.rs");
+    let read_fn = src.split("pub fn read(p: &Path) -> Result<Self, RepairError> {").nth(1).unwrap_or("");
+    let read_fn = read_fn.split("\n    }\n").next().unwrap_or("");
+    assert!(!read_fn.contains("std::fs::read("), "LaidSource::read opens the path once");
     replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
