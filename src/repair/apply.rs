@@ -2784,11 +2784,12 @@ pub fn run_registrar(pack: &Path, dry_run: bool) -> Result<String, RepairError> 
         }
     }
     cmd.env("CYS_PACK_DIR", pack);
-    // U-7: the one spawn-policy helper — an ATTACHED child (waited for, killed and reaped at its
-    // deadline), the console hidden on Windows; no autostart of a rival daemon from it.
+    // U-7: the one spawn-policy helper. CT6: its OWN process group (`GroupScoped` — a new session on
+    // unix, a new process group on Windows, the console hidden) so that `run_bounded` can stop the
+    // registrar AND every descendant at the deadline; no autostart of a rival daemon from it.
     {
         use crate::SpawnPolicy as _;
-        cmd.spawn_policy(crate::ChildLifetime::Attached).no_autostart();
+        cmd.spawn_policy(crate::ChildLifetime::GroupScoped).no_autostart();
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -2796,46 +2797,108 @@ pub fn run_registrar(pack: &Path, dry_run: bool) -> Result<String, RepairError> 
     run_bounded(cmd, RECONCILE_DEADLINE)
 }
 
-/// Spawns `cmd`, collects stdout on a reader thread, kills and reaps the child at `deadline`.
+/// RULINGS CT6 / CZ10 — THE bounded child discipline of the job and of every apply (the registrar):
+/// ONE deadline covers the child's run, the termination of its whole process group, the reaping and
+/// the collection of its output. The child should lead its own process group (the caller's spawn
+/// policy `GroupScoped`). After the child exits, its output must reach EOF before `deadline − reserve`
+/// (`reserve` = ¼ of the deadline, at most 2 s); otherwise — or when the child itself is still running
+/// then — the whole group is killed (unix `killpg(SIGKILL)`; Windows: the child only — residual),
+/// the child reaped, and the output collected until the deadline; a descendant that escaped the
+/// group and still holds the pipe cannot hold this call: the reader thread is left to it and the
+/// call returns at the deadline. What was left behind is RETURNED in the error, never swallowed.
 pub fn run_bounded(mut cmd: std::process::Command, deadline: Duration) -> Result<String, RepairError> {
+    let start = std::time::Instant::now();
+    let reserve = (deadline / 4).min(Duration::from_secs(2));
+    let exit_by = deadline.saturating_sub(reserve);
     let mut child = cmd
         .spawn()
         .map_err(|e| RepairError::Io(format!("등록기를 시작할 수 없습니다: {e}")))?;
-    let mut out = child.stdout.take();
-    let reader = std::thread::spawn(move || {
+    let pid = child.id();
+    let out = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let _ = std::thread::Builder::new().name("cys-bounded-reader".into()).spawn(move || {
         let mut s = String::new();
-        if let Some(o) = out.as_mut() {
-            let _ = std::io::Read::read_to_string(o, &mut s);
+        if let Some(mut o) = out {
+            let _ = std::io::Read::read_to_string(&mut o, &mut s);
         }
-        s
+        let _ = tx.send(s);
     });
-    let start = std::time::Instant::now();
-    loop {
+    let left = |d: Duration| d.saturating_sub(start.elapsed());
+    // (1) the child's own run, until `exit_by`
+    let mut status = None;
+    while start.elapsed() < exit_by {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let s = reader.join().unwrap_or_default();
-                if !status.success() {
-                    return Err(RepairError::CheckFailed(format!(
-                        "등록기가 실패했습니다(종료 {:?})",
-                        status.code()
-                    )));
-                }
-                return Ok(s);
+            Ok(Some(st)) => {
+                status = Some(st);
+                break;
             }
-            Ok(None) => {}
-            Err(e) => return Err(RepairError::Io(format!("등록기 상태를 읽을 수 없습니다: {e}"))),
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => {
+                kill_group_of(pid);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(RepairError::Io(format!("등록기 상태를 읽을 수 없어 그 프로세스 그룹을 멈췄습니다: {e}")));
+            }
         }
-        if start.elapsed() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return Err(RepairError::CheckTimeout(format!(
-                "등록기가 {}초 안에 끝나지 않아 멈췄습니다",
-                deadline.as_secs()
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(50));
     }
+    // (2) its output, until `exit_by` as well
+    let mut output = match status {
+        Some(_) => rx.recv_timeout(left(exit_by)).ok(),
+        None => None,
+    };
+    if status.is_some() && output.is_some() {
+        let st = status.unwrap_or_else(|| unreachable!());
+        let s = output.unwrap_or_default();
+        if !st.success() {
+            return Err(RepairError::CheckFailed(format!("등록기가 실패했습니다(종료 {:?})", st.code())));
+        }
+        return Ok(s);
+    }
+    // (3) termination of the whole group, reaping, and the rest of the output — within the deadline
+    kill_group_of(pid);
+    let _ = child.kill();
+    let reaped = child.wait().ok();
+    if output.is_none() {
+        output = rx.recv_timeout(left(deadline)).ok();
+    }
+    let got = output.as_deref().unwrap_or("");
+    let shown: String = got.chars().take(400).collect();
+    let pipe = if output.is_none() {
+        " · 그룹 밖으로 나간 자손이 출력 파이프를 아직 쥐고 있어 읽기를 기다리지 않고 돌아왔습니다"
+    } else {
+        ""
+    };
+    if status.is_none() {
+        return Err(RepairError::CheckTimeout(format!(
+            "등록기가 {}초 안에 끝나지 않아 그 프로세스 그룹(pgid {pid})을 멈추고 거두었습니다(종료 {:?}){pipe} — 받은 출력 {}바이트: {shown}",
+            deadline.as_secs(),
+            reaped.and_then(|s| s.code()),
+            got.len()
+        )));
+    }
+    Err(RepairError::CheckFailed(format!(
+        "등록기는 끝났지만 그 자손이 출력 파이프를 쥐고 있어 기한 안에 보고를 다 받지 못했습니다 — 프로세스 그룹(pgid {pid})을 멈췄습니다{pipe} — 받은 출력 {}바이트: {shown}",
+        got.len()
+    )))
+}
+
+/// Kills the process group led by `pid` (unix, only when `pid` really leads its own group — never
+/// the daemon's group); elsewhere nothing (the caller kills the child itself).
+fn kill_group_of(pid: u32) {
+    #[cfg(unix)]
+    {
+        let Ok(p) = i32::try_from(pid) else {
+            return;
+        };
+        // SAFETY: getpgid / killpg take plain integers; a group is signalled only when `pid` leads it.
+        unsafe {
+            if libc::getpgid(p) == p && p != libc::getpgrp() {
+                libc::killpg(p, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 /// Parses the registrar's Y2(a) JSON into a report.

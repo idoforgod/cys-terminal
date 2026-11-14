@@ -1628,3 +1628,65 @@ fn unrecoverable_target_leaves_a_revertible_conflict_row() {
     assert_eq!(row.state, LaneState::Conflict);
     assert!(row.applied.is_empty(), "nothing of the apply is live any more: {:?}", row.applied);
 }
+
+// ───────────────────────────── RULINGS CT6 — the job thread always returns ─────────────────────────────
+
+fn pid_gone(pid: i32) -> bool {
+    // a killed orphan is reaped by the system shortly; wait for it, bounded
+    for _ in 0..200 {
+        // SAFETY: signal 0 only probes the pid.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50)); // wallclock: guard bounded poll for a guaranteed reap
+    }
+    false
+}
+
+/// CT6 (major 7; CZ10): the child exits at once but its DESCENDANT keeps stdout open. With the
+/// child leading its own process group the whole group is stopped and the call returns within the
+/// deadline with what was left behind in the error (the descendant's pid, the output received);
+/// the descendant is gone. Without CT6 `reader.join()` waited for the descendant (60 s here — in
+/// production forever: the job thread never returned and every later tick answered `busy`).
+#[cfg(unix)]
+#[test]
+fn a_descendant_holding_stdout_cannot_hold_the_job() {
+    use crate::SpawnPolicy as _;
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c").arg("sleep 60 & echo partial $!");
+    cmd.spawn_policy(crate::ChildLifetime::GroupScoped);
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    let t = std::time::Instant::now();
+    let res = run_bounded(cmd, Duration::from_secs(4));
+    assert!(t.elapsed() < Duration::from_secs(20), "returned at the deadline, not when the descendant ended");
+    let msg = match res {
+        Err(RepairError::CheckFailed(m)) => m,
+        other => panic!("a held pipe is reported, not swallowed: {other:?}"),
+    };
+    assert!(msg.contains("자손") && msg.contains("partial"), "{msg}");
+    let pid: i32 = msg.split("partial ").nth(1).and_then(|t| t.split_whitespace().next()).and_then(|p| p.parse().ok()).expect("the descendant's pid");
+    assert!(pid_gone(pid), "the descendant (pid {pid}) was stopped with its group");
+}
+
+/// CT6: even a descendant that ESCAPED the group (here: the child does not lead a group at all)
+/// cannot hold the call past its deadline — the reader is left to it and the error says so. The
+/// test stops its own stray descendant afterwards by its exact pid.
+#[cfg(unix)]
+#[test]
+fn an_escaped_descendant_cannot_hold_the_reader_past_the_deadline() {
+    let r = rig("ct6escape");
+    let pidfile = r.base.join("sleep.pid");
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c").arg(format!("sleep 30 & echo $! > '{}'; echo escaped", pidfile.display()));
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    let t = std::time::Instant::now();
+    let res = run_bounded(cmd, Duration::from_secs(4));
+    assert!(t.elapsed() < Duration::from_secs(20), "returned at the deadline");
+    let msg = format!("{res:?}");
+    let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    // SAFETY: our own child's descendant, by its exact pid.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    assert!(res.is_err() && msg.contains("파이프"), "{msg}");
+}
