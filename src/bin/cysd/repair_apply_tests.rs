@@ -136,6 +136,32 @@ fn committed(r: &Rig, rel: &str, post: &[u8]) -> String {
     id
 }
 
+/// RULINGS GK4 (codex r5 M2) through the daemon's commit verb: the pack is updated BETWEEN `begin`
+/// (whose pre-image copy records its generation) and `commit` — the commit still succeeds, the row
+/// says the repair cannot be returned automatically, it is not offered to a revert, and nothing is
+/// put back. Without GK4 the general commit stamped the current generation with `closed: None`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_general_commit_after_an_update_is_not_returned_automatically() {
+    let r = rig("gk4");
+    let w = seat(3, "worker");
+    let b = r.call(T0, &w, "begin", json!({"trigger": "owner_order", "files": ["bin/a.py"]})).unwrap();
+    let id = b["repair"].as_str().unwrap().to_string();
+    std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
+    std::fs::write(r.pack.join("bin/a.py"), b"print('fixed')\n").unwrap();
+    r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "fix"})).unwrap();
+    r.call(T0 + 2.0, &seat(7, "reviewer-codex"), "attest_verify", json!({"repair": id, "verdict": "pass", "note": "ok"})).unwrap();
+    let c = r.call(T0 + 3.0, &w, "commit", json!({"repair": id})).unwrap();
+    assert_eq!(c["state"], "probation", "the commit still succeeds: {c}");
+    let rid = RepairId::parse(&id).unwrap();
+    let row = ledger::read_lane_in(&r.root, &rid, &r.lane).unwrap().unwrap();
+    let closed = row.probation.as_ref().unwrap().closed.clone().unwrap_or_default();
+    assert!(closed.contains(cys::repair::apply::NOT_REVERTIBLE_SENTENCE), "the row says so: {closed}");
+    assert!(!cys::repair::apply::revertible_here(&r.record_of(&id), &row, &r.lane), "not offered to the return");
+    assert!(r.call(T0 + 4.0, &human(), "revert", json!({"repair": id})).is_err(), "a revert is refused");
+    assert_eq!(std::fs::read(r.pack.join("bin/a.py")).unwrap(), b"print('fixed')\n", "nothing put back");
+}
+
 /// `repair.revert` from a human and from a worker seat of the lane: the pre-image is live again by
 /// rule one, the repaired copy is in the vault, the record is 되돌려짐; a master is refused by the
 /// role table (C3: master never) and nothing changes.

@@ -3125,6 +3125,10 @@ mod ledger_verbs {
                     applied_history.push(prev.applied.clone());
                 }
             }
+            // T6 · RULINGS GK4 (the EN8 seam; FI1 on the general commit): pre-images taken in another
+            // generation than the one live NOW, or in an unknown one → the commit stands, the row says
+            // it cannot be returned automatically, and it is never offered to the automatic return
+            let not_revertible = cys::repair::apply::begun_in_another_generation(&rec, &ctx.pack_dir);
             let row = LaneRecord {
                 schema: cys::repair::REPAIR_SCHEMA,
                 repair: id.clone(),
@@ -3135,7 +3139,7 @@ mod ledger_verbs {
                     pro_revision: pro,
                     applied_at: ctx.now,
                     expected: committed.clone(),
-                    closed: None,
+                    closed: not_revertible.then(cys::repair::apply::not_revertible_closure),
                     check_timings: timings,
                     check_timeouts: Vec::new(),
                 }),
