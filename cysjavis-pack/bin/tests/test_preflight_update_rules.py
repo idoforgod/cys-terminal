@@ -175,11 +175,12 @@ class LedgerKinds(Rig):
             with open(os.path.join(elsewhere, name), "w", encoding="utf-8") as f:
                 f.write("e")
         os.symlink(elsewhere, os.path.join(self.pack, "linked"))
-        want = ("★기록 없는 보관 사본 1건 — 병합 대기 기록 없이 디스크에 남은 내 수정본 <파일>.user(`--take-new` 로 vendor 본 "
-                "유지를 확정했거나 기록이 지워짐 · 기동 필수·보호 목록 파일이면 사본이 있는 동안 되돌리기가 그 파일을 건너뜀 · "
-                "다시 입히기 = 워커가 승인 절차로: 수리로 고친 파일이면 `cys repair reapply <수리번호>`, 직접 고친 파일이면 "
-                "`cys repair begin --files <파일> --trigger update` · 다시 입히지 않으려면 그 사본을 다른 이름으로 옮긴다"
-                "(지우지 않는다)): hooks/guard.sh")
+        # ★T2i(RULINGS FH4 — 기대가 바뀜): 원본이 없는 사본(hooks/orphan.sh.user)도 '원본 없음'으로 보인다.
+        want = ("★기록 없는 보관 사본 2건 — 병합 대기 기록 없이 디스크에 남은 내 수정본 <파일>.user(`--take-new` 로 vendor 본 "
+                "유지를 확정했거나 기록이 지워짐 · '원본 없음' = 그 파일이 지워졌거나 업데이트에서 빠짐 · 기동 필수·보호 목록 "
+                "파일이면 사본이 있는 동안 되돌리기가 그 파일을 건너뜀 · 다시 입히기 = 워커가 승인 절차로: 수리로 고친 파일이면 "
+                "`cys repair reapply <수리번호>`, 직접 고친 파일이면 `cys repair begin --files <파일> --trigger update` · 다시 "
+                "입히지 않으려면 그 사본을 다른 이름으로 옮긴다(지우지 않는다)): hooks/guard.sh, hooks/orphan.sh(원본 없음)")
         st, detail = self.run_check("c62_pack_heal_ledger", "C62", fix=False)
         self.assertEqual((st, detail), (WARN, want), "원장 없음")
         self.ledger({"bin/other.py": {"kind": "kept-drift", "side": "bin/other.py", "version": "x", "ts": 0}})
@@ -189,12 +190,34 @@ class LedgerKinds(Rig):
         self.ledger({"hooks/guard.sh": {"kind": "vendor-first", "side": "hooks/guard.sh.user", "version": "0.15.0", "ts": 1}})
         st, detail = self.run_check("c62_pack_heal_ledger", "C62", fix=False)
         self.assertEqual(st, WARN)
-        self.assertNotIn("기록 없는 보관 사본", detail, "기록이 이름 대면 그 줄에만")
+        self.assertIn("기록 없는 보관 사본 1건", detail, "기록이 이름 대는 사본은 그 줄에만 — 원본 없는 사본은 남는다")
+        self.assertNotIn("hooks/guard.sh,", detail)
         self.assertIn("vendor-first) 1건", detail)
+        os.remove(os.path.join(self.pack, "hooks", "orphan.sh.user"))
         os.rename(os.path.join(self.pack, "hooks", "guard.sh.user"), os.path.join(self.pack, "hooks", "guard.sh.user.aside"))
         os.remove(os.path.join(self.pack, ".merge-pending.json"))
         st, detail = self.run_check("c62_pack_heal_ledger", "C62", fix=False)
         self.assertEqual((st, detail), (PASS, "병합 대기 0건 (원장 없음)"), "사본을 옮기면 사라진다")
+
+    # ★T2i(RULINGS FH4): 조사를 끝내지 못하면(읽지 못한 폴더 · 방문 상한) C62 는 '0건'이라고 말하지 않는다 — 원장이 없어도.
+    def test_c62_unfinished_scan_never_says_zero(self):
+        locked = os.path.join(self.pack, "locked")
+        os.makedirs(locked)
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o755)
+        st, detail = self.run_check("c62_pack_heal_ledger", "C62", fix=False)
+        self.assertEqual(st, WARN)
+        self.assertEqual(detail, "★보관 사본 조사 미완(폴더 'locked' 를 읽지 못함(Permission denied)) — 기록 없는 보관 사본이 더 있을 "
+                                 "수 있음(이 점검은 '0건'이라고 말하지 않는다)")
+        os.chmod(locked, 0o755)
+        with open(os.path.join(self.pack, "x.txt"), "w") as f:
+            f.write("x")
+        with mock.patch.object(pf, "UNRECORDED_SCAN_CAP", 0):
+            st, detail = self.run_check("c62_pack_heal_ledger", "C62", fix=False)
+        self.assertEqual(st, WARN)
+        self.assertIn("방문 상한 0개에 닿음", detail)
+        st, detail = self.run_check("c62_pack_heal_ledger", "C62", fix=False)
+        self.assertEqual((st, detail), (PASS, "병합 대기 0건 (원장 없음)"))
 
     def _wake_rig(self):
         wk = os.path.join(self.pack, "bin")

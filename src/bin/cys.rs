@@ -26729,8 +26729,9 @@ fn run_pack_merge_with(
     let Some(rel) = file else {
         // 목록 모드
         // ★T2i(RULINGS EF2 · EF3): 기록 없는 보관 사본(디스크의 사실)도 보인다 — 없을 때만 '정합 상태'라고 말한다.
-        let unrecorded = unrecorded_parked_copies(&dir, &pending);
-        if pending.is_empty() && unrecorded.is_empty() {
+        // ★T2i(RULINGS FH4): 원본이 없는 사본도 보이고, 조사를 끝내지 못했으면 '정합'이라고 말하지 않는다.
+        let scan = unrecorded_parked_copies(&dir, &pending);
+        if merge_list_says_consistent(&pending, &scan) {
             println!("병합 대기 없음 — 커스터마이즈와 vendor 팩이 정합 상태입니다.");
             return 0;
         }
@@ -26743,8 +26744,11 @@ fn run_pack_merge_with(
             // ★T2g(RULINGS CL2): 등재 파일의 줄은 그 파일에서 거부되는 동사를 권하지 않는다 — 수리 흐름을 이름 댄다.
             println!("{}", merge_status_line(&dir, rel, e, sources.is_listed(rel)));
         }
-        if !unrecorded.is_empty() {
-            println!("{}", unrecorded_copies_line(&unrecorded, &|r| sources.is_listed(r)));
+        if !scan.copies.is_empty() {
+            println!("{}", unrecorded_copies_line(&scan.copies, &|r| sources.is_listed(r)));
+        }
+        if let Some(why) = scan.incomplete.as_deref() {
+            println!("{}", unrecorded_scan_incomplete_line(why));
         }
         return 0;
     };
@@ -28276,70 +28280,115 @@ fn snapshot_absence_reason(meta: &cys::pack::SnapshotMeta, rel: &str) -> String 
 /// 병합 대기 목록의 한 항목 줄(`cys pack-merge` 목록 모드). ★T2g(RULINGS CL2): `listed`(기동 필수·보호 목록 파일)이면 그
 /// 파일에서 거부되는 동사(`--ai` · 합치기 · `--revert-merge` · `pack-adopt`)를 권하지 않고 수리 흐름을 이름 댄다 —
 /// `pack-heal` 은 system 파일에서만. 이 목록의 파일은 업데이트가 병합하지 않으므로 "다음 전진 때 재병합"도 말하지 않는다.
-/// ★T2i(RULINGS EF1 · EF2 · EF3): 병합 대기 기록 없이 디스크에 남은 보관 사본 `<rel>.user` — '보관 중'은 디스크의
-/// 사실이다. 원장이 그 사본을 이름 대는 종류(vendor-first · healed · conflicted)면 이미 보이므로 뺀다. 본 파일 `<rel>` 이
-/// 옆에 있는 사본만(팩이 관리하는 파일의 사본). 링크는 따라가지 않고(종류는 `file_type` — 링크 자체), 점 디렉터리
-/// (`.pristine` 등)는 건너뛴다. 방문 상한 [`UNRECORDED_SCAN_CAP`](넘으면 거기까지 찾은 것만). 파이썬 C62 의
-/// `_unrecorded_parked_copies` 와 같은 규칙.
+/// ★T2i(RULINGS EF1 · EF2 · EF3 · FH4): 병합 대기 기록 없이 디스크에 남은 보관 사본 `<rel>.user` — '보관 중'은 디스크의
+/// 사실이다. 원장이 그 사본을 이름 대는 종류(vendor-first · healed · conflicted)면 이미 보이므로 뺀다. **원본 `<rel>` 이 없는
+/// 사본도 보인다**(지워졌거나 업데이트에서 빠진 파일의 사본 — `orphan = true`). 링크는 따라가지 않고(종류는 `file_type` —
+/// 링크 자체), 건너뛰는 폴더는 팩 루트의 `.pristine`(출시본 기준선 — 사용자 사본이 아니다) 하나다. 방문 상한
+/// [`UNRECORDED_SCAN_CAP`] 에 닿거나 폴더를 읽지 못하면 `incomplete` 에 그 사유 — 그때 목록은 '0건' · '정합'을 말하지 않는다.
+/// 파이썬 C62 의 `_unrecorded_parked_copies` 와 같은 규칙.
 const UNRECORDED_SCAN_CAP: usize = 100_000;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UnrecordedScan {
+    /// (팩 상대 rel, 원본 없음) — 정렬.
+    copies: Vec<(String, bool)>,
+    /// 조사를 끝내지 못한 사유(끝냈으면 None).
+    incomplete: Option<String>,
+}
 
 fn unrecorded_parked_copies(
     dir: &std::path::Path,
     pending: &serde_json::Map<String, serde_json::Value>,
-) -> Vec<String> {
-    let mut out = Vec::new();
+) -> UnrecordedScan {
+    unrecorded_parked_copies_capped(dir, pending, UNRECORDED_SCAN_CAP)
+}
+
+fn unrecorded_parked_copies_capped(
+    dir: &std::path::Path,
+    pending: &serde_json::Map<String, serde_json::Value>,
+    cap: usize,
+) -> UnrecordedScan {
+    let mut scan = UnrecordedScan::default();
     let mut seen = 0usize;
     let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+    'walk: while let Some(d) = stack.pop() {
+        let entries = match std::fs::read_dir(&d) {
+            Ok(e) => e,
+            Err(e) => {
+                let shown = d.strip_prefix(dir).map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+                scan.incomplete.get_or_insert(format!("폴더 '{}' 를 읽지 못함({e})", if shown.is_empty() { "." } else { &shown }));
+                continue;
+            }
+        };
         for entry in entries.flatten() {
             seen += 1;
-            if seen > UNRECORDED_SCAN_CAP {
-                out.sort();
-                return out;
+            if seen > cap {
+                scan.incomplete = Some(format!("방문 상한 {cap}개에 닿음"));
+                break 'walk;
             }
             let Ok(ft) = entry.file_type() else { continue };
             let name = entry.file_name().to_string_lossy().into_owned();
             if ft.is_dir() {
-                if !name.starts_with('.') {
+                if !(d == dir && name == cys::pack::PRISTINE_DIR) {
                     stack.push(entry.path());
                 }
                 continue;
             }
             let Some(base) = name.strip_suffix(".user") else { continue };
-            if base.is_empty() || std::fs::symlink_metadata(d.join(base)).is_err() {
+            if base.is_empty() {
                 continue;
             }
+            let orphan = std::fs::symlink_metadata(d.join(base)).is_err();
             let Ok(rel_path) = d.join(base).strip_prefix(dir).map(|p| p.to_path_buf()) else { continue };
             let rel = rel_path.to_string_lossy().replace('\\', "/");
             let kind = pending.get(&rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str());
             if matches!(kind, Some("vendor-first" | "healed" | "conflicted")) {
                 continue;
             }
-            out.push(rel);
+            scan.copies.push((rel, orphan));
         }
     }
-    out.sort();
-    out
+    scan.copies.sort();
+    scan
 }
 
-/// ★T2i(RULINGS EF2 · EF3): `cys pack-merge` 목록의 기록 없는 보관 사본 줄 — 세 경우(기록이 지워짐 · `--take-new` 로 확정 ·
-/// 등재 파일 아님)에 참인 문장. 다시 입히는 두 길 또는 사본을 옮기기를 이름 대고, 지우라고 하지 않는다.
-fn unrecorded_copies_line(unrecorded: &[String], is_listed: &dyn Fn(&str) -> bool) -> String {
+/// ★T2i(RULINGS FH4): `cys pack-merge` 목록이 '정합 상태'라고 말해도 되는가 — 대기 0 · 기록 없는 사본 0 · 조사를 끝냈음.
+fn merge_list_says_consistent(pending: &serde_json::Map<String, serde_json::Value>, scan: &UnrecordedScan) -> bool {
+    pending.is_empty() && scan.copies.is_empty() && scan.incomplete.is_none()
+}
+
+/// ★T2i(RULINGS EF2 · EF3 · FH4): `cys pack-merge` 목록의 기록 없는 보관 사본 줄 — 세 경우(기록이 지워짐 · `--take-new` 로 확정 ·
+/// 등재 파일 아님)와 원본이 없는 사본에 참인 문장. 다시 입히는 두 길 또는 사본을 옮기기를 이름 대고, 지우라고 하지 않는다.
+fn unrecorded_copies_line(unrecorded: &[(String, bool)], is_listed: &dyn Fn(&str) -> bool) -> String {
     let shown: Vec<String> = unrecorded
         .iter()
         .take(8)
-        .map(|r| if is_listed(r) { format!("{r}(기동 필수·보호 목록)") } else { r.clone() })
+        .map(|(r, orphan)| {
+            let mut tags: Vec<&str> = Vec::new();
+            if *orphan {
+                tags.push("원본 없음");
+            }
+            if is_listed(r) {
+                tags.push("기동 필수·보호 목록");
+            }
+            if tags.is_empty() { r.clone() } else { format!("{r}({})", tags.join(" · ")) }
+        })
         .collect();
     let more = if unrecorded.len() > 8 { format!(" 외 {}건", unrecorded.len() - 8) } else { String::new() };
     format!(
         "⚠ 병합 대기 기록 없이 남은 보관 사본 {}건: {}{more} — 원장에 없어서 위 목록에는 나오지 않습니다(`--take-new` 로 vendor 본 \
-         유지를 확정했거나 기록이 지워졌습니다). 기동 필수·보호 목록 파일은 그 사본이 있는 동안 되돌리기(`cys pack-rollback`)가 \
-         건너뜁니다. 다시 입히려면 {} — 워커가 승인 절차로. 다시 입히지 않으려면 그 사본을 다른 이름으로 옮기십시오(지우지 마십시오).",
+         유지를 확정했거나 기록이 지워졌습니다 · '원본 없음' = 그 파일이 지워졌거나 업데이트에서 빠졌습니다). 기동 필수·보호 목록 \
+         파일은 그 사본이 있는 동안 되돌리기(`cys pack-rollback`)가 건너뜁니다. 다시 입히려면 {} — 워커가 승인 절차로. 다시 입히지 \
+         않으려면 그 사본을 다른 이름으로 옮기십시오(지우지 마십시오).",
         unrecorded.len(),
         shown.join(", "),
         cys::pack::parked_copy_routes("<파일>")
     )
+}
+
+/// ★T2i(RULINGS FH4): 보관 사본 조사를 끝내지 못했을 때의 줄 — '0건' · '정합'을 말하지 않는다.
+fn unrecorded_scan_incomplete_line(why: &str) -> String {
+    format!("⚠ 보관 사본 조사를 끝내지 못했습니다({why}) — 기록 없는 보관 사본이 더 있을 수 있어, 이 목록은 완전하지 않습니다.")
 }
 
 fn merge_status_line(dir: &std::path::Path, rel: &str, e: &serde_json::Value, listed: bool) -> String {
@@ -43018,6 +43067,51 @@ mod tests {
         assert!(bad.is_empty(), "pack-verb write sites that open an existing path: {bad:?}");
     }
 
+    /// ★T2i(RULINGS FH4): 원본이 없는 보관 사본도 목록에 보인다(종전: 원본이 없으면 건너뛰어 원장이 비면 '정합'이라 했다).
+    /// 점 폴더 안의 사본도 보이고(건너뛰는 것은 팩 루트의 `.pristine` 하나), 폴더를 읽지 못했거나 방문 상한에 닿으면 조사 미완 —
+    /// 목록은 '정합'을 말하지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn fh4_an_orphan_copy_is_listed_and_an_unfinished_scan_never_says_consistent() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = std::env::temp_dir().join(format!("cys-fh4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let w = |rel: &str| {
+            let p = td.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x").unwrap();
+        };
+        w("hooks/gone.sh.user");
+        w(".hidden/x.md");
+        w(".hidden/x.md.user");
+        w(".pristine/hooks/y.sh");
+        w(".pristine/hooks/y.sh.user");
+        let none = serde_json::Map::new();
+        let scan = unrecorded_parked_copies(&td, &none);
+        assert_eq!(
+            scan,
+            UnrecordedScan { copies: vec![(".hidden/x.md".into(), false), ("hooks/gone.sh".into(), true)], incomplete: None }
+        );
+        assert!(!merge_list_says_consistent(&none, &scan), "사본이 있으면 정합이 아니다");
+        // 상한에 닿음 → 미완.
+        let capped = unrecorded_parked_copies_capped(&td, &none, 1);
+        assert_eq!(capped.incomplete.as_deref(), Some("방문 상한 1개에 닿음"));
+        // 사본이 없어도 읽지 못한 폴더가 있으면 정합이라 말하지 않는다.
+        for p in ["hooks/gone.sh.user", ".hidden/x.md.user"] {
+            std::fs::remove_file(td.join(p)).unwrap();
+        }
+        std::fs::create_dir_all(td.join("locked")).unwrap();
+        std::fs::set_permissions(td.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let scan = unrecorded_parked_copies(&td, &none);
+        std::fs::set_permissions(td.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(scan.copies.is_empty());
+        assert!(scan.incomplete.as_deref().is_some_and(|w| w.starts_with("폴더 'locked' 를 읽지 못함")), "{scan:?}");
+        assert!(!merge_list_says_consistent(&none, &scan), "조사 미완이면 정합이 아니다");
+        let scan = unrecorded_parked_copies(&td, &none);
+        assert!(merge_list_says_consistent(&none, &scan), "다 읽었고 사본이 없으면 정합: {scan:?}");
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
     /// ★T2i(RULINGS EF1 · EF4): '보관 중'은 디스크의 사실이다 — 보고서 R3.2 의 다섯 걸음을 그대로: vendor-first 보관(기록 +
     /// `.user`) → 다른 쓰는 쪽의 **원장 통째 저장**이 기록을 지운다 → 다음 업데이트의 스냅샷이 출시본을 든다 → 되돌리기는
     /// **거부**되고 보관된 사본과 살아 있는 파일은 그대로다(종전: 기록이 없으니 출시본을 되돌렸고 그다음 설치가 그 바이트를 내
@@ -43056,7 +43150,7 @@ mod tests {
         cys::pack::save_merge_pending(&td, &stale).unwrap();
         assert_eq!(t4_ledger_kind(&td, &rel), None, "검체: 기록이 지워졌다");
         // EF3: 기록 없는 사본은 `cys pack-merge` 목록에 보인다(같은 디스크 규칙).
-        assert_eq!(unrecorded_parked_copies(&td, &cys::pack::load_merge_pending(&td)), vec![rel.clone()]);
+        assert_eq!(unrecorded_parked_copies(&td, &cys::pack::load_merge_pending(&td)).copies, vec![(rel.clone(), false)]);
         // ③ 다음 업데이트(손대지 않은 파일)의 스냅샷 = 이전 출시본(출시본 바이트).
         std::fs::write(td.join(&rel), old).unwrap();
         let s = cys::pack::create_update_snapshot(
@@ -43080,7 +43174,11 @@ mod tests {
         assert_eq!(run_pack_merge_with(Some(rel.clone()), take, None, &src), 0, "vendor 본 유지 확정");
         assert_eq!(t4_ledger_kind(&td, &rel), None, "기록은 지워졌다");
         assert!(td.join(format!("{rel}.user")).is_file(), "사본은 남았다");
-        assert_eq!(unrecorded_parked_copies(&td, &cys::pack::load_merge_pending(&td)), vec![rel.clone()], "--take-new 뒤에도 보인다");
+        assert_eq!(
+            unrecorded_parked_copies(&td, &cys::pack::load_merge_pending(&td)).copies,
+            vec![(rel.clone(), false)],
+            "--take-new 뒤에도 보인다"
+        );
         assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, false, false, &src), 1, "--take-new 뒤에도 거부");
         assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed);
         // 대조: 보관된 사본이 없는 등재 파일은 T2f 규칙대로 되돌아간다.
@@ -43353,14 +43451,23 @@ mod tests {
         );
         assert!(!rollback_unrecorded_copy_refusal(rel, "0.14.56", false).contains("지우십시오"), "지우라고 하지 않는다");
         assert_eq!(
-            unrecorded_copies_line(&[rel.to_string(), "bin/x.py".to_string()], &|r| r == rel),
+            unrecorded_copies_line(
+                &[(rel.to_string(), false), ("bin/x.py".to_string(), false), ("hooks/gone.sh".to_string(), true)],
+                &|r| r == rel || r == "hooks/gone.sh"
+            ),
             format!(
-                "⚠ 병합 대기 기록 없이 남은 보관 사본 2건: hooks/guard.sh(기동 필수·보호 목록), bin/x.py — 원장에 없어서 위 목록에는 \
-                 나오지 않습니다(`--take-new` 로 vendor 본 유지를 확정했거나 기록이 지워졌습니다). 기동 필수·보호 목록 파일은 그 사본이 \
-                 있는 동안 되돌리기(`cys pack-rollback`)가 건너뜁니다. 다시 입히려면 {} — 워커가 승인 절차로. 다시 입히지 않으려면 그 \
+                "⚠ 병합 대기 기록 없이 남은 보관 사본 3건: hooks/guard.sh(기동 필수·보호 목록), bin/x.py, hooks/gone.sh(원본 없음 · 기동 \
+                 필수·보호 목록) — 원장에 없어서 위 목록에는 나오지 않습니다(`--take-new` 로 vendor 본 유지를 확정했거나 기록이 \
+                 지워졌습니다 · '원본 없음' = 그 파일이 지워졌거나 업데이트에서 빠졌습니다). 기동 필수·보호 목록 파일은 그 사본이 있는 \
+                 동안 되돌리기(`cys pack-rollback`)가 건너뜁니다. 다시 입히려면 {} — 워커가 승인 절차로. 다시 입히지 않으려면 그 \
                  사본을 다른 이름으로 옮기십시오(지우지 마십시오).",
                 cys::pack::parked_copy_routes("<파일>")
             )
+        );
+        assert_eq!(
+            unrecorded_scan_incomplete_line("방문 상한 1개에 닿음"),
+            "⚠ 보관 사본 조사를 끝내지 못했습니다(방문 상한 1개에 닿음) — 기록 없는 보관 사본이 더 있을 수 있어, 이 목록은 완전하지 \
+             않습니다."
         );
         assert_eq!(rollback_list_note(&GuardedCopy::Released), "");
         assert_eq!(rollback_list_note(&GuardedCopy::Link("/x".into())), " — 되돌리지 않음: 기동 필수·보호 목록 파일 · 보관본이 링크(→ /x)");
