@@ -740,7 +740,13 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, repor
             })
             .map_err(RepairError::Io)
             .and_then(|r| r);
-            (env.intake)(first_rel, &format!("시험 기간 재검사 실패로 수리 {}를 되돌림 — {why}", id.as_str()));
+            // DR8: the intake description is derived from the MEASURED outcome of the revert
+            let outcome_text = match &r {
+                Ok(x) if x.outcome == ApplyOutcome::Applied => "되돌림".to_string(),
+                Ok(x) => format!("되돌리지 못함({:?})", x.outcome),
+                Err(e) => format!("되돌리지 못함({e:?})"),
+            };
+            (env.intake)(first_rel, &format!("시험 기간 재검사 실패 — 수리 {} {outcome_text} — {why}", id.as_str()));
             match r {
                 Ok(r) if r.outcome == ApplyOutcome::Applied => {
                     report.reverted.push(id.clone());

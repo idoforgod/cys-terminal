@@ -612,7 +612,11 @@ fn step4(
                 generation: None,
             };
             let r = run_op_depth(env, &relive, depth + 1)?;
-            note.push_str(&format!(" · 밀려난 바이트의 사본을 다시 살렸습니다({:?})", r.outcome));
+            if r.outcome == ApplyOutcome::Applied {
+                note.push_str(" · 밀려난 바이트의 사본을 다시 살렸습니다");
+            } else {
+                note.push_str(&format!(" · 밀려난 바이트의 사본을 다시 살리지 못했습니다({:?})", r.outcome));
+            }
         }
     }
     if env.faults.at(Point::BeforeDone, live, Some(slot)) {
@@ -728,7 +732,11 @@ fn after_seal_move_in(
                 generation: None,
             };
             let r = run_op_depth(env, &relive, depth + 1)?;
-            note.push_str(&format!(" · 사본을 그 자리에 다시 놓았습니다({:?})", r.outcome));
+            if r.outcome == ApplyOutcome::Applied {
+                note.push_str(" · 사본을 그 자리에 다시 놓았습니다");
+            } else {
+                note.push_str(&format!(" · 사본을 그 자리에 다시 놓지 못했습니다({:?})", r.outcome));
+            }
         } else {
             note.push_str(" · 그 자리에 이미 무엇인가 있어 더 바꾸지 않았습니다");
         }
@@ -992,7 +1000,8 @@ fn second_move(
                 generation: None,
             };
             match run_op_depth(env, &back, 1) {
-                Ok(r) => format!("{rel}: 끊긴 동작을 그만두고 보관한 바이트의 사본을 되놓았습니다({:?})", r.outcome),
+                Ok(r) if r.outcome == ApplyOutcome::Applied => format!("{rel}: 끊긴 동작을 그만두고 보관한 바이트의 사본을 되놓았습니다"),
+                Ok(r) => format!("{rel}: 끊긴 동작을 그만두었으나 사본을 되놓지 못했습니다 — 아무것도 지우지 않음({:?})", r.outcome),
                 Err(e) => format!("{rel}: 끊긴 동작을 그만두었으나 사본을 되놓지 못했습니다 — 아무것도 지우지 않음({e:?})"),
             }
         }
@@ -3224,6 +3233,36 @@ pub fn parse_reconcile(stdout: &str) -> Result<ReconcileReport, RepairError> {
     Ok(ReconcileReport { hooks })
 }
 
+/// RULINGS DR8 — a dry run is a MEASUREMENT only when it names EVERY requested hook (exact event
+/// and script) with its complete captured state: a `desired` of `registered` / `unregistered` and a
+/// `targets` array whose every entry has a `path` and a `state`. A syntactically valid answer that
+/// is empty or incomplete is refused exactly like an error.
+pub fn dry_run_measurement(stdout: &str, named: &[(String, String)]) -> Result<ReconcileReport, RepairError> {
+    let report = parse_reconcile(stdout)?;
+    let raw: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| RepairError::CheckFailed(format!("등록기 보고를 읽을 수 없습니다: {e}")))?;
+    let rows = raw.get("hooks").and_then(|h| h.as_array()).cloned().unwrap_or_default();
+    for (event, script) in named {
+        let row = rows.iter().find(|h| {
+            h.get("event").and_then(|x| x.as_str()) == Some(event.as_str())
+                && h.get("script").and_then(|x| x.as_str()) == Some(script.as_str())
+        });
+        let Some(row) = row else {
+            return Err(RepairError::CheckFailed(format!("예행 보고에 요청한 훅 {event}:{script} 가 없습니다")));
+        };
+        let desired_ok = matches!(row.get("desired").and_then(|x| x.as_str()), Some("registered") | Some("unregistered"));
+        let targets_ok = row.get("targets").and_then(|t| t.as_array()).is_some_and(|ts| {
+            ts.iter().all(|t| t.get("path").and_then(|p| p.as_str()).is_some_and(|p| !p.is_empty()) && t.get("state").and_then(|p| p.as_str()).is_some_and(|p| !p.is_empty()))
+        });
+        if !desired_ok || !targets_ok {
+            return Err(RepairError::CheckFailed(format!(
+                "예행 보고의 훅 {event}:{script} 에 원하는 상태나 대상 목록이 온전하지 않습니다"
+            )));
+        }
+    }
+    Ok(report)
+}
+
 /// Y2(b): judges ONLY the named hooks — matched by EXACT event and script name (AW6: a case variant
 /// matches nothing). Ok when every writable target of each named hook is in `want`; `refused:*`
 /// targets are listed and do not fail it; a named hook the report does not list fails it.
@@ -3334,12 +3373,14 @@ pub fn hook_lines_step_in(
     // (i) the record first, with the targets of a dry run (matcher / timeout as found). CT3: a dry
     // run that cannot be measured DECLINES before anything is recorded or changed (the caller marks
     // the lane row 충돌; nothing was unregistered without the captured registration state)
-    let dry = registrar(pack, true).and_then(|s| parse_reconcile(&s)).map_err(|e| {
-        RepairError::CheckFailed(format!(
-            "{}: 훅 등록기의 예행을 측정할 수 없어 훅 단계를 하지 않았습니다(아무것도 바꾸지 않음) — {e:?}",
-            id.as_str()
-        ))
-    })?;
+    let dry = registrar(pack, true)
+        .and_then(|s| dry_run_measurement(&s, &named))
+        .map_err(|e| {
+            RepairError::CheckFailed(format!(
+                "{}: 훅 등록기의 예행을 측정할 수 없어 훅 단계를 하지 않았습니다(아무것도 바꾸지 않음) — {e:?}",
+                id.as_str()
+            ))
+        })?;
     let lines: Vec<wal::HookLine> = named
         .iter()
         .map(|(event, script)| wal::HookLine {

@@ -1939,3 +1939,45 @@ fn a_stubborn_child_and_a_failing_kill_never_hold_the_runner() {
     }
     assert!(msg.contains("멈추지 못했습니다"), "the failed kill is reported: {msg}");
 }
+
+// ───────────────────────────── RULINGS DR8 — a dry run must name everything asked ─────────────────────────────
+
+/// DR8: a dry run that is valid JSON but empty (`{"hooks": []}`), or names the hook without a
+/// complete captured state, is NOT a measurement — the step declines before any record, tombstone
+/// or real registrar run, exactly like an error. Without DR8 it proceeded with empty captured targets.
+#[test]
+fn an_empty_or_incomplete_dry_run_declines_like_an_error() {
+    for answer in [
+        r#"{"hooks": []}"#.to_string(),
+        r#"{"hooks": [{"event": "Stop", "script": "e.sh", "lifeline": false}]}"#.to_string(),
+        r#"{"hooks": [{"event": "Stop", "script": "e.sh", "desired": "registered", "targets": [{"path": "/x/settings.json"}]}]}"#.to_string(),
+        report_json(&[("Stop", "E.sh", "registered", &[])]),
+    ] {
+        let r = rig("dr8dry");
+        let id = rid("R-37");
+        hook_record(&r, &id, "Stop", "e.sh");
+        let calls = RefCell::new(Vec::new());
+        let ans = answer.clone();
+        let registrar = move |_: &Path, dry: bool| -> Result<String, RepairError> {
+            calls.borrow_mut().push(dry);
+            assert!(dry, "the real run never happens");
+            Ok(ans.clone())
+        };
+        let res = hook_lines_step_in(&r.root, &r.pack, &id, &r.lane, HookStep::Unregister, &registrar, 5.0);
+        assert!(res.is_err(), "{answer}: {res:?}");
+        let (ops, _) = wal::list_in(&r.root, &id);
+        assert!(ops.is_empty(), "{answer}: nothing recorded");
+        assert!(crate::repair::tombstones::load_in(&r.root, &r.lane).unwrap().is_empty(), "{answer}: no tombstone");
+    }
+}
+
+/// DR8: a nested put-back that does not succeed is never described as done — the abandon of an
+/// interrupted Windows operation whose copy cannot be placed says it could NOT put it back.
+#[test]
+fn an_unsuccessful_put_back_is_never_described_as_done() {
+    let src = include_str!("apply.rs");
+    let prod = &src[..src.find("#[cfg(test)]\n#[path = \"apply_tests.rs\"]").unwrap()];
+    for done_sentence in ["사본을 되놓았습니다(", "다시 살렸습니다(", "다시 놓았습니다("] {
+        assert!(!prod.contains(done_sentence), "a success sentence carries an unchecked outcome: {done_sentence}");
+    }
+}
