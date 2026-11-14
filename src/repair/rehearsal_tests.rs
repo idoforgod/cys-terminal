@@ -192,7 +192,17 @@ fn replay_env_is_allow_list_only() {
     let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(
         keys,
-        vec!["HOME", "TMPDIR", "PATH", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL"]
+        vec![
+            "HOME",
+            "TMPDIR",
+            "PATH",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "LANG",
+            "LC_ALL",
+            concat!("PYTHONDONT", "WRITEBYTECODE")
+        ]
     );
     let path = &env.iter().find(|(k, _)| k == "PATH").unwrap().1;
     assert!(path.starts_with(&*r.join("bin").to_string_lossy()));
