@@ -28379,13 +28379,38 @@ fn unrecorded_parked_copies_capped(
                 continue;
             }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            // ★T2i(RULINGS GB3): 조사 안의 오류(항목 읽기 · 종류 확인)는 건너뛰지 않고 '조사 미완'으로 — 그때 목록은 '정합'을 말하지
+            //   않는다.
+            let shown = d.strip_prefix(dir).map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+            let shown = if shown.is_empty() { ".".to_string() } else { shown };
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    scan.incomplete.get_or_insert(format!("폴더 '{shown}' 의 항목을 읽지 못함({e})"));
+                    continue;
+                }
+            };
             seen += 1;
             if seen > cap {
                 scan.incomplete = Some(format!("방문 상한 {cap}개에 닿음"));
                 break 'walk;
             }
-            let Ok(ft) = entry.file_type() else { continue };
+            #[cfg(test)]
+            let fault = SCAN_ENTRY_FAULT.with(|f| f.get() == Some(seen));
+            #[cfg(not(test))]
+            let fault = false;
+            let ft = match entry.file_type() {
+                Ok(t) if !fault => t,
+                Ok(_) => {
+                    scan.incomplete.get_or_insert(format!("폴더 '{shown}' 의 항목 종류를 알 수 없음(시험 주입)"));
+                    continue;
+                }
+                Err(e) => {
+                    scan.incomplete.get_or_insert(format!("폴더 '{shown}' 의 항목 종류를 알 수 없음({e})"));
+                    continue;
+                }
+            };
             let name = entry.file_name().to_string_lossy().into_owned();
             if ft.is_dir() {
                 if !(d == dir && name == cys::pack::PRISTINE_DIR) {
@@ -28410,6 +28435,12 @@ fn unrecorded_parked_copies_capped(
     }
     scan.copies.sort();
     scan
+}
+
+#[cfg(test)]
+thread_local! {
+    /// ★T2i(RULINGS GB3) 시험 주입: 조사의 n 번째 항목(1부터)에서 종류 확인이 실패한 것으로 한다.
+    static SCAN_ENTRY_FAULT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// ★T2i(RULINGS FH4): `cys pack-merge` 목록이 '정합 상태'라고 말해도 되는가 — 대기 0 · 기록 없는 사본 0 · 조사를 끝냈음.
@@ -43249,6 +43280,40 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "pack-verb write sites that open an existing path: {bad:?}");
+    }
+
+    /// ★T2i(RULINGS GB3): 보관 사본 조사 안의 오류(항목의 종류를 알 수 없음)는 '조사 미완'이다 — 첫 항목에서든 가운데 항목에서든.
+    /// 그때 목록은 '정합'을 말하지 않는다. 오류가 없으면 다 읽었다.
+    #[test]
+    fn gb3_an_error_inside_the_scan_makes_it_incomplete() {
+        let td = std::env::temp_dir().join(format!("cys-gb3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(td.join(n), "x").unwrap();
+        }
+        let none = serde_json::Map::new();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                SCAN_ENTRY_FAULT.with(|f| f.set(None));
+            }
+        }
+        let _reset = Reset;
+        for at in [1usize, 2] {
+            SCAN_ENTRY_FAULT.with(|f| f.set(Some(at)));
+            let scan = unrecorded_parked_copies(&td, &none);
+            assert!(scan.copies.is_empty());
+            assert!(
+                scan.incomplete.as_deref().is_some_and(|w| w.starts_with("폴더 '.' 의 항목 종류를 알 수 없음")),
+                "fault at entry {at}: {scan:?}"
+            );
+            assert!(!merge_list_says_consistent(&none, &scan), "fault at entry {at}: 정합이라 말하지 않는다");
+        }
+        SCAN_ENTRY_FAULT.with(|f| f.set(None));
+        let scan = unrecorded_parked_copies(&td, &none);
+        assert!(merge_list_says_consistent(&none, &scan), "{scan:?}");
+        let _ = std::fs::remove_dir_all(&td);
     }
 
     /// ★T2i(RULINGS FH5): 보관 결과 문장 — 겹침을 감사 원장에 적었을 때만 '감사 원장에 기록'이라고 말하고, 적지 못했으면 그렇게
