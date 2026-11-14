@@ -515,7 +515,13 @@ esac
 #    파일이 없거나 못 읽어도 작업 폴더 막힘은 독립된 사실이라 좌석에 알려야 한다 — 아래 게이트의
 #    exit 0 이 이 고지를 삼키지 않게 순서를 이렇게 고정한다.
 if [ -n "${CYS_CWD_BLOCKED:-}" ]; then
-  printf '■ 고지(작업 폴더): 이 좌석이 시작될 때 작업 폴더 %s 를 읽을 수 없었다(macOS 폴더 접근 권한 — 사람에게는 앱 화면 알림이 따로 뜬다). 그 폴더가 필요한 지시를 받으면 착수 전에 ls 로 지금 읽히는지 확인하고, 안 되면 그 지시의 회신에만 적어라 — 자발 보고·push 금지, 다른 폴더에 대신 저장 금지.\n' "$CYS_CWD_BLOCKED"
+  # ★(T1d · CX2) 이 고지는 역할 블록보다 **앞**이라 경로 표시를 100자로 묶는다 — 더 긴 폴더는 "이 좌석의 작업 디렉터리"로 부른다
+  #   (좌석은 그 폴더에서 뜬다 — cysd cwd_probe · pwd 로 확인된다). `${#…}` 는 셸 확장이다(새 프로세스 0).
+  CYS_SS_CWD_SHOWN="$CYS_CWD_BLOCKED"
+  if [ "${#CYS_CWD_BLOCKED}" -gt 100 ]; then
+    CYS_SS_CWD_SHOWN="(이 좌석의 작업 디렉터리 — 경로가 길어 생략 · pwd)"
+  fi
+  printf '■ 고지(작업 폴더): 이 좌석이 시작될 때 작업 폴더 %s 를 읽을 수 없었다(macOS 폴더 접근 권한 — 사람에게는 앱 화면 알림이 따로 뜬다). 그 폴더가 필요한 지시를 받으면 착수 전에 ls 로 지금 읽히는지 확인하고, 안 되면 그 지시의 회신에만 적어라 — 자발 보고·push 금지, 다른 폴더에 대신 저장 금지.\n' "$CYS_SS_CWD_SHOWN"
 fi
 # ★(0.14.41 U4 C2 ①) 지침 판독 가능성 — 강등(위 두 문)이 먼저 판정된 뒤에만 본다.
 if [ ! -f "$D" ]; then
@@ -539,7 +545,12 @@ echo "■ CYSJavis 역할 각성 (CYS_ROLE=$CYS_ROLE)"
 #   전문을 첫 제출로 붙여 넣는다)에서도 참이 되어, 모델이 같은 지침(~9.5만 B)·soul.md 를 한 번 더 Read 해 매 부트·사이클 컨텍스트가
 #   두 배로 든다(② · test_session_start_hook 22b). 줄 전체가 미리보기 창(앞 2,000자) 안에서 끝나야 한다.
 #   경로 줄은 printf(G8 — macOS /bin/sh 의 xpg_echo 가 윈도우 백슬래시 경로를 먹는다).
-printf '■ 이 출력이 길어 앞부분 미리보기만 보이고(나머지는 파일로 빠짐) 역할 지침 전문이 이 대화에 따로 없으면, 지침 전문 %s 과 %s 를 Read 도구로 끝까지(offset·limit 로 나눠) 읽은 뒤에 행동하라 — 전문이 이 대화에 이미 있으면(부트·사이클은 CLI 가 붙여 넣는다) 다시 읽지 않는다(같은 지침 중복 적재 금지) · 지침 없이 추측으로 움직이지 않는다.\n' "$(cys_native_path "$D" 2>/dev/null || printf '%s' "$D")" "$(cys_native_path "$JARVIS_DIR/soul.md" 2>/dev/null || printf '%s' "$JARVIS_DIR/soul.md")"
+#   ★(0.15.0 · T1d · RULINGS CX2) 이 줄과 아래 역할 블록 앞에는 **길이가 정해지지 않은 것을 두지 않는다**: 안내 줄은 팩 기준
+#   상대 이름(directives/<역할>_DIRECTIVE.md)만 싣고, 전체 경로(팩 폴더가 길면 수백 자 — macOS PATH_MAX 1,024)는 블록 **뒤**의
+#   '■ 지침 경로' 줄로 보낸다. 그래서 안내 줄·블록의 위치는 팩 경로 길이와 무관하다(머리줄 + 안내 줄 + 블록 < 1,800자 ·
+#   test_session_start_hook 23b · 24 — 실제로 만든 가장 긴 팩 경로로 잰다). 미리보기 밖이어도 안내 줄의 'CYS_PACK_DIR, 없으면
+#   ~/.cys/pack' 이 위 JARVIS_DIR 규칙 그대로라 좌석이 경로를 스스로 잇는다. 새 프로세스 0 — `${D#…}` 는 셸 확장이다.
+printf '■ 앞부분만 보이고(나머지는 파일로 빠짐) 역할 지침 전문이 이 대화에 따로 없으면 팩 폴더(CYS_PACK_DIR, 없으면 ~/.cys/pack)의 %s 와 soul.md 를 Read 도구로 끝까지(offset·limit 로 나눠) 읽은 뒤에 행동하라(전체 경로: 블록 뒤 ■ 지침 경로 줄) — 전문이 이 대화에 이미 있으면(부트·사이클은 CLI 가 붙여 넣는다) 다시 읽지 않는다(같은 지침 중복 적재 금지) · 지침 없이 추측으로 움직이지 않는다.\n' "${D#"$JARVIS_DIR"/}"
 # ★(0.15.0 · 「스스로 해결」 M1 · RULINGS B10 · C6 6.7) 역할별 규칙 블록 — 읽기 안내 줄 **뒤**·지침 본문 **앞**
 #   (앞 2,000자 미리보기 안 · 안내 줄의 위치는 그대로다 — 부록 A-1 #23). 문구는 프로그램 본체의 컴파일 상수
 #   하나뿐이고 여기에 사본을 두지 않는다 — LOCAL 동사 `cys repair rules` 가 찍는다(데몬 무접촉 · 레인 탐색 전 종료).
@@ -553,6 +564,8 @@ fi
 if [ -n "$CYS_RULES_OUT" ]; then
   printf '%s\n' "$CYS_RULES_OUT" | tr -d '\r'
 fi
+# ★(T1d · CX2) 전체 경로는 블록 **뒤** — 길이가 얼마든 안내 줄·블록을 미리보기 밖으로 밀지 않는다. 경로 줄은 printf(G8).
+printf '■ 지침 경로: %s · %s\n' "$(cys_native_path "$D" 2>/dev/null || printf '%s' "$D")" "$(cys_native_path "$JARVIS_DIR/soul.md" 2>/dev/null || printf '%s' "$JARVIS_DIR/soul.md")"
 cat "$D"
 # ★R13 부트 브리지(T2b 전 임시 — hook=system층이라 디렉티브(user-owned) 미개정 기계에도 전파):
 # 구 산문 §0만 아는 master는 부트 스크립트를 몰라 완료 마커가 안 생기고 CEO 승격이 영구
