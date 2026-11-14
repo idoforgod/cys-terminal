@@ -844,6 +844,119 @@ class KeptFolder(Rig):
         self.assertEqual(json.loads(_slurp(kept + ".kept", encoding="utf-8"))["sha256"], digest)
         self.assertFalse(os.path.exists(src))
 
+    # ── ★RULINGS FL6 ──
+    def test_a_crash_while_a_sidecar_is_published_leaves_no_empty_sidecar(self):
+        """곁 파일은 통째로 게시된다(codex B6: 단독 생성 뒤 쓰기 전에 멈추면 빈 곁 파일이 남았다). 곁 파일 이름을 만드는 바로 그
+        호출 뒤에서 멈춘다 — 남은 곁 파일은 온전하다(점으로 시작하는 임시 파일은 사본도 곁 파일도 아니다)."""
+        self.seed()
+        ns = ceo_py_module()
+        stop = lambda target: str(target).endswith(".kept") and not os.path.basename(str(target)).startswith(".")
+
+        class _Os:
+            def __getattr__(self, name):
+                return getattr(os, name)
+
+            def open(self, path, flags, *a, **kw):
+                fd = os.open(path, flags, *a, **kw)
+                if stop(path) and flags & os.O_CREAT:
+                    os.close(fd)
+                    raise SystemExit("crash right after the sidecar name was created")
+                return fd
+
+            def link(self, a, b):
+                os.link(a, b)
+                if stop(b):
+                    raise SystemExit("crash right after the sidecar was placed")
+        ns["os"] = _Os()
+        nr0 = ns["noreplace_fn"]()
+        if nr0 is not None:
+            def nr(a, b):
+                nr0(a, b)
+                if stop(b):
+                    raise SystemExit("crash right after the sidecar was placed")
+            ns["noreplace_fn"] = lambda: nr
+        src = self.p("MASTER_DIRECTIVE.md.scratch")
+        _write(src, "보관할 바이트\n")
+        with self.assertRaises(SystemExit):
+            ns["keep_file"](src, self.p("MASTER_DIRECTIVE.md"), "test")
+        kd = os.path.join(self.dirs, ".ceo-kept")
+        sides = [f for f in os.listdir(kd) if stop(f)]
+        self.assertTrue(sides, "곁 파일 이름을 만드는 호출에 이르지 않았다(시험 무효)")
+        for f in sides:
+            raw = _slurp(os.path.join(kd, f), encoding="utf-8")
+            self.assertTrue(raw.strip(), "멈춘 뒤 빈 곁 파일이 남았다(codex B6)")
+            self.assertEqual(json.loads(raw)["sha256"], sha("보관할 바이트\n"))
+
+    def test_a_kept_file_without_a_readable_sidecar_is_unresolved_not_skipped(self):
+        """곁 파일이 없거나 형식이 틀린 사본은 C03 이 건너뛰지 않는다 — '미확인'으로 보인다(처음엔 WARN, 그 뒤로도 이름이 남는다)."""
+        self.seed()
+        kd = os.path.join(self.dirs, ".ceo-kept")
+        os.makedirs(kd)
+        bare = os.path.join(kd, "20260101T000000Z-1-1.compose")
+        bad = os.path.join(kd, "20260101T000000Z-1-2.compose")
+        _write(bare, USER)
+        _write(bad, USER)
+        _write(bad + ".kept", "")
+        _write(os.path.join(kd, ".20260101T000000Z-1-3.compose.kept.x.tmp"), "")    # 멈춘 게시의 임시 파일 — 사본이 아니다
+        row = self.c03()["C03.ceo-kept"]
+        self.assertEqual(row["status"], pf.WARN, row)
+        for k in (bare, bad):
+            self.assertIn(k, row["detail"], "곁 파일이 없거나 틀린 사본을 건너뛰었다")
+        self.assertIn("미확인", row["detail"])
+        self.assertIn("보관 사본 2개", row["detail"], "임시 파일을 사본으로 셌다")
+        again = self.c03()["C03.ceo-kept"]
+        self.assertEqual(again["status"], pf.PASS, "같은 미확인 사본을 매번 경고했다")
+        for k in (bare, bad):
+            self.assertIn(k, again["detail"], "미확인 사본이 다음 확인에서 사라졌다")
+
+    def test_the_warned_mark_follows_the_warning(self):
+        """'알렸다' 표지는 WARN 행을 남긴 뒤에 만든다(codex B6: 표지를 먼저 만들고 멈추면 그 저장은 영영 알려지지 않았다)."""
+        self.seed()
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        holder = self.late_save_through_an_old_handle("demote")
+        orig = pf.Preflight.add
+
+        def failing_add(p, cid, status, *a, **kw):
+            if cid == "C03.ceo-kept" and status == pf.WARN:
+                raise RuntimeError("the WARN row was never emitted (crash)")
+            return orig(p, cid, status, *a, **kw)
+        pf.Preflight.add = failing_add
+        try:
+            with self.assertRaises(RuntimeError):
+                self.c03()
+        finally:
+            pf.Preflight.add = orig
+        row = self.c03()["C03.ceo-kept"]
+        self.assertEqual(row["status"], pf.WARN, "알리지 못한 저장을 '이미 알림'으로 넘겼다(표지가 알림보다 먼저 생겼다)")
+        self.assertIn(holder, row["detail"])
+
+    def test_the_warning_claims_only_what_it_measured(self):
+        """경고는 잰 것을 말한다 — 사본의 바이트가 보관 뒤에 바뀌었다. '살아 있는 지침에는 없다'는 살아 있는 지침과 비교했을 때만:
+        바뀐 내용이 살아 있는 지침에도 있으면 그렇게, 살아 있는 지침을 읽지 못하면 '비교하지 못했다'고 말한다(codex minor)."""
+        self.seed()
+        kd = os.path.join(self.dirs, ".ceo-kept")
+        os.makedirs(kd)
+        k1 = os.path.join(kd, "20260101T000000Z-1-1.compose")
+        _write(k1, HEADER + SEP + USER)                                   # 바뀐 사본 — 그 본문은 살아 있는 지침(USER)과 같다
+        _write(k1 + ".kept", json.dumps({"schema": 1, "sha256": sha("보관 때의 바이트\n")}))
+        row = self.c03()["C03.ceo-kept"]
+        self.assertEqual(row["status"], pf.WARN, row)
+        self.assertIn("보관 뒤에 바뀌었다", row["detail"])
+        self.assertIn("살아 있는 지침에도 있다", row["detail"])
+        self.assertNotIn("살아 있는 지침에는 없다", row["detail"], "비교해 보면 있는데 없다고 말했다")
+        k2 = os.path.join(kd, "20260101T000000Z-1-2.compose")
+        _write(k2, USER + "다른 줄\n")
+        _write(k2 + ".kept", json.dumps({"schema": 1, "sha256": sha("보관 때의 바이트\n")}))
+        aside = self.p("MASTER_DIRECTIVE.md.aside")
+        os.rename(self.p("MASTER_DIRECTIVE.md"), aside)                   # 살아 있는 지침을 읽을 수 없다
+        try:
+            row = self.c03()["C03.ceo-kept"]
+        finally:
+            os.rename(aside, self.p("MASTER_DIRECTIVE.md"))
+        self.assertIn(k2, row["detail"])
+        self.assertIn("비교하지 못했다", row["detail"])
+        self.assertNotIn("살아 있는 지침에는 없다", row["detail"], "비교하지 않고 '없다'고 말했다")
+
 
 class IntentRecovery(Rig):
     """★RULINGS EY2·FA2·FA3 — 교체는 복구할 수 있는 한 단위다: 살아 있는 이름이 바뀌기 전에 의도 기록(directives/.ceo-intent.json)
