@@ -219,6 +219,38 @@ fn an_unreadable_notice_source_is_said_not_emptied() {
     let _ = std::fs::remove_dir_all(root.parent().unwrap());
 }
 
+/// The EP condition (T5b's watchdog, `reconcile_stale_pending`, calls the seam while HOLDING the
+/// daemon's per-repair lock and the approval-table lock): `approval_consumed_in` called on THIS
+/// thread inside the daemon's real per-repair lock of the repair it reads, and inside a second held
+/// mutex standing for T5b's approval-table lock (that code is not in this tree), returns its answer —
+/// it takes neither (std mutexes are not re-entrant: a body that took the held repair lock would never
+/// return here).
+#[test]
+fn the_consumed_seam_answers_inside_the_repair_lock_and_the_table_lock() {
+    let (daemon, root, _pack) = rig("t6-ep-locks");
+    let lane = LaneKey::of_socket(&daemon.socket_path);
+    let id = RepairId::parse("R-1").unwrap();
+    let intents = root.join("R-1").join("intents");
+    std::fs::create_dir_all(&intents).unwrap();
+    std::fs::write(
+        intents.join(format!("{}.json", lane.0)),
+        serde_json::json!({"schema": 1, "repair": "R-1", "lane_key": lane.0, "op_tag": "t", "state": "applied",
+            "targets": [], "note": "", "pack_generation": null, "approval_ref": "rqr-ep", "created_at": 1.0, "updated_at": 1.0})
+        .to_string(),
+    )
+    .unwrap();
+    let table = std::sync::Mutex::new(());
+    let mut answer = None;
+    repair_lock(&daemon)(&id, &mut || {
+        let _table = table.lock().unwrap();
+        answer = Some(cys::repair::consumed::approval_consumed_in(&root, &lane, "rqr-ep"));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(answer, Some(cys::repair::consumed::ApprovalUse::Consumed));
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
 /// O-C7-3 / F8 source pin: the readiness flag and its time are set FIRST in `post_listen_boot` (the
 /// one function both accept loops call), before anything it spawns.
 #[test]

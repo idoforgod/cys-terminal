@@ -2610,7 +2610,16 @@ pub fn read_intent_checked_in(root: &Path, id: &RepairId, lane: &LaneKey) -> Res
 
 fn read_checked<T: serde::de::DeserializeOwned>(path: &Path, owner_dir: &Path) -> Result<Option<T>, String> {
     match std::fs::read(path) {
-        Ok(b) => serde_json::from_slice(&b).map(Some).map_err(|e| format!("{}: 읽을 수 없음 — {e}", path.display())),
+        Ok(b) => {
+            let v: serde_json::Value = serde_json::from_slice(&b).map_err(|e| format!("{}: 읽을 수 없음 — {e}", path.display()))?;
+            // FG1 / the EP condition: a record of a newer schema (or without one) cannot be
+            // interpreted — an error, never a value read as if it were this schema's
+            match v.get("schema").and_then(|s| s.as_u64()) {
+                Some(n) if n <= u64::from(super::REPAIR_SCHEMA) => {}
+                other => return Err(format!("{}: 해석할 수 없는 판입니다(schema {other:?})", path.display())),
+            }
+            serde_json::from_value(v).map(Some).map_err(|e| format!("{}: 읽을 수 없음 — {e}", path.display()))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => match std::fs::read_dir(owner_dir) {
             Ok(_) => Ok(None),
             Err(e2) => Err(format!("{}: 없음, 그러나 {} 도 읽을 수 없음 — {e2}", path.display(), owner_dir.display())),
