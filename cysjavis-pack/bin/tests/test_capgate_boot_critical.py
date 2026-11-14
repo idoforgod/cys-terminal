@@ -759,9 +759,9 @@ class JudgeIsolation(_PlantedVectors, _Env):
 
 # RULINGS ES1 — the two interpreter starts of `_lib.sh` (the --owned runner and the deadline wrapper), as
 # they are now and as they were at 288de708 (rebuilt in a copy for the negative controls)
-LIB_NEW_OWNED = '    "$CYS_PY" -I -S -B -X utf8 -c \'import os,runpy,sys\n'
-LIB_OLD_OWNED = '    "$CYS_PY" -B -c \'import sys\nsys.path[:]=[x for x in sys.path if x]\nimport os,runpy\n'
-LIB_NEW_FALLBACK = '    _cys_tr_mark=""\n    case "${OSTYPE:-}" in\n      msys*|cygwin*|win32*) ;;\n      *) _cys_tr_mark="${TMPDIR:-/tmp}/.cys-tr-${BASHPID:-$$}-${RANDOM:-0}${RANDOM:-0}"\n         { : > "$_cys_tr_mark"; } 2>/dev/null || _cys_tr_mark="" ;;\n    esac\n    "$CYS_PY" -I -S -B -X utf8 -c \'import os,sys\nif sys.argv[1]:\n    try:\n        os.unlink(sys.argv[1])\n    except OSError:\n        pass\nimport signal,subprocess\ntry:\n    p = subprocess.Popen(sys.argv[3:], start_new_session=True)\nexcept FileNotFoundError:\n    sys.exit(127)\nexcept Exception:\n    sys.exit(126)\ntry:\n    sys.exit(p.wait(timeout=float(sys.argv[2])))\nexcept subprocess.TimeoutExpired:\n    try:\n        os.killpg(os.getpgid(p.pid), signal.SIGKILL)\n    except Exception:\n        p.kill()\n    sys.exit(124)\' "$_cys_tr_mark" "$_cys_to" "$@"\n    _cys_tr_rc=$?\n    if [ -n "$_cys_tr_mark" ] && [ -e "$_cys_tr_mark" ]; then\n      rm -f "$_cys_tr_mark" 2>/dev/null\n      echo "cys_timeout_run: 실행기 인터프리터가 격리 기동(-I -S -B -X utf8)을 거부했거나 시작하지 못했다(rc=$_cys_tr_rc · ${CYS_PY}) — 명령은 실행되지 않았다" >&2\n      return 126\n    fi\n    return $_cys_tr_rc\n'
+LIB_NEW_OWNED = '    "$CYS_PY" -I -S -B -X utf8 -c \'import os,runpy,sys\nif sys.argv[1]:\n    os.environ["LC_CTYPE"]=sys.argv[1][1:]\nelse:\n    os.environ.pop("LC_CTYPE",None)\np=sys.argv[2]\nif os.name == "nt" and len(p)>3 and p[0]=="/" and p[2]=="/" and p[1].isalpha():\n    p=p[1]+":"+p[2:]\nsys.argv=[p]+sys.argv[3:]\nrunpy.run_path(p,run_name="__main__")\' "${LC_CTYPE+=$LC_CTYPE}" "$_cys_owned_leaf"'
+LIB_OLD_OWNED = '    "$CYS_PY" -B -c \'import sys\nsys.path[:]=[x for x in sys.path if x]\nimport os,runpy\np=sys.argv[1]\nif os.name == "nt" and len(p)>3 and p[0]=="/" and p[2]=="/" and p[1].isalpha():\n    p=p[1]+":"+p[2:]\nsys.argv=[p]+sys.argv[2:]\nrunpy.run_path(p,run_name="__main__")\' "$_cys_owned_leaf"'
+LIB_NEW_FALLBACK = '    _cys_tr_mark=""\n    case "${OSTYPE:-}" in\n      msys*|cygwin*|win32*) ;;\n      *) _cys_tr_mark="${TMPDIR:-/tmp}/.cys-tr-${BASHPID:-$$}-${RANDOM:-0}${RANDOM:-0}"\n         { : > "$_cys_tr_mark"; } 2>/dev/null || _cys_tr_mark="" ;;\n    esac\n    "$CYS_PY" -I -S -B -X utf8 -c \'import os,sys\nif sys.argv[1]:\n    try:\n        os.unlink(sys.argv[1])\n    except OSError:\n        pass\nif sys.argv[2]:\n    os.environ["LC_CTYPE"] = sys.argv[2][1:]\nelse:\n    os.environ.pop("LC_CTYPE", None)\nimport signal,subprocess\ntry:\n    p = subprocess.Popen(sys.argv[4:], start_new_session=True)\nexcept FileNotFoundError:\n    sys.exit(127)\nexcept Exception:\n    sys.exit(126)\ntry:\n    sys.exit(p.wait(timeout=float(sys.argv[3])))\nexcept subprocess.TimeoutExpired:\n    try:\n        os.killpg(os.getpgid(p.pid), signal.SIGKILL)\n    except Exception:\n        p.kill()\n    sys.exit(124)\' "$_cys_tr_mark" "${LC_CTYPE+=$LC_CTYPE}" "$_cys_to" "$@"\n    _cys_tr_rc=$?\n    if [ -n "$_cys_tr_mark" ] && [ -e "$_cys_tr_mark" ]; then\n      rm -f "$_cys_tr_mark" 2>/dev/null\n      echo "cys_timeout_run: 실행기 인터프리터가 격리 기동(-I -S -B -X utf8)을 거부했거나 시작하지 못했다(rc=$_cys_tr_rc · ${CYS_PY}) — 명령은 실행되지 않았다" >&2\n      return 126\n    fi\n    return $_cys_tr_rc\n'
 LIB_OLD_FALLBACK = '    "$CYS_PY" -B -c \'import sys\nsys.path[:]=[x for x in sys.path if x]\nimport os,signal,subprocess\ntry:\n    p = subprocess.Popen(sys.argv[2:], start_new_session=True)\nexcept FileNotFoundError:\n    sys.exit(127)\nexcept Exception:\n    sys.exit(126)\ntry:\n    sys.exit(p.wait(timeout=float(sys.argv[1])))\nexcept subprocess.TimeoutExpired:\n    try:\n        os.killpg(os.getpgid(p.pid), signal.SIGKILL)\n    except Exception:\n        p.kill()\n    sys.exit(124)\' "$_cys_to" "$@"\n    return $?\n'
 LEAF = BIN / "_owned_process.py"
 
@@ -817,6 +817,13 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
         self.answer = self.fakebin / "role-answer"
         self.answer.write_text("#!/bin/sh\nprintf 'reviewer-codex\\n'\nexit \"${1:-0}\"\n", encoding="utf-8")
         self.answer.chmod(0o755)
+        # the --owned runner runs its leaf IN its own interpreter (runpy): a probe leaf in place of
+        # bin/_owned_process.py measures exactly that interpreter — the real leaf re-launches itself as a
+        # CHILD interpreter, which keeps the environment it is given (ES1) and is not what is measured here
+        self.probe_leaf = self.root / "probe-leaf" / "leaf.py"
+        self.probe_leaf.parent.mkdir()
+        self.probe_leaf.write_text("import hashlib, json, re, tempfile, sys\nsys.stdout.write('reviewer-codex\\n')\n",
+                                   encoding="utf-8")
 
     def lib_copy(self, tag, swaps):
         src = LIB.read_text(encoding="utf-8")
@@ -839,14 +846,8 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
                            cwd=str(cwd), env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=90)
         return r.returncode, r.stdout, r.stderr.decode("utf-8", "replace")
 
-    @staticmethod
-    def owned_records(out, head):
-        rest = out[len(head):] if out.startswith(head) else b""
-        f = rest.split(b"\0")
-        return {f[i].decode("utf-8", "replace"): f[i + 1].decode("utf-8", "replace") for i in range(0, len(f) - 1, 2)}
-
-    OWNED = ["--owned", "30", str(LEAF), "--records", "--managed-command", "--",
-             "/bin/sh", "-c", "printf 'reviewer-codex\\n'", "sh"]
+    def owned(self):
+        return ["--owned", "30", str(self.probe_leaf), "--records", "--", "/bin/true"]
 
     def wrapper_faults(self, vectors, marker, lib=None):
         out = {}
@@ -860,9 +861,8 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
                     if rc != 0 or so != b"reviewer-codex\n":
                         why.append("rc=%d stdout=%r stderr=%r" % (rc, so[:120], se[-200:]))
                 else:
-                    rc, so, se = self.lib_run(self.OWNED, extra, cwd, lib)
-                    rec = self.owned_records(so, b"reviewer-codex\n")
-                    if rc != 0 or rec.get("_OWNED_RETURNED") != "1":
+                    rc, so, se = self.lib_run(self.owned(), extra, cwd, lib)
+                    if rc != 0 or so != b"reviewer-codex\n":
                         why.append("rc=%d stdout=%r stderr=%r" % (rc, so[:160], se[-200:]))
                 if marker.exists():
                     why.append("planted code RAN: %r" % marker.read_text(encoding="utf-8"))
@@ -872,7 +872,8 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
     def test_the_wrappers_start_isolated(self):
         """ES1 negative controls on `_lib.sh` as it is: for every DY1 vector, neither wrapper's interpreter
         runs the planted code (marker absent) and the answer is whole — the deadline wrapper relays the
-        command's line and exit code unchanged, the --owned runner completes (`_OWNED_RETURNED` 1)."""
+        command's line and exit code unchanged; the --owned runner's interpreter runs a probe leaf (it
+        imports json / hashlib / re / tempfile, the names the vectors plant) and its line comes out alone."""
         marker = self.root / "PLANTED-RAN"
         got = self.wrapper_faults(self.vectors(marker), marker)
         bad = {k: v for k, v in got.items() if v}
@@ -927,6 +928,7 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
     def role_printer(self, marker):
         d = self.tmpdir / "pp-role"
         d.mkdir(exist_ok=True)
+        (self.tmpdir / "review-ws").mkdir(exist_ok=True)
         (d / "sitecustomize.py").write_text(
             "import sys\nopen(%r, 'a').write('role-printer\\n')\nsys.stdout.write('worker\\n')\nsys.stdout.flush()\n"
             % str(marker), encoding="utf-8")
@@ -952,31 +954,52 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
         return sorted(x for x in raw.split(b"\0") if x)
 
     def test_the_wrapped_command_keeps_its_environment(self):
-        """ES1 — only the wrapper's interpreter is isolated: the command it runs gets exactly the
-        environment the old wrapper gave it (byte for byte, the PYTHON* variables included), and nothing
-        the shell would give it directly is removed or changed (apart from `_`, the shell's last-command)."""
-        extra = {"PYTHONPATH": str(self.tmpdir / "pp-none"), "PYTHONSTARTUP": str(self.tmpdir / "none.py"),
-                 "PYTHONUSERBASE": str(self.tmpdir / "ub-none"), "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
-                 "PYTHONNOUSERSITE": "", "ES1_PROBE": "kept"}
+        """ES1 — only the wrapper's interpreter is isolated: what the command it runs receives is exactly what
+        the shell would give it directly (apart from `_`, the shell's last-command, and what any Python launcher
+        adds — the same as under the old wrapper), on a UTF-8 locale and on the C locale, where CPython rewrites
+        LC_CTYPE for its children (PEP 538) and `-I` ignores a PYTHONCOERCECLOCALE=0 that stopped it: the
+        wrappers put LC_CTYPE back as the shell had it. The --owned runner is measured with a probe leaf that
+        starts the command the way `bin/_owned_process.py` does (`env=os.environ.copy()`)."""
         env_cmd = ["/usr/bin/env", "-0"] if os.path.exists("/usr/bin/env") else ["env", "-0"]
+        probe = self.root / "probe-leaf" / "env-leaf.py"
+        probe.write_text("import os, subprocess, sys\nsys.exit(subprocess.call(%r, env=os.environ.copy()))\n" % env_cmd,
+                         encoding="utf-8")
         old = self.old_lib() / "_lib.sh"
-        new_dl = self.env_lines(self.lib_run(["5"] + env_cmd, extra, self.root)[1])
-        old_dl = self.env_lines(self.lib_run(["5"] + env_cmd, extra, self.root, lib=old)[1])
-        self.assertEqual(new_dl, old_dl, "the deadline wrapper changed its command's environment")
-        owned = ["--owned", "30", str(LEAF), "--records", "--managed-command", "--", "/bin/sh", "-c",
-                 " ".join(env_cmd), "sh"]
-        cut = lambda raw: raw.split(b"_OWNED_STARTED\0", 1)[0]
-        new_ow = self.env_lines(cut(self.lib_run(owned, extra, self.root)[1]))
-        old_ow = self.env_lines(cut(self.lib_run(owned, extra, self.root, lib=old)[1]))
-        self.assertEqual(new_ow, old_ow, "the --owned runner changed its command's environment")
-        env = dict(self.env, _CYS_LIB_DEFINE_ONLY="1")
-        env.update(extra)
-        direct = self.env_lines(subprocess.run([SH, "-c", '"$@"', "x"] + env_cmd, env=env, cwd=str(self.root),
-                                               capture_output=True, timeout=30).stdout)
-        missing = [x for x in direct if not x.startswith(b"_=") and x not in new_dl]
-        self.assertEqual(missing, [], "removed or changed for the command")
-        self.assertIn(b"PYTHONPATH=" + str(self.tmpdir / "pp-none").encode(), new_dl)
-        self.assertIn(b"ES1_PROBE=kept", new_ow)
+        base = {"PYTHONPATH": str(self.tmpdir / "pp-none"), "PYTHONSTARTUP": str(self.tmpdir / "none.py"),
+                "PYTHONUSERBASE": str(self.tmpdir / "ub-none"), "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
+                "ES1_PROBE": "kept"}
+        for tag, loc in (("UTF-8", {"LANG": "en_US.UTF-8", "LC_CTYPE": None}),
+                         ("C + PYTHONCOERCECLOCALE=0", {"LANG": "C", "LC_CTYPE": "C", "PYTHONCOERCECLOCALE": "0", "PYTHONUTF8": "0"}),
+                         ("LANG=C only", {"LANG": "C", "LC_CTYPE": None, "PYTHONUTF8": None})):
+            extra = dict(base, LC_ALL=None, **loc)
+            env = dict(self.env, _CYS_LIB_DEFINE_ONLY="1")
+            for k, v in extra.items():
+                if v is None:
+                    env.pop(k, None)
+                else:
+                    env[k] = v
+            direct = set(self.env_lines(subprocess.run([SH, "-c", '"$@"', "x"] + env_cmd, env=env, cwd=str(self.root),
+                                                       capture_output=True, timeout=30).stdout))
+            for kind, args in (("deadline wrapper", ["5"] + env_cmd),
+                               ("--owned runner", ["--owned", "30", str(probe), "--records", "--", "/bin/true"])):
+                got, olds = [], []
+                for lib, sink in ((None, got), (old, olds)):
+                    e = dict(self.env, _CYS_LIB_DEFINE_ONLY="1")
+                    for k, v in extra.items():
+                        if v is None:
+                            e.pop(k, None)
+                        else:
+                            e[k] = v
+                    r = subprocess.run([SH, "-c", '. "$1"; shift; cys_timeout_run "$@"', "x", str(lib or LIB)] + args,
+                                       cwd=str(self.root), env=e, stdin=subprocess.DEVNULL, capture_output=True, timeout=90)
+                    sink.extend(self.env_lines(r.stdout))
+                new_set, old_set = set(got), set(olds)
+                missing = sorted(x for x in direct - new_set if not x.startswith(b"_="))
+                added = sorted(x for x in new_set - direct - old_set if not x.startswith(b"_="))
+                self.assertEqual(missing, [], "%s, %s: removed or changed for the command" % (kind, tag))
+                self.assertEqual(added, [], "%s, %s: added that the old wrapper did not add either" % (kind, tag))
+                self.assertIn(b"ES1_PROBE=kept", new_set, "%s, %s" % (kind, tag))
+                self.assertIn(b"PYTHONPATH=" + str(self.tmpdir / "pp-none").encode(), new_set, "%s, %s" % (kind, tag))
 
     def test_the_wrappers_import_the_standard_library_only(self):
         """ES1 — the code each isolated interpreter runs imports the standard library only: the two `-c`
@@ -985,7 +1008,7 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
         k = "\"$CYS_PY\" -I -S -B -X utf8 -c '"
         self.assertEqual(src.count(k), 2, "the two isolated starts of _lib.sh")
         i1 = src.index(k) + len(k)
-        j1 = src.index("' \"$_cys_owned_leaf\"", i1)
+        j1 = src.index("' \"${LC_CTYPE+=$LC_CTYPE}\" \"$_cys_owned_leaf\"", i1)
         i2 = src.index(k, j1) + len(k)
         j2 = src.index("' \"$_cys_tr_mark\"", i2)
         bodies = [src[i1:j1], src[i2:j2]]
@@ -997,7 +1020,7 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
 
     def refusing_python(self, log):
         p = self.fakebin / "python2-like"
-        p.write_text("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %s\n"
+        p.write_text("#!/bin/sh\nprintf 'launch %%s\\n' \"$1\" >> %s\n"
                      "for a in \"$@\"; do [ \"$a\" = -I ] && { echo 'Unknown option: -I' >&2; exit 2; }; done\n"
                      "exec %s \"$@\"\n" % (log, sys.executable), encoding="utf-8")
         p.chmod(0o755)
@@ -1018,9 +1041,9 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
             self.assertEqual(se.count("cys_timeout_run: 실행기 인터프리터가 격리 기동"), 1, se[-300:])
             self.assertEqual(len(log.read_text().splitlines()) - n0, 1, "one interpreter launch per call")
         self.assertEqual([n for n in os.listdir(str(self.tmpdir)) if n.startswith(".cys-tr-")], [])
-        rc, so, se = self.lib_run(self.OWNED, {"CYS_PY": str(py)}, self.root)
+        rc, so, se = self.lib_run(["--owned", "30", str(LEAF), "--records", "--", "/bin/true"], {"CYS_PY": str(py)}, self.root)
         self.assertNotEqual(rc, 0)
-        self.assertNotIn(b"_OWNED_RETURNED", so)
+        self.assertNotIn(b"_OWNED_RETURNED", so, "the callers read a run without this record as unmeasured")
         nomark = self.lib_copy("no-mark", [('         { : > "$_cys_tr_mark"; } 2>/dev/null || _cys_tr_mark="" ;;',
                                             '         _cys_tr_mark="" ;;')])
         rc, so, se = self.lib_run(["5", self.answer, 0], {"CYS_PY": str(py)}, self.root, lib=nomark / "_lib.sh")
@@ -1144,7 +1167,7 @@ class GuardJudgeIsolation(_PlantedVectors, _Env):
     def test_an_interpreter_that_refuses_the_flags_is_todays_broken_interpreter(self):
         log = self.root / "launches.log"
         refuses = self.fakebin / "python2-like"
-        refuses.write_text("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %s\n"
+        refuses.write_text("#!/bin/sh\nprintf 'launch %%s\\n' \"$1\" >> %s\n"
                            "for a in \"$@\"; do [ \"$a\" = -I ] && { echo 'Unknown option: -I' >&2; exit 2; }; done\n"
                            "exec %s \"$@\"\n" % (log, sys.executable), encoding="utf-8")
         refuses.chmod(0o755)

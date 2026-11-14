@@ -334,15 +334,22 @@ cys_timeout_run() {
     # user site, neither the script folder nor the working directory on sys.path), -S (no site: no .pth,
     # sitecustomize, usercustomize), -B (no bytecode), -X utf8 (the UTF-8 mode PYTHONUTF8=1 gave, given
     # back explicitly; it replaces the PKG-3A M1 reason for not using -I). Bootstrap and leaf import the
-    # standard library only; the command the leaf runs gets this process's environment unchanged. An
-    # interpreter that refuses the flags exits 2 with no records: the caller's existing "phase owner
-    # ended without completion; unmeasured" branch, the one a broken interpreter takes today.
+    # standard library only; the command the leaf runs gets this process's environment unchanged — with
+    # one repair: on a C / POSIX locale CPython rewrites LC_CTYPE in its own environment (PEP 538), and
+    # -I also ignores a PYTHONCOERCECLOCALE=0 that would have stopped it, so the first statement puts
+    # LC_CTYPE back exactly as the shell had it (passed as "=value", or "" when unset). An interpreter
+    # that refuses the flags exits 2 with no records: the caller's existing "phase owner ended without
+    # completion; unmeasured" branch, the one a broken interpreter takes today.
     "$CYS_PY" -I -S -B -X utf8 -c 'import os,runpy,sys
-p=sys.argv[1]
+if sys.argv[1]:
+    os.environ["LC_CTYPE"]=sys.argv[1][1:]
+else:
+    os.environ.pop("LC_CTYPE",None)
+p=sys.argv[2]
 if os.name == "nt" and len(p)>3 and p[0]=="/" and p[2]=="/" and p[1].isalpha():
     p=p[1]+":"+p[2:]
-sys.argv=[p]+sys.argv[2:]
-runpy.run_path(p,run_name="__main__")' "$_cys_owned_leaf" --bounded "$_cys_owned_cap" "$@"
+sys.argv=[p]+sys.argv[3:]
+runpy.run_path(p,run_name="__main__")' "${LC_CTYPE+=$LC_CTYPE}" "$_cys_owned_leaf" --bounded "$_cys_owned_cap" "$@"
     return $?
   fi
   _cys_to="${1:-2}"
@@ -371,6 +378,7 @@ runpy.run_path(p,run_name="__main__")' "$_cys_owned_leaf" --bounded "$_cys_owned
     #   command never ran → 126 and one line, the code a broken interpreter gives today; a command's own 2
     #   stays 2. No mark (exit code passes as before) on MSYS / Cygwin — a native interpreter cannot open
     #   a /tmp spelling — or when TMPDIR is not writable. No extra process: two file operations.
+    #   LC_CTYPE is put back exactly as the shell had it (PEP 538 coercion — see the --owned runner above).
     _cys_tr_mark=""
     case "${OSTYPE:-}" in
       msys*|cygwin*|win32*) ;;
@@ -383,21 +391,25 @@ if sys.argv[1]:
         os.unlink(sys.argv[1])
     except OSError:
         pass
+if sys.argv[2]:
+    os.environ["LC_CTYPE"] = sys.argv[2][1:]
+else:
+    os.environ.pop("LC_CTYPE", None)
 import signal,subprocess
 try:
-    p = subprocess.Popen(sys.argv[3:], start_new_session=True)
+    p = subprocess.Popen(sys.argv[4:], start_new_session=True)
 except FileNotFoundError:
     sys.exit(127)
 except Exception:
     sys.exit(126)
 try:
-    sys.exit(p.wait(timeout=float(sys.argv[2])))
+    sys.exit(p.wait(timeout=float(sys.argv[3])))
 except subprocess.TimeoutExpired:
     try:
         os.killpg(os.getpgid(p.pid), signal.SIGKILL)
     except Exception:
         p.kill()
-    sys.exit(124)' "$_cys_tr_mark" "$_cys_to" "$@"
+    sys.exit(124)' "$_cys_tr_mark" "${LC_CTYPE+=$LC_CTYPE}" "$_cys_to" "$@"
     _cys_tr_rc=$?
     if [ -n "$_cys_tr_mark" ] && [ -e "$_cys_tr_mark" ]; then
       rm -f "$_cys_tr_mark" 2>/dev/null

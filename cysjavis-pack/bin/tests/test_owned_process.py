@@ -1382,6 +1382,18 @@ if __name__=='__main__':
         heads = '## 금지선 하나\n## 오너 규칙 둘\n'.encode('utf-8')
         (pack/'soul.md').write_bytes(b'# s\n' + heads.replace(b'\n', b'\nx\n'))
         env = dict(self.crlf_env(), CYS_PY=PYTHON, CYS_ROLE='master', CYS_ROOT=str(self.root), CYS_PACK_DIR=str(pack))
+        if os.name == 'posix':
+            # RULINGS ES1 (0.15.0 · T5c): _lib.sh's --owned runner now starts its interpreter isolated (-I -S), so the
+            # emulation's sitecustomize can no longer reach the process under test through PYTHONPATH (that is the
+            # point of ES1). A test-only CYS_PY runs the same emulation first inside every `-c` program instead -
+            # the runner's flags stay as the product has them; the premise check below still demands the process
+            # carrying --bounded --records.
+            shim = self.root/'cys-py-crlf'
+            shim.write_text('#!/bin/sh\nprev=\nfor a in "$@"; do\n  shift\n'
+                            '  if [ "$prev" = -c ]; then set -- "$@" "exec(open(%r).read())\n$a"; else set -- "$@" "$a"; fi\n'
+                            '  prev=$a\ndone\nexec %s "$@"\n' % (str(self.root/'crlf-emu'/'sitecustomize.py'), PYTHON))
+            shim.chmod(0o755)
+            env['CYS_PY'] = str(shim)
         if os.name == 'nt':
             env['PATH'] = str(Path(bash).parent.parent/'usr'/'bin') + os.pathsep + env.get('PATH', '')
         p = subprocess.run([bash, str(pack/'hooks'/'inject-context.sh')], capture_output=True, env=env, cwd=str(self.root),  # wallclock: guard 60 s only ends a hang of the hook; the verdict is the output bytes
