@@ -1642,7 +1642,7 @@ CEO_PENDING="$HOME/.cys/state/ceo-pending"
 CEO_RECEIPT_NAME=".ceo-receipt.json"
 ceo_py(){  # $1 = superset | state | compose | demote | verify | promoted
   python3 - "$@" <<'PY'
-import errno, hashlib, json, os, re, sys, tempfile, time
+import errno, hashlib, json, math, os, re, sys, tempfile, time
 
 # 구분선 — scripts/gen_ceo_template.py SEPARATOR 와 같은 바이트(O-C11-2 · test_ceo_composition 이 고정한다).
 SEP = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n".encode("utf-8")
@@ -1882,13 +1882,20 @@ LOCK_WAIT_DEFAULT_S = 10.0
 SWAP_ATTEMPTS = 3
 
 
+LOCK_WAIT_MAX_S = 120.0
+
+
 def lock_wait_s():
+    """★RULINGS EY4 — 잠금 대기 상한(초). 환경 값(CYS_CEO_LOCK_WAIT_S)이 숫자가 아니거나 유한하지 않거나(nan·inf) 음수면 기본값
+    10 초, 유한한 값은 120 초로 자른다 — 어느 길에서도 마감이 유한하다(종전: nan 이 비교를 모두 거짓으로 만들어 영원히 기다렸다)."""
     raw = os.environ.get("CYS_CEO_LOCK_WAIT_S", "")
     try:
-        v = float(raw) if raw else LOCK_WAIT_DEFAULT_S
+        v = float(raw) if raw.strip() else LOCK_WAIT_DEFAULT_S
     except ValueError:
         v = LOCK_WAIT_DEFAULT_S
-    return min(max(v, 0.0), 120.0)
+    if not math.isfinite(v) or v < 0:
+        v = LOCK_WAIT_DEFAULT_S
+    return min(v, LOCK_WAIT_MAX_S)
 
 
 def take_lock(md):

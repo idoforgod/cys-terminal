@@ -1094,6 +1094,31 @@ class LockIsReal(Rig):
         self.assertEqual(self.pushes("CEO 강등 보류(다른 승격·강등이 진행 중)"), 1)
         self.assertNotIn("무락 진행", out + err, "'잠금 없이 진행' 갈래가 남았다")
 
+    def test_bad_wait_values_fall_back_to_the_bounded_default(self):
+        """★RULINGS EY4 — 환경의 대기 값이 유한하지 않거나(nan·inf) 음수거나 숫자가 아니면 기본값(10 초)이다. 풀리지 않는 잠금
+        앞에서 `launch` 가 그 상한 안에 돌아와 티켓·편성 단계에 닿는다(종전: nan 이면 마감이 영원히 오지 않아 launch 가 멈췄다).
+        subprocess 의 120 초 상한은 멈춤을 끝낼 뿐이고, 판정은 rc·지침·단계 문구다."""
+        self.seed()
+        self.hold_lock()
+        for bad in ("nan", "inf", "-1", "abc"):
+            with self.subTest(wait=bad):
+                self.env["CYS_CEO_LOCK_WAIT_S"] = bad
+                try:
+                    rc, out, err = self.run_dept("launch", "d0", timeout=120)
+                except subprocess.TimeoutExpired:
+                    self.fail("CYS_CEO_LOCK_WAIT_S=%s 에서 launch 가 돌아오지 않았다(끝없는 잠금 대기)" % bad)
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "잠금 없이 진행했다")
+                self.assertIn("가동 완료", out, out + err)
+        ns = ceo_py_module()
+        for bad, want in (("nan", 10.0), ("inf", 10.0), ("-1", 10.0), ("abc", 10.0), ("", 10.0),
+                          ("1e9", 120.0), ("0.5", 0.5), ("0", 0.0)):
+            os.environ["CYS_CEO_LOCK_WAIT_S"] = bad
+            try:
+                self.assertEqual(ns["lock_wait_s"](), want, "대기 값 %r" % bad)
+            finally:
+                os.environ.pop("CYS_CEO_LOCK_WAIT_S", None)
+
     def test_the_lock_is_taken_by_the_real_code(self):
         """잠금을 지우는 변이는 이 시험이 잡는다: 잠금이 잡혀 있으면 do_compose 는 상한 안에 rc 8(보류)로 끝난다."""
         self.seed()
