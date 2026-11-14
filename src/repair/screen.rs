@@ -2128,6 +2128,37 @@ fn doc_difference(reference: &SettingsDoc, got: &SettingsDoc) -> Option<String> 
     }
 }
 
+/// RULINGS GR1: the marker of a row whose registrar run changed a pinned protection file of its pack.
+const I3_PROTECTION_CHANGED: &str = "등록기가 보호 파일을 바꿈";
+
+/// RULINGS GR1 / decision 26: the sentence of an I3 refusal on a protection file the registrar changed.
+const I3_PROTECTION_CHANGED_SENTENCE: &str = "등록기(javis_preflight.py C28)가 실행 중에 보호 파일(hooks/guard.sh · hooks/role-capability-gate.sh · hooks/_lib.sh)을 바꿨습니다 — 등록된 관문이 깔아 둔 그 파일이 아니므로 거부합니다";
+
+/// RULINGS GR1 — the pinned protection files of a variant's scratch pack (census (iii)'s devices and
+/// the shared prelude) that are no longer exactly what was laid out (content, or absent / link): read
+/// through the bounded no-follow reader; one that cannot be read counts as changed.
+fn protection_files_changed(files: &Files, pack: &Path) -> Vec<String> {
+    let content = |s: &TargetState| match s {
+        TargetState::File { sha256, .. } => format!("file:{sha256}"),
+        other => other.canon(),
+    };
+    corpus::CENSUS_PINS
+        .iter()
+        .map(|p| p.0)
+        .filter(|rel| {
+            let want = files
+                .get(*rel)
+                .map(|s| s.state())
+                .unwrap_or(TargetState::Absent);
+            match LaidSource::read(&pack.join(rel)) {
+                Ok(got) => content(&got.state()) != content(&want),
+                Err(_) => true,
+            }
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// RULINGS GA2: the marker of a variant row whose document differs from the released registrar's.
 const I3_DOC_DIFFERS: &str = "설정 문서가 출시본 등록기의 결과와 다름";
 
@@ -2327,6 +2358,9 @@ fn run_i3(
             ];
             for k in 1..=2 {
                 let o = r.run(&argv, &env, &work, b"");
+                // RULINGS GR1: the pinned protection files of this scratch variant are exactly what was
+                // laid out after the registrar's run
+                let changed = protection_files_changed(files, &pack);
                 // RULINGS GA3: the registrar's run counts only when observed whole
                 let completed = replay::observed_whole(&o) && matches!(o.code, Some(0) | Some(1));
                 let why = if completed {
@@ -2365,9 +2399,14 @@ fn run_i3(
                         };
                         let doc = settings_doc(t, &run);
                         let st = if doc.is_none() { None } else { st };
+                        let (st, gr1) = if changed.is_empty() {
+                            (st, String::new())
+                        } else {
+                            (Some(false), format!("; {I3_PROTECTION_CHANGED}: {}", changed.join(", ")))
+                        };
                         (
                             st,
-                            format!("{why}; entry as released {whole:?}, grammar {grammar:?}, document read {}", doc.is_some()),
+                            format!("{why}; entry as released {whole:?}, grammar {grammar:?}, document read {}{gr1}", doc.is_some()),
                             doc,
                         )
                     } else {
@@ -2620,6 +2659,9 @@ fn screen_i3(r: &Runner<'_>, v: &Variants, rels: &[String], results: &mut Vec<Pr
             let mut pick = |var: Var| -> Option<Answer> {
                 let rows = rows_of(var);
                 let x = rows.iter().find(|x| x.run == rel.run && x.label == rel.label)?;
+                if x.detail.contains(I3_PROTECTION_CHANGED) {
+                    why.push_str(&format!("; {var:?}: {I3_PROTECTION_CHANGED}"));
+                }
                 Some(match (&rel.doc, &x.doc, x.registered) {
                     (Some(a), Some(b), Some(reg)) => match doc_difference(a, b) {
                         None => ans(Some(reg)),
@@ -2848,6 +2890,14 @@ fn summarize(probes: Vec<ProbeResult>, input_fingerprint: String, took: Duration
         p.test == "I3" && p.decision == ProbeDecision::Refused && p.detail.contains(I3_DOC_DIFFERS)
     }) {
         refusals.push(I3_VENDOR_ONLY.to_string());
+    }
+    // RULINGS GR1: … and a refusal on a protection file the registrar changed says that
+    if probes.iter().any(|p| {
+        p.test == "I3"
+            && p.decision == ProbeDecision::Refused
+            && p.detail.contains(I3_PROTECTION_CHANGED)
+    }) {
+        refusals.push(I3_PROTECTION_CHANGED_SENTENCE.to_string());
     }
     let n_findings: usize = findings.values().map(Vec::len).sum();
     if n_findings > 0 {
