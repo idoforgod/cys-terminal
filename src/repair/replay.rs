@@ -91,29 +91,73 @@ impl ScratchRoot {
     }
 }
 
+impl ScratchRoot {
+    /// Removes the scratch root and SAYS whether it is gone (RULINGS CZ4: a cleanup error or a
+    /// leftover scratch root is returned, never swallowed).
+    pub fn close(mut self) -> Result<(), RepairError> {
+        let p = std::mem::take(&mut self.path);
+        remove_tree(&p)
+    }
+}
+
 impl Drop for ScratchRoot {
+    /// The fallback of a root that was not [`ScratchRoot::close`]d (an early return): removed as far
+    /// as possible; the callers that judge a run close it explicitly.
     fn drop(&mut self) {
-        remove_tree(&self.path);
+        if !self.path.as_os_str().is_empty() {
+            let _ = remove_tree(&self.path);
+        }
     }
 }
 
 /// Removes a tree without following links; directories made read-only by a run (E-17) are made
-/// writable again first. Errors are swallowed (a leftover scratch folder is not a failure of the
-/// verdict; it is inside the scratch base).
-pub fn remove_tree(p: &Path) {
-    let Ok(meta) = std::fs::symlink_metadata(p) else {
-        return;
+/// writable again first. RULINGS CZ4: every error is RETURNED (the first one; the walk still removes
+/// what it can), and a tree still present afterwards is an error — a leftover scratch root makes the
+/// run that owned it not measurable.
+pub fn remove_tree(p: &Path) -> Result<(), RepairError> {
+    let mut first: Option<RepairError> = None;
+    remove_walk(p, &mut first);
+    if first.is_none() && std::fs::symlink_metadata(p).is_ok() {
+        first = Some(RepairError::Io(format!(
+            "{}: scratch tree still present after removal",
+            p.display()
+        )));
+    }
+    match first {
+        None => Ok(()),
+        Some(e) => Err(e),
+    }
+}
+
+fn remove_walk(p: &Path, first: &mut Option<RepairError>) {
+    fn note(first: &mut Option<RepairError>, p: &Path, e: std::io::Error) {
+        if first.is_none() {
+            *first = Some(RepairError::Io(format!("{}: {e}", p.display())));
+        }
+    }
+    let meta = match std::fs::symlink_metadata(p) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => return note(first, p, e),
     };
     if meta.file_type().is_dir() {
         set_mode(p, 0o700);
-        if let Ok(rd) = std::fs::read_dir(p) {
-            for e in rd.flatten() {
-                remove_tree(&e.path());
+        match std::fs::read_dir(p) {
+            Ok(rd) => {
+                for e in rd {
+                    match e {
+                        Ok(e) => remove_walk(&e.path(), first),
+                        Err(e) => note(first, p, e),
+                    }
+                }
             }
+            Err(e) => note(first, p, e),
         }
-        let _ = std::fs::remove_dir(p);
-    } else {
-        let _ = std::fs::remove_file(p);
+        if let Err(e) = std::fs::remove_dir(p) {
+            note(first, p, e);
+        }
+    } else if let Err(e) = std::fs::remove_file(p) {
+        note(first, p, e);
     }
 }
 
@@ -243,7 +287,7 @@ impl Drop for ScratchSocket {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
         if let Some(d) = &self.short_dir {
-            remove_tree(d);
+            let _ = remove_tree(d);
         }
     }
 }
@@ -261,17 +305,50 @@ pub struct ChildOutcome {
     /// The child could not be started at all.
     pub spawn_error: Option<String>,
     pub elapsed: Duration,
-    /// The child's process group still had a member after the run's group was killed.
+    /// Processes of the run still alive after the run's group was killed: a member of the group, or
+    /// a process carrying the run's environment marker that left the group (RULINGS CZ4 / DF5 —
+    /// each found one is killed by its exact pid and still reported).
     pub leftovers: Vec<u32>,
+    /// A pipe of the run (stdout / stderr) was still held open after the group was killed and
+    /// drained — a process outside the group kept it (RULINGS CZ4): the output may be incomplete.
+    pub pipe_held: bool,
+}
+
+impl ChildOutcome {
+    /// RULINGS CZ4: a run that left something behind (a process, a held pipe) did not end cleanly —
+    /// its answer is not measurable, whatever it printed.
+    pub fn left_something(&self) -> Option<String> {
+        if !self.leftovers.is_empty() {
+            return Some(format!("leftover process(es) {:?}", self.leftovers));
+        }
+        if self.pipe_held {
+            return Some("an output pipe was held open past the run".into());
+        }
+        None
+    }
 }
 
 /// Largest output kept per stream (the rest is dropped; a probe's verdict never needs more).
 const MAX_CAPTURE: usize = 1 << 20;
 
-/// Runs `argv` with EXACTLY `env` (nothing inherited — the fixed clean environment, BA1), in `cwd`,
-/// with `stdin` as input, in its own process group, killed (the whole group) and reaped at
-/// `deadline`. After a normal end the group is killed as well, so no process of the run survives it
-/// (replay rule (c)(3)).
+/// How long the pipes of a finished (killed) run are drained before a still-open one is reported.
+const DRAIN: Duration = Duration::from_millis(500);
+
+/// The environment variable that marks every process of one run (RULINGS DF5: leftovers tracked
+/// beyond the process group — a process that called `setsid` / `setpgid` keeps its environment).
+pub const RUN_MARK_VAR: &str = "CYS_REPLAY_RUN";
+
+/// Runs `argv` with EXACTLY `env` (nothing inherited — the fixed clean environment, BA1) plus the
+/// run's own marker [`RUN_MARK_VAR`], in `cwd`, with `stdin` as input, in its own process group,
+/// killed (the whole group) and reaped at `deadline`. After a normal end the group is killed as well,
+/// so no process of the run survives it (replay rule (c)(3)).
+///
+/// RULINGS CZ4 — the runner ALWAYS returns and says what it left behind: no thread and no blocking
+/// call — stdin is written and both outputs are read through non-blocking pipes polled by this
+/// thread, so a child (or a descendant that escaped its group) that never reads stdin or keeps an
+/// output open cannot hold the runner past `deadline` + the bounded drain; a held output pipe is
+/// reported (`pipe_held`); every process still carrying the run's marker after the kill — inside the
+/// group or not — is killed by exact pid and reported (`leftovers`).
 #[cfg(unix)]
 pub fn run_child(
     argv: &[String],
@@ -280,7 +357,7 @@ pub fn run_child(
     stdin: &[u8],
     deadline: Duration,
 ) -> ChildOutcome {
-    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::process::{Command, Stdio};
 
@@ -290,10 +367,12 @@ pub fn run_child(
         out.spawn_error = Some("empty argv".into());
         return out;
     };
+    let mark = random_hex(12);
     let mut cmd = Command::new(prog);
     cmd.args(args)
         .env_clear()
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .env(RUN_MARK_VAR, &mark)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -308,67 +387,61 @@ pub fn run_child(
         }
     };
     let pid = child.id() as libc::pid_t;
-    // stdin on its own thread (a child that never reads must not block us)
-    let input = stdin.to_vec();
-    let stdin_pipe = child.stdin.take();
-    let w = std::thread::spawn(move || {
-        if let Some(mut s) = stdin_pipe {
-            let _ = s.write_all(&input);
-        }
-    });
-    let reader = |p: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut r) = p {
-                let mut chunk = [0u8; 8192];
-                loop {
-                    match r.read(&mut chunk) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if buf.len() < MAX_CAPTURE {
-                                let take = n.min(MAX_CAPTURE - buf.len());
-                                buf.extend_from_slice(&chunk[..take]);
-                            }
-                        }
-                    }
-                }
-            }
-            buf
-        })
-    };
-    let ro = reader(
-        child
-            .stdout
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-    );
-    let re = reader(
-        child
-            .stderr
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-    );
-    // wait without reaping (WNOWAIT) so the group can be killed while its id is still ours
-    let mut sleep = Duration::from_millis(1);
+    let mut sin = child.stdin.take();
+    let mut sout = child.stdout.take();
+    let mut serr = child.stderr.take();
+    for fd in [
+        sin.as_ref().map(|s| s.as_raw_fd()),
+        sout.as_ref().map(|s| s.as_raw_fd()),
+        serr.as_ref().map(|s| s.as_raw_fd()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        set_nonblocking(fd);
+    }
+    let mut written = 0usize;
+    if stdin.is_empty() {
+        sin = None; // EOF at once
+    }
+    // pump until the child ends (not reaped — WNOWAIT) or the deadline
     loop {
+        pump_stdin(&mut sin, stdin, &mut written);
+        pump_out(&mut sout, &mut out.stdout);
+        pump_out(&mut serr, &mut out.stderr);
         if exited_no_reap(pid) {
             break;
         }
-        if started.elapsed() >= deadline {
+        let left = deadline.saturating_sub(started.elapsed());
+        if left.is_zero() {
             out.timed_out = true;
             break;
         }
-        std::thread::sleep(sleep);
-        sleep = (sleep * 2).min(Duration::from_millis(20));
+        wait_io(&sin, &sout, &serr, left.min(Duration::from_millis(20)));
     }
+    // our end of stdin goes now: a descendant holding the other end can never block us
+    drop(sin);
     // SAFETY: kill(2) on our own child's process group (pgid = the child's pid, set by
     // process_group(0)); the leader is not reaped yet, so the group id cannot have been reused.
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }
     let status = child.wait();
-    // replay rule (c)(3): nothing of the group may outlive the run — a member still there after
-    // the kill is recorded (signal 0 only checks existence)
+    // drain what the dead group left in the pipes — bounded: an output still open after DRAIN is held
+    // by a process outside the group
+    let drain_until = Instant::now() + DRAIN;
+    while (sout.is_some() || serr.is_some()) && Instant::now() < drain_until {
+        pump_out(&mut sout, &mut out.stdout);
+        pump_out(&mut serr, &mut out.stderr);
+        if sout.is_some() || serr.is_some() {
+            wait_io(&None, &sout, &serr, Duration::from_millis(20));
+        }
+    }
+    out.pipe_held = sout.is_some() || serr.is_some();
+    drop(sout);
+    drop(serr);
+    // replay rule (c)(3) / RULINGS CZ4: nothing of the run may outlive it — a member of the group
+    // still there after the kill, and every process carrying the run's marker
     // SAFETY: kill(2) with signal 0 sends nothing.
     if unsafe { libc::kill(-pid, 0) } == 0 {
         std::thread::sleep(Duration::from_millis(50));
@@ -377,9 +450,16 @@ pub fn run_child(
             out.leftovers.push(pid as u32);
         }
     }
-    let _ = w.join();
-    out.stdout = join_bounded(ro, Duration::from_secs(2));
-    out.stderr = join_bounded(re, Duration::from_secs(2));
+    for p in marked_processes(&mark) {
+        // SAFETY: kill(2) of a process that carries THIS run's random marker in its environment —
+        // a process of the run, by its exact pid.
+        unsafe {
+            libc::kill(p as libc::pid_t, libc::SIGKILL);
+        }
+        if !out.leftovers.contains(&p) {
+            out.leftovers.push(p);
+        }
+    }
     match status {
         Ok(st) => {
             out.code = st.code();
@@ -409,16 +489,189 @@ pub fn run_child(
     }
 }
 
-fn join_bounded(h: std::thread::JoinHandle<Vec<u8>>, wait: Duration) -> Vec<u8> {
-    let t0 = Instant::now();
-    while !h.is_finished() {
-        if t0.elapsed() >= wait {
-            // a process outside our group still holds the pipe: give up on the rest of the output
-            return Vec::new();
+#[cfg(unix)]
+fn set_nonblocking(fd: std::os::fd::RawFd) {
+    // SAFETY: fcntl(2) on a pipe descriptor this process owns.
+    unsafe {
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        if fl >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
         }
-        std::thread::sleep(Duration::from_millis(5));
     }
-    h.join().unwrap_or_default()
+}
+
+/// Writes what the (non-blocking) stdin pipe takes now; done or broken → the pipe is closed.
+#[cfg(unix)]
+fn pump_stdin(sin: &mut Option<std::process::ChildStdin>, input: &[u8], written: &mut usize) {
+    use std::io::Write;
+    let Some(s) = sin.as_mut() else {
+        return;
+    };
+    while *written < input.len() {
+        match s.write(&input[*written..]) {
+            Ok(0) => break,
+            Ok(n) => *written += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                *sin = None; // the reader is gone (EPIPE)
+                return;
+            }
+        }
+    }
+    if *written >= input.len() {
+        *sin = None; // all written: EOF for the child
+    }
+}
+
+/// Reads what a (non-blocking) output pipe holds now; EOF or an error → the pipe is closed.
+#[cfg(unix)]
+fn pump_out<R: std::io::Read>(p: &mut Option<R>, buf: &mut Vec<u8>) {
+    let Some(r) = p.as_mut() else {
+        return;
+    };
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => {
+                *p = None;
+                return;
+            }
+            Ok(n) => {
+                if buf.len() < MAX_CAPTURE {
+                    let take = n.min(MAX_CAPTURE - buf.len());
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                *p = None;
+                return;
+            }
+        }
+    }
+}
+
+/// Waits (at most `limit`) until one of the open pipes is ready.
+#[cfg(unix)]
+fn wait_io(
+    sin: &Option<std::process::ChildStdin>,
+    sout: &Option<std::process::ChildStdout>,
+    serr: &Option<std::process::ChildStderr>,
+    limit: Duration,
+) {
+    use std::os::fd::AsRawFd;
+    let mut fds: Vec<libc::pollfd> = Vec::with_capacity(3);
+    if let Some(s) = sin {
+        fds.push(libc::pollfd {
+            fd: s.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        });
+    }
+    for fd in [sout.as_ref().map(|s| s.as_raw_fd()), serr.as_ref().map(|s| s.as_raw_fd())]
+        .into_iter()
+        .flatten()
+    {
+        fds.push(libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    let ms = limit.as_millis().clamp(1, 1000) as libc::c_int;
+    if fds.is_empty() {
+        std::thread::sleep(Duration::from_millis(ms as u64));
+        return;
+    }
+    // SAFETY: poll(2) over a vector of pollfd we own, its exact length.
+    unsafe {
+        libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms);
+    }
+}
+
+/// The processes (pid) whose environment carries `<RUN_MARK_VAR>=<mark>` (RULINGS DF5). macOS: the
+/// kernel's argument + environment area of every process of this user (`KERN_PROCARGS2`); Linux:
+/// `/proc/<pid>/environ`. Elsewhere none is found — the limit is the process group (stated in the
+/// report).
+pub fn marked_processes(mark: &str) -> Vec<u32> {
+    let needle = format!("{RUN_MARK_VAR}={mark}");
+    marked_processes_by(needle.as_bytes())
+}
+
+fn has_entry(area: &[u8], needle: &[u8]) -> bool {
+    area.split(|b| *b == 0).any(|e| e == needle)
+}
+
+#[cfg(target_os = "macos")]
+fn marked_processes_by(needle: &[u8]) -> Vec<u32> {
+    let me = std::process::id() as libc::pid_t;
+    // SAFETY: proc_listallpids(3) with a null buffer returns the number of pids.
+    let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    let mut pids: Vec<libc::pid_t> = vec![0; n as usize + 128];
+    let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: the buffer holds `bytes` bytes of pid_t slots.
+    let got = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    if got <= 0 {
+        return Vec::new();
+    }
+    pids.truncate((got as usize).min(pids.len()));
+    let mut area = vec![0u8; 1 << 20];
+    let mut out = Vec::new();
+    for pid in pids {
+        if pid <= 0 || pid == me {
+            continue;
+        }
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut size = area.len();
+        // SAFETY: sysctl(3) reads at most `size` bytes into `area`; a process of another user (or
+        // one that is gone) answers an error and is skipped.
+        let r = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                area.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if r == 0 && has_entry(&area[..size.min(area.len())], needle) {
+            out.push(pid as u32);
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn marked_processes_by(needle: &[u8]) -> Vec<u32> {
+    let me = std::process::id();
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/proc") {
+        for e in rd.flatten() {
+            let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if pid == me {
+                continue;
+            }
+            if let Ok(area) = std::fs::read(e.path().join("environ")) {
+                if has_entry(&area, needle) {
+                    out.push(pid);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn marked_processes_by(_needle: &[u8]) -> Vec<u32> {
+    Vec::new()
 }
 
 /// True when the child `pid` has ended (not reaped — `WNOWAIT`).

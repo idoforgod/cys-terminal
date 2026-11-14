@@ -38,7 +38,7 @@ fn sh_syntax_pass_and_fail() {
         run_check(&req(&r, "bin/bad.sh")).unwrap(),
         CheckResult::Fail(_)
     ));
-    replay::remove_tree(&r);
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
 /// The compile check reads the file only: no `__pycache__` is written next to it.
@@ -56,7 +56,7 @@ fn py_compile_pass_fail_and_writes_no_pycache() {
         !r.join("bin/__pycache__").exists(),
         "the compile check wrote __pycache__"
     );
-    replay::remove_tree(&r);
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
 #[test]
@@ -69,7 +69,7 @@ fn json_parse_pass_and_fail() {
         run_check(&req(&r, "x/bad.json")).unwrap(),
         CheckResult::Fail(_)
     ));
-    replay::remove_tree(&r);
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
 /// S3: a file type with no check is not a failure; it is marked "사전 예행 불가". A listed
@@ -97,7 +97,7 @@ fn unknown_type_not_rehearsable_and_agents_json_parsed() {
         run_check(&req(&r, "agents.json")).unwrap(),
         CheckResult::Pass
     );
-    replay::remove_tree(&r);
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
 /// A rel that is not a plain pack-relative path is never checked (no `..`, no absolute path).
@@ -110,7 +110,7 @@ fn rel_must_be_plain() {
             "{bad}"
         );
     }
-    replay::remove_tree(&r);
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
 /// The hook replay (D:779): the released capability gate passes against itself; a candidate with a
@@ -144,7 +144,7 @@ fn hook_replay_judged_by_output_and_markers() {
         ),
         other => panic!("a broken hook passed the replay: {other:?}"),
     }
-    replay::remove_tree(&r);
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
 /// A child that outlives the deadline is killed with its whole process group and reaped.
@@ -181,7 +181,61 @@ fn timeout_kills_and_reaps_the_group() {
         Duration::from_secs(5),
     );
     assert_eq!(o.code, Some(0));
-    replay::remove_tree(&r);
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
+/// RULINGS CZ4 / DF5: a child whose descendant ESCAPES the process group (`setsid`) and keeps stdin
+/// open unread and stdout open after the child itself exits cannot hold the runner: it returns by its
+/// deadline plus the bounded drain, says the pipe was held, and reports — and kills — the escaped
+/// process by the run's environment marker. (The old runner blocked in the stdin writer's join and in
+/// the readers until the descendant's 30 s sleep ended, and saw no leftover outside the group.)
+#[test]
+fn runner_returns_when_an_escaped_descendant_holds_the_pipes() {
+    let r = root("escape");
+    let pidfile = r.join("esc.pid");
+    let script = format!(
+        "/usr/bin/perl -e 'use POSIX; POSIX::setsid(); open(F, \">\", \"{}\"); print F $$; close F; sleep 30' & sleep 0.3; exit 0",
+        pidfile.display()
+    );
+    let env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
+    let input = vec![b'x'; 1 << 20]; // far more than a pipe buffer: the writer would block
+    let t0 = std::time::Instant::now();
+    let o = replay::run_child(
+        &["/bin/sh".into(), "-c".into(), script],
+        &env,
+        &r,
+        &input,
+        Duration::from_secs(3),
+    );
+    let took = t0.elapsed();
+    assert!(took < Duration::from_secs(6), "the runner was held for {took:?}");
+    let esc: u32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(o.pipe_held, "the held output pipe is reported: {o:?}");
+    assert!(o.leftovers.contains(&esc), "the escaped process {esc} is reported: {o:?}");
+    assert!(o.left_something().is_some());
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!replay::pid_alive(esc), "the escaped process {esc} was killed by its exact pid");
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
+/// RULINGS CZ4: a cleanup error or a leftover scratch tree is RETURNED, never swallowed.
+#[test]
+fn cleanup_errors_are_returned() {
+    let r = root("cleanup");
+    let locked = r.join("locked");
+    std::fs::create_dir_all(locked.join("inner")).unwrap();
+    std::fs::write(locked.join("inner").join("f"), b"x").unwrap();
+    // a parent the walk cannot write: its child entries cannot be removed
+    replay::set_mode(&r, 0o500);
+    let e = replay::remove_tree(&locked);
+    replay::set_mode(&r, 0o700);
+    assert!(e.is_err(), "a tree that could not be removed is an error");
+    assert!(replay::remove_tree(&r.join("never-there")).is_ok());
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
 /// The replay environment is the allow-list only: nothing of this process's environment leaks in.
@@ -233,7 +287,7 @@ fn replay_env_is_allow_list_only() {
             "{v} leaked into the replay: {out}"
         );
     }
-    replay::remove_tree(&r);
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
 /// The stub cys answers like a daemon-less binary when its socket is not a socket, logs every call,
@@ -302,7 +356,7 @@ fn stub_cys_answers_and_logs() {
     );
     assert_eq!(replay::stub_calls(&bin).len(), 4);
     drop(sock);
-    replay::remove_tree(&r);
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
 /// RULINGS H2: every kind has a built-in known-good fixture that passes its own check.
