@@ -3698,7 +3698,10 @@ mod apply_verbs {
     /// `trigger: update`; the vendor bytes now live are R′'s pre-image; `reapplies: R` is recorded on
     /// R′. R is not re-opened and not locked. Refused: no parked copy of R here; a repair with
     /// `reapplies: R` unfinished or in force (it reaches this lane by propagation); a being-worked
-    /// repair of this lane already holds one of the files (the ordinary `begin` rule).
+    /// repair of this lane already holds one of the files (the ordinary `begin` rule). RULINGS CQ2: when
+    /// no target is parked but a target's `<rel>.user` IS on disk without a `vendor-first` record naming
+    /// it (e.g. the record was replaced by `kept-drift`), the refusal names that copy and the route that
+    /// works — `cys repair begin --files <rel> --trigger update` — instead of "nothing to re-apply".
     pub(crate) fn reapply(ctx: &Ctx<'_>, caller: &Caller, p: &Value) -> Result<Value, VerbError> {
         if !caller.is_worker() {
             return Err(VerbError::refused(
@@ -3711,22 +3714,47 @@ mod apply_verbs {
             .ok_or_else(|| VerbError::not_found(format!("{}: 그런 수리가 없습니다", r_id.as_str())))?;
         let pending = cys::pack::load_merge_pending(&ctx.pack_dir);
         let mut parked: Vec<(String, std::path::PathBuf)> = Vec::new();
+        // CQ2: a regular `<rel>.user` on disk that no `vendor-first` record names
+        let mut unrecorded: Vec<(String, std::path::PathBuf)> = Vec::new();
+        let is_regular = |p: &std::path::Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file());
         for f in ledger::file_targets(&r) {
-            let Some(e) = pending.get(&f.rel) else {
+            let copy_at_rel = ctx.pack_dir.join(format!("{}.user", f.rel));
+            let vendor_first = pending
+                .get(&f.rel)
+                .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("vendor-first"));
+            let Some(e) = vendor_first else {
+                if is_regular(&copy_at_rel) {
+                    unrecorded.push((f.rel.clone(), copy_at_rel));
+                }
                 continue;
             };
-            if e.get("kind").and_then(|k| k.as_str()) != Some("vendor-first") {
-                continue;
-            }
             let side = e
                 .get("side")
                 .and_then(|s| s.as_str())
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("{}.user", f.rel));
             let path = ctx.pack_dir.join(&side);
-            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
+            if is_regular(&path) {
                 parked.push((f.rel.clone(), path));
+            } else if path != copy_at_rel && is_regular(&copy_at_rel) {
+                // the record names another side copy that is gone; `<rel>.user` is not the one it names
+                unrecorded.push((f.rel.clone(), copy_at_rel));
             }
+        }
+        if parked.is_empty() && !unrecorded.is_empty() {
+            let copies = unrecorded
+                .iter()
+                .map(|(_, p)| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rels = unrecorded.iter().map(|(rel, _)| rel.as_str()).collect::<Vec<_>>().join(" ");
+            return Err(VerbError::new(
+                cys::repair::types::ERR_PRECONDITION,
+                format!(
+                    "{id}: 보관 사본 {copies} 는 그대로 있지만 그 사본을 가리키는 vendor-first 기록이 없어 다시 입히기(reapply)로는 입히지 않습니다 — 그 사본을 살리는 길은 수리입니다: cys repair begin --files {rels} --trigger update (작업 사본에서 <파일>.user 를 합친 뒤 검증·감사 서명 → 주인 최종 승인)",
+                    id = r_id.as_str()
+                ),
+            ));
         }
         if parked.is_empty() {
             return Err(VerbError::new(

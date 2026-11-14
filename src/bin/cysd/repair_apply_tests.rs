@@ -289,6 +289,57 @@ fn reapply_starts_a_new_repair_once() {
     assert!(e.message.contains("전파"), "{}", e.message);
 }
 
+/// RULINGS CQ2: `reapply`'s "no parked copy" refusal is true in both sub-cases — (i) neither the
+/// `vendor-first` record nor `<rel>.user` → "다시 입힐 것이 없습니다" (unchanged sentence); (ii) the copy
+/// is on disk but no `vendor-first` record names it (the boot sweep replaced it by `kept-drift`) → the
+/// sentence names the copy and the route that works, and says nothing about "nothing to re-apply".
+/// Both sentences pinned in full.
+#[test]
+fn reapply_refusal_is_true_with_and_without_the_kept_copy() {
+    let r = rig("reapplycq2");
+    let w = seat(3, "worker");
+    let id = committed(&r, "hooks/h.sh", b"#!/bin/sh\necho mine\n");
+    // (i) neither the record nor the copy
+    let e = r.call(T0 + 10.0, &w, "reapply", json!({"repair": id})).unwrap_err();
+    assert_eq!(e.code, cys::repair::types::ERR_PRECONDITION, "{}", e.message);
+    assert_eq!(
+        e.message,
+        // (every refusal reaches the wire with the verb's `repair.<verb>: ` prefix — `handle_with`)
+        format!("repair.reapply: {id}: 이 부서의 팩에는 업데이트가 보관한 {id} 의 수정본이 없습니다(vendor-first 기록과 보관 사본 <파일>.user 가 함께 있어야 합니다) — 다시 입힐 것이 없습니다")
+    );
+    // (ii) the update parked the edit, then the boot sweep replaced the record by `kept-drift`
+    park(&r, "hooks/h.sh", b"#!/bin/sh\necho mine\n", b"#!/bin/sh\necho vendor\n");
+    let mut pending = cys::pack::load_merge_pending(&r.pack);
+    pending.insert("hooks/h.sh".into(), json!({"kind": "kept-drift", "version": "0.15.1", "ts": 2}));
+    cys::pack::save_merge_pending(&r.pack, &pending);
+    let copy = r.pack.join("hooks/h.sh.user");
+    let e = r.call(T0 + 11.0, &w, "reapply", json!({"repair": id})).unwrap_err();
+    assert_eq!(e.code, cys::repair::types::ERR_PRECONDITION, "{}", e.message);
+    assert_eq!(
+        e.message,
+        format!(
+            "repair.reapply: {id}: 보관 사본 {} 는 그대로 있지만 그 사본을 가리키는 vendor-first 기록이 없어 다시 입히기(reapply)로는 입히지 않습니다 — 그 사본을 살리는 길은 수리입니다: cys repair begin --files hooks/h.sh --trigger update (작업 사본에서 <파일>.user 를 합친 뒤 검증·감사 서명 → 주인 최종 승인)",
+            copy.display()
+        )
+    );
+    assert!(!e.message.contains("다시 입힐 것이 없습니다"), "{}", e.message);
+    // the same with no record at all
+    let mut pending = cys::pack::load_merge_pending(&r.pack);
+    pending.remove("hooks/h.sh");
+    cys::pack::save_merge_pending(&r.pack, &pending);
+    let e = r.call(T0 + 12.0, &w, "reapply", json!({"repair": id})).unwrap_err();
+    assert!(e.message.contains(&copy.display().to_string()) && e.message.contains("cys repair begin --files hooks/h.sh --trigger update"), "{}", e.message);
+    // nothing was started and nothing in the pack changed
+    assert_eq!(std::fs::read(&copy).unwrap(), b"#!/bin/sh\necho mine\n");
+    assert_eq!(ledger::list_ids_in(&r.root).len(), 1, "no new repair");
+    // the route the sentence names is open (RULINGS CN) — R itself was superseded by the update
+    let mut rec = r.record_of(&id);
+    rec.state = RepairState::Superseded;
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let v = r.call(T0 + 13.0, &w, "begin", json!({"trigger": "update", "files": ["hooks/h.sh"]})).unwrap();
+    assert_eq!(v["begin"], "new", "{v}");
+}
+
 /// `tick` / `sweep` reach the daemon's own handler only; through the bare dispatcher (no daemon) they
 /// are refused with a sentence (the old expectation of T3's census was `repair_not_implemented`).
 #[test]
