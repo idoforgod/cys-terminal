@@ -402,7 +402,7 @@ class Gate(unittest.TestCase):
     # -- the updater archive: one streaming pass (RULINGS CA1) --
     def make_tar(self, name, src_dir, arcname="cys.app"):
         arc = os.path.join(self.tmp, name)
-        with tarfile.open(arc, "w:gz") as t:
+        with tarfile.open(arc, "w:gz", format=tarfile.USTAR_FORMAT) as t:
             t.add(src_dir, arcname=arcname)
         return arc
 
@@ -424,7 +424,7 @@ class Gate(unittest.TestCase):
         # link added LAST (after its target), fat binaries whose target slice sits late in the member
         arc = os.path.join(self.tmp, "big.tar.gz")
         n_text, step, n_macho = 4000, 66, 0
-        with tarfile.open(arc, "w:gz") as t:
+        with tarfile.open(arc, "w:gz", format=tarfile.USTAR_FORMAT) as t:
             def add(rel, data, mode=0o644):
                 ti = tarfile.TarInfo("cys.app/" + rel)
                 ti.size, ti.mode = len(data), mode
@@ -469,7 +469,7 @@ class Gate(unittest.TestCase):
             ti = tarfile.TarInfo(prefix + py + rel)
             ti.type, ti.linkname, ti.mode = tarfile.LNKTYPE, prefix + py + target, 0o755
             t.addfile(ti)
-        with tarfile.open(arc, "w:gz") as t:
+        with tarfile.open(arc, "w:gz", format=tarfile.USTAR_FORMAT) as t:
             for when, rel, target in plan:
                 if when == "before":
                     hard(t, rel, target)
@@ -641,7 +641,7 @@ class Gate(unittest.TestCase):
         if not keep_python:
             os.remove(os.path.join(app, "Contents/Resources/runtime/python/bin/python3.12"))   # python3 still links to it
         arc = os.path.join(self.tmp, "odd.tar.gz")
-        with tarfile.open(arc, "w:gz") as t:
+        with tarfile.open(arc, "w:gz", format=tarfile.USTAR_FORMAT) as t:
             t.add(app, arcname="cys.app")
             data = thin(X86_64, minos="10.15") if data is None else data
             ti = tarfile.TarInfo(name)
@@ -674,7 +674,7 @@ class Gate(unittest.TestCase):
         # green control: a directory member repeated is fine
         app = self.app()
         arc = os.path.join(self.tmp, "dirs.tar.gz")
-        with tarfile.open(arc, "w:gz") as t:
+        with tarfile.open(arc, "w:gz", format=tarfile.USTAR_FORMAT) as t:
             t.add(app, arcname="cys.app")
             ti = tarfile.TarInfo("cys.app/Contents/Resources")
             ti.type = tarfile.DIRTYPE
@@ -696,7 +696,7 @@ class Gate(unittest.TestCase):
         for flag in (b"Z", tarfile.FIFOTYPE):
             app = self.app()
             arc = os.path.join(self.tmp, "type.tar.gz")
-            with tarfile.open(arc, "w:gz") as t:
+            with tarfile.open(arc, "w:gz", format=tarfile.USTAR_FORMAT) as t:
                 t.add(app, arcname="cys.app")
                 data = thin(ARM64, minos="11.0")
                 ti = tarfile.TarInfo("cys.app/Contents/Resources/runtime/extra")
@@ -704,8 +704,9 @@ class Gate(unittest.TestCase):
                 t.addfile(ti, io.BytesIO(data))
             rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
             self.assertEqual(rc, 2, flag.decode() + "\n" + out)
-            self.assertIn("the archive is not in the plain shape (RULINGS DU1) — cys.app/Contents/Resources/runtime/extra: "
-                          "not measurable — member type %r is not a directory, a regular file" % flag.decode(), out)
+            self.assertIn("the archive is not in the plain shape (RULINGS DU1) — record ", out)
+            self.assertIn("cys.app/Contents/Resources/runtime/extra: not measurable — its record kind %r is not in the "
+                          "allow-list" % flag.decode(), out)
             self.assertNotIn("RESULT: PASS", out)
             shutil.rmtree(app)
 
@@ -715,7 +716,7 @@ class Gate(unittest.TestCase):
         for link_first in (True, False):
             app = self.py_links([("python/bin/python3", "python3.12"), ("py", "python")])
             arc = os.path.join(self.tmp, "below.tar.gz")
-            with tarfile.open(arc, "w:gz") as t:
+            with tarfile.open(arc, "w:gz", format=tarfile.USTAR_FORMAT) as t:
                 def below():
                     ti = tarfile.TarInfo("cys.app/Contents/Resources/runtime/py/bin/python3.12")
                     ti.size, ti.mode = 10, 0o755
@@ -727,8 +728,8 @@ class Gate(unittest.TestCase):
                     below()
             rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
             self.assertEqual(rc, 2, out)
-            self.assertIn("cys.app/Contents/Resources/runtime/py/bin/python3.12: not measurable — its name passes through "
-                          "the symbolic-link member cys.app/Contents/Resources/runtime/py", out)
+            self.assertIn("cys.app/Contents/Resources/runtime/py/bin/python3.12: not measurable — its parent "
+                          "cys.app/Contents/Resources/runtime/py is a member that is a symbolic link", out)
             self.assertNotIn("FAIL", out)
             self.assertNotRegex(out, r"python3 -> python3\.12\s+x86_64")     # the stale Mach-O result is not used
             shutil.rmtree(app)
@@ -737,7 +738,7 @@ class Gate(unittest.TestCase):
         # DU2, the reviewer's case: NO directory members; cys.app/Contents/MacOS/cys and a required python3 ->
         # /usr/bin/python3 — not measurable (exit 2), no "missing component" proven failure
         arc = os.path.join(self.tmp, "nodirs.tar.gz")
-        with tarfile.open(arc, "w:gz") as t:
+        with tarfile.open(arc, "w:gz", format=tarfile.USTAR_FORMAT) as t:
             data = thin(X86_64, minos="10.13")
             ti = tarfile.TarInfo("cys.app/Contents/MacOS/cys")
             ti.size, ti.mode = len(data), 0o755
@@ -750,6 +751,92 @@ class Gate(unittest.TestCase):
         self.assertIn("CANNOT JUDGE required entry point cys.app/Contents/Resources/runtime/python/bin/python3: not measurable", out)
         self.assertNotIn("missing component", out)
         self.assertNotIn("FAIL", out)
+
+    # -- T11b · RULINGS EB1–EB3: the raw records, every parent a directory, hard links first --
+    def test_sparse_records_in_every_form_are_not_measurable(self):
+        # EB1, the reviewer's I1: a PAX local header GNU.sparse.map=4096,96 + GNU.sparse.size=4192 before a type-'0'
+        # member whose 96 stored bytes are an arm64 Mach-O — tarfile applies the map (zeros), the updater's tar crate
+        # writes the stored bytes; and the 0.0 / 1.0 forms and the old GNU type 'S'
+        arm = thin(ARM64, minos="11.0")[:96].ljust(96, b"\0")
+        for label, fmt, pax, kind in (
+                ("PAX 0.1", tarfile.PAX_FORMAT, {"GNU.sparse.map": "4096,96", "GNU.sparse.size": "4192"}, tarfile.REGTYPE),
+                ("PAX 0.0", tarfile.PAX_FORMAT, {"GNU.sparse.numblocks": "1", "GNU.sparse.offset": "4096",
+                                                  "GNU.sparse.numbytes": "96", "GNU.sparse.size": "4192"}, tarfile.REGTYPE),
+                ("PAX 1.0", tarfile.PAX_FORMAT, {"GNU.sparse.major": "1", "GNU.sparse.minor": "0",
+                                                  "GNU.sparse.name": "cys.app/Contents/Resources/runtime/extra",
+                                                  "GNU.sparse.realsize": "4192"}, tarfile.REGTYPE),
+                ("old GNU 'S'", tarfile.GNU_FORMAT, {}, tarfile.GNUTYPE_SPARSE)):
+            app = self.app()
+            arc = os.path.join(self.tmp, "sparse.tar.gz")
+            with tarfile.open(arc, "w:gz", format=tarfile.USTAR_FORMAT) as t:
+                t.add(app, arcname="cys.app")
+            with tarfile.open(arc, "r:gz") as src, tarfile.open(arc + ".2", "w:gz", format=fmt) as t:
+                for m in src:                                      # copy the ustar members, then the planted record
+                    t.addfile(m, src.extractfile(m) if m.isfile() else None)
+                ti = tarfile.TarInfo("cys.app/Contents/Resources/runtime/extra")
+                ti.type, ti.size, ti.mode, ti.pax_headers = kind, len(arm), 0o755, dict(pax)
+                t.addfile(ti, io.BytesIO(arm))
+            rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc + ".2")
+            self.assertEqual(rc, 2, label + "\n" + out)
+            self.assertIn("(RULINGS EB1)", out)
+            self.assertNotIn("RESULT: PASS", out)
+            shutil.rmtree(app)
+
+    def test_a_long_name_in_the_ustar_prefix_is_measured_normally(self):
+        # EB4: the real archives carry names up to 162 bytes through the ustar prefix field (4,812 records each)
+        app = self.app()
+        deep = "cys.app/Contents/Resources/runtime/python/lib/python3.12/site-packages/a-very-long-package-name/" \
+               "and/a/deeper/folder/libdeep.dylib"
+        self.assertGreater(len(deep), 100)
+        self.put(deep, thin(X86_64, minos="10.15"))
+        rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, self.make_tar("long.tar.gz", app))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Mach-O files: 9 ", out)                    # the 8 of the fake app + the deep dylib
+
+    def test_a_parent_that_is_not_a_directory_member_is_not_measurable(self):
+        # EB2, the reviewer's I2: `extra` a regular (text) member and `extra/python3` a Mach-O, in both orders
+        for file_first in (True, False):
+            app = self.app()
+            arc = os.path.join(self.tmp, "parent.tar.gz")
+            with tarfile.open(arc, "w:gz", format=tarfile.USTAR_FORMAT) as t:
+                t.add(app, arcname="cys.app")
+                def add(name, data):
+                    ti = tarfile.TarInfo(name)
+                    ti.size, ti.mode = len(data), 0o755
+                    t.addfile(ti, io.BytesIO(data))
+                members = [("cys.app/Contents/Resources/runtime/extra", b"text\n"),
+                           ("cys.app/Contents/Resources/runtime/extra/python3", thin(X86_64))]
+                for name, data in (members if file_first else members[::-1]):
+                    add(name, data)
+            rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("cys.app/Contents/Resources/runtime/extra/python3: not measurable — its parent "
+                          "cys.app/Contents/Resources/runtime/extra is a member that is not a directory", out)
+            self.assertNotIn("RESULT: PASS", out)
+            shutil.rmtree(app)
+
+    def test_a_hard_link_with_a_repeated_name_is_proven_wrong_in_both_orders(self):
+        # EB3: the hard link is recorded before any name handling — exit 1 with its own diagnosis
+        for link_first in (True, False):
+            app = self.app()
+            arc = os.path.join(self.tmp, "hard-dup.tar.gz")
+            with tarfile.open(arc, "w:gz", format=tarfile.USTAR_FORMAT) as t:
+                t.add(app, arcname="cys.app")
+                def regular():
+                    ti = tarfile.TarInfo("cys.app/Contents/Resources/runtime/extra")
+                    ti.size = 5
+                    t.addfile(ti, io.BytesIO(b"text\n"))
+                def hard():
+                    ti = tarfile.TarInfo("cys.app/Contents/Resources/runtime/extra")
+                    ti.type, ti.linkname = tarfile.LNKTYPE, "cys.app/Contents/MacOS/cys"
+                    t.addfile(ti)
+                for f in ((hard, regular) if link_first else (regular, hard)):
+                    f()
+            rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("FAIL cys.app/Contents/Resources/runtime/extra: a tar hard link (to cys.app/Contents/MacOS/cys) "
+                          "— the archive does not guarantee which file this link names", out)
+            shutil.rmtree(app)
 
     def test_absolute_names_dotdot_and_odd_components_in_member_names_are_not_measurable(self):
         for name in ("cys.app/../evil", "/abs/evil", "cys.app//evil", "cys.app/./evil"):
