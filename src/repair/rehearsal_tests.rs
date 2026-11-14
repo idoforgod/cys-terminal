@@ -5,11 +5,11 @@ use super::*;
 use crate::repair::replay;
 use crate::repair::types::TargetState;
 
+/// RULINGS DE6: every test folder lies inside the replay's own scratch base (never HOME).
 fn root(name: &str) -> PathBuf {
-    let home = dirs::home_dir().expect("HOME");
-    let p = home
-        .join("t5b-rehearsal")
-        .join(format!("{name}-{}", replay::random_hex(4)));
+    let p = scratch_base()
+        .join("tests.nosync")
+        .join(format!("rehearsal-{name}-{}", replay::random_hex(4)));
     std::fs::create_dir_all(&p).unwrap();
     p
 }
