@@ -91,14 +91,48 @@ fn plan_units(n: usize) {
 
 /// Records one execution unit of the current check (RULINGS GA3 / GR3).
 fn note(o: &ChildOutcome) {
+    note_unit(replay::observed_whole(o));
+}
+
+/// Records one unit of the current check that ended — observed whole or not (a read counts as one).
+fn note_unit(whole: bool) {
     UNITS.with(|u| {
         let (p, w, b) = u.get();
-        if replay::observed_whole(o) {
+        if whole {
             u.set((p, w + 1, b));
         } else {
             u.set((p, w, true));
         }
     });
+}
+
+/// The events a hook replay runs (`check_arg`, comma separated; none named → `PreToolUse`).
+fn hook_events(arg: &str) -> Vec<&str> {
+    let events: Vec<&str> = arg
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .collect();
+    if events.is_empty() {
+        vec!["PreToolUse"]
+    } else {
+        events
+    }
+}
+
+/// RULINGS GR3 / HU1 — the execution plan of a check of this kind, fixed BEFORE anything of the check
+/// can return: a hook replay = its syntax check + per event the candidate's run and the released
+/// copy's run; a syntax check, a compile check, a self-test and a JSON read one unit each; a kind
+/// that rehearses nothing none.
+fn units_for(kind: CheckKind, arg: &str, rel: &str) -> usize {
+    match kind {
+        CheckKind::NonePrerehearsal => usize::from(arg == "json-parse"),
+        CheckKind::JsonParse | CheckKind::ShSyntax | CheckKind::PyCompile | CheckKind::SelfTest => 1,
+        CheckKind::HookReplay => {
+            usize::from(rel.ends_with(".sh"))
+                + hook_events(arg).len() * (1 + usize::from(released_copy(rel).is_some()))
+        }
+    }
 }
 
 /// RULINGS GA3 / GR3 — [`run_check`] and whether the check ran to a RESULT with EVERY execution unit
@@ -121,6 +155,11 @@ pub fn run_check_observed(req: &CheckRequest) -> (Result<CheckResult, RepairErro
 
 /// Runs one check child (killed and reaped at the deadline).
 pub fn run_check(req: &CheckRequest) -> Result<CheckResult, RepairError> {
+    // RULINGS HU1: the execution plan for this kind of check is fixed before ANY return — a planned
+    // execution that could not start (a target gone, not a regular file, not a plain path) leaves its
+    // unit without an outcome: incomplete
+    let (kind, arg) = check_for(&req.entry_rel);
+    plan_units(units_for(kind, arg, &req.entry_rel));
     if !rel_is_plain(&req.entry_rel) {
         return Ok(CheckResult::Fail(format!(
             "{}: 팩 안의 상대 경로가 아닙니다",
@@ -128,7 +167,6 @@ pub fn run_check(req: &CheckRequest) -> Result<CheckResult, RepairError> {
         )));
     }
     let file = req.scratch_root.join(&req.entry_rel);
-    let (kind, arg) = check_for(&req.entry_rel);
     run_kind(kind, arg, &req.entry_rel, &req.scratch_root, &file, req)
 }
 
@@ -160,14 +198,8 @@ fn run_kind(
             "{rel}: 일반 파일이 아닙니다(없거나 링크·폴더)"
         ))),
         CheckKind::JsonParse => Ok(json_parse(file, rel)),
-        CheckKind::ShSyntax => {
-            plan_units(1);
-            Ok(sh_syntax(file, rel, req.deadline))
-        }
-        CheckKind::PyCompile => {
-            plan_units(1);
-            py_compile(file, rel, req.deadline)
-        }
+        CheckKind::ShSyntax => Ok(sh_syntax(file, rel, req.deadline)),
+        CheckKind::PyCompile => py_compile(file, rel, req.deadline),
         CheckKind::SelfTest => executed(root, rel, req, Exec::SelfTest(arg)),
         CheckKind::HookReplay => executed(root, rel, req, Exec::Hook(arg)),
     }
@@ -186,7 +218,12 @@ fn read_plain(file: &Path) -> Result<Vec<u8>, RepairError> {
 }
 
 fn json_parse(file: &Path, rel: &str) -> CheckResult {
-    match read_plain(file) {
+    let read = read_plain(file);
+    // RULINGS HU1: the read is this check's one unit — it ended when the bytes were read
+    if read.is_ok() {
+        note_unit(true);
+    }
+    match read {
         Ok(b) => match serde_json::from_slice::<serde_json::Value>(&b) {
             Ok(_) => CheckResult::Pass,
             Err(e) => CheckResult::Fail(format!("{rel}: JSON 으로 읽히지 않습니다 — {e}")),
@@ -487,7 +524,6 @@ fn executed(
     let started = std::time::Instant::now();
     match &exec {
         Exec::SelfTest(_) => {
-            plan_units(1);
             let o = run_in_copy(root, rel, None, None, &exec, "", req.deadline)?;
             if let Some(m) = broken_marker(&o.stderr) {
                 if !o.timed_out {
@@ -499,24 +535,11 @@ fn executed(
             Ok(outcome_result(&o, rel, "자체 시험"))
         }
         Exec::Hook(events) => {
-            let events: Vec<&str> = events
-                .split(',')
-                .map(str::trim)
-                .filter(|e| !e.is_empty())
-                .collect();
-            let events = if events.is_empty() {
-                vec!["PreToolUse"]
-            } else {
-                events
-            };
+            // RULINGS GR3 / HU1: the units of this replay were listed by `run_check` before anything
+            // could return (`units_for`) — the syntax check, then per event both sides
+            let events = hook_events(events);
             // the released copy of this hook, for the expected-output comparison
             let released = released_copy(rel);
-            // RULINGS GR3: every unit of this replay is listed before the first one starts — the
-            // syntax check, then per event the candidate's run and the released copy's run
-            plan_units(
-                usize::from(rel.ends_with(".sh"))
-                    + events.len() * (1 + usize::from(released.is_some())),
-            );
             // the syntax check first (design §4-8 "문법 검사를 돌린다"): a hook that `exec`s into its
             // interpreter early never parses its own tail, so the replay alone cannot see an error there
             if rel.ends_with(".sh") {
