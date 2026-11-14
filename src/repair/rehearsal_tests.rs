@@ -23,6 +23,23 @@ fn req(root: &Path, rel: &str) -> CheckRequest {
     }
 }
 
+/// RULINGS GA4 (c): a process observed from OUTSIDE the runner — identity = pid + start time — has
+/// disappeared (within a generous bound that only ends a hang). A runner that merely empties its own
+/// report fails this.
+fn gone(pid: u32) -> bool {
+    let Some(t) = replay::process_identity(pid) else {
+        return true;
+    };
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < until { // wallclock: guard the bound only ends a hang; the verdict is the process's own disappearance
+        if replay::process_identity(pid) != Some(t) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
 fn put(root: &Path, rel: &str, text: &str) {
     let p = root.join(rel);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -168,8 +185,8 @@ fn timeout_kills_and_reaps_the_group() {
         .trim()
         .parse()
         .unwrap();
-    // the runner's own truthful account (DR3), not a sleep: a process it could not kill is a survivor
-    assert!(!o.survivors.contains(&bg), "the background child {bg} survived the kill");
+    // RULINGS GA4 (c): observed from outside — the process itself is gone
+    assert!(gone(bg), "the background child {bg} survived the kill");
     // a normal end also leaves nothing behind
     let o = replay::run_child(
         &["/bin/sh".into(), "-c".into(), "sleep 30 & exit 0".into()],
@@ -212,7 +229,7 @@ fn runner_returns_when_an_escaped_descendant_holds_the_pipes() {
     assert!(o.pipe_held, "the held output pipe is reported: {o:?}");
     assert!(o.leftovers.contains(&esc), "the escaped process {esc} is reported: {o:?}");
     assert!(o.left_something().is_some());
-    assert!(!o.survivors.contains(&esc), "the escaped process {esc} was killed by its exact pid");
+    assert!(gone(esc), "the escaped process {esc} was killed by its exact pid");
     replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
@@ -333,7 +350,7 @@ fn descendant_living_on_after_a_successful_exit_is_killed_and_reported() {
     let bg: u32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
     assert!(o.leftovers.contains(&bg), "the descendant {bg} is reported: {o:?}");
     assert!(o.left_something().is_some());
-    assert!(!o.survivors.contains(&bg), "the descendant {bg} was killed");
+    assert!(gone(bg), "the descendant {bg} was killed");
     replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
@@ -406,6 +423,35 @@ fn nonblocking_setup_failure_runs_nothing() {
     replay::FAIL_NONBLOCK_FOR_TEST.with(|f| f.set(false));
     assert!(o.spawn_error.as_deref().is_some_and(|e| e.contains("non-blocking")), "{o:?}");
     assert!(!o.unreaped, "{o:?}");
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
+/// RULINGS GA4 (a): a child C leaves the group (`setsid`) and is seen; LATER C starts a grandchild G
+/// that closes its standard streams, and C exits. G is followed because the sampler asks the
+/// children of every process it has seen, at every sample — G is reported and killed, and is gone
+/// observed from outside. (The old sampler skipped every process it had seen once, so G was never
+/// looked at.)
+#[test]
+#[cfg(unix)]
+fn grandchild_of_an_escaped_child_is_followed() {
+    let r = root("ga4-follow");
+    let pidfile = r.join("g.pid");
+    let script = format!(
+        "/usr/bin/perl -e 'use POSIX; POSIX::setsid(); sleep 1; my $g = fork(); if ($g == 0) {{ close STDIN; close STDOUT; close STDERR; sleep 30; exit 0 }} open(F, \">\", \"{}\"); print F $g; close F; sleep 1; exit 0' & sleep 3; exit 0",
+        pidfile.display()
+    );
+    let env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
+    let o = replay::run_child(
+        &["/bin/sh".into(), "-c".into(), script],
+        &env,
+        &r,
+        b"",
+        Duration::from_secs(20),
+    );
+    assert_eq!(o.code, Some(0), "{o:?}");
+    let g: u32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    assert!(o.leftovers.contains(&g), "the grandchild {g} is reported: {o:?}");
+    assert!(gone(g), "the grandchild {g} was killed");
     replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
