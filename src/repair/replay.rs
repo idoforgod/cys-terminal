@@ -355,6 +355,132 @@ pub fn observed_whole(o: &ChildOutcome) -> bool {
         && o.stderr_state.whole()
 }
 
+/// RULINGS GA1 — what one hook run ANSWERED, read in ONE place from the complete observation: how
+/// it ended, whether each stream was observed whole, read errors. Every hook answer of the screen
+/// (R / C / G, the backstop cell) and of the rehearsal's hook replay is read by [`judge_hook`] and
+/// nowhere else; the deny grammar ([`deny_payload`]) has this one caller (a source census pins it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookAnswer {
+    /// exit 2 — the harness blocks the call whatever the output says (the code stands by itself)
+    Block,
+    /// exit 0 and the WHOLE output is exactly one deny object (DF1 / EO1)
+    DenyObject,
+    /// exit 0, the whole output observed, no deny object
+    Pass,
+    /// not judged: timed out, could not start, left something behind, ended otherwise, or an exit 0
+    /// whose output was not observed whole (EL1) — never a deny and never an allow
+    NotShown(String),
+}
+
+/// What a hook printed on standard output — read only from an output observed whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Printed {
+    Nothing,
+    /// every non-blank line is a JSON document
+    Json,
+    Text,
+}
+
+/// THE reading of one hook run ([`judge_hook`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookReading {
+    pub answer: HookAnswer,
+    /// standard output's shape; `None` = not observed whole (whatever the exit code)
+    pub printed: Option<Printed>,
+    /// standard error observed whole — a line in it is evidence only then
+    pub stderr_whole: bool,
+}
+
+/// RULINGS GA1 — THE judge of every hook answer.
+pub fn judge_hook(o: &ChildOutcome) -> HookReading {
+    let printed = o.stdout_whole().then(|| printed_shape(&o.stdout));
+    let answer = if o.timed_out {
+        HookAnswer::NotShown("timeout".into())
+    } else if let Some(why) = o.left_something() {
+        // RULINGS CZ4: a run that left a process or a held pipe behind is not measurable
+        HookAnswer::NotShown(why)
+    } else if let Some(e) = &o.spawn_error {
+        HookAnswer::NotShown(format!("spawn: {e}"))
+    } else {
+        match o.code {
+            Some(2) => HookAnswer::Block,
+            Some(0) if !o.stdout_whole() => HookAnswer::NotShown(format!(
+                "exit 0, output not observed whole ({:?})",
+                o.stdout_state
+            )),
+            Some(0) if deny_payload(&o.stdout) => HookAnswer::DenyObject,
+            Some(0) => HookAnswer::Pass,
+            Some(c) => HookAnswer::NotShown(format!("exit {c}")),
+            None => HookAnswer::NotShown(format!("signal {:?}", o.signal)),
+        }
+    };
+    HookReading {
+        answer,
+        printed,
+        stderr_whole: o.stderr_state.whole(),
+    }
+}
+
+fn printed_shape(b: &[u8]) -> Printed {
+    let text = String::from_utf8_lossy(b);
+    if text.trim().is_empty() {
+        return Printed::Nothing;
+    }
+    if text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok())
+    {
+        Printed::Json
+    } else {
+        Printed::Text
+    }
+}
+
+/// RULINGS DF1 / EO1 — DENY-by-JSON is a BYTE GRAMMAR, not a trim: the output must be, byte for
+/// byte, optional JSON white space (0x20 0x09 0x0A 0x0D) + ONE object of exactly the shape the
+/// released devices print — the only top-level key `hookSpecificOutput`, an object whose keys are
+/// exactly `hookEventName` = `PreToolUse`, `permissionDecision` = `deny` and
+/// `permissionDecisionReason`, every value a string, no key twice — + optional JSON white space.
+/// Anything else (another white space such as U+0085, U+00A0 or U+FEFF, a second object, another
+/// key, another value type) is "not shown".
+pub(crate) fn deny_payload(stdout: &[u8]) -> bool {
+    let json_ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r');
+    let start = stdout.iter().position(|b| !json_ws(b)).unwrap_or(stdout.len());
+    let end = stdout.iter().rposition(|b| !json_ws(b)).map_or(start, |i| i + 1);
+    let body = &stdout[start..end];
+    if body.first() != Some(&b'{') {
+        return false;
+    }
+    // a key twice is a shape the devices never print (a parser would keep one of them)
+    let text = String::from_utf8_lossy(body);
+    for key in [
+        "\"hookSpecificOutput\"",
+        "\"hookEventName\"",
+        "\"permissionDecision\"",
+        "\"permissionDecisionReason\"",
+    ] {
+        if text.matches(key).count() > 1 {
+            return false;
+        }
+    }
+    let Ok(serde_json::Value::Object(top)) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    if top.len() != 1 {
+        return false;
+    }
+    let Some(serde_json::Value::Object(h)) = top.get("hookSpecificOutput") else {
+        return false;
+    };
+    let keys: std::collections::BTreeSet<&str> = h.keys().map(String::as_str).collect();
+    keys == std::collections::BTreeSet::from(["hookEventName", "permissionDecision", "permissionDecisionReason"])
+        && h.values().all(|v| v.is_string())
+        && h.get("hookEventName").and_then(|v| v.as_str()) == Some("PreToolUse")
+        && h.get("permissionDecision").and_then(|v| v.as_str()) == Some("deny")
+}
+
 /// RULINGS GA3 — THE completeness of a pass, in ONE place (the screen and the rehearsal both ask it):
 /// the planned executions are declared before the first one starts ([`PassPlan::plan`]); each ends
 /// with an outcome observed whole or not ([`PassPlan::record`]); the pass is complete only when every
