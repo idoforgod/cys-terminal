@@ -174,6 +174,25 @@ else:
 
 env = dict(os.environ)
 env["CYS_PACK_DIR"] = env.get("CYS_PACK_DIR") or "/tmp"
+# ★0.15.0 T7b (RULINGS I1 · Q4 — REWRITE, old expectation kept): `task-prompt` now asks the assignment gate
+#   (`cys repair gate --lane … --json`) before it builds a ticket, and holds an ordinary ticket when that read cannot
+#   run (no `cys` in this test's PATH). This file measures the survival gate and the todo path, not the assignment
+#   gate (tests/test_task_prompt_gate.py does), so the subprocess runs get a fake `cys` that answers the gate OPEN and
+#   the in-process runs replace `_ticket_gate` by the open answer; every expectation below is unchanged (rc 0 · ticket).
+import tempfile  # noqa: E402
+_gate_stub = tempfile.mkdtemp(prefix="orch-gate-stub-")
+with open(os.path.join(_gate_stub, "gate.py"), "w", encoding="utf-8") as _f:
+    _f.write("import json, sys\nif sys.argv[1:3] == ['repair', 'gate']:\n"
+             "    print(json.dumps({'verdict': 'open', 'cause': None, 'conflict_summary': None})); sys.exit(0)\n"
+             "sys.exit(3)\n")
+if os.name == "nt":
+    with open(os.path.join(_gate_stub, "cys.cmd"), "w", encoding="utf-8") as _f:
+        _f.write('@"%s" "%s" %%*\r\n' % (sys.executable, os.path.join(_gate_stub, "gate.py")))
+else:
+    with open(os.path.join(_gate_stub, "cys"), "w", encoding="utf-8") as _f:
+        _f.write("#!/bin/sh\nexec %s %s \"$@\"\n" % (sys.executable, os.path.join(_gate_stub, "gate.py")))
+    os.chmod(os.path.join(_gate_stub, "cys"), 0o755)
+env["PATH"] = _gate_stub + os.pathsep + env.get("PATH", "")
 r_cc = subprocess.run([PY, ORCH, "task-prompt", "--task", "T", "--scope", "S", "--success", "C",
                        "--to", "worker", "--no-survival-gate", "--output-format", "F"],
                       capture_output=True, text=True, encoding="utf-8", env=env, timeout=60)
@@ -289,6 +308,9 @@ def run_tp(rows, to="worker", surface=None, no_gate=False):
                                  no_survival_gate=no_gate)
     real = orch.cys_status
     orch.cys_status = fake_status
+    # ★0.15.0 T7b (REWRITE — before T7b `cmd_task_prompt` had no assignment gate): the gate answers OPEN here
+    real_gate = orch._ticket_gate
+    orch._ticket_gate = lambda prefix, a, lane: (None, [])
     out, err = io.StringIO(), io.StringIO()
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -297,6 +319,7 @@ def run_tp(rows, to="worker", surface=None, no_gate=False):
         rc = "EXC:%s:%s" % (type(e).__name__, str(e)[:80])
     finally:
         orch.cys_status = real
+        orch._ticket_gate = real_gate
     return rc, out.getvalue(), err.getvalue(), calls[0]
 
 
