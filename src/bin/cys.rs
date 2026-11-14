@@ -27332,19 +27332,17 @@ fn heal_prompt_line(kind: Option<&str>, ts: Option<u64>, rel: &str) -> String {
     }
 }
 
-/// ★T4-fix(R1-적대 #2): `{rel}.user` 세대 보존 — 백업 덮어쓰기 직전, 기존 보존본이 있고 내용이
-/// 이번에 쓸 내용과 다르면 `{rel}.user.prev-<ts>[-n]` 으로 원자 개명해 이전 세대를 지킨다.
-/// conflicted(reason:capture-failed) 원장의 .user 는 자동 병합 실패 때 살아남은 유일 원본 —
-/// 단일 슬롯(.user) 재사용이 이를 침묵 클로버하면 영구 소실이었다(캡처 없음). 동일 내용이면
-/// 무조치(멱등 재실행의 세대 증식 방지) · 개명 실패 = Err(호출측 fail-closed 거부 의무).
-/// ★0.15.0 M11 사: 본문은 라이브러리(`cys::pack::preserve_prior_user_generation`)로 옮겼다 — 설치 실행부도
-/// 같은 함수를 쓴다(세 번째 방식 금지). 이 이름은 기존 호출부를 위해 남긴 위임이다.
-fn preserve_prior_user_generation(
-    dir: &std::path::Path,
-    rel: &str,
-    incoming: Option<&[u8]>,
-) -> Result<Option<std::path::PathBuf>, String> {
-    cys::pack::preserve_prior_user_generation(dir, rel, incoming)
+/// ★T2i(RULINGS EC2): 보관 결과의 사람용 줄 — 자리의 다른 사본을 옮긴 세대 자리 · 겹침.
+fn print_park_outcome(dir: &std::path::Path, rel: &str, parked: &cys::pack::ParkOutcome) {
+    for s in &parked.moved {
+        println!("기존 보존본 세대 보존: {}", dir.join(s).display());
+    }
+    if parked.overlap {
+        println!(
+            "⚠ '{rel}' 보관 자리({rel}.user)가 다른 쓰기와 겹쳐, 이번 사본은 {} 에 두었습니다(감사 원장에 기록) — 어느 사본도 덮이지 않았습니다",
+            dir.join(&parked.at).display()
+        );
+    }
 }
 
 /// ★T4(v2 §5): 명시 치유 동사 — 드리프트 system 파일을 embed 본으로 복원(백업 선행 · 3중 전진 ·
@@ -27412,19 +27410,13 @@ fn run_pack_heal(rel: &str, yes: bool) -> i32 {
     // 침묵 클로버하면 영구 소실이었다. 이번 백업 내용(현 디스크 바이트)과 다르면
     // .user.prev-<ts> 세대 개명 후 진행 · 개명 실패 = fail-closed 거부(무변경).
     // ⑤-0 · ⑤ (RULINGS EC1: 잠금을 새로 잡지 않는다 — 세대는 배타 자리 예약이 지킨다).
+    // ★T2i(RULINGS EC2): 세대 보존과 백업이 하나다 — `park_copy`(덮지 않는 놓기 · 자리의 다른 사본은 세대 자리로).
     let step = (|| -> Result<(), String> {
-        if target.exists() {
-            match preserve_prior_user_generation(&dir, rel, std::fs::read(&target).ok().as_deref()) {
-                Ok(Some(prev)) => println!("기존 보존본 세대 보존: {}", prev.display()),
-                Ok(None) => {}
-                Err(e) => return Err(format!("{e} — fail-closed 거부(무변경)")),
-            }
-        }
         // ⑤ 백업 선행 — 판독 가능=.user 전문 · 판독 불가(존재 시)=바이트 백업 · 실패=fail-closed 거부.
         if let Some(d) = disk.as_deref() {
-            // ★T2i(RULINGS EC4 (4)): 닻 내린 쓰기.
-            cys::pack::write_beneath(&dir, &format!("{rel}.user"), d.as_bytes())
+            let parked = cys::pack::park_copy(&dir, rel, d.as_bytes(), false)
                 .map_err(|e| format!("백업 쓰기 실패({e}) — fail-closed 거부(무변경)"))?;
+            print_park_outcome(&dir, rel, &parked);
         } else if target.exists() {
             cys::pack::byte_backup_user(&dir, rel, &target).map_err(|e| {
                 format!("바이트 백업 실패({e}) — fail-closed 거부(무변경 · L0 강행 예외는 무인 스윕 전용)")
@@ -27590,18 +27582,11 @@ fn run_pack_revert_merge(dir: &std::path::Path, rel: &str, yes: bool, sources: &
     let merged_now = std::fs::read_to_string(&target).unwrap_or_default();
     // ★T4-fix(R1-적대 #2 동계열): 이전 세대 .user(병합 이전 치유·충돌의 보존본) 침묵 클로버 방지.
     // (RULINGS EC1: 잠금을 새로 잡지 않는다 — 세대는 배타 자리 예약이 지킨다.)
-    let step = (|| -> Result<Option<std::path::PathBuf>, String> {
-        let prev = preserve_prior_user_generation(dir, rel, Some(merged_now.as_bytes()))?;
-        // ★T2i(RULINGS EC4 (4)): 닻 내린 쓰기.
-        cys::pack::write_beneath(dir, &format!("{rel}.user"), merged_now.as_bytes())
-            .map_err(|e| format!("백업 쓰기 실패({e})"))?;
-        Ok(prev)
-    })();
-    match step {
-        Ok(Some(prev)) => println!("기존 보존본 세대 보존: {}", prev.display()),
-        Ok(None) => {}
+    // ★T2i(RULINGS EC2): 세대 보존과 백업이 하나다 — `park_copy`(덮지 않는 놓기).
+    match cys::pack::park_copy(dir, rel, merged_now.as_bytes(), false) {
+        Ok(parked) => print_park_outcome(dir, rel, &parked),
         Err(e) => {
-            eprintln!("{e} — fail-closed 거부(무변경)");
+            eprintln!("백업 쓰기 실패({e}) — fail-closed 거부(무변경)");
             return 1;
         }
     }
@@ -28035,8 +28020,15 @@ fn adopt_one(
         let _ = cys::pack::save_merge_pending(dir, &pending);
     }
     // ⑧ .user 소스 개명 보존(--from 소스는 원위치 무접촉).
+    // ★T2i(RULINGS EC2): 덮지 않는 이동 — 같은 이름의 예전 복권 사본이 있으면 다음 이름(`-n`).
     if from.is_none() {
-        let _ = std::fs::rename(&src_path, dir.join(format!("{rel}.user.adopted-{now}")));
+        for n in 1u32..=10_000 {
+            let to = if n == 1 { format!("{rel}.user.adopted-{now}") } else { format!("{rel}.user.adopted-{now}-{n}") };
+            match cys::pack::beneath_move_no_replace(dir, &format!("{rel}.user"), &to) {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                _ => break,
+            }
+        }
     }
     // ⑨ 감사.
     let before = disk.unwrap_or_default();
@@ -42946,8 +42938,8 @@ mod tests {
 
     /// ★T2i(RULINGS EC4): 쓰기 자리 조사(census) — 팩 동사와 그 쓰기 도구의 몸통에 '이미 있는 경로를 쓰려고 여는' 호출이 없다:
     /// `std::fs::write(` · `File::create(` · `.truncate(true)` · `std::fs::copy(` 은 어디에도, 평범한 생성 `.create(true)` 는
-    /// 덧붙이기 원장(`append_merge_audit`) 하나에만. 팩 동사의 쓰기는 닻 내린 도구(`write_pack_file_beneath` · `write_beneath`)로만
-    /// — 경로로 쓰는 `cys::pack::write_pack_file(` · `cys::pack::write_atomic(` 은 없다.
+    /// 덧붙이기 원장(`append_merge_audit`) 하나에만. 팩 동사의 쓰기는 닻 내린 도구(`write_pack_file_beneath` · `write_beneath` ·
+    /// `park_copy` · `beneath_move_no_replace`)로만 — 경로로 쓰는 `cys::pack::write_pack_file(` · `cys::pack::write_atomic(` 은 없다.
     #[test]
     fn ec4_pack_verb_write_site_census() {
         let cys_src = include_str!("cys.rs");
@@ -42986,6 +42978,9 @@ mod tests {
         let tools = [
             "pub fn beneath_write(",
             "pub fn write_pack_file_beneath(",
+            "pub fn beneath_move_no_replace(",
+            "fn park_copy_at(",
+            "fn move_occupant_to_slot(",
             "fn preserve_prior_user_generation_at(",
             "pub fn byte_backup_user(",
             "pub fn save_merge_pending(",

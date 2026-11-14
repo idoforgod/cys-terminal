@@ -4342,6 +4342,104 @@ pub fn write_pack_file_beneath(
     beneath_write(root, rel_path, bytes, mode, true, place, false)
 }
 
+/// ★T2i(RULINGS EC2): 같은 폴더 안의 **덮지 않는** 이동(보관본을 세대 자리로) — unix 는 닻 내린 기술자 안의
+/// [`no_replace_renameat`], 윈도우는 경로 규칙 뒤 [`windows_move_no_replace`]. 원본 없음 = `NotFound`, 대상 있음 = `AlreadyExists`.
+pub fn beneath_move_no_replace(root: &Path, from_rel: &str, to_rel: &str) -> std::io::Result<()> {
+    let fp = rel_parts(from_rel)?;
+    let tp = rel_parts(to_rel)?;
+    if fp[..fp.len() - 1] != tp[..tp.len() - 1] {
+        return Err(std::io::Error::other(format!("{from_rel} → {to_rel}: 같은 폴더 안에서만 옮깁니다")));
+    }
+    #[cfg(unix)]
+    {
+        let d = anchor_dir(root, &fp[..fp.len() - 1], false, from_rel)?;
+        no_replace_renameat(d.0, &c_name(fp[fp.len() - 1])?, &c_name(tp[tp.len() - 1])?)
+    }
+    #[cfg(windows)]
+    {
+        sidecar_path_gate(root, &fp[..fp.len() - 1].join("/")).map_err(std::io::Error::other)?;
+        let base = fp[..fp.len() - 1].iter().fold(root.to_path_buf(), |p, c| p.join(c));
+        windows_move_no_replace(&base.join(fp[fp.len() - 1]), &base.join(tp[tp.len() - 1]))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, fp, tp);
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "덮지 않는 이동을 이 운영체제에서 쓸 수 없습니다"))
+    }
+}
+
+/// ★T2i(RULINGS EC2): 보관 자리(`<rel>.user`)에 지금 있는 것 — 닻 내린 판독(링크 비추종 · 막히지 않음 · 일반 파일 · 상한).
+#[derive(Debug)]
+enum Occupant {
+    Missing,
+    /// 일반 파일 — 바이트(상한 초과 · 판독 실패 = None: 비교할 수 없으니 '다른 사본'으로 다룬다).
+    File(Option<Vec<u8>>),
+    /// 파일이 아닌 것(폴더 · 링크 · FIFO …) 또는 자리를 확인할 수 없음 — 세대가 아니라 장애물.
+    Obstacle(String),
+}
+
+fn beneath_occupant(root: &Path, rel_path: &str) -> Occupant {
+    let parts = match rel_parts(rel_path) {
+        Ok(p) => p,
+        Err(e) => return Occupant::Obstacle(e.to_string()),
+    };
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::io::FromRawFd;
+        let d = match anchor_dir(root, &parts[..parts.len() - 1], false, rel_path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Occupant::Missing,
+            Err(e) => return Occupant::Obstacle(e.to_string()),
+        };
+        let leaf_c = match c_name(parts[parts.len() - 1]) {
+            Ok(c) => c,
+            Err(e) => return Occupant::Obstacle(e.to_string()),
+        };
+        let fd = unsafe {
+            libc::openat(d.0, leaf_c.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            return if e.raw_os_error() == Some(libc::ENOENT) {
+                Occupant::Missing
+            } else {
+                Occupant::Obstacle(e.to_string())
+            };
+        }
+        let f = unsafe { std::fs::File::from_raw_fd(fd) };
+        let Ok(m) = f.metadata() else { return Occupant::Obstacle("상태 확인 실패".into()) };
+        if !m.is_file() {
+            return Occupant::Obstacle("일반 파일이 아님".into());
+        }
+        if m.len() > START_META_CAP {
+            return Occupant::File(None);
+        }
+        let mut b = Vec::new();
+        match f.take(START_META_CAP + 1).read_to_end(&mut b) {
+            Ok(_) => Occupant::File(Some(b)),
+            Err(_) => Occupant::File(None),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(e) = sidecar_path_gate(root, &parts[..parts.len() - 1].join("/")) {
+            return Occupant::Obstacle(e);
+        }
+        let p = parts.iter().fold(root.to_path_buf(), |p, c| p.join(c));
+        match std::fs::symlink_metadata(&p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Occupant::Missing,
+            Err(e) => Occupant::Obstacle(e.to_string()),
+            Ok(m) if meta_is_link_like(&m) || !m.is_file() => Occupant::Obstacle("일반 파일이 아님".into()),
+            Ok(_) => match read_start_meta(&p) {
+                StartRead::Bytes(b) => Occupant::File(Some(b)),
+                StartRead::Missing => Occupant::Missing,
+                StartRead::Unreadable(_) => Occupant::File(None),
+            },
+        }
+    }
+}
+
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_atomic_mode(path, bytes, None)
 }
@@ -4878,10 +4976,9 @@ pub fn byte_backup_user(dir: &Path, rel: &str, src: &Path) -> Result<(), String>
         StartRead::Missing => return Err(format!("바이트 백업 원본 없음 {}", src.display())),
         StartRead::Unreadable(why) => return Err(format!("바이트 백업 원본 판독 불가 {}: {why}", src.display())),
     };
-    // ★T2i(RULINGS EC4 (2)): 고정 임시 이름(`<rel>.user.tmp-<pid>` — 이미 있으면 따라가 자르고 썼다)을 쓰지 않는다 — 배타 임시
-    //   파일 + 놓기(닻 내린 쓰기).
-    beneath_write(dir, &format!("{rel}.user"), &bytes, None, false, Place::Replace, false)
-        .map_err(|e| format!("바이트 백업 실패 {rel}.user: {e}"))
+    // ★T2i(RULINGS EC4 (2) · EC2): 고정 임시 이름(`<rel>.user.tmp-<pid>` — 이미 있으면 따라가 자르고 썼다)을 쓰지 않는다 — 보관은
+    //   [`park_copy`](배타 임시 파일 · 덮지 않는 놓기 · 차 있으면 세대 자리로).
+    park_copy(dir, rel, &bytes, false).map(|_| ())
 }
 
 /// ★T3(D9 · v2 §2 원칙 3): 검증 base lazy 로드 — `.pristine/<rel>` 을 읽어
@@ -4915,10 +5012,9 @@ pub fn preserve_prior_user_generation(
     preserve_prior_user_generation_at(dir, rel, incoming, ts, &mut |_| {})
 }
 
-/// ★T2h(RULINGS CW2 · 검토자 B2): 세대 자리는 **배타적으로 예약**한다 — 후보 이름을 `create_new`(O_EXCL · 윈도우 CREATE_NEW)로
-/// 만들어 차지한 뒤에만 `.user` 를 그 자리로 옮긴다(교체되는 것은 방금 차지한 빈 자리뿐). 다른 쓰는 쪽이 같은 이름을 먼저
-/// 차지했으면 다음 이름으로 넘어간다 — 확인과 이름 바꾸기 사이에 남의 세대를 덮던 창(종전 `exists()` 뒤 `rename`)이 없다.
-/// 다른 쓰는 쪽이 이미 `.user` 를 옮겼으면 보존할 것이 없다(Ok(None)). `before_reserve` = 시험의 끼어들기 지점(제품은 빈 함수).
+/// ★T2h(RULINGS CW2 · 검토자 B2) → ★T2i(RULINGS EC2): 세대 자리는 **덮지 않는 이동**으로만 채운다 — `<rel>.user` 를 후보 이름으로
+/// [`beneath_move_no_replace`](차 있으면 `AlreadyExists` → 다음 이름). 교체되는 세대 자리는 없다. 다른 쓰는 쪽이 이미 `.user` 를
+/// 옮겼으면 보존할 것이 없다(Ok(None)). `before_reserve` = 시험의 끼어들기 지점(제품은 빈 함수).
 fn preserve_prior_user_generation_at(
     dir: &Path,
     rel: &str,
@@ -4926,66 +5022,158 @@ fn preserve_prior_user_generation_at(
     ts: u64,
     before_reserve: &mut dyn FnMut(&Path),
 ) -> Result<Option<PathBuf>, String> {
-    let prior = dir.join(format!("{rel}.user"));
-    if !prior.exists() {
-        return Ok(None);
+    match beneath_occupant(dir, &format!("{rel}.user")) {
+        Occupant::Missing => return Ok(None),
+        Occupant::File(Some(b)) if incoming == Some(b.as_slice()) => return Ok(None),
+        _ => {}
     }
-    if let Some(inc) = incoming {
-        if read_start_meta(&prior).bytes().as_deref() == Some(inc) {
-            return Ok(None);
-        }
-    }
+    Ok(move_occupant_to_slot(dir, rel, ts, before_reserve)?.map(|s| dir.join(s)))
+}
+
+/// ★T2i(RULINGS EC2): `<rel>.user` 에 있는 것을 새 세대 자리 `<rel>.user.prev-<ts>[-n]` 로 **덮지 않고** 옮긴다(팩 상대 경로 반환 ·
+/// 옮길 것이 이미 없으면 None).
+fn move_occupant_to_slot(
+    dir: &Path,
+    rel: &str,
+    ts: u64,
+    before_reserve: &mut dyn FnMut(&Path),
+) -> Result<Option<String>, String> {
+    let user_rel = format!("{rel}.user");
     for n in 1u32..=10_000 {
-        let dest = if n == 1 {
-            dir.join(format!("{rel}.user.prev-{ts}"))
-        } else {
-            dir.join(format!("{rel}.user.prev-{ts}-{n}"))
-        };
-        before_reserve(&dest);
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&dest) {
-            Ok(_) => {}
+        let slot = if n == 1 { format!("{rel}.user.prev-{ts}") } else { format!("{rel}.user.prev-{ts}-{n}") };
+        before_reserve(&dir.join(&slot));
+        match beneath_move_no_replace(dir, &user_rel, &slot) {
+            Ok(()) => return Ok(Some(slot)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("기존 {rel}.user 세대 자리 예약 실패({e})")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("기존 {rel}.user 세대 보존 실패({e})")),
         }
-        return match std::fs::rename(&prior, &dest) {
-            Ok(()) => Ok(Some(dest)),
-            Err(e) => {
-                let _ = std::fs::remove_file(&dest);
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    Ok(None)
-                } else {
-                    Err(format!("기존 {rel}.user 세대 보존 실패({e})"))
-                }
-            }
-        };
     }
     Err(format!("기존 {rel}.user 세대 자리를 찾지 못했습니다"))
 }
 
-/// 설치 실행부 전용 세대 보존: `{rel}.user` 가 **일반 파일**일 때만 이전 세대로 비켜 세운다. 그 자리에 파일이
-/// 아닌 것(디렉터리 등)이 있으면 세대가 아니라 장애물이다 — 옮기지 않고 Err(백업 불가 → 호출자는 덮지 않는다,
-/// 부록 A-2 #4). 부재 = Ok(할 일 없음).
-fn preserve_prior_user_file(dir: &Path, rel: &str, incoming: Option<&[u8]>) -> Result<(), String> {
-    match std::fs::symlink_metadata(dir.join(format!("{rel}.user"))) {
-        Err(_) => Ok(()),
-        Ok(m) if m.file_type().is_file() => {
-            preserve_prior_user_generation(dir, rel, incoming).map(|_| ())
+/// ★T2i(RULINGS EC2): 보관 한 번의 결과.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkOutcome {
+    /// 이 쓰는 쪽의 사본이 있는 곳(팩 상대) — `<rel>.user`, 또는 자리가 끝내 비지 않았을 때 자기 세대 자리.
+    pub at: String,
+    /// 자리에 있던 다른 사본을 옮긴 세대 자리들(팩 상대).
+    pub moved: Vec<String>,
+    /// 자리가 끝내 비지 않아 자기 세대 자리에 놓았고 감사 원장에 겹침을 적었다.
+    pub overlap: bool,
+}
+
+/// ★T2i(RULINGS EC2): 보관의 끼어들기 지점(시험 전용 — 제품은 빈 함수).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkStep {
+    /// n 번째 놓기 직전.
+    BeforePlace(u32),
+    /// n 번째 놓기가 '차 있음'을 본 뒤, 그 자리의 사본을 세대 자리로 옮기기 직전.
+    BeforeMove(u32),
+}
+
+/// ★T2i(RULINGS EC2): 덮지 않는 놓기를 다시 시도하는 횟수(그 뒤엔 자기 세대 자리 + 감사 원장의 겹침 기록).
+pub const PARK_PLACE_TRIES: u32 = 3;
+
+/// ★T2i(RULINGS EC2 — 규칙 하나를 보관본에): `<rel>.user` 에는 **아무것도 덮어쓰지 않는다**. 사본은 덮지 않는 놓기로만 그 이름에
+/// 생기고([`beneath_write`] `NoReplace`), 그 이름에 있던 것은 덮지 않는 이동으로만 세대 자리로 간다. 놓을 때 자리가 차 있으면:
+/// 같은 바이트면 끝 · 다르면 그 사본을 새 세대 자리로 옮기고 다시 놓는다(최대 [`PARK_PLACE_TRIES`]번). 그래도 차 있으면 자기
+/// 사본을 자기 세대 자리에 두고 겹침을 감사 원장에 적는다(`park-overlap`). 그래서 두 쓰는 쪽이 어떻게 엇갈려도 모든 사본이 이름이나
+/// 세대 자리에 남는다 — '막기가 아니라 알아채고 보관'. 덮지 않는 놓기를 지원하지 않는 파일 시스템 = Err(호출부의 보관 불가 갈래).
+/// `durable` = vendor 우선의 선저장(EC7 — 놓은 뒤 폴더 fsync 실패를 돌려준다).
+pub fn park_copy(dir: &Path, rel: &str, bytes: &[u8], durable: bool) -> Result<ParkOutcome, String> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    park_copy_at(dir, rel, bytes, durable, ts, &mut |_| {})
+}
+
+fn park_copy_at(
+    dir: &Path,
+    rel: &str,
+    bytes: &[u8],
+    durable: bool,
+    ts: u64,
+    hook: &mut dyn FnMut(ParkStep),
+) -> Result<ParkOutcome, String> {
+    let user_rel = format!("{rel}.user");
+    let mut moved: Vec<String> = Vec::new();
+    for attempt in 0..PARK_PLACE_TRIES {
+        hook(ParkStep::BeforePlace(attempt));
+        match beneath_write(dir, &user_rel, bytes, None, false, Place::NoReplace, durable) {
+            Ok(()) => return Ok(ParkOutcome { at: user_rel, moved, overlap: false }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                return Err(format!("{user_rel}: {e} — 덮지 않고 놓을 수 없어 보관하지 않았습니다"))
+            }
+            Err(e) => return Err(format!("{user_rel} 기록 실패: {e}")),
         }
-        Ok(_) => Err(format!("{rel}.user 자리에 파일이 아닌 항목이 있어 세대 보존·백업을 할 수 없습니다")),
+        match beneath_occupant(dir, &user_rel) {
+            Occupant::Missing => continue,
+            Occupant::File(Some(b)) if b == bytes => {
+                if durable {
+                    beneath_sync_parent(dir, &user_rel).map_err(|e| format!("{user_rel} 기록 실패: {e}"))?;
+                }
+                return Ok(ParkOutcome { at: user_rel, moved, overlap: false });
+            }
+            Occupant::File(_) => {}
+            Occupant::Obstacle(why) => {
+                return Err(format!("{user_rel} 자리에 파일이 아닌 항목이 있어 세대 보존·백업을 할 수 없습니다({why})"))
+            }
+        }
+        // 마지막 시도에서도 차 있으면 그 사본은 이름에 두고(옮기지 않는다) 자기 사본을 세대 자리로.
+        if attempt + 1 == PARK_PLACE_TRIES {
+            break;
+        }
+        hook(ParkStep::BeforeMove(attempt));
+        if let Some(slot) = move_occupant_to_slot(dir, rel, ts, &mut |_| {})? {
+            moved.push(slot);
+        }
+    }
+    // 자리가 끝내 비지 않았다 — 자기 사본은 자기 세대 자리로, 겹침은 감사 원장에.
+    let mut own: Option<String> = None;
+    for n in 1u32..=10_000 {
+        let slot = if n == 1 { format!("{rel}.user.prev-{ts}") } else { format!("{rel}.user.prev-{ts}-{n}") };
+        match beneath_write(dir, &slot, bytes, None, false, Place::NoReplace, durable) {
+            Ok(()) => {
+                own = Some(slot);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{rel}: 보관 자리 겹침 — 자기 세대 자리 기록 실패({e})")),
+        }
+    }
+    let Some(slot) = own else { return Err(format!("{rel}: 보관 자리 겹침 — 세대 자리를 찾지 못했습니다")) };
+    let entry = serde_json::json!({
+        "ts": ts, "file": rel, "action": "park-overlap", "slot": slot, "moved": moved, "flags": [],
+    });
+    if let Err(e) = append_merge_audit(dir, &entry) {
+        eprintln!("[pack] ⚠ {rel}: 보관 자리 겹침을 감사 원장에 적지 못했습니다({e}) — 사본은 {slot} 에 있습니다");
+    }
+    Ok(ParkOutcome { at: slot, moved, overlap: true })
+}
+
+/// ★T2i(RULINGS EC7): `rel_path` 의 부모 폴더 fsync(닻 내린 기술자 — 윈도우는 '지원하지 않음').
+fn beneath_sync_parent(root: &Path, rel_path: &str) -> std::io::Result<()> {
+    let parts = rel_parts(rel_path)?;
+    #[cfg(unix)]
+    {
+        let d = anchor_dir(root, &parts[..parts.len() - 1], false, rel_path)?;
+        sync_dir_fd(&d, parts[parts.len() - 1])
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, parts);
+        Ok(())
     }
 }
 
 /// ★M11 나: 사용자 수정본을 `{rel}.user` 로 보관(이전 세대 보존 선행). 이미 같은 내용이면 무조치.
 /// Err = 보관 불가(호출자는 덮지 않고 격리한다 — 부록 A-2 #4).
-fn park_user_copy(dir: &Path, rel: &str, bytes: &[u8]) -> Result<(), String> {
-    let user_path = dir.join(format!("{rel}.user"));
-    if read_start_meta(&user_path).bytes().as_deref() == Some(bytes) {
-        return Ok(());
-    }
-    preserve_prior_user_file(dir, rel, Some(bytes))?;
-    // ★T2i(RULINGS EC7): vendor 우선 선저장의 첫 반쪽 — 보관본도 영속이 증명돼야 한다(같은 폴더의 fsync 가 앞선 세대 이동도
-    //   함께 내린다).
-    write_atomic_durable(&user_path, bytes).map_err(|e| format!("{rel}.user 기록 실패: {e}"))
+/// ★T2i(RULINGS EC2 · EC7): [`park_copy`] 하나로(덮지 않는 놓기 · 영속 증명) — 사본이 있는 곳을 돌려준다(원장 side).
+fn park_user_copy(dir: &Path, rel: &str, bytes: &[u8]) -> Result<ParkOutcome, String> {
+    park_copy(dir, rel, bytes, true)
 }
 
 /// ★M11 가: 사용자 파일 유지 + vendor 신버전 `<rel>.new` 보관 + 원장 `user-kept`. 셸 스크립트는 살아 있는
@@ -6309,7 +6497,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 // 보관이 안 되면 덮지 않는다(격리 · 부록 A-2 #4). 보관되면 아래 공용 경로가 vendor 본을 쓴다.
                 let user_bytes: Option<Vec<u8>> = read_start_live(&path).bytes();
                 match user_bytes.as_deref().map(|b| park_user_copy(&dir, rel, b)) {
-                    Some(Ok(())) => {
+                    Some(Ok(parked)) => {
                         // 앞서 user-kept·new-pending 으로 보관하던 `.new` 는 이제 살아 있는 vendor 본과 같아진다 — 치운다.
                         if matches!(
                             pending.get(rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str()),
@@ -6317,11 +6505,16 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         ) {
                             let _ = std::fs::remove_file(dir.join(format!("{rel}.new")));
                         }
-                        if let serde_json::Value::Object(entry) = serde_json::json!({
+                        if let serde_json::Value::Object(mut entry) = serde_json::json!({
                             "kind": "vendor-first", "side": format!("{rel}.user"),
                             "reason": reason, "parked_at": now_ts,
                             "version": target_version, "ts": now_ts,
                         }) {
+                            // ★T2i(RULINGS EC2): 자리가 끝내 비지 않아 이 사본이 세대 자리에 있으면 그 자리를 함께 적는다
+                            //   (겹침은 감사 원장에도).
+                            if parked.overlap {
+                                entry.insert("overlap_slot".into(), serde_json::json!(parked.at));
+                            }
                             upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
                         }
                         // ★RULINGS AC7: 원장을 vendor 바이트보다 **먼저** 저장한다 — 그 사이에 멈춰도 `.user` 가 기록
@@ -6611,10 +6804,8 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 if let Some(d) = user_src.as_deref() {
                     let user_path = dir.join(format!("{rel}.user"));
                     if read_start_meta(&user_path).text().as_deref() != Some(d) {
-                        let backup = preserve_prior_user_file(&dir, rel, Some(d.as_bytes()))
-                            .and_then(|_| {
-                                write_atomic(&user_path, d.as_bytes()).map_err(|e| e.to_string())
-                            });
+                        // ★T2i(RULINGS EC2): 덮지 않는 보관(차 있으면 세대 자리로 — 어느 사본도 덮이지 않는다).
+                        let backup = park_copy(&dir, rel, d.as_bytes(), false).map(|_| ());
                         match backup {
                             Ok(()) => {}
                             Err(e) if fallback_reason == "capture-failed" => {
@@ -6684,8 +6875,8 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     if let Some(d) = disk.as_deref() {
                         let user_path = dir.join(format!("{rel}.user"));
                         if read_start_meta(&user_path).text().as_deref() != Some(d) {
-                            let _ = preserve_prior_user_file(&dir, rel, Some(d.as_bytes()));
-                            let _ = write_atomic(&user_path, d.as_bytes());
+                            // ★T2i(RULINGS EC2): 덮지 않는 보관.
+                            let _ = park_copy(&dir, rel, d.as_bytes(), false);
                         }
                         // ★T3(D7): healed upsert 는 계보 인지 헬퍼 경유 — 크래시 창 재스윕 healed 가
                         // 영속된 merged 항목의 capture 포인터를 지우는 창의 봉인(v2 §4 공통 적용 규칙).
@@ -6701,12 +6892,8 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         // (tmp+copy+rename 원자화)으로 봉인한다.
                         // ★0.15.0 사: 이전 세대 보존을 먼저 — 두 번 밀려나도 첫 백업이 덮이지 않는다(CP949
                         // 파일 A·B). 세대 보존 실패는 백업 실패와 같다(fail-closed → 아래 격리).
-                        let backup = preserve_prior_user_file(
-                            &dir,
-                            rel,
-                            read_start_live(&path).bytes().as_deref(),
-                        )
-                        .and_then(|_| byte_backup_user(&dir, rel, &path));
+                        // ★T2i(RULINGS EC2): 세대 보존과 백업이 하나다(`byte_backup_user` → `park_copy`).
+                        let backup = byte_backup_user(&dir, rel, &path);
                         match backup {
                             Ok(()) => {
                                 if let serde_json::Value::Object(entry) = serde_json::json!({
@@ -14938,10 +15125,86 @@ mod m11_tests {
         assert_eq!(rig.kind(rel).as_deref(), Some("vendor-first"), "기록과 함께");
     }
 
+    /// ★T2i(RULINGS EC2): 두 쓰는 쪽이 각 경계에서 엇갈려도 **모든 사본이 남는다**(이름 또는 세대 자리) — U(먼저 보관돼 있던 사본) ·
+    /// V(쓰는 쪽 B) · W(쓰는 쪽 A). 경계 = A 의 첫 놓기 직전 · A 가 '차 있음'을 보고 옮기기 직전 · A 의 다시 놓기 직전 — 그
+    /// 지점에서 B 가 끝까지 돈다(끼어들기 지점으로 순서를 정한다 · 잠 없음). 자리가 끝내 비지 않으면(놓기마다 다른 쓰는 쪽의
+    /// 사본이 먼저 생김) A 의 사본은 자기 세대 자리에, 겹침은 감사 원장에 남는다.
+    #[test]
+    fn ec2_two_writers_every_parked_copy_survives_at_each_boundary() {
+        let rig = Rig::new("ec2");
+        let rel = "hooks/x.sh";
+        let copies = |rig: &Rig| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(rig.pack.join("hooks"))
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n == "x.sh.user" || n.starts_with("x.sh.user.prev-")
+                })
+                .map(|e| std::fs::read_to_string(e.path()).unwrap())
+                .collect();
+            v.sort();
+            v
+        };
+        let reset = |rig: &Rig| {
+            let _ = std::fs::remove_dir_all(rig.pack.join("hooks"));
+            let _ = std::fs::remove_file(rig.pack.join(MERGE_AUDIT_FILE));
+            rig.write(&format!("{rel}.user"), b"U\n");
+        };
+        for (case, at) in [
+            ("before the first placement", ParkStep::BeforePlace(0)),
+            ("before moving the occupant", ParkStep::BeforeMove(0)),
+            ("before the retry", ParkStep::BeforePlace(1)),
+        ] {
+            reset(&rig);
+            let pack = rig.pack.clone();
+            let mut fired = false;
+            let out = park_copy_at(&rig.pack, rel, b"W\n", false, 100, &mut |s| {
+                if s == at && !fired {
+                    fired = true;
+                    park_copy_at(&pack, rel, b"V\n", false, 100, &mut |_| {}).unwrap();
+                }
+            })
+            .unwrap();
+            assert!(fired, "{case}: the interleaving happened");
+            assert_eq!(copies(&rig), vec!["U\n", "V\n", "W\n"], "{case}: every copy exists");
+            assert!(!out.overlap, "{case}");
+            assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some("W\n"), "{case}: A's copy holds the name");
+        }
+        // 같은 바이트가 이미 그 자리에 있으면 끝(사본이 늘지 않는다).
+        reset(&rig);
+        let out = park_copy_at(&rig.pack, rel, b"U\n", false, 100, &mut |_| {}).unwrap();
+        assert_eq!((out.moved.len(), out.overlap), (0, false));
+        assert_eq!(copies(&rig), vec!["U\n"]);
+        // 자리가 끝내 비지 않음 → 자기 세대 자리 + 감사 원장의 겹침.
+        reset(&rig);
+        let pack = rig.pack.clone();
+        let mut k = 0;
+        let out = park_copy_at(&rig.pack, rel, b"W\n", false, 100, &mut |s| {
+            if let ParkStep::BeforePlace(_) = s {
+                k += 1;
+                park_copy_at(&pack, rel, format!("X{k}\n").as_bytes(), false, 200, &mut |_| {}).unwrap();
+            }
+        })
+        .unwrap();
+        assert!(out.overlap, "{out:?}");
+        assert_eq!(copies(&rig), vec!["U\n", "W\n", "X1\n", "X2\n", "X3\n"], "every copy exists");
+        assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some("X3\n"), "the last other copy stays at the name");
+        assert_eq!(std::fs::read_to_string(rig.pack.join(&out.at)).unwrap(), "W\n");
+        let audit = std::fs::read_to_string(rig.pack.join(MERGE_AUDIT_FILE)).unwrap();
+        let e: serde_json::Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+        assert_eq!((e["action"].as_str(), e["file"].as_str(), e["slot"].as_str()), (Some("park-overlap"), Some(rel), Some(out.at.as_str())));
+        // 파일이 아닌 자리(폴더) = 장애물 → 보관하지 않는다(호출부의 격리 갈래).
+        reset(&rig);
+        std::fs::remove_file(rig.pack.join(format!("{rel}.user"))).unwrap();
+        std::fs::create_dir_all(rig.pack.join(format!("{rel}.user"))).unwrap();
+        assert!(park_copy_at(&rig.pack, rel, b"W\n", false, 100, &mut |_| {}).is_err());
+    }
+
     /// ★T2i(RULINGS EC4): 팩 동사는 이미 있는 경로를 쓰려고 열지 않는다 — 검토자의 두 순서: (a) 미리 심은 `<rel>.user.tmp-<pid>`
     /// (보호 훅을 가리키는 링크 · 그 훅의 하드 링크) → 바이트 백업은 그 이름을 쓰지 않고(새 배타 임시 파일) 보호 훅은 그대로,
-    /// (b) 감사 원장이 보호 파일의 하드 링크 → 덧붙이지 않는다. (4) 구성 요소가 링크로 바뀐 자리: 닻 내린 쓰기는 거부하고 링크
-    /// 너머에 아무것도 만들지 않는다. 윈도우: 같은 규칙을 핸들의 사실로(링크 수 = `GetFileInformationByHandle`,
+    /// (b) 감사 원장이 보호 파일의 하드 링크 → 덧붙이지 않는다. (4) 구성 요소가 링크로 바뀐 자리: 닻 내린 쓰기 · 보관 · 덮지 않는
+    /// 이동은 거부하고 링크 너머에 아무것도 만들지 않는다. 윈도우: 같은 규칙을 핸들의 사실로(링크 수 = `GetFileInformationByHandle`,
     /// 자리 = `GetFinalPathNameByHandleW`) — 이 기계에서는 잴 수 없다(TW1).
     #[cfg(unix)]
     #[test]
@@ -14977,8 +15240,11 @@ mod m11_tests {
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, rig.pack.join("skills")).unwrap();
         assert!(write_pack_file_beneath(&rig.pack, "skills/a.md", b"A", None, false, Place::Replace).is_err());
+        assert!(park_copy(&rig.pack, "skills/a.md", b"A", false).is_err());
+        std::fs::write(elsewhere.join("b.md.user"), "B").unwrap();
+        assert!(beneath_move_no_replace(&rig.pack, "skills/b.md.user", "skills/b.md.user.prev-1").is_err());
         let left: Vec<String> = std::fs::read_dir(&elsewhere).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-        assert!(left.is_empty(), "nothing created behind the link: {left:?}");
+        assert_eq!(left, vec!["b.md.user".to_string()], "nothing created or moved behind the link");
         // 덮지 않는 놓기: 차 있으면 AlreadyExists · 무변경.
         rig.write("hooks/n.sh", b"OLD");
         let e = beneath_write(&rig.pack, "hooks/n.sh", b"NEW", None, false, Place::NoReplace, false).unwrap_err();
