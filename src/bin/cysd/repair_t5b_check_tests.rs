@@ -112,3 +112,32 @@ fn a_finding_that_could_not_be_recorded_is_not_passed() {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }
+
+/// RULINGS HU1 — through the production wrapper: the first run of the check passes, and the target
+/// hook is gone right after it (here the replay itself removes the live file by its absolute path —
+/// "another ordinary operation moves or removes the target"). The comparison sees the live change and
+/// repeats; the repeat returns at the file check without running anything. The execution plan was fixed
+/// before that return, so the repeat is INCOMPLETE and the pass is refused. (The old plan was made
+/// after the file check: the repeat read (0, 0) units = "complete", nothing written again → noted, and
+/// the first pass's "passed" was kept.)
+#[test]
+fn a_target_gone_after_the_first_success_refuses_the_pass() {
+    let p = pack("hu1");
+    let target = p.join("hooks/appbuild-gate.sh");
+    std::fs::write(
+        &target,
+        format!("#!/bin/sh\ncat >/dev/null\nrm -f '{}'\nexit 0\n", target.display()),
+    )
+    .unwrap();
+    let r = super::production_check_with(
+        "hooks/appbuild-gate.sh",
+        &target,
+        std::time::Duration::from_secs(30),
+        &|_| Some(super::Filed::New),
+    )
+    .expect("the runner answers");
+    assert!(!target.exists(), "premise: the target is gone after the first run");
+    assert!(!r.passed, "a repeat that never ran kept the first pass");
+    assert!(r.failure.contains("끝나지 않아"), "{}", r.failure);
+    let _ = std::fs::remove_dir_all(p.parent().unwrap());
+}
