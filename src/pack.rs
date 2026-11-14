@@ -3500,7 +3500,9 @@ pub fn save_merge_pending(
     let json = serde_json::to_string_pretty(&serde_json::Value::Object(pending.clone()))
         .map_err(|e| format!("병합 대기 원장 직렬화 실패: {e}"))?;
     let p = dir.join(MERGE_PENDING_FILE);
-    write_atomic(&p, json.as_bytes()).map_err(|e| format!("병합 대기 원장 기록 실패 {}: {e}", p.display()))
+    // ★T2i(RULINGS EC7): 영속이 증명된 쓰기(본문 · 교체 · 폴더 fsync — 실패는 돌려준다). vendor 우선은 이 결과를 보고서만
+    //   살아 있는 파일을 바꾼다.
+    write_atomic_durable(&p, json.as_bytes()).map_err(|e| format!("병합 대기 원장 기록 실패 {}: {e}", p.display()))
 }
 
 /// ★G3-축3 감사 원장 1줄 append. 다중 프로세스 appender 전제라 O_APPEND + **라인당 단일
@@ -4102,7 +4104,65 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// 방식은 넓은 창이 잠깐 열리므로, **처음부터** 목표 mode 로 만든다.
 pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
     // 거동 불변: enforce=false 는 종전과 **바이트 동일**하다(mode 는 open(2) 인자로만 간다).
-    write_atomic_mode_inner(path, bytes, mode, false, apply_mode_exact)
+    write_atomic_mode_inner(path, bytes, mode, false, apply_mode_exact, false)
+}
+
+/// ★T2i(RULINGS EC7): **영속이 증명된** 원자 쓰기 — 본문 fsync → 원자 교체 → 부모 폴더 fsync, 그리고 그 셋의 실패를 **모두**
+/// 돌려준다(종전 [`write_atomic`] 은 폴더 fsync 실패를 버렸다). 너그럽게 넘기는 것은 '폴더 fsync 를 지원하지 않음' 하나다
+/// ([`dir_sync_unsupported`] — `Unsupported` · `EINVAL` · `ENOTSUP`/`EOPNOTSUPP`). vendor 우선의 선저장(보관본 `<rel>.user` 와
+/// 원장)이 이것을 쓴다 — 살아 있는 기동 필수 파일은 이 둘이 디스크에 남았음이 증명된 뒤에만 바뀐다.
+/// 윈도우: 본문은 `FlushFileBuffers`(`sync_all`)로 내리고, 폴더는 std 로 열어 내릴 수 없다(`FILE_FLAG_BACKUP_SEMANTICS` 필요) —
+/// '지원하지 않음'으로 다룬다(교체의 영속은 NTFS 메타데이터 기록에 기댄다 — 추정).
+pub fn write_atomic_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_mode_inner(path, bytes, None, false, apply_mode_exact, true)
+}
+
+/// ★T2i(RULINGS EC7): 폴더 fsync 가 '지원하지 않음'으로 실패했는가(그때만 너그럽게 넘긴다).
+fn dir_sync_unsupported(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        let c = e.raw_os_error();
+        c == Some(libc::EINVAL) || c == Some(libc::ENOTSUP) || c == Some(libc::EOPNOTSUPP)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// ★T2i(RULINGS EC7) 시험 주입: 이 파일 이름의 영속 쓰기에서 부모 폴더 fsync 가 실패한 것으로 한다(스레드 단위 — 다른 시험과
+    /// 섞이지 않는다).
+    static FAIL_DIR_SYNC_FOR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// ★T2i(RULINGS EC7): 영속 쓰기의 부모 폴더 fsync — 실패를 돌려준다('지원하지 않음'만 Ok).
+fn sync_parent_dir(path: &Path, parent: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        if FAIL_DIR_SYNC_FOR.with(|f| f.borrow().is_some() && *f.borrow() == name) {
+            return Err(std::io::Error::other("injected directory flush failure"));
+        }
+    }
+    let _ = path;
+    #[cfg(unix)]
+    {
+        let d = std::fs::File::open(parent)?;
+        match d.sync_all() {
+            Err(e) if dir_sync_unsupported(&e) => Ok(()),
+            other => other,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Ok(())
+    }
 }
 
 /// [`write_atomic_mode`] 의 **정확 적용판**(H-08).
@@ -4115,7 +4175,7 @@ pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::i
 /// (chmod(2) 는 umask 무관 — `install_into` 의 실행비트 루프가 이미 `set_permissions` 를 쓰는 이유다)
 /// **rename 전에 fstat 으로 검증**한다. 검증 실패·적용 실패는 **대상을 교체하지 않고** 그대로 올린다.
 pub fn write_atomic_mode_exact(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
-    write_atomic_mode_inner(path, bytes, mode, true, apply_mode_exact)
+    write_atomic_mode_inner(path, bytes, mode, true, apply_mode_exact, false)
 }
 
 fn write_atomic_mode_inner(
@@ -4127,6 +4187,8 @@ fn write_atomic_mode_inner(
     //   이유는 H-CONC-3 핀이 소유자를 `fn <이름>(` 문자열로 해소하기 때문이다 — 제네릭을 붙이면
     //   정의가 `fn write_atomic_mode_inner<A>(` 가 되어 핀이 소유자를 놓친다(실측된 사각).
     apply: fn(&std::fs::File, u32) -> std::io::Result<()>,
+    // ★T2i(RULINGS EC7): true = 부모 폴더 fsync 실패를 돌려준다([`write_atomic_durable`]) · false = 종전(최선 노력).
+    durable: bool,
 ) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().ok_or_else(|| {
@@ -4186,6 +4248,7 @@ fn write_atomic_mode_inner(
         Ok(())
     })();
     match res {
+        Ok(()) if durable => sync_parent_dir(path, parent),
         Ok(()) => {
             // 디렉터리 엔트리 영속화 — best-effort(실패 무시).
             if let Ok(d) = std::fs::File::open(parent) {
@@ -4676,7 +4739,9 @@ fn park_user_copy(dir: &Path, rel: &str, bytes: &[u8]) -> Result<(), String> {
         return Ok(());
     }
     preserve_prior_user_file(dir, rel, Some(bytes))?;
-    write_atomic(&user_path, bytes).map_err(|e| format!("{rel}.user 기록 실패: {e}"))
+    // ★T2i(RULINGS EC7): vendor 우선 선저장의 첫 반쪽 — 보관본도 영속이 증명돼야 한다(같은 폴더의 fsync 가 앞선 세대 이동도
+    //   함께 내린다).
+    write_atomic_durable(&user_path, bytes).map_err(|e| format!("{rel}.user 기록 실패: {e}"))
 }
 
 /// ★M11 가: 사용자 파일 유지 + vendor 신버전 `<rel>.new` 보관 + 원장 `user-kept`. 셸 스크립트는 살아 있는
@@ -7557,6 +7622,7 @@ mod tests {
             Some(0o755),
             true,
             chmod_wrong_then_verify,
+            false,
         )
         .expect_err("mode 적용이 무시됐는데 성공을 돌려주면 조용한 실패다");
         assert!(
@@ -7588,6 +7654,7 @@ mod tests {
             Some(0o755),
             true,
             apply_mode_exact,
+            false,
         )
         .expect("진짜 fchmod 경로는 성공해야 한다");
         assert_eq!(
@@ -14621,6 +14688,53 @@ mod m11_tests {
         assert!(rig.pack.join(MERGE_PENDING_FILE).is_dir(), "원장 자리는 그대로");
         // 원장을 쓸 수 있게 되면 다음 스윕이 수렴한다.
         std::fs::remove_dir_all(rig.pack.join(MERGE_PENDING_FILE)).unwrap();
+        rig.install(&[(rel, v1)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(v1), "기동 필수 = vendor 먼저");
+        assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some(mine), "내 사본 보관");
+        assert_eq!(rig.kind(rel).as_deref(), Some("vendor-first"), "기록과 함께");
+    }
+
+    /// ★T2i(RULINGS EC7): vendor 우선의 선저장은 **영속이 증명돼야** 한다 — 원장 쓰기의 부모 폴더 fsync 가 실패하면(시험 주입)
+    /// 살아 있는 기동 필수 파일은 사용자 사본 그대로다(격리 · ledger-write-failed). 보관본 `<rel>.user` 쓰기의 폴더 fsync 가
+    /// 실패해도 같다(user-backup-failed). 주입이 없으면 같은 스윕이 vendor 본 · `.user` · 기록으로 수렴한다. 영속 쓰기 자체는
+    /// 폴더 fsync 실패를 돌려주고, '지원하지 않음'(EINVAL · ENOTSUP)만 너그럽게 넘긴다.
+    #[test]
+    fn ec7_vendor_first_needs_a_durable_record_before_the_live_file_changes() {
+        let rig = Rig::new("ec7");
+        let rel = "hooks/inject.sh";
+        let src = || UpdateSources::none().with_boot_critical(bc_only(&["hooks/inject.sh"]));
+        let mine = "#!/bin/bash\necho USER-A\n";
+        let v1 = "#!/bin/bash\necho V1\n";
+        let inject = |name: Option<&str>| FAIL_DIR_SYNC_FOR.with(|f| *f.borrow_mut() = name.map(str::to_string));
+        // 영속 쓰기: 주입 → Err · 파일은 자리에 있다(교체는 됐으나 증명 안 됨) · 주입 해제 → Ok.
+        let probe = rig.base.join("probe.json");
+        inject(Some("probe.json"));
+        assert!(write_atomic_durable(&probe, b"{}").is_err(), "폴더 fsync 실패를 돌려준다");
+        inject(None);
+        assert!(write_atomic_durable(&probe, b"{}").is_ok());
+        #[cfg(unix)]
+        {
+            assert!(dir_sync_unsupported(&std::io::Error::from_raw_os_error(libc::EINVAL)));
+            assert!(dir_sync_unsupported(&std::io::Error::from_raw_os_error(libc::ENOTSUP)));
+            assert!(!dir_sync_unsupported(&std::io::Error::from_raw_os_error(libc::EIO)), "EIO 는 실패");
+        }
+        // ① 원장 쓰기의 폴더 fsync 실패 → 살아 있는 파일 무변경.
+        rig.write(rel, mine.as_bytes());
+        inject(Some(MERGE_PENDING_FILE));
+        rig.install(&[(rel, v1)], false, &src());
+        inject(None);
+        assert_eq!(rig.read(rel).as_deref(), Some(mine), "원장이 영속하지 않으면 바꾸지 않는다");
+        assert_eq!(rig.kind(rel).as_deref(), Some("quarantined"));
+        assert_eq!(rig.entry(rel).unwrap()["reason"], "ledger-write-failed");
+        // ② 보관본 쓰기의 폴더 fsync 실패 → 무변경.
+        let _ = std::fs::remove_file(rig.pack.join(MERGE_PENDING_FILE));
+        let _ = std::fs::remove_file(rig.pack.join(format!("{rel}.user")));
+        inject(Some("inject.sh.user"));
+        rig.install(&[(rel, v1)], false, &src());
+        inject(None);
+        assert_eq!(rig.read(rel).as_deref(), Some(mine), "보관본이 영속하지 않으면 바꾸지 않는다");
+        assert_eq!(rig.entry(rel).unwrap()["reason"], "user-backup-failed");
+        // ③ 주입 없음 → 수렴.
         rig.install(&[(rel, v1)], false, &src());
         assert_eq!(rig.read(rel).as_deref(), Some(v1), "기동 필수 = vendor 먼저");
         assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some(mine), "내 사본 보관");
