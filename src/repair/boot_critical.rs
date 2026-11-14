@@ -2178,14 +2178,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&t);
     }
 
-    /// RULINGS CY1 — a path is listed if ANY of its identities is listed: the lexical spelling, the
-    /// OS-canonical path (links resolved, also a chain of links) and the PHYSICAL path (`..` taken
-    /// after the link it follows, as the OS does), plus the live file's own identity (a hard link).
-    /// The J3 counterexample: an alias directory INSIDE the pack (`hooks-alias → hooks`) gave an
-    /// equal-root-length tie that the lexical candidate won, so `hooks-alias/session-start.sh` was
-    /// "not on the list" while the shell writes the live boot hook.
-    #[cfg(unix)]
-
     /// RULINGS FR1 (a) — a DANGLING link inside the pack to an ABSENT listed file (a write through it
     /// creates the listed file) is followed by its text: relative, absolute, a chain of two dangling
     /// links; a dangling link pointing out of the pack names no row; a link loop does not hang and
@@ -2292,6 +2284,14 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&t);
     }
+
+    /// RULINGS CY1 — a path is listed if ANY of its identities is listed: the lexical spelling, the
+    /// OS-canonical path (links resolved, also a chain of links) and the PHYSICAL path (`..` taken
+    /// after the link it follows, as the OS does), plus the live file's own identity (a hard link).
+    /// The J3 counterexample: an alias directory INSIDE the pack (`hooks-alias → hooks`) gave an
+    /// equal-root-length tie that the lexical candidate won, so `hooks-alias/session-start.sh` was
+    /// "not on the list" while the shell writes the live boot hook.
+    #[cfg(unix)]
     #[test]
     fn every_identity_of_a_path_is_checked() {
         // a root WITHOUT a linked component (as `~/.cys/pack` is): the lexical and the canonical root
