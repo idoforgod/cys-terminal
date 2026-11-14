@@ -673,7 +673,13 @@ fn stub_cys_answers_and_logs() {
         Some(1),
         "no socket → like the binary without a daemon"
     );
-    assert_eq!(replay::stub_calls(&bin).len(), 4);
+    // RULINGS GA5: the log has three answers (old expectation: `replay::stub_calls(&bin).len() == 4`
+    // on a plain list that an unreadable log also gave, empty)
+    assert!(
+        matches!(replay::stub_calls(&bin), replay::StubCalls::Read(ref c) if c.len() == 4),
+        "{:?}",
+        replay::stub_calls(&bin)
+    );
     drop(sock);
     replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }

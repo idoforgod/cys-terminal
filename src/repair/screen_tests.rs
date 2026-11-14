@@ -158,24 +158,114 @@ fn read_site_census_only_the_bounded_reader() {
         "std::fs::read(e.path().join(\"environ\"))",
         "std::fs::OpenOptions::new()",
         "    std::fs::File::open(p)",
+        // RULINGS V2(a): THE candidate reader of the T0 contract (body T3 over `TargetState::read`);
+        // its bound lies in `types.rs`, which this unit does not edit — stated in the report (GA5)
+        "ledger::candidate_states_in(&ctx.root, &id)",
     ];
+    // RULINGS GA5: the daemon side too — the approval channel and the check's consequence step, and
+    // the T5b functions of the daemon's repair module (the intake filing, the worker's `check`)
+    let region = |src: &'static str, from: &str, to: &str| -> &'static str {
+        let a = src.find(from).unwrap_or_else(|| panic!("census region start {from:?}"));
+        let b = a + src[a..].find(to).unwrap_or_else(|| panic!("census region end {to:?}"));
+        &src[a..b]
+    };
+    let daemon_repair = include_str!("../bin/cysd/repair.rs");
     let files = [
         ("screen.rs", include_str!("screen.rs")),
         ("replay.rs", include_str!("replay.rs")),
         ("rehearsal.rs", include_str!("rehearsal.rs")),
         ("screen_corpus.rs", include_str!("screen_corpus.rs")),
+        ("repair_approval.rs", include_str!("../bin/cysd/repair_approval.rs")),
+        (
+            "repair.rs (file_intake)",
+            region(daemon_repair, "/// Track T5b — one intake row", "/// The verb dispatcher behind"),
+        ),
+        (
+            "repair.rs (check)",
+            region(daemon_repair, "pub(crate) fn production_check_with(", "// Track T3 — the verb bodies"),
+        ),
+    ];
+    // direct opens, and the readers that read on the caller's behalf without a bound (the shared
+    // type's EOF hash loop and the ledger functions built on it)
+    let readers = [
+        "fs::read(",
+        "read_to_string(",
+        "File::open(",
+        "OpenOptions::new(",
+        "TargetState::read(",
+        "read_under_no_link(",
+        "candidate_states(",
+        "candidate_states_in(",
     ];
     let mut bad = Vec::new();
     for (name, src) in files {
         for (i, l) in src.lines().enumerate() {
             let code = l.split("//").next().unwrap_or("");
-            let opens = ["fs::read(", "read_to_string(", "File::open(", "OpenOptions::new("];
-            if opens.iter().any(|o| code.contains(o)) && !allowed.iter().any(|a| l.contains(a)) {
+            if readers.iter().any(|o| code.contains(o)) && !allowed.iter().any(|a| l.contains(a)) {
                 bad.push(format!("{name}:{}: {}", i + 1, l.trim()));
             }
         }
     }
     assert!(bad.is_empty(), "unbounded read sites: {bad:#?}");
+}
+
+/// RULINGS GA5 — the stub's call log has three answers: absent (no call), the calls, and "could not
+/// be read" for a folder, a FIFO, a link and a file over the cap — never an empty list.
+#[test]
+fn stub_call_log_has_three_answers() {
+    let root = test_root("ga5-log");
+    let log = root.join("cys-calls.log");
+    assert_eq!(replay::stub_calls(&root), replay::StubCalls::Absent);
+    std::fs::write(&log, "cys a\ncys b\n").unwrap();
+    assert_eq!(
+        replay::stub_calls(&root),
+        replay::StubCalls::Read(vec!["cys a".into(), "cys b".into()])
+    );
+    std::fs::remove_file(&log).unwrap();
+    std::fs::create_dir(&log).unwrap();
+    let mut unread = vec![("a folder", replay::stub_calls(&root))];
+    std::fs::remove_dir(&log).unwrap();
+    #[cfg(unix)]
+    {
+        let c = std::ffi::CString::new(log.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        unread.push(("a FIFO", replay::stub_calls(&root)));
+        std::fs::remove_file(&log).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), &log).unwrap();
+        unread.push(("a link", replay::stub_calls(&root)));
+        std::fs::remove_file(&log).unwrap();
+    }
+    let f = std::fs::File::create(&log).unwrap();
+    f.set_len(replay::MAX_READ + 1).unwrap();
+    drop(f);
+    unread.push(("over the cap", replay::stub_calls(&root)));
+    for (name, got) in &unread {
+        assert!(matches!(got, replay::StubCalls::Unreadable(_)), "{name}: {got:?}");
+    }
+    cleanup(&root);
+}
+
+/// RULINGS GA5 — a candidate `_lib.sh` that turns the stub's call log into a folder before the hook
+/// asks the stub: the hook's answer is unchanged, the log cannot be read — the probe FAILS (an
+/// ERROR answer, refused), never "stub calls 0" beside the old answer.
+#[test]
+fn unreadable_stub_log_fails_the_probe() {
+    let root = test_root("ga5-probe");
+    let lane = lane_of(&root, &[]);
+    let lib = released("hooks/_lib.sh")
+        + "\n{ __c=$(command -v cys 2>/dev/null) && [ -n \"$__c\" ] && rm -f \"${__c%/*}/cys-calls.log\" && mkdir \"${__c%/*}/cys-calls.log\"; } 2>/dev/null || :\n";
+    let cand = candidate_of(&root, &[("hooks/_lib.sh", Some(lib))]);
+    let c = cfg(&root, Some(vec!["R-1"]), Some(vec!["E-1"]), false);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let r1 = rep
+        .probes
+        .iter()
+        .find(|p| p.class.starts_with("R-1") && p.cell == "E-1")
+        .unwrap_or_else(|| panic!("{:#?}", rep.probes));
+    assert_eq!(r1.released, Answer::Deny, "{r1:#?}");
+    assert_eq!(r1.clean, Some(Answer::Error), "{r1:#?}");
+    assert_eq!(r1.decision, ProbeDecision::Refused, "{r1:#?}");
+    cleanup(&root);
 }
 
 /// RULINGS EL3: a candidate registrar that leaves a writer-less FIFO where `settings.json` was cannot
