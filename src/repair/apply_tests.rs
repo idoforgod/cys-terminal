@@ -1730,3 +1730,44 @@ fn resumed_hook_step_failure_marks_the_lane_conflict() {
     let row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
     assert_eq!(row.state, LaneState::Conflict);
 }
+
+/// CT9 (major 13): F9's triple is an AGREEMENT — each member's independent mismatch makes it false:
+/// (a) an UNRELATED approval fingerprint on an otherwise complete triple, (b) a lane row whose
+/// approval reference is not the approval's, (c) slot metadata that disagrees with the operation's
+/// expected state. Without CT9 all three stayed "approved".
+#[test]
+fn f9_is_an_agreement_of_its_members() {
+    let rel = "hooks/f.sh";
+    let fresh = |tag: &str| {
+        let r = rig(tag);
+        let id = rid("R-13");
+        approved_and_applied(&r, &id, rel, b"PRE\n", b"APPROVED\n");
+        assert!(approved_copy_of_current_generation_in(&r.root, &r.pack, &r.lane, rel).unwrap(), "{tag}: complete triple");
+        (r, id)
+    };
+    // (a) an unrelated approval fingerprint
+    let (r, id) = fresh("f9a");
+    let mut rec = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
+    rec.approval.as_mut().unwrap().fingerprint_sha256 = "0".repeat(64);
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    assert!(!approved_copy_of_current_generation_in(&r.root, &r.pack, &r.lane, rel).unwrap(), "(a)");
+    // (b) the approval reference
+    let (r, id) = fresh("f9b");
+    let mut row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+    row.approval_ref = Some("rqr-other".into());
+    ledger::write_lane_in(&r.root, &row).unwrap();
+    assert!(!approved_copy_of_current_generation_in(&r.root, &r.pack, &r.lane, rel).unwrap(), "(b)");
+    // (c) the slot's metadata disagrees with the operation's expected state
+    let (r, id) = fresh("f9c");
+    let (ops, _) = wal::list_in(&r.root, &id);
+    let op = ops.iter().find(|o| o.kind == "apply" && o.outcome.as_deref() == Some("applied")).unwrap();
+    let slot = Slot::at(op.slot.as_ref().unwrap(), rel);
+    let mut pre: serde_json::Value = serde_json::from_slice(&std::fs::read(slot.meta_pre()).unwrap()).unwrap();
+    pre["sha256"] = serde_json::json!("f".repeat(64));
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(slot.meta_pre(), std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    std::fs::write(slot.meta_pre(), serde_json::to_vec(&pre).unwrap()).unwrap();
+    assert!(!approved_copy_of_current_generation_in(&r.root, &r.pack, &r.lane, rel).unwrap(), "(c)");
+}

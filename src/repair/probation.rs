@@ -822,6 +822,32 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
     let pack = env.op.pack;
     let mut existing = load_findings(root, lane);
     let mut new_findings = Vec::new();
+    // CT9: a put-back's finding survives a crash between the exchange and the findings write — it is
+    // rebuilt idempotently from the completed operation records of the M10 sub-ledger
+    let sub_root = m10_root_in(root, lane);
+    let (done_ops, _) = super::wal::list_in(&sub_root, &m10_bucket());
+    for op in done_ops.into_iter().filter(|o| {
+        o.finished && o.outcome.as_deref() == Some("applied") && o.kind == "m10-revert" && o.lane_key == *lane
+    }) {
+        if existing.iter().chain(new_findings.iter()).any(|f: &Finding| f.slot.is_some() && f.slot == op.slot) {
+            continue;
+        }
+        let sha = match apply::state_of_canon(&op.expected) {
+            Some(TargetState::File { sha256, .. }) => sha256,
+            _ => continue,
+        };
+        new_findings.push(Finding {
+            rel: op.rel.clone(),
+            sha256: sha,
+            kind: "reverted".into(),
+            at: op.updated_at,
+            notice: true,
+            notified: false,
+            slot: op.slot.clone(),
+            kept_copy: None,
+            note: "검사 결과: 실패(기록이 끊겨 동작 기록에서 다시 세움)".into(),
+        });
+    }
     // The install manifest (rel → sha256 at install) is read ONLY to tell "unchanged since the install"
     // when this binary does not know the current generation's original (a pro pack, a pack-only update
     // newer than the binary): then a file equal to its installed bytes is not an unapproved change. It
@@ -855,11 +881,28 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
         if original.is_none() && manifest.get(rel).map(String::as_str) == Some(sha.as_str()) {
             continue;
         }
+        let already = |kind: &str| existing.iter().any(|f| f.rel == rel && f.sha256 == sha && f.kind == kind);
+        // CT9: a line-endings-only difference is a LEDGER-ONLY branch before any check or write
+        if original.as_ref().is_some_and(|o| strip_cr(o) == strip_cr(&bytes)) {
+            if !already("line-endings-only") {
+                new_findings.push(Finding {
+                    rel: rel.to_string(),
+                    sha256: sha.clone(),
+                    kind: "line-endings-only".into(),
+                    at: env.op.now,
+                    notice: false,
+                    notified: false,
+                    slot: None,
+                    kept_copy: None,
+                    note: "줄바꿈만 다름 — 장부에만 기록".into(),
+                });
+            }
+            continue;
+        }
         if apply::approved_copy_of_current_generation_in(root, pack, lane, rel).unwrap_or(false) {
             continue;
         }
-        let already = |kind: &str| existing.iter().any(|f| f.rel == rel && f.sha256 == sha && f.kind == kind);
-        let lf_only = original.as_ref().is_some_and(|o| strip_cr(o) == strip_cr(&bytes));
+        let lf_only = false;
         let deadline = check_deadline(rel);
         let verdict = match (env.check)(rel, pack, deadline) {
             Ok(o) => o.result,

@@ -686,3 +686,59 @@ fn reconstructed_origin_row_is_closed_when_the_generation_cannot_be_confirmed() 
     let row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
     assert!(row.probation.as_ref().unwrap().closed.as_deref().is_some_and(|c| c.starts_with("대체됨")), "{:?}", row.probation);
 }
+
+// ───────────────────────────── RULINGS CT9 — the scan's three gaps ─────────────────────────────
+
+/// CT9 (major 12): a line-endings-only difference is a ledger-only branch BEFORE any check or write —
+/// even when the file's check would fail, nothing is checked and nothing is put back. Without CT9 a
+/// failing check of a CR-only file reached the put-back.
+#[cfg(target_os = "macos")]
+#[test]
+fn line_endings_only_is_ledger_only_before_any_check() {
+    let Some(rel) = listed() else {
+        return;
+    };
+    let r = rig("ct9cr");
+    r.put(rel, b"#!/bin/bash\r\necho ok\r\n", 0o755);
+    let checked = RefCell::new(0);
+    let fails = |_: &str, _: &Path, _: Duration| {
+        *checked.borrow_mut() += 1;
+        outcome(CheckResult::Fail("bad".into()), 5)
+    };
+    let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    assert!(f.iter().any(|x| x.rel == rel && x.kind == "line-endings-only" && !x.notice), "{f:?}");
+    assert_eq!(*checked.borrow(), 0, "never checked");
+    assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"#!/bin/bash\r\necho ok\r\n", "never written");
+}
+
+/// CT9 (major 14): a put-back's finding survives a crash between the exchange and the findings
+/// write — the next scan rebuilds it from the completed operation record, naming the kept copy;
+/// a further scan adds nothing (idempotent). Without CT9 the restored file was skipped and the
+/// kept bytes had no finding.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_put_back_finding_survives_a_crash_before_it_is_written() {
+    let Some(rel) = listed() else {
+        return;
+    };
+    let r = rig("ct9find");
+    r.put(rel, b"#!/bin/bash\nbroken(\n", 0o755);
+    let fails = |x: &str, _: &Path, _: Duration| if x == rel { outcome(CheckResult::Fail("bad".into()), 5) } else { outcome(CheckResult::Pass, 5) };
+    let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    let first = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    assert!(first.iter().any(|x| x.kind == "reverted"));
+    // the crash: the findings write never happened
+    std::fs::remove_file(findings_path_in(&r.root, &r.lane)).unwrap();
+    let again = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0, &lock)).unwrap();
+    let rebuilt = again.iter().find(|x| x.rel == rel && x.kind == "reverted").expect("rebuilt from the operation record");
+    let kept = rebuilt.kept_copy.clone().expect("names the kept copy");
+    assert_eq!(std::fs::read(&kept).unwrap(), b"#!/bin/bash\nbroken(\n");
+    assert!(rebuilt.note.contains("cys repair begin --files"), "{}", rebuilt.note);
+    let third = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 7200.0, &lock)).unwrap();
+    assert!(!third.iter().any(|x| x.kind == "reverted"), "idempotent: {third:?}");
+}

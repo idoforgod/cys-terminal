@@ -1675,6 +1675,28 @@ pub fn approved_copy_of_current_generation_in(
         if !row.applied.iter().any(|(r, c)| r == rel && *c == live.canon()) {
             continue;
         }
+        // CT9 — the triple is an AGREEMENT: (i) the approval's fingerprint equals the fingerprint of
+        // the operation set this lane applied, (ii) the lane row's approval reference is that
+        // approval's, (iii) every applied operation's incoming state is the row's state of its file
+        let approval = rec.approval.as_ref().unwrap_or_else(|| unreachable!());
+        let applied_states: Option<Vec<(String, TargetState)>> =
+            row.applied.iter().map(|(r, c)| parse_canon(c).map(|st| (r.clone(), st))).collect();
+        let Some(applied_states) = applied_states else {
+            continue;
+        };
+        if super::types::fingerprint(&applied_states) != approval.fingerprint_sha256 {
+            continue;
+        }
+        if row.approval_ref.as_deref() != Some(approval.request_id.as_str()) {
+            continue;
+        }
+        let ops_agree = row.applied.iter().all(|(r, c)| match applied_op_for(root, &id, lane, r) {
+            Some(o) => o.incoming == *c,
+            None => true, // a target the apply left unchanged has no operation
+        });
+        if !ops_agree {
+            continue;
+        }
         let Some(op) = applied_op_for(root, &id, lane, rel) else {
             continue;
         };
@@ -1689,13 +1711,30 @@ pub fn approved_copy_of_current_generation_in(
             continue;
         };
         let slot = Slot::at(dir, rel);
+        // (iv) the slot's metadata agrees with the operation's EXPECTED identity and state, and so
+        // does the verified deposit
+        let expected = parse_canon(&op.expected).unwrap_or(TargetState::Absent);
+        let (want_sha, want_mode, want_link) = match &expected {
+            TargetState::File { sha256, mode } => (sha256.clone(), *mode, serde_json::Value::Null),
+            TargetState::Link { target } => (String::new(), 0, serde_json::json!(target)),
+            TargetState::Absent => (String::new(), 0, serde_json::Value::Null),
+        };
         let pre_ok = std::fs::read(slot.meta_pre())
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
             .is_some_and(|v| {
-                v["repair"] == id.as_str() && v["lane_key"] == lane.0.as_str() && v["rel"] == rel
+                v["repair"] == id.as_str()
+                    && v["lane_key"] == lane.0.as_str()
+                    && v["rel"] == rel
+                    && v["sha256"] == want_sha.as_str()
+                    && v["mode"] == want_mode
+                    && v["link_target"] == want_link
             });
-        if pre_ok && vault::deposit_of(&slot).is_ok() {
+        let identity_ok = match (&op.live_identity, &expected) {
+            (Some(i), TargetState::File { sha256, .. }) => i.sha256 == *sha256,
+            _ => true,
+        };
+        if pre_ok && identity_ok && vault::deposit_of(&slot).is_ok_and(|(st, _)| st == expected) {
             return Ok(true);
         }
     }
