@@ -1574,39 +1574,124 @@ fn cv1_an_answer_older_than_the_current_decision_is_refused() {
     assert_eq!((v["grant"].clone(), v["generation"].clone()), (json!("on"), json!(2)));
 }
 
-/// CV1: while another daemon holds the grant lock (B between its validation and its write),
-/// `grant on` is refused with the busy sentence after a BOUNDED wait, writes nothing and keeps the
-/// question; once the lock is free the same request succeeds. (T4d · RULINGS EZ — no wall-clock
-/// premise: the bound is shown by the lock and the wait the code is handed, never by measuring real
-/// time. `lock_grant_in` gives up after the wait it is handed — with a zero wait it refuses on its
-/// first try against a held lock, no clock involved; the verb hands `decide_in` the constant
-/// `GRANT_LOCK_WAIT_MS` (pinned: 2 000 ms, and the verb's source passes exactly that); and the verb
-/// returns its refusal at all — an unbounded wait would never return.)
+// RULINGS FD1 — a clock this test controls for the grant lock's wait (`grant::LockClock`): the time
+// source returns the test's virtual time (one real reading as its origin, nothing measured) and
+// records each reading; the sleep advances the virtual time, records itself and, when the virtual
+// time reaches `release_at`, drops the lock the clock holds. Per test thread.
+#[derive(Default)]
+struct VirtualLockClock {
+    origin: Option<std::time::Instant>,
+    at: std::time::Duration,
+    reads: Vec<std::time::Duration>,
+    sleeps: Vec<std::time::Duration>,
+    release: Option<(std::time::Duration, grant::GrantLock)>,
+}
+
+thread_local! {
+    static VIRTUAL_LOCK_CLOCK: std::cell::RefCell<VirtualLockClock> = std::cell::RefCell::new(VirtualLockClock::default());
+}
+
+fn virtual_now() -> std::time::Instant {
+    VIRTUAL_LOCK_CLOCK.with(|c| {
+        let mut c = c.borrow_mut();
+        let at = c.at;
+        c.reads.push(at);
+        c.origin.expect("the virtual clock is set") + at
+    })
+}
+
+fn virtual_sleep(d: std::time::Duration) {
+    VIRTUAL_LOCK_CLOCK.with(|c| {
+        let mut c = c.borrow_mut();
+        c.sleeps.push(d);
+        c.at += d;
+        if c.release.as_ref().is_some_and(|(when, _)| c.at >= *when) {
+            c.release = None; // the holder lets go
+        }
+    })
+}
+
+const VIRTUAL: grant::LockClock = grant::LockClock { now: virtual_now, sleep: virtual_sleep };
+
+/// Starts the virtual clock at 0 (optionally holding `release` until that virtual time).
+fn virtual_clock_start(release: Option<(std::time::Duration, grant::GrantLock)>) {
+    VIRTUAL_LOCK_CLOCK.with(|c| {
+        *c.borrow_mut() = VirtualLockClock {
+            origin: Some(std::time::Instant::now()),
+            release,
+            ..VirtualLockClock::default()
+        }
+    });
+}
+
+/// The readings and the sleeps the lock's wait made since the start.
+fn virtual_clock_record() -> (Vec<std::time::Duration>, Vec<std::time::Duration>) {
+    VIRTUAL_LOCK_CLOCK.with(|c| {
+        let mut c = c.borrow_mut();
+        (std::mem::take(&mut c.reads), std::mem::take(&mut c.sleeps))
+    })
+}
+
+/// CV1 · T4d · RULINGS FD1: a decision waits a BOUNDED time for the grant lock — shown on a clock the
+/// test controls, injected into the lock's wait loop (`grant::LockClock`; the product passes
+/// `grant::REAL_LOCK_CLOCK`). Nothing here measures real time.
+/// - Held elsewhere: `decide_in` with the verb's wait (`GRANT_LOCK_WAIT_MS` = 2 000 ms) tries every
+///   20 ms of the test's clock until the deadline and stops AT it — 101 attempts (100 sleeps of
+///   20 ms, the last attempt judged at exactly 2 000 ms) — then refuses with the busy sentence
+///   without running the decision.
+/// - Released during the wait (at 1 000 ms): the next attempt takes it (51 attempts).
+/// - The verb hands `decide_in` exactly that constant wait and the real clock (its source). Held
+///   elsewhere, the verb refuses, writes nothing and keeps the question; once free, it decides.
+/// - Each of "ZERO instead of the wait", "a different bound" and "no retry" changes the counts and
+///   fails this test.
 #[test]
 fn cv1_a_decision_waits_a_bounded_time_for_the_lock() {
     let r = rig("cv1-wait");
     let t = now0();
     r.call(t, &master(), "grant_ask", json!({})).unwrap();
     r.typed(MASTER, "예", t + 1.0);
-    // a free lock is taken on the first try (zero wait)
-    let held = grant::lock_grant_in(&r.root, std::time::Duration::ZERO).unwrap();
-    // the lock's own bound: held elsewhere, a zero wait refuses on its first try
-    let e = grant::lock_grant_in(&r.root, std::time::Duration::ZERO)
-        .err()
-        .expect("the lock is held");
-    assert!(
-        matches!(&e, RepairError::Precondition(m) if m == grant::GRANT_LOCK_BUSY_KO),
-        "{e:?}"
-    );
-    // the verb waits the constant bound, handed to `decide_in` from its own source
     assert_eq!(grant::GRANT_LOCK_WAIT_MS, 2_000);
+    let wait = std::time::Duration::from_millis(grant::GRANT_LOCK_WAIT_MS);
+    let step = std::time::Duration::from_millis(20);
+    // held elsewhere for the whole wait: the attempts go on until the deadline and stop AT it
+    let held = grant::lock_grant_in(&r.root, std::time::Duration::ZERO, grant::REAL_LOCK_CLOCK).unwrap();
+    virtual_clock_start(None);
+    let ran = std::cell::Cell::new(false);
+    let e = grant::decide_in(&r.root, wait, VIRTUAL, &|_| {}, |_| {
+        ran.set(true);
+        Err(RepairError::Precondition("the decision ran".into()))
+    })
+    .unwrap_err();
+    assert!(matches!(&e, RepairError::Precondition(m) if m == grant::GRANT_LOCK_BUSY_KO), "{e:?}");
+    assert!(!ran.get(), "the decision never ran without the lock");
+    let (reads, sleeps) = virtual_clock_record();
+    assert_eq!(sleeps.len(), 100, "a failed attempt before the deadline sleeps once: 100 sleeps, 101 attempts");
+    assert!(sleeps.iter().all(|d| *d == step), "every pause is 20 ms: {sleeps:?}");
+    // one reading for the deadline, then one per failed attempt
+    assert_eq!(reads.len(), 1 + 101, "{reads:?}");
+    assert_eq!(reads[0], std::time::Duration::ZERO, "the deadline is set at the start");
+    assert!(reads[1..101].iter().all(|at| *at < wait), "every earlier attempt had time left");
+    assert_eq!(reads[101], wait, "the last attempt is judged AT the deadline, and nothing follows it");
+    // released during the wait: the next attempt takes it
+    let release_at = std::time::Duration::from_millis(1_000);
+    virtual_clock_start(Some((release_at, held)));
+    let got = grant::lock_grant_in(&r.root, wait, VIRTUAL).expect("taken once released");
+    let (reads, sleeps) = virtual_clock_record();
+    assert_eq!(sleeps.len(), 50, "released at 1 000 ms: the 51st attempt takes it");
+    assert_eq!(reads.last(), Some(&(release_at - step)), "the last failed attempt had time left");
+    drop(got);
+    // the verb hands `decide_in` the constant wait and the real clock (its own source)
     let src = include_str!("repair.rs");
     let body = &src[src.find("pub(crate) fn grant(ctx: &Ctx<'_>, caller: &Caller, p: &Value)").unwrap()..];
     let body = &body[..body.find("\n    }\n").unwrap()];
     assert!(
-        body.contains("grant::decide_in(\n            &ctx.root,\n            std::time::Duration::from_millis(grant::GRANT_LOCK_WAIT_MS),"),
-        "the grant verb hands decide_in the constant wait"
+        body.contains(
+            "grant::decide_in(\n            &ctx.root,\n            std::time::Duration::from_millis(grant::GRANT_LOCK_WAIT_MS),\n            grant::REAL_LOCK_CLOCK,"
+        ),
+        "the grant verb hands decide_in the constant wait and the real clock"
     );
+    // held elsewhere, the verb refuses, writes nothing and keeps the question; once free, it decides
+    let held = grant::lock_grant_in(&r.root, std::time::Duration::ZERO, grant::REAL_LOCK_CLOCK).unwrap();
     let e = r.call(t + 2.0, &master(), "grant", json!({"mode": "on"})).unwrap_err();
     assert_eq!(e.message, format!("repair.grant: {}", grant::GRANT_LOCK_BUSY_KO));
     assert_eq!(r.decision(), None, "nothing written");

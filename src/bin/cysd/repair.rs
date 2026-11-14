@@ -3625,6 +3625,7 @@ mod grant_verbs {
         let published = grant::decide_in(
             &ctx.root,
             std::time::Duration::from_millis(grant::GRANT_LOCK_WAIT_MS),
+            grant::REAL_LOCK_CLOCK,
             &|_| {},
             |cur| {
                 let mut map = ctx.prompts.lock().unwrap_or_else(|e| e.into_inner());

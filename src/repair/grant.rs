@@ -264,10 +264,31 @@ fn try_lock_file(file: &std::fs::File) -> std::io::Result<bool> {
     }
 }
 
-/// Takes the grant lock, waiting at most `wait` (polled every 20 ms). The lock file is opened
-/// without following a link and without blocking (unix `O_NOFOLLOW | O_NONBLOCK`) and must be a
-/// regular file. Not taken in time → `Err(Precondition(GRANT_LOCK_BUSY_KO))`.
-pub fn lock_grant_in(root: &Path, wait: std::time::Duration) -> Result<GrantLock, RepairError> {
+/// RULINGS FD1 — the clock of the grant lock's wait: the time source its deadline is computed from
+/// and compared with, and the sleep between two attempts. The product passes [`REAL_LOCK_CLOCK`];
+/// a test injects functions it controls.
+#[derive(Debug, Clone, Copy)]
+pub struct LockClock {
+    /// The time source.
+    pub now: fn() -> std::time::Instant,
+    /// The sleep between two attempts.
+    pub sleep: fn(std::time::Duration),
+}
+
+/// The real clock of the grant lock's wait: `Instant::now` and `std::thread::sleep`.
+pub const REAL_LOCK_CLOCK: LockClock = LockClock {
+    now: std::time::Instant::now,
+    sleep: std::thread::sleep,
+};
+
+/// Takes the grant lock, waiting at most `wait` (polled every 20 ms) on `clock`. The lock file is
+/// opened without following a link and without blocking (unix `O_NOFOLLOW | O_NONBLOCK`) and must be
+/// a regular file. Not taken in time → `Err(Precondition(GRANT_LOCK_BUSY_KO))`.
+pub fn lock_grant_in(
+    root: &Path,
+    wait: std::time::Duration,
+    clock: LockClock,
+) -> Result<GrantLock, RepairError> {
     let p = grant_lock_path_in(root);
     std::fs::create_dir_all(root).map_err(|e| io_err(root, e))?;
     let mut o = std::fs::OpenOptions::new();
@@ -283,12 +304,12 @@ pub fn lock_grant_in(root: &Path, wait: std::time::Duration) -> Result<GrantLock
         Ok(_) => return Err(io_err(&p, "the grant lock is not a regular file")),
         Err(e) => return Err(io_err(&p, e)),
     }
-    let deadline = std::time::Instant::now() + wait;
+    let deadline = (clock.now)() + wait;
     loop {
         match try_lock_file(&file) {
             Ok(true) => return Ok(GrantLock { file }),
-            Ok(false) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
+            Ok(false) if (clock.now)() < deadline => {
+                (clock.sleep)(std::time::Duration::from_millis(20));
             }
             Ok(false) => return Err(RepairError::Precondition(GRANT_LOCK_BUSY_KO.to_string())),
             Err(e) => return Err(io_err(&p, e)),
@@ -320,18 +341,19 @@ pub enum DecideStep {
 /// `decide` validate the owner's answer against it (and consume the question — the caller's memory),
 /// then publish the result with generation `validated + 1` — refused if the current generation is no
 /// longer the one validated (`GRANT_STALE_KO`). A decision that validated an older generation can
-/// therefore never overwrite a later one ("an old 예 never overwrites a later off"). `hook` = test
-/// suspension points. On any `Err` nothing was published.
+/// therefore never overwrite a later one ("an old 예 never overwrites a later off"). `clock` = the
+/// lock wait's clock (FD1). `hook` = test suspension points. On any `Err` nothing was published.
 pub fn decide_in<F>(
     root: &Path,
     wait: std::time::Duration,
+    clock: LockClock,
     hook: &dyn Fn(DecideStep),
     decide: F,
 ) -> Result<GrantDecision, RepairError>
 where
     F: FnOnce(CurrentDecision<'_>) -> Result<GrantDecision, RepairError>,
 {
-    let _lock = lock_grant_in(root, wait)?;
+    let _lock = lock_grant_in(root, wait, clock)?;
     hook(DecideStep::Locked);
     let read = read_decision_in(root);
     let (current, unreadable) = match &read {
