@@ -3826,7 +3826,8 @@ mod grant_verbs {
             return Err(VerbError::invalid(CAP_ON_ASK_ONLY_KO));
         }
         let d = grant::read_decision_in(&ctx.root)?;
-        // DK1 (2): the later of this daemon's memory and the durable marks; an unreadable pause
+        // DK1 (2) / DM1: the later of this daemon's memory and the written marks (each until its
+        // covered-through time + 30 min); an unreadable pause
         // directory = paused for this read; the hold after this daemon's start (DG3 (c)). Writes nothing.
         let st = grant::pause_state_in(&ctx.root, ctx.now);
         let hold = grant::incarnation_started_at(&ctx.incarnation)
@@ -3916,10 +3917,11 @@ mod grant_verbs {
 /// seen by THIS lane's daemon in the grant's pause file (only while the grant is on; nothing is sent
 /// to any queue). Called at the two places the daemon learns of owner input (`handlers.rs`): an
 /// owner-typed prompt in `hook.machine_origin` (STRICT judgment — CH2) and an operator-typed app send
-/// (`human_verified`). App typing arrives in many small sends: RULINGS DK1 — every one of them moves
-/// this daemon's in-memory latest input first; the lane's mark is written (the later of the stored
-/// mark and the current latest input) whenever the latest input is not yet durable, at most once
-/// per second; this daemon's pause ends 30 minutes after the later of its memory and the marks.
+/// (`human_verified`). App typing arrives in many small sends: RULINGS DK1 / DM1 — every one of them
+/// moves this daemon's in-memory latest input first; a write happens only when that input is later
+/// than the time the lane's last written mark covers through (the write's time + 5 s), so a burst
+/// writes about once per 5 s and its last input is always covered; the pause lasts at least 30
+/// minutes after the last input (at most the covering window longer).
 pub(crate) fn grant_note_owner_input(daemon: &Daemon) {
     let root = production_root(daemon);
     let lane = LaneKey::of_socket(&daemon.socket_path);
@@ -3947,10 +3949,11 @@ pub(crate) fn grant_note_app_typing(
     }
 }
 
-/// [`grant_note_owner_input`]'s body (root and clock explicit for the tests) — RULINGS DK1: the
-/// in-memory latest input moves at once; the write follows when the input is not yet durable (at
-/// most once per second); a failed write is one stderr line scoped to THIS lane's daemon (DK1 (6))
-/// and nothing is latched — the next asker tries again. Nothing to any queue.
+/// [`grant_note_owner_input`]'s body (root and clock explicit for the tests) — RULINGS DK1 / DM1:
+/// the in-memory latest input moves at once; the write follows when the input is not yet visible
+/// (later than the covered-through time this daemon wrote); a failed write is one stderr line scoped
+/// to THIS lane's daemon (DK1 (6)) and only spaces the next attempt by a second (DM2). Nothing to
+/// any queue.
 pub(crate) fn note_owner_input_throttled(root: &Path, lane: &LaneKey, now: f64) {
     if let Err(e) = cys::repair::grant::note_owner_input_in(root, lane, now) {
         eprintln!("{} ({e:?})", cys::repair::grant::PAUSE_WRITE_FAILED_KO);

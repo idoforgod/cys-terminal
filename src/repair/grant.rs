@@ -371,35 +371,57 @@ pub fn current_generation_in(root: &Path) -> u64 {
 
 // ───────────────────────────── the pause (B4) ─────────────────────────────
 
-/// One lane's pause file: the last owner input that lane's daemon saw.
+/// One lane's pause file: the last owner input that lane's daemon saw, and (RULINGS DM1) the time
+/// the mark covers through — every reader treats the pause as lasting until `covered_through + 30
+/// min`. A mark written before DM1 has no `covered_through` (read as `paused_at`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PauseMark {
     pub schema: u32,
     pub lane_key: LaneKey,
     pub paused_at: f64,
     pub resumed_at: f64,
+    #[serde(default)]
+    pub covered_through: Option<f64>,
 }
 
-/// RULINGS DK1 (T4b — replaces CV3, DG3 (a)(b) and DG4) — THE PAUSE, IN ONE FORM:
-/// (1) per lane this daemon holds ONE in-memory value, the latest owner-input time (it only moves
-/// forward); every owner input updates it first; (2) this daemon's answer to "paused?" = now < 30
-/// minutes after the LATER of that value and every durable mark it can read — when the pause
-/// directory cannot be read (anything but "not found") the answer for THAT call is "paused",
-/// nothing is latched; (3) a write, under the lane's writer lock, stores the later of the stored
-/// mark and the CURRENT in-memory value, and records "durably written up to" under the same lock;
-/// (4) "not yet durable" is DERIVED (in-memory later than durably written) — whoever asks while it
-/// is true (an owner input, a start admission, a new-round check) tries the write first, at most
-/// once per second per lane, then answers by (2). No flag is set or cleared by a completion; no
-/// timer, no thread. Each lane writes ONLY its own mark file; written only while the grant is on.
-/// Sends nothing to any queue.
+impl PauseMark {
+    /// The time the mark covers owner input through (DM1).
+    pub fn covered(&self) -> f64 {
+        self.covered_through
+            .filter(|c| c.is_finite())
+            .map_or(self.paused_at, |c| c.max(self.paused_at))
+    }
+}
+
+/// THE PAUSE (RULINGS DK1 (1)(2)(5)(6) with DM1–DM3 in place of DK1 (3)(4) — T4b):
+/// (1) per lane this daemon holds ONE in-memory value, the latest owner-input time (forward only);
+/// every owner input updates it first; (2) this daemon's answer to "paused?" = now < 30 minutes after
+/// the LATER of that value and every written mark it can read (a mark counts until its
+/// `covered_through` + 30 min); a pause directory that cannot be read (anything but "not found")
+/// answers "paused" for THAT call — nothing is latched; DM1: a write, under the lane's writer lock,
+/// stores `covered_through` = the CURRENT latest input + [`PAUSE_COVER_SECS`] (on the input path the
+/// write runs at the input, so this is the write's wall time + W; a retried write covers the last
+/// input + W, so the pause still ends 30 minutes + W after the last input — DM4), kept as the later
+/// of the stored and the new value; an input at or before
+/// the lane's covered-through time needs NO write; "not yet visible" is DERIVED (the in-memory input
+/// is later than the covered-through time this daemon wrote) and whoever asks while it is true (an
+/// owner input, a start admission, a new-round check) attempts the write, then answers by (2);
+/// DM2: only after a FAILED attempt is the next one spaced — by a monotonic clock read under the
+/// writer lock, [`PAUSE_RETRY_AFTER_FAILURE_SECS`] — never by a caller's captured input time;
+/// DM3: "written", not "flushed" — the mark is published by an atomic replace so other daemons see
+/// it, and deliberately NOT forced to stable storage (the write is on the path of the owner's
+/// typing; a machine crash that loses a mark restarts every daemon, and the hold after a daemon
+/// start covers each lane for the pause length). Each lane writes ONLY its own mark; written only
+/// while the grant is on. No flag is set or cleared by a completion; no timer, no thread. Sends
+/// nothing to any queue.
 #[derive(Debug, Default, Clone, Copy)]
 struct PauseMemory {
     /// (1) the latest owner-input time seen by this daemon for the lane (0 = none)
     latest: f64,
-    /// (3) the input time the lane's mark durably holds (0 = none known)
-    durable: f64,
-    /// (4) when a write was last attempted (at most one attempt per second)
-    attempted: Option<f64>,
+    /// DM1: the covered-through time this daemon last wrote for the lane (0 = none)
+    visible_through: f64,
+    /// DM2: after a failed attempt, no new attempt before this monotonic instant
+    retry_after: Option<std::time::Instant>,
 }
 
 type PauseKey = (PathBuf, String);
@@ -410,11 +432,43 @@ fn pause_memory() -> &'static std::sync::Mutex<std::collections::HashMap<PauseKe
     M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// DK1 (4): at most one write attempt per second per lane.
-pub const PAUSE_WRITE_MIN_INTERVAL_SECS: f64 = 1.0;
+/// DM1: W — how far past the wall time of a write a mark covers owner input.
+pub const PAUSE_COVER_SECS: f64 = 5.0;
 
-/// DK1 (3) — the per-lane writer lock of this process (each lane's mark has one writer: that
-/// lane's daemon; its threads take this lock for the read-compare-write of the mark).
+/// DM2: after a failed attempt, the next attempt waits at least this long (monotonic).
+pub const PAUSE_RETRY_AFTER_FAILURE_SECS: f64 = 1.0;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam (DM4): pause-mark writes on this thread fail (the directory stays readable).
+    pub(crate) static FAIL_PAUSE_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam (DM2): added to the monotonic clock on this thread.
+    pub(crate) static MONOTONIC_SKEW: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+fn monotonic_now() -> std::time::Instant {
+    let now = std::time::Instant::now();
+    #[cfg(test)]
+    {
+        return now + MONOTONIC_SKEW.with(|c| c.get());
+    }
+    #[allow(unreachable_code)]
+    now
+}
+
+fn write_pause_mark(p: &Path, mark: &PauseMark) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        if FAIL_PAUSE_WRITE.with(|c| c.get()) {
+            return Err(std::io::Error::other("injected pause-write failure"));
+        }
+    }
+    crate::atomic_write_json(p, mark)
+}
+
+/// The per-lane writer lock of this process (each lane's mark has one writer: that lane's daemon;
+/// its threads take this lock for the read-compare-write of the mark).
 fn pause_write_lock(root: &Path, lane: &LaneKey) -> std::sync::Arc<std::sync::Mutex<()>> {
     static W: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<PauseKey, std::sync::Arc<std::sync::Mutex<()>>>>,
@@ -427,27 +481,25 @@ fn pause_write_lock(root: &Path, lane: &LaneKey) -> std::sync::Arc<std::sync::Mu
         .clone()
 }
 
-/// DK1 (3)(4) — if the lane's latest input is not yet durable and no write was attempted in the
-/// last second: under the lane's writer lock, write the later of the stored mark and the CURRENT
-/// in-memory value, and record "durably written up to". `Ok(true)` = a mark was written; `Ok(false)`
-/// = nothing written (durable already, a write attempted in the last second, or the grant is off —
-/// no write is attempted then and the input stays "not yet durable" for a later `grant on`);
-/// `Err` = the write failed (nothing latched: the next asker tries).
-fn persist_pause(root: &Path, lane: &LaneKey, now: f64) -> Result<bool, RepairError> {
+/// DM1 / DM2 — if the lane's latest input is not yet visible (later than the covered-through time
+/// this daemon wrote) and no failed attempt is less than a second old (monotonic): under the lane's
+/// writer lock, write `covered_through` = max(stored, the CURRENT latest input + W). `Ok(true)` =
+/// written; `Ok(false)` = nothing to do (covered already, a failed attempt in the last second, or
+/// the grant is off — then nothing is attempted); `Err` = the write failed (the next attempt waits a
+/// second; nothing else is latched).
+fn persist_pause(root: &Path, lane: &LaneKey) -> Result<bool, RepairError> {
     let key = (root.to_path_buf(), lane.0.clone());
     let write_lock = pause_write_lock(root, lane);
     let _held = write_lock.lock().unwrap_or_else(|e| e.into_inner());
-    {
+    let mono = monotonic_now();
+    let latest = {
         let m = pause_memory().lock().unwrap_or_else(|e| e.into_inner());
         let e = m.get(&key).copied().unwrap_or_default();
-        if e.latest <= e.durable
-            || e
-                .attempted
-                .is_some_and(|a| now >= a && now - a < PAUSE_WRITE_MIN_INTERVAL_SECS)
-        {
+        if e.latest <= e.visible_through || e.retry_after.is_some_and(|r| mono < r) {
             return Ok(false);
         }
-    }
+        e.latest // the CURRENT value, read under the writer lock
+    };
     let on = match read_decision_in(root) {
         Ok(d) => is_on(d.as_ref()),
         // an unreadable decision is off for starting — but an owner input must still pause in case
@@ -457,36 +509,39 @@ fn persist_pause(root: &Path, lane: &LaneKey, now: f64) -> Result<bool, RepairEr
     if !on {
         return Ok(false);
     }
-    let latest = {
-        let mut m = pause_memory().lock().unwrap_or_else(|e| e.into_inner());
-        let e = m.entry(key.clone()).or_default();
-        e.attempted = Some(now);
-        e.latest // the CURRENT value, read under the writer lock
-    };
     let p = pause_path_in(root, lane);
     let stored = std::fs::read(&p)
         .map_err(|e| corrupt(&p, e))
         .and_then(|b| parse_versioned::<PauseMark>(&p, &b))
-        .ok()
-        .map(|m| m.paused_at)
-        .filter(|t| t.is_finite());
-    let at = stored.map_or(latest, |s| s.max(latest));
+        .ok();
+    let paused_at = stored.as_ref().map_or(latest, |m| m.paused_at.max(latest));
+    let covered = (latest + PAUSE_COVER_SECS).max(stored.as_ref().map_or(0.0, PauseMark::covered));
     let mark = PauseMark {
         schema: super::REPAIR_SCHEMA,
         lane_key: lane.clone(),
-        paused_at: at,
-        resumed_at: at + PAUSE_QUIET_SECS as f64,
+        paused_at,
+        resumed_at: covered + PAUSE_QUIET_SECS as f64,
+        covered_through: Some(covered),
     };
-    crate::atomic_write_json(&p, &mark).map_err(|e| io_err(&p, e))?;
+    let written = write_pause_mark(&p, &mark);
     let mut m = pause_memory().lock().unwrap_or_else(|e| e.into_inner());
     let e = m.entry(key).or_default();
-    e.durable = e.durable.max(at); // "durably written up to", under the writer lock
-    Ok(true)
+    match written {
+        Ok(()) => {
+            e.visible_through = e.visible_through.max(covered);
+            e.retry_after = None;
+            Ok(true)
+        }
+        Err(err) => {
+            e.retry_after = Some(mono + std::time::Duration::from_secs_f64(PAUSE_RETRY_AFTER_FAILURE_SECS));
+            Err(io_err(&p, err))
+        }
+    }
 }
 
-/// B4 "주인의 아무 입력이면 즉시 정지" — an owner input seen by `lane`'s daemon at `now`: DK1 (1)
-/// the in-memory latest input moves forward at once; (4) then the write is tried if the input is
-/// not yet durable. `Ok(true)` = a mark was written by this call; `Err` = the write failed — this
+/// B4 "주인의 아무 입력이면 즉시 정지" — an owner input seen by `lane`'s daemon at `now`: (1) the
+/// in-memory latest input moves forward at once; DM1: then the write is attempted if the input is
+/// not yet visible. `Ok(true)` = a mark was written by this call; `Err` = the write failed — this
 /// lane's daemon stays paused for 30 minutes after its latest input from its memory alone.
 pub fn note_owner_input_in(root: &Path, lane: &LaneKey, now: f64) -> Result<bool, RepairError> {
     {
@@ -496,33 +551,44 @@ pub fn note_owner_input_in(root: &Path, lane: &LaneKey, now: f64) -> Result<bool
             e.latest = now;
         }
     }
-    persist_pause(root, lane, now)
+    persist_pause(root, lane)
 }
 
-/// DK1 (4) — before answering "paused?" for a start admission or a new-round check: every lane of
-/// `root` whose latest input is not yet durable in this daemon tries its write (at most once per
-/// second). A failure is one stderr line scoped to this lane's daemon (DK1 (6)).
-pub fn refresh_pause_in(root: &Path, now: f64) {
+/// DM1 — before answering "paused?" for a start admission or a new-round check: every lane of
+/// `root` whose latest input is not yet visible in this daemon attempts its write. A failure is one
+/// stderr line scoped to this lane's daemon (DK1 (6)).
+pub fn refresh_pause_in(root: &Path) {
     let pending: Vec<String> = pause_memory()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .filter(|((r, _), e)| r == root && e.latest > e.durable)
+        .filter(|((r, _), e)| r == root && e.latest > e.visible_through)
         .map(|((_, lane), _)| lane.clone())
         .collect();
     for lane in pending {
-        if let Err(e) = persist_pause(root, &LaneKey(lane), now) {
+        if let Err(e) = persist_pause(root, &LaneKey(lane)) {
             eprintln!("{} ({e:?})", PAUSE_WRITE_FAILED_KO);
         }
     }
 }
 
-/// DK1 (6): the sentence of a failed pause write — this lane's daemon only.
-pub const PAUSE_WRITE_FAILED_KO: &str = "[cysd] repair grant: 이 부서의 데몬은 주인의 입력을 파일에 남기지 못했습니다 — 이 부서의 데몬은 마지막 입력 뒤 30분 동안 자동 착수를 멈춥니다(다른 부서의 데몬은 이 입력을 모릅니다)";
+/// Test helper: forget this process's memory of a lane — the view of ANOTHER daemon, which has
+/// only the written marks (the "separate process" of the DM tests).
+#[cfg(test)]
+pub(crate) fn forget_pause_memory(root: &Path, lane: &LaneKey) {
+    pause_memory()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(root.to_path_buf(), lane.0.clone()));
+}
 
-/// When the pause ends: the later of this daemon's in-memory latest input and every readable
-/// durable mark (`grant.json`'s own pause and each lane's mark; an unreadable mark counts with its
-/// modification time, or "now" — fail closed), + 30 minutes. `None` = no owner input known.
+/// DK1 (6): the sentence of a failed pause write — this lane's daemon only.
+pub const PAUSE_WRITE_FAILED_KO: &str = "[cysd] repair grant: 이 부서의 데몬은 주인의 입력을 파일에 남기지 못했습니다 — 이 부서의 데몬은 마지막 입력 뒤 적어도 30분 동안 자동 착수를 멈춥니다(다른 부서의 데몬은 이 입력을 모릅니다)";
+
+/// When the pause ends: the later of this daemon's in-memory latest input + 30 min and every
+/// readable written mark's `covered_through` + 30 min (DM1; `grant.json`'s own pause counts from its
+/// `paused_at`; an unreadable mark counts with its modification time, or "now" — fail closed).
+/// `None` = no owner input known.
 pub fn pause_deadline_in(root: &Path, now: f64) -> Option<f64> {
     pause_read_in(root, now).0
 }
@@ -573,7 +639,7 @@ fn pause_read_in(root: &Path, now: f64) -> (Option<f64>, bool) {
                     .map_err(|e| corrupt(&p, e))
                     .and_then(|b| parse_versioned::<PauseMark>(&p, &b))
                 {
-                    Ok(m) => bump(m.paused_at + quiet),
+                    Ok(m) => bump(m.covered() + quiet),
                     Err(_) => bump(mtime_epoch(&p).unwrap_or(now) + quiet),
                 }
             }
@@ -639,7 +705,7 @@ pub fn restart_hold_until(owner: &LockOwner) -> Option<f64> {
     incarnation_started_at(&owner.incarnation).map(|s| s + PAUSE_QUIET_SECS as f64)
 }
 
-/// B4 / DK1 (2): paused while the pause has not ended (memory and durable marks, the later wins),
+/// B4 / DK1 (2): paused while the pause has not ended (memory and written marks, the later wins),
 /// and for a call that cannot read the pause directory. A clock set back keeps the pause on (the
 /// safe side). Writes nothing.
 pub fn is_paused_in(root: &Path, now: f64) -> bool {
@@ -1130,7 +1196,7 @@ pub fn try_claim_in(
     if let Evaluated::Busy = evaluated {
         return Ok(StartVerdict::Busy);
     }
-    refresh_pause_in(env.root, (env.clock)()); // DK1 (4): a not-yet-durable input is written first
+    refresh_pause_in(env.root); // DM1: a not-yet-visible input is written first
     let held = |now: f64| restart_hold_until(owner).is_some_and(|h| now < h); // DG3 (c)
     if is_paused_in(env.root, (env.clock)()) || held((env.clock)()) {
         return Ok(StartVerdict::Paused);
@@ -1184,7 +1250,7 @@ pub fn try_claim_in(
     // Anything published after the second reads is ordered after this start (a running round is
     // not stopped by a pause — B4).
     let now = (env.clock)();
-    refresh_pause_in(env.root, now);
+    refresh_pause_in(env.root);
     let d1 = read_decision_in(env.root).unwrap_or(None);
     let p1 = pause_state_in(env.root, now);
     step!(env, ClaimStep::BetweenAdmissionReads);
@@ -1273,7 +1339,7 @@ pub fn observe_and_close_claims(high_water: u32) -> Result<u32, RepairError> {
 /// grant is paused, and while it is off (the owner withdrew the standing mission; `commit` and
 /// `revert` stay open — only a NEW round is refused).
 pub fn may_open_new_round_in(root: &Path, now: f64) -> Result<bool, RepairError> {
-    refresh_pause_in(root, now); // DK1 (4): the new-round check writes a not-yet-durable input first
+    refresh_pause_in(root); // DM1: the new-round check writes a not-yet-visible input first
     let on = is_on(read_decision_in(root).unwrap_or(None).as_ref());
     Ok(on && !is_paused_in(root, now))
 }

@@ -741,7 +741,7 @@ fn t4_print(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, v: &Value
                         .and_then(|t| chrono::DateTime::from_timestamp(t as i64, 0))
                         .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
                         .unwrap_or_else(|| "-".into());
-                    format!("일시정지 중({until}까지 · 주인의 입력 뒤 30분)")
+                    format!("일시정지 중({until}까지 · 주인의 입력 뒤 적어도 30분)")
                 } else {
                     "일시정지 아님".to_string()
                 };
@@ -758,7 +758,7 @@ fn t4_print(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, v: &Value
             if v.get("grant") == Some(&json!("on")) {
                 writeln!(
                     out,
-                    "자동 수리 허락: 켬 (하루 상한 {}건 · 주인의 입력이 있으면 30분 쉼)",
+                    "자동 수리 허락: 켬 (하루 상한 {}건 · 주인의 입력이 있으면 그 뒤 적어도 30분 쉼)",
                     s(v, "daily_cap")
                 )
             } else {

@@ -353,11 +353,13 @@ fn owner_input_pauses_and_resumes() {
     assert!(!seq_dir_in(&r).exists() || claims(&r).is_empty());
     assert!(is_paused_in(&r, t - 3_600.0), "a clock set back keeps the pause");
     assert!(is_paused_in(&r, t + 1_799.0));
-    // RULINGS DK1 (round 3): the pause ends exactly 30 minutes after the input again — CV3's
-    // "+ coalescing window" (round-1 expectations t + 1805 / t + 1806) is withdrawn with it
-    assert!(!is_paused_in(&r, t + 1_800.5));
-    assert!(may_open_new_round_in(&r, t + 1_801.0).unwrap());
-    assert!(allowed(&start_new(&r, t + 1_801.0, D, &o).1));
+    // RULINGS DM1 (round 4): a written mark covers its input + W (5 s), so the pause lasts until
+    // covered-through + 30 min = t + 1805 (round 3 / pre-T4b expectations: `!is_paused_in(&r, t +
+    // 1_800.5)`, open at t + 1801)
+    assert!(is_paused_in(&r, t + 1_804.5));
+    assert!(!is_paused_in(&r, t + 1_805.5));
+    assert!(may_open_new_round_in(&r, t + 1_806.0).unwrap());
+    assert!(allowed(&start_new(&r, t + 1_806.0, D, &o).1));
     // an unreadable pause file holds the pause by its modification time
     std::fs::write(pause_path_in(&r, &LaneKey("dept-9".into())), b"x").unwrap();
     assert!(is_paused_in(&r, t0() + 5.0));
@@ -1166,125 +1168,167 @@ fn dg3_a_lane_holds_autonomous_starts_after_its_daemon_started() {
     assert!(allowed(&start_new(&r, started + 1_800.5, D, &o).1), "the hold ends 30 min after the start");
 }
 
-// ───────────────────────────── RULINGS DK1 (T4b round 3 — replaces the CV3 / DG3 (a)(b) / DG4 tests) ─────────────────────────────
+// ───────────────────────────── RULINGS DK1 + DM (T4b rounds 3–4) ─────────────────────────────
 
-/// DK1 (1)(2): every input moves this daemon's latest input; two inputs 4 s apart → paused until
-/// exactly 30 minutes after the SECOND, not a second longer; both are written (at most one write
-/// attempt per second — an input within the same second is not written by itself).
-/// (Replaces `cv3_two_inputs_four_seconds_apart`, whose OLD expectations were "the second input is
-/// coalesced" and "resumed by t + 1800 + 5".)
-#[test]
-fn dk1_the_pause_ends_thirty_minutes_after_the_last_input() {
-    let r = root("dk1-two");
-    grant_on(&r, 5);
-    let lane = LaneKey("dk1-two".into());
-    let t = t0();
-    assert!(note_owner_input_in(&r, &lane, t).unwrap());
-    assert!(!note_owner_input_in(&r, &lane, t + 0.5).unwrap(), "same second: no second write attempt");
-    assert!(note_owner_input_in(&r, &lane, t + 4.0).unwrap(), "a second later: written");
-    let m: PauseMark = serde_json::from_slice(&std::fs::read(pause_path_in(&r, &lane)).unwrap()).unwrap();
-    assert_eq!(m.paused_at, t + 4.0, "the later of the stored mark and the CURRENT latest input");
-    assert!(is_paused_in(&r, t + 4.0 + 1_799.9));
-    assert!(!is_paused_in(&r, t + 4.0 + 1_800.1), "not a second longer");
-    let o = owner("base", 3, "inc-1");
-    assert_eq!(start_new(&r, t + 1_803.0, D, &o).1.unwrap(), StartVerdict::Paused);
-    assert!(allowed(&start_new(&r, t + 1_804.5, D, &o).1));
+fn mark_of(r: &Path, lane: &LaneKey) -> PauseMark {
+    serde_json::from_slice(&std::fs::read(pause_path_in(r, lane)).unwrap()).unwrap()
 }
 
-/// DK1 pin — the verdict's stuck new round: an input whose write fails, storage recovers, NO new
-/// input: the new-round check itself tries the write first (the mark appears with the input's
-/// time) and answers "paused" until 30 minutes after that input, then opens. And a write that keeps
-/// failing never pauses past 30 minutes after the last input (no latched flag).
+/// DM1: a written mark covers its input + W — inputs at or before the covered-through time need no
+/// write, a later input writes; the pause lasts at least 30 minutes after the LAST input and at most
+/// W longer. (Replaces round 3's "at most one write attempt per second".)
 #[test]
-fn dk1_a_failed_write_is_retried_by_the_asker_and_never_outlives_thirty_minutes() {
-    let r = root("dk1-stuck");
+fn dm1_a_written_mark_covers_a_window() {
+    let r = root("dm1-burst");
     grant_on(&r, 5);
-    let lane = LaneKey("dk1-stuck".into());
+    let lane = LaneKey("dm1-burst".into());
     let t = t0();
-    std::fs::write(r.join("grant-pause"), b"not a directory").unwrap();
+    assert!(note_owner_input_in(&r, &lane, t).unwrap());
+    assert_eq!(mark_of(&r, &lane).covered(), t + PAUSE_COVER_SECS);
+    assert!(!note_owner_input_in(&r, &lane, t + 0.5).unwrap(), "covered: no write");
+    assert!(!note_owner_input_in(&r, &lane, t + PAUSE_COVER_SECS).unwrap(), "at the covered time: no write");
+    assert!(note_owner_input_in(&r, &lane, t + 6.0).unwrap(), "later than covered: written");
+    assert_eq!(mark_of(&r, &lane).covered(), t + 6.0 + PAUSE_COVER_SECS);
+    assert!(is_paused_in(&r, t + 6.0 + 1_800.0), "at least 30 minutes after the last input");
+    assert!(!is_paused_in(&r, t + 6.0 + PAUSE_COVER_SECS + 1_800.1), "at most W longer");
+}
+
+/// DM1 pin — the burst seen from ANOTHER daemon (its own state: only the written marks): lane A
+/// writes at t and takes its last input at t + 0.5 (covered — no write); lane B refuses at
+/// t + 1800.1 and admits only after covered-through + 1800.
+#[test]
+fn dm1_another_lane_sees_the_last_input_of_a_burst() {
+    let r = root("dm1-lanes");
+    grant_on(&r, 5);
+    let a = LaneKey("dept-a".into());
+    let t = t0();
+    assert!(note_owner_input_in(&r, &a, t).unwrap());
+    assert!(!note_owner_input_in(&r, &a, t + 0.5).unwrap());
+    forget_pause_memory(&r, &a); // lane B's daemon has none of A's memory
+    let b = owner("dept-b", 7, "inc-b");
+    assert_eq!(start_new(&r, t + 1_800.1, D, &b).1.unwrap(), StartVerdict::Paused);
+    assert_eq!(start_new(&r, t + PAUSE_COVER_SECS + 1_799.9, D, &b).1.unwrap(), StartVerdict::Paused);
+    assert!(allowed(&start_new(&r, t + PAUSE_COVER_SECS + 1_800.1, D, &b).1));
+}
+
+/// DM4 / DK1 pin — a WRITE failure with a READABLE directory (seam): this daemon is paused from its
+/// memory; storage recovers and NO new input comes — the new-round check (what `record` asks)
+/// retries the write first (after the one-second spacing) and the pause ends 30 minutes + W after
+/// the last input; a write that keeps failing never pauses past 30 minutes after the last input.
+#[test]
+fn dm4_a_write_failure_is_retried_by_the_asker_and_never_outlives_the_window() {
+    let r = root("dm4-write");
+    grant_on(&r, 5);
+    let lane = LaneKey("dm4-write".into());
+    let t = t0();
+    FAIL_PAUSE_WRITE.with(|c| c.set(true));
     assert!(note_owner_input_in(&r, &lane, t).is_err(), "the write fails");
+    FAIL_PAUSE_WRITE.with(|c| c.set(false));
     assert!(is_paused_in(&r, t + 60.0), "this daemon is paused from its memory");
-    std::fs::remove_file(r.join("grant-pause")).unwrap();
-    assert!(!may_open_new_round_in(&r, t + 60.0).unwrap(), "still within 30 minutes");
-    let m: PauseMark = serde_json::from_slice(&std::fs::read(pause_path_in(&r, &lane)).unwrap()).unwrap();
-    assert_eq!(m.paused_at, t, "the check wrote the not-yet-durable input first");
-    assert!(may_open_new_round_in(&r, t + 1_801.0).unwrap(), "the round opens once 30 minutes passed");
-    // storage that keeps failing: the pause still ends 30 minutes after the last input
-    let r2 = root("dk1-fail");
+    assert!(!pause_path_in(&r, &lane).exists());
+    MONOTONIC_SKEW.with(|c| c.set(std::time::Duration::from_secs(2)));
+    assert!(!may_open_new_round_in(&r, t + 60.0).unwrap(), "still within the pause");
+    assert_eq!(mark_of(&r, &lane).covered(), t + PAUSE_COVER_SECS, "the check wrote the last input first");
+    assert!(!may_open_new_round_in(&r, t + 1_804.0).unwrap());
+    assert!(may_open_new_round_in(&r, t + PAUSE_COVER_SECS + 1_800.1).unwrap(), "30 min + W after the last input");
+    MONOTONIC_SKEW.with(|c| c.set(std::time::Duration::ZERO));
+    // a write that keeps failing: the pause still ends 30 minutes after the last input
+    let r2 = root("dm4-keeps-failing");
     grant_on(&r2, 5);
-    std::fs::write(r2.join("grant-pause"), b"x").unwrap();
+    FAIL_PAUSE_WRITE.with(|c| c.set(true));
     assert!(note_owner_input_in(&r2, &lane, t).is_err());
     let o = owner("base", 3, "inc-1");
     assert_eq!(start_new(&r2, t + 1_799.0, D, &o).1.unwrap(), StartVerdict::Paused);
-    assert!(may_open_new_round_in(&r2, t + 1_801.0).unwrap(), "not past 30 minutes because of a failed write");
-    assert!(allowed(&start_new(&r2, t + 1_801.0, D, &o).1));
+    assert!(may_open_new_round_in(&r2, t + 1_800.1).unwrap(), "not past 30 minutes because of a failed write");
+    assert!(allowed(&start_new(&r2, t + 1_800.1, D, &o).1));
+    FAIL_PAUSE_WRITE.with(|c| c.set(false));
 }
 
-/// DK1 pin — an older successful write cannot hide a newer failed one: input t written; the disk
-/// fails; input t + 10 is not written — "not yet durable" is derived (memory later than durable),
-/// so this daemon stays paused by t + 10 and the next asker (an admission) writes t + 10.
+/// DK1 / DM pin — an older successful write cannot hide a newer failed one: input t written;
+/// input t + 10 fails — "not yet visible" is derived, so this daemon stays paused by t + 10 and the
+/// next asker (an admission, after the spacing) writes it.
 #[test]
-fn dk1_an_older_success_never_hides_a_newer_failure() {
-    let r = root("dk1-older");
+fn dm_an_older_success_never_hides_a_newer_failure() {
+    let r = root("dm-older");
     grant_on(&r, 5);
-    let lane = LaneKey("dk1-older".into());
+    let lane = LaneKey("dm-older".into());
     let t = t0();
     assert!(note_owner_input_in(&r, &lane, t).unwrap());
-    let dir = r.join("grant-pause");
-    let saved = r.join("grant-pause.saved");
-    std::fs::rename(&dir, &saved).unwrap();
-    std::fs::write(&dir, b"blocked").unwrap();
+    FAIL_PAUSE_WRITE.with(|c| c.set(true));
     assert!(note_owner_input_in(&r, &lane, t + 10.0).is_err());
-    assert!(is_paused_in(&r, t + 1_805.0), "paused by the newer input (memory)");
-    std::fs::remove_file(&dir).unwrap();
-    std::fs::rename(&saved, &dir).unwrap();
+    FAIL_PAUSE_WRITE.with(|c| c.set(false));
+    assert!(is_paused_in(&r, t + 1_809.0), "paused by the newer input (memory)");
+    assert_eq!(mark_of(&r, &lane).covered(), t + PAUSE_COVER_SECS, "the older mark is all that is written");
+    MONOTONIC_SKEW.with(|c| c.set(std::time::Duration::from_secs(2)));
     let o = owner("base", 3, "inc-1");
     assert_eq!(start_new(&r, t + 20.0, D, &o).1.unwrap(), StartVerdict::Paused);
-    let m: PauseMark = serde_json::from_slice(&std::fs::read(pause_path_in(&r, &lane)).unwrap()).unwrap();
-    assert_eq!(m.paused_at, t + 10.0, "the admission wrote the newer input");
+    MONOTONIC_SKEW.with(|c| c.set(std::time::Duration::ZERO));
+    assert_eq!(mark_of(&r, &lane).covered(), t + 10.0 + PAUSE_COVER_SECS, "the admission wrote the newer input");
 }
 
-/// DK1 (3) pin — reversed completion order: the newer input is written first, an older input
-/// arriving after it neither moves the in-memory latest back nor the stored mark; eight concurrent
-/// writers leave the latest input stored.
+/// DM2 pin — retry spacing is monotonic and only after a failure: after a FAILED newer write, a
+/// delayed OLDER caller does not attempt within the second (its captured input time plays no
+/// part) and does not move the latest input back; after the second the next asker writes.
 #[test]
-fn dk1_reversed_completion_never_moves_the_end_back() {
-    let r = root("dk1-rev");
+fn dm2_a_delayed_older_caller_after_a_failed_newer_one() {
+    let r = root("dm2");
     grant_on(&r, 5);
-    let lane = LaneKey("dk1-rev".into());
+    let lane = LaneKey("dm2".into());
+    let t = t0();
+    assert!(note_owner_input_in(&r, &lane, t).unwrap());
+    FAIL_PAUSE_WRITE.with(|c| c.set(true));
+    assert!(note_owner_input_in(&r, &lane, t + 10.0).is_err(), "the newer write fails");
+    FAIL_PAUSE_WRITE.with(|c| c.set(false));
+    assert!(!note_owner_input_in(&r, &lane, t + 2.0).unwrap(), "the older caller: no attempt within the second");
+    assert_eq!(mark_of(&r, &lane).covered(), t + PAUSE_COVER_SECS);
+    MONOTONIC_SKEW.with(|c| c.set(std::time::Duration::from_millis(1_500)));
+    assert!(note_owner_input_in(&r, &lane, t + 3.0).unwrap(), "after the second: the asker writes");
+    MONOTONIC_SKEW.with(|c| c.set(std::time::Duration::ZERO));
+    assert_eq!(mark_of(&r, &lane).covered(), t + 10.0 + PAUSE_COVER_SECS, "the latest input, not the caller's");
+    // a success never spaces the next write: a later input after the covered time writes at once
+    assert!(note_owner_input_in(&r, &lane, t + 20.0).unwrap());
+}
+
+/// DK1 (3) pin — reversed completion order: the newer input is written first; an older input
+/// arriving after it neither moves the latest input back nor the stored mark; eight concurrent
+/// writers leave a mark covering the latest input.
+#[test]
+fn dm_reversed_completion_never_moves_the_end_back() {
+    let r = root("dm-rev");
+    grant_on(&r, 5);
+    let lane = LaneKey("dm-rev".into());
     let t = t0();
     assert!(note_owner_input_in(&r, &lane, t + 10.0).unwrap());
-    assert!(!note_owner_input_in(&r, &lane, t).unwrap(), "already durable up to t + 10");
-    let m: PauseMark = serde_json::from_slice(&std::fs::read(pause_path_in(&r, &lane)).unwrap()).unwrap();
-    assert_eq!(m.paused_at, t + 10.0);
-    let r2 = root("dk1-threads");
+    assert!(!note_owner_input_in(&r, &lane, t).unwrap(), "already covered");
+    assert_eq!(mark_of(&r, &lane).covered(), t + 10.0 + PAUSE_COVER_SECS);
+    let r2 = root("dm-threads");
     grant_on(&r2, 5);
     std::thread::scope(|sc| {
         for k in 0..8u32 {
             let (r2, lane) = (&r2, &lane);
             sc.spawn(move || {
-                let _ = note_owner_input_in(r2, lane, t + f64::from(k));
+                let _ = note_owner_input_in(r2, lane, t + 2.0 * f64::from(k));
             });
         }
     });
-    let m: PauseMark = serde_json::from_slice(&std::fs::read(pause_path_in(&r2, &lane)).unwrap()).unwrap();
-    assert_eq!(m.paused_at, t + 7.0, "the latest input is stored whatever the completion order");
+    assert!(mark_of(&r2, &lane).covered() >= t + 14.0, "the latest input is covered whatever the order");
 }
 
-/// DK1 (2) pin — a pause directory that cannot be read (a deterministic test seam, independent of
-/// the user running the tests) answers "paused" for THAT call; nothing is latched: once it can be
-/// read again the answer follows the marks.
+/// DM4 / DK1 (2) pin — a directory-READ failure (a deterministic test seam, independent of the
+/// user running the tests) answers "paused" for THAT call, for as long as it lasts; nothing is
+/// latched: once it can be read the answer follows the marks.
 #[test]
-fn dk1_an_unreadable_pause_directory_pauses_that_call_only() {
-    let r = root("dk1-dir");
+fn dm4_a_directory_read_failure_pauses_that_call_only() {
+    let r = root("dm4-dir");
     grant_on(&r, 5);
     let t = t0();
     assert!(!is_paused_in(&r, t));
     FAIL_PAUSE_DIR_READ.with(|c| c.set(true));
     let st = pause_state_in(&r, t);
     let start = start_new(&r, t, D, &owner("base", 3, "inc-1")).1;
+    let later = pause_state_in(&r, t + 86_400.0);
     FAIL_PAUSE_DIR_READ.with(|c| c.set(false));
-    assert!(st.unreadable && st.paused_at(t + 86_400.0));
+    assert!(st.unreadable && st.paused_at(t) && later.paused_at(t + 86_400.0));
     assert_eq!(start.unwrap(), StartVerdict::Paused);
     assert!(!is_paused_in(&r, t), "nothing latched");
     assert!(allowed(&start_new(&r, t, D, &owner("base", 3, "inc-1")).1));
