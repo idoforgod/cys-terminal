@@ -43,13 +43,23 @@ streaming pass in archive order — never by seeking back in a compressed stream
 reads of the real 0.14.56 archive rewound the gzip ~3,864 times, ~35 minutes per pass). The output line
 `archive read in one pass: <members> members, <read> of <size> compressed bytes` is measured from the real
 reads (`read` can only exceed `size` if something rewound).
-Tar HARD-LINK members (RULINGS DB5) are resolved by tar's own rule — a hard link names an ALREADY archived
-member, and every extractor (Python tarfile, libarchive / bsdtar, GNU tar, the Rust `tar` crate) creates it
-from the file it already wrote: each hard link is recorded with whether its target had already streamed
-past, and resolved after the pass (the target's Mach-O result was recorded when its bytes went by — no
-second pass). A required entry point packed as a hard link is found through its target (chains followed);
-a hard link whose target is absent, or comes only after it (it would be missing after extraction), FAILs;
-a wrong-architecture target FAILs as that file.
+Tar HARD-LINK members are judged as the product's extractor treats them (RULINGS DB5, DI2). The tar archives this
+gate reads are the updater archive `cys.app.tar.gz` (release.yml, build-macos-signed.sh); the app unpacks it in
+tauri-plugin-updater 2.10.1 (`src/updater.rs:1236–1250`, macOS `install_inner`) by calling, for every member,
+`entry.unpack(<file path>)` of the Rust `tar` crate 0.4.46 (Cargo.lock), and on the first error it deletes what it
+extracted and abandons the update. `Entry::unpack(dst)` is `unpack(None, dst)` (`tar-0.4.46/src/entry.rs:203–204`);
+for a hard link with no target base it takes the stored link name as it is (`:528–545`) — a path relative to the
+updater process's working directory, not to the extraction folder — and calls `fs::hard_link` on it (`:548`). So a
+hard-link member, whether its target comes before or after it, does not produce the packed file: every hard-link
+member FAILs with "the archive cannot be extracted as packed". (The system tar's handling is not documented in the
+local man page and is not the product's extractor.)
+Symbolic links are followed component by component as the file system does after extraction (RULINGS DI3, DI4):
+`.` and empty components are dropped, a component that is itself a symbolic-link member is replaced by its target,
+`..` climbs one level (above the root of the tree: refused as an unsafe link); a loop is an actual revisit — a link
+whose own resolution needs itself — and a valid chain of any length resolves (each link is resolved once, memoised).
+Every load command of every Mach-O is checked (RULINGS DI1): each must start and end inside `sizeofcmds`, whatever
+its size; the commands are read one by one (header, and the version field only where needed), forward, so a large
+command area is read in bounded steps, never skipped.
 
 Reads bytes only: no `lipo`, `otool`, `file` or `vtool` (they are not on a stock Mac and not needed),
 no execution of anything it inspects, no network. Standard library only (python 3.8+).
@@ -87,7 +97,9 @@ TARGETS = {
 SATISFIES = {"x86_64": ("x86_64",), "arm64": ("arm64", "arm64v8")}
 # entry points whose minimum macOS is printed (relative-path suffixes; Contents/MacOS/* is added by rule)
 ENTRY_SUFFIXES = ("python/bin/python3", "node/bin/node", "git/bin/git", "uv/uv")
-MAX_CMDS_BYTES = 1 << 20
+HARD_LINK_WHY = ("the archive cannot be extracted as packed — this member is a tar hard link (to %s); the updater's "
+                 "extractor (the Rust tar crate's Entry::unpack) makes it from that name taken relative to its working "
+                 "directory, not inside the extraction folder, so it fails and the update is abandoned (RULINGS DI2)")
 
 
 class Unjudgeable(Exception):
@@ -136,26 +148,24 @@ def _thin(read, off, end, where):
     ncmds, sizeofcmds = struct.unpack(endian + "II", hdr[16:24])
     if end is not None and off + hsize + sizeofcmds > end:
         raise Unjudgeable("load commands (%d bytes) run past the end of %s" % (sizeofcmds, where))
-    minos = None
-    if sizeofcmds <= MAX_CMDS_BYTES:
-        cmds = _exact(read, off + hsize, sizeofcmds, "load commands")
-        pos = 0
-        for k in range(ncmds):
-            if pos + 8 > len(cmds):
-                raise Unjudgeable("load commands end early")
-            cmd, cmdsize = struct.unpack(endian + "II", cmds[pos:pos + 8])
-            if cmdsize < 8:
-                raise Unjudgeable("load command of size %d" % cmdsize)
-            if pos + cmdsize > len(cmds):
-                raise Unjudgeable("load command %d (%d bytes) runs past sizeofcmds (%d bytes) in %s"
-                                  % (k, cmdsize, len(cmds), where))
-            if cmd == LC_BUILD_VERSION and pos + 16 <= len(cmds):
-                minos = _decode_version(struct.unpack(endian + "I", cmds[pos + 12:pos + 16])[0])
-                break
-            if cmd == LC_VERSION_MIN_MACOSX and pos + 12 <= len(cmds) and minos is None:
-                minos = _decode_version(struct.unpack(endian + "I", cmds[pos + 8:pos + 12])[0])
-            pos += cmdsize
-    return cputype, subtype, minos
+    # RULINGS DI1: EVERY load command is checked (no early stop), read one by one and forward — a command area of
+    # any size is read in bounded steps; a command that does not fit is not measurable
+    build, legacy, pos, base = None, None, 0, off + hsize
+    for k in range(ncmds):
+        if pos + 8 > sizeofcmds:
+            raise Unjudgeable("load commands end early (command %d of %d starts past sizeofcmds) in %s" % (k, ncmds, where))
+        cmd, cmdsize = struct.unpack(endian + "II", _exact(read, base + pos, 8, "load command"))
+        if cmdsize < 8:
+            raise Unjudgeable("load command of size %d" % cmdsize)
+        if pos + cmdsize > sizeofcmds:
+            raise Unjudgeable("load command %d (%d bytes) runs past sizeofcmds (%d bytes) in %s"
+                              % (k, cmdsize, sizeofcmds, where))
+        if cmd == LC_BUILD_VERSION and build is None and cmdsize >= 16:
+            build = _decode_version(struct.unpack(endian + "I", _exact(read, base + pos + 12, 4, "LC_BUILD_VERSION"))[0])
+        elif cmd == LC_VERSION_MIN_MACOSX and legacy is None and cmdsize >= 12:
+            legacy = _decode_version(struct.unpack(endian + "I", _exact(read, base + pos + 8, 4, "LC_VERSION_MIN_MACOSX"))[0])
+        pos += cmdsize
+    return cputype, subtype, build or legacy
 
 
 def inspect(read, size, target_arch):
@@ -329,9 +339,8 @@ def _arc_rel(name):
 
 def scan_tar(path, target_arch, out):
     """ONE streaming pass in archive order (CA1). → (records, links, files, problems, hardlinks): hardlinks
-    {rel: (target rel, whether the target had already been archived when the link came)} (RULINGS DB5)."""
+    {rel: stored link name} — every one is judged as the updater's extractor treats it (RULINGS DI2)."""
     records, links, files, problems, hardlinks = {}, {}, set(), [], {}
-    archived = set()                    # every member name met so far (tar: a hard link names an earlier member)
     raw = CountingFile(path)
     members = 0
     try:
@@ -340,11 +349,8 @@ def scan_tar(path, target_arch, out):
                 members += 1
                 rel = _arc_rel(m.name)
                 if m.islnk():
-                    target = _arc_rel(m.linkname)
-                    hardlinks[rel] = (target, target in archived)
-                    archived.add(rel)
+                    hardlinks[rel] = m.linkname
                     continue
-                archived.add(rel)
                 if m.issym():
                     links[rel] = m.linkname
                     continue
@@ -368,37 +374,63 @@ def scan_tar(path, target_arch, out):
     return records, links, files, problems, hardlinks
 
 
-def _resolve(rel, links, records, files, seen=None, hardlinks=None):
-    """Follow links inside the tree → (resolved rel | None, why). A tar hard link (RULINGS DB5) is the same file
-    as its target, an archive-root path that must have been archived BEFORE the link."""
-    seen = seen or set()
+def _components(path):
+    return [c for c in path.split("/") if c not in ("", ".")]
+
+
+def _realpath(path, links, hardlinks, memo, active):
+    """PATH (relative to the root of the tree) resolved component by component as the file system does after
+    extraction → (components | None, why). A component that is a symbolic-link member is replaced by its target,
+    relative to the link's directory; `..` climbs one level; each link is resolved once (MEMO) and a link met again
+    while its own resolution is still under way (ACTIVE) is a real loop (RULINGS DI3, DI4)."""
+    done = []
+    for c in _components(path):
+        if c == "..":
+            if not done:
+                return None, "unsafe link: it climbs above the root of the tree"
+            done.pop()
+            continue
+        cand = "/".join(done + [c])
+        if cand in hardlinks:
+            return None, "through %s, which %s" % (cand, HARD_LINK_WHY % hardlinks[cand])
+        if cand in links:
+            if cand not in memo:
+                if cand in active:
+                    return None, "link loop"
+                target = links[cand]
+                if target.startswith("/"):
+                    memo[cand] = (None, "absolute link outside the tree")
+                else:
+                    active.add(cand)
+                    memo[cand] = _realpath("/".join(done + [target]), links, hardlinks, memo, active)
+                    active.discard(cand)
+            res = memo[cand]
+            if res[0] is None:
+                return res
+            done = list(res[0])
+            continue
+        done.append(c)
+    return done, ""
+
+
+def _resolve(rel, links, records, files, hardlinks=None, memo=None):
+    """Follow links inside the tree → (resolved rel | None, why)."""
     hardlinks = hardlinks or {}
-    if rel in records:
-        return rel, ""
-    if rel in files:
-        return None, "not a Mach-O file"
+    memo = {} if memo is None else memo
     if rel in hardlinks:
-        if rel in seen or len(seen) > 16:
-            return None, "link loop"
-        target, earlier = hardlinks[rel]
-        if not any(target in s for s in (records, files, links, hardlinks)):
-            return None, "dangling hard link (no member %s in the archive)" % target
-        if not earlier:
-            return None, ("hard link before its target %s — tar creates a hard link from a member it has already "
-                          "extracted, so this one would be missing after extraction" % target)
-        seen.add(rel)
-        return _resolve(target, links, records, files, seen, hardlinks)
-    if rel not in links:
-        return None, "missing"
-    if rel in seen or len(seen) > 16:
-        return None, "link loop"
-    target = links[rel]
-    if target.startswith("/"):
-        return None, "absolute link outside the tree"
-    nxt = posixpath.normpath(posixpath.join(posixpath.dirname(rel), target))
-    seen.add(rel)
-    r, why = _resolve(nxt, links, records, files, seen, hardlinks)
-    return r, (why if why != "missing" else "dangling link")
+        return None, HARD_LINK_WHY % hardlinks[rel]
+    try:
+        comps, why = _realpath(rel, links, hardlinks, memo, set())
+    except RecursionError:
+        return None, "cannot judge: the link chain is too deep to follow"
+    if comps is None:
+        return None, why
+    final = "/".join(comps)
+    if final in records:
+        return final, ""
+    if final in files:
+        return None, "not a Mach-O file"
+    return None, ("missing" if final == "/".join(_components(rel)) else "dangling link")
 
 
 def check_one(path, target_arch, requires, quiet, out):
@@ -425,12 +457,14 @@ def check_one(path, target_arch, requires, quiet, out):
         for msg in info.get("mismatch", ()):
             failures.append("%s: %s — a loader picks the slice by the table and then loads what the slice holds "
                             "(RULINGS DB4)" % (rel, msg))
+    for rel in sorted(hardlinks):                     # RULINGS DI2: the updater cannot extract a hard-link member
+        failures.append("%s: %s" % (rel, HARD_LINK_WHY % hardlinks[rel]))
+    memo = {}
     entries = []
     for rel in sorted(set([r for r in records if is_entry(r)] + [r for r in links if is_entry(r)]
                           + [r for r in hardlinks if is_entry(r)])):
-        real, _ = _resolve(rel, links, records, files, None, hardlinks)
+        real, _ = _resolve(rel, links, records, files, hardlinks, memo)
         entries.append((rel, real, records.get(real)))
-    required_hits = set()
     for req in requires:
         req = req.strip("/")
         hits = sorted(r for r in set(records) | set(links) | files | set(hardlinks) if r == req or r.endswith("/" + req))
@@ -438,18 +472,13 @@ def check_one(path, target_arch, requires, quiet, out):
             failures.append("required entry point %s: missing" % req)
             continue
         for r in hits:
-            required_hits.add(r)
-            real, why = _resolve(r, links, records, files, None, hardlinks)
+            if r in hardlinks:
+                continue                              # named above: the archive cannot be extracted as packed
+            real, why = _resolve(r, links, records, files, hardlinks, memo)
             if real is None:
                 failures.append("required entry point %s: %s" % (r, why))
             elif not records[real]["ok"]:
                 pass                                  # already named above with its architecture
-    for rel in sorted(hardlinks):                     # RULINGS DB5: every hard link must be extractable
-        if rel in required_hits:
-            continue                                  # already judged above as a required entry point
-        real, why = _resolve(rel, links, records, files, None, hardlinks)
-        if real is None and why != "not a Mach-O file":
-            failures.append("hard link %s: %s" % (rel, why))
     plist_min = None
     if label.endswith(".app") and not is_tar:
         try:
@@ -470,7 +499,7 @@ def check_one(path, target_arch, requires, quiet, out):
         out.append("  entry points (minimum macOS):")
         for rel, real, info in entries:
             shown = rel if real in (None, rel) else "%s -> %s" % (rel, posixpath.basename(real))
-            archs = "+".join(info["archs"]) if info else "(not a Mach-O file)"
+            archs = "+".join(info["archs"]) if info else ("(tar hard link)" if rel in hardlinks else "(not a Mach-O file)")
             out.append("    %-60s %-14s min %s" % (shown, archs, (info or {}).get("minos") or "?"))
     if plist_min is not None and not quiet:
         out.append("  Info.plist LSMinimumSystemVersion = %s" % plist_min)
