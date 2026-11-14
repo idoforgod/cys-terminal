@@ -409,6 +409,28 @@ fn nonblocking_setup_failure_runs_nothing() {
     replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
+/// RULINGS GA9: a pipe that answers "interrupted" for ever cannot keep the pump in its turn — every
+/// attempt counts against the turn's budget and the pump returns to the outer deadline check. (The
+/// old pump retried an interrupted read without counting it: this test never returned there.)
+#[test]
+#[cfg(unix)]
+fn interrupted_reads_return_to_the_deadline() {
+    struct Interrupted(usize);
+    impl std::io::Read for Interrupted {
+        fn read(&mut self, _b: &mut [u8]) -> std::io::Result<usize> {
+            self.0 += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        }
+    }
+    let mut p = Some(Interrupted(0));
+    let mut buf = Vec::new();
+    let mut st = replay::StreamState::default();
+    replay::pump_out(&mut p, &mut buf, &mut st);
+    let attempts = p.as_ref().map_or(0, |r| r.0);
+    assert!(attempts > 0 && attempts <= 64, "{attempts} attempts in one turn");
+    assert!(p.is_some() && !st.eof && buf.is_empty(), "still open, nothing read");
+}
+
 /// RULINGS CZ4: a cleanup error or a leftover scratch tree is RETURNED, never swallowed.
 #[test]
 fn cleanup_errors_are_returned() {
