@@ -341,7 +341,8 @@ class Tree:
         self.kinds = {}             # name → "dir" | "other" (DU1 (c))
         self.shape = []             # (member order, "<member>: not measurable — <why>") — DU1 violations
         self.names = []             # (member order, name) of every member in the accepted spelling (DU1 (d), DU2)
-        self.symlinks = set()       # names of the symbolic-link members (DU1 (d))
+        self.symlinks = set()       # names of the symbolic-link members (EB2)
+        self.hard = []              # (name, stored target) of every hard-link record — proven wrong first (EB3)
         self.order = 0
 
     def forget(self, rel):
@@ -353,7 +354,7 @@ class Tree:
     def not_measurable(self, label, why, shadow=None, order=None):
         line = "%s: not measurable — %s" % (label, why)
         if self.archive:
-            self.shape.append((self.order if order is None else order, line))
+            self.shape.append(((1, self.order if order is None else order), line))
         else:
             self.problems.append(line)
         if shadow:
@@ -392,13 +393,16 @@ class Tree:
             parts = name.split("/")
             for i in range(1, len(parts)):
                 prefix = "/".join(parts[:i])
-                if prefix in self.symlinks:       # DU1 (d): the name passes through a symbolic-link member
+                if self.kinds.get(prefix, "dir") != "dir":   # EB2: a member that is not a directory as a parent
                     below.append((order, name, prefix))
-                    break
+                    break                         # nothing is inferred below it
                 self.dirs.add(prefix)
-        for order, name, prefix in below:         # decided at the end of the pass: the link may come later
-            self.not_measurable(name, "its name passes through the symbolic-link member %s (RULINGS DU1 (d))" % prefix,
-                                name, order)
+        for order, name, prefix in below:         # decided at the end of the pass: the parent may come later
+            what = "a symbolic link" if prefix in self.symlinks else "not a directory"
+            self.not_measurable(name, "its parent %s is a member that is %s — every parent that is a member must be a "
+                                "directory member (RULINGS EB2)" % (prefix, what), name, order)
+            if prefix not in self.symlinks:
+                continue
             real, _, kind = _walk(posixpath.dirname(name), self)
             if not kind and real is not None:     # the place it really lands: what was measured there is stale
                 dest = real + "/" + posixpath.basename(name) if real else posixpath.basename(name)
@@ -468,57 +472,195 @@ def scan_dir(root, target_arch):
     return tree
 
 
+# ── RULINGS EB1: the raw records, before any library interprets them ─────────────────────────────────
+# The ALLOW-LIST is what the two published v0.14.56 updater archives are MEASURED to contain (8,846 records each:
+# '5' 864 · '0' 7,825 · '2' 157; magic "ustar\0" + version "00"; no extended-header record of any kind; names up to
+# 162 bytes through the ustar prefix field; no base-256 size) and what both libraries read the same way:
+#   name    — Rust tar 0.4.46 src/header.rs:992–1004 (UstarHeader::path_bytes: prefix + "/" + name when the prefix
+#             is set) · tarfile frombuf: `prefix = nts(buf[345:500])`, `obj.name = prefix + "/" + obj.name`
+#             (CPython 3.9 tarfile.py:1077, :1106–1108; 3.14 :1359, :1390);
+#   size    — Rust src/header.rs:319–339 (entry_size: the octal size field; sparse only for type 'S') · tarfile
+#             `obj.size = nti(buf[124:136])` (3.9 :1068; 3.14 :1350);
+#   type    — Rust src/entry_type.rs:48–55 ('0' Regular, '2' Symlink, '5' Directory) · tarfile
+#             `obj.type = buf[156:157]` (3.9 :1071; 3.14 :1353);
+#   link    — Rust src/header.rs:459–466 (link_name_bytes: the 100-byte field) · tarfile `nts(buf[157:257])`
+#             (3.9 :1072; 3.14 :1354);
+#   magic   — Rust src/header.rs:201–203 (is_ustar: "ustar\0" + "00"; only then is the prefix used).
+# Every extension is read differently or not at all by one of them (Rust src/archive.rs:330–448: GNU long names,
+# PAX local headers incl. PAX size, GNU sparse — tarfile applies PAX GNU.sparse.* maps that the Rust crate ignores),
+# so the extended-header allow-list is "none": any 'x', 'g', 'L', 'K', 'S' or other kind is not measurable.
+ALLOWED_KINDS = (b"0", b"5", b"2")
+USTAR_MAGIC = b"ustar\x0000"
+ZERO_BLOCK = b"\0" * 512
+
+
+class RecordCensus:
+    """The decompressed archive bytes on their way to tarfile, read as raw 512-byte records (RULINGS EB1):
+    header → size → skip payload. `bad` lists every record outside the allow-list, `hard` every hard link."""
+
+    def __init__(self, f):
+        self.f, self.base, self.buf, self.next = f, 0, b"", 0
+        self.zeros, self.done, self.records, self.bad = 0, False, 0, []
+
+    def read(self, n=-1):
+        b = self.f.read(n)
+        if b and not self.done:
+            self._feed(b)
+        return b
+
+    def _feed(self, b):
+        self.buf += b
+        self._cut()
+        while not self.done and self.base == self.next and len(self.buf) >= 512:
+            self._header(self.buf[:512])
+            self._cut()
+
+    def _cut(self):
+        if self.next > self.base:
+            cut = min(self.next - self.base, len(self.buf))
+            self.buf, self.base = self.buf[cut:], self.base + cut
+
+    def _header(self, h):
+        if h == ZERO_BLOCK:
+            self.zeros += 1
+            self.done = self.zeros == 2
+            self.next = self.base + 512
+            return
+        self.zeros = 0
+        self.records += 1
+        name, prefix = h[0:100].split(b"\0", 1)[0], h[345:500].split(b"\0", 1)[0]
+        label = (prefix + b"/" + name if prefix else name).decode("utf-8", "replace")
+        kind, magic = h[156:157], h[257:265]
+        try:
+            if h[124] & 0x80:
+                raise ValueError("a base-256 size")
+            size = int(h[124:136].split(b"\0", 1)[0].strip() or b"0", 8)
+        except ValueError as e:
+            self.bad.append((self.records, label, "its size field cannot be read (%s)" % e))
+            self.done = True
+            return
+        if magic != USTAR_MAGIC:
+            self.bad.append((self.records, label, "its header format %r is not POSIX ustar" % magic))
+        if kind in (b"x", b"g"):
+            body = self.buf[512:512 + size] if len(self.buf) >= 512 + size else b""
+            keys = sorted({rec.split(b"=", 1)[0].split(b" ", 1)[-1].decode("utf-8", "replace")
+                           for rec in body.split(b"\n") if b"=" in rec})
+            self.bad.append((self.records, label, "a %s extended header%s — the allow-list of extended-header records "
+                             "is none" % ("PAX local" if kind == b"x" else "PAX global",
+                                          " (keys %s)" % ", ".join(keys) if keys else "")))
+        elif kind != b"1" and kind not in ALLOWED_KINDS:
+            self.bad.append((self.records, label, "its record kind %r is not in the allow-list (regular '0', directory "
+                             "'5', symbolic link '2' — what the published archives contain)" % kind.decode("latin-1")))
+        self.next = self.base + 512 + (size + 511) // 512 * 512
+
+
+class Decompressed:
+    """The archive's tar bytes from a gzip file (or a plain tar), read forward once from RAW."""
+
+    def __init__(self, raw):
+        self.raw, self.d, self.pending = raw, None, b""
+        head = raw.read(1 << 16)
+        if head[:2] == b"\x1f\x8b":
+            self.d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            self.pending = self.d.decompress(head)
+        else:
+            self.pending = head
+
+    def read(self, n=-1):
+        want = (1 << 16) if n is None or n < 0 else n
+        while len(self.pending) < want:
+            chunk = self.raw.read(1 << 16)
+            if not chunk:
+                if self.d is not None:
+                    self.pending += self.d.flush()
+                break
+            if self.d is None:
+                self.pending += chunk
+                continue
+            self.pending += self.d.decompress(chunk)
+            while self.d.eof and self.d.unused_data:          # a further gzip member
+                rest = self.d.unused_data
+                self.d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                self.pending += self.d.decompress(rest)
+        out, self.pending = self.pending[:want], self.pending[want:]
+        return out
+
+
 def scan_tar(path, target_arch, out):
-    """ONE streaming pass in archive order (CA1) → Tree. A member name is accepted in the one spelling of DN1 (one
-    leading `./` dropped); a repeated name is DN2; a hard-link member is kept with its stored target VERBATIM
-    (every hard link is refused — DL1 (3) — so its target needs no spelling rule)."""
+    """ONE streaming pass in archive order (CA1) → Tree. The raw records are censused on the way (EB1); a hard
+    link is recorded as proven wrong before any name handling (EB3); then DU1 (a)–(c) on the members and, at the
+    end, the parent rule EB2. A hard link's stored target is kept VERBATIM (every hard link is refused)."""
     tree = Tree(archive=True)
     raw = CountingFile(path)
     members = 0
+    library_error = None
     try:
-        with tarfile.open(fileobj=raw, mode="r|*") as tar:
-            for m in tar:
-                members += 1
-                tree.order = members
-                rel = m.name[2:] if m.name.startswith("./") else m.name
-                p = spelling_problem(rel, "member name")                       # DU1 (b)
-                if p:
-                    tree.not_measurable(m.name, p, _shadow(rel))
-                    continue
-                tree.names.append((members, rel))
-                if m.type not in PLAIN_TYPES:                                  # DU1 (a)
-                    tree.not_measurable(rel, "member type %r is not a directory, a regular file, a symbolic link or "
-                                        "a hard link (RULINGS DU1 (a))" % m.type.decode("latin-1"), rel)
-                    continue
-                if not tree.claim(rel, "dir" if m.isdir() else "other"):       # DU1 (c)
-                    continue
-                if m.issym():
-                    tree.symlinks.add(rel)
-                if m.islnk():
-                    tree.hardlinks[rel] = m.linkname
-                    continue
-                if m.isdir():
-                    tree.dirs.add(rel)
-                    continue
-                if m.issym():
-                    tree.add_link(rel, m.linkname)
-                    continue
-                if not m.isfile():
-                    continue
-                tree.files.add(rel)
-                fobj = tar.extractfile(m)
-                try:
-                    info = inspect(ForwardReader(fobj).read, m.size, target_arch)
-                except Unjudgeable as e:
-                    tree.problems.append("%s: %s" % (rel, e))
-                    tree.unmeasurable[rel] = str(e)
-                    continue
-                if info is not None:
-                    tree.records[rel] = info
-        while raw.read(1 << 16):        # the end-of-archive padding / gzip trailer: count it, still one pass
-            pass
+        census = RecordCensus(Decompressed(raw))
+        try:
+            tar = tarfile.open(fileobj=census, mode="r|")
+        except tarfile.TarError as e:
+            library_error, tar = e, None
+        it = iter(tar) if tar is not None else iter(())
+        while True:
+            try:
+                m = next(it)
+            except StopIteration:
+                break
+            except (tarfile.TarError, EOFError, ValueError, zlib.error) as e:                    # the library gave up: the raw census still decides (EB1)
+                library_error = e
+                break
+            members += 1
+            tree.order = members
+            rel = m.name[2:] if m.name.startswith("./") else m.name
+            if m.islnk():                                                  # EB3: before any name handling
+                tree.hard.append((rel, m.linkname))
+            p = spelling_problem(rel, "member name")                       # DU1 (b)
+            if p:
+                tree.not_measurable(m.name, p, _shadow(rel))
+                continue
+            tree.names.append((members, rel))
+            if m.type not in PLAIN_TYPES:                                  # DU1 (a)
+                tree.kinds.setdefault(rel, "other")
+                tree.not_measurable(rel, "member type %r is not a directory, a regular file, a symbolic link or "
+                                    "a hard link (RULINGS DU1 (a))" % m.type.decode("latin-1"), rel)
+                continue
+            if not tree.claim(rel, "dir" if m.isdir() else "other"):       # DU1 (c)
+                continue
+            if m.islnk():
+                tree.hardlinks[rel] = m.linkname
+                continue
+            if m.isdir():
+                tree.dirs.add(rel)
+                continue
+            if m.issym():
+                tree.symlinks.add(rel)
+                tree.add_link(rel, m.linkname)
+                continue
+            if not m.isfile():
+                continue
+            tree.files.add(rel)
+            try:
+                info = inspect(ForwardReader(tar.extractfile(m)).read, m.size, target_arch)
+            except Unjudgeable as e:
+                tree.problems.append("%s: %s" % (rel, e))
+                tree.unmeasurable[rel] = str(e)
+                continue
+            except (tarfile.TarError, EOFError, ValueError, zlib.error) as e:
+                library_error = e
+                break
+            if info is not None:
+                tree.records[rel] = info
+        try:
+            while census.read(1 << 16):  # the end-of-archive padding / gzip trailer: count it, still one pass
+                pass
+        except zlib.error as e:
+            library_error = library_error or e
     finally:
         raw.close()
+    if library_error is not None and not census.bad:
+        raise library_error             # unreadable — and no raw record names a reason: exit 2 as before
+    for index, label, why in census.bad:  # EB1 — decided on the raw records: it comes first
+        tree.shape.append(((0, index), "record %d %s: not measurable — %s (RULINGS EB1)" % (index, label, why)))
     out.append("  archive read in one pass: %d members, %d of %d compressed bytes"
                % (members, raw.read_bytes, os.path.getsize(path)))
     tree.finish()
@@ -625,7 +767,7 @@ def _check_one(path, target_arch, requires, quiet, out):
         for msg in info.get("mismatch", ()):
             failures.append("%s: %s — a loader picks the slice by the table and then loads what the slice holds "
                             "(RULINGS DB4)" % (rel, msg))
-    hard = [HARD_LINK_WHY % (rel, hardlinks[rel]) for rel in sorted(hardlinks)]   # DL1 (3): every hard link fails
+    hard = [HARD_LINK_WHY % (rel, target) for rel, target in tree.hard]   # DL1 (3), EB3
     entries = []
     for rel in sorted(set([r for r in records if is_entry(r)] + [r for r in links if is_entry(r)]
                           + [r for r in hardlinks if is_entry(r)])):
