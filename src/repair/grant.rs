@@ -35,6 +35,11 @@ pub struct GrantDecision {
     pub prompt_excerpt: String,
     pub paused_at: Option<f64>,
     pub resumed_at: Option<f64>,
+    /// RULINGS CV1 (T4b): the decision's GENERATION — one more than the decision it replaced (0 = a
+    /// file written before T4b). A decision is published only by [`decide_in`], under the shared
+    /// grant lock, and only if the generation it validated is still the current one.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,23 +165,363 @@ pub fn is_on(d: Option<&GrantDecision>) -> bool {
     d.is_some_and(|d| d.state == GrantState::On)
 }
 
+// ───────────────────────────── one order for decisions (RULINGS CV1 · T4b) ─────────────────────────────
+
+/// `<root>/grant.lock` — the lock every lane daemon takes to decide (validate the answer, consume
+/// the question, publish `grant.json`). An OS advisory lock on an open file (unix `flock`, Windows
+/// `LockFileEx` on byte 0): the kernel releases it when the holder's process ends, so a dead holder
+/// never leaves it held. The file itself is empty and never removed.
+pub fn grant_lock_path_in(root: &Path) -> PathBuf {
+    root.join("grant.lock")
+}
+
+/// How long a decision waits for the grant lock before it is refused (milliseconds). Only the
+/// owner-decision verbs (`grant on` / `grant off`) take the lock — never a start, a boot step, a
+/// sweep or a read.
+pub const GRANT_LOCK_WAIT_MS: u64 = 2_000;
+
+/// The refusal of a decision that could not get the lock in time.
+pub const GRANT_LOCK_BUSY_KO: &str = "다른 좌석이 지금 자동 수리 허락을 결정하는 중입니다 — 잠시 뒤 다시 하세요(아무것도 바꾸지 않았습니다)";
+
+/// The refusal of a decision whose validated generation is no longer the current one.
+pub const GRANT_STALE_KO: &str = "이 결정을 확인하는 사이에 다른 결정이 먼저 났습니다 — 아무것도 바꾸지 않았습니다(다시 물으려면 `cys repair grant ask`)";
+
+/// The held grant lock (released when dropped).
+pub struct GrantLock {
+    file: std::fs::File,
+}
+
+impl Drop for GrantLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: the descriptor is owned by `self.file` for the duration of the call.
+            unsafe {
+                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::UnlockFile;
+            // SAFETY: the handle is owned by `self.file`; byte 0, length 1, as locked.
+            unsafe {
+                UnlockFile(self.file.as_raw_handle() as _, 0, 0, 1, 0);
+            }
+        }
+    }
+}
+
+/// One non-blocking try of the lock: `Ok(true)` taken, `Ok(false)` another holder, `Err` cannot tell.
+fn try_lock_file(file: &std::fs::File) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: the descriptor is owned by `file` for the duration of the call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(c) if c == libc::EWOULDBLOCK || c == libc::EAGAIN => Ok(false),
+            _ => Err(e),
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        };
+        // SAFETY: a zeroed OVERLAPPED is the documented "offset 0" value; the handle is owned by
+        // `file` for the duration of the call.
+        let mut ov: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as _,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut ov,
+            )
+        };
+        if ok != 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(33) => Ok(false), // ERROR_LOCK_VIOLATION
+            _ => Err(e),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no file lock"))
+    }
+}
+
+/// RULINGS FD1 — the clock of the grant lock's wait: the time source its deadline is computed from
+/// and compared with, and the sleep between two attempts. The product passes [`REAL_LOCK_CLOCK`];
+/// a test injects functions it controls.
+#[derive(Debug, Clone, Copy)]
+pub struct LockClock {
+    /// The time source.
+    pub now: fn() -> std::time::Instant,
+    /// The sleep between two attempts.
+    pub sleep: fn(std::time::Duration),
+}
+
+/// The real clock of the grant lock's wait: `Instant::now` and `std::thread::sleep`.
+pub const REAL_LOCK_CLOCK: LockClock = LockClock {
+    now: std::time::Instant::now,
+    sleep: std::thread::sleep,
+};
+
+/// Takes the grant lock, waiting at most `wait` (polled every 20 ms) on `clock`. The lock file is
+/// opened without following a link and without blocking (unix `O_NOFOLLOW | O_NONBLOCK`) and must be
+/// a regular file. Not taken in time → `Err(Precondition(GRANT_LOCK_BUSY_KO))`.
+pub fn lock_grant_in(
+    root: &Path,
+    wait: std::time::Duration,
+    clock: LockClock,
+) -> Result<GrantLock, RepairError> {
+    let p = grant_lock_path_in(root);
+    std::fs::create_dir_all(root).map_err(|e| io_err(root, e))?;
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = o.open(&p).map_err(|e| io_err(&p, e))?;
+    match file.metadata() {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err(io_err(&p, "the grant lock is not a regular file")),
+        Err(e) => return Err(io_err(&p, e)),
+    }
+    let deadline = (clock.now)() + wait;
+    loop {
+        match try_lock_file(&file) {
+            Ok(true) => return Ok(GrantLock { file }),
+            Ok(false) if (clock.now)() < deadline => {
+                (clock.sleep)(std::time::Duration::from_millis(20));
+            }
+            Ok(false) => return Err(RepairError::Precondition(GRANT_LOCK_BUSY_KO.to_string())),
+            Err(e) => return Err(io_err(&p, e)),
+        }
+    }
+}
+
+/// The decision a [`decide_in`] step validated against.
+#[derive(Debug, Clone, Copy)]
+pub struct CurrentDecision<'a> {
+    /// The decision read under the lock (`None` = no decision yet, or unreadable — see `unreadable`).
+    pub decision: Option<&'a GrantDecision>,
+    /// `grant.json` exists but cannot be read.
+    pub unreadable: bool,
+    /// The current generation (0 when there is no readable decision).
+    pub generation: u64,
+}
+
+/// Points of a decision where a test can suspend it (production: none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecideStep {
+    /// The lock is held; nothing has been read yet.
+    Locked,
+    /// The decision is validated (the caller's step ran and returned it); publication is next.
+    BeforePublish,
+}
+
+/// RULINGS CV1 — ONE step for a decision: under the grant lock, read the current decision, let
+/// `decide` validate the owner's answer against it (and consume the question — the caller's memory),
+/// then publish the result with generation `validated + 1` — refused if the current generation is no
+/// longer the one validated (`GRANT_STALE_KO`). A decision that validated an older generation can
+/// therefore never overwrite a later one ("an old 예 never overwrites a later off"). `clock` = the
+/// lock wait's clock (FD1). `hook` = test suspension points. On any `Err` nothing was published.
+pub fn decide_in<F>(
+    root: &Path,
+    wait: std::time::Duration,
+    clock: LockClock,
+    hook: &dyn Fn(DecideStep),
+    decide: F,
+) -> Result<GrantDecision, RepairError>
+where
+    F: FnOnce(CurrentDecision<'_>) -> Result<GrantDecision, RepairError>,
+{
+    let _lock = lock_grant_in(root, wait, clock)?;
+    hook(DecideStep::Locked);
+    let read = read_decision_in(root);
+    let (current, unreadable) = match &read {
+        Ok(d) => (d.as_ref(), false),
+        Err(_) => (None, true),
+    };
+    let generation = current.map(|d| d.generation).unwrap_or(0);
+    let mut d = decide(CurrentDecision {
+        decision: current,
+        unreadable,
+        generation,
+    })?;
+    hook(DecideStep::BeforePublish);
+    // defence in depth: a writer that does not take the lock (an older build) may have written
+    let now_gen = read_decision_in(root)
+        .ok()
+        .flatten()
+        .map(|x| x.generation)
+        .unwrap_or(0);
+    if now_gen != generation {
+        return Err(RepairError::Precondition(GRANT_STALE_KO.to_string()));
+    }
+    d.generation = generation.saturating_add(1);
+    write_decision_in(root, &d)?;
+    Ok(d)
+}
+
+/// The current decision's generation (0 when absent or unreadable) — what `grant ask` records in
+/// its question (RULINGS CV1: an answer is good only while no decision was published after it).
+pub fn current_generation_in(root: &Path) -> u64 {
+    read_decision_in(root)
+        .ok()
+        .flatten()
+        .map(|d| d.generation)
+        .unwrap_or(0)
+}
+
 // ───────────────────────────── the pause (B4) ─────────────────────────────
 
-/// One lane's pause file: the last owner input that lane's daemon saw.
+/// One lane's pause file: the last owner input that lane's daemon saw, and (RULINGS DM1) the time
+/// the mark covers through — every reader treats the pause as lasting until `covered_through + 30
+/// min`. A mark written before DM1 has no `covered_through` (read as `paused_at`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PauseMark {
     pub schema: u32,
     pub lane_key: LaneKey,
     pub paused_at: f64,
     pub resumed_at: f64,
+    #[serde(default)]
+    pub covered_through: Option<f64>,
 }
 
-/// B4 "주인의 아무 입력이면 즉시 정지": records an owner input seen by `lane`'s daemon at `now`.
-/// Each lane writes ONLY its own file (one writer per file — a read-modify-write of `grant.json` by
-/// several daemons could lose a concurrent `grant off` and turn the grant back on, the unsafe
-/// direction). Written only while the grant is on (off needs no pause). Sends nothing to any queue.
-/// Returns whether a mark was written.
-pub fn note_owner_input_in(root: &Path, lane: &LaneKey, now: f64) -> Result<bool, RepairError> {
+impl PauseMark {
+    /// The time the mark covers owner input through (DM1).
+    pub fn covered(&self) -> f64 {
+        self.covered_through
+            .filter(|c| c.is_finite())
+            .map_or(self.paused_at, |c| c.max(self.paused_at))
+    }
+}
+
+/// THE PAUSE (RULINGS DK1 (1)(2)(5)(6) with DM1–DM3 in place of DK1 (3)(4) — T4b):
+/// (1) per lane this daemon holds ONE in-memory value, the latest owner-input time (forward only);
+/// every owner input updates it first; (2) this daemon's answer to "paused?" = now < 30 minutes after
+/// the LATER of that value and every written mark it can read (a mark counts until its
+/// `covered_through` + 30 min); a pause directory that cannot be read (anything but "not found")
+/// answers "paused" for THAT call — nothing is latched; DM1: a write, under the lane's writer lock,
+/// stores `covered_through` = the CURRENT latest input + [`PAUSE_COVER_SECS`] (on the input path the
+/// write runs at the input, so this is the write's wall time + W; a retried write covers the last
+/// input + W, so the pause still ends 30 minutes + W after the last input — DM4), kept as the later
+/// of the stored and the new value; an input at or before
+/// the lane's covered-through time needs NO write; "not yet visible" is DERIVED (the in-memory input
+/// is later than the covered-through time this daemon wrote) and whoever asks while it is true (an
+/// owner input, a start admission, a new-round check) attempts the write, then answers by (2);
+/// DM2: only after a FAILED attempt is the next one spaced — by a monotonic clock read under the
+/// writer lock, [`PAUSE_RETRY_AFTER_FAILURE_SECS`] — never by a caller's captured input time;
+/// DM3: "written", not "flushed" — the mark is published by an atomic replace so other daemons see
+/// it, and deliberately NOT forced to stable storage (the write is on the path of the owner's
+/// typing; a machine crash that loses a mark restarts every daemon, and the hold after a daemon
+/// start covers each lane for the pause length). Each lane writes ONLY its own mark; written only
+/// while the grant is on. No flag is set or cleared by a completion; no timer, no thread. Sends
+/// nothing to any queue.
+#[derive(Debug, Default, Clone, Copy)]
+struct PauseMemory {
+    /// (1) the latest owner-input time seen by this daemon for the lane (0 = none)
+    latest: f64,
+    /// DM1: the covered-through time this daemon last wrote for the lane (0 = none)
+    visible_through: f64,
+    /// DM2: after a failed attempt, no new attempt before this monotonic instant
+    retry_after: Option<std::time::Instant>,
+}
+
+type PauseKey = (PathBuf, String);
+
+fn pause_memory() -> &'static std::sync::Mutex<std::collections::HashMap<PauseKey, PauseMemory>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PauseKey, PauseMemory>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// DM1: W — how far past the wall time of a write a mark covers owner input.
+pub const PAUSE_COVER_SECS: f64 = 5.0;
+
+/// DM2: after a failed attempt, the next attempt waits at least this long (monotonic).
+pub const PAUSE_RETRY_AFTER_FAILURE_SECS: f64 = 1.0;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam (DM4): pause-mark writes on this thread fail (the directory stays readable).
+    pub(crate) static FAIL_PAUSE_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam (DM2): added to the monotonic clock on this thread.
+    pub(crate) static MONOTONIC_SKEW: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+fn monotonic_now() -> std::time::Instant {
+    let now = std::time::Instant::now();
+    #[cfg(test)]
+    {
+        return now + MONOTONIC_SKEW.with(|c| c.get());
+    }
+    #[allow(unreachable_code)]
+    now
+}
+
+fn write_pause_mark(p: &Path, mark: &PauseMark) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        if FAIL_PAUSE_WRITE.with(|c| c.get()) {
+            return Err(std::io::Error::other("injected pause-write failure"));
+        }
+    }
+    crate::atomic_write_json(p, mark)
+}
+
+/// The per-lane writer lock of this process (each lane's mark has one writer: that lane's daemon;
+/// its threads take this lock for the read-compare-write of the mark).
+fn pause_write_lock(root: &Path, lane: &LaneKey) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static W: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PauseKey, std::sync::Arc<std::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    W.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry((root.to_path_buf(), lane.0.clone()))
+        .or_default()
+        .clone()
+}
+
+/// DM1 / DM2 — if the lane's latest input is not yet visible (later than the covered-through time
+/// this daemon wrote) and no failed attempt is less than a second old (monotonic): under the lane's
+/// writer lock, write `covered_through` = max(stored, the CURRENT latest input + W). `Ok(true)` =
+/// written; `Ok(false)` = nothing to do (covered already, a failed attempt in the last second, or
+/// the grant is off — then nothing is attempted); `Err` = the write failed (the next attempt waits a
+/// second; nothing else is latched).
+fn persist_pause(root: &Path, lane: &LaneKey) -> Result<bool, RepairError> {
+    let key = (root.to_path_buf(), lane.0.clone());
+    let write_lock = pause_write_lock(root, lane);
+    let _held = write_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mono = monotonic_now();
+    let latest = {
+        let m = pause_memory().lock().unwrap_or_else(|e| e.into_inner());
+        let e = m.get(&key).copied().unwrap_or_default();
+        if e.latest <= e.visible_through || e.retry_after.is_some_and(|r| mono < r) {
+            return Ok(false);
+        }
+        e.latest // the CURRENT value, read under the writer lock
+    };
     let on = match read_decision_in(root) {
         Ok(d) => is_on(d.as_ref()),
         // an unreadable decision is off for starting — but an owner input must still pause in case
@@ -187,48 +532,206 @@ pub fn note_owner_input_in(root: &Path, lane: &LaneKey, now: f64) -> Result<bool
         return Ok(false);
     }
     let p = pause_path_in(root, lane);
+    let stored = std::fs::read(&p)
+        .map_err(|e| corrupt(&p, e))
+        .and_then(|b| parse_versioned::<PauseMark>(&p, &b))
+        .ok();
+    let paused_at = stored.as_ref().map_or(latest, |m| m.paused_at.max(latest));
+    let covered = (latest + PAUSE_COVER_SECS).max(stored.as_ref().map_or(0.0, PauseMark::covered));
     let mark = PauseMark {
         schema: super::REPAIR_SCHEMA,
         lane_key: lane.clone(),
-        paused_at: now,
-        resumed_at: now + PAUSE_QUIET_SECS as f64,
+        paused_at,
+        resumed_at: covered + PAUSE_QUIET_SECS as f64,
+        covered_through: Some(covered),
     };
-    crate::atomic_write_json(&p, &mark).map_err(|e| io_err(&p, e))?;
-    Ok(true)
-}
-
-/// The time of the last owner input known to the grant (`grant.json.paused_at` written with the
-/// decision, and every lane's pause file); an unreadable pause file counts with its modification
-/// time (fail closed — the pause holds), one whose time cannot be read counts as "now".
-pub fn last_owner_input_in(root: &Path, now: f64) -> Option<f64> {
-    let mut last: Option<f64> = read_decision_in(root).ok().flatten().and_then(|d| d.paused_at);
-    let mut bump = |t: f64| last = Some(last.map_or(t, |l: f64| l.max(t)));
-    let dir = root.join("grant-pause");
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if name.starts_with('.') || !name.ends_with(".json") {
-                continue; // a temporary file of a writer
-            }
-            match std::fs::read(&p)
-                .map_err(|e| corrupt(&p, e))
-                .and_then(|b| parse_versioned::<PauseMark>(&p, &b))
-            {
-                Ok(m) => bump(m.paused_at),
-                Err(_) => bump(mtime_epoch(&p).unwrap_or(now)),
-            }
+    let written = write_pause_mark(&p, &mark);
+    let mut m = pause_memory().lock().unwrap_or_else(|e| e.into_inner());
+    let e = m.entry(key).or_default();
+    match written {
+        Ok(()) => {
+            e.visible_through = e.visible_through.max(covered);
+            e.retry_after = None;
+            Ok(true)
+        }
+        Err(err) => {
+            e.retry_after = Some(mono + std::time::Duration::from_secs_f64(PAUSE_RETRY_AFTER_FAILURE_SECS));
+            Err(io_err(&p, err))
         }
     }
-    last
 }
 
-/// B4: paused while the last owner input is less than 30 minutes old. A clock set back keeps the
-/// pause on (the safe side).
+/// B4 "주인의 아무 입력이면 즉시 정지" — an owner input seen by `lane`'s daemon at `now`: (1) the
+/// in-memory latest input moves forward at once; DM1: then the write is attempted if the input is
+/// not yet visible. `Ok(true)` = a mark was written by this call; `Err` = the write failed — this
+/// lane's daemon stays paused for 30 minutes after its latest input from its memory alone.
+pub fn note_owner_input_in(root: &Path, lane: &LaneKey, now: f64) -> Result<bool, RepairError> {
+    {
+        let mut m = pause_memory().lock().unwrap_or_else(|e| e.into_inner());
+        let e = m.entry((root.to_path_buf(), lane.0.clone())).or_default();
+        if now > e.latest {
+            e.latest = now;
+        }
+    }
+    persist_pause(root, lane)
+}
+
+/// DM1 — before answering "paused?" for a start admission or a new-round check: every lane of
+/// `root` whose latest input is not yet visible in this daemon attempts its write. A failure is one
+/// stderr line scoped to this lane's daemon (DK1 (6)).
+pub fn refresh_pause_in(root: &Path) {
+    let pending: Vec<String> = pause_memory()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|((r, _), e)| r == root && e.latest > e.visible_through)
+        .map(|((_, lane), _)| lane.clone())
+        .collect();
+    for lane in pending {
+        if let Err(e) = persist_pause(root, &LaneKey(lane)) {
+            eprintln!("{} ({e:?})", PAUSE_WRITE_FAILED_KO);
+        }
+    }
+}
+
+/// Test helper: forget this process's memory of a lane — the view of ANOTHER daemon, which has
+/// only the written marks (the "separate process" of the DM tests).
+#[cfg(test)]
+pub(crate) fn forget_pause_memory(root: &Path, lane: &LaneKey) {
+    pause_memory()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(root.to_path_buf(), lane.0.clone()));
+}
+
+/// DK1 (6): the sentence of a failed pause write — this lane's daemon only.
+pub const PAUSE_WRITE_FAILED_KO: &str = "[cysd] repair grant: 이 부서의 데몬은 주인의 입력을 파일에 남기지 못했습니다 — 이 부서의 데몬은 마지막 입력 뒤 적어도 30분 동안 자동 착수를 멈춥니다(다른 부서의 데몬은 이 입력을 모릅니다)";
+
+/// When the pause ends: the later of this daemon's in-memory latest input + 30 min and every
+/// readable written mark's `covered_through` + 30 min (DM1; `grant.json`'s own pause counts from its
+/// `paused_at`; an unreadable mark counts with its modification time, or "now" — fail closed).
+/// `None` = no owner input known.
+pub fn pause_deadline_in(root: &Path, now: f64) -> Option<f64> {
+    pause_read_in(root, now).0
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam (DK1 pin): the next reads of the pause directory on this thread fail as an
+    /// unreadable directory would — deterministic, independent of the user running the tests.
+    pub(crate) static FAIL_PAUSE_DIR_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn read_pause_dir(dir: &Path) -> std::io::Result<std::fs::ReadDir> {
+    #[cfg(test)]
+    {
+        if FAIL_PAUSE_DIR_READ.with(|c| c.get()) {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+    }
+    std::fs::read_dir(dir)
+}
+
+/// [`pause_deadline_in`] and whether the pause directory could not be read in full (DK1 (2): a
+/// failure to list it other than "not found", or an unreadable entry → "paused" for this call).
+fn pause_read_in(root: &Path, now: f64) -> (Option<f64>, bool) {
+    let mut unreadable = false;
+    let quiet = PAUSE_QUIET_SECS as f64;
+    let mut end: Option<f64> = read_decision_in(root)
+        .ok()
+        .flatten()
+        .and_then(|d| d.paused_at.map(|p| p + quiet));
+    let mut bump = |t: f64| end = Some(end.map_or(t, |l: f64| l.max(t)));
+    let dir = root.join("grant-pause");
+    match read_pause_dir(&dir) {
+        Ok(rd) => {
+            for e in rd {
+                let Ok(e) = e else {
+                    unreadable = true;
+                    continue;
+                };
+                let p = e.path();
+                let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if name.starts_with('.') || !name.ends_with(".json") {
+                    continue; // a temporary file of a writer
+                }
+                match std::fs::read(&p)
+                    .map_err(|e| corrupt(&p, e))
+                    .and_then(|b| parse_versioned::<PauseMark>(&p, &b))
+                {
+                    Ok(m) => bump(m.covered() + quiet),
+                    Err(_) => bump(mtime_epoch(&p).unwrap_or(now) + quiet),
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => unreadable = true,
+    }
+    for ((r, _), m) in pause_memory()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        if r == root && m.latest > 0.0 {
+            bump(m.latest + quiet);
+        }
+    }
+    (end, unreadable)
+}
+
+/// The pause as one read (RULINGS DG2 / DK1 (2)): when it ends and whether the pause directory
+/// could not be read in this read. Two reads that compare equal saw no change in between.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PauseState {
+    pub deadline: Option<f64>,
+    pub unreadable: bool,
+}
+
+impl PauseState {
+    /// Paused at `now`: the directory could not be read in this read, or the pause has not ended.
+    pub fn paused_at(&self, now: f64) -> bool {
+        self.unreadable || self.deadline.is_some_and(|d| now < d)
+    }
+}
+
+/// [`PauseState`] of `root` read now (no write — a READ verb may call it).
+pub fn pause_state_in(root: &Path, now: f64) -> PauseState {
+    let (deadline, unreadable) = pause_read_in(root, now);
+    PauseState {
+        deadline,
+        unreadable,
+    }
+}
+
+/// RULINGS DG3 (c) — the start time of the daemon an attempt runs in, from its incarnation
+/// (`"{started_at:x}-{pid:x}"` — `seat_token_generation` in the daemon's `state.rs`; the lock owner
+/// of every attempt carries it). `None` = not that shape (then no hold).
+pub fn incarnation_started_at(incarnation: &str) -> Option<f64> {
+    let (hex, pid) = incarnation.split_once('-')?;
+    if hex.is_empty()
+        || pid.is_empty()
+        || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+        || !pid.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok().map(|s| s as f64)
+}
+
+/// RULINGS DG3 (c) — after a daemon start its lane holds AUTONOMOUS starts for the pause length:
+/// its memory of recent owner input (and of a failed pause write) is gone, so it waits as if an
+/// owner input had come at its start. The owner's own "고쳐라" (`owner_order`) never comes here.
+pub fn restart_hold_until(owner: &LockOwner) -> Option<f64> {
+    incarnation_started_at(&owner.incarnation).map(|s| s + PAUSE_QUIET_SECS as f64)
+}
+
+/// B4 / DK1 (2): paused while the pause has not ended (memory and written marks, the later wins),
+/// and for a call that cannot read the pause directory. A clock set back keeps the pause on (the
+/// safe side). Writes nothing.
 pub fn is_paused_in(root: &Path, now: f64) -> bool {
-    last_owner_input_in(root, now).is_some_and(|t| now < t + PAUSE_QUIET_SECS as f64)
+    pause_state_in(root, now).paused_at(now)
 }
 
 /// The modification time of `p` in epoch seconds (`None` = cannot be read).
@@ -263,6 +766,8 @@ pub enum ClaimStep {
     BeforePlace,
     /// Step 4 done (the claim is placed).
     AfterPlace,
+    /// Step 5 (RULINGS DG2): between the first and the second read of the admission state.
+    BetweenAdmissionReads,
 }
 
 /// What a test hook tells the attempt to do at a [`ClaimStep`].
@@ -693,6 +1198,8 @@ pub fn try_claim_in(
     if !is_on(decision.as_ref()) {
         return Err(RepairError::Precondition(GRANT_OFF_KO.to_string()));
     }
+    // RULINGS CV1: the generation the attempt is admitted under (re-checked at the end)
+    let generation = decision.as_ref().map(|d| d.generation).unwrap_or(0);
     let cap = decision
         .as_ref()
         .map(|d| d.daily_cap)
@@ -711,7 +1218,9 @@ pub fn try_claim_in(
     if let Evaluated::Busy = evaluated {
         return Ok(StartVerdict::Busy);
     }
-    if is_paused_in(env.root, (env.clock)()) {
+    refresh_pause_in(env.root); // DM1: a not-yet-visible input is written first
+    let held = |now: f64| restart_hold_until(owner).is_some_and(|h| now < h); // DG3 (c)
+    if is_paused_in(env.root, (env.clock)()) || held((env.clock)()) {
         return Ok(StartVerdict::Paused);
     }
     let (count, mine) = count_today(env, &snap, &day, id);
@@ -752,7 +1261,41 @@ pub fn try_claim_in(
         }
     }
     step!(env, ClaimStep::AfterPlace);
-    // (5) START
+    // (5) ADMIT — RULINGS CV1 / DG2: admission is decided at the END, on ONE coherent state. With
+    // the clock read once (`now`), the decision and the pause are each read TWICE in alternation
+    // (decision, pause, decision, pause): admitted only when both decision reads are ON with the
+    // generation the attempt started under and both pause reads are equal and not paused at `now`.
+    // Generations only grow and stored pause ends never move back (DG4), so equal reads bracket
+    // an instant at which that decision and that pause held together — never a combination of
+    // two independent reads. A refusal closes the attempt's own claim (`<n>.closed` — a closed
+    // claim counts toward today's cap: failures count, G3 / K3) and releases its own lock.
+    // Anything published after the second reads is ordered after this start (a running round is
+    // not stopped by a pause — B4).
+    let now = (env.clock)();
+    refresh_pause_in(env.root);
+    let d1 = read_decision_in(env.root).unwrap_or(None);
+    let p1 = pause_state_in(env.root, now);
+    step!(env, ClaimStep::BetweenAdmissionReads);
+    let d2 = read_decision_in(env.root).unwrap_or(None);
+    let p2 = pause_state_in(env.root, now);
+    let gen = |d: &Option<GrantDecision>| d.as_ref().map(|d| (d.state, d.generation));
+    let on_now = is_on(d1.as_ref()) && is_on(d2.as_ref());
+    let same = gen(&d1) == gen(&d2) && d2.as_ref().map(|d| d.generation) == Some(generation);
+    let paused = p1.paused_at(now) || p2.paused_at(now) || p1 != p2 || held(now);
+    if !on_now || !same || paused {
+        if let Err(e) = create_marker(env.root, target) {
+            // stderr only (F1); the claim's lock is released below, so it is closable by any evaluator
+            eprintln!("[cysd] repair grant: refused start could not close its claim {target}: {e:?}");
+        }
+        release();
+        if !on_now {
+            return Err(RepairError::Precondition(GRANT_OFF_KO.to_string()));
+        }
+        if paused {
+            return Ok(StartVerdict::Paused);
+        }
+        return Ok(StartVerdict::LostRace);
+    }
     Ok(StartVerdict::Allowed { claim: target })
 }
 
@@ -818,6 +1361,7 @@ pub fn observe_and_close_claims(high_water: u32) -> Result<u32, RepairError> {
 /// grant is paused, and while it is off (the owner withdrew the standing mission; `commit` and
 /// `revert` stay open — only a NEW round is refused).
 pub fn may_open_new_round_in(root: &Path, now: f64) -> Result<bool, RepairError> {
+    refresh_pause_in(root); // DM1: the new-round check writes a not-yet-visible input first
     let on = is_on(read_decision_in(root).unwrap_or(None).as_ref());
     Ok(on && !is_paused_in(root, now))
 }

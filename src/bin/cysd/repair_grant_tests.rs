@@ -158,6 +158,7 @@ impl Rig {
                 prompt_excerpt: "예".into(),
                 paused_at: None,
                 resumed_at: None,
+                generation: 0,
             },
         )
         .unwrap();
@@ -966,23 +967,30 @@ fn ch3_owner_input_pauses_new_autonomous_starts_only() {
     let _ = std::fs::remove_dir_all(&r.root);
 }
 
-/// CH3: app typing arrives in many small sends — one lane's mark is rewritten at most once per
-/// `PAUSE_MARK_MIN_GAP_SECS`; a later input moves it on.
+/// CH3 / DM1: app typing arrives in many small sends — every input moves this daemon's latest input
+/// at once; a written mark covers its input + W (5 s), so inputs at or before the covered-through
+/// time need no write and a later one writes; the pause lasts at least 30 minutes after the LAST
+/// input (at most W longer). (Round-4 rewrite. OLD expectations: round 0 — `assert_eq!(read(), t,
+/// "within the gap: not rewritten")` with admission resuming 30 minutes after the FIRST input;
+/// round 1 — 5 s coalescing, resumed_at = input + 1805; round 3 — at most one write per second, the
+/// pause ending exactly 30 minutes after the last input in THIS daemon only.)
 #[test]
 fn ch3_pause_mark_is_throttled_per_lane() {
     let r = rig("ch3-throttle");
     r.grant_on(5);
     let t = now0();
+    let w = grant::PAUSE_COVER_SECS;
     note_owner_input_throttled(&r.root, &r.lane, t);
-    let read = || -> f64 {
-        let v: Value = serde_json::from_slice(&std::fs::read(grant::pause_path_in(&r.root, &r.lane)).unwrap()).unwrap();
-        v["paused_at"].as_f64().unwrap()
+    let read = || -> grant::PauseMark {
+        serde_json::from_slice(&std::fs::read(grant::pause_path_in(&r.root, &r.lane)).unwrap()).unwrap()
     };
-    assert_eq!(read(), t);
-    note_owner_input_throttled(&r.root, &r.lane, t + 1.0);
-    assert_eq!(read(), t, "within the gap: not rewritten");
-    note_owner_input_throttled(&r.root, &r.lane, t + PAUSE_MARK_MIN_GAP_SECS + 1.0);
-    assert_eq!(read(), t + PAUSE_MARK_MIN_GAP_SECS + 1.0);
+    assert_eq!((read().paused_at, read().covered()), (t, t + w));
+    note_owner_input_throttled(&r.root, &r.lane, t + 0.4);
+    note_owner_input_throttled(&r.root, &r.lane, t + 4.0);
+    assert_eq!(read().paused_at, t, "covered inputs need no write");
+    assert!(grant::is_paused_in(&r.root, t + 4.0 + 1_800.0 - 0.1), "at least 30 minutes after the last input");
+    note_owner_input_throttled(&r.root, &r.lane, t + w + 1.0);
+    assert_eq!((read().paused_at, read().covered()), (t + w + 1.0, t + 2.0 * w + 1.0), "later than covered: written");
 }
 
 /// CH4: the owner says "끄라", a machine prompt arrives, then the master runs `grant off` — still
@@ -1314,11 +1322,14 @@ fn ci6b_grant_status_reads_the_state() {
     );
     note_owner_input_throttled(&r.root, &r.lane, t);
     let v = status(&seat(3, "worker"), t + 10.0).unwrap();
+    // DM1 (round 4): the mark covers the input + W, so the pause lasts until t + 1800 + W (round 3's
+    // expectations were `Some(t + 1_800.0)` and not paused at t + 1801)
+    let w = grant::PAUSE_COVER_SECS;
     assert_eq!(
         (v["state"].clone(), v["paused"].clone(), v["paused_until"].as_f64()),
-        (json!("on"), json!(true), Some(t + 1_800.0))
+        (json!("on"), json!(true), Some(t + 1_800.0 + w))
     );
-    assert_eq!(status(&master(), t + 1_801.0).unwrap()["paused"], false);
+    assert_eq!(status(&master(), t + 1_801.0 + w).unwrap()["paused"], false);
     assert_eq!(
         r.call(t, &master(), "grant_status", json!({"daily_cap": 3}))
             .unwrap_err()
@@ -1510,4 +1521,373 @@ fn cj5_grant_ask_reply_names_the_limit() {
         v["ask_owner"],
         "자비스가 발견한 명백한 버그·오류를 스스로 고쳐도 될까요? (하루 12건까지)"
     );
+}
+
+// ───────────────────────────── RULINGS CV1 (T4b) ─────────────────────────────
+
+/// CV1 (the verdict's T4-01, as the lock now orders it): two `grant on` requests carry the same
+/// answered question. A turns the grant on and takes the question; the owner says "끄라" and `grant
+/// off` publishes the next generation; B — the same answer, arriving late — is refused: the
+/// question is gone and the decision stays OFF. Generations 1 then 2.
+#[test]
+fn cv1_an_old_yes_never_overwrites_a_later_off() {
+    let r = rig("cv1-seq");
+    let t = now0();
+    r.call(t, &master(), "grant_ask", json!({})).unwrap();
+    r.typed(MASTER, "예", t + 1.0);
+    let on = |at: f64| r.call(at, &master(), "grant", json!({"mode": "on"}));
+    let a = on(t + 2.0).unwrap();
+    assert_eq!((a["grant"].clone(), a["generation"].clone()), (json!("on"), json!(1)));
+    r.prompt(MASTER, "자동 수리 꺼라", "human", t + 3.0);
+    let off = r.call(t + 4.0, &master(), "grant", json!({"mode": "off"})).unwrap();
+    assert_eq!((off["grant"].clone(), off["generation"].clone()), (json!("off"), json!(2)));
+    let b = on(t + 5.0).unwrap_err();
+    assert_eq!(b.code, "repair_precondition");
+    let d = r.decision().unwrap();
+    assert_eq!((d.state, d.generation), (GrantState::Off, 2), "the later off stands");
+}
+
+/// CV1 across lanes: the question was asked in lane X (generation 0) and answered; lane Y's
+/// daemon (same repairs root, its own memory) publishes `off` first — X's `grant on` with that
+/// answer is refused (the question was asked before the current decision) and X's question is
+/// left as it is (nothing taken, nothing written).
+#[test]
+fn cv1_an_answer_older_than_the_current_decision_is_refused() {
+    let x = rig("cv1-x");
+    let mut y = rig("cv1-y");
+    y.root = x.root.clone();
+    y.lane = LaneKey("dept-2".into());
+    let t = now0();
+    x.call(t, &master(), "grant_ask", json!({})).unwrap();
+    x.typed(MASTER, "예", t + 1.0);
+    y.prompt(MASTER, "자동 수리 꺼", "human", t + 2.0);
+    y.call(t + 3.0, &master(), "grant", json!({"mode": "off"})).unwrap();
+    let e = x.call(t + 4.0, &master(), "grant", json!({"mode": "on"})).unwrap_err();
+    assert!(e.message.contains("다른 결정"), "{}", e.message);
+    assert!(x.prompts.lock().unwrap()[&MASTER].question.is_some(), "nothing taken");
+    let d = x.decision().unwrap();
+    assert_eq!((d.state, d.generation), (GrantState::Off, 1));
+    // asked again after the off: the answer counts
+    x.call(t + 5.0, &master(), "grant_ask", json!({})).unwrap();
+    x.typed(MASTER, "예", t + 6.0);
+    let v = x.call(t + 7.0, &master(), "grant", json!({"mode": "on"})).unwrap();
+    assert_eq!((v["grant"].clone(), v["generation"].clone()), (json!("on"), json!(2)));
+}
+
+// RULINGS FD1 — a clock this test controls for the grant lock's wait (`grant::LockClock`): the time
+// source returns the test's virtual time (one real reading as its origin, nothing measured) and
+// records each reading; the sleep advances the virtual time, records itself and, when the virtual
+// time reaches `release_at`, drops the lock the clock holds. Per test thread.
+#[derive(Default)]
+struct VirtualLockClock {
+    origin: Option<std::time::Instant>,
+    at: std::time::Duration,
+    reads: Vec<std::time::Duration>,
+    sleeps: Vec<std::time::Duration>,
+    release: Option<(std::time::Duration, grant::GrantLock)>,
+}
+
+thread_local! {
+    static VIRTUAL_LOCK_CLOCK: std::cell::RefCell<VirtualLockClock> = std::cell::RefCell::new(VirtualLockClock::default());
+}
+
+fn virtual_now() -> std::time::Instant {
+    VIRTUAL_LOCK_CLOCK.with(|c| {
+        let mut c = c.borrow_mut();
+        let at = c.at;
+        c.reads.push(at);
+        c.origin.expect("the virtual clock is set") + at
+    })
+}
+
+fn virtual_sleep(d: std::time::Duration) {
+    VIRTUAL_LOCK_CLOCK.with(|c| {
+        let mut c = c.borrow_mut();
+        c.sleeps.push(d);
+        c.at += d;
+        if c.release.as_ref().is_some_and(|(when, _)| c.at >= *when) {
+            c.release = None; // the holder lets go
+        }
+    })
+}
+
+const VIRTUAL: grant::LockClock = grant::LockClock { now: virtual_now, sleep: virtual_sleep };
+
+/// Starts the virtual clock at 0 (optionally holding `release` until that virtual time).
+fn virtual_clock_start(release: Option<(std::time::Duration, grant::GrantLock)>) {
+    VIRTUAL_LOCK_CLOCK.with(|c| {
+        *c.borrow_mut() = VirtualLockClock {
+            origin: Some(std::time::Instant::now()),
+            release,
+            ..VirtualLockClock::default()
+        }
+    });
+}
+
+/// The readings and the sleeps the lock's wait made since the start.
+fn virtual_clock_record() -> (Vec<std::time::Duration>, Vec<std::time::Duration>) {
+    VIRTUAL_LOCK_CLOCK.with(|c| {
+        let mut c = c.borrow_mut();
+        (std::mem::take(&mut c.reads), std::mem::take(&mut c.sleeps))
+    })
+}
+
+/// CV1 · T4d · RULINGS FD1: a decision waits a BOUNDED time for the grant lock — shown on a clock the
+/// test controls, injected into the lock's wait loop (`grant::LockClock`; the product passes
+/// `grant::REAL_LOCK_CLOCK`). Nothing here measures real time.
+/// - Held elsewhere: `decide_in` with the verb's wait (`GRANT_LOCK_WAIT_MS` = 2 000 ms) tries every
+///   20 ms of the test's clock until the deadline and stops AT it — 101 attempts (100 sleeps of
+///   20 ms, the last attempt judged at exactly 2 000 ms) — then refuses with the busy sentence
+///   without running the decision.
+/// - Released during the wait (at 1 000 ms): the next attempt takes it (51 attempts).
+/// - The verb hands `decide_in` exactly that constant wait and the real clock (its source). Held
+///   elsewhere, the verb refuses, writes nothing and keeps the question; once free, it decides.
+/// - Each of "ZERO instead of the wait", "a different bound" and "no retry" changes the counts and
+///   fails this test.
+#[test]
+fn cv1_a_decision_waits_a_bounded_time_for_the_lock() {
+    let r = rig("cv1-wait");
+    let t = now0();
+    r.call(t, &master(), "grant_ask", json!({})).unwrap();
+    r.typed(MASTER, "예", t + 1.0);
+    assert_eq!(grant::GRANT_LOCK_WAIT_MS, 2_000);
+    let wait = std::time::Duration::from_millis(grant::GRANT_LOCK_WAIT_MS);
+    let step = std::time::Duration::from_millis(20);
+    // held elsewhere for the whole wait: the attempts go on until the deadline and stop AT it
+    let held = grant::lock_grant_in(&r.root, std::time::Duration::ZERO, grant::REAL_LOCK_CLOCK).unwrap();
+    virtual_clock_start(None);
+    let ran = std::cell::Cell::new(false);
+    let e = grant::decide_in(&r.root, wait, VIRTUAL, &|_| {}, |_| {
+        ran.set(true);
+        Err(RepairError::Precondition("the decision ran".into()))
+    })
+    .unwrap_err();
+    assert!(matches!(&e, RepairError::Precondition(m) if m == grant::GRANT_LOCK_BUSY_KO), "{e:?}");
+    assert!(!ran.get(), "the decision never ran without the lock");
+    let (reads, sleeps) = virtual_clock_record();
+    assert_eq!(sleeps.len(), 100, "a failed attempt before the deadline sleeps once: 100 sleeps, 101 attempts");
+    assert!(sleeps.iter().all(|d| *d == step), "every pause is 20 ms: {sleeps:?}");
+    // one reading for the deadline, then one per failed attempt
+    assert_eq!(reads.len(), 1 + 101, "{reads:?}");
+    assert_eq!(reads[0], std::time::Duration::ZERO, "the deadline is set at the start");
+    assert!(reads[1..101].iter().all(|at| *at < wait), "every earlier attempt had time left");
+    assert_eq!(reads[101], wait, "the last attempt is judged AT the deadline, and nothing follows it");
+    // released during the wait: the next attempt takes it
+    let release_at = std::time::Duration::from_millis(1_000);
+    virtual_clock_start(Some((release_at, held)));
+    let got = grant::lock_grant_in(&r.root, wait, VIRTUAL).expect("taken once released");
+    let (reads, sleeps) = virtual_clock_record();
+    assert_eq!(sleeps.len(), 50, "released at 1 000 ms: the 51st attempt takes it");
+    assert_eq!(reads.last(), Some(&(release_at - step)), "the last failed attempt had time left");
+    drop(got);
+    // the verb hands `decide_in` the constant wait and the real clock (its own source)
+    let src = include_str!("repair.rs");
+    let body = &src[src.find("pub(crate) fn grant(ctx: &Ctx<'_>, caller: &Caller, p: &Value)").unwrap()..];
+    let body = &body[..body.find("\n    }\n").unwrap()];
+    assert!(
+        body.contains(
+            "grant::decide_in(\n            &ctx.root,\n            std::time::Duration::from_millis(grant::GRANT_LOCK_WAIT_MS),\n            grant::REAL_LOCK_CLOCK,"
+        ),
+        "the grant verb hands decide_in the constant wait and the real clock"
+    );
+    // held elsewhere, the verb refuses, writes nothing and keeps the question; once free, it decides
+    let held = grant::lock_grant_in(&r.root, std::time::Duration::ZERO, grant::REAL_LOCK_CLOCK).unwrap();
+    let e = r.call(t + 2.0, &master(), "grant", json!({"mode": "on"})).unwrap_err();
+    assert_eq!(e.message, format!("repair.grant: {}", grant::GRANT_LOCK_BUSY_KO));
+    assert_eq!(r.decision(), None, "nothing written");
+    assert!(r.prompts.lock().unwrap()[&MASTER].question.is_some(), "the question is kept");
+    drop(held);
+    assert_eq!(r.call(t + 3.0, &master(), "grant", json!({"mode": "on"})).unwrap()["grant"], "on");
+}
+
+// ───────────────────────────── RULINGS CV2 (T4b) ─────────────────────────────
+
+/// CV2 end to end (the repair flow through the verbs): the owner names soul.md, the master obtains
+/// the token, a WORKER begins the token-backed rule-document repair and holds its lock → the
+/// guard's question is answered "allowed"; the same seat is re-declared master (the daemon's own
+/// binding calls, as `claim-role` makes them) → "not allowed", with the sentence; a seat that stays
+/// in the worker family (`worker-2`) keeps it; a seat first seen as master is never allowed.
+#[test]
+fn cv2_a_re_declared_seat_loses_the_rule_document_write() {
+    let mut r = rig("cv2");
+    r.lane = LaneKey(format!("cv2-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+    r.inc = "cv2-inc".into();
+    let (lane, inc) = (r.lane.0.clone(), r.inc.clone());
+    let t = now0();
+    let token = token_for(&r, "soul.md", t);
+    let sid = 77u64;
+    let worker = seat_caller(&lane, &inc, sid, Some("worker".into()));
+    let v = r
+        .call(t + 2.0, &worker, "begin", json!({"trigger": "owner_order", "files": ["soul.md"], "owner_token": token}))
+        .unwrap();
+    assert_eq!(v["owner_token_bound"], true);
+    let ask = |who: &Caller| r.call(t + 3.0, who, "rule_doc_allowed", json!({"path": "soul.md"})).unwrap();
+    assert_eq!(ask(&worker)["allowed"], true, "the worker that began it may write");
+    // same family: still allowed
+    record_role_claim(&lane, &inc, sid, Some("worker"), "worker-2");
+    assert_eq!(ask(&seat_caller(&lane, &inc, sid, Some("worker-2".into())))["allowed"], true);
+    // re-declared master: the seat keeps its lock, but not the write
+    record_role_claim(&lane, &inc, sid, Some("worker-2"), "master");
+    let master_now = seat_caller(&lane, &inc, sid, Some("master".into()));
+    assert_eq!(master_now.bound_family, Some(RoleFamily::Worker));
+    let v = ask(&master_now);
+    assert_eq!(v["allowed"], false, "{v}");
+    assert_eq!(v["reason"], rule_doc_allowed_worker_only_ko());
+    // a seat first seen as master, then claiming worker, is bound to master: never allowed
+    let other = 78u64;
+    let _ = seat_caller(&lane, &inc, other, Some("master".into()));
+    record_role_claim(&lane, &inc, other, Some("master"), "worker-3");
+    let v = ask(&seat_caller(&lane, &inc, other, Some("worker-3".into())));
+    assert_eq!(v["allowed"], false, "{v}");
+}
+
+fn rule_doc_allowed_worker_only_ko() -> &'static str {
+    grant_verbs::RULE_DOC_WORKER_ONLY_KO
+}
+
+/// CV2 through the daemon's REAL role change: a tmp daemon, a worker seat; the guard's question
+/// passes the role gate (refused only for want of a repair); `system.claim_role master` from the
+/// seat itself (handlers.rs — the role changes, the AD1 binding stays worker); the same question is
+/// then refused at the role gate with the sentence.
+#[test]
+fn cv2_the_real_claim_role_line_takes_the_write_away() {
+    use crate::handlers::{dispatch, Reply};
+    let d = crate::team_gate_tests::tmp_daemon("t4b-cv2", false);
+    let pid = 734_001u32;
+    let sid = crate::team_gate_tests::seat(&d, "worker", pid);
+    let ask = || -> Value {
+        match handle(&d, "rule_doc_allowed", &json!({"path": "soul.md"}), &json!(1), Some(sid), false, Some(pid)) {
+            Reply::Single(v) => v["result"].clone(),
+            _ => panic!("one reply"),
+        }
+    };
+    let v = ask();
+    assert_eq!(v["allowed"], false);
+    assert_ne!(v["reason"], rule_doc_allowed_worker_only_ko(), "a worker passes the role gate: {v}");
+    let req = cys::Request {
+        id: json!(2),
+        method: "system.claim_role".into(),
+        params: json!({"role": "master", "surface_id": sid}),
+    };
+    let Reply::Single(c) = dispatch(&d, req, Some(pid)) else {
+        panic!("one reply")
+    };
+    assert_eq!(c["ok"], json!(true), "claim_role master: {c}");
+    let v = ask();
+    assert_eq!(v["allowed"], false);
+    assert_eq!(v["reason"], rule_doc_allowed_worker_only_ko(), "{v}");
+    // RULINGS DG1: back to worker through the same real line — still refused (the seat left its
+    // family once; its write authority never comes back)
+    let req = cys::Request {
+        id: json!(3),
+        method: "system.claim_role".into(),
+        params: json!({"role": "worker", "surface_id": sid}),
+    };
+    let Reply::Single(c) = dispatch(&d, req, Some(pid)) else {
+        panic!("one reply")
+    };
+    assert_eq!(c["ok"], json!(true), "claim_role worker: {c}");
+    let v = ask();
+    assert_eq!(v["allowed"], false);
+    assert_eq!(v["reason"], rule_doc_allowed_worker_only_ko(), "worker → master → worker: {v}");
+    let _ = std::fs::remove_dir_all(production_root(&d));
+}
+
+/// RULINGS DG1: a seat that left the worker family never gets its repair's write authority back —
+/// a worker begins a token-backed rule-document repair (allowed), is re-declared master, then
+/// worker again: still "not allowed"; the repair is continued by ANOTHER worker seat through a
+/// normal pick-up (after the first seat's lease) and that seat is allowed.
+#[test]
+fn dg1_worker_master_worker_stays_refused_and_another_worker_picks_up() {
+    let mut r = rig("dg1");
+    r.lane = LaneKey(format!("dg1-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+    r.inc = "dg1-inc".into();
+    let (lane, inc) = (r.lane.0.clone(), r.inc.clone());
+    let t = now0();
+    let token = token_for(&r, "soul.md", t);
+    let first = 81u64;
+    let w1 = seat_caller(&lane, &inc, first, Some("worker".into()));
+    let v = r
+        .call(t + 2.0, &w1, "begin", json!({"trigger": "owner_order", "files": ["soul.md"], "owner_token": token}))
+        .unwrap();
+    assert_eq!(v["owner_token_bound"], true);
+    let ask = |who: &Caller, at: f64| r.call(at, who, "rule_doc_allowed", json!({"path": "soul.md"})).unwrap();
+    assert_eq!(ask(&w1, t + 3.0)["allowed"], true);
+    record_role_claim(&lane, &inc, first, Some("worker"), "master");
+    record_role_claim(&lane, &inc, first, Some("master"), "worker");
+    let back = seat_caller(&lane, &inc, first, Some("worker".into()));
+    assert_eq!((back.bound_family, back.role.as_deref()), (Some(RoleFamily::Worker), Some("worker")));
+    let v = ask(&back, t + 4.0);
+    assert_eq!(v["allowed"], false, "worker → master → worker: {v}");
+    assert_eq!(v["reason"], rule_doc_allowed_worker_only_ko());
+    // another worker seat picks the repair up once the first seat's lease is over
+    let later = t + 4.0 + 7_200.0 + 61.0;
+    let w2 = seat_caller(&lane, &inc, 82, Some("worker".into()));
+    let p = r
+        .call(later, &w2, "begin", json!({"trigger": "owner_order", "files": ["soul.md"], "owner_token": token}))
+        .unwrap();
+    assert_eq!(p["begin"], "picked-up", "{p}");
+    assert_eq!(ask(&w2, later + 1.0)["allowed"], true, "the second worker may write");
+    assert_eq!(ask(&back, later + 1.0)["allowed"], false, "the first seat still may not");
+}
+
+// ───────────────────────────── RULINGS CV3 (T4b) ─────────────────────────────
+
+/// DK1 at the daemon: a pause write that keeps failing (a directory stands at the lane's mark path,
+/// so the write's rename fails while the pause directory itself stays readable) pauses THIS lane's
+/// daemon for 30 minutes after the input, from its memory — `begin --trigger grant` and `grant
+/// status` say paused — and NOT longer although the write still fails (no latched flag; round-1's
+/// CV3 version of this test held the pause past 60 minutes until a write succeeded — withdrawn).
+#[test]
+fn cv3_a_failed_pause_write_keeps_starts_paused() {
+    let r = rig("cv3-d");
+    r.grant_on(5);
+    let t = now0();
+    std::fs::create_dir_all(grant::pause_path_in(&r.root, &r.lane)).unwrap();
+    note_owner_input_throttled(&r.root, &r.lane, t);
+    let w = seat(3, "worker");
+    let e = r
+        .call(t + 60.0, &w, "begin", json!({"trigger": "grant", "files": ["bin/a.py"]}))
+        .unwrap_err();
+    assert!(e.message.contains("일시정지"), "{}", e.message);
+    let st = r.call(t + 60.0, &master(), "grant_status", json!({})).unwrap();
+    assert_eq!(st["paused"], true, "{st}");
+    assert!(grant::pause_path_in(&r.root, &r.lane).is_dir(), "the write still cannot succeed");
+    let v = r
+        .call(t + 1_801.0, &w, "begin", json!({"trigger": "grant", "files": ["bin/a.py"]}))
+        .unwrap();
+    assert!(v["repair"].is_string(), "not paused past 30 minutes because of a failed write: {v}");
+}
+
+/// RULINGS DG3 (c) at the daemon: the start time comes from the daemon's own incarnation (pinned
+/// here against a real test daemon — no line on the daemon's start path); within 30 minutes of the
+/// start `begin --trigger grant` is held and `grant status` says paused, while the owner's own
+/// "고쳐라" (`--trigger owner_order`) is never held.
+#[test]
+fn dg3_after_a_daemon_start_autonomous_starts_wait_owner_orders_do_not() {
+    let d = crate::team_gate_tests::tmp_daemon("t4b-dg3", false);
+    assert_eq!(
+        grant::incarnation_started_at(&d.incarnation),
+        Some((d.started_at as u64) as f64),
+        "the incarnation carries the daemon's start time"
+    );
+    let mut r = rig("dg3c");
+    let t = now0();
+    r.inc = format!("{:x}-{:x}", (t - 60.0) as u64, std::process::id());
+    r.grant_on(5);
+    let w = seat(3, "worker");
+    let e = r
+        .call(t, &w, "begin", json!({"trigger": "grant", "files": ["bin/a.py"]}))
+        .unwrap_err();
+    assert!(e.message.contains("일시정지"), "{}", e.message);
+    let st = r.call(t, &master(), "grant_status", json!({})).unwrap();
+    assert_eq!(st["paused"], true, "{st}");
+    let v = r
+        .call(t, &w, "begin", json!({"trigger": "owner_order", "files": ["bin/b.py"]}))
+        .unwrap();
+    assert!(v["repair"].is_string(), "an owner order is never held: {v}");
+    let v = r
+        .call(t - 60.0 + 1_801.0, &seat(4, "worker-2"), "begin", json!({"trigger": "grant", "files": ["bin/a.py"]}))
+        .unwrap();
+    assert!(v["repair"].is_string(), "after 30 minutes the hold is over: {v}");
 }

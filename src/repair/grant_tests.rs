@@ -99,6 +99,7 @@ fn grant_on(root: &Path, cap: u32) {
             prompt_excerpt: "예".into(),
             paused_at: None,
             resumed_at: None,
+            generation: 0,
         },
     )
     .unwrap();
@@ -212,9 +213,10 @@ fn decision_file_read_write() {
     keys.sort();
     assert_eq!(
         keys,
+        // RULINGS CV1 (T4b): + `generation` (OLD expectation: the same list without it)
         [
-            "daily_cap", "decided_at", "decided_lane", "decided_seat", "paused_at", "prompt_digest",
-            "prompt_excerpt", "resumed_at", "schema", "state"
+            "daily_cap", "decided_at", "decided_lane", "decided_seat", "generation", "paused_at",
+            "prompt_digest", "prompt_excerpt", "resumed_at", "schema", "state"
         ]
     );
     std::fs::write(grant_path_in(&r), b"{not json").unwrap();
@@ -335,13 +337,32 @@ fn pick_up_after_closure_counted_once() {
 /// B4: any owner input pauses at once (`Paused`, no new round); the pause ends by itself after 30
 /// minutes without owner input; nothing is written while the grant is off; a clock set back keeps
 /// the pause; `grant on` with the answer's time pauses too (the answer is an owner input).
+/// T4d (RULINGS DM1, the batch-1 rust-lib failure at this test's old line 348): an input seen while
+/// the grant is off is not written, but it stays in the daemon's memory as "not yet visible"; the
+/// first check after `grant on` writes it and answers paused. The mark covers THE INPUT's time + W
+/// (the time the caller passed, not the moment of the write): an input 10 minutes before the check
+/// pauses until input + 5 s + 30 min. (Old expectation: after an input while off, `grant on` left a
+/// new round open at the same time — `may_open_new_round_in(&r, t)` true.)
 #[test]
 fn owner_input_pauses_and_resumes() {
-    let r = root("pause");
     let lane = LaneKey("dept-4".into());
     let t = t0();
-    assert!(!note_owner_input_in(&r, &lane, t).unwrap(), "off: nothing to pause");
-    assert!(!pause_path_in(&r, &lane).exists());
+    // off: nothing is written; the input is remembered, and written by the first check after `grant on`
+    let off = root("pause-off");
+    let earlier = t - 600.0;
+    assert!(!note_owner_input_in(&off, &lane, earlier).unwrap(), "off: nothing to pause");
+    assert!(!pause_path_in(&off, &lane).exists(), "off: nothing written");
+    grant_on(&off, 5);
+    assert!(!may_open_new_round_in(&off, t).unwrap(), "the remembered input pauses once the grant is on");
+    let p = pause_path_in(&off, &lane);
+    let mark: PauseMark = parse_versioned(&p, &std::fs::read(&p).unwrap()).unwrap();
+    assert_eq!(mark.covered_through, Some(earlier + PAUSE_COVER_SECS), "covered through the input's time + W");
+    assert_eq!(mark.paused_at, earlier);
+    assert!(is_paused_in(&off, earlier + 1_804.5));
+    assert!(!is_paused_in(&off, earlier + 1_805.5), "30 minutes after the input's covered time, not after the write");
+    assert!(!note_owner_input_in(&off, &lane, earlier).unwrap(), "already covered: no second write");
+    // on: an input pauses at once
+    let r = root("pause");
     grant_on(&r, 5);
     assert!(may_open_new_round_in(&r, t).unwrap());
     assert!(note_owner_input_in(&r, &lane, t).unwrap());
@@ -351,9 +372,13 @@ fn owner_input_pauses_and_resumes() {
     assert!(!seq_dir_in(&r).exists() || claims(&r).is_empty());
     assert!(is_paused_in(&r, t - 3_600.0), "a clock set back keeps the pause");
     assert!(is_paused_in(&r, t + 1_799.0));
-    assert!(!is_paused_in(&r, t + 1_800.5));
-    assert!(may_open_new_round_in(&r, t + 1_801.0).unwrap());
-    assert!(allowed(&start_new(&r, t + 1_801.0, D, &o).1));
+    // RULINGS DM1 (round 4): a written mark covers its input + W (5 s), so the pause lasts until
+    // covered-through + 30 min = t + 1805 (round 3 / pre-T4b expectations: `!is_paused_in(&r, t +
+    // 1_800.5)`, open at t + 1801)
+    assert!(is_paused_in(&r, t + 1_804.5));
+    assert!(!is_paused_in(&r, t + 1_805.5));
+    assert!(may_open_new_round_in(&r, t + 1_806.0).unwrap());
+    assert!(allowed(&start_new(&r, t + 1_806.0, D, &o).1));
     // an unreadable pause file holds the pause by its modification time
     std::fs::write(pause_path_in(&r, &LaneKey("dept-9".into())), b"x").unwrap();
     assert!(is_paused_in(&r, t0() + 5.0));
@@ -911,4 +936,419 @@ fn grant_code_sends_nothing_to_queues() {
     for needle in ["cys send", "send_text", "alert_route", "events::", "feed.push", "wakeup", "enqueue", "Command::new"] {
         assert!(!prod.contains(needle), "grant.rs production code mentions {needle}");
     }
+}
+
+// ───────────────────────────── RULINGS CV1 (T4b) ─────────────────────────────
+
+/// CV1: a decision is ONE step under the grant lock — while one decision holds the lock between its
+/// validation and its publication (B suspended right before its write), another decision cannot
+/// interleave (bounded wait → refused, nothing written); B then publishes generation 1; a later
+/// `off` publishes generation 2. A writer that does not take the lock (an older build) and writes
+/// between validation and publication makes the decision STALE: refused, its file left as it is.
+#[test]
+fn cv1_decisions_are_one_step_under_the_shared_lock() {
+    let r = root("cv1-lock");
+    let d = |state: GrantState| GrantDecision {
+        schema: 1,
+        state,
+        daily_cap: 5,
+        decided_at: 1.0,
+        decided_lane: LaneKey("base".into()),
+        decided_seat: 1,
+        prompt_digest: "d".into(),
+        prompt_excerpt: "예".into(),
+        paused_at: None,
+        resumed_at: None,
+        generation: 0,
+    };
+    let short = std::time::Duration::from_millis(150);
+    let (to_main, at_main) = std::sync::mpsc::channel::<()>();
+    let (to_b, at_b) = std::sync::mpsc::channel::<()>();
+    let rb = r.clone();
+    let b = std::thread::spawn(move || {
+        let hook = move |s: DecideStep| {
+            if s == DecideStep::BeforePublish {
+                to_main.send(()).unwrap();
+                at_b.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+            }
+        };
+        decide_in(&rb, std::time::Duration::from_secs(5), REAL_LOCK_CLOCK, &hook, |cur| {
+            assert_eq!((cur.generation, cur.unreadable), (0, false));
+            Ok(GrantDecision { state: GrantState::On, ..d(GrantState::On) })
+        })
+    });
+    at_main.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+    // B is validated and suspended before its write: nothing can interleave
+    let e = lock_grant_in(&r, short, REAL_LOCK_CLOCK).err().expect("the lock is held by B");
+    assert!(matches!(&e, RepairError::Precondition(m) if m == GRANT_LOCK_BUSY_KO), "{e:?}");
+    let a = decide_in(&r, short, REAL_LOCK_CLOCK, &|_| {}, |_| Ok(d(GrantState::Off)));
+    assert!(a.is_err(), "A waits at most `wait` and is refused");
+    assert_eq!(read_decision_in(&r).unwrap(), None, "nothing written while B holds the lock");
+    to_b.send(()).unwrap();
+    let pb = b.join().unwrap().unwrap();
+    assert_eq!((pb.state, pb.generation), (GrantState::On, 1));
+    let off = decide_in(&r, short, REAL_LOCK_CLOCK, &|_| {}, |cur| {
+        assert_eq!(cur.generation, 1);
+        Ok(d(GrantState::Off))
+    })
+    .unwrap();
+    assert_eq!((off.state, off.generation), (GrantState::Off, 2));
+    // a lock-less writer between validation and publication → stale, refused, nothing overwritten
+    let sneak = |s: DecideStep| {
+        if s == DecideStep::BeforePublish {
+            write_decision_in(&r, &GrantDecision { generation: 7, ..d(GrantState::Off) }).unwrap();
+        }
+    };
+    let e = decide_in(&r, short, REAL_LOCK_CLOCK, &sneak, |_| Ok(d(GrantState::On))).unwrap_err();
+    assert!(matches!(&e, RepairError::Precondition(m) if m == GRANT_STALE_KO), "{e:?}");
+    let now = read_decision_in(&r).unwrap().unwrap();
+    assert_eq!((now.state, now.generation), (GrantState::Off, 7), "the stale decision wrote nothing");
+    // a validation error publishes nothing and releases the lock
+    let e = decide_in(&r, short, REAL_LOCK_CLOCK, &|_| {}, |_| Err(RepairError::Precondition("no".into())));
+    assert!(e.is_err());
+    assert!(lock_grant_in(&r, short, REAL_LOCK_CLOCK).is_ok(), "released after a refused decision");
+    // an old file (no generation) reads as generation 0
+    std::fs::write(grant_path_in(&r), br#"{"schema":1,"state":"off","daily_cap":5,"decided_at":1.0,"decided_lane":"base","decided_seat":1,"prompt_digest":"d","prompt_excerpt":"","paused_at":null,"resumed_at":null}"#).unwrap();
+    assert_eq!(current_generation_in(&r), 0);
+}
+
+/// CV1 / fatal four: the grant lock dies with its holder — a process that holds it and is killed
+/// leaves it free (the kernel releases an advisory lock with the last descriptor); the wait is
+/// bounded; a link or a non-regular file at the lock's name is refused, never followed.
+#[cfg(unix)]
+#[test]
+fn cv1_the_grant_lock_dies_with_its_holder() {
+    use std::io::BufRead;
+    let r = root("cv1-dead");
+    let p = grant_lock_path_in(&r);
+    std::fs::write(&p, b"").unwrap();
+    // the holder is another PROCESS (perl's flock — not a python spawn site, see lib.rs's census)
+    let mut child = std::process::Command::new("perl")
+        .arg("-MFcntl=:flock")
+        .arg("-e")
+        .arg("open(my $f, '>>', $ARGV[0]) or die; flock($f, LOCK_EX) or die; $| = 1; print \"held\\n\"; sleep 60;")
+        .arg(&p)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("perl is on PATH in the test environment");
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(line.trim(), "held");
+    let started = std::time::Instant::now();
+    assert!(lock_grant_in(&r, std::time::Duration::from_millis(300), REAL_LOCK_CLOCK).is_err(), "held by the child");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "the wait is bounded");
+    child.kill().unwrap(); // our own child, by its handle (exact pid)
+    child.wait().unwrap();
+    assert!(lock_grant_in(&r, std::time::Duration::from_secs(2), REAL_LOCK_CLOCK).is_ok(), "free after the holder died");
+    // never follows a link at the lock's name
+    let r2 = root("cv1-link");
+    std::os::unix::fs::symlink(r2.join("elsewhere"), grant_lock_path_in(&r2)).unwrap();
+    assert!(lock_grant_in(&r2, std::time::Duration::from_millis(50), REAL_LOCK_CLOCK).is_err());
+    assert!(!r2.join("elsewhere").exists(), "the link's target was not created");
+}
+
+/// CV1: a start is admitted at the END — an owner input or a `grant off` published while the
+/// attempt is suspended after its pause check (at AfterLock and at BeforePlace) refuses it: the
+/// attempt closes its own claim (if placed) and releases its own lock; nothing else changes.
+#[test]
+fn cv1_a_start_is_admitted_at_the_end() {
+    for (at, what) in [
+        (ClaimStep::AfterLock, "pause"),
+        (ClaimStep::BeforePlace, "pause"),
+        (ClaimStep::AfterLock, "off"),
+        (ClaimStep::BeforePlace, "off"),
+        (ClaimStep::AfterPlace, "pause"),
+        (ClaimStep::AfterPlace, "off"),
+    ] {
+        let r = root("cv1-admit");
+        grant_on(&r, 5);
+        let t = t0();
+        let id = rid(1);
+        put(&r, &rec(&id, RepairState::InProgress, None));
+        let o = owner("base", 3, "inc-1");
+        let lane = LaneKey(format!("cv1-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+        let hook = |s: ClaimStep| {
+            if s == at {
+                if what == "pause" {
+                    assert!(note_owner_input_in(&r, &lane, t).unwrap());
+                } else {
+                    decide_in(&r, std::time::Duration::from_secs(2), REAL_LOCK_CLOCK, &|_| {}, |cur| {
+                        let mut d = cur.decision.cloned().unwrap();
+                        d.state = GrantState::Off;
+                        Ok(d)
+                    })
+                    .unwrap();
+                }
+            }
+            HookAction::Continue
+        };
+        let clock = move || t + 1.0;
+        let today = || D.to_string();
+        let v = try_claim_in(&ClaimEnv { root: &r, clock: &clock, today: &today, hook: &hook }, &o, &id);
+        if what == "pause" {
+            assert_eq!(v.as_ref().ok(), Some(&StartVerdict::Paused), "{at:?}: {v:?}");
+        } else {
+            assert!(matches!(&v, Err(RepairError::Precondition(m)) if m == GRANT_OFF_KO), "{at:?}: {v:?}");
+        }
+        assert_eq!(get(&r, &id).lock, None, "{at:?} {what}: the attempt's own lock is released");
+        for (n, _) in claims(&r) {
+            assert!(closed(&r, n), "{at:?} {what}: the attempt's own claim {n} is closed");
+        }
+        assert_eq!(get(&r, &id).state, RepairState::InProgress, "the record stays open");
+    }
+    // an unchanged decision and no pause → admitted (the final check reads the same generation)
+    let r = root("cv1-admit-ok");
+    grant_on(&r, 5);
+    let id = rid(1);
+    put(&r, &rec(&id, RepairState::InProgress, None));
+    let v = attempt(&r, t0(), D, &owner("base", 3, "inc-1"), &id).unwrap();
+    assert_eq!(v, StartVerdict::Allowed { claim: 1 });
+    assert!(!closed(&r, 1));
+}
+
+// ───────────────────────────── RULINGS CV3 (T4b) ─────────────────────────────
+
+// ───────────────────────────── RULINGS DG (T4b round 2) ─────────────────────────────
+
+/// DG2 (the verdict's sequence): the attempt passes the first pause check; an owner input arrives
+/// before placement (a pause that ends soon); the claim is placed; the attempt is suspended between
+/// its two admission reads while `grant off` is published and the pause runs out. Every instant
+/// after placement was paused or off → not Allowed (off), its claim closed, its lock released.
+/// Without the Off: the pause that was in force when admission began refuses it (Paused); a pause
+/// that starts between the two reads refuses it too (the reads differ).
+#[test]
+fn dg2_final_admission_is_one_coherent_read() {
+    for case in ["off-and-expiry", "expiry-only", "input-between"] {
+        let r = root("dg2");
+        grant_on(&r, 5);
+        let t = t0();
+        let id = rid(1);
+        put(&r, &rec(&id, RepairState::InProgress, None));
+        let o = owner("base", 3, "inc-1");
+        let lane = LaneKey(format!("dg2-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+        let clock_now = Cell::new(t);
+        let hook = |s: ClaimStep| {
+            match (s, case) {
+                (ClaimStep::BeforePlace, "off-and-expiry" | "expiry-only") => {
+                    // an owner input whose pause ends 2 s from now
+                    let at = clock_now.get() - PAUSE_QUIET_SECS as f64 + 2.0;
+                    assert!(note_owner_input_in(&r, &lane, at).unwrap());
+                }
+                (ClaimStep::BetweenAdmissionReads, "off-and-expiry") => {
+                    decide_in(&r, std::time::Duration::from_secs(2), REAL_LOCK_CLOCK, &|_| {}, |cur| {
+                        let mut d = cur.decision.cloned().unwrap();
+                        d.state = GrantState::Off;
+                        Ok(d)
+                    })
+                    .unwrap();
+                    clock_now.set(clock_now.get() + 60.0); // the pause has run out
+                }
+                (ClaimStep::BetweenAdmissionReads, "expiry-only") => {
+                    clock_now.set(clock_now.get() + 60.0);
+                }
+                (ClaimStep::BetweenAdmissionReads, "input-between") => {
+                    assert!(note_owner_input_in(&r, &lane, clock_now.get()).unwrap());
+                }
+                _ => {}
+            }
+            HookAction::Continue
+        };
+        let clock = || clock_now.get();
+        let today = || D.to_string();
+        let v = try_claim_in(&ClaimEnv { root: &r, clock: &clock, today: &today, hook: &hook }, &o, &id);
+        match case {
+            "off-and-expiry" => assert!(matches!(&v, Err(RepairError::Precondition(m)) if m == GRANT_OFF_KO), "{case}: {v:?}"),
+            _ => assert_eq!(v.as_ref().ok(), Some(&StartVerdict::Paused), "{case}: {v:?}"),
+        }
+        assert_eq!(get(&r, &id).lock, None, "{case}: own lock released");
+        let placed = claims(&r);
+        assert_eq!(placed.len(), 1, "{case}");
+        assert!(closed(&r, placed[0].0), "{case}: own claim closed");
+    }
+}
+
+/// DG3 (c): after its daemon started, a lane holds AUTONOMOUS starts for the pause length (the start
+/// time comes from the attempt's lock owner — the daemon incarnation "{started_at:x}-{pid:x}");
+/// an incarnation of another shape (the tests' "inc-1") holds nothing.
+#[test]
+fn dg3_a_lane_holds_autonomous_starts_after_its_daemon_started() {
+    let r = root("dg3c");
+    grant_on(&r, 5);
+    let t = t0();
+    let started = (t - 100.0).floor();
+    let inc = format!("{:x}-{:x}", started as u64, 4242);
+    assert_eq!(incarnation_started_at(&inc), Some(started));
+    assert_eq!(incarnation_started_at("inc-1"), None);
+    assert_eq!(incarnation_started_at("abc"), None);
+    let o = owner("base", 3, &inc);
+    assert_eq!(start_new(&r, t, D, &o).1.unwrap(), StartVerdict::Paused, "held: started 100 s ago");
+    assert!(allowed(&start_new(&r, started + 1_800.5, D, &o).1), "the hold ends 30 min after the start");
+}
+
+// ───────────────────────────── RULINGS DK1 + DM (T4b rounds 3–4) ─────────────────────────────
+
+fn mark_of(r: &Path, lane: &LaneKey) -> PauseMark {
+    serde_json::from_slice(&std::fs::read(pause_path_in(r, lane)).unwrap()).unwrap()
+}
+
+/// DM1: a written mark covers its input + W — inputs at or before the covered-through time need no
+/// write, a later input writes; the pause lasts at least 30 minutes after the LAST input and at most
+/// W longer. (Replaces round 3's "at most one write attempt per second".)
+#[test]
+fn dm1_a_written_mark_covers_a_window() {
+    let r = root("dm1-burst");
+    grant_on(&r, 5);
+    let lane = LaneKey("dm1-burst".into());
+    let t = t0();
+    assert!(note_owner_input_in(&r, &lane, t).unwrap());
+    assert_eq!(mark_of(&r, &lane).covered(), t + PAUSE_COVER_SECS);
+    assert!(!note_owner_input_in(&r, &lane, t + 0.5).unwrap(), "covered: no write");
+    assert!(!note_owner_input_in(&r, &lane, t + PAUSE_COVER_SECS).unwrap(), "at the covered time: no write");
+    assert!(note_owner_input_in(&r, &lane, t + 6.0).unwrap(), "later than covered: written");
+    assert_eq!(mark_of(&r, &lane).covered(), t + 6.0 + PAUSE_COVER_SECS);
+    assert!(is_paused_in(&r, t + 6.0 + 1_800.0), "at least 30 minutes after the last input");
+    assert!(!is_paused_in(&r, t + 6.0 + PAUSE_COVER_SECS + 1_800.1), "at most W longer");
+}
+
+/// DM1 pin — the burst seen from ANOTHER daemon (its own state: only the written marks): lane A
+/// writes at t and takes its last input at t + 0.5 (covered — no write); lane B refuses at
+/// t + 1800.1 and admits only after covered-through + 1800.
+#[test]
+fn dm1_another_lane_sees_the_last_input_of_a_burst() {
+    let r = root("dm1-lanes");
+    grant_on(&r, 5);
+    let a = LaneKey("dept-a".into());
+    let t = t0();
+    assert!(note_owner_input_in(&r, &a, t).unwrap());
+    assert!(!note_owner_input_in(&r, &a, t + 0.5).unwrap());
+    forget_pause_memory(&r, &a); // lane B's daemon has none of A's memory
+    let b = owner("dept-b", 7, "inc-b");
+    assert_eq!(start_new(&r, t + 1_800.1, D, &b).1.unwrap(), StartVerdict::Paused);
+    assert_eq!(start_new(&r, t + PAUSE_COVER_SECS + 1_799.9, D, &b).1.unwrap(), StartVerdict::Paused);
+    assert!(allowed(&start_new(&r, t + PAUSE_COVER_SECS + 1_800.1, D, &b).1));
+}
+
+/// DM4 / DK1 pin — a WRITE failure with a READABLE directory (seam): this daemon is paused from its
+/// memory; storage recovers and NO new input comes — the new-round check (what `record` asks)
+/// retries the write first (after the one-second spacing) and the pause ends 30 minutes + W after
+/// the last input; a write that keeps failing never pauses past 30 minutes after the last input.
+#[test]
+fn dm4_a_write_failure_is_retried_by_the_asker_and_never_outlives_the_window() {
+    let r = root("dm4-write");
+    grant_on(&r, 5);
+    let lane = LaneKey("dm4-write".into());
+    let t = t0();
+    FAIL_PAUSE_WRITE.with(|c| c.set(true));
+    assert!(note_owner_input_in(&r, &lane, t).is_err(), "the write fails");
+    FAIL_PAUSE_WRITE.with(|c| c.set(false));
+    assert!(is_paused_in(&r, t + 60.0), "this daemon is paused from its memory");
+    assert!(!pause_path_in(&r, &lane).exists());
+    MONOTONIC_SKEW.with(|c| c.set(std::time::Duration::from_secs(2)));
+    assert!(!may_open_new_round_in(&r, t + 60.0).unwrap(), "still within the pause");
+    assert_eq!(mark_of(&r, &lane).covered(), t + PAUSE_COVER_SECS, "the check wrote the last input first");
+    assert!(!may_open_new_round_in(&r, t + 1_804.0).unwrap());
+    assert!(may_open_new_round_in(&r, t + PAUSE_COVER_SECS + 1_800.1).unwrap(), "30 min + W after the last input");
+    MONOTONIC_SKEW.with(|c| c.set(std::time::Duration::ZERO));
+    // a write that keeps failing: the pause still ends 30 minutes after the last input
+    let r2 = root("dm4-keeps-failing");
+    grant_on(&r2, 5);
+    FAIL_PAUSE_WRITE.with(|c| c.set(true));
+    assert!(note_owner_input_in(&r2, &lane, t).is_err());
+    let o = owner("base", 3, "inc-1");
+    assert_eq!(start_new(&r2, t + 1_799.0, D, &o).1.unwrap(), StartVerdict::Paused);
+    assert!(may_open_new_round_in(&r2, t + 1_800.1).unwrap(), "not past 30 minutes because of a failed write");
+    assert!(allowed(&start_new(&r2, t + 1_800.1, D, &o).1));
+    FAIL_PAUSE_WRITE.with(|c| c.set(false));
+}
+
+/// DK1 / DM pin — an older successful write cannot hide a newer failed one: input t written;
+/// input t + 10 fails — "not yet visible" is derived, so this daemon stays paused by t + 10 and the
+/// next asker (an admission, after the spacing) writes it.
+#[test]
+fn dm_an_older_success_never_hides_a_newer_failure() {
+    let r = root("dm-older");
+    grant_on(&r, 5);
+    let lane = LaneKey("dm-older".into());
+    let t = t0();
+    assert!(note_owner_input_in(&r, &lane, t).unwrap());
+    FAIL_PAUSE_WRITE.with(|c| c.set(true));
+    assert!(note_owner_input_in(&r, &lane, t + 10.0).is_err());
+    FAIL_PAUSE_WRITE.with(|c| c.set(false));
+    assert!(is_paused_in(&r, t + 1_809.0), "paused by the newer input (memory)");
+    assert_eq!(mark_of(&r, &lane).covered(), t + PAUSE_COVER_SECS, "the older mark is all that is written");
+    MONOTONIC_SKEW.with(|c| c.set(std::time::Duration::from_secs(2)));
+    let o = owner("base", 3, "inc-1");
+    assert_eq!(start_new(&r, t + 20.0, D, &o).1.unwrap(), StartVerdict::Paused);
+    MONOTONIC_SKEW.with(|c| c.set(std::time::Duration::ZERO));
+    assert_eq!(mark_of(&r, &lane).covered(), t + 10.0 + PAUSE_COVER_SECS, "the admission wrote the newer input");
+}
+
+/// DM2 pin — retry spacing is monotonic and only after a failure: after a FAILED newer write, a
+/// delayed OLDER caller does not attempt within the second (its captured input time plays no
+/// part) and does not move the latest input back; after the second the next asker writes.
+#[test]
+fn dm2_a_delayed_older_caller_after_a_failed_newer_one() {
+    let r = root("dm2");
+    grant_on(&r, 5);
+    let lane = LaneKey("dm2".into());
+    let t = t0();
+    assert!(note_owner_input_in(&r, &lane, t).unwrap());
+    FAIL_PAUSE_WRITE.with(|c| c.set(true));
+    assert!(note_owner_input_in(&r, &lane, t + 10.0).is_err(), "the newer write fails");
+    FAIL_PAUSE_WRITE.with(|c| c.set(false));
+    assert!(!note_owner_input_in(&r, &lane, t + 2.0).unwrap(), "the older caller: no attempt within the second");
+    assert_eq!(mark_of(&r, &lane).covered(), t + PAUSE_COVER_SECS);
+    MONOTONIC_SKEW.with(|c| c.set(std::time::Duration::from_millis(1_500)));
+    assert!(note_owner_input_in(&r, &lane, t + 3.0).unwrap(), "after the second: the asker writes");
+    MONOTONIC_SKEW.with(|c| c.set(std::time::Duration::ZERO));
+    assert_eq!(mark_of(&r, &lane).covered(), t + 10.0 + PAUSE_COVER_SECS, "the latest input, not the caller's");
+    // a success never spaces the next write: a later input after the covered time writes at once
+    assert!(note_owner_input_in(&r, &lane, t + 20.0).unwrap());
+}
+
+/// DK1 (3) pin — reversed completion order: the newer input is written first; an older input
+/// arriving after it neither moves the latest input back nor the stored mark; eight concurrent
+/// writers leave a mark covering the latest input.
+#[test]
+fn dm_reversed_completion_never_moves_the_end_back() {
+    let r = root("dm-rev");
+    grant_on(&r, 5);
+    let lane = LaneKey("dm-rev".into());
+    let t = t0();
+    assert!(note_owner_input_in(&r, &lane, t + 10.0).unwrap());
+    assert!(!note_owner_input_in(&r, &lane, t).unwrap(), "already covered");
+    assert_eq!(mark_of(&r, &lane).covered(), t + 10.0 + PAUSE_COVER_SECS);
+    let r2 = root("dm-threads");
+    grant_on(&r2, 5);
+    std::thread::scope(|sc| {
+        for k in 0..8u32 {
+            let (r2, lane) = (&r2, &lane);
+            sc.spawn(move || {
+                let _ = note_owner_input_in(r2, lane, t + 2.0 * f64::from(k));
+            });
+        }
+    });
+    assert!(mark_of(&r2, &lane).covered() >= t + 14.0, "the latest input is covered whatever the order");
+}
+
+/// DM4 / DK1 (2) pin — a directory-READ failure (a deterministic test seam, independent of the
+/// user running the tests) answers "paused" for THAT call, for as long as it lasts; nothing is
+/// latched: once it can be read the answer follows the marks.
+#[test]
+fn dm4_a_directory_read_failure_pauses_that_call_only() {
+    let r = root("dm4-dir");
+    grant_on(&r, 5);
+    let t = t0();
+    assert!(!is_paused_in(&r, t));
+    FAIL_PAUSE_DIR_READ.with(|c| c.set(true));
+    let st = pause_state_in(&r, t);
+    let start = start_new(&r, t, D, &owner("base", 3, "inc-1")).1;
+    let later = pause_state_in(&r, t + 86_400.0);
+    FAIL_PAUSE_DIR_READ.with(|c| c.set(false));
+    assert!(st.unreadable && st.paused_at(t) && later.paused_at(t + 86_400.0));
+    assert_eq!(start.unwrap(), StartVerdict::Paused);
+    assert!(!is_paused_in(&r, t), "nothing latched");
+    assert!(allowed(&start_new(&r, t, D, &owner("base", 3, "inc-1")).1));
 }
