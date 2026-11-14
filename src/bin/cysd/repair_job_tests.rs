@@ -209,3 +209,20 @@ fn job_intake_counts_the_real_hourly_rows() {
     assert_eq!(new_intake_rows_in_last_hour(&root, &lane, now), 2);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// DX5: the rels the job files its fault reports under — `repairs/<R-id>/record.json` and
+/// `repairs/<R-id>/ops` — are accepted by the intake (parsed, not excluded, recorded as a new row),
+/// so a fault report is never silently "acknowledged" by a refusal.
+#[test]
+fn the_intake_accepts_the_jobs_fault_rels() {
+    let root = std::env::temp_dir().join(format!("cys-dx5-intake-{}-{}", std::process::id(), now_ms()));
+    let lane = cys::repair::types::LaneKey("base".into());
+    for rel in ["repairs/R-1/record.json", "repairs/R-1/ops"] {
+        let err = "자체 해결 작업이 수리 R-1를 처리하지 못함 — 수리 기록을 읽을 수 없습니다";
+        let report = cys::repair::intake::parse_report(rel, err).expect("parsed");
+        assert!(cys::repair::intake::excluded(rel, err, false).is_none(), "{rel}: not excluded");
+        let rec = cys::repair::intake::record_in(&root, &lane, &report, "daemon", 1_800_000_000.0, 0, false, err).unwrap();
+        assert!(matches!(rec, cys::repair::intake::Recorded::New(_)), "{rel}: {rec:?}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

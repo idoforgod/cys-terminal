@@ -180,7 +180,13 @@ pub fn temp_owner_pid(name: &str) -> Option<u32> {
         return None;
     }
     let tail = if let Some(i) = name.rfind(".part-") {
-        &name[i + ".part-".len()..]
+        let t = &name[i + ".part-".len()..];
+        let mut parts = t.split('-');
+        let digits = |p: Option<&str>| p.is_some_and(|x| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()));
+        if !(digits(parts.next()) && digits(parts.next()) && parts.next().is_none()) {
+            return None;
+        }
+        t
     } else if let Some(t) = name.strip_prefix(".building-") {
         t
     } else if let Some(t) = name.strip_prefix(".screen-") {
@@ -241,12 +247,25 @@ pub fn publish_new(final_path: &Path, bytes: &[u8], mode: u32) -> Result<(), Rep
     publish_with(final_path, bytes, mode, &mut |_| Ok(()))
 }
 
-/// Removes our temporary entries left in ONE directory by an interrupted publication (CT1 —
-/// recovery discards an incomplete temporary entry). Only `.…part-…` names; never anything else.
-fn discard_temps_in(dir: &Path) {
+/// Whether `name` is EXACTLY the temporary name this vault writes for `member`:
+/// `.<member>.part-<pid>-<ns>` with both numbers all digits (DX4).
+pub fn is_temp_name_of(name: &str, member: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.').and_then(|r| r.strip_prefix(member)).and_then(|r| r.strip_prefix(".part-")) else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    let digits = |p: Option<&str>| p.is_some_and(|x| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()));
+    digits(parts.next()) && digits(parts.next()) && parts.next().is_none()
+}
+
+/// Removes our temporary entries for ONE member left in ONE slot directory by an interrupted
+/// publication (CT1). DX4: only names that are EXACTLY that member's temporary name — a sealed pack
+/// file whose basename merely looks like the pattern is a slot entry and stays — and only from
+/// inside the operation that owns the slot (its own run, or the recovery that claimed it — DR9).
+fn discard_temps_in(dir: &Path, member: &str) {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') && name.contains(".part-") {
+        if is_temp_name_of(&name, member) {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -451,7 +470,7 @@ pub fn seal(slot: &Slot) -> Result<(), RepairError> {
 pub fn seal_with(slot: &Slot, hook: &mut PublishHook<'_>) -> Result<(), RepairError> {
     let payload = slot.payload();
     let sealed = slot.sealed();
-    discard_temps_in(&slot.dir.join("sealed"));
+    discard_temps_in(&slot.dir.join("sealed"), &slot.basename);
     if std::fs::symlink_metadata(&sealed).is_ok() {
         return verify_published_seal(slot);
     }
@@ -553,7 +572,7 @@ pub fn finish_seal(slot: &Slot, now: f64) -> Result<SealFacts, RepairError> {
 pub fn finish_seal_with(slot: &Slot, now: f64, hook: &mut PublishHook<'_>) -> Result<SealFacts, RepairError> {
     let sealed = slot.sealed();
     let payload = slot.payload();
-    discard_temps_in(&slot.dir.join("meta"));
+    discard_temps_in(&slot.dir.join("meta"), "sealed.json");
     let (sealed_state, sealed_sha) = if std::fs::symlink_metadata(&sealed).is_ok() {
         if let Ok(f) = std::fs::File::open(&sealed) {
             full_flush_file(&f).map_err(|e| io(&sealed, e))?;
@@ -812,5 +831,26 @@ mod tests {
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].changed_after_deposit, Some(true), "E4 flag");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// DX4: only EXACT temporary names of the member are discarded — a sealed pack file whose name
+    /// merely looks like the pattern, another member's temporary, or a malformed tail stays.
+    #[test]
+    fn only_exact_temporary_names_are_discarded() {
+        assert!(is_temp_name_of(".x.sh.part-123-456", "x.sh"));
+        assert!(!is_temp_name_of(".x.sh.part-123-456", "y.sh"));
+        assert!(!is_temp_name_of(".x.sh.part-abc-456", "x.sh"));
+        assert!(!is_temp_name_of(".x.sh.part-1-2-3", "x.sh"));
+        assert!(!is_temp_name_of("x.sh.part-1-2", "x.sh"));
+        let d = std::env::temp_dir().join(format!("cys-dx4-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&d).unwrap();
+        for n in [".x.sh.part-12-34", ".x.sh.part-oops", ".y.sh.part-1-2", ".x.sh.part-1-2.keep"] {
+            std::fs::write(d.join(n), b"x").unwrap();
+        }
+        discard_temps_in(&d, "x.sh");
+        let mut left: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        left.sort();
+        assert_eq!(left, vec![".x.sh.part-1-2.keep", ".x.sh.part-oops", ".y.sh.part-1-2"]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
