@@ -1805,7 +1805,7 @@ def stamp():
 _FLUSH_UNSUPPORTED = (errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP)
 
 
-def fsync_dir(d):
+def fs_sync_dir(d):
     """★RULINGS FL5 — 폴더 안의 이름 바꾸기를 디스크에 확정한다. **실패는 실패다**(OSError — 부르는 쪽이 보류한다: 확정됐다고 믿을
     수 없는 기록 아래에서는 살아 있는 이름을 건드리지 않는다). 용인하는 것은 '이 파일 시스템은 폴더 flush 를 지원하지 않는다'
     뿐이다: 윈도우(파이썬은 폴더를 열어 fsync 할 수 없다 — NTFS 는 이름 바꾸기를 메타데이터 저널에 남긴다)와 fsync 가
@@ -1835,28 +1835,92 @@ def retry_sharing(fn, *args):
             time.sleep(0.1)
 
 
-def silent_unlink(p):
-    try:
-        os.unlink(p)
-    except OSError:
-        pass
+def fs_create(p, data, mode=None):
+    """★FY4a 문 — 새 이름 p 를 단독 생성(O_EXCL)으로 만들고 다 쓴 뒤 flush 한다(권한 mode). 이미 있으면 FileExistsError(아무것도
+    만들지 않았다). 그 뒤의 실패(쓰기·flush)는 그대로 올린다 — 만든 반쪽 파일은 남는다(부르는 쪽이 보관 폴더로 옮긴다 · FL2)."""
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o644)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    if mode is not None:
+        try:
+            os.chmod(p, mode)
+        except OSError:
+            pass
 
 
-def write_temp(path, data, expect=None):
-    """같은 폴더 임시 파일에 다 쓰고 flush·fsync, (expect) 다시 읽어 확인 — 그 경로. 실패하면 임시 파일을 남기지 않는다."""
-    d = os.path.dirname(os.path.abspath(path))
-    fd, tmp = tempfile.mkstemp(dir=d, prefix="." + os.path.basename(path) + ".", suffix=".tmp")
-    done = False
+def fs_temp(d, prefix, data, mode=None):
+    """★FY4a 문 — 폴더 d 에 새 임시 파일(점으로 시작 · .tmp)을 만들어 다 쓰고 flush 한다 — 그 경로. 쓰기·flush 가 실패하면 그 임시
+    파일(우리 것 · 메타데이터)을 치우고 올린다."""
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=prefix, suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        mode = fs_mode(path)                    # 기존 파일의 권한을 그대로(cp 와 같은 결과 · 없으면 644 · 모르면 Unknown)
         try:
             os.chmod(tmp, 0o644 if mode is None else mode)
         except OSError:
             pass
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return tmp
+
+
+def fs_replace(src, dst):
+    """★FY4a 문 — 원자 교체(메타데이터만: 동작 기록·영수증 — 지침 이름에는 쓰지 않는다)."""
+    retry_sharing(os.replace, src, dst)
+
+
+def fs_link(src, dst):
+    """★FY4a 문 — 우리 다 쓴 임시 파일에 새 이름 하나(덮지 않는다 — 있으면 FileExistsError)."""
+    os.link(src, dst)
+
+
+def fs_unlink(p, missing_ok=False):
+    """★FY4a 문 — 이름 하나를 지운다: 우리 임시 파일의 원래 이름 · 방법 시험 파일 · 끝난 동작 기록 · 영수증. 지침의 판·후보·보관
+    사본은 여기로 오지 않는다(FL2)."""
+    try:
+        os.unlink(p)
+    except FileNotFoundError:
+        if not missing_ok:
+            raise
+
+
+def fs_mkdir(p):
+    """★FY4a 문 — 폴더(와 그 위)를 만든다(있으면 그대로)."""
+    os.makedirs(p, exist_ok=True)
+
+
+def fs_append(p, line):
+    """★FY4a 문 — 부르는 셸의 반환 파일에 한 줄(KEPT — 알림이 아니다)."""
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(line)
+
+
+def fs_exchange(a, b):
+    """★FY4a 문 — 두 이름의 원자 맞바꾸기(맥 RENAME_SWAP · 리눅스 RENAME_EXCHANGE)."""
+    exchange_fn()(a, b)
+
+
+def silent_unlink(p):
+    try:
+        fs_unlink(p, missing_ok=True)
+    except OSError:
+        pass
+
+
+def write_temp(path, data, expect=None):
+    """같은 폴더 임시 파일에 다 쓰고 flush, (expect) 다시 읽어 확인 — 그 경로. 실패하면 임시 파일을 남기지 않는다."""
+    d = os.path.dirname(os.path.abspath(path))
+    tmp = fs_temp(d, "." + os.path.basename(path) + ".", data, fs_mode(path))   # 기존 파일의 권한 그대로(없으면 644)
+    done = False
+    try:
         if expect is not None:
             back = fs_read(tmp)
             if back is None or not expect(back):
@@ -1872,11 +1936,11 @@ def write_atomic(path, data, expect=None):
     """우리 것(영수증)의 원자 교체 — 임시 파일 → 원자 교체. 실패 = 살아 있는 파일 무변경."""
     tmp = write_temp(path, data, expect)
     try:
-        retry_sharing(os.replace, tmp, path)
+        fs_replace(tmp, path)
     except BaseException:
         silent_unlink(tmp)
         raise
-    fsync_dir(os.path.dirname(os.path.abspath(path)))
+    fs_sync_dir(os.path.dirname(os.path.abspath(path)))
 
 
 def write_new(path, data):
@@ -1902,36 +1966,24 @@ class NoSafeMove(OSError):
 
 def move_noreplace(src, dst):
     """★RULINGS EY3 — **우리 임시 파일**(다 쓴 .pre-ceo·곁 파일)을 새 이름으로 옮긴다, dst 가 있으면 **덮지 않고** FileExistsError.
-    바이트를 다시 쓰지 않는다(같은 파일 그대로). ★FL3: 살아 있는 지침 이름에는 쓰지 않는다 — 그 이름은 rename_into(보관)와
-    place_noreplace(놓기)만 바꾼다(링크 뒤 지우기는 그 사이에 이름을 바꿔 놓은 저장을 지운다).
+    바이트를 다시 쓰지 않는다(같은 파일 그대로). ★FL3: 살아 있는 지침 이름에는 쓰지 않는다 — 그 이름은 fs_rename_into(보관)와
+    fs_place(놓기)만 바꾼다(링크 뒤 지우기는 그 사이에 이름을 바꿔 놓은 저장을 지운다).
     POSIX = 하드 링크 + 원래 이름 지우기(링크는 기존 이름을 덮지 않는다) → 하드 링크가 안 되면 덮지 않는 이름 바꾸기(맥 renamex_np
     RENAME_EXCL · 리눅스 renameat2 RENAME_NOREPLACE) → 그것도 없으면 NoSafeMove(호출부가 보류 — 확인 뒤 이름 바꾸기는 쓰지 않는다).
     윈도우 = os.rename(대상이 있으면 FileExistsError · 공유 위반은 짧게 재시도)."""
     if os.name != "posix":
-        retry_sharing(os.rename, src, dst)
-        return dst
+        return fs_place(src, dst)
     try:
-        os.link(src, dst)
+        fs_link(src, dst)
     except FileExistsError:
         raise
     except OSError:
-        nr = noreplace_fn()
-        if nr is None:
-            raise NoSafeMove(errno.ENOTSUP, "덮지 않는 이동이 없는 파일 시스템", dst)
-        try:
-            nr(src, dst)
-        except OSError as e:
-            if e.errno == errno.EEXIST:
-                raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), dst)
-            if e.errno in _NO_EXCHANGE:
-                raise NoSafeMove(e.errno, "덮지 않는 이동이 없는 파일 시스템", dst)
-            raise
-        return dst
-    os.unlink(src)
+        return fs_place(src, dst)       # 하드 링크가 없는 파일 시스템 — 덮지 않는 이름 바꾸기(없으면 NoSafeMove)
+    fs_unlink(src)
     return dst
 
 
-def rename_into(src, dst):
+def fs_rename_into(src, dst):
     """★RULINGS FL3 — src 를 dst 로 **한 번의 원자 이름 바꾸기**로 옮긴다. 링크 + 지우기는 쓰지 않는다: 두 호출 사이에 편집기의
     원자 저장이 원래 이름을 바꿔 놓으면 둘째 호출이 그 저장을 지운다(codex B2). 한 번의 이름 바꾸기는 그 순간 그 이름에 있는
     것을 옮긴다. dst 는 잠금 안에서 만든 유일한 보관 이름이라 덮을 것이 없다 — 그래도 덮지 않는 호출(맥 RENAME_EXCL · 리눅스
@@ -1954,7 +2006,7 @@ def rename_into(src, dst):
     return dst
 
 
-def place_noreplace(src, dst):
+def fs_place(src, dst):
     """★RULINGS FL3·EY3 — 다 쓴 후보를 비어 있는 살아 있는 이름에 놓는다: 한 번의 **덮지 않는** 이름 바꾸기(맥 RENAME_EXCL · 리눅스
     RENAME_NOREPLACE · 윈도우 os.rename). 살아 있는 이름은 사용자도 만들므로 '확인 뒤 이름 바꾸기'도 링크도 쓰지 않는다 — 그
     호출이 없으면 NoSafeMove(보류). 그 사이 누가 만들었으면 FileExistsError(그것이 이긴다)."""
@@ -1973,17 +2025,17 @@ def place_noreplace(src, dst):
     return dst
 
 
-def keep_file(src, md, reason, name=None):
+def keep_file(src, md, reason, name=None, sidecar=True):
     """★RULINGS EY1 — 살아 있던 지침 파일(교체로 밀려난 것 · 되돌린 후보 · 강등 뒤의 .pre-ceo)을 보관 폴더 directives/.ceo-kept/
     로 **옮긴다**(지우지 않는다 · 다시 쓰지 않는다 · 덮지 않는 이름 <UTC>-<pid>-<n>.<reason>). 옮긴 뒤 그 순간의 바이트 해시를
     곁 파일 <이름>.kept 에 **단독 생성**(O_EXCL)으로 적는다 — 공유 원장을 다시 쓰지 않는다. 나중에 그 파일에 저장이 들어가면
     (교체 전에 열린 편집기 핸들) preflight C03 이 해시로 알아보고 알린다(FA1). 이 사본을 지우는 것은 오너나 워커의 몫이다 —
     승격·강등은 지우지 않는다. 돌려주는 값 = (보관 경로, 곁 파일이 적은 sha256 | None(일반 파일이 아님 · 읽지 못함))."""
     kd = kept_dir(md)
-    os.makedirs(kd, exist_ok=True)
+    fs_mkdir(kd)
     if name is not None:                # 의도 기록이 미리 정한 이름(EY2) — 있으면 덮지 않고 실패
         kept = os.path.join(kd, name)
-        rename_into(src, kept)          # ★FL3 — 한 번의 이름 바꾸기
+        fs_rename_into(src, kept)          # ★FL3 — 한 번의 이름 바꾸기
     else:
         base = "%s-%d" % (stamp(), os.getpid())
         for n in range(1, 1000):
@@ -1991,12 +2043,14 @@ def keep_file(src, md, reason, name=None):
             if present(kept) or present(kept + ".kept"):
                 continue
             try:
-                rename_into(src, kept)
+                fs_rename_into(src, kept)
             except FileExistsError:
                 continue
             break
         else:
             raise OSError("보관 이름을 만들지 못했다(%s)" % kd)
+    if not sidecar:
+        return kept, None                   # 곁 파일은 부르는 쪽이 곧 게시한다(맡기고 먼저 — 두 이름 바꾸기 사이에 아무것도 두지 않는다)
     return kept, write_sidecar(kept, reason, os.path.basename(src)).get("sha256")
 
 
@@ -2024,7 +2078,7 @@ def write_sidecar(kept, reason, origin):
                 "kept_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         try:
             write_new(side_p, (json.dumps(side, ensure_ascii=False) + "\n").encode("utf-8"))
-            fsync_dir(os.path.dirname(kept))
+            fs_sync_dir(os.path.dirname(kept))
             return side
         except FileExistsError:
             pass
@@ -2078,7 +2132,12 @@ def take_lock(md, wait=None):
     flock 명령과 같은 잠금이라 섞여 돌아도 서로 막는다). 윈도우(Git Bash + 번들 파이썬, flock 명령 없음) = msvcrt.locking
     (LK_NBLCK) — 같은 파일 첫 바이트의 OS 잠금, 핸들이 닫히면(프로세스가 끝나면) 풀린다. 시간 안에 못 잡으면 LockBusy —
     '잠금 없이 진행'은 없다(호출부가 보류하고 알림 1건). 돌려준 파일 객체를 닫거나 프로세스가 끝나면 풀린다."""
-    f = open(md + ".promote.lock", "a+b")
+    return fs_lock(md + ".promote.lock", wait)
+
+
+def fs_lock(path, wait=None):
+    """★FY4a 문 — 승격·강등 잠금(상한 있는 대기): take_lock 의 설명 그대로. 돌려준 파일 객체를 닫으면(프로세스가 끝나면) 풀린다."""
+    f = open(path, "a+b")
     try:
         import fcntl
 
@@ -2102,7 +2161,7 @@ def take_lock(md, wait=None):
     try:
         while not attempt():
             if time.monotonic() >= deadline:
-                raise LockBusy(md + ".promote.lock")
+                raise LockBusy(path)
             time.sleep(0.05)
     except BaseException:
         f.close()
@@ -2198,19 +2257,17 @@ def swap_mode(md):
     tag = "%s-%d" % (stamp(), os.getpid())
     pa, pb, pc = (os.path.join(d, ".ceo-probe.%s.%s" % (tag, x)) for x in ("a", "b", "c"))
     try:
-        for q, body in ((pa, b"a"), (pb, b"b")):
-            with open(q, "wb") as f:
-                f.write(body)
-        ex = exchange_fn()
-        if ex is not None:
+        for q, data in ((pa, b"a"), (pb, b"b")):
+            fs_create(q, data)
+        if exchange_fn() is not None:
             try:
-                ex(pa, pb)
+                fs_exchange(pa, pb)
                 mode = "exchange"
             except OSError:
                 pass
         if mode is None:
             try:
-                place_noreplace(pa, pc)         # ★FL3 — 맡기고 먼저는 덮지 않는 이름 바꾸기가 있어야 한다
+                fs_place(pa, pc)         # ★FL3 — 맡기고 먼저는 덮지 않는 이름 바꾸기가 있어야 한다
                 mode = "deposit"
             except OSError:
                 pass
@@ -2259,28 +2316,25 @@ def reserve_names(md, reason=None):
 def write_candidate(cand_p, data, like, expect=None):
     """후보를 덮지 않는 새 파일로 **다** 쓴다(fsync · 권한은 살아 있는 파일과 같게 · expect 로 다시 읽어 확인). 실패하면 그 반쪽
     후보는 보관 폴더로 옮긴다(★FL2 — 지우지 않는다)."""
-    fd = os.open(cand_p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o644)
-    done = False
+    mode = fs_mode(like)
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        mode = fs_mode(like)
-        if mode is not None:
-            try:
-                os.chmod(cand_p, mode)
-            except OSError:
-                pass
+        fs_create(cand_p, data, mode)
+    except FileExistsError:
+        raise                               # 아무것도 만들지 않았다(그 이름은 우리 것이 아니다)
+    except BaseException:
+        discard_candidate(cand_p, cand_p)   # 만든 반쪽 후보 — 보관 폴더로(FL2)
+        raise
+    try:
         if expect is not None:
             back = fs_read(cand_p)
             if back is None or not expect(back):
                 raise ValueError("다시 읽은 후보가 조립 결과와 다르다(반쪽 기록 — 교체하지 않음)")
-        done = True
-    finally:
-        if not done:
-            discard_candidate(cand_p, cand_p)
-    fsync_dir(os.path.dirname(cand_p))
+    except Unknown:
+        raise                               # ★FY1: 모른다 — 아무것도 옮기지 않는다(그 후보는 다음 입구가 이름 없는 후보로 옮긴다)
+    except BaseException:
+        discard_candidate(cand_p, cand_p)   # 다르다 — 쓰이지 않은 후보로 보관 폴더에(FL2)
+        raise
+    fs_sync_dir(os.path.dirname(cand_p))
 
 
 def write_intent(md, rec):
@@ -2355,11 +2409,8 @@ def set_step(md, rec, step, nf):
 
 
 def remove_intent(md):
-    try:
-        os.unlink(intent_path(md))
-    except FileNotFoundError:
-        pass
-    fsync_dir(os.path.dirname(os.path.abspath(md)))
+    fs_unlink(intent_path(md), missing_ok=True)
+    fs_sync_dir(os.path.dirname(os.path.abspath(md)))
 
 
 def discard_candidate(md, p):
@@ -2386,14 +2437,14 @@ def park_unnamed_candidates(md, named=()):
 
 def prim_exchange(cand_p, md):
     """두 이름을 원자로 맞바꾼다 — 살아 있는 이름 = 후보, 후보 이름 = 교체 순간의 그 파일(맥·리눅스)."""
-    exchange_fn()(cand_p, md)
-    fsync_dir(os.path.dirname(os.path.abspath(md)))
+    fs_exchange(cand_p, md)
+    fs_sync_dir(os.path.dirname(os.path.abspath(md)))
 
 
 def place_candidate(cand_p, md):
     """다 쓴 후보를 비어 있는 살아 있는 이름에 덮지 않는 방식으로 놓는다(맡기고 먼저 형식의 둘째 걸음 · ★FL3 한 번의 이름 바꾸기)."""
-    place_noreplace(cand_p, md)
-    fsync_dir(os.path.dirname(os.path.abspath(md)))
+    fs_place(cand_p, md)
+    fs_sync_dir(os.path.dirname(os.path.abspath(md)))
 
 
 def hold_unflushed(md, nf, what, e):
@@ -2493,7 +2544,9 @@ def swap_names(md, rec, nf):
             keep_file(cand_p, md, sw["reason"], name=sw["kept"])    # 밀려난 파일(후보 이름에 있다) → 보관 폴더
             return
     try:
-        keep_file(md, md, sw["reason"], name=sw["kept"])            # 살아 있는 파일 → 보관 폴더(★FL3 한 번의 이름 바꾸기)
+        # 살아 있는 파일 → 보관 폴더(★FL3 한 번의 이름 바꾸기). ★FY1·FA4: 두 이름 바꾸기 사이에는 아무 원시 연산도 두지 않는다 —
+        #   그 사이의 읽기가 '모른다'로 보류하면 살아 있는 이름이 빈 채 남는다. 곁 파일은 놓은 뒤에 게시한다(그 사이 바이트는 그대로).
+        keep_file(md, md, sw["reason"], name=sw["kept"], sidecar=False)
     except FileNotFoundError:
         if not present(os.path.join(kept_dir(md), sw["kept"])):
             return                  # 살아 있는 지침이 없다 — 바꾸지 않았다
@@ -2502,6 +2555,7 @@ def swap_names(md, rec, nf):
         place_candidate(cand_p, md)
     except FileExistsError:
         pass                        # 비어 있던 순간 편집기가 만든 새 파일이 이긴다 — settle 이 우리 후보를 정리한다
+    write_sidecar(os.path.join(kept_dir(md), sw["kept"]), sw["reason"], os.path.basename(md))
 
 
 def finish_swap(md, rec, nf):
@@ -2750,7 +2804,7 @@ def write_receipt(p, header=None, sep=None, body=None, composed=None, hashes=Non
 
 def drop(p):
     try:
-        os.unlink(p)
+        fs_unlink(p)
         return True
     except FileNotFoundError:
         return False
@@ -2906,14 +2960,14 @@ def note(title, body, about=None):
         name = key + ".notice"
         if present(os.path.join(box, name)) or present(os.path.join(box, "sent", name)):
             return True
-        os.makedirs(box, exist_ok=True)
+        fs_mkdir(box)
         tmp = write_temp(os.path.join(box, name), ("%s\n%s\n" % (clean(title), clean(body))).encode("utf-8"))
         try:
-            rename_into(tmp, os.path.join(box, name))   # 덮지 않는 한 번의 이름 바꾸기 — 알림함의 이름은 이 잠금 아래의 우리만 만든다
+            fs_rename_into(tmp, os.path.join(box, name))   # 덮지 않는 한 번의 이름 바꾸기 — 알림함의 이름은 이 잠금 아래의 우리만 만든다
         except BaseException:
             silent_unlink(tmp)
             raise
-        fsync_dir(box)
+        fs_sync_dir(box)
         return True
     except FileExistsError:
         return True
@@ -2926,8 +2980,7 @@ def note_kept(nf, kept):
     """보관 사본 경로를 bash 에 넘긴다(KEPT 줄 — 알림이 아니다: 자동 승격 알림 등이 이 경로를 사용자에게 말한다 · EY1)."""
     if nf and kept:
         try:
-            with open(nf, "a", encoding="utf-8") as f:
-                f.write("KEPT\t%s\t-\n" % kept.replace("\t", " ").replace("\n", " "))
+            fs_append(nf, "KEPT\t%s\t-\n" % kept.replace("\t", " ").replace("\n", " "))
         except OSError as e:
             err("보관 경로 전달 실패(%s): %s" % (e, kept))
 
