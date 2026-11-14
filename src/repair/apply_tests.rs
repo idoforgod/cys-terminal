@@ -2565,8 +2565,9 @@ fn an_unreadable_recorded_state_is_an_error_never_absent() {
 
 // ───────────────────────────── RULINGS FG6 / FG1 — the censuses of the repair module ─────────────────────────────
 
-/// Every production file of the repair module, read from disk (so a NEW file is seen), test code cut
-/// off: (file name, text).
+/// Every production file of the repair module, read from disk (so a NEW file is seen), its test
+/// modules cut out (GK6: by their braces — the code after a test module is still counted):
+/// (file name, text).
 fn census_sources() -> Vec<(String, String)> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("repair");
     let mut out = Vec::new();
@@ -2577,28 +2578,108 @@ fn census_sources() -> Vec<(String, String)> {
             continue;
         }
         let src = std::fs::read_to_string(&p).unwrap();
-        out.push((name, census_prod(&src).to_string()));
+        out.push((name, census_prod(&src)));
     }
     out.sort();
     out
 }
 
-/// A file's production text: cut at its TEST module only — `#[cfg(test)]` followed by `mod tests` or
-/// by a `#[path = "…_tests.rs"]` — never at another test-only item (a test-only derivation module,
-/// an injection helper), so the production code after such an item is still counted.
-fn census_prod(src: &str) -> &str {
+/// RULINGS GK6 — a file's production text: every `#[cfg(test)]` MODULE is cut out — an out-of-line
+/// `mod x;` (with its attribute lines) or an inline `mod x { … }` up to its matching brace — and
+/// nothing else: the file is never truncated, so production code after a test module is counted;
+/// other test-only items (an injection helper, a thread-local) stay counted.
+fn census_prod(src: &str) -> String {
     let mark = "\n#[cfg(test)]\n";
+    let mut out = String::new();
     let mut at = 0;
-    while let Some(i) = src[at..].find(mark) {
+    loop {
+        let Some(i) = src[at..].find(mark) else {
+            out.push_str(&src[at..]);
+            return out;
+        };
         let start = at + i;
-        let rest = &src[start + mark.len()..];
-        let first = rest.lines().next().unwrap_or("");
-        if rest.starts_with("mod tests") || (rest.starts_with("#[path = \"") && first.ends_with("_tests.rs\"]")) {
-            return &src[..start];
+        // the item after the attribute lines
+        let mut item = start + mark.len();
+        while src[item..].starts_with("#[") {
+            item += src[item..].find('\n').map(|n| n + 1).unwrap_or(src.len() - item);
         }
-        at = start + 1;
+        let head = src[item..].lines().next().unwrap_or("");
+        let is_mod = head.starts_with("mod ") || head.starts_with("pub mod ") || head.starts_with("pub(crate) mod ");
+        if !is_mod {
+            out.push_str(&src[at..start + 1]);
+            at = start + 1;
+            continue;
+        }
+        out.push_str(&src[at..=start]);
+        let line_end = item + head.len();
+        at = if head.trim_end().ends_with(';') {
+            line_end
+        } else {
+            match src[item..].find('{') {
+                Some(o) => census_block_end(src, item + o),
+                None => line_end,
+            }
+        };
     }
-    src
+}
+
+/// The index just after the `}` matching the `{` at `open` — strings, raw strings, characters and
+/// comments skipped.
+fn census_block_end(src: &str, open: usize) -> usize {
+    let b = src.as_bytes();
+    let (mut i, mut depth) = (open, 0usize);
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                i += src[i..].find('\n').unwrap_or(src.len() - i);
+                continue;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += src[i..].find("*/").map(|n| n + 2).unwrap_or(src.len() - i);
+                continue;
+            }
+            b'r' if (b.get(i + 1) == Some(&b'"') || b.get(i + 1) == Some(&b'#')) && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) => {
+                let mut j = i + 1;
+                while b.get(j) == Some(&b'#') {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'"') {
+                    let close = format!("\"{}", "#".repeat(j - i - 1));
+                    i = j + 1 + src[j + 1..].find(&close).map(|n| n + close.len()).unwrap_or(src.len() - j - 1);
+                    continue;
+                }
+            }
+            b'"' => {
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b'"' {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                i = j + 1;
+                continue;
+            }
+            b'\'' => {
+                if b.get(i + 1) == Some(&b'\\') {
+                    i += 2 + src[i + 2..].find('\'').map(|n| n + 1).unwrap_or(0);
+                    continue;
+                }
+                let ch_len = src[i + 1..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                if b.get(i + 1 + ch_len) == Some(&b'\'') {
+                    i += 2 + ch_len;
+                    continue;
+                }
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    b.len()
 }
 
 /// The function a `fn` line declares (visibility and qualifiers skipped).
@@ -2639,10 +2720,17 @@ fn census_counts(sources: &[(String, String)], calls: &[&str], literals: &[&str]
             if t.starts_with("//") {
                 continue;
             }
-            if let Some(n) = census_fn_name(t) {
-                cur = n;
-                continue;
-            }
+            // GK6: a declaration line's body (after its first `{`) is code of that function
+            let line = match census_fn_name(t) {
+                Some(n) => {
+                    cur = n;
+                    match line.find('{') {
+                        Some(o) => &line[o + 1..],
+                        None => continue,
+                    }
+                }
+                None => line,
+            };
             let n: usize = calls.iter().map(|c| census_calls(line, c)).sum::<usize>() + literals.iter().map(|l| line.matches(l).count()).sum::<usize>();
             if n > 0 {
                 *m.entry((file.clone(), cur.clone())).or_insert(0) += n;
@@ -2721,13 +2809,15 @@ fn every_write_of_the_repair_module_is_classified() {
     let sources = census_sources();
     let v = write_census(&sources);
     assert!(v.is_empty(), "{v:#?}");
-    let modrs = &sources.iter().find(|(n, _)| n == "mod.rs").unwrap().1;
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("repair");
+    let raw: Vec<String> = sources.iter().map(|(n, _)| std::fs::read_to_string(dir.join(n)).unwrap()).collect();
+    let modrs = &raw[sources.iter().position(|(n, _)| n == "mod.rs").unwrap()];
     for (f, _) in &sources {
         if f == "mod.rs" {
             continue;
         }
         let m = f.trim_end_matches(".rs");
-        let declared = modrs.contains(&format!("mod {m};")) || sources.iter().any(|(_, t)| t.contains(&format!("#[path = \"{f}\"]")));
+        let declared = modrs.contains(&format!("mod {m};")) || raw.iter().any(|t| t.contains(&format!("#[path = \"{f}\"]")));
         assert!(declared, "{f}: not a declared module of the repair module");
     }
 }
@@ -2755,6 +2845,16 @@ fn the_write_census_catches_each_mutation() {
     let mut new_file = base.clone();
     new_file.push(("census_mutant.rs".into(), "pub fn x() {}\n".into()));
     assert!(!write_census(&new_file).is_empty(), "a new module file");
+    // GK6: a ONE-LINE function with a direct write, and a write in production code that follows a
+    // test module, are counted
+    let one_line: Vec<(String, String)> = base
+        .iter()
+        .map(|(n, t)| (n.clone(), if n == "probation.rs" { format!("{t}\nfn census_mutant(p: &std::path::Path) {{ std::fs::write(p, b\"x\").unwrap(); }}\n") } else { t.clone() }))
+        .collect();
+    assert!(!write_census(&one_line).is_empty(), "a one-line function with a direct write");
+    let after_tests = census_prod("pub fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() { let s = \"}\"; let c = '}'; }\n}\nfn after(p: &Path) { std::fs::write(p, b\"x\").unwrap(); }\n");
+    assert!(after_tests.contains("fn after"), "the code after a test module is kept: {after_tests}");
+    assert!(!after_tests.contains("fn t()"), "the test module is cut out: {after_tests}");
 }
 
 /// RULINGS FG1 (codex r4 B1): every site of the repair module that can turn a read error into a value
@@ -2777,6 +2877,12 @@ fn the_read_census_catches_a_new_collapse() {
         .map(|(n, t)| (n.clone(), if n == "probation.rs" { format!("{t}\nfn census_mutant(p: &Path) -> Vec<u8> {{\n    std::fs::read(p).ok().unwrap_or_default()\n}}\n") } else { t.clone() }))
         .collect();
     assert!(!read_census(&with).is_empty());
+    // GK6: a ONE-LINE function turning a failed read into a default
+    let one_line: Vec<(String, String)> = base
+        .iter()
+        .map(|(n, t)| (n.clone(), if n == "probation.rs" { format!("{t}\nfn census_mutant(p: &Path) -> Vec<u8> {{ std::fs::read(p).ok().unwrap_or_default() }}\n") } else { t.clone() }))
+        .collect();
+    assert!(!read_census(&one_line).is_empty(), "a one-line read collapse");
 }
 
 const CENSUS_MODULE_FILES: &[&str] = &["apply.rs", "boot_critical.rs", "boot_critical_derive.rs", "consumed.rs", "durable.rs", "exchange.rs", "grant.rs", "guard.rs", "intake.rs", "ledger.rs", "lock.rs", "mod.rs", "owner_origin.rs", "paths.rs", "platform.rs", "probation.rs", "reapply_claim.rs", "rehearsal.rs", "roles.rs", "rules.rs", "screen.rs", "tombstones.rs", "types.rs", "vault.rs", "wal.rs"];
