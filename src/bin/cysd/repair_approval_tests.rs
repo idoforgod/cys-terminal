@@ -1295,16 +1295,27 @@ fn the_test_double_is_not_in_the_default_build() {
         );
     }
     assert!(!cfg!(feature = "repair-test-auth"));
-    // the built default daemon (when present beside this test binary) does not hold the double
-    if let Some(bin) = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().and_then(|d| d.parent()).map(|d| d.join("cysd")))
-    {
-        if let Ok(bytes) = std::fs::read(&bin) {
-            let found = bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
-            assert!(!found, "{} contains the test double", bin.display());
-        }
+    // RULINGS CZ8: the artifact check runs on the EXACT default-build artifact the release ships —
+    // the release mac leg's artifact gate (`scripts/check-no-ioreport-link.sh` on
+    // `cys.app/Contents/MacOS/cysd`) refuses the double's knob in it (exit 1) and a missing or
+    // unreadable artifact (exit 2: not measured is not passed); the harness's `ioreport-link` suite
+    // runs the same gate on the default debug build of this source. (The old block here silently
+    // passed when its guessed path was absent or unreadable.)
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let gate = std::fs::read_to_string(root.join("scripts/check-no-ioreport-link.sh")).unwrap();
+    for want in [
+        "knob=\"CYS_REPAIR_TEST\"\"_AUTH_ANSWER\"",
+        "grep -a -F -q \"$knob\" \"$bin\"",
+        "if [ ! -r \"$bin\" ]; then",
+        "if [ ! -f \"$bin\" ]; then",
+    ] {
+        assert!(gate.contains(want), "the artifact gate lost: {want}");
     }
+    let release = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+    assert!(
+        release.contains("bash scripts/check-no-ioreport-link.sh \"$SRC/macos/cys.app/Contents/MacOS/cysd\""),
+        "the release leg no longer runs the artifact gate on the shipped cysd"
+    );
     // the production spawn: hidden verb, seat identity removed, no console, stdin null
     let spawn = &src[src
         .find("pub(crate) fn spawn_helper(")
