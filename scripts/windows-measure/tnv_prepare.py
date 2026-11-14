@@ -69,15 +69,14 @@ def main(argv=None):
         with open(lock_p, "w", encoding="utf-8", newline="") as f:
             f.write(lock2)
     marked, skipped = [], []
-    files = (sc["listed_changed"] + sc["listed_unchanged"] + sc["general_changed_py"] + sc["general_changed_sh"]
-             + sc["general_changed_md"])
+    files = [rel for pool in sc["tnv_mark_pools"] for rel in sc[pool]]
     for rel in files:
         p = os.path.join(root, "cysjavis-pack", *rel.split("/"))
         if not os.path.isfile(p):
             skipped.append(rel)
             continue
         ext = rel.rsplit(".", 1)[-1]
-        line = sc["next_version_marker"].get("md" if ext == "md" else ("py" if ext == "py" else "sh"))
+        line = sc["next_version_marker"].get({"md": "md", "py": "py", "cmd": "cmd"}.get(ext, "sh"))
         with open(p, "rb") as f:
             data = f.read()
         with open(p, "wb") as f:

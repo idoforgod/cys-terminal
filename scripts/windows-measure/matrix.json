@@ -24,7 +24,9 @@
   "T11b",
   "T2d",
   "T9",
-  "TV1"
+  "T9a",
+  "TV1",
+  "TV2"
  ],
  "unit_markers": {
   "T6": [
@@ -79,6 +81,42 @@
    "skills/vibecoding/SKILL.md",
    "skills/harness-creator/SKILL.md"
   ],
+  "general_cmd": [
+   "hooks/cys-agy-statusline.cmd"
+  ],
+  "early_holder_file": "agents.json",
+  "g01_variants": [
+   [
+    "control",
+    []
+   ],
+   [
+    "python",
+    [
+     "python"
+    ]
+   ],
+   [
+    "bash",
+    [
+     "bash"
+    ]
+   ],
+   [
+    "early",
+    [
+     "early"
+    ]
+   ]
+  ],
+  "tnv_mark_pools": [
+   "listed_changed",
+   "listed_unchanged",
+   "general_changed_py",
+   "general_changed_sh",
+   "general_changed_md",
+   "general_cmd"
+  ],
   "holder_hook": "save-state.sh",
   "holder_module": "javis_event",
   "query_listed_rel": "hooks/session-start.sh",
@@ -87,7 +125,8 @@
   "next_version_marker": {
    "py": "# tw1 next-version marker (TNV build only, never committed)",
    "sh": "# tw1 next-version marker (TNV build only, never committed)",
-   "md": "<!-- tw1 next-version marker (TNV build only, never committed) -->"
+   "md": "<!-- tw1 next-version marker (TNV build only, never committed) -->",
+   "cmd": "REM tw1 next-version marker (TNV build only, never committed)"
   }
  },
  "expected_top_rows": 65,
@@ -104,7 +143,8 @@
   "s3_dy1",
   "s3_intake",
   "s3_listen",
-  "s3_siblings"
+  "s3_siblings",
+  "s6_variants"
  ],
  "probes": {
   "s0_env": {
@@ -210,6 +250,14 @@
    "leaves_state": "same",
    "read_only": true,
    "does": "conclusions of the other workflow runs at this commit (REST)"
+  },
+  "s6_variants": {
+   "stage": "S6",
+   "time_limit_s": 2700,
+   "requires_state": "any",
+   "leaves_state": "unknown",
+   "read_only": false,
+   "does": "G01 variants: per holder set a fresh base + L1 edit, candidate /S, the app's init-pack WITH the holders, the daemon's install; the pack manifest after every writer (RULINGS FS5)"
   }
  },
  "setup": [
@@ -357,15 +405,15 @@
    "id": "G01",
    "group": "gate",
    "title": "pack-folder rename while files are held: does it fall back to copy-then-delete and delete only part?",
-   "source": "design 8-2 #1 (line 1281); 2-6 step 5 (src/pack.rs staged swap); 4-15 ra; testplan WIN-16 WIN-01",
-   "why": "the Defender holder depends on Defender being able to scan on the runner (D8); the repetitions per holder set are stage S6",
-   "expected": "no partial state: every path of the installed manifest exists after the update; the fallback, if taken, is named (WIN-01: record complete; a partial deletion = FAIL)",
+   "source": "design 8-2 #1 (line 1281); 2-6 step 5 (src/pack.rs atomic_swap / rename_dir_or_move); 4-15 ra; RULINGS FS (reproduced in run 1); testplan WIN-16 WIN-01",
+   "why": "the Defender holder depends on Defender being able to scan on the runner (D8); the 'nothing disappears' verdicts need the fix T9a (RULINGS FS2) - without it they are recorded, not judged",
+   "expected": "with T9a: after every init-pack with held files the manifest taken right after it shows that nothing disappeared from the live pack and the swap answered 'not replaced'; the edited listed file is then parked vendor-first by the daemon's install",
    "subrows": [
     {
      "id": "G01.all",
      "kind": "record",
      "probe": "s2_update",
-     "title": "the S2 update with the Git Bash and Python holders (and a Defender scan when available)",
+     "title": "the S2 update with run 1's holders: the pack manifest after every writer and the swap's answer are recorded",
      "checks": [
       {
        "id": "cand-marker",
@@ -423,23 +471,33 @@
        "op": "true"
       },
       {
-       "id": "no-partial",
+       "id": "delta-installer",
        "role": "check",
-       "fact": "manifest_missing",
-       "op": "empty",
-       "text": "every path the installed manifest names exists"
+       "fact": "pack_missing_after_installer",
+       "op": "not_none"
       },
       {
-       "id": "pack-version",
+       "id": "delta-app",
        "role": "check",
-       "fact": "pack_version_after",
-       "op": "eq_fact",
-       "other": "candidate_version"
+       "fact": "pack_missing_after_app",
+       "op": "not_none"
       },
       {
-       "id": "leftovers-recorded",
+       "id": "delta-before-daemon",
        "role": "check",
-       "fact": "pack_leftovers",
+       "fact": "pack_missing_before_daemon",
+       "op": "not_none"
+      },
+      {
+       "id": "delta-daemon",
+       "role": "check",
+       "fact": "pack_missing_after_daemon",
+       "op": "not_none"
+      },
+      {
+       "id": "swap-answer",
+       "role": "check",
+       "fact": "driver_init_ran",
        "op": "present"
       }
      ],
@@ -447,34 +505,236 @@
      "phase": 1
     },
     {
-     "id": "G01.bash",
-     "why": "stage S6",
-     "probe": null,
-     "title": "Git Bash holder alone (fresh base)",
-     "class": "PARTLY",
+     "id": "G01.nodelete",
+     "probe": "s2_update",
+     "needs_units": [
+      "T9a"
+     ],
+     "run_when_absent": true,
+     "title": "nothing disappeared from the live pack before the daemon's install (writers: installer, app, the app's init-pack)",
+     "checks": [
+      {
+       "id": "holders",
+       "role": "complete",
+       "fact": "py_holder_started",
+       "op": "true"
+      },
+      {
+       "id": "delta-observed",
+       "role": "complete",
+       "fact": "pack_missing_before_daemon",
+       "op": "not_none"
+      },
+      {
+       "id": "nothing-missing",
+       "role": "check",
+       "fact": "pack_missing_before_daemon",
+       "op": "empty",
+       "text": "RULINGS FS2: a failed rename of the live pack changes nothing"
+      },
+      {
+       "id": "nothing-missing-daemon",
+       "role": "check",
+       "fact": "pack_missing_after_daemon",
+       "op": "empty"
+      }
+     ],
+     "class": "YES",
      "kind": "assert",
-     "phase": 1,
-     "checks": []
+     "phase": 1
     },
     {
-     "id": "G01.py",
-     "why": "stage S6",
-     "probe": null,
-     "title": "Python holder alone (fresh base)",
-     "class": "PARTLY",
-     "kind": "assert",
-     "phase": 1,
-     "checks": []
+     "id": "G01.variants",
+     "kind": "record",
+     "probe": "s6_variants",
+     "title": "variants on a fresh base each: control (no holder), Python holder, Git Bash holder, a holder of an early pack-root file",
+     "checks": [
+      {
+       "id": "v-control-base",
+       "role": "complete",
+       "fact": "v_control_base_ok",
+       "op": "true"
+      },
+      {
+       "id": "v-python-base",
+       "role": "complete",
+       "fact": "v_python_base_ok",
+       "op": "true"
+      },
+      {
+       "id": "v-bash-base",
+       "role": "complete",
+       "fact": "v_bash_base_ok",
+       "op": "true"
+      },
+      {
+       "id": "v-early-base",
+       "role": "complete",
+       "fact": "v_early_base_ok",
+       "op": "true"
+      },
+      {
+       "id": "v-control-cand",
+       "role": "complete",
+       "fact": "v_control_cand_ok",
+       "op": "true"
+      },
+      {
+       "id": "v-python-cand",
+       "role": "complete",
+       "fact": "v_python_cand_ok",
+       "op": "true"
+      },
+      {
+       "id": "v-bash-cand",
+       "role": "complete",
+       "fact": "v_bash_cand_ok",
+       "op": "true"
+      },
+      {
+       "id": "v-early-cand",
+       "role": "complete",
+       "fact": "v_early_cand_ok",
+       "op": "true"
+      },
+      {
+       "id": "v-python-held",
+       "role": "complete",
+       "fact": "v_python_holders_all_started",
+       "op": "true"
+      },
+      {
+       "id": "v-bash-held",
+       "role": "complete",
+       "fact": "v_bash_holders_all_started",
+       "op": "true"
+      },
+      {
+       "id": "v-early-held",
+       "role": "complete",
+       "fact": "v_early_holders_all_started",
+       "op": "true"
+      },
+      {
+       "id": "ctl-nothing-missing",
+       "role": "control",
+       "fact": "v_control_missing_before_daemon",
+       "op": "empty",
+       "text": "without a holder the swap succeeds and nothing disappears (the pipeline is sound)"
+      },
+      {
+       "id": "v-python-delta",
+       "role": "check",
+       "fact": "v_python_missing_before_daemon",
+       "op": "not_none"
+      },
+      {
+       "id": "v-bash-delta",
+       "role": "check",
+       "fact": "v_bash_missing_before_daemon",
+       "op": "not_none"
+      },
+      {
+       "id": "v-early-delta",
+       "role": "check",
+       "fact": "v_early_missing_before_daemon",
+       "op": "not_none"
+      }
+     ],
+     "class": "YES",
+     "phase": 1
     },
     {
-     "id": "G01.ctl",
-     "why": "stage S6",
-     "probe": null,
-     "title": "control: the same update without holders",
-     "class": "PARTLY",
+     "id": "G01.variants-nodelete",
+     "probe": "s6_variants",
+     "needs_units": [
+      "T9a"
+     ],
+     "run_when_absent": true,
+     "title": "with each holder set nothing disappears and the edited listed file is parked vendor-first",
+     "checks": [
+      {
+       "id": "v-python-held",
+       "role": "complete",
+       "fact": "v_python_holders_all_started",
+       "op": "true"
+      },
+      {
+       "id": "v-bash-held",
+       "role": "complete",
+       "fact": "v_bash_holders_all_started",
+       "op": "true"
+      },
+      {
+       "id": "v-early-held",
+       "role": "complete",
+       "fact": "v_early_holders_all_started",
+       "op": "true"
+      },
+      {
+       "id": "v-python-nothing-missing",
+       "role": "check",
+       "fact": "v_python_missing_before_daemon",
+       "op": "empty"
+      },
+      {
+       "id": "v-bash-nothing-missing",
+       "role": "check",
+       "fact": "v_bash_missing_before_daemon",
+       "op": "empty"
+      },
+      {
+       "id": "v-early-nothing-missing",
+       "role": "check",
+       "fact": "v_early_missing_before_daemon",
+       "op": "empty"
+      },
+      {
+       "id": "v-python-L1-parked",
+       "role": "check",
+       "fact": "v_python_L1_park_sha",
+       "op": "eq_fact",
+       "other": "v_python_L1_user_sha"
+      },
+      {
+       "id": "v-bash-L1-parked",
+       "role": "check",
+       "fact": "v_bash_L1_park_sha",
+       "op": "eq_fact",
+       "other": "v_bash_L1_user_sha"
+      },
+      {
+       "id": "v-early-L1-parked",
+       "role": "check",
+       "fact": "v_early_L1_park_sha",
+       "op": "eq_fact",
+       "other": "v_early_L1_user_sha"
+      },
+      {
+       "id": "v-python-L1-vendor",
+       "role": "check",
+       "fact": "v_python_L1_live_sha",
+       "op": "eq_fact",
+       "other": "v_python_L1_vendor_sha"
+      },
+      {
+       "id": "v-bash-L1-vendor",
+       "role": "check",
+       "fact": "v_bash_L1_live_sha",
+       "op": "eq_fact",
+       "other": "v_bash_L1_vendor_sha"
+      },
+      {
+       "id": "v-early-L1-vendor",
+       "role": "check",
+       "fact": "v_early_L1_live_sha",
+       "op": "eq_fact",
+       "other": "v_early_L1_vendor_sha"
+      }
+     ],
+     "class": "YES",
      "kind": "assert",
-     "phase": 1,
-     "checks": []
+     "phase": 1
     }
    ],
    "kind": "assert",
@@ -1123,10 +1383,51 @@
    "id": "CW7-LISTED",
    "group": "cw7",
    "probe": "s3_files",
+   "needs_units": [
+    "T9a"
+   ],
+   "run_when_absent": true,
    "title": "an edited listed (boot-critical) file -> vendor-first with the parked copy",
-   "source": "RULINGS CW7; design 4-11 na (line 875); 7 row 1; src/pack.rs classify_update",
-   "expected": "E-L1 / E-L2: live = candidate vendor bytes, <rel>.user = the user's bytes, ledger kind vendor-first; E-L3 (vendor unchanged): the user's bytes stay live (kept-drift, from the code - the design names only the conflict case)",
+   "source": "RULINGS CW7, FS; design 4-11 na (line 875), da; 7 row 1; src/pack.rs classify_update",
+   "expected": "with T9a (run 1 lost E-L1 to defect ra - RULINGS FS): E-L1 / E-L2: live = candidate vendor bytes, <rel>.user = the user's bytes, ledger kind vendor-first, and the update snapshot holds the user's bytes; E-L3 (vendor unchanged, the base's install record intact): the user's bytes stay live (kept-drift - with no base record it would go vendor-first with its copy parked, the designed safe direction of 4-11 da)",
    "checks": [
+    {
+     "id": "L1-live-at-update",
+     "role": "complete",
+     "fact": "pre_update_L1_sha",
+     "op": "eq_fact",
+     "other": "L1_user_sha",
+     "text": "the user's edit was on disk immediately before the update (timeline point s2_pre_update)"
+    },
+    {
+     "id": "L2-live-at-update",
+     "role": "complete",
+     "fact": "pre_update_L2_sha",
+     "op": "eq_fact",
+     "other": "L2_user_sha"
+    },
+    {
+     "id": "L3-live-at-update",
+     "role": "complete",
+     "fact": "pre_update_L3_sha",
+     "op": "eq_fact",
+     "other": "L3_user_sha"
+    },
+    {
+     "id": "base-record",
+     "role": "complete",
+     "fact": "manifest_present_before_install",
+     "op": "true",
+     "text": "the base's install record existed when the per-file rules ran (else every file is 'no base')"
+    },
+    {
+     "id": "L1-snapshot",
+     "role": "check",
+     "fact": "L1_in_snapshot_sha",
+     "op": "eq_fact",
+     "other": "L1_user_sha",
+     "text": "the update snapshot holds the user's pre-update bytes (the update-rules worker's cross-check)"
+    },
     {
      "id": "sel-L1",
      "role": "complete",
@@ -1357,12 +1658,6 @@
      "value": 0
     },
     {
-     "id": "no-partial",
-     "role": "check",
-     "fact": "manifest_missing",
-     "op": "empty"
-    },
-    {
      "id": "pack-version",
      "role": "check",
      "fact": "pack_version_after",
@@ -1382,6 +1677,34 @@
      "op": "present"
     }
    ],
+   "subrows": [
+    {
+     "id": "CW7-HELD.nopartial",
+     "probe": "s2_update",
+     "needs_units": [
+      "T9a"
+     ],
+     "run_when_absent": true,
+     "title": "no partial pack while the files were held (the manifest right after each writer)",
+     "checks": [
+      {
+       "id": "observed",
+       "role": "complete",
+       "fact": "pack_missing_before_daemon",
+       "op": "not_none"
+      },
+      {
+       "id": "nothing-missing",
+       "role": "check",
+       "fact": "pack_missing_before_daemon",
+       "op": "empty"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    }
+   ],
    "kind": "assert",
    "phase": 1,
    "class": "YES"
@@ -1389,77 +1712,216 @@
   {
    "id": "CW7-ENC",
    "group": "cw7",
-   "probe": "s3_files",
    "title": "CP949 / CRLF content",
-   "source": "RULINGS CW7; design 4-11 ga-2 (line 873), ra (line 879); 7 row 3",
-   "expected": "CP949 system file: byte backup at <rel>.user, vendor bytes live; CRLF general shell script: no CR live; CRLF .md: the user's bytes kept",
-   "checks": [
+   "source": "RULINGS CW7, FT; design 4-11 ga-2 (line 873), ra (line 879); 7 row 3",
+   "expected": "CP949 system file: byte backup at <rel>.user, vendor bytes live; a kept shell script: no CR; a kept non-shell text file (.md, .cmd, .py): content kept, and with the fix of RULINGS FT1 its bytes kept exactly with no 'eol' field",
+   "subrows": [
     {
-     "id": "enc-invalid",
-     "role": "complete",
-     "fact": "ENC1_user_invalid_utf8",
-     "op": "true",
-     "text": "the CP949 edit really is unreadable as UTF-8"
+     "id": "CW7-ENC.cp949",
+     "probe": "s3_files",
+     "title": "a CP949 system file: byte backup listed, vendor bytes live",
+     "checks": [
+      {
+       "id": "enc-invalid",
+       "role": "complete",
+       "fact": "ENC1_user_invalid_utf8",
+       "op": "true",
+       "text": "the CP949 edit really is unreadable as UTF-8"
+      },
+      {
+       "id": "sel-ENC1",
+       "role": "complete",
+       "fact": "ENC1_listed",
+       "op": "eq",
+       "value": 1
+      },
+      {
+       "id": "enc-live",
+       "role": "check",
+       "fact": "ENC1_live_sha",
+       "op": "eq_fact",
+       "other": "ENC1_vendor_sha"
+      },
+      {
+       "id": "enc-backup",
+       "role": "check",
+       "fact": "ENC1_park_sha",
+       "op": "eq_fact",
+       "other": "ENC1_user_sha"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
     },
     {
-     "id": "sel-ENC1",
-     "role": "complete",
-     "fact": "ENC1_listed",
-     "op": "eq",
-     "value": 1
+     "id": "CW7-ENC.shell",
+     "probe": "s3_files",
+     "title": "a kept shell script with CRLF: no CR live, content kept",
+     "checks": [
+      {
+       "id": "sel-CRLF1",
+       "role": "complete",
+       "fact": "CRLF1_listed",
+       "op": "eq",
+       "value": 1
+      },
+      {
+       "id": "crlf1-had-cr",
+       "role": "control",
+       "fact": "CRLF1_user_has_cr",
+       "op": "true",
+       "text": "the user's shell script had CR (the CR detector can see one)"
+      },
+      {
+       "id": "crlf1-no-cr",
+       "role": "check",
+       "fact": "CRLF1_live_has_cr",
+       "op": "false"
+      },
+      {
+       "id": "crlf1-content",
+       "role": "check",
+       "fact": "CRLF1_live_norm_sha",
+       "op": "eq_fact",
+       "other": "CRLF1_user_norm_sha"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
     },
     {
-     "id": "sel-CRLF1",
-     "role": "complete",
-     "fact": "CRLF1_listed",
-     "op": "eq",
-     "value": 1
+     "id": "CW7-ENC.content-md",
+     "probe": "s3_files",
+     "title": "a kept .md with only its line endings changed to CRLF: content kept modulo line endings",
+     "checks": [
+      {
+       "id": "sel-CRLF2",
+       "role": "complete",
+       "fact": "CRLF2_listed",
+       "op": "eq",
+       "value": 1
+      },
+      {
+       "id": "crlf2-content",
+       "role": "check",
+       "fact": "CRLF2_live_norm_sha",
+       "op": "eq_fact",
+       "other": "CRLF2_user_norm_sha"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
     },
     {
-     "id": "sel-CRLF2",
-     "role": "complete",
-     "fact": "CRLF2_listed",
-     "op": "eq",
-     "value": 1
+     "id": "CW7-ENC.content-cmd",
+     "probe": "s3_files",
+     "title": "a kept Windows batch file (.cmd) with a content change and CRLF: content kept modulo line endings",
+     "checks": [
+      {
+       "id": "sel-CRLF3",
+       "role": "complete",
+       "fact": "CRLF3_listed",
+       "op": "eq",
+       "value": 1
+      },
+      {
+       "id": "crlf3-content",
+       "role": "check",
+       "fact": "CRLF3_live_norm_sha",
+       "op": "eq_fact",
+       "other": "CRLF3_user_norm_sha"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
     },
     {
-     "id": "crlf1-had-cr",
-     "role": "control",
-     "fact": "CRLF1_user_has_cr",
-     "op": "true",
-     "text": "the user's shell script had CR (the CR detector can see one)"
+     "id": "CW7-ENC.content-py",
+     "probe": "s3_files",
+     "title": "a kept .py with a content change and CRLF: content kept modulo line endings",
+     "checks": [
+      {
+       "id": "sel-CRLF4",
+       "role": "complete",
+       "fact": "CRLF4_listed",
+       "op": "eq",
+       "value": 1
+      },
+      {
+       "id": "crlf4-content",
+       "role": "check",
+       "fact": "CRLF4_live_norm_sha",
+       "op": "eq_fact",
+       "other": "CRLF4_user_norm_sha"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
     },
     {
-     "id": "enc-live",
-     "role": "check",
-     "fact": "ENC1_live_sha",
-     "op": "eq_fact",
-     "other": "ENC1_vendor_sha"
-    },
-    {
-     "id": "enc-backup",
-     "role": "check",
-     "fact": "ENC1_park_sha",
-     "op": "eq_fact",
-     "other": "ENC1_user_sha"
-    },
-    {
-     "id": "crlf1-no-cr",
-     "role": "check",
-     "fact": "CRLF1_live_has_cr",
-     "op": "false"
-    },
-    {
-     "id": "crlf2-kept",
-     "role": "check",
-     "fact": "CRLF2_live_sha",
-     "op": "eq_fact",
-     "other": "CRLF2_user_sha"
+     "id": "CW7-ENC.exact",
+     "probe": "s3_files",
+     "needs_units": [
+      "T2g"
+     ],
+     "run_when_absent": true,
+     "title": "kept non-shell text files keep the user's bytes exactly, no 'eol' field (RULINGS FT1 - the narrowed shell-script test; until a build contains it this is expected to fail exactly as in run 1)",
+     "checks": [
+      {
+       "id": "crlf2-exact",
+       "role": "check",
+       "fact": "CRLF2_live_sha",
+       "op": "eq_fact",
+       "other": "CRLF2_user_sha"
+      },
+      {
+       "id": "crlf3-exact",
+       "role": "check",
+       "fact": "CRLF3_live_sha",
+       "op": "eq_fact",
+       "other": "CRLF3_user_sha"
+      },
+      {
+       "id": "crlf4-exact",
+       "role": "check",
+       "fact": "CRLF4_live_sha",
+       "op": "eq_fact",
+       "other": "CRLF4_user_sha"
+      },
+      {
+       "id": "crlf2-no-eol",
+       "role": "check",
+       "fact": "CRLF2_pending_eol",
+       "op": "none"
+      },
+      {
+       "id": "crlf3-no-eol",
+       "role": "check",
+       "fact": "CRLF3_pending_eol",
+       "op": "none"
+      },
+      {
+       "id": "crlf4-no-eol",
+       "role": "check",
+       "fact": "CRLF4_pending_eol",
+       "op": "none"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
     }
    ],
    "kind": "assert",
    "phase": 1,
-   "class": "YES"
+   "checks": [],
+   "class": "YES",
+   "probe": null
   },
   {
    "id": "CW7-WFAIL",
@@ -1798,6 +2260,10 @@
     {
      "id": "I-LISTEN.b",
      "probe": "s3_files",
+     "needs_units": [
+      "T9a"
+     ],
+     "run_when_absent": true,
      "title": "the conflicted listed files are vendor bytes and the user copies are kept",
      "checks": [
       {
@@ -2101,9 +2567,13 @@
    "id": "DY3",
    "group": "ruling",
    "probe": "s3_query",
+   "needs_units": [
+    "T5c"
+   ],
+   "run_when_absent": true,
    "title": "an in-pack junction and MSYS spellings against the compiled list",
    "source": "RULINGS DY3; GAPS last line; EQ5",
-   "expected": "a listed hook is never classified General (exit 1) through a junction or an MSYS spelling",
+   "expected": "with T5c (a path is listed when ANY of its identities is listed): a listed hook is never classified General (exit 1) through a junction or an MSYS spelling; run 1 (without T5c) reproduced the junction case as the known defect",
    "checks": [
     {
      "id": "junction",

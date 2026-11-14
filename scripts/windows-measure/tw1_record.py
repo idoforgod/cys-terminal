@@ -705,3 +705,30 @@ def build_wait_decision(run):
     if run is None:
         return "absent"
     return "found" if run.get("status") == "completed" else "wait"
+
+
+# ───────────────────────────── pack manifests and line endings (run-1 lessons; RULINGS FS, FT) ─────────────────────────────
+
+def eol_normalized(data):
+    """The bytes with every CRLF turned into LF (for "content kept modulo line endings")."""
+    return data.replace(b"\r\n", b"\n") if data is not None else None
+
+
+def manifest_delta(prev, cur):
+    """Two pack manifests {rel: sha} -> {"missing": [...], "added": [...], "changed": [...]} (sorted). None in -> None out:
+    a manifest that was not taken is not an observation of "nothing changed"."""
+    if prev is None or cur is None:
+        return None
+    p, c = set(prev), set(cur)
+    return {"missing": sorted(p - c), "added": sorted(c - p),
+            "changed": sorted(k for k in p & c if prev[k] != cur[k])}
+
+
+def ntfs_key(name):
+    """NTFS directory order is case-insensitive by its upper-case table; ASCII names: str.upper() reproduces it."""
+    return name.upper()
+
+
+def entries_before(names, held):
+    """The directory entries an in-order delete visits before the held entry `held` (it stops there)."""
+    return sorted((n for n in names if ntfs_key(n) < ntfs_key(held)), key=ntfs_key)

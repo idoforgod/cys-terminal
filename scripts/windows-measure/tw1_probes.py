@@ -109,6 +109,32 @@ def write_bytes(p, b):
         f.write(b)
 
 
+def pack_manifest(pack_dir):
+    """{rel: sha256} of every file under the pack (dot files included). None when the pack folder is absent."""
+    if not os.path.isdir(pack_dir):
+        return None
+    out = {}
+    for dp, _dns, fns in os.walk(pack_dir):
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            out[os.path.relpath(p, pack_dir).replace("\\", "/")] = sha256_file(p)
+    return out
+
+
+def _dump(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(obj, fh, ensure_ascii=False, indent=0, sort_keys=True)
+
+
+def _load(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
 def norm_path(p):
     """Case-folded, backslash form of a Windows path for comparisons (None stays None)."""
     if p is None:
@@ -383,6 +409,19 @@ class Probe:
     def ev_cmd(self, name, res):
         self.ev(name, res)
         return res
+
+    def timeline_point(self, label, edits=None):
+        """Full pack manifest {rel: sha256} right after a writer (run-1 lesson: a partial delete that a later writer
+        refills is invisible at the end). Saved in the work folder (for later probes) and as evidence; the edited
+        files' hashes at this point go into facts["timeline"][label]."""
+        m = pack_manifest(self.pack_dir)
+        _dump(os.path.join(self.work, "timeline", label + ".json"), m)
+        self.ev("timeline/%s.json" % label, m if m is not None else {"absent": True})
+        edits = edits if edits is not None else (self.ctx.get("edits") or {})
+        tl = self.facts.setdefault("timeline", {})
+        tl[label] = {"at": round(time.time(), 3), "files": None if m is None else len(m),
+                     "edited": {k: (None if m is None else m.get(e["rel"])) for k, e in edits.items()}}
+        return m
 
     def register_pid(self, pid, purpose):
         reg = os.path.join(self.work, "pids.jsonl")
@@ -803,6 +842,7 @@ def probe_s1_base(pr):
     regs = lifeline_registrations(settings)
     f["base_hooks_lifeline"] = sorted(regs)
     pr.ev("base-lifeline-registrations.json", regs)
+    pr.timeline_point("s1_before_edits", {})
     # ── selection: listed / general by the candidate's own query; vendor change by bytes ──
     cand_cys = ((pr.ctx.get("candidate_bins") or {}).get("cys.exe") or [None])[0]
     sel, why = {}, {}
@@ -832,7 +872,7 @@ def probe_s1_base(pr):
             ok_listed = (lc == 0) if want_listed else (lc == 1)
             if lc is None:
                 ok_listed = True  # verified after the update with the installed binary (rows' 'complete' checks)
-            if changed == want_changed and ok_listed:
+            if (want_changed is None or changed == want_changed) and ok_listed:
                 sel[key] = rel
                 taken.add(rel)
                 return
@@ -846,6 +886,8 @@ def probe_s1_base(pr):
         pick(key, sc["general_changed_py"], False, True, taken)
     pick("CRLF1", sc["general_changed_sh"], False, True, taken)
     pick("CRLF2", sc["general_changed_md"], False, True, taken)
+    pick("CRLF3", sc["general_cmd"], False, None, taken)        # a Windows batch file (FT1); vendor change recorded
+    pick("CRLF4", sc["general_changed_py"], False, True, taken)  # content AND line endings changed together (FT)
     f["selection"] = sel
     f["selection_listed_verified"] = cand_cys is not None
     f["selection_ok"] = all(k in sel for k in ("L1", "L2", "CL", "L3", "G1", "ENC1", "CG", "CRLF1", "CRLF2"))
@@ -865,6 +907,7 @@ def probe_s1_base(pr):
             return
         nb = transform(b)
         write_bytes(p, nb)
+        write_bytes(os.path.join(pr.work, "user-bytes", key), nb)
         edits[key] = {"rel": rel, "base_sha": sha256_bytes(b), "user_sha": sha256_bytes(nb),
                       "vendor_sha": sha256_bytes(vendor(rel) or b""), "user_has_cr": b"\r" in nb}
 
@@ -881,6 +924,12 @@ def probe_s1_base(pr):
     def to_crlf(b):
         return b.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
 
+    def content_and_crlf(comment):
+        def t(b):
+            nl = b"" if b.endswith(b"\n") else b"\n"
+            return to_crlf(b + nl + (comment + "\n").encode("ascii"))
+        return t
+
     edit("L1", append_line("L1"))
     edit("L2", append_line("L2"))
     edit("L3", append_line("L3"))
@@ -888,12 +937,35 @@ def probe_s1_base(pr):
     edit("ENC1", to_cp949)
     edit("CRLF1", to_crlf)
     edit("CRLF2", to_crlf)
+    if sel.get("CRLF3"):
+        edit("CRLF3", content_and_crlf("REM tw1 user edit CRLF3"))
+    if sel.get("CRLF4"):
+        edit("CRLF4", content_and_crlf("# tw1 user edit CRLF4"))
     for key in ("CL", "CG"):
         rel = sel.get(key)
         if rel:
             b = read_bytes(os.path.join(pack, *rel.split("/"))) or b""
             edits[key] = {"rel": rel, "base_sha": sha256_bytes(b), "user_sha": sha256_bytes(b),
                           "vendor_sha": sha256_bytes(vendor(rel) or b""), "user_has_cr": b"\r" in b}
+    # read-back: every edited file is re-hashed from the disk (run 1 recorded the bytes it wrote, not a read-back)
+    rb_bad = []
+    for key, e in edits.items():
+        e["read_back_sha"] = sha256_file(os.path.join(pack, *e["rel"].split("/")))
+        if e["read_back_sha"] != e["user_sha"]:
+            rb_bad.append(key)
+    f["edits_read_back_ok"] = not rb_bad
+    f["edits_read_back_bad"] = rb_bad
+    # the base's own install record for the edited files (design 4-11 da: without it every file is "no base")
+    man_txt = read_text(os.path.join(pack, ".install-manifest.json"))
+    try:
+        man = json.loads(man_txt) if man_txt else None
+    except ValueError:
+        man = None
+    man = man.get("files") if isinstance(man, dict) and isinstance(man.get("files"), dict) else man
+    f["base_manifest_present"] = isinstance(man, dict)
+    f["base_manifest_entries"] = len(man) if isinstance(man, dict) else None
+    for key, e in edits.items():
+        e["base_manifest_hash"] = man.get(e["rel"]) if isinstance(man, dict) else None
     enc = sel.get("ENC1")
     if enc:
         try:
@@ -933,6 +1005,7 @@ def probe_s1_base(pr):
     else:
         f["rt_edit_sha"] = None
         aux.append("E-RT: %s not found" % "runtime/LICENSES/BUNDLED-RUNTIMES.txt")
+    pr.timeline_point("s1_after_edits", edits)
     f["edits"] = edits
     f["edit_errors"] = errors
     f["aux_edit_errors"] = aux  # these only make their own rows NOT-MEASURED (the rows' controls)
@@ -1042,6 +1115,10 @@ def probe_s2_update(pr):
     f["py_holder_started"] = bool(ppid and alive(ppid) and pyout.startswith("held"))
     f["py_holder_import"] = pyout.strip()[:200]
     f["defender_scan_started"] = bool(dpid and (alive(dpid)))
+    # ── the state immediately before the update (run-1 lesson; RULINGS FS): every edited file re-hashed ──
+    pre = pr.timeline_point("s2_pre_update")
+    for key, e in (ctx.get("edits") or {}).items():
+        f["pre_update_%s_sha" % key] = None if pre is None else pre.get(e["rel"])
     # ── the update with the app's exact arguments (RULINGS EQ4 D9) ──
     cand = ctx["installers"]["candidate"]
     w = Watcher(pr.install_dir)
@@ -1084,6 +1161,7 @@ def probe_s2_update(pr):
         final_exit = s["code"]
     f["installer_final_exit"] = final_exit
     time.sleep(2)
+    after_inst = pr.timeline_point("s2_after_installer")
     ff = pr.exe("cys-install-failure.txt")
     f["failure_file_present"] = os.path.isfile(ff)
     if f["failure_file_present"]:
@@ -1103,11 +1181,18 @@ def probe_s2_update(pr):
     for a in pids_under(pr.install_dir, "cys-app.exe"):
         terminate(a)
         pr.unregister_pid(a)
+    after_app = pr.timeline_point("s2_after_app")
+    f["driver_init_ran"] = applied_by is None
+    after_drv = None
     if applied_by is None:
         ip = pr.ev_cmd("driver-init-pack.json", pr.cys(["init-pack", "--no-install-hook"], timeout=600))
         f["driver_init_pack_exit"] = ip["code"]
         f["driver_init_pack_secs"] = ip["secs"]
+        f["driver_init_rename_failed"] = "rename 실패" in ip["err"]
+        f["driver_init_swap_refused"] = "교체 안 함" in ip["err"]
+        f["driver_init_stderr_tail"] = ip["err"][-600:]
         applied_by = "driver" if ip["code"] == 0 else "driver-failed"
+        after_drv = pr.timeline_point("s2_after_driver_init")
     f["pack_applied_by"] = applied_by
     w.stop_ev.set()
     w.join(5)
@@ -1128,6 +1213,8 @@ def probe_s2_update(pr):
         pr.unregister_pid(p)
     time.sleep(2)
     f["old_daemons_stopped"] = not any(alive(p) for p in old)
+    before_daemon = pr.timeline_point("s2_before_daemon")
+    f["manifest_present_before_install"] = (before_daemon is not None and ".install-manifest.json" in before_daemon)
     start = time.time()
     lp = start_detached([pr.exe("cysd.exe")], env=clean_env(), stdout_path=os.path.join(pr.ev_dir, "new-cysd.out"))
     pr.register_pid(lp, "new daemon (launcher)")
@@ -1141,6 +1228,15 @@ def probe_s2_update(pr):
     pr.ctx_updates["new_daemon"] = {"pids": daemons, "start_epoch": start, "ready": ok}
     ns = pr.ev_cmd("new-surface.json", pr.cys(["new-surface", "--role", "master"], timeout=60))
     f["master_surface_after"] = ns["code"] == 0
+    after_daemon = pr.timeline_point("s2_after_daemon")
+    # ── what disappeared from the live pack, writer by writer (G01; RULINGS FS5) ──
+    for label, a, b in (("installer", pre, after_inst), ("app", after_inst, after_app),
+                        ("driver_init", after_app, after_drv), ("daemon", before_daemon, after_daemon)):
+        d = R.manifest_delta(a, b)
+        f["pack_missing_after_" + label] = None if d is None else d["missing"]
+        f["pack_changed_by_" + label] = None if d is None else len(d["changed"]) + len(d["added"])
+    d_all = R.manifest_delta(pre, before_daemon)
+    f["pack_missing_before_daemon"] = None if d_all is None else d_all["missing"]
     # ── holders' fate, then stop them ──
     f["bash_holder_alive_after"] = bool(bpid and alive(bpid))
     f["py_holder_alive_after"] = bool(ppid and alive(ppid))
@@ -1182,6 +1278,34 @@ def probe_s2_update(pr):
         if t is not None:
             pr.ev("pack-ledgers/" + name.lstrip("."), t[:2_000_000])
     pr.ev("snapshots.json", {"before": snaps_before, "after": snaps_after})
+    # ── where the user's bytes are now: pack.prev, pack-captures, the update snapshot (RULINGS FS; update-rules hint) ──
+    edits = ctx.get("edits") or {}
+    prev_dir = os.path.join(os.path.dirname(pack), "pack.prev")
+    f["pack_prev_exists"] = os.path.isdir(prev_dir)
+    cap_root = os.path.join(os.path.dirname(pack), "pack-captures")
+    cap_files = []
+    if os.path.isdir(cap_root):
+        for dp, _dns, fns in os.walk(cap_root):
+            for fn in fns:
+                cap_files.append(os.path.join(dp, fn))
+    f["pack_captures_files"] = len(cap_files)
+    snap_listing = {}
+    for d in new:
+        files_root = os.path.join(d, "files")
+        lst = []
+        for dp, _dns, fns in os.walk(files_root):
+            for fn in fns:
+                lst.append(os.path.relpath(os.path.join(dp, fn), files_root).replace("\\", "/"))
+        snap_listing[os.path.basename(d)] = {"files": sorted(lst), "meta": read_text(os.path.join(d, "meta.json"))}
+    pr.ev("update-snapshot-listing.json", snap_listing)
+    pr.ev("pack-captures-listing.json", sorted(os.path.relpath(c, cap_root).replace("\\", "/") for c in cap_files)[:2000])
+    for key, e in edits.items():
+        rel = e["rel"]
+        f["%s_in_pack_prev_sha" % key] = sha256_file(os.path.join(prev_dir, *rel.split("/"))) if f["pack_prev_exists"] else None
+        f["%s_in_captures_shas" % key] = sorted({sha256_file(c) for c in cap_files
+                                                  if c.replace("\\", "/").endswith("/" + rel)})
+        snap = [os.path.join(d, "files", *rel.split("/")) for d in new]
+        f["%s_in_snapshot_sha" % key] = next((sha256_file(x) for x in snap if os.path.isfile(x)), None)
     pr.ev("profile-top.json", sorted(os.listdir(os.path.join(profile, ".cys"))) if os.path.isdir(os.path.join(profile, ".cys")) else None)
     pr.restored = True
 
@@ -1248,6 +1372,12 @@ def probe_s3_files(pr):
         f[key + "_prev_parks"] = len(prev)
         ent = pending.get(rel) if isinstance(pending, dict) else None
         f[key + "_pending_kind"] = ent.get("kind") if isinstance(ent, dict) else None
+        f[key + "_pending_eol"] = ent.get("eol") if isinstance(ent, dict) else None
+        f[key + "_pending_reason"] = ent.get("reason") if isinstance(ent, dict) else None
+        user_bytes_path = os.path.join(pr.work, "user-bytes", key)
+        ub = read_bytes(user_bytes_path)
+        f[key + "_user_norm_sha"] = sha256_bytes(R.eol_normalized(ub)) if ub is not None else None
+        f[key + "_live_norm_sha"] = sha256_bytes(R.eol_normalized(live)) if live is not None else None
         code, _, _ = _boot_critical_exit(pr.exe("cys.exe"), p)
         f[key + "_listed"] = code
     s1 = os.path.join(pr.work, "obs", "s1_base.json")
@@ -1255,6 +1385,14 @@ def probe_s3_files(pr):
         f["ENC1_user_invalid_utf8"] = json.loads(read_text(s1))["facts"].get("ENC1_user_invalid_utf8")
     except (TypeError, ValueError, KeyError):
         f["ENC1_user_invalid_utf8"] = None
+    # facts of S2 the CW7 rows compare with (the state right before the update; where the user's bytes went)
+    s2 = _load(os.path.join(pr.work, "obs", "s2_update.json")) or {}
+    s2f = s2.get("facts") or {}
+    for key in edits:
+        for suffix in ("_in_snapshot_sha", "_in_pack_prev_sha", "_in_captures_shas"):
+            f[key + suffix] = s2f.get(key + suffix)
+        f["pre_update_%s_sha" % key] = s2f.get("pre_update_%s_sha" % key)
+    f["manifest_present_before_install"] = s2f.get("manifest_present_before_install")
     pr.ev("pending.json", pending)
     pr.restored = True
 
@@ -1572,6 +1710,146 @@ def probe_s3_siblings(pr):
     pr.restored = True
 
 
+# ───────────────────────────── S6 — G01 variants (each on a fresh base) ─────────────────────────────
+
+def _kill_product(install_dir):
+    killed = []
+    for p in processes():
+        name = (p.get("name") or "").lower()
+        path = norm_path(p.get("path"))
+        if name in ("cys.exe", "cysd.exe", "cys-app.exe") or (path and path.startswith(norm_path(install_dir) + "\\")):
+            if terminate(p["pid"]):
+                killed.append(p["pid"])
+    time.sleep(1)
+    return killed
+
+
+def _reset_installation(pr):
+    """Uninstall and remove the installation and the user's .cys (the runner is ephemeral). -> facts dict."""
+    res = {"killed": _kill_product(pr.install_dir)}
+    un = os.path.join(pr.install_dir, "uninstall.exe")
+    if os.path.isfile(un):
+        r = run([un, "/S"], 300)
+        res["uninstall_exit"] = r["code"]
+        time.sleep(3)
+    errs = []
+    for d in (pr.install_dir, os.path.dirname(pr.pack_dir)):
+        if os.path.exists(d):
+            shutil.rmtree(d, onerror=lambda fn, path, exc: errs.append("%s: %s" % (path, exc[1])))
+    res["rmtree_errors"] = errs[:20]
+    res["clean"] = not os.path.exists(pr.install_dir) and not os.path.exists(os.path.dirname(pr.pack_dir))
+    return res
+
+
+def _start_holder(pr, kind, pack, tag):
+    """One holder of run 1's kinds: 'bash' (Git Bash fd on a hook), 'python' (a pack module imported + its file open),
+    'early' (Python holding a file that sorts early in the pack root, without delete sharing)."""
+    m = matrix()["scenario"]
+    out = os.path.join(pr.ev_dir, "%s-holder-%s.out" % (tag, kind))
+    if kind == "bash":
+        hf = os.path.join(pack, "hooks", m["holder_hook"])
+        return start_detached([pr.bundled_hook_bash(), "-c", 'exec 3< "%s"; sleep 900' % hf.replace("\\", "/")],
+                              env=clean_env(), stdout_path=out)
+    if kind == "python":
+        mod = m["holder_module"]
+        held = os.path.join(pack, "bin", mod + ".py")
+        code = ("import sys,time\nsys.path.insert(0, r'%s')\nimport %s\nf=open(r'%s','rb')\nprint('held', flush=True)\n"
+                "time.sleep(900)\n") % (os.path.join(pack, "bin"), mod, held)
+        return start_detached([pr.bundled_python(), "-B", "-c", code], env=clean_env(), stdout_path=out)
+    if kind == "early":
+        held = os.path.join(pack, m["early_holder_file"])
+        code = "import time\nf=open(r'%s','rb')\nprint('held', flush=True)\ntime.sleep(900)\n" % held
+        return start_detached([pr.bundled_python(), "-B", "-c", code], env=clean_env(), stdout_path=out)
+    raise ValueError(kind)
+
+
+def probe_s6_variants(pr):
+    """G01 variants (RULINGS FS5): for each holder set, a fresh v0.14.56 base with the L1 edit, the candidate installed
+    with /S, then the app's exact `cys init-pack --no-install-hook` WITH the holders, then the daemon's install - the
+    pack manifest after every writer. The control has no holder."""
+    f = pr.facts
+    ctx = pr.ctx
+    m = matrix()
+    sc = m["scenario"]
+    base_inst = ctx["installers"]["base"]
+    cand = ctx["installers"]["candidate"]
+    want = ctx["versions"]["candidate"]
+    rel = (ctx.get("selection") or {}).get("L1")
+    f["variants_L1_rel"] = rel
+    if not (base_inst and cand and rel):
+        return
+    vendor = read_bytes(os.path.join(REPO, "cysjavis-pack", *rel.split("/")))
+    for name, kinds in sc["g01_variants"]:
+        tag = "v_" + name
+        rs = _reset_installation(pr)
+        f[tag + "_reset_clean"] = rs["clean"]
+        pr.ev(tag + "/reset.json", rs)
+        r = run([base_inst, "/S"], 900)
+        time.sleep(2)
+        _kill_product(pr.install_dir)
+        f[tag + "_base_ok"] = (r["code"] == 0 and (read_text(pr.exe("cys-installed-version.txt")) or "").strip()
+                               == m["base"]["version"])
+        ip0 = pr.cys(["init-pack"], timeout=600)
+        dpid = start_detached([pr.exe("cysd.exe")], env=clean_env(), stdout_path=os.path.join(pr.ev_dir, tag + "-base-cysd.out"))
+        pr.register_pid(dpid, tag + " base daemon")
+        wait_ready(pr.exe("cys.exe"), 90)
+        lp = os.path.join(pr.pack_dir, *rel.split("/"))
+        b = read_bytes(lp)
+        if b is None:
+            f[tag + "_L1_edit_ok"] = False
+            continue
+        nb = b + (b"" if b.endswith(b"\n") else b"\n") + b"# tw1 user edit L1 (variant)\n"
+        write_bytes(lp, nb)
+        f[tag + "_L1_user_sha"] = sha256_bytes(nb)
+        f[tag + "_L1_edit_ok"] = sha256_file(lp) == f[tag + "_L1_user_sha"]
+        f[tag + "_L1_vendor_sha"] = sha256_bytes(vendor) if vendor else None
+        holders = {}
+        for k in kinds:
+            hp = _start_holder(pr, k, pr.pack_dir, tag)
+            pr.register_pid(hp, "%s holder %s" % (tag, k))
+            holders[k] = hp
+        time.sleep(4)
+        f[tag + "_holders_started"] = {k: alive(hp) for k, hp in holders.items()}
+        f[tag + "_holders_all_started"] = all(f[tag + "_holders_started"].values()) if holders else True
+        root_names = sorted(os.listdir(pr.pack_dir), key=R.ntfs_key)
+        if "early" in kinds:
+            f[tag + "_predicted_if_partial_delete"] = R.entries_before(root_names, sc["early_holder_file"])
+        pre = pr.timeline_point(tag + "_pre", {})
+        ri = run([cand, "/S"], 900)
+        time.sleep(2)
+        f[tag + "_cand_ok"] = (ri["code"] == 0 and (read_text(pr.exe("cys-installed-version.txt")) or "").strip() == want)
+        after_inst = pr.timeline_point(tag + "_after_installer", {})
+        ip = pr.cys(["init-pack", "--no-install-hook"], timeout=600)
+        pr.ev(tag + "/init-pack.json", ip)
+        f[tag + "_init_exit"] = ip["code"]
+        f[tag + "_rename_failed"] = "rename 실패" in ip["err"]
+        f[tag + "_swap_refused"] = "교체 안 함" in ip["err"]
+        after_drv = pr.timeline_point(tag + "_after_driver_init", {})
+        d = R.manifest_delta(pre, after_drv)
+        f[tag + "_missing_before_daemon"] = None if d is None else d["missing"]
+        d1 = R.manifest_delta(pre, after_inst)
+        f[tag + "_missing_after_installer"] = None if d1 is None else d1["missing"]
+        f[tag + "_manifest_present_before_install"] = after_drv is not None and ".install-manifest.json" in after_drv
+        f[tag + "_L1_sha_before_daemon"] = None if after_drv is None else after_drv.get(rel)
+        dr = pr.cys(["drain"], timeout=45)
+        _kill_product(pr.install_dir)
+        nd = start_detached([pr.exe("cysd.exe")], env=clean_env(), stdout_path=os.path.join(pr.ev_dir, tag + "-new-cysd.out"))
+        pr.register_pid(nd, tag + " new daemon")
+        ok, _secs, _ = wait_ready(pr.exe("cys.exe"), 90)
+        f[tag + "_daemon_ready"] = ok
+        after_dmn = pr.timeline_point(tag + "_after_daemon", {})
+        f[tag + "_L1_live_sha"] = sha256_file(lp)
+        f[tag + "_L1_park_sha"] = sha256_file(lp + ".user") if os.path.isfile(lp + ".user") else None
+        pend = _load(os.path.join(pr.pack_dir, ".merge-pending.json")) or {}
+        ent = pend.get(rel) if isinstance(pend, dict) else None
+        f[tag + "_L1_pending_kind"] = ent.get("kind") if isinstance(ent, dict) else None
+        for k, hp in holders.items():
+            kill_tree(hp)
+            pr.unregister_pid(hp)
+        _kill_product(pr.install_dir)
+    pr.restored = False  # the installation is a variant's now: nothing after this stage may assume the S2 state
+
+
 PROBES = {
     "s0_env": probe_s0_env,
     "s1_base": probe_s1_base,
@@ -1586,4 +1864,5 @@ PROBES = {
     "s3_intake": probe_s3_intake,
     "s3_listen": probe_s3_listen,
     "s3_siblings": probe_s3_siblings,
+    "s6_variants": probe_s6_variants,
 }

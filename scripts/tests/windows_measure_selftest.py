@@ -84,6 +84,18 @@ class MatrixTests(unittest.TestCase):
         self.assertIn("T5c", m["DY1.product"]["needs_units"])
         self.assertEqual(m["T7C.capture"]["class"], "NO")
 
+    def test_rows_that_wait_for_a_fix_name_it_and_still_record(self):
+        """RULINGS FS / FT / run-1 ruling (3): a row whose verdict needs a fix that is not merged is NOT-MEASURED
+        "feature absent" - and its observation is still recorded (run_when_absent)."""
+        m = {r["id"]: r for r, _ in R.iter_rows(load())}
+        for rid, unit in (("CW7-LISTED", "T9a"), ("G01.nodelete", "T9a"), ("G01.variants-nodelete", "T9a"),
+                          ("CW7-HELD.nopartial", "T9a"), ("I-LISTEN.b", "T9a"), ("CW7-ENC.exact", "T2g"), ("DY3", "T5c")):
+            self.assertIn(unit, m[rid]["needs_units"], rid)
+            self.assertTrue(m[rid].get("run_when_absent"), rid)
+            dec = R.decide_row(m[rid], load()["probes"], "updated", 1, {unit: {"merge_log": False}})
+            self.assertEqual(dec[1], R.NM, rid)
+            self.assertTrue(dec[2].startswith(R.R_FEATURE_ABSENT), rid)
+
     def _errors_after(self, mutate):
         m = load()
         mutate(m)
@@ -282,7 +294,9 @@ class VerdictTests(unittest.TestCase):
     def test_vendor_first_row_fails_its_control_when_the_untouched_file_is_parked(self):
         m = {r["id"]: r for r, _ in R.iter_rows(load())}
         row = m["CW7-LISTED"]
-        facts = {"L1_listed": 0, "L2_listed": 0, "L3_listed": 0, "CL_listed": 0,
+        facts = {"pre_update_L1_sha": "u1", "pre_update_L2_sha": "u2", "pre_update_L3_sha": "u3",
+                 "manifest_present_before_install": True, "L1_in_snapshot_sha": "u1",
+                 "L1_listed": 0, "L2_listed": 0, "L3_listed": 0, "CL_listed": 0,
                  "CL_live_sha": "v", "CL_vendor_sha": "v", "CL_park_sha": None,
                  "L1_live_sha": "v1", "L1_vendor_sha": "v1", "L1_park_sha": "u1", "L1_user_sha": "u1",
                  "L1_pending_kind": "vendor-first",
@@ -295,6 +309,10 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(R.compute_verdict(row, ran(not_parked))["verdict"], R.NM)  # None side = not an observation
         user_live = dict(facts, L1_live_sha="u1")
         self.assertEqual(R.compute_verdict(row, ran(user_live))["verdict"], R.FAIL)
+        lost_before = dict(facts, pre_update_L1_sha="v-other")   # the edit was not on disk when the update began
+        self.assertEqual(R.compute_verdict(row, ran(lost_before))["verdict"], R.NM)
+        no_base = dict(facts, manifest_present_before_install=False)
+        self.assertEqual(R.compute_verdict(row, ran(no_base))["verdict"], R.NM)
 
     def test_update_row_refuses_a_candidate_that_is_not_newer(self):
         m = {r["id"]: r for r, _ in R.iter_rows(load())}
@@ -588,6 +606,24 @@ class BuildRunTests(unittest.TestCase):
         self.assertEqual(R.build_wait_decision({"status": "completed", "conclusion": "failure"}), "found")
 
 
+class ManifestHelperTests(unittest.TestCase):
+    def test_eol_normalized(self):
+        self.assertEqual(R.eol_normalized(b"a\r\nb\r\n"), b"a\nb\n")
+        self.assertEqual(R.eol_normalized(b"a\rb"), b"a\rb")
+        self.assertIsNone(R.eol_normalized(None))
+
+    def test_manifest_delta(self):
+        d = R.manifest_delta({"a": "1", "b": "2", "c": "3"}, {"b": "2", "c": "9", "d": "4"})
+        self.assertEqual(d, {"missing": ["a"], "added": ["d"], "changed": ["c"]})
+        self.assertIsNone(R.manifest_delta(None, {}))
+        self.assertIsNone(R.manifest_delta({}, None))
+
+    def test_entries_before_follows_the_ntfs_order(self):
+        names = ["agents.json", ".install-manifest.json", "acl.json", "bin", "CHARTER-RATIONALE.md", "bench", "_x"]
+        self.assertEqual(R.entries_before(names, "agents.json"), [".install-manifest.json", "acl.json"])
+        self.assertEqual(R.entries_before(names, "bin"), [".install-manifest.json", "acl.json", "agents.json", "bench"])
+
+
 class DriverShapeTests(unittest.TestCase):
     def test_every_ordered_probe_has_a_function_and_back(self):
         import tw1_probes as P
@@ -596,8 +632,11 @@ class DriverShapeTests(unittest.TestCase):
 
     def test_scenario_lists_are_disjoint_and_the_following_version_marks_them(self):
         sc = load()["scenario"]
-        pools = [sc[k] for k in ("listed_changed", "listed_unchanged", "general_changed_py", "general_changed_sh",
-                                 "general_changed_md")]
+        pools = [sc[k] for k in sc["tnv_mark_pools"]]
+        self.assertEqual(set(sc["tnv_mark_pools"]), {"listed_changed", "listed_unchanged", "general_changed_py",
+                                                      "general_changed_sh", "general_changed_md", "general_cmd"})
+        self.assertTrue(all(len(v) == 2 and v[0] for v in sc["g01_variants"]))
+        self.assertIn(["control", []], sc["g01_variants"])
         flat = [x for p in pools for x in p]
         self.assertEqual(len(flat), len(set(flat)))
         self.assertGreaterEqual(len(sc["listed_changed"]), 3)
@@ -618,6 +657,7 @@ class DriverShapeTests(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertIn('name = "other"\nversion = "0.15.0"', lock2)
         self.assertEqual(T.append_marker(b"a\r\nb", "# m"), b"a\nb\n# m\n")
+        self.assertIn("cmd", load()["scenario"]["next_version_marker"])
 
 
 class WorkflowTests(unittest.TestCase):
