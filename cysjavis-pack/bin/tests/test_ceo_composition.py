@@ -16,10 +16,12 @@
     python3 cysjavis-pack/bin/tests/test_ceo_composition.py
 """
 import ast
+import contextlib
 import errno
 import glob
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -1231,6 +1233,290 @@ class IntentRecovery(Rig):
         self.assertIn(USER.encode(), after.values(), "밀려난 판이 지워졌다(codex B3)")
         self.assertEqual(self.kept(), [], "장벽인데 무언가를 옮겼다")
         self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), 1, "장벽 알림이 한 번이 아니다(틱마다 보내지 않는다 — FA3)")
+
+
+class _Crash(BaseException):
+    """끼워 넣은 멈춤 — BaseException 이라 제품의 어떤 except 도 삼키지 않는다(죽은 프로세스)."""
+
+
+class _Runaway(BaseException):
+    """한 입구가 정한 연산 수를 넘었다 — 끝나지 않는 되풀이(S3 위반)."""
+
+
+class _FS:
+    """ceo_py 의 파일 시스템 기본 연산(상태를 바꾸는 것 — 만들기·fsync·이름 바꾸기·맞바꾸기·링크·지우기·폴더 만들기)에 번호를
+    매긴다. crash_at 번째 연산 **뒤에서** 멈추고, 그 뒤의 연산은 하지 않고 다시 멈춘다(죽은 프로세스는 정리 코드도 돌지 않는다).
+    save_at 번째 연산 **앞에서** 사용자 저장 1회. 연산마다 그 앞에서 살아 있는 지침을 관찰한다. 방법 시험(.ceo-probe.*)은 세지
+    않는다. fsync 는 세되 실제로 하지 않는다(프로세스 안의 멈춤은 디스크 확정과 무관하다 — flush 실패는 FlushFailure 가 잰다)."""
+    BUDGET = 400
+
+    def __init__(self, crash_at=None, save_at=None, save=None, observe=None):
+        self.crash_at, self.save_at, self.save, self.observe = crash_at, save_at, save, observe
+        self.n, self.dead = 0, False
+
+    def call(self, fn, paths, *a, **kw):
+        if any(".ceo-probe." in str(p) for p in paths):
+            return fn(*a, **kw)
+        if self.dead:
+            raise _Crash()
+        self.n += 1
+        if self.n > self.BUDGET:
+            raise _Runaway()
+        if self.observe:
+            self.observe()
+        if self.save_at == self.n:
+            self.save()
+        r = fn(*a, **kw)
+        if self.crash_at == self.n:
+            self.dead = True
+            raise _Crash()
+        return r
+
+
+class _OsProxy:
+    def __init__(self, fs):
+        self._fs = fs
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def open(self, path, flags, *a, **kw):
+        if flags & os.O_CREAT:
+            return self._fs.call(os.open, (path,), path, flags, *a, **kw)
+        return os.open(path, flags, *a, **kw)
+
+    def fsync(self, fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            return None
+        return self._fs.call(lambda: None, ())
+
+    def rename(self, a, b):
+        return self._fs.call(os.rename, (a, b), a, b)
+
+    def replace(self, a, b):
+        return self._fs.call(os.replace, (a, b), a, b)
+
+    def link(self, a, b):
+        return self._fs.call(os.link, (a, b), a, b)
+
+    def unlink(self, p):
+        return self._fs.call(os.unlink, (p,), p)
+
+    def remove(self, p):
+        return self._fs.call(os.remove, (p,), p)
+
+    def mkdir(self, p, *a, **kw):
+        return self._fs.call(os.mkdir, (p,), p, *a, **kw)
+
+    def makedirs(self, p, mode=0o777, exist_ok=False):
+        if os.path.isdir(p):
+            return os.makedirs(p, mode, exist_ok)
+        return self._fs.call(os.makedirs, (p,), p, mode, exist_ok)
+
+
+class CrashProperty(Rig):
+    """★RULINGS FL7 — 한 속성 시험이 S1–S3 을 진다(T6 의 멈춤 속성 시험 형식). 승격·강등·복구의 파일 시스템 기본 연산을 감싸
+    **모든 연산 하나하나의 뒤에서** 멈춤을 끼워 넣고, 멈춘 지점마다 다음 입구(같은 동작의 입구 · 10분 틱)를 돌리되 그 입구도 **그
+    연산마다** 멈춘다(두 번째 고장). 그리고 깨끗한 입구 하나가 마무리한 뒤 불변식을 단언한다:
+      I1 살아 있던 적이 있는 모든 판(연산마다 관찰)과 어느 걸음에서든 끼워 넣은 사용자 저장은 살아 있는 지침이나 보관 폴더에
+         있다(사용자 자신의 저장이 덮은 판만 예외 — 그것은 사용자가 바꾼 것이다).
+      I2 살아 있는 이름이 있고, 더 새 저장이 있을 때 낡은 조립·강등 결과가 아니다(끝난 입구마다 · 마지막에).
+      I3 기록된 동작은 끝났거나(조립 = 현행 머리말 + 마지막 본문 · 유효한 영수증 / 강등 = 마지막 본문 · 영수증 없음) 알림과 함께
+         보류됐고, 남은 기록·후보가 없다(멈추지 않은 틱은 남은 기록을 끝낸다).
+      I4 모든 입구가 끝났다(입구마다 연산 상한 — 넘으면 끝나지 않는 되풀이).
+    맞바꾸기 경로(맥·리눅스)와 맡기고 먼저 경로(윈도우 등)를 모두 돈다. 시간은 쓰지 않는다(EZ1 — sleep 없음 · 끼워 넣기는 연산
+    번호로). 저장은 제자리 쓰기와 원자 이름 바꾸기를 번갈아 쓴다."""
+    SAVE_LINE = "USERSAVE-FL7 어느 걸음에서든 끼워 넣은 저장\n"
+    _code = None
+
+    @classmethod
+    def code(cls):
+        if cls._code is None:
+            src = extract_shell_function(_slurp(DEPT, encoding="utf-8"), "ceo_py")
+            body = src.split("<<'PY'\n", 1)[1].rsplit("\nPY\n", 1)[0].rstrip()
+            tail = "sys.exit(main(sys.argv))"
+            assert body.endswith(tail)
+            cls._code = compile(body[: -len(tail)], DEPT + ":ceo_py", "exec")
+        return cls._code
+
+    def module(self, mode, fs=None):
+        ns = {"__name__": "ceo_py_property"}
+        exec(self.code(), ns)
+        real_ex, real_nr = self.real_ex, self.real_nr
+        if fs is not None:
+            ns["os"] = _OsProxy(fs)
+            ns["noreplace_fn"] = (lambda: None) if real_nr is None else (lambda: (lambda a, b: fs.call(real_nr, (a, b), a, b)))
+            ex = None if real_ex is None else (lambda a, b: fs.call(real_ex, (a, b), a, b))
+        else:
+            ex = real_ex
+        ns["exchange_fn"] = (lambda: None) if mode == "deposit" else (lambda: ex)
+        ns["_MODE"][os.path.dirname(os.path.abspath(self.md))] = mode   # 방법 시험은 세지 않는다 — 시나리오의 경로로 고정
+        return ns
+
+    # ── 한 시나리오 ──
+    def md_bytes(self):
+        try:
+            with open(self.md, "rb") as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+
+    def observe(self):
+        try:
+            st = os.stat(self.md)
+            key = (st.st_ino, st.st_size, st.st_mtime_ns)
+        except FileNotFoundError:
+            return
+        if key != self._seen:                # 바뀌었을 때만 읽는다(같은 inode·크기·시각 = 같은 판)
+            self._seen = key
+            b = self.md_bytes()
+            if b is not None:
+                self.observed.add(b)
+
+    def make_save(self, op, how):
+        text = ((HEADER + SEP + USER + self.SAVE_LINE) if op == "demote" else (USER + self.SAVE_LINE)).encode("utf-8")
+
+        def save():
+            cur = self.md_bytes()
+            if cur is not None:
+                self.excused.add(cur)       # 사용자 자신의 저장이 덮는 판
+            if how == "in-place":
+                with open(self.md, "wb") as f:
+                    f.write(text)
+            else:
+                tmp = self.md + ".editor-tmp"
+                with open(tmp, "wb") as f:
+                    f.write(text)
+                os.replace(tmp, self.md)
+            self.saved, self._seen = text, None
+        return save
+
+    def expected(self, op):
+        body = USER + (self.SAVE_LINE if self.saved else "")
+        return ((HEADER + SEP + body) if op == "compose" else body).encode("utf-8")
+
+    def fresh(self, op, mode):
+        shutil.rmtree(self.dirs, ignore_errors=True)
+        os.makedirs(self.dirs)
+        _write(self.md, USER)
+        _write(self.tmpl, TEMPLATE)
+        if op == "demote":                  # 강등의 출발점 = 깨끗한 승격(세지 않는다)
+            ns = self.module(mode)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(ns["do_compose"]([self.tmpl, self.md, sha(TEMPLATE), ""]), 0)
+        self.observed, self.excused, self.saved, self._seen = set(), set(), None, None
+        self.observe()
+
+    def entry(self, op, mode, kind, fs, nf):
+        ns = self.module(mode, fs)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                if kind == "tick":
+                    return ns["do_recover"]([self.md, nf])
+                if op == "compose":
+                    return ns["do_compose"]([self.tmpl, self.md, sha(TEMPLATE), nf])
+                return ns["do_demote"]([self.tmpl, self.md, nf])
+            except _Crash:
+                return "crash"
+
+    def scenario(self, op, mode, plan):
+        """plan = [(kind, crash_at, save_at, how), ...] — 그 뒤에 깨끗한 같은 동작 입구 하나. 돌려주는 값 = 입구마다 연산 수."""
+        self.fresh(op, mode)
+        where = "%s/%s %r" % (op, mode, plan)
+        counts = []
+        intent = self.p(".ceo-intent.json")
+        for i, (kind, crash_at, save_at, how) in enumerate(list(plan) + [("op", None, None, None)]):
+            had = os.path.lexists(intent)
+            fs = _FS(crash_at, save_at, self.make_save(op, how) if save_at else None, self.observe)
+            nf = os.path.join(self.tmp, "nf-prop.txt")
+            if os.path.exists(nf):
+                os.unlink(nf)
+            try:
+                res = self.entry(op, mode, kind, fs, nf)
+            except _Runaway:
+                self.fail("I4: 입구 %d 가 연산 %d 개를 넘었다(끝나지 않는 되풀이) — %s" % (i, _FS.BUDGET, where))
+            counts.append(fs.n)
+            self.observe()
+            if res == "crash":
+                continue
+            live = self.md_bytes()
+            notes = _slurp(nf, encoding="utf-8") if os.path.exists(nf) else ""
+            if res in (6, 9):
+                self.assertIn("NOTICE\t", notes, "I3: 보류(rc %s)에 알림이 없다 — %s" % (res, where))
+                self.assertIsNotNone(live, "I2: 보류 뒤 살아 있는 이름이 없다 — %s" % where)
+                continue
+            if kind == "op" or had:
+                self.assertIn(res, (0, 10, 11, 12), "입구 %d 의 rc — %s" % (i, where))
+                self.assertFalse(os.path.lexists(intent), "I3: 끝난 입구 %d 뒤에 기록이 남았다 — %s" % (i, where))
+                # 동작이 끝난 지침이거나, 교체가 검증된 **뒤**에 들어온 사용자 저장 그 자체(낡은 결과가 아니다 — 다음 확인이
+                #   그것으로 다시 한다: 마지막 깨끗한 입구 뒤에는 동작이 끝난 지침이어야 한다).
+                self.assertIn(live, (self.expected(op),) + ((self.saved,) if self.saved else ()),
+                              "I2/I3: 끝난 입구 %d 뒤의 지침이 낡았거나 동작이 끝나지 않았다 — %s" % (i, where))
+        self.final(op, where)
+        return counts
+
+    def final(self, op, where):
+        live = self.md_bytes()
+        self.assertEqual(live, self.expected(op), "I2/I3: 마지막 지침 — %s" % where)
+        self.assertFalse(os.path.lexists(self.p(".ceo-intent.json")), "I3: 기록이 남았다 — %s" % where)
+        self.assertEqual([f for f in os.listdir(self.dirs) if f.endswith(".candidate")], [], "후보가 남았다 — %s" % where)
+        pool = {live} | {_slurp(k, "rb") for k in self.kept()}
+        if self.saved:
+            self.assertIn(self.saved, pool, "I1: 끼워 넣은 저장이 살아 있는 지침에도 보관 폴더에도 없다 — %s" % where)
+        lost = [v[:60] for v in self.observed - self.excused if v not in pool]
+        self.assertEqual(lost, [], "I1: 살아 있던 판이 사라졌다 — %s" % where)
+        r = self.receipt()
+        if op == "compose":
+            self.assertIsNotNone(r, "I3: 조립을 끝냈는데 영수증이 없다 — %s" % where)
+            self.assertEqual(r["composed_sha256"], hashlib.sha256(live).hexdigest(), "I3: 영수증 — %s" % where)
+        else:
+            self.assertIsNone(r, "I3: 강등을 끝냈는데 영수증이 남았다 — %s" % where)
+
+    def test_every_crash_point_second_fault_and_save_keeps_s1_to_s3(self):
+        base = ceo_py_module()
+        self.real_ex, self.real_nr = base["exchange_fn"](), base["noreplace_fn"]()
+        self.md, self.tmpl = self.p("MASTER_DIRECTIVE.md"), self.p("CEO_TEMPLATE.md")
+        modes = (["exchange"] if self.real_ex is not None else []) + ["deposit"]
+        if self.real_nr is None and os.name == "posix":
+            modes.remove("deposit")
+        hows = ("in-place", "rename")
+        stats = {"crash points": 0, "second faults": 0, "saves": 0, "scenarios": 0}
+        for op in ("compose", "demote"):
+            for mode in modes:
+                n1 = self.scenario(op, mode, [("op", None, None, None)])[0]
+                self.assertGreater(n1, 5, "시험 무효: 감싼 연산이 없다")
+                stats["scenarios"] += 1
+                n2s = {}
+                for k1 in range(1, n1 + 1):
+                    stats["crash points"] += 1
+                    for kind2 in ("op", "tick"):
+                        n2 = n2s[k1, kind2] = self.scenario(op, mode, [("op", k1, None, None), (kind2, None, None, None)])[1]
+                        stats["scenarios"] += 1
+                        for k2 in range(1, n2 + 1):
+                            self.scenario(op, mode, [("op", k1, None, None), (kind2, k2, None, None)])
+                            stats["second faults"] += 1
+                            stats["scenarios"] += 1
+                # 첫 입구의 모든 연산 앞에서 저장 — 혼자, 그리고 그 뒤 모든 연산에서의 멈춤과 함께
+                for s in range(1, n1 + 1):
+                    how = hows[s % 2]
+                    n1s = self.scenario(op, mode, [("op", None, s, how)])[0]
+                    stats["saves"] += 1
+                    stats["scenarios"] += 1
+                    for k1 in range(s, n1s + 1):
+                        self.scenario(op, mode, [("op", k1, s, how), ("tick" if k1 % 2 else "op", None, None, None)])
+                        stats["saves"] += 1
+                        stats["scenarios"] += 1
+                # 복구 입구의 모든 연산 앞에서 저장(멈춘 지점마다)
+                for k1 in range(1, n1 + 1):
+                    kind2 = "tick" if k1 % 2 else "op"
+                    for s2 in range(1, n2s[k1, kind2] + 1):
+                        self.scenario(op, mode, [("op", k1, None, None), (kind2, None, s2, hows[(k1 + s2) % 2])])
+                        stats["saves"] += 1
+                        stats["scenarios"] += 1
+        sys.stderr.write("\n[FL7] paths %s · crash points %d · second faults %d · saves injected %d · scenarios %d\n"
+                         % ("+".join(modes), stats["crash points"], stats["second faults"], stats["saves"],
+                            stats["scenarios"]))
+        self.assertGreater(stats["second faults"], stats["crash points"])
 
 
 class SafePrimitives(Rig):

@@ -2188,6 +2188,19 @@ def candidate_path(md, iid):
     return os.path.join(os.path.dirname(os.path.abspath(md)), ".%s.%s.candidate" % (os.path.basename(md), iid))
 
 
+def reserve_names(md, reason=None):
+    """★FL3 — 후보 이름과 미리 정한 보관 이름을 **잠금 안에서 비어 있음을 확인해** 고른다: <UTC 초>-<pid>-<번호> 는 프로세스마다 번호가
+    1 부터 다시 시작해, 같은 초에 같은 pid 를 받은 뒤의 입구(멈춘 입구의 남은 것)와 겹칠 수 있다(FL7 속성 시험이 찾았다 — 겹치면
+    교체가 FileExistsError 로 멈췄다). 돌려주는 값 = (iid, 후보 경로, 보관 경로 | None)."""
+    for _ in range(1000):
+        iid = new_iid()
+        cand_p = candidate_path(md, iid)
+        kept_p = os.path.join(kept_dir(md), "%s.%s" % (iid, reason)) if reason else None
+        if not any(os.path.lexists(x) for x in (cand_p, kept_p, kept_p and kept_p + ".kept") if x):
+            return iid, cand_p, kept_p
+    raise OSError("후보·보관 이름을 만들지 못했다(%s)" % os.path.dirname(os.path.abspath(md)))
+
+
 def write_candidate(cand_p, data, like, expect=None):
     """후보를 덮지 않는 새 파일로 **다** 쓴다(fsync · 권한은 살아 있는 파일과 같게 · expect 로 다시 읽어 확인). 실패하면 그 반쪽
     후보는 보관 폴더로 옮긴다(★FL2 — 지우지 않는다)."""
@@ -2251,7 +2264,8 @@ def read_intent(md):
                 or sw.get("mode") not in ("exchange", "deposit") or not isinstance(sw.get("reason"), str)
                 or not _plain_name(sw.get("candidate")) or not _plain_name(sw.get("kept"))
                 or any(not (isinstance(sw.get(k), str) and HEX64.fullmatch(sw[k]))
-                       for k in ("read_sha256", "candidate_sha256"))):
+                       for k in ("read_sha256", "candidate_sha256"))
+                or (sw["purpose"] == "restore" and not _plain_name(sw.get("source")))):
             return "bad"
     rec["_disk"] = True
     return rec
@@ -2372,13 +2386,14 @@ def unreadable_record(md, nf):
                 "(.MASTER_DIRECTIVE.md.*.candidate)에 있습니다." % (intent_path(md), kept_dir(md)))
 
 
-def swap_unit(md, data, expect_sha, op, reason, expect=None, nf="", rec=None, notices=None, done=None):
+def swap_unit(md, data, expect_sha, op, reason, expect=None, nf="", rec=None, notices=None, done=None, source=None):
     """★RULINGS EY2·FL4 — 동작 기록 아래의 교체 하나(살아 있는 이름을 바꾸는 물리적 부분): ① 후보를 다 쓴다 ② 기록을 'swap' 단계로
     확정한다(읽은 바이트의 해시 · 후보 · 미리 정한 보관 이름 · 방식 — 동작의 교체면 그 동작이 끝날 때 쓸 값과 알림도) ③ 살아 있는
     이름을 바꾼다 — 맞바꾸기(맥·리눅스) 또는 맡기고 먼저(살아 있는 파일을 한 번의 이름 바꾸기로 보관 폴더에 옮긴 뒤 다 쓴 후보를
     덮지 않게 놓는다) ④ 밀려난 파일을 보관 폴더로(곁 파일에 그 순간의 해시). 검증·되돌리기·동작 마무리·기록 지우기는 이 함수가
     아니라 기록의 다음 단계다(finish_swap → settle → complete — 기록은 마지막에 지운다). op = 'compose'|'demote'(동작의 교체) ·
-    'restore'(읽은 뒤의 저장을 되돌리는 교체 — 같은 기록 아래). 돌려주는 값 = 미리 정한 보관 경로."""
+    'restore'(읽은 뒤의 저장을 되돌리는 교체 — 같은 기록 아래 · source = 그 저장을 담은 보관 파일 이름: 되돌리기가 바꾸기 전에
+    멈추면 거기서 다시 한다). 돌려주는 값 = 미리 정한 보관 경로."""
     mode = swap_mode(md)
     if mode is None:                            # ★EY3: 반쪽을 드러내지 않는 방법이 없다 — 바꾸지 않고 보류(쓴 것 0)
         err("CEO 지침 교체 보류: 이 파일 시스템에서는 본부 지침을 안전하게 바꿀 수 없다(맞바꾸기·덮지 않는 이동 없음) — %s"
@@ -2389,16 +2404,16 @@ def swap_unit(md, data, expect_sha, op, reason, expect=None, nf="", rec=None, no
         raise HoldSwap("no safe primitive")
     if rec is None:
         rec = new_record(op if op in OPS else "compose")
-    iid = new_iid()
-    cand_p = candidate_path(md, iid)
-    kname = "%s.%s" % (iid, reason)
-    kept_p = os.path.join(kept_dir(md), kname)
+    iid, cand_p, kept_p = reserve_names(md, reason)
+    kname = os.path.basename(kept_p)
     try:
         write_candidate(cand_p, data, md, expect)
     except OSError as e:
         hold_unflushed(md, nf, "새 지침 후보", e)
     rec["swap"] = {"purpose": "restore" if op == "restore" else "op", "mode": mode, "read_sha256": expect_sha,
                    "candidate": os.path.basename(cand_p), "candidate_sha256": sha(data), "kept": kname, "reason": reason}
+    if op == "restore":
+        rec["swap"]["source"] = source
     rec["step"] = "swap"
     if op == "restore":
         rec["notices"] = []         # 동작이 되돌린 판으로 다시 계획한다 — 앞 계획의 알림은 이제 맞지 않다
@@ -2459,7 +2474,9 @@ def read_or_none(p):
 def finish_swap(md, rec, nf):
     """★FL4 — 'swap' 단계의 기록을 물리적으로 끝낸다(멈춘 지점이 어디든 · 몇 번을 다시 해도 같은 끝). 바꾸기 전에 멈췄으면 후보는
     살아 있던 적이 없다 — 정리하고 단계를 'run'(동작을 다시 계획) · 바꾼 뒤면 밀려난 파일이 곁 파일과 함께 보관 폴더에 있고
-    살아 있는 이름이 비어 있지 않게 한다. 돌려주는 값 = 밀려난 판의 보관 시각 해시 | None('run' 으로 돌아감)."""
+    살아 있는 이름이 비어 있지 않게 한다. 바꾸기 전에 멈춘 것이 **되돌리기**이고 우리 낡은 후보가 아직 살아 있으면 'redo' — 새
+    진실은 source 보관 파일에 있으니 되돌리기를 다시 한다('run' 으로 가면 낡은 조립에서 다시 계획한다 — FL7 속성 시험이 찾았다).
+    돌려주는 값 = 밀려난 판의 보관 시각 해시 | 'redo' | None('run' 으로 돌아감)."""
     sw = rec["swap"]
     d = os.path.dirname(os.path.abspath(md))
     cand_p, kept_p = os.path.join(d, sw["candidate"]), os.path.join(kept_dir(md), sw["kept"])
@@ -2470,18 +2487,24 @@ def finish_swap(md, rec, nf):
             csha = None
         if sw["mode"] == "exchange" and csha is not None and csha != sw["candidate_sha256"]:
             keep_file(cand_p, md, sw["reason"], name=sw["kept"])    # 맞바꾼 뒤에 멈췄다 — 후보 이름의 것은 밀려난 파일이다
-        elif os.path.lexists(cand_p):
-            discard_candidate(md, cand_p)   # 바꾸기 전에 멈췄다(살아 있는 파일은 옮겨지지 않았다) — 후보는 살아 있던 적이 없다
-            set_step(md, rec, "run", nf)
-            return None
         else:
+            # 바꾸기 전에 멈췄다(살아 있는 파일은 옮겨지지 않았다) — 후보는 살아 있던 적이 없다(보관 폴더로 · FL2)
+            had_cand = os.path.lexists(cand_p)
+            if had_cand:
+                discard_candidate(md, cand_p)
             live = read_or_none(md)
-            if live is not None and sha(live) == sw["candidate_sha256"]:
+            lsha = sha(live) if live is not None else None
+            if sw["purpose"] == "restore" and lsha != sw["candidate_sha256"]:
+                if lsha == sw["read_sha256"]:
+                    return "redo"   # 우리 낡은 후보가 아직 살아 있다 — 되돌리기를 그 source 에서 다시(새 진실은 보관 폴더에)
+                if lsha is not None:
+                    two_edits(md, rec, nf, os.path.join(kept_dir(md), sw["source"]))    # 그 뒤 또 저장됐다 — 끝(보류)
+            elif sw["purpose"] == "op" and not had_cand and lsha is not None and lsha == sw["candidate_sha256"]:
                 hold_record(md, nf, T_INTENT_CHECK,
                             "끝나지 않은 본부 지침 교체에서 밀려난 판(%s)이 어디에도 없습니다(이 제품 밖에서 지워졌습니다) — 그 사이의 "
                             "저장이 사라지지 않았는지 잴 수 없어 CEO 지침을 더 바꾸지 않고 보류했습니다. 기록(%s)은 그대로 "
                             "두었습니다 — 오너 지시로 확인하십시오." % (kept_p, intent_path(md)))
-            set_step(md, rec, "run", nf)    # 후보가 이 제품 밖에서 사라졌다 — 바꾼 것이 없다
+            set_step(md, rec, "run", nf)    # 동작을 지금 판으로 다시 계획한다
             return None
     ksha = write_sidecar(kept_p, sw["reason"], os.path.basename(md))   # 곁 파일이 없으면 지금 게시한다
     if not os.path.lexists(md):
@@ -2489,7 +2512,7 @@ def finish_swap(md, rec, nf):
         src = cand_p
         try:
             if not (os.path.lexists(cand_p) and sha(read_bytes(cand_p)) == sw["candidate_sha256"]):
-                src = candidate_path(md, new_iid())     # ★EY3: 보관된 판의 사본을 후보로 **다** 쓴 뒤
+                src = reserve_names(md)[1]              # ★EY3: 보관된 판의 사본을 후보로 **다** 쓴 뒤
                 write_candidate(src, read_bytes(kept_p), kept_p)
             place_candidate(src, md)                    # 덮지 않는 이동으로 놓는다(살아 있는 경로에 직접 쓰지 않는다)
         except FileExistsError:
@@ -2525,10 +2548,15 @@ def settle(md, rec, nf, ksha):
         return None
     if lsha == sw["candidate_sha256"]:
         return "restore"
-    err("CEO 지침 교체 보류: 교체 뒤 살아 있는 지침도 저장됐다 — 두 판을 합치지 않는다(앞의 판: %s)" % kept_p)
+    two_edits(md, rec, nf, kept_p)
+
+
+def two_edits(md, rec, nf, earlier):
+    """읽은 뒤의 저장(보관 폴더의 earlier)과 그 뒤의 저장(살아 있다)이 겹쳤다 — 둘 다 남기고 보류(동작 끝 · 기록 제거 · 알림 1건)."""
+    err("CEO 지침 교체 보류: 교체 뒤 살아 있는 지침도 저장됐다 — 두 판을 합치지 않는다(앞의 판: %s)" % earlier)
     note(nf, T_TWO_EDITS, "본부 지침을 바꾸는 동안 저장이 두 번 겹쳤습니다. 지금 살아 있는 지침(나중 저장)은 그대로 두었고, "
                           "앞의 저장은 %s 에 그대로 보관했습니다 — 자동으로 합치지 않습니다. 앞의 판의 내용이 필요하면 오너 "
-                          "지시로 워커가 본문에 옮기십시오." % kept_p)
+                          "지시로 워커가 본문에 옮기십시오." % earlier)
     close_record(md, rec, nf, notices=False)
     raise HoldSwap("two edits")
 
@@ -2593,19 +2621,24 @@ def run_record(md, nf, rec, args, until_run=False):
     while True:
         step = rec["step"]
         if step == "swap":
-            ksha = finish_swap(md, rec, nf)
-            if ksha is None and rec["step"] == "run":
+            r = finish_swap(md, rec, nf)
+            if r is None and rec["step"] == "run":
                 continue
-            if settle(md, rec, nf, ksha) == "restore":
-                restores += 1
-                if restores > SWAP_ATTEMPTS:
-                    err("CEO %s 보류: 본부 지침이 되돌리는 중에도 계속 저장된다 — 다음 확인 때 이어 간다" % action)
-                    note(nf, changing, "본부 지침이 CEO %s 중에 계속 저장되어 보류했습니다. 살아 있던 모든 판은 %s 에 있고, 다음 "
-                                       "승격 확인이 기록에서 이어 갑니다." % (action, kept_dir(md)))
-                    raise HoldSwap("changing", 9)
-                sw = rec["swap"]
-                swap_unit(md, read_bytes(os.path.join(kept_dir(md), sw["kept"])), sw["candidate_sha256"], "restore",
-                          "replaced", nf=nf, rec=rec)
+            sw = rec["swap"]
+            if r == "redo":
+                src, displace = sw["source"], sw["read_sha256"]         # 바꾸기 전에 멈춘 되돌리기를 다시
+            elif settle(md, rec, nf, r) == "restore":
+                src, displace = sw["kept"], sw["candidate_sha256"]      # 밀려난 새 진실을 되돌린다(우리 낡은 후보를 밀어낸다)
+            else:
+                continue
+            restores += 1
+            if restores > SWAP_ATTEMPTS:
+                err("CEO %s 보류: 본부 지침이 되돌리는 중에도 계속 저장된다 — 다음 확인 때 이어 간다" % action)
+                note(nf, changing, "본부 지침이 CEO %s 중에 계속 저장되어 보류했습니다. 살아 있던 모든 판은 %s 에 있고, 다음 "
+                                   "승격 확인이 기록에서 이어 갑니다." % (action, kept_dir(md)))
+                raise HoldSwap("changing", 9)
+            swap_unit(md, read_bytes(os.path.join(kept_dir(md), src)), displace, "restore", "replaced", nf=nf, rec=rec,
+                      source=src)
             continue
         if step == "swapped":
             return complete(md, rec, nf)
