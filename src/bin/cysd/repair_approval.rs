@@ -60,6 +60,8 @@ pub(crate) enum ReqState {
     Checking,
     Pending,
     Verifying,
+    /// Claimed by the verification that is applying it (RULINGS CZ2 / DE4) — ended only by it.
+    Applying,
     Approved,
     Rejected,
     Expired,
@@ -70,7 +72,7 @@ impl ReqState {
     fn live(self) -> bool {
         matches!(
             self,
-            ReqState::Checking | ReqState::Pending | ReqState::Verifying
+            ReqState::Checking | ReqState::Pending | ReqState::Verifying | ReqState::Applying
         )
     }
 
@@ -79,6 +81,7 @@ impl ReqState {
             ReqState::Checking => "제출 검사 중",
             ReqState::Pending => "주인 승인 대기",
             ReqState::Verifying => "본인 확인 중",
+            ReqState::Applying => "적용 중",
             ReqState::Approved => "승인됨",
             ReqState::Rejected => "승인되지 않음",
             ReqState::Expired => "만료",
@@ -211,7 +214,19 @@ fn load(ctx: &Ctx<'_>, id: &RepairId) -> Result<RepairRecord, VerbError> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam of RULINGS CZ2's interleaving tests: runs ONCE at this thread's next record write —
+    /// the write that follows a claim, inside the repair lock.
+    pub(crate) static BEFORE_RECORD_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
 fn write(ctx: &Ctx<'_>, rec: &RepairRecord) -> Result<(), VerbError> {
+    #[cfg(test)]
+    if let Some(f) = BEFORE_RECORD_WRITE.with(|h| h.borrow_mut().take()) {
+        f();
+    }
     ledger::write_record_durable_in(&ctx.root, rec).map_err(VerbError::from)
 }
 
@@ -297,6 +312,7 @@ pub(crate) fn submit(
     caller: &Caller,
     p: &Value,
     table: &Mutex<ApprovalTable>,
+    eff: &dyn Effects,
     platform_enabled: Result<(), &'static str>,
 ) -> Result<(Value, Option<Step3Input>), VerbError> {
     let id = repair_id(p)?;
@@ -348,6 +364,16 @@ pub(crate) fn submit(
                 live.request_id,
                 live.state.label_ko()
             )));
+        }
+        // CZ2: a previous durable pending request no request of this table serves (a restart not yet
+        // reconciled by the first sweep, an end not written) is settled BEFORE it is replaced — its
+        // expiry counted once, never lost
+        let (changed, count) = reconcile_stale_pending(ctx.now, &tbl, id.as_str(), &mut rec);
+        if changed {
+            write(ctx, &rec)?;
+            if count == Some(MAX_RESUBMITS + 1) {
+                eff.tell_master(budget_line(id.as_str(), &ctx.lane.0));
+            }
         }
         match rec.state {
             RepairState::InProgress | RepairState::AwaitingApproval => {}
@@ -443,72 +469,213 @@ pub(crate) fn submit(
     })
 }
 
-/// Ends a live request: the record's pending request cleared, the state set, the result delivered
-/// once, the event published. `expired` = counted toward the resubmission budget.
-fn end_request(
-    ctx: &Ctx<'_>,
+/// RULINGS CZ2: is the record's durable pending request THIS request (identity = fingerprint +
+/// expiry, both written at `submit`)?
+fn pending_is(rec: &RepairRecord, r: &Request) -> bool {
+    rec.pending_request
+        .as_ref()
+        .is_some_and(|(f, e)| *f == r.fingerprint_sha256 && *e == r.expires_at)
+}
+
+/// What an end does to the record's approval result.
+#[derive(Clone)]
+enum RecApproval {
+    Keep,
+    Set(ApprovalResult),
+    Clear,
+}
+
+/// RULINGS CZ2 — THE terminal claim. Under the table lock a request in one of `from` takes `to` at
+/// once (reason, end time, the one-time nonce spent, the helper forgotten) and its state before the
+/// claim is returned. Of any number of racing enders exactly ONE gets `Some`. Every caller holds the
+/// repair's lock around the claim and the durable update that follows, so the pair is atomic against
+/// `submit` and the restart reconciliation (both take the same lock).
+fn claim(
     table: &Mutex<ApprovalTable>,
-    eff: &dyn Effects,
-    request_id: &str,
+    rid: &str,
+    from: &[ReqState],
     to: ReqState,
-    reason: String,
+    reason: &str,
+    now: f64,
+) -> Option<Request> {
+    let mut tbl = table.lock().unwrap_or_else(|e| e.into_inner());
+    let r = tbl.find_mut(rid).filter(|r| from.contains(&r.state))?;
+    let before = r.clone();
+    r.state = to;
+    r.nonce.clear();
+    r.helper_pid = None;
+    if !to.live() {
+        r.reason = Some(reason.to_string());
+        r.ended_at = Some(now);
+    }
+    Some(before)
+}
+
+/// The durable side of an end (the caller holds the repair lock and has claimed the request): the
+/// pending request cleared only when it is THIS request's, the expiry counted then and only then
+/// (so exactly once), the repair sent back, the approval result set / kept / cleared. Returns the new
+/// expiry count when one was counted (and written).
+fn settle_record(
+    ctx: &Ctx<'_>,
+    id: &RepairId,
+    r: &Request,
+    to: ReqState,
     back_to: RepairState,
-    approval: Option<ApprovalResult>,
-) -> Result<(), VerbError> {
-    let (repair, seat, fp) = {
-        let tbl = table.lock().unwrap_or_else(|e| e.into_inner());
-        match tbl.find(request_id) {
-            Some(r) if r.state.live() => (
-                r.repair.clone(),
-                r.worker_seat,
-                r.fingerprint_sha256.clone(),
-            ),
-            _ => return Ok(()),
-        }
+    approval: &RecApproval,
+) -> (Option<u32>, Result<(), VerbError>) {
+    let mut rec = match load(ctx, id) {
+        Ok(rec) => rec,
+        Err(e) => return (None, Err(e)),
     };
-    let id = RepairId::parse(&repair).map_err(VerbError::from)?;
     let mut count = None;
-    ctx.locked(id.as_str(), || -> Result<(), VerbError> {
-        let mut rec = load(ctx, &id)?;
-        if rec.pending_request.as_ref().is_some_and(|(f, _)| *f == fp) {
-            rec.pending_request = None;
-        }
+    if pending_is(&rec, r) {
+        rec.pending_request = None;
         if to == ReqState::Expired {
-            count = Some(bump_expired(&mut rec, &fp));
+            count = Some(bump_expired(&mut rec, &r.fingerprint_sha256));
         }
         if rec.state == RepairState::AwaitingApproval {
             rec.state = back_to;
         }
-        if let Some(a) = approval.clone() {
-            rec.approval = Some(a);
-        }
-        write(ctx, &rec)
-    })?;
-    {
-        let mut tbl = table.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(r) = tbl.find_mut(request_id) {
-            r.state = to;
-            r.reason = Some(reason.clone());
-            r.ended_at = Some(ctx.now);
-            r.helper_pid = None;
-        }
     }
+    match approval {
+        RecApproval::Keep => {}
+        RecApproval::Set(a) => rec.approval = Some(a.clone()),
+        RecApproval::Clear => rec.approval = None,
+    }
+    match write(ctx, &rec) {
+        Ok(()) => (count, Ok(())),
+        Err(e) => (None, Err(e)),
+    }
+}
+
+/// The result of an end told ONCE — only the claimer of the request gets here: the bus event, the
+/// one delivery to the fixer seat and, at the expiry that used the budget up, the lane master's one
+/// line.
+fn announce(ctx: &Ctx<'_>, eff: &dyn Effects, r: &Request, to: ReqState, reason: &str, count: Option<u32>) {
     eff.publish(
         "repair.approval.resolved",
-        json!({"request_id": request_id, "repair": repair, "state": to, "reason": reason}),
+        json!({"request_id": r.request_id, "repair": r.repair, "state": to, "reason": reason}),
     );
     eff.deliver(
-        seat,
+        r.worker_seat,
         format!(
-            "[수리 {repair}] 최종 승인 요청 {request_id}: {} — {reason}",
+            "[수리 {}] 최종 승인 요청 {}: {} — {reason}",
+            r.repair,
+            r.request_id,
             to.label_ko()
         ),
     );
     // the budget is used up exactly once: at the expiry that makes the count exceed the limit
     if count == Some(MAX_RESUBMITS + 1) {
-        eff.tell_master(budget_line(&repair, &ctx.lane.0));
+        eff.tell_master(budget_line(&r.repair, &ctx.lane.0));
     }
-    Ok(())
+}
+
+/// The states an ender (the owner's rejection, the expiry, a void, step 3's return, a failed start)
+/// may claim a request from. `Applying` is owned by the verification that claimed it (CZ2 / DE4).
+const ENDABLE: &[ReqState] = &[ReqState::Checking, ReqState::Pending, ReqState::Verifying];
+
+/// Ends a request through the ONE terminal claim (RULINGS CZ2, [`claim`]): under the repair lock the
+/// claim, then the record; outside every lock the one announcement. `Ok(false)` = the request was
+/// not in one of `from` any more (another end came first) — nothing is written or told.
+#[allow(clippy::too_many_arguments)]
+fn end_request(
+    ctx: &Ctx<'_>,
+    table: &Mutex<ApprovalTable>,
+    eff: &dyn Effects,
+    request_id: &str,
+    from: &[ReqState],
+    to: ReqState,
+    reason: String,
+    back_to: RepairState,
+    approval: RecApproval,
+) -> Result<bool, VerbError> {
+    let repair = {
+        let tbl = table.lock().unwrap_or_else(|e| e.into_inner());
+        match tbl.find(request_id) {
+            Some(r) => r.repair.clone(),
+            None => return Ok(false),
+        }
+    };
+    let id = RepairId::parse(&repair).map_err(VerbError::from)?;
+    let done = ctx.locked(id.as_str(), || {
+        let r = claim(table, request_id, from, to, &reason, ctx.now)?;
+        let (count, res) = settle_record(ctx, &id, &r, to, back_to, &approval);
+        Some((r, count, res))
+    });
+    let Some((r, count, res)) = done else {
+        return Ok(false);
+    };
+    announce(ctx, eff, &r, to, &reason, count);
+    res.map(|()| true)
+}
+
+/// Ends a request this verification OWNS (state `Applying` — RULINGS CZ2 / DE4): the record first,
+/// then the table's truthful terminal state, then the one announcement.
+#[allow(clippy::too_many_arguments)]
+fn settle_owned(
+    ctx: &Ctx<'_>,
+    table: &Mutex<ApprovalTable>,
+    eff: &dyn Effects,
+    r: &Request,
+    to: ReqState,
+    reason: String,
+    back_to: RepairState,
+    approval: RecApproval,
+) -> Result<(), VerbError> {
+    let id = RepairId::parse(&r.repair).map_err(VerbError::from)?;
+    let (count, res) = ctx.locked(id.as_str(), || {
+        let out = settle_record(ctx, &id, r, to, back_to, &approval);
+        let mut tbl = table.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(x) = tbl
+            .find_mut(&r.request_id)
+            .filter(|x| x.state == ReqState::Applying)
+        {
+            x.state = to;
+            x.reason = Some(reason.clone());
+            x.ended_at = Some(ctx.now);
+        }
+        out
+    });
+    announce(ctx, eff, r, to, &reason, count);
+    res
+}
+
+/// RULINGS CZ2 — a durable pending request that no request of this table is serving (a previous
+/// daemon's, or one whose end could not be written) is reconciled under the repair lock (the caller
+/// holds it and the table lock) BEFORE anything replaces it: ended in this table → settled as it
+/// ended (counted when it expired); unknown here (a restart — D-18-01, V2(d)) → counted as expired
+/// when its time had passed, else voided by the restart (not counted — U4(c)). An `approved`
+/// approval result of that request was never consumed (a crash between its write and the apply —
+/// RULINGS DF5) and is cleared. Returns (record changed, the new expiry count when one was counted).
+fn reconcile_stale_pending(
+    now: f64,
+    tbl: &ApprovalTable,
+    repair: &str,
+    rec: &mut RepairRecord,
+) -> (bool, Option<u32>) {
+    let Some((fp, exp)) = rec.pending_request.clone() else {
+        return (false, None);
+    };
+    let serving = tbl
+        .requests
+        .iter()
+        .find(|r| r.repair == repair && r.fingerprint_sha256 == fp && r.expires_at == exp);
+    let expired = match serving {
+        Some(r) if r.state.live() => return (false, None),
+        Some(r) => r.state == ReqState::Expired,
+        None => now >= exp,
+    };
+    rec.pending_request = None;
+    if rec
+        .approval
+        .as_ref()
+        .is_some_and(|a| a.approved && a.fingerprint_sha256 == fp)
+    {
+        rec.approval = None;
+    }
+    let count = expired.then(|| bump_expired(rec, &fp));
+    (true, count)
 }
 
 // ═══════════════════════════════════════════ step 3 ═══════════════════════════════════════════
@@ -523,14 +690,6 @@ pub(crate) fn run_step3(
     s3: &Step3Input,
 ) {
     let outcome = eff.step3(s3);
-    let still_checking = {
-        let tbl = table.lock().unwrap_or_else(|e| e.into_inner());
-        tbl.find(request_id)
-            .is_some_and(|r| r.state == ReqState::Checking)
-    };
-    if !still_checking {
-        return;
-    }
     match outcome {
         Err(why) => {
             let _ = end_request(
@@ -538,19 +697,21 @@ pub(crate) fn run_step3(
                 table,
                 eff,
                 request_id,
+                &[ReqState::Checking],
                 ReqState::Voided,
                 format!("제출 검사에서 돌려보냈습니다(주인에게 올리지 않았습니다): {why}"),
                 RepairState::InProgress,
-                None,
+                RecApproval::Keep,
             );
         }
         Ok(ok) => {
-            for (file, line) in &ok.lane_findings {
-                eff.intake(file, line);
-            }
+            // the card appears only for a request still in step 3 (never over an end that came first)
             let card = {
                 let mut tbl = table.lock().unwrap_or_else(|e| e.into_inner());
-                match tbl.find_mut(request_id) {
+                match tbl
+                    .find_mut(request_id)
+                    .filter(|r| r.state == ReqState::Checking)
+                {
                     Some(r) => {
                         r.state = ReqState::Pending;
                         r.rehearsal = Some((true, ok.rehearsal_summary.clone()));
@@ -560,12 +721,16 @@ pub(crate) fn run_step3(
                     None => None,
                 }
             };
-            if let Some(r) = card {
-                eff.publish(
-                    "repair.approval.created",
-                    json!({"request_id": r.request_id, "repair": r.repair, "targets": r.targets, "expires_at": r.expires_at}),
-                );
+            let Some(r) = card else {
+                return;
+            };
+            for (file, line) in &ok.lane_findings {
+                eff.intake(file, line);
             }
+            eff.publish(
+                "repair.approval.created",
+                json!({"request_id": r.request_id, "repair": r.repair, "targets": r.targets, "expires_at": r.expires_at}),
+            );
         }
     }
 }
@@ -715,7 +880,9 @@ pub(crate) fn approval_list(ctx: &Ctx<'_>, table: &Mutex<ApprovalTable>) -> Valu
         // lanes other than this one (identical bytes applied where the state equals the pre-image)
         let other = other_lanes_for(ctx, r);
         match r.state {
-            ReqState::Pending | ReqState::Verifying => open.push(card(r, &other)),
+            ReqState::Pending | ReqState::Verifying | ReqState::Applying => {
+                open.push(card(r, &other))
+            }
             ReqState::Checking => {}
             _ => ended.push(card(r, &other)),
         }
@@ -793,17 +960,20 @@ pub(crate) fn approval_start(
             table,
             eff.as_ref(),
             &rid,
+            &[ReqState::Pending],
             ReqState::Expired,
             "30분이 지나 만료되었습니다".into(),
             RepairState::AwaitingApproval,
-            None,
+            RecApproval::Keep,
         )?;
         return Err(precondition(format!("{rid}: 30분이 지나 만료되었습니다")));
     }
     {
         let mut tbl = table.lock().unwrap_or_else(|e| e.into_inner());
         match tbl.find_mut(&rid) {
-            Some(r) if r.state == ReqState::Pending => r.state = ReqState::Verifying,
+            Some(r) if r.state == ReqState::Pending && ctx.now < r.expires_at => {
+                r.state = ReqState::Verifying
+            }
             Some(r) if r.state == ReqState::Verifying => {
                 return Ok(
                     json!({"request_id": rid, "state": ReqState::Verifying, "note": "이미 본인 확인 중입니다"}),
@@ -817,7 +987,10 @@ pub(crate) fn approval_start(
             let pid = child.id();
             {
                 let mut tbl = table.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(r) = tbl.find_mut(&rid) {
+                if let Some(r) = tbl
+                    .find_mut(&rid)
+                    .filter(|r| r.state == ReqState::Verifying)
+                {
                     r.helper_pid = Some(pid);
                 }
             }
@@ -833,10 +1006,11 @@ pub(crate) fn approval_start(
                 table,
                 eff.as_ref(),
                 &rid,
+                &[ReqState::Verifying],
                 ReqState::Rejected,
                 format!("본인 확인을 시작하지 못했습니다({e}) — 승인이 아닙니다"),
                 RepairState::InProgress,
-                None,
+                RecApproval::Keep,
             )?;
             Err(precondition(format!(
                 "{rid}: 본인 확인을 시작하지 못했습니다 — 승인이 아닙니다"
@@ -871,6 +1045,13 @@ pub(crate) fn wait_helper_for(mut child: std::process::Child, limit: Duration) -
 
 /// The helper's result consumed (design §4-7 steps 6–9; I3 validity by timestamp; verify → apply →
 /// consume). `verified` = the helper exited 0.
+///
+/// RULINGS CZ2 / DE4: under the repair lock (the record and the candidate read first) and then the
+/// table lock, the result is re-validated — the request's identity (this id, still `Verifying`, its
+/// live one-time nonce), its expiry, its cancellation (the record still 승인 대기 and still naming
+/// THIS request) and the candidate (same fingerprint, same targets) — and the request is CLAIMED:
+/// a terminal state, or `Applying` (owned by this verification; no other end can take it). The table
+/// says `Approved` only after the apply's outcome is known; a declined apply leaves `Voided`.
 pub(crate) fn finish_verification(
     ctx: &Ctx<'_>,
     table: &Mutex<ApprovalTable>,
@@ -883,103 +1064,141 @@ pub(crate) fn finish_verification(
     // (the apply's own expiry check below reads it again — I3 "again at apply")
     let started = std::time::Instant::now();
     let now = |ctx: &Ctx<'_>| ctx.now + started.elapsed().as_secs_f64();
-    let req = {
-        let mut tbl = table.lock().unwrap_or_else(|e| e.into_inner());
-        match tbl.find_mut(rid) {
-            // the one-time nonce of THIS request: a result carrying another nonce is no result, and
-            // the nonce is spent here (used once — D:761)
-            Some(r)
-                if r.state == ReqState::Verifying && !r.nonce.is_empty() && r.nonce == nonce =>
-            {
-                let snapshot = r.clone();
-                r.nonce.clear();
-                snapshot
-            }
+    let repair = {
+        let tbl = table.lock().unwrap_or_else(|e| e.into_inner());
+        match tbl.find(rid) {
+            Some(r) if r.state == ReqState::Verifying => r.repair.clone(),
             _ => return Ok(()),
         }
     };
-    if !verified {
-        return end_request(
-            ctx,
-            table,
-            eff,
-            rid,
-            ReqState::Rejected,
-            "운영체제 본인 확인이 끝나지 않았거나 실패했습니다 — 승인이 아닙니다".into(),
-            RepairState::InProgress,
-            Some(ApprovalResult {
-                request_id: rid.into(),
-                fingerprint_sha256: req.fingerprint_sha256.clone(),
-                decided_at: ctx.now,
-                approved: false,
-            }),
-        );
+    let id = RepairId::parse(&repair).map_err(VerbError::from)?;
+    enum Step {
+        Ended(ReqState, String, Option<u32>, Result<(), VerbError>),
+        Apply(Vec<(String, TargetState)>, Result<(), VerbError>),
     }
-    // I3: a result at or after the deadline is not approved, whatever the stored state says
-    if ctx.now >= req.expires_at {
-        return end_request(
-            ctx,
-            table,
-            eff,
-            rid,
-            ReqState::Expired,
-            "본인 확인 결과가 30분이 지난 뒤에 왔습니다 — 승인이 아닙니다".into(),
-            RepairState::AwaitingApproval,
-            None,
-        );
-    }
-    let id = RepairId::parse(&req.repair).map_err(VerbError::from)?;
-    // verify: the candidate re-compared just before the apply (after the card was shown)
-    let now_states = ledger::candidate_states_in(&ctx.root, &id).map_err(VerbError::from)?;
-    let same_targets = now_states
-        .iter()
-        .map(|(r, _)| r.clone())
-        .collect::<Vec<_>>()
-        == req.targets;
-    if cys::repair::fingerprint(&now_states) != req.fingerprint_sha256 || !same_targets {
-        return end_request(
-            ctx,
-            table,
-            eff,
-            rid,
-            ReqState::Voided,
-            "카드를 보인 뒤에 후보가 바뀌었습니다 — 승인이 아닙니다. 다시 서명을 받아 제출하세요"
-                .into(),
-            RepairState::InProgress,
-            None,
-        );
-    }
-    // F9: the approval result into the record (durably) BEFORE the apply
-    let approval = ApprovalResult {
-        request_id: rid.into(),
-        fingerprint_sha256: req.fingerprint_sha256.clone(),
-        decided_at: ctx.now,
-        approved: true,
-    };
-    ctx.locked(id.as_str(), || -> Result<(), VerbError> {
-        let mut rec = load(ctx, &id)?;
-        rec.approval = Some(approval.clone());
-        write(ctx, &rec)
-    })?;
-    {
+    let decided = ctx.locked(id.as_str(), || -> Option<(Request, Step)> {
+        let rec = ledger::read_record_in(&ctx.root, &id);
+        let states = ledger::candidate_states_in(&ctx.root, &id);
+        let t = now(ctx);
         let mut tbl = table.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(r) = tbl.find_mut(rid) {
-            r.state = ReqState::Approved; // consumed: never startable again
-            r.ended_at = Some(ctx.now);
-            r.helper_pid = None;
+        let r = tbl.find_mut(rid)?;
+        // a result that does not carry THIS request's live one-time nonce is no result
+        if r.state != ReqState::Verifying || r.nonce.is_empty() || r.nonce != nonce {
+            return None;
         }
+        let snap = r.clone();
+        let cancelled = !matches!(&rec, Ok(Some(x)) if x.state == RepairState::AwaitingApproval && pending_is(x, &snap));
+        let same_candidate = matches!(&states, Ok(s) if cys::repair::fingerprint(s) == snap.fingerprint_sha256
+            && s.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>() == snap.targets);
+        let end: Option<(ReqState, String, RepairState, RecApproval)> = if !verified {
+            Some((
+                ReqState::Rejected,
+                "운영체제 본인 확인이 끝나지 않았거나 실패했습니다 — 승인이 아닙니다".into(),
+                RepairState::InProgress,
+                RecApproval::Set(ApprovalResult {
+                    request_id: rid.into(),
+                    fingerprint_sha256: snap.fingerprint_sha256.clone(),
+                    decided_at: ctx.now,
+                    approved: false,
+                }),
+            ))
+        } else if t >= snap.expires_at {
+            // I3: a result at or after the deadline is not approved, whatever the stored state says
+            Some((
+                ReqState::Expired,
+                "본인 확인 결과가 30분이 지난 뒤에 왔습니다 — 승인이 아닙니다".into(),
+                RepairState::AwaitingApproval,
+                RecApproval::Keep,
+            ))
+        } else if cancelled {
+            Some((
+                ReqState::Voided,
+                "그 사이에 이 요청이 취소되었습니다(되돌리기·새 수리·데몬 재시작) — 승인이 아닙니다".into(),
+                RepairState::InProgress,
+                RecApproval::Keep,
+            ))
+        } else if !same_candidate {
+            // verify: the candidate re-compared just before the apply (after the card was shown)
+            Some((
+                ReqState::Voided,
+                "카드를 보인 뒤에 후보가 바뀌었습니다 — 승인이 아닙니다. 다시 서명을 받아 제출하세요".into(),
+                RepairState::InProgress,
+                RecApproval::Keep,
+            ))
+        } else {
+            None
+        };
+        // THE claim: the request leaves `Verifying` here, exactly once, and the nonce is spent
+        r.state = end.as_ref().map_or(ReqState::Applying, |e| e.0);
+        r.nonce.clear();
+        r.helper_pid = None;
+        if let Some((_, why, _, _)) = &end {
+            r.reason = Some(why.clone());
+            r.ended_at = Some(ctx.now);
+        }
+        drop(tbl);
+        // the durable side, still under the repair lock
+        Some(match end {
+            Some((to, why, back_to, approval)) => {
+                let (count, res) = settle_record(ctx, &id, &snap, to, back_to, &approval);
+                (snap, Step::Ended(to, why, count, res))
+            }
+            None => {
+                // F9: the approval result into the record (durably) BEFORE the apply
+                let recorded = match rec {
+                    Ok(Some(mut x)) => {
+                        x.approval = Some(ApprovalResult {
+                            request_id: rid.into(),
+                            fingerprint_sha256: snap.fingerprint_sha256.clone(),
+                            decided_at: ctx.now,
+                            approved: true,
+                        });
+                        write(ctx, &x)
+                    }
+                    _ => Err(precondition(format!("{rid}: 장부 기록을 읽을 수 없습니다"))),
+                };
+                (snap, Step::Apply(states.unwrap_or_default(), recorded))
+            }
+        })
+    });
+    let Some((req, step)) = decided else {
+        return Ok(());
+    };
+    let (states, recorded) = match step {
+        Step::Ended(to, why, count, res) => {
+            announce(ctx, eff, &req, to, &why, count);
+            return res;
+        }
+        Step::Apply(states, recorded) => (states, recorded),
+    };
+    if let Err(e) = recorded {
+        settle_owned(
+            ctx,
+            table,
+            eff,
+            &req,
+            ReqState::Voided,
+            format!("승인 결과를 기록하지 못해 적용하지 않았습니다 — {}", e.message),
+            RepairState::InProgress,
+            RecApproval::Clear,
+        )?;
+        return Err(e);
     }
     // the apply re-checks the expiry itself too (I3 — "again at apply")
     if now(ctx) >= req.expires_at {
-        return revert_approval(
+        return settle_owned(
             ctx,
+            table,
             eff,
             &req,
-            "적용 직전에 30분이 지났습니다 — 적용하지 않았습니다",
+            ReqState::Expired,
+            "적용 직전에 30분이 지났습니다 — 적용하지 않았습니다".into(),
+            RepairState::AwaitingApproval,
+            RecApproval::Clear,
         );
     }
     let staging = ledger::staging_dir_in(&ctx.root, &id);
-    let files: Vec<cys::repair::apply::CandidateFile> = now_states
+    let files: Vec<cys::repair::apply::CandidateFile> = states
         .iter()
         .filter_map(|(rel, st)| match st {
             TargetState::File { mode, .. } => Some(cys::repair::apply::CandidateFile {
@@ -991,67 +1210,46 @@ pub(crate) fn finish_verification(
         })
         .collect();
     match eff.apply(&id, &ctx.lane, &files) {
-        Ok(cys::repair::apply::ApplyOutcome::Applied) => {
-            ctx.locked(id.as_str(), || -> Result<(), VerbError> {
-                let mut rec = load(ctx, &id)?;
-                rec.pending_request = None;
-                write(ctx, &rec)
-            })?;
-            eff.publish(
-                "repair.approval.resolved",
-                json!({"request_id": rid, "repair": req.repair, "state": ReqState::Approved}),
-            );
-            eff.deliver(req.worker_seat, format!("[수리 {}] 최종 승인 요청 {rid}: 주인이 승인했고 데몬이 적용했습니다(시험 기간 재검사가 이어집니다)", req.repair));
-            Ok(())
-        }
-        Ok(cys::repair::apply::ApplyOutcome::Declined(why))
-        | Ok(cys::repair::apply::ApplyOutcome::Superseded(why)) => revert_approval(
+        Ok(cys::repair::apply::ApplyOutcome::Applied) => settle_owned(
             ctx,
+            table,
             eff,
             &req,
-            &format!("승인되었지만 적용이 거절되었습니다 — {why}"),
+            ReqState::Approved,
+            "주인이 승인했고 데몬이 적용했습니다(시험 기간 재검사가 이어집니다)".into(),
+            RepairState::AwaitingApproval,
+            RecApproval::Keep,
         ),
-        Err(e) => revert_approval(
+        // AY5: a declined apply — in the origin the approval is void and the repair returns to
+        // `진행 중`; the table says so (DE4)
+        Ok(cys::repair::apply::ApplyOutcome::Declined(why))
+        | Ok(cys::repair::apply::ApplyOutcome::Superseded(why)) => settle_owned(
             ctx,
+            table,
             eff,
             &req,
-            &format!(
+            ReqState::Voided,
+            format!("승인되었지만 적용이 거절되었습니다 — {why}"),
+            RepairState::InProgress,
+            RecApproval::Clear,
+        ),
+        Err(e) => settle_owned(
+            ctx,
+            table,
+            eff,
+            &req,
+            ReqState::Voided,
+            format!(
                 "승인되었지만 적용하지 못했습니다 — {}",
                 VerbError::from(e).message
             ),
+            RepairState::InProgress,
+            RecApproval::Clear,
         ),
     }
 }
 
-/// A declined apply: in the origin the approval is void and the repair returns to `진행 중` (AY5).
-fn revert_approval(
-    ctx: &Ctx<'_>,
-    eff: &dyn Effects,
-    req: &Request,
-    why: &str,
-) -> Result<(), VerbError> {
-    let id = RepairId::parse(&req.repair).map_err(VerbError::from)?;
-    ctx.locked(id.as_str(), || -> Result<(), VerbError> {
-        let mut rec = load(ctx, &id)?;
-        rec.approval = None;
-        rec.pending_request = None;
-        if rec.state == RepairState::AwaitingApproval {
-            rec.state = RepairState::InProgress;
-        }
-        write(ctx, &rec)
-    })?;
-    eff.publish("repair.approval.resolved", json!({"request_id": req.request_id, "repair": req.repair, "state": ReqState::Voided, "reason": why}));
-    eff.deliver(
-        req.worker_seat,
-        format!(
-            "[수리 {}] 최종 승인 요청 {}: {why}",
-            req.repair, req.request_id
-        ),
-    );
-    Ok(())
-}
-
-/// `repair.approval_reject {request_id}` — the owner says no.
+/// `repair.approval_reject {request_id}` — the owner says no (claims `Rejected` from `Pending` only).
 pub(crate) fn approval_reject(
     ctx: &Ctx<'_>,
     p: &Value,
@@ -1079,26 +1277,33 @@ pub(crate) fn approval_reject(
             state.label_ko()
         )));
     }
-    end_request(
+    let ended = end_request(
         ctx,
         table,
         eff,
         &rid,
+        &[ReqState::Pending],
         ReqState::Rejected,
         "주인이 거절했습니다".into(),
         RepairState::InProgress,
-        Some(ApprovalResult {
+        RecApproval::Set(ApprovalResult {
             request_id: rid.clone(),
             fingerprint_sha256: fp,
             decided_at: ctx.now,
             approved: false,
         }),
     )?;
+    if !ended {
+        return Err(precondition(format!(
+            "{rid}: 그 사이에 요청이 끝났거나 본인 확인이 시작되었습니다 — 거절하지 않았습니다"
+        )));
+    }
     Ok(json!({"request_id": rid, "state": ReqState::Rejected}))
 }
 
 /// Voids a live request of `repair` (its target was reverted by the daemon's automatic revert —
-/// 5.11; the revert never waits for this request's lock). Told to the fixer once.
+/// 5.11; the revert never waits for this request's lock). Told to the fixer once. A request being
+/// applied is not voided (its verification owns it).
 pub(crate) fn void_for_repair(
     ctx: &Ctx<'_>,
     table: &Mutex<ApprovalTable>,
@@ -1116,10 +1321,11 @@ pub(crate) fn void_for_repair(
             table,
             eff,
             &rid,
+            ENDABLE,
             ReqState::Voided,
             why.to_string(),
             RepairState::InProgress,
-            None,
+            RecApproval::Keep,
         );
     }
 }
@@ -1143,12 +1349,7 @@ pub(crate) fn sweep(ctx: &Ctx<'_>, table: &Mutex<ApprovalTable>, eff: &dyn Effec
         let tbl = table.lock().unwrap_or_else(|e| e.into_inner());
         tbl.requests
             .iter()
-            .filter(|r| {
-                matches!(
-                    r.state,
-                    ReqState::Pending | ReqState::Verifying | ReqState::Checking
-                ) && ctx.now >= r.expires_at
-            })
+            .filter(|r| ENDABLE.contains(&r.state) && ctx.now >= r.expires_at)
             .map(|r| r.request_id.clone())
             .collect()
     };
@@ -1158,7 +1359,10 @@ pub(crate) fn sweep(ctx: &Ctx<'_>, table: &Mutex<ApprovalTable>, eff: &dyn Effec
         let tbl = table.lock().unwrap_or_else(|e| e.into_inner());
         tbl.requests
             .iter()
-            .filter(|r| r.state.live() && !due.contains(&r.request_id))
+            .filter(|r| {
+                matches!(r.state, ReqState::Pending | ReqState::Verifying)
+                    && !due.contains(&r.request_id)
+            })
             .map(|r| r.repair.clone())
             .collect()
     };
@@ -1183,11 +1387,12 @@ pub(crate) fn sweep(ctx: &Ctx<'_>, table: &Mutex<ApprovalTable>, eff: &dyn Effec
             table,
             eff,
             &rid,
+            ENDABLE,
             ReqState::Expired,
             "30분이 지나 만료되었습니다 — 후보는 작업 사본에 남아 있고 다시 제출할 수 있습니다"
                 .into(),
             RepairState::AwaitingApproval,
-            None,
+            RecApproval::Keep,
         );
     }
     let mut tbl = table.lock().unwrap_or_else(|e| e.into_inner());
@@ -1195,18 +1400,12 @@ pub(crate) fn sweep(ctx: &Ctx<'_>, table: &Mutex<ApprovalTable>, eff: &dyn Effec
         .retain(|r| r.state.live() || r.ended_at.map_or(true, |t| ctx.now - t < ENDED_KEEP_SECS));
 }
 
-/// A record of this lane still naming a pending request after a restart: expired if its time had
-/// passed (counted), else voided by the restart (not counted — D-18-01). The lock is released by the
-/// restart itself (lease incarnation).
+/// A record of this lane still naming a pending request that no request of this table serves (after
+/// a restart): reconciled under the repair lock by [`reconcile_stale_pending`] — expired if its time
+/// had passed (counted), else voided by the restart (not counted — D-18-01). The lock is released by
+/// the restart itself (lease incarnation).
 fn resolve_after_restart(ctx: &Ctx<'_>, table: &Mutex<ApprovalTable>, eff: &dyn Effects) {
     for id in ledger::list_ids_in(&ctx.root) {
-        let live = {
-            let tbl = table.lock().unwrap_or_else(|e| e.into_inner());
-            tbl.live_for(id.as_str()).is_some()
-        };
-        if live {
-            continue;
-        }
         let mut count = None;
         let res = ctx.locked(id.as_str(), || -> Result<bool, VerbError> {
             let Ok(Some(mut rec)) = ledger::read_record_in(&ctx.root, &id) else {
@@ -1215,14 +1414,15 @@ fn resolve_after_restart(ctx: &Ctx<'_>, table: &Mutex<ApprovalTable>, eff: &dyn 
             if rec.origin_lane != ctx.lane {
                 return Ok(false);
             }
-            let Some((fp, expires_at)) = rec.pending_request.clone() else {
-                return Ok(false);
+            let (changed, c) = {
+                let tbl = table.lock().unwrap_or_else(|e| e.into_inner());
+                reconcile_stale_pending(ctx.now, &tbl, id.as_str(), &mut rec)
             };
-            rec.pending_request = None;
-            if ctx.now >= expires_at {
-                count = Some(bump_expired(&mut rec, &fp));
+            if !changed {
+                return Ok(false);
             }
             write(ctx, &rec)?;
+            count = c;
             Ok(true)
         });
         if matches!(res, Ok(true)) && count == Some(MAX_RESUBMITS + 1) {
@@ -1410,7 +1610,10 @@ pub(crate) fn handle_submit(
         cys::repair::platform::BootCriticalGate::Enabled => Ok(()),
         cys::repair::platform::BootCriticalGate::Pending(why) => Err(why),
     };
-    let (out, s3) = submit(ctx, caller, p, &daemon.repair_approvals, gate)?;
+    let eff = DaemonEffects {
+        daemon: daemon.clone(),
+    };
+    let (out, s3) = submit(ctx, caller, p, &daemon.repair_approvals, &eff, gate)?;
     if let (Some(s3), Some(rid)) = (
         s3,
         out.get("request_id")
