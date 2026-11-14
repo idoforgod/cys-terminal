@@ -312,6 +312,10 @@ pub struct ChildOutcome {
     /// A pipe of the run (stdout / stderr) was still held open after the group was killed and
     /// drained — a process outside the group kept it (RULINGS CZ4): the output may be incomplete.
     pub pipe_held: bool,
+    /// Processes of the run still alive AFTER the kill — what the runner could not kill (DR3).
+    pub survivors: Vec<u32>,
+    /// The child was not reaped within the kill grace — left to a detached reap (DR3).
+    pub unreaped: bool,
 }
 
 impl ChildOutcome {
@@ -324,6 +328,12 @@ impl ChildOutcome {
         if self.pipe_held {
             return Some("an output pipe was held open past the run".into());
         }
+        if !self.survivors.is_empty() {
+            return Some(format!("process(es) the kill did not reach {:?}", self.survivors));
+        }
+        if self.unreaped {
+            return Some("the child did not die within the kill grace (left to a detached reap)".into());
+        }
         None
     }
 }
@@ -331,24 +341,43 @@ impl ChildOutcome {
 /// Largest output kept per stream (the rest is dropped; a probe's verdict never needs more).
 const MAX_CAPTURE: usize = 1 << 20;
 
-/// How long the pipes of a finished (killed) run are drained before a still-open one is reported.
+/// How long the output pipes of an ENDED child are still read (never past the run's deadline) before
+/// a still-open one is reported as held.
 const DRAIN: Duration = Duration::from_millis(500);
+
+/// After the deadline's kill: how long the child's exit is polled before the runner returns anyway
+/// and leaves the child to a detached reap (RULINGS DR3).
+const KILL_GRACE: Duration = Duration::from_millis(500);
+
+/// How long a killed process may take to disappear before it counts as one the kill did not reach.
+const SETTLE: Duration = Duration::from_millis(300);
 
 /// The environment variable that marks every process of one run (RULINGS DF5: leftovers tracked
 /// beyond the process group — a process that called `setsid` / `setpgid` keeps its environment).
 pub const RUN_MARK_VAR: &str = "CYS_REPLAY_RUN";
 
+/// Whether the runner kills (production) or — a test seam standing for "a child slow to die" — sends
+/// no kill at all (RULINGS DR3's third test).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillMode {
+    Kill,
+    #[doc(hidden)]
+    NoKillForTest,
+}
+
 /// Runs `argv` with EXACTLY `env` (nothing inherited — the fixed clean environment, BA1) plus the
-/// run's own marker [`RUN_MARK_VAR`], in `cwd`, with `stdin` as input, in its own process group,
-/// killed (the whole group) and reaped at `deadline`. After a normal end the group is killed as well,
-/// so no process of the run survives it (replay rule (c)(3)).
+/// run's own marker [`RUN_MARK_VAR`], in `cwd`, with `stdin` as input, in its own process group.
 ///
-/// RULINGS CZ4 — the runner ALWAYS returns and says what it left behind: no thread and no blocking
-/// call — stdin is written and both outputs are read through non-blocking pipes polled by this
-/// thread, so a child (or a descendant that escaped its group) that never reads stdin or keeps an
-/// output open cannot hold the runner past `deadline` + the bounded drain; a held output pipe is
-/// reported (`pipe_held`); every process still carrying the run's marker after the kill — inside the
-/// group or not — is killed by exact pid and reported (`leftovers`).
+/// RULINGS CZ4 / DR3 — THE BOUNDED RUNNER NEVER BLOCKS: no thread, no blocking read, write or wait.
+/// ONE loop with ONE deadline writes stdin and reads stdout / stderr through non-blocking pipes and
+/// polls the child's exit without reaping it (`waitid … WNOHANG | WNOWAIT`). When the child has
+/// ended, its outputs are read until both close or [`DRAIN`] passes — never past the deadline; every
+/// process still carrying the run's marker then (a descendant in the group or one that left it, e.g.
+/// one that closed stdout and lives on) is a leftover: killed by exact pid and reported, and the whole
+/// group is killed. At the deadline the group is killed and the exit polled for [`KILL_GRACE`]; the
+/// runner RETURNS in every case, saying truthfully what it could not kill (`survivors`) or reap
+/// (`unreaped` — that child is left to a detached reap; the calling thread never waits for it). A
+/// still-open output is reported (`pipe_held`).
 #[cfg(unix)]
 pub fn run_child(
     argv: &[String],
@@ -357,11 +386,25 @@ pub fn run_child(
     stdin: &[u8],
     deadline: Duration,
 ) -> ChildOutcome {
+    run_child_with(argv, env, cwd, stdin, deadline, KillMode::Kill)
+}
+
+/// [`run_child`] with the kill mode (tests only pass [`KillMode::NoKillForTest`]).
+#[cfg(unix)]
+pub fn run_child_with(
+    argv: &[String],
+    env: &[(String, String)],
+    cwd: &Path,
+    stdin: &[u8],
+    deadline: Duration,
+    kill: KillMode,
+) -> ChildOutcome {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::process::{Command, Stdio};
 
     let started = Instant::now();
+    let until = started + deadline;
     let mut out = ChildOutcome::default();
     let Some((prog, args)) = argv.split_first() else {
         out.spawn_error = Some("empty argv".into());
@@ -387,6 +430,15 @@ pub fn run_child(
         }
     };
     let pid = child.id() as libc::pid_t;
+    let kill_group = || {
+        if kill == KillMode::Kill {
+            // SAFETY: kill(2) on our own child's process group (pgid = the child's pid, set by
+            // process_group(0)); the leader is not reaped yet, so the group id is still ours.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    };
     let mut sin = child.stdin.take();
     let mut sout = child.stdout.take();
     let mut serr = child.stderr.take();
@@ -404,68 +456,120 @@ pub fn run_child(
     if stdin.is_empty() {
         sin = None; // EOF at once
     }
-    // pump until the child ends (not reaped — WNOWAIT) or the deadline
+    // THE loop: one deadline, non-blocking I/O on every pipe, the exit polled
+    let mut ended_at: Option<Instant> = None;
     loop {
         pump_stdin(&mut sin, stdin, &mut written);
         pump_out(&mut sout, &mut out.stdout);
         pump_out(&mut serr, &mut out.stderr);
-        if exited_no_reap(pid) {
+        let now = Instant::now();
+        if ended_at.is_none() && exited_no_reap(pid) {
+            ended_at = Some(now);
+            sin = None; // nobody reads it any more; a descendant holding it can never block us
+        }
+        if let Some(t) = ended_at {
+            if (sout.is_none() && serr.is_none()) || now >= t + DRAIN {
+                break;
+            }
+        }
+        if now >= until {
+            if ended_at.is_none() {
+                out.timed_out = true;
+            }
             break;
         }
-        let left = deadline.saturating_sub(started.elapsed());
-        if left.is_zero() {
-            out.timed_out = true;
-            break;
-        }
-        wait_io(&sin, &sout, &serr, left.min(Duration::from_millis(20)));
+        let cap = until.saturating_duration_since(now).min(Duration::from_millis(20));
+        wait_io(&sin, &sout, &serr, cap);
     }
-    // our end of stdin goes now: a descendant holding the other end can never block us
     drop(sin);
-    // SAFETY: kill(2) on our own child's process group (pgid = the child's pid, set by
-    // process_group(0)); the leader is not reaped yet, so the group id cannot have been reused.
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-    }
-    let status = child.wait();
-    // drain what the dead group left in the pipes — bounded: an output still open after DRAIN is held
-    // by a process outside the group
-    let drain_until = Instant::now() + DRAIN;
-    while (sout.is_some() || serr.is_some()) && Instant::now() < drain_until {
-        pump_out(&mut sout, &mut out.stdout);
-        pump_out(&mut serr, &mut out.stderr);
-        if sout.is_some() || serr.is_some() {
-            wait_io(&None, &sout, &serr, Duration::from_millis(20));
-        }
-    }
-    out.pipe_held = sout.is_some() || serr.is_some();
-    drop(sout);
-    drop(serr);
-    // replay rule (c)(3) / RULINGS CZ4: nothing of the run may outlive it — a member of the group
-    // still there after the kill, and every process carrying the run's marker
-    // SAFETY: kill(2) with signal 0 sends nothing.
-    if unsafe { libc::kill(-pid, 0) } == 0 {
-        std::thread::sleep(Duration::from_millis(50));
-        // SAFETY: as above.
-        if unsafe { libc::kill(-pid, 0) } == 0 {
-            out.leftovers.push(pid as u32);
-        }
+    // an output still open when the drain of an ENDED child ran out is held by a process of the run
+    // that outlived it — the output may be incomplete (CZ4)
+    let held_at_drain = ended_at.is_some() && (sout.is_some() || serr.is_some());
+    // what is still alive of the run NOW besides the child itself (an ended leader is a zombie and is
+    // not listed): a descendant in the group or one that left it — killed by exact pid and reported
+    if ended_at.is_some() {
+        std::thread::sleep(Duration::from_millis(10)); // a descendant that has just closed its pipes
     }
     for p in marked_processes(&mark) {
-        // SAFETY: kill(2) of a process that carries THIS run's random marker in its environment —
-        // a process of the run, by its exact pid.
-        unsafe {
-            libc::kill(p as libc::pid_t, libc::SIGKILL);
+        if p == pid as u32 {
+            continue; // the timed-out child itself: the group kill below
         }
-        if !out.leftovers.contains(&p) {
-            out.leftovers.push(p);
+        if kill == KillMode::Kill {
+            // SAFETY: kill(2) of a process that carries THIS run's random marker — a process of
+            // the run, by its exact pid.
+            unsafe {
+                libc::kill(p as libc::pid_t, libc::SIGKILL);
+            }
         }
+        out.leftovers.push(p);
     }
-    match status {
-        Ok(st) => {
-            out.code = st.code();
-            out.signal = st.signal();
+    kill_group();
+    // the exit: already seen, or polled for a short fixed grace after the kill
+    let grace_until = Instant::now() + KILL_GRACE;
+    while ended_at.is_none() {
+        if exited_no_reap(pid) {
+            ended_at = Some(Instant::now());
+            break;
         }
-        Err(e) => out.spawn_error = Some(format!("wait: {e}")),
+        if Instant::now() >= grace_until {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // what the kill did not reach: marked processes still alive once the kill has had a moment to land
+    // (a killed process is torn down asynchronously — re-read for at most SETTLE)
+    let settle_until = Instant::now() + SETTLE;
+    out.survivors = marked_processes(&mark);
+    while !out.survivors.is_empty() && Instant::now() < settle_until {
+        std::thread::sleep(Duration::from_millis(20));
+        out.survivors = marked_processes(&mark);
+    }
+    // the outputs, once more without blocking; still open → held by something the kill did not reach
+    pump_out(&mut sout, &mut out.stdout);
+    pump_out(&mut serr, &mut out.stderr);
+    out.pipe_held = held_at_drain || sout.is_some() || serr.is_some();
+    drop(sout);
+    drop(serr);
+    if ended_at.is_some() {
+        // the exit was seen: this reaps at once
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                out.code = st.code();
+                out.signal = st.signal();
+            }
+            Ok(None) => out.unreaped = true,
+            Err(e) => out.spawn_error = Some(format!("wait: {e}")),
+        }
+        // a member of the group still alive after the kill (every platform — where no marker scan
+        // exists this is the only sight beyond the child)
+        // SAFETY: kill(2) with signal 0 sends nothing.
+        if !out.unreaped && kill == KillMode::Kill {
+            let settle_until = Instant::now() + SETTLE;
+            // SAFETY: kill(2) with signal 0 sends nothing.
+            let mut member = unsafe { libc::kill(-pid, 0) } == 0;
+            while member && Instant::now() < settle_until {
+                std::thread::sleep(Duration::from_millis(20));
+                // SAFETY: as above.
+                member = unsafe { libc::kill(-pid, 0) } == 0;
+            }
+            if member && !out.survivors.contains(&(pid as u32)) {
+                out.survivors.push(pid as u32);
+            }
+        }
+    } else {
+        out.unreaped = true;
+    }
+    if out.unreaped {
+        // a child that does not die (stuck in the kernel): reported; reaped by a detached thread —
+        // the caller never waits for it
+        let detached = std::thread::Builder::new()
+            .name("replay-reap".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+        if detached.is_err() {
+            out.spawn_error = Some("the unreaped child could not be handed to a reaper".into());
+        }
     }
     if out.timed_out {
         out.code = None;

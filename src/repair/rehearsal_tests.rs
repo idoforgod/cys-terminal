@@ -227,6 +227,7 @@ fn runner_returns_when_an_escaped_descendant_holds_the_pipes() {
 /// FIFO in its place is refused at once (never a hang), a link stays a link, and the bytes, mode and
 /// stamp all come from that handle. No second `std::fs::read` of the same path remains.
 #[test]
+#[cfg(unix)]
 fn compared_reads_use_one_nonblocking_handle() {
     let r = root("df5");
     let fifo = r.join("fifo");
@@ -319,6 +320,65 @@ fn compared_runs_find_a_write_to_a_live_listed_file() {
     assert!(matches!(c, Comparison::Refused(_)), "an incomplete repeat: {c:?}");
     let (_, c) = compared_runs(&lane, &home, || ((), true));
     assert_eq!(c, Comparison::Clean);
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
+/// RULINGS DR3 — on a SUCCESSFUL exit too: a descendant that closed its outputs but lives on (and
+/// holds stdin unread) is killed by its exact pid and REPORTED; the runner returns at once. (The old
+/// runner killed the group and then saw nothing left — the descendant was never reported.)
+#[test]
+#[cfg(unix)]
+fn descendant_living_on_after_a_successful_exit_is_killed_and_reported() {
+    let r = root("dr3-live");
+    let pidfile = r.join("bg.pid");
+    let script = format!("sleep 30 >/dev/null 2>&1 & echo $! > '{}'; exit 0", pidfile.display());
+    let env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
+    let input = vec![b'y'; 1 << 20];
+    let t0 = std::time::Instant::now();
+    let o = replay::run_child(
+        &["/bin/sh".into(), "-c".into(), script],
+        &env,
+        &r,
+        &input,
+        Duration::from_secs(10),
+    );
+    assert!(t0.elapsed() < Duration::from_secs(4), "held for {:?}", t0.elapsed());
+    assert_eq!(o.code, Some(0), "{o:?}");
+    let bg: u32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    assert!(o.leftovers.contains(&bg), "the descendant {bg} is reported: {o:?}");
+    assert!(o.left_something().is_some());
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!replay::pid_alive(bg), "the descendant {bg} was killed");
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
+/// RULINGS DR3 — a child slow to die after the kill (here: the kill withheld by the test seam) does
+/// not hold the runner: it returns after the deadline plus the fixed grace, says the child was not
+/// reaped and names it among the processes the kill did not reach; a detached thread reaps it later.
+#[test]
+#[cfg(unix)]
+fn child_slow_to_die_is_reported_and_never_waited_for() {
+    let r = root("dr3-slow");
+    let env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
+    let t0 = std::time::Instant::now();
+    let o = replay::run_child_with(
+        &["/bin/sh".into(), "-c".into(), "sleep 30; :".into()],
+        &env,
+        &r,
+        b"",
+        Duration::from_secs(1),
+        replay::KillMode::NoKillForTest,
+    );
+    assert!(t0.elapsed() < Duration::from_secs(4), "held for {:?}", t0.elapsed());
+    assert!(o.timed_out && o.unreaped, "{o:?}");
+    assert!(!o.survivors.is_empty(), "{o:?}");
+    assert!(o.left_something().is_some());
+    for p in &o.survivors {
+        // SAFETY: kill(2) of this test's own child processes, by exact pid
+        unsafe {
+            libc::kill(*p as libc::pid_t, libc::SIGKILL);
+        }
+    }
     replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
