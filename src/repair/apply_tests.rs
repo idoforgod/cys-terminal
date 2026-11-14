@@ -1981,3 +1981,62 @@ fn an_unsuccessful_put_back_is_never_described_as_done() {
         assert!(!prod.contains(done_sentence), "a success sentence carries an unchecked outcome: {done_sentence}");
     }
 }
+
+// ───────────────────────────── RULINGS DR9 — recovery touches only what no live operation owns ─────────────────────────────
+
+/// DR9: an unfinished operation that a live thread of this process is executing — a hook step
+/// paused after its record (it holds no pack-apply lock by design) or a file operation — is never
+/// resumed or abandoned by recovery; once its owner is gone it is recovered. Without DR9 the tick
+/// re-ran the live hook step / file operation.
+#[cfg(target_os = "macos")]
+#[test]
+fn recovery_never_touches_a_live_operation() {
+    let r = rig("dr9live");
+    // a hook step paused after its record
+    let id = rid("R-38");
+    hook_record(&r, &id, "Stop", "l.sh");
+    lane_row(&r, &id, Vec::new(), Vec::new());
+    let op = OpRecord {
+        schema: 1,
+        op: wal::new_op_id(1.0, "hook-unregister"),
+        repair: id.clone(),
+        lane_key: r.lane.clone(),
+        kind: "hook-unregister".into(),
+        form: "hook".into(),
+        rel: String::new(),
+        pre_existed: false,
+        expected: String::new(),
+        incoming: String::new(),
+        pack_generation: Some(pack_generation(&r.pack)),
+        slot: None,
+        slot_identity: None,
+        live_identity: None,
+        incoming_copy: None,
+        incoming_copy_identity: None,
+        step: "recorded".into(),
+        hooks: vec![wal::HookLine { event: "Stop".into(), script: "l.sh".into(), targets: Vec::new() }],
+        finished: false,
+        outcome: None,
+        note: String::new(),
+        created_at: 1.0,
+        updated_at: 1.0,
+    };
+    wal::write_in(&r.root, &op).unwrap();
+    let ok = |_: &Path, _: bool| -> Result<String, RepairError> { Ok(report_json(&[("Stop", "l.sh", "unregistered", &[])])) };
+    let owner = wal::LiveOp::enter(&op.op);
+    assert_eq!(resume_hook_steps_in(&r.root, &r.pack, &r.lane, &ok, &no_repair_lock, 3.0), 0, "a live hook step is not resumed");
+    assert_eq!(wal::unfinished_for_lane(&r.root, &r.lane).len(), 1);
+    drop(owner);
+    assert_eq!(resume_hook_steps_in(&r.root, &r.pack, &r.lane, &ok, &no_repair_lock, 3.0), 1, "a dead incarnation's step is recovered");
+    // a file operation stopped after its record, still owned
+    let before = r.put("hooks/l2.sh", b"OLD\n", 0o755);
+    let (src, incoming) = r.source("l2-new", b"NEW\n", 0o755);
+    let spec = OpSpec { id: rid("R-39"), rel: "hooks/l2.sh".into(), kind: "revert".into(), expected: before, incoming, source: Some(src), generation: None };
+    let stop = StopOn { rel: "hooks/l2.sh", point: Point::AfterRecord, fired: Cell::new(false) };
+    assert!(run_op(&r.env(&stop, ApplyForm::Exchange), &spec).is_err());
+    let rec = wal::unfinished_for_lane(&r.root, &r.lane).into_iter().next().unwrap();
+    let owner = wal::LiveOp::enter(&rec.op);
+    assert_eq!(resume_interrupted_in(&r.env(&NoFaults, ApplyForm::Exchange)).unwrap(), 0);
+    drop(owner);
+    assert_eq!(resume_interrupted_in(&r.env(&NoFaults, ApplyForm::Exchange)).unwrap(), 1);
+}

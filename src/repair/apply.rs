@@ -408,6 +408,7 @@ fn run_op_depth(env: &OpEnv<'_>, spec: &OpSpec, depth: u8) -> Result<OpDone, Rep
         return Ok(done(ApplyOutcome::Applied, None));
     }
     let op = wal::new_op_id(env.now, &spec.kind);
+    let _live = wal::LiveOp::enter(&op); // DR9: recovery never touches an operation that is running
     match (&spec.expected, &spec.incoming, env.form) {
         (TargetState::Absent, _, _) => op_place(env, spec, &op, &live, &gen),
         (_, TargetState::Absent, _) => op_move_in(env, spec, &op, &live, &gen, depth),
@@ -1174,6 +1175,10 @@ pub fn resume_interrupted_in(env: &OpEnv<'_>) -> Result<u32, RepairError> {
         if rec.form == "hook" {
             continue; // hook records are finished by the hook step's own resume
         }
+        // DR9: an operation a live thread of this process is executing is not "interrupted"
+        let Some(_owned) = wal::LiveOp::try_enter(&rec.op) else {
+            continue;
+        };
         match resume_op(env, rec) {
             Ok(_) => n += 1,
             Err(e) if format!("{e:?}").contains(INJECTED_STOP) => return Err(e),
@@ -2051,6 +2056,10 @@ pub fn recover_apply_intents_in(env: &OpEnv<'_>, locked: &RepairLock<'_>) -> Vec
         if intent.state != "applying" {
             continue;
         }
+        // DR9: an apply running now owns its intent
+        let Some(_owned) = wal::LiveOp::try_enter(&format!("intent:{}", intent.op_tag)) else {
+            continue;
+        };
         match recover_one_intent(env, &mut intent, locked) {
             Ok(line) => lines.push(line),
             Err(e) => lines.push(format!("{}: 끊긴 적용을 정리하지 못했습니다 — 다음 차례에 다시({e:?})", id.as_str())),
@@ -2344,6 +2353,7 @@ pub fn apply_candidate_in(
         created_at: env.now,
         updated_at: env.now,
     };
+    let _live_intent = wal::LiveOp::enter(&format!("intent:{}", op_tag)); // DR9
     if let Err(e) = write_intent(env.root, &intent) {
         return decline(format!("{}: 적용 의도를 기록할 수 없어 아무것도 바꾸지 않았습니다 — {e:?}", id.as_str()));
     }
@@ -2590,6 +2600,7 @@ fn exchange_prepared(
         }
     };
     let op = wal::new_op_id(env.now, &spec.kind);
+    let _live = wal::LiveOp::enter(&op); // DR9
     let mut rec = new_record(env, spec, &op, "exchange", &gen);
     rec.slot = Some(slot.dir.clone());
     rec.slot_identity = Some(slot_identity);
@@ -3432,6 +3443,7 @@ pub fn hook_lines_step_in(
         created_at: now,
         updated_at: now,
     };
+    let _live = wal::LiveOp::enter(&op.op); // DR9: owned until the step returns
     wal::write_in(root, &op)?;
     finish_hook_op(root, pack, &rec, &mut op, registrar, now)
 }
@@ -3488,6 +3500,10 @@ pub fn resume_hook_steps_in(
 ) -> u32 {
     let mut n = 0;
     for mut op in wal::unfinished_for_lane(root, lane).into_iter().filter(|r| r.form == "hook") {
+        // DR9: a hook step running now (it holds no pack-apply lock by design) is never resumed
+        let Some(_owned) = wal::LiveOp::try_enter(&op.op) else {
+            continue;
+        };
         let Ok(Some(rec)) = ledger::read_record_in(root, &op.repair) else {
             continue;
         };
