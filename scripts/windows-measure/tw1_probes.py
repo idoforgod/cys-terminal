@@ -71,6 +71,20 @@ if IS_WIN:
     _ver.GetFileVersionInfoSizeW.argtypes = [wt.LPCWSTR, ctypes.POINTER(wt.DWORD)]
     _ver.GetFileVersionInfoW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p]
     _ver.VerQueryValueW.argtypes = [ctypes.c_void_p, wt.LPCWSTR, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wt.UINT)]
+    _k32.CreateFileW.restype = wt.HANDLE
+    _k32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p, wt.DWORD, wt.DWORD, wt.HANDLE]
+    _k32.MoveFileExW.argtypes = [wt.LPCWSTR, wt.LPCWSTR, wt.DWORD]
+    _k32.CreateHardLinkW.argtypes = [wt.LPCWSTR, wt.LPCWSTR, ctypes.c_void_p]
+    _k32.FlushFileBuffers.argtypes = [wt.HANDLE]
+    _k32.GetFinalPathNameByHandleW.argtypes = [wt.HANDLE, wt.LPWSTR, wt.DWORD, wt.DWORD]
+
+    class _BHFI(ctypes.Structure):
+        _fields_ = [("dwFileAttributes", wt.DWORD), ("ftCreationTime", wt.FILETIME), ("ftLastAccessTime", wt.FILETIME),
+                    ("ftLastWriteTime", wt.FILETIME), ("dwVolumeSerialNumber", wt.DWORD), ("nFileSizeHigh", wt.DWORD),
+                    ("nFileSizeLow", wt.DWORD), ("nNumberOfLinks", wt.DWORD), ("nFileIndexHigh", wt.DWORD),
+                    ("nFileIndexLow", wt.DWORD)]
+
+    _k32.GetFileInformationByHandle.argtypes = [wt.HANDLE, ctypes.POINTER(_BHFI)]
 
 
 # ───────────────────────────── small helpers ─────────────────────────────
@@ -1710,6 +1724,269 @@ def probe_s3_siblings(pr):
     pr.restored = True
 
 
+# ───────────────────────────── S7 — OS primitives (scratch folder; the installed bash / Python as holders) ─────────────────────────────
+
+_GR, _GW = 0x80000000, 0x40000000
+_LIST_DIR, _SYNC = 0x0001, 0x00100000
+_SR, _SW, _SD = 1, 2, 4
+_OPEN_EXISTING, _CREATE_ALWAYS = 3, 2
+_BACKUP, _REPARSE = 0x02000000, 0x00200000
+_REPLACE = 0x1
+
+
+def _open_h(path, access, share, disp=_OPEN_EXISTING, flags=0):
+    h = _k32.CreateFileW(path, access, share, None, disp, flags, None)
+    err = ctypes.get_last_error()
+    return (None if h in (None, wt.HANDLE(-1).value) else h), err
+
+
+def _move(src, dst, flags=0):
+    ok = bool(_k32.MoveFileExW(src, dst, flags))
+    return {"ok": ok, "error": 0 if ok else ctypes.get_last_error()}
+
+
+def _wait_dead(pid, limit):
+    t0 = time.time()
+    while alive(pid) and time.time() - t0 < limit:
+        time.sleep(0.5)
+    if alive(pid):
+        kill_tree(pid)
+
+
+def probe_s7_primitives(pr):
+    """G06, G16.prim (+ the 50 two-move gaps), EC2.prim, EC4.prim, T7C.prim, G09.flush, G09.kill - observations only."""
+    f = pr.facts
+    root = os.path.join(pr.work, "prim")
+    os.makedirs(root, exist_ok=True)
+    bash, py = pr.bundled_hook_bash(), pr.bundled_python()
+    f["prim_runtime_found"] = os.path.isfile(bash) and os.path.isfile(py)
+    if not f["prim_runtime_found"]:
+        return
+    log = {}
+    # ── G06: a running Git Bash script / an imported Python module, renamed, rewritten in place, replaced ──
+    d = os.path.join(root, "g06")
+    os.makedirs(d, exist_ok=True)
+    body = b"echo L1\nsleep 4\necho L2\nsleep 4\necho L3\n"
+    alt = b"echo X1\nsleep 4\necho X2\nsleep 4\necho X3\n"
+    for case in ("a_rename", "b_rewrite", "c_move_in"):
+        h = os.path.join(d, case + ".sh")
+        write_bytes(h, body)
+        out = os.path.join(d, case + ".out")
+        pid = start_detached([bash, h.replace("\\", "/")], env=clean_env(), stdout_path=out)
+        pr.register_pid(pid, "g06 " + case)
+        time.sleep(1.5)
+        if case == "a_rename":
+            r = _move(h, h + ".aside")
+        elif case == "b_rewrite":
+            try:
+                with open(h, "r+b") as fh:
+                    fh.write(alt)
+                r = {"ok": True, "error": 0}
+            except OSError as e:
+                r = {"ok": False, "error": getattr(e, "winerror", None) or e.errno}
+        else:
+            write_bytes(h + ".new", alt)
+            r = _move(h + ".new", h, _REPLACE)
+        _wait_dead(pid, 20)
+        pr.unregister_pid(pid)
+        printed = (read_text(out) or "").split()
+        f["g06_%s_ok" % case] = r["ok"]
+        f["g06_%s_error" % case] = r["error"]
+        f["g06_%s_printed" % case] = printed
+        log[case] = {"action": r, "printed": printed}
+    mod = os.path.join(d, "tw1mod.py")
+    for case in ("d_rename", "e_move_in", "f_rewrite"):
+        write_bytes(mod, b"def v():\n    return 'old'\n")
+        out = os.path.join(d, case + ".pyout")
+        code = ("import sys,time\nsys.path.insert(0, r'%s')\nimport tw1mod\n"
+                "for i in range(10):\n print(tw1mod.v(), flush=True)\n time.sleep(1)\n") % d
+        pid = start_detached([py, "-B", "-c", code], env=clean_env(), stdout_path=out)
+        pr.register_pid(pid, "g06 " + case)
+        time.sleep(2)
+        if case == "d_rename":
+            r = _move(mod, mod + ".aside")
+        elif case == "e_move_in":
+            write_bytes(mod + ".new", b"def v():\n    return 'new'\n")
+            r = _move(mod + ".new", mod, _REPLACE)
+        else:
+            try:
+                write_bytes(mod, b"def v():\n    return 'rew'\n")
+                r = {"ok": True, "error": 0}
+            except OSError as e:
+                r = {"ok": False, "error": getattr(e, "winerror", None) or e.errno}
+        _wait_dead(pid, 20)
+        pr.unregister_pid(pid)
+        printed = (read_text(out) or "").split()
+        f["g06_%s_ok" % case] = r["ok"]
+        f["g06_%s_kept_old_code" % case] = bool(printed) and printed[-1] == "old"
+        log[case] = {"action": r, "printed": printed}
+        if os.path.exists(mod + ".aside"):
+            os.replace(mod + ".aside", mod)
+    c = os.path.join(d, "ctl.sh")
+    write_bytes(c, body)
+    f["g06_ctl_rename_ok"] = _move(c, c + ".aside")["ok"]
+    write_bytes(c + ".new", alt)
+    f["g06_ctl_move_in_ok"] = _move(c + ".new", c + ".aside", _REPLACE)["ok"]
+    # ── G16.prim: the deposit-first form on held files; the empty gap; EC2.prim: no-replace onto an existing name ──
+    d = os.path.join(root, "g16")
+    vault = os.path.join(d, "vault")
+    os.makedirs(vault, exist_ok=True)
+
+    def deposit_first(live, new, tag):
+        slot = os.path.join(vault, "%s-%d" % (tag, time.perf_counter_ns()))
+        m1 = _move(live, slot, 0)
+        m2 = _move(new, live, 0) if m1["ok"] else {"ok": False, "error": None, "skipped": True}
+        return {"move_live_to_vault": m1, "place_new": m2, "live_exists": os.path.exists(live),
+                "vault_has_old": os.path.exists(slot)}
+
+    live_b = os.path.join(d, "held-bash.sh")
+    write_bytes(live_b, b"echo live\n")
+    hb = start_detached([bash, "-c", 'exec 3< "%s"; sleep 60' % live_b.replace("\\", "/")], env=clean_env())
+    live_p = os.path.join(d, "held-py.py")
+    write_bytes(live_p, b"x = 1\n")
+    hp = start_detached([py, "-B", "-c", "import time\nf=open(r'%s','rb')\ntime.sleep(60)\n" % live_p], env=clean_env())
+    for x in (hb, hp):
+        pr.register_pid(x, "g16 holder")
+    live_s = os.path.join(d, "held-shareread.txt")
+    write_bytes(live_s, b"live\n")
+    h3, _ = _open_h(live_s, _GR, _SR)
+    time.sleep(2)
+    for tag, live in (("bash", live_b), ("python", live_p), ("shareread", live_s)):
+        write_bytes(live + ".incoming", b"new content\n")
+        r = deposit_first(live, live + ".incoming", tag)
+        f["g16_%s_deposit_ok" % tag] = r["move_live_to_vault"]["ok"]
+        f["g16_%s_error" % tag] = r["move_live_to_vault"]["error"]
+        f["g16_%s_nothing_lost" % tag] = r["live_exists"] or r["vault_has_old"]
+        log["g16_" + tag] = r
+    if h3:
+        _k32.CloseHandle(h3)
+    for x in (hb, hp):
+        kill_tree(x)
+        pr.unregister_pid(x)
+    lc = os.path.join(d, "unheld.txt")
+    write_bytes(lc, b"live\n")
+    write_bytes(lc + ".incoming", b"new\n")
+    rc = deposit_first(lc, lc + ".incoming", "ctl")
+    f["g16_ctl_deposit_ok"] = rc["move_live_to_vault"]["ok"] and rc["place_new"]["ok"]
+    gaps = []
+    gl = os.path.join(d, "gap.txt")
+    write_bytes(gl, b"v0\n")
+    for i in range(50):
+        write_bytes(gl + ".n", b"v%d\n" % (i + 1))
+        a = _move(gl, os.path.join(vault, "gap-%d" % i), 0)
+        t2 = time.perf_counter_ns()
+        b = _move(gl + ".n", gl, 0)
+        t3 = time.perf_counter_ns()
+        if a["ok"] and b["ok"]:
+            gaps.append(round((t3 - t2) / 1000.0, 1))
+    f["g16_gap_runs"] = len(gaps)
+    f["g16_gap_us"] = ({"min": min(gaps), "median": sorted(gaps)[len(gaps) // 2], "max": max(gaps)} if gaps else None)
+    tgt, src = os.path.join(d, "occupied.txt"), os.path.join(d, "placing.txt")
+    write_bytes(tgt, b"occupant\n")
+    write_bytes(src, b"placing\n")
+    r = _move(src, tgt, 0)
+    f["ec2_noreplace_ok"] = r["ok"]
+    f["ec2_noreplace_error"] = r["error"]
+    f["ec2_target_unchanged"] = read_bytes(tgt) == b"occupant\n"
+    f["ec2_source_kept"] = read_bytes(src) == b"placing\n"
+    f["ec2_ctl_free_ok"] = _move(src, os.path.join(d, "free-name.txt"), 0)["ok"]
+    # ── EC4.prim: facts from the open handle ──
+    d = os.path.join(root, "ec4")
+    os.makedirs(os.path.join(d, "real"), exist_ok=True)
+    a = os.path.join(d, "ledger.jsonl")
+    write_bytes(a, b"{}\n")
+    f["ec4_hardlink_created"] = bool(_k32.CreateHardLinkW(os.path.join(d, "alias.jsonl"), a, None))
+
+    def links(p):
+        h, _e = _open_h(p, _GR, _SR | _SW | _SD)
+        if not h:
+            return None
+        try:
+            info = _BHFI()
+            return int(info.nNumberOfLinks) if _k32.GetFileInformationByHandle(h, ctypes.byref(info)) else None
+        finally:
+            _k32.CloseHandle(h)
+
+    f["ec4_links_hardlinked"] = links(a)
+    single = os.path.join(d, "single.jsonl")
+    write_bytes(single, b"{}\n")
+    f["ec4_links_single"] = links(single)
+    write_bytes(os.path.join(d, "real", "x.txt"), b"x\n")
+    j = os.path.join(d, "junction")
+    mk = run(["cmd", "/c", "mklink", "/J", j, os.path.join(d, "real")], 30)
+    f["ec4_junction_created"] = mk["code"] == 0 and os.path.isdir(j)
+    final = None
+    h, _e = _open_h(os.path.join(j, "x.txt"), _GR, _SR | _SW | _SD)
+    if h:
+        buf = ctypes.create_unicode_buffer(32768)
+        n = _k32.GetFinalPathNameByHandleW(h, buf, 32768, 0)
+        final = buf.value if n else None
+        _k32.CloseHandle(h)
+    f["ec4_final_path_resolves_junction"] = bool(final) and "\\junction\\" not in final.lower() and final.lower().endswith("\\real\\x.txt")
+    run(["cmd", "/c", "rmdir", j], 30)
+    # ── T7C.prim: a folder held without FILE_SHARE_DELETE (RULINGS DB3's share mode) ──
+    held = os.path.join(root, "t7c", "store")
+    os.makedirs(held, exist_ok=True)
+    h, err = _open_h(held, _LIST_DIR | _SYNC, _SR | _SW, _OPEN_EXISTING, _BACKUP | _REPARSE)
+    f["t7c_held"] = h is not None
+    if h:
+        try:
+            p = os.path.join(held, "copy.tmp")
+            try:
+                write_bytes(p, b"c\n")
+                f["t7c_create_inside_ok"] = True
+            except OSError:
+                f["t7c_create_inside_ok"] = False
+            f["t7c_move_inside_ok"] = _move(p, os.path.join(held, "copy.bin"), 0)["ok"]
+            r = _move(held, held + "-renamed", 0)
+            f["t7c_rename_held_folder_ok"] = r["ok"]
+            f["t7c_rename_held_folder_error"] = r["error"]
+        finally:
+            _k32.CloseHandle(h)
+    if os.path.isdir(held + "-renamed"):
+        os.replace(held + "-renamed", held)
+    f["t7c_ctl_rename_unheld_ok"] = _move(held, held + "-renamed", 0)["ok"]
+    # ── G09.flush: FlushFileBuffers on a file and on a directory (RULINGS EC7) ──
+    d = os.path.join(root, "g09")
+    os.makedirs(d, exist_ok=True)
+    h, _e = _open_h(os.path.join(d, "file.bin"), _GW, _SR, _CREATE_ALWAYS, 0)
+    f["g09_file_flush_ok"] = bool(h and _k32.FlushFileBuffers(h))
+    f["g09_file_flush_error"] = 0 if f["g09_file_flush_ok"] else ctypes.get_last_error()
+    if h:
+        _k32.CloseHandle(h)
+    hd, err = _open_h(d, _GW, _SR | _SW | _SD, _OPEN_EXISTING, _BACKUP)
+    f["g09_dir_open_for_flush"] = hd is not None
+    f["g09_dir_open_error"] = 0 if hd else err
+    f["g09_dir_flush_ok"] = None
+    if hd:
+        f["g09_dir_flush_ok"] = bool(_k32.FlushFileBuffers(hd))
+        f["g09_dir_flush_error"] = 0 if f["g09_dir_flush_ok"] else ctypes.get_last_error()
+        _k32.CloseHandle(hd)
+    # ── G09.kill: a writer killed mid-record (process death only - NOT a power loss) ──
+    torn = {"flush": 0, "noflush": 0}
+    for mode in ("flush", "noflush"):
+        for i in range(10):
+            led = os.path.join(d, "%s-%d.jsonl" % (mode, i))
+            code = ("import json,os\nf=open(r'%s','ab')\nn=0\nwhile True:\n"
+                    " f.write((json.dumps({'n':n,'pad':'x'*200})+'\\n').encode())\n%s n+=1\n") % (
+                led, " f.flush(); os.fsync(f.fileno())\n" if mode == "flush" else "")
+            wp = subprocess.Popen([py, "-B", "-c", code], env=clean_env(),
+                                  creationflags=CREATE_NO_WINDOW if IS_WIN else 0)
+            time.sleep(0.3 + 0.07 * i)
+            wp.kill()
+            wp.wait(10)
+            lines = (read_bytes(led) or b"").split(b"\n")
+            for ln in lines[:-1]:
+                try:
+                    json.loads(ln)
+                except ValueError:
+                    torn[mode] += 1
+    f["g09_kill_torn_flush"] = torn["flush"]
+    f["g09_kill_torn_noflush"] = torn["noflush"]
+    pr.ev("primitives.json", log)
+    pr.restored = True
+
+
 # ───────────────────────────── S6 — G01 variants (each on a fresh base) ─────────────────────────────
 
 def _kill_product(install_dir):
@@ -1864,5 +2141,6 @@ PROBES = {
     "s3_intake": probe_s3_intake,
     "s3_listen": probe_s3_listen,
     "s3_siblings": probe_s3_siblings,
+    "s7_primitives": probe_s7_primitives,
     "s6_variants": probe_s6_variants,
 }

@@ -144,6 +144,7 @@
   "s3_intake",
   "s3_listen",
   "s3_siblings",
+  "s7_primitives",
   "s6_variants"
  ],
  "probes": {
@@ -250,6 +251,14 @@
    "leaves_state": "same",
    "read_only": true,
    "does": "conclusions of the other workflow runs at this commit (REST)"
+  },
+  "s7_primitives": {
+   "stage": "S7",
+   "time_limit_s": 600,
+   "requires_state": "any",
+   "leaves_state": "same",
+   "read_only": true,
+   "does": "OS primitives in a scratch folder with the installed bash / Python as holders: G06, G16.prim, EC2.prim, EC4.prim, T7C.prim, G09.flush, G09.kill"
   },
   "s6_variants": {
    "stage": "S6",
@@ -1015,12 +1024,103 @@
    "id": "G06",
    "group": "gate",
    "kind": "record",
-   "probe": null,
+   "probe": "s7_primitives",
    "title": "Git Bash running a hook that is renamed / rewritten in place; Python file replaced while imported",
    "source": "design 8-2 #6 (line 1286); WIN-16 WIN-06",
    "expected": "record per action; control: un-held files",
+   "checks": [
+    {
+     "id": "runtime",
+     "role": "complete",
+     "fact": "prim_runtime_found",
+     "op": "true"
+    },
+    {
+     "id": "g06-a_rename",
+     "role": "check",
+     "fact": "g06_a_rename_ok",
+     "op": "present"
+    },
+    {
+     "id": "g06-b_rewrite",
+     "role": "check",
+     "fact": "g06_b_rewrite_ok",
+     "op": "present"
+    },
+    {
+     "id": "g06-c_move_in",
+     "role": "check",
+     "fact": "g06_c_move_in_ok",
+     "op": "present"
+    },
+    {
+     "id": "g06-d_rename",
+     "role": "check",
+     "fact": "g06_d_rename_ok",
+     "op": "present"
+    },
+    {
+     "id": "g06-e_move_in",
+     "role": "check",
+     "fact": "g06_e_move_in_ok",
+     "op": "present"
+    },
+    {
+     "id": "g06-f_rewrite",
+     "role": "check",
+     "fact": "g06_f_rewrite_ok",
+     "op": "present"
+    },
+    {
+     "id": "g06-a_rename-printed",
+     "role": "check",
+     "fact": "g06_a_rename_printed",
+     "op": "present"
+    },
+    {
+     "id": "g06-b_rewrite-printed",
+     "role": "check",
+     "fact": "g06_b_rewrite_printed",
+     "op": "present"
+    },
+    {
+     "id": "g06-c_move_in-printed",
+     "role": "check",
+     "fact": "g06_c_move_in_printed",
+     "op": "present"
+    },
+    {
+     "id": "g06-d_rename-oldcode",
+     "role": "check",
+     "fact": "g06_d_rename_kept_old_code",
+     "op": "present"
+    },
+    {
+     "id": "g06-e_move_in-oldcode",
+     "role": "check",
+     "fact": "g06_e_move_in_kept_old_code",
+     "op": "present"
+    },
+    {
+     "id": "g06-f_rewrite-oldcode",
+     "role": "check",
+     "fact": "g06_f_rewrite_kept_old_code",
+     "op": "present"
+    },
+    {
+     "id": "ctl-rename",
+     "role": "control",
+     "fact": "g06_ctl_rename_ok",
+     "op": "true"
+    },
+    {
+     "id": "ctl-move-in",
+     "role": "control",
+     "fact": "g06_ctl_move_in_ok",
+     "op": "true"
+    }
+   ],
    "phase": 1,
-   "checks": [],
    "class": "YES"
   },
   {
@@ -1079,21 +1179,68 @@
    "subrows": [
     {
      "id": "G09.flush",
-     "probe": null,
-     "title": "FlushFileBuffers on a file and on a directory handle on NTFS (stage S7)",
+     "kind": "record",
+     "probe": "s7_primitives",
+     "title": "FlushFileBuffers on a file and on a directory handle on NTFS (the fact RULINGS EC7 relies on)",
+     "checks": [
+      {
+       "id": "file",
+       "role": "check",
+       "fact": "g09_file_flush_ok",
+       "op": "present"
+      },
+      {
+       "id": "dir-open",
+       "role": "check",
+       "fact": "g09_dir_open_for_flush",
+       "op": "present"
+      },
+      {
+       "id": "dir-flush",
+       "role": "check",
+       "fact": "g09_dir_flush_ok",
+       "op": "present"
+      },
+      {
+       "id": "file-flush-works",
+       "role": "control",
+       "fact": "g09_file_flush_ok",
+       "op": "true",
+       "text": "a file flush succeeds (the probe can call it)"
+      }
+     ],
      "class": "YES",
-     "kind": "assert",
-     "phase": 1,
-     "checks": []
+     "phase": 1
     },
     {
      "id": "G09.kill",
-     "probe": null,
-     "title": "a writer killed mid-record leaves a parsable ledger (stage S7)",
+     "probe": "s7_primitives",
+     "title": "a writer killed mid-record leaves every completed line parsable (process death only, not a power loss)",
+     "checks": [
+      {
+       "id": "runtime",
+       "role": "complete",
+       "fact": "prim_runtime_found",
+       "op": "true"
+      },
+      {
+       "id": "flush",
+       "role": "check",
+       "fact": "g09_kill_torn_flush",
+       "op": "eq",
+       "value": 0
+      },
+      {
+       "id": "noflush",
+       "role": "check",
+       "fact": "g09_kill_torn_noflush",
+       "op": "eq",
+       "value": 0
+      }
+     ],
      "class": "YES",
      "kind": "assert",
-     "phase": 1,
-     "checks": []
+     "phase": 1
     }
    ],
    "kind": "assert",
@@ -1231,13 +1378,78 @@
    "subrows": [
     {
      "id": "G16.prim",
-     "why": "Defender holder depends on D8",
-     "probe": null,
-     "title": "MoveFileExW without REPLACE_EXISTING on held files + 50 two-move gaps (stage S7)",
+     "why": "the Defender holder is not built (a FileShare.Read handle stands for the antivirus class)",
+     "kind": "record",
+     "probe": "s7_primitives",
+     "title": "the deposit-first form (live -> vault slot, new -> live without replace) on files held by Git Bash, Python, a FileShare.Read handle; 50 un-held two-move gaps",
+     "checks": [
+      {
+       "id": "runtime",
+       "role": "complete",
+       "fact": "prim_runtime_found",
+       "op": "true"
+      },
+      {
+       "id": "g16-bash",
+       "role": "check",
+       "fact": "g16_bash_deposit_ok",
+       "op": "present"
+      },
+      {
+       "id": "g16-python",
+       "role": "check",
+       "fact": "g16_python_deposit_ok",
+       "op": "present"
+      },
+      {
+       "id": "g16-shareread",
+       "role": "check",
+       "fact": "g16_shareread_deposit_ok",
+       "op": "present"
+      },
+      {
+       "id": "g16-bash-lost",
+       "role": "check",
+       "fact": "g16_bash_nothing_lost",
+       "op": "true",
+       "text": "whatever the move answered, the live bytes exist at the live name or in the vault (design 4-9 Windows form)"
+      },
+      {
+       "id": "g16-python-lost",
+       "role": "check",
+       "fact": "g16_python_nothing_lost",
+       "op": "true",
+       "text": "whatever the move answered, the live bytes exist at the live name or in the vault (design 4-9 Windows form)"
+      },
+      {
+       "id": "g16-shareread-lost",
+       "role": "check",
+       "fact": "g16_shareread_nothing_lost",
+       "op": "true",
+       "text": "whatever the move answered, the live bytes exist at the live name or in the vault (design 4-9 Windows form)"
+      },
+      {
+       "id": "gaps",
+       "role": "check",
+       "fact": "g16_gap_runs",
+       "op": "ge",
+       "value": 40
+      },
+      {
+       "id": "gap-dist",
+       "role": "check",
+       "fact": "g16_gap_us",
+       "op": "not_none"
+      },
+      {
+       "id": "ctl-unheld",
+       "role": "control",
+       "fact": "g16_ctl_deposit_ok",
+       "op": "true"
+      }
+     ],
      "class": "PARTLY",
-     "kind": "assert",
-     "phase": 1,
-     "checks": []
+     "phase": 1
     },
     {
      "id": "G16.product",
@@ -2640,12 +2852,38 @@
    "subrows": [
     {
      "id": "EC2.prim",
-     "probe": null,
-     "title": "MoveFileExW without REPLACE_EXISTING (stage S7)",
+     "probe": "s7_primitives",
+     "title": "MoveFileExW without REPLACE_EXISTING onto an existing name refuses and changes nothing",
+     "checks": [
+      {
+       "id": "refused",
+       "role": "check",
+       "fact": "ec2_noreplace_ok",
+       "op": "false"
+      },
+      {
+       "id": "target",
+       "role": "check",
+       "fact": "ec2_target_unchanged",
+       "op": "true"
+      },
+      {
+       "id": "source",
+       "role": "check",
+       "fact": "ec2_source_kept",
+       "op": "true"
+      },
+      {
+       "id": "ctl-free",
+       "role": "control",
+       "fact": "ec2_ctl_free_ok",
+       "op": "true",
+       "text": "onto a free name the same call succeeds"
+      }
+     ],
      "class": "YES",
      "kind": "assert",
-     "phase": 1,
-     "checks": []
+     "phase": 1
     },
     {
      "id": "EC2.product",
@@ -2677,12 +2915,46 @@
    "subrows": [
     {
      "id": "EC4.prim",
-     "probe": null,
-     "title": "GetFileInformationByHandle / GetFinalPathNameByHandleW (stage S7)",
+     "probe": "s7_primitives",
+     "title": "the link count and the final path taken from the open handle",
+     "checks": [
+      {
+       "id": "hardlink",
+       "role": "complete",
+       "fact": "ec4_hardlink_created",
+       "op": "true"
+      },
+      {
+       "id": "junction",
+       "role": "complete",
+       "fact": "ec4_junction_created",
+       "op": "true"
+      },
+      {
+       "id": "links-2",
+       "role": "check",
+       "fact": "ec4_links_hardlinked",
+       "op": "eq",
+       "value": 2
+      },
+      {
+       "id": "single-1",
+       "role": "control",
+       "fact": "ec4_links_single",
+       "op": "eq",
+       "value": 1,
+       "text": "a file with one name reads 1"
+      },
+      {
+       "id": "final-path",
+       "role": "check",
+       "fact": "ec4_final_path_resolves_junction",
+       "op": "true"
+      }
+     ],
      "class": "YES",
      "kind": "assert",
-     "phase": 1,
-     "checks": []
+     "phase": 1
     },
     {
      "id": "EC4.product",
@@ -2730,12 +3002,65 @@
    "subrows": [
     {
      "id": "T7C.prim",
-     "probe": null,
-     "title": "a folder held without FILE_SHARE_DELETE (stage S7)",
+     "kind": "record",
+     "probe": "s7_primitives",
+     "title": "a folder held without FILE_SHARE_DELETE (T7c's share mode)",
+     "checks": [
+      {
+       "id": "held",
+       "role": "complete",
+       "fact": "t7c_held",
+       "op": "true"
+      },
+      {
+       "id": "create",
+       "role": "check",
+       "fact": "t7c_create_inside_ok",
+       "op": "present"
+      },
+      {
+       "id": "move",
+       "role": "check",
+       "fact": "t7c_move_inside_ok",
+       "op": "present"
+      },
+      {
+       "id": "rename",
+       "role": "check",
+       "fact": "t7c_rename_held_folder_ok",
+       "op": "present"
+      },
+      {
+       "id": "ctl-unheld",
+       "role": "control",
+       "fact": "t7c_ctl_rename_unheld_ok",
+       "op": "true",
+       "text": "the same folder un-held can be renamed"
+      },
+      {
+       "id": "asm-inside",
+       "role": "assumption",
+       "fact": "t7c_move_inside_ok",
+       "op": "true",
+       "assumption": "reports/T7c-report.md DB3 (INFERRED): creating files and MoveFileExW renames inside a folder held this way succeed"
+      },
+      {
+       "id": "asm-create",
+       "role": "assumption",
+       "fact": "t7c_create_inside_ok",
+       "op": "true",
+       "assumption": "reports/T7c-report.md DB3 (INFERRED): files can be created inside the held folder"
+      },
+      {
+       "id": "asm-locked",
+       "role": "assumption",
+       "fact": "t7c_rename_held_folder_ok",
+       "op": "false",
+       "assumption": "reports/T7c-report.md DB3: while the capture holds them no other process can rename those folders"
+      }
+     ],
      "class": "YES",
-     "kind": "assert",
-     "phase": 1,
-     "checks": []
+     "phase": 1
     },
     {
      "id": "T7C.capture",
@@ -2909,13 +3234,26 @@
   {
    "id": "R-T2G-DIRFLUSH",
    "group": "report",
-   "probe": null,
+   "probe": "s7_primitives",
+   "kind": "record",
+   "checks": [
+    {
+     "id": "dir-open",
+     "role": "check",
+     "fact": "g09_dir_open_for_flush",
+     "op": "present"
+    },
+    {
+     "id": "dir-flush",
+     "role": "check",
+     "fact": "g09_dir_flush_ok",
+     "op": "present"
+    }
+   ],
    "title": "'durable includes the name' on NTFS (directory flush)",
    "source": "reports/T2g-report.md; RULINGS EC7",
    "why": "the product leg is T2g / T2h; the primitive is G09.flush (stage S7)",
-   "kind": "assert",
    "phase": 1,
-   "checks": [],
    "class": "PARTLY"
   },
   {
