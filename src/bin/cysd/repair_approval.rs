@@ -127,6 +127,8 @@ pub(crate) struct ApprovalTable {
     pub(crate) restart_resolved: bool,
     /// RULINGS EL5: the repairs whose unknown approval was already reported (one finding each).
     pub(crate) unknown_reported: std::collections::BTreeSet<String>,
+    /// RULINGS EO5 (b): (repair, candidate fingerprint) whose escape refusal the owner was told of.
+    pub(crate) escape_told: std::collections::BTreeSet<(String, String)>,
 }
 
 impl ApprovalTable {
@@ -189,8 +191,9 @@ pub(crate) struct Step3Input {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Step3Err {
     pub why: String,
-    /// RULINGS DE1 / BK1: a refusal by the after-run comparison files ONE intake row (file, line) …
-    pub intake: Option<(String, String)>,
+    /// RULINGS DE1 / BK1 / EO5: the intake rows of the comparison — its refusal's ONE row, and a noted
+    /// difference's row (never dropped when step 3 later fails) …
+    pub intake: Vec<(String, String)>,
     /// … and the owner's one line, through the lane master — nothing more, never per tick.
     pub owner_line: Option<String>,
 }
@@ -219,7 +222,7 @@ impl Step3Err {
                 "수리 {} 의 제출 검사에서 예행이 실제 환경을 건드려 후보를 돌려보냈습니다 — {line}",
                 repair.as_str()
             )),
-            intake: Some((rel.to_string(), line.clone())),
+            intake: vec![(rel.to_string(), line.clone())],
             why: line,
         }
     }
@@ -828,12 +831,20 @@ pub(crate) fn run_step3(
                 RepairState::InProgress,
                 RecApproval::Keep,
             );
-            // RULINGS DE1: the comparison's refusal — ONE intake row and the owner's one line
-            if let Some((file, line)) = &err.intake {
+            // RULINGS DE1: the comparison's rows (its refusal's ONE row, a noted difference's row)
+            for (file, line) in &err.intake {
                 eff.intake(file, line);
             }
+            // EO5 (b): the owner's line for an escape refusal — once per (repair, candidate fingerprint)
             if let Some(line) = err.owner_line {
-                eff.tell_master(line);
+                let first = {
+                    let mut tbl = table.lock().unwrap_or_else(|e| e.into_inner());
+                    tbl.escape_told
+                        .insert((s3.repair.as_str().to_string(), cys::repair::fingerprint(&s3.states)))
+                };
+                if first {
+                    eff.tell_master(line);
+                }
             }
         }
         Ok(ok) => {
@@ -976,21 +987,31 @@ pub(crate) fn production_step3_with(
         }
         Comparison::Clean => {}
     }
-    let mut summary = rehearsed.map_err(|(why, _)| Step3Err::from(why))?;
+    // EO5 (a): a noted difference stays on its intake row even when step 3 fails after it
+    let with_found = |mut e: Step3Err| {
+        e.intake.extend(found.iter().cloned());
+        e
+    };
+    let mut summary = rehearsed.map_err(|(why, _)| with_found(Step3Err::from(why)))?;
     // (b) the protection screen (C4 — every boot-critical and protection-related submit, AT2)
     let cand = ScreenCandidate {
         files: staging.clone(),
         targets: s3.states.clone(),
     };
     let left = STEP3_DEADLINE.saturating_sub(started.elapsed());
-    let rep = screen::screen_protections(&cand, &s3.pack, left)
-        .map_err(|e| Step3Err::from(format!("보호장치 심사를 끝내지 못했습니다 — {e:?}")))?;
+    let rep = screen::screen_protections(&cand, &s3.pack, left).map_err(|e| {
+        with_found(Step3Err::from(format!(
+            "보호장치 심사를 끝내지 못했습니다 — {e:?}"
+        )))
+    })?;
     // RULINGS DE1: a refusal by the screen's own after-run comparison has the same consequences
     if let Some(line) = screen::after_run_refusal(&rep) {
-        return Err(Step3Err::escaped(&s3.repair, &first_rel, line));
+        return Err(with_found(Step3Err::escaped(&s3.repair, &first_rel, line)));
     }
     if rep.verdict == ScreenVerdict::Refused {
-        return Err(format!("보호장치 심사 거부 — {}", rep.refusals.join(" / ")).into());
+        return Err(with_found(
+            format!("보호장치 심사 거부 — {}", rep.refusals.join(" / ")).into(),
+        ));
     }
     // RULINGS CZ5: recorded only while the live inputs still match what the screen tested
     notes.extend(rep.notes.iter().cloned());
@@ -2076,6 +2097,45 @@ pub(crate) fn route(
         }
         e
     }))
+}
+
+/// RULINGS EO5 (a) / DE1: what the scoped after-run comparison around the worker's `check` found has
+/// the same consequences as in step 3 — ONE intake row (a noted difference too) and, for a refusal, the
+/// lane master's ONE line — the line once per (file, live state) (EO5 (b)). Filed on its own thread:
+/// the check may run under a repair lock that the intake verb would wait for.
+pub(crate) fn comparison_consequence(
+    daemon: &Arc<Daemon>,
+    rel: &str,
+    live: &std::path::Path,
+    c: &cys::repair::rehearsal::Comparison,
+) {
+    use cys::repair::rehearsal::Comparison;
+    static TOLD: std::sync::OnceLock<Mutex<std::collections::BTreeSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    let (line, refused) = match c {
+        Comparison::Clean => return,
+        Comparison::Noted(l) => (l.clone(), false),
+        Comparison::Refused(l) => (l.clone(), true),
+    };
+    let state = TargetState::read(live)
+        .map(|s| s.canon())
+        .unwrap_or_default();
+    let tell = refused
+        && TOLD
+            .get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+            .lock()
+            .map(|mut t| t.insert((rel.to_string(), state)))
+            .unwrap_or(true);
+    let (d, rel) = (daemon.clone(), rel.to_string());
+    let _ = spawn_thread("check-compared", move || {
+        crate::repair::file_intake(&d, &rel, &line);
+        if tell {
+            let eff = DaemonEffects { daemon: d.clone() };
+            eff.tell_master(format!(
+                "{rel} 의 검사(`check`)에서 예행이 실제 환경을 건드려 검사를 통과시키지 않았습니다 — {line}"
+            ));
+        }
+    });
 }
 
 /// RULINGS DF3: the repairs of `lane` whose owner HAS A CARD now — a request past step 3 whose

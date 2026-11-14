@@ -917,7 +917,7 @@ fn comparison_refusal_files_one_intake_row_and_one_owner_line() {
     let eff = effects();
     *eff.step3_err.lock().unwrap() = Some(Step3Err {
         why: "예행이 실제 환경의 항목을 다시 썼습니다(x)".into(),
-        intake: Some(("hooks/h.sh".into(), "예행이 실제 환경의 항목을 다시 썼습니다(x)".into())),
+        intake: vec![("hooks/h.sh".into(), "예행이 실제 환경의 항목을 다시 썼습니다(x)".into())],
         owner_line: Some("수리 R-1 … 돌려보냈습니다".into()),
     });
     let rid = pending(&r, &t, &eff, T0);
@@ -928,6 +928,26 @@ fn comparison_refusal_files_one_intake_row_and_one_owner_line() {
     sweep(&r.ctx(T0 + 2000.0), &t, &eff);
     assert_eq!(eff.intake.lock().unwrap().len(), 1, "never again per tick");
     assert_eq!(eff.master.lock().unwrap().len(), 1);
+}
+
+/// RULINGS EO5 (b): the owner's line for an escape refusal is sent once per (repair, candidate
+/// fingerprint) — the same candidate refused again tells nobody again (the intake row is filed each
+/// time step 3 refuses).
+#[test]
+fn escape_line_once_per_candidate() {
+    let r = rig("eo5b");
+    r.signed_repair();
+    let t = Mutex::new(ApprovalTable::default());
+    let eff = effects();
+    *eff.step3_err.lock().unwrap() = Some(Step3Err {
+        why: "예행이 실제 환경의 항목을 다시 썼습니다(x)".into(),
+        intake: vec![("hooks/h.sh".into(), "다시 썼습니다".into())],
+        owner_line: Some("수리 R-1 … 돌려보냈습니다".into()),
+    });
+    pending(&r, &t, &eff, T0);
+    pending(&r, &t, &eff, T0 + 10.0);
+    assert_eq!(eff.master.lock().unwrap().len(), 1, "one owner line for one candidate");
+    assert_eq!(eff.intake.lock().unwrap().len(), 2);
 }
 
 /// RULINGS CZ3: the rehearsal of step 3 runs INSIDE the scoped after-run comparison — a candidate hook
@@ -961,7 +981,7 @@ fn step3_finds_a_rehearsal_writing_the_live_lane() {
     let e = production_step3_with(&s3, &home).unwrap_err();
     assert!(e.why.contains("다시 썼습니다"), "{}", e.why);
     assert!(e.why.contains("guard.sh"), "{}", e.why);
-    assert_eq!(e.intake.as_ref().map(|(f, _)| f.as_str()), Some(rel));
+    assert_eq!(e.intake.first().map(|(f, _)| f.as_str()), Some(rel));
     assert!(e.owner_line.as_deref().is_some_and(|l| l.contains("R-1")));
 }
 
