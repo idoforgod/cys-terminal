@@ -2506,8 +2506,10 @@ class Preflight:
     #   등록을 조정하고, 출력(Y2(a))을 파싱해 자기가 지목한 훅만 판정한다. 등록 논리는 두 벌이 아니다 —
     #   아래는 평소 점검이 쓰는 같은 등록기·같은 존재 술어를 부를 뿐이다. 훅 목록은 제품이 등록하는 목록
     #   그대로다(새로 더하거나 빼지 않는다 — P1): C08·C32·C33·C28(능력 게이트 포함)·C27·C55.
-    #   능력 게이트는 생명줄이고 그 등록 조건(데몬 경보 ∧ 지침 표지 · 대상표 deny)은 C28 이 소유하므로
-    #   여기서는 **보고만** 한다(기대 상태 = 그 조건의 판정) — 묘비는 생명줄에 적용되지 않으니 조정할 일이 없다.
+    #   능력 게이트는 생명줄이고 그 등록 조건(데몬 경보 ∧ 지침 표지 · 대상표 deny)은 C28 이 소유한다 — ★T2h(RULINGS CW6):
+    #   그 조건이 **충족**이면 좁은 모드도 같은 등록기로 올린다(빠진 항목 · 선언 timeout 미달 · matcher 로 좁혀진 항목을 C28 ⓒ
+    #   와 같은 방법으로 교정 · 대상표 deny 프로필 제외 · 생명줄이라 묘비 무관 · --dry-run 은 쓰지 않는다). 조건 거짓 · 판정 불능은
+    #   지금처럼 보고만 한다(해제는 C28 이 한다).
     def _reconcile_hook_table(self):
         """(event, script, structural_lifeline, kind, matcher, timeout) — 제품 등록 목록(기존 상수에서 유도)."""
         rows = [("SessionStart", "session-start.sh", True, "c08", None, None),
@@ -2545,6 +2547,7 @@ class Preflight:
         life = lane_lifeline_scripts()
         raw_hook_tombs = lane_tombstones()[1]
         cap_state = None
+        cap_deny = set()
         rows, missing, errors = [], set(), []
         for event, script, structural, kind, matcher, timeout in self._reconcile_hook_table():
             lifeline = bool(structural or (life is not None and script in life))
@@ -2554,6 +2557,10 @@ class Preflight:
             if kind == "capgate":
                 if cap_state is None:
                     cap_state = self._capgate_gate()[0]
+                    # ★T2h(RULINGS CW6): C28 과 같은 대상표 — 판독 실패는 판정 불능(등록 보류 · C28 과 같다).
+                    cap_deny, cap_tbl_err = capgate_table_denied_basenames(pack_dir())
+                    if cap_tbl_err:
+                        cap_state = CAPGATE_UNKNOWN
                 desired = {CAPGATE_ON: "registered", CAPGATE_OFF: "unregistered"}.get(cap_state,
                                                                                       "unknown")
             elif lifeline:
@@ -2567,7 +2574,10 @@ class Preflight:
             tstates = []
             for t in targets:
                 state = self._reg_state(t, event, script, kind)
-                if (not dry_run and not state.startswith("refused:") and kind != "capgate"
+                cap_ok = (kind != "capgate"
+                          or (desired == "registered"
+                              and os.path.basename(os.path.dirname(os.path.abspath(t))) not in cap_deny))
+                if (not dry_run and not state.startswith("refused:") and cap_ok
                         and desired in ("registered", "unregistered")):
                     err = None
                     if desired == "registered" and script_ok:
@@ -2577,11 +2587,18 @@ class Preflight:
                             err = self._register_statusline(t)
                         elif kind == "appbuild" and not self._appbuild_hook_registered(t):
                             err = self._register_appbuild_hook(t, respect_tombstone=not lifeline)
-                        elif kind == "event" and not self._event_hook_registered(t, event, script,
-                                                                                  timeout):
-                            err = self._register_event_hook(t, event, script, matcher,
-                                                            timeout=timeout,
-                                                            respect_tombstone=not lifeline)
+                        elif kind in ("event", "capgate"):
+                            # ★T2h(RULINGS CW6): matcher 로 좁혀진 능력 게이트 등록은 '부분 집행' — C28 ⓒ 와 같이 우리 항목만 빼고
+                            #   다시 넣는다(남의 훅은 `_hook_entry_is_ours` 가 보존한다).
+                            narrowed = (kind == "capgate"
+                                        and not self._event_hook_scope_ok(t, event, script, matcher))
+                            if narrowed:
+                                err = self._unregister_event_hook(t, event, script)
+                            if not err and (narrowed
+                                            or not self._event_hook_registered(t, event, script, timeout)):
+                                err = self._register_event_hook(t, event, script, matcher,
+                                                                timeout=timeout,
+                                                                respect_tombstone=not lifeline)
                     elif desired == "unregistered" and state == "registered":
                         # Y2(d): 항목이 **있을 때만** 해제 · 잠금 안에서 묘비 재확인.
                         err = self._unregister_event_hook(t, event, script, require_tombstone=True)

@@ -152,6 +152,52 @@ class ReconcileMode(Rig):
         for t in self.targets:
             self.assertFalse(self.present(t, "PostToolUse", "pack-guard.sh"), "묘비 훅이 %s 에 남았다" % t)
 
+    # ★T2h(RULINGS CW6 · 검토자 M2): 능력 게이트 등록 조건이 충족(CAPGATE_ON)이면 좁은 모드가 생명줄을 되살린다 — 빠진 항목은
+    #   등록하고, matcher 로 좁혀졌거나 선언 timeout 이 모자란 항목은 교정한다(모든 대상). --dry-run 은 쓰지 않는다. 묘비는
+    #   생명줄에 적용되지 않는다(이 Rig 의 setUp 묘비 R-5 가 있어도 등록). 조건 거짓이면 보고만(종전).
+    def _cap(self, state):
+        return mock.patch.object(pf.Preflight, "_capgate_gate", lambda _self: (state, "test"))
+
+    def test_capgate_missing_entry_is_registered_when_the_condition_holds(self):
+        ev, sc = pf.CAPGATE_HOOK[1][0][0], pf.CAPGATE_HOOK[0]
+        self.set_tombs(hooks=[(ev, sc, "R-5")])
+        with self._cap(pf.CAPGATE_ON):
+            dry = self.reconcile(dry_run=True)
+            self.assertEqual(self.row(dry, ev, sc)["desired"], "registered")
+            for t in self.targets:
+                self.assertFalse(self.present(t, ev, sc), "--dry-run 은 쓰지 않는다")
+            rep = self.reconcile()
+        r = self.row(rep, ev, sc)
+        self.assertTrue(r["lifeline"])
+        self.assertEqual([x["state"] for x in r["targets"]], ["registered"] * len(self.targets))
+        p = self.pf_fix()
+        for t in self.targets:
+            self.assertTrue(self.present(t, ev, sc), "능력 게이트가 %s 에 올라가지 않았다" % t)
+            self.assertTrue(p._event_hook_scope_ok(t, ev, sc, pf.CAPGATE_HOOK[1][0][1]), "전 도구 범위")
+            self.assertTrue(p._event_hook_registered(t, ev, sc, pf.hook_timeout_for(sc, ev)), "선언 timeout")
+        self.assertEqual(rep["errors"], [])
+
+    def test_capgate_stale_entry_is_corrected_when_the_condition_holds(self):
+        ev, sc = pf.CAPGATE_HOOK[1][0][0], pf.CAPGATE_HOOK[0]
+        p = self.pf_fix()
+        for t in self.targets:
+            self.assertIsNone(p._register_event_hook(t, ev, sc, "Bash", timeout=1))
+            self.assertFalse(p._event_hook_scope_ok(t, ev, sc, pf.CAPGATE_HOOK[1][0][1]), "검체: 좁혀진 항목")
+        with self._cap(pf.CAPGATE_ON):
+            rep = self.reconcile()
+        for t in self.targets:
+            self.assertTrue(p._event_hook_scope_ok(t, ev, sc, pf.CAPGATE_HOOK[1][0][1]), "범위 교정: %s" % t)
+            self.assertTrue(p._event_hook_registered(t, ev, sc, pf.hook_timeout_for(sc, ev)), "timeout 교정: %s" % t)
+        self.assertEqual(rep["errors"], [])
+
+    def test_capgate_condition_false_is_report_only(self):
+        ev, sc = pf.CAPGATE_HOOK[1][0][0], pf.CAPGATE_HOOK[0]
+        with self._cap(pf.CAPGATE_OFF):
+            rep = self.reconcile()
+        self.assertEqual(self.row(rep, ev, sc)["desired"], "unregistered")
+        for t in self.targets:
+            self.assertFalse(self.present(t, ev, sc), "조건 거짓 — 좁은 모드는 올리지 않는다")
+
     def test_tombstone_removed_then_registered_again(self):
         self.set_tombs(hooks=[("PostToolUse", "pack-guard.sh", "R-3")])
         self.reconcile()
