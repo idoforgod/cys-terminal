@@ -1238,6 +1238,72 @@ mod ledger_verbs {
         Q.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
+    /// RULINGS DJ2 — a test seam at the boundary between "this signature is new" (observed) and
+    /// "its quota place is reserved" in `report` (test builds only): a test holds ONE signature's
+    /// report there until it opens the gate (bounded: 20 s).
+    #[cfg(test)]
+    pub(crate) struct IntakeSeam {
+        sig: String,
+        state: Mutex<(bool, bool)>, // (arrived, open)
+        cv: std::sync::Condvar,
+    }
+
+    #[cfg(test)]
+    static INTAKE_SEAM: Mutex<Option<std::sync::Arc<IntakeSeam>>> = Mutex::new(None);
+
+    #[cfg(test)]
+    impl IntakeSeam {
+        /// Waits until the held report reached the boundary (bounded).
+        pub(crate) fn wait_arrived(&self, within: std::time::Duration) -> bool {
+            let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (g, _) = self
+                .cv
+                .wait_timeout_while(g, within, |s| !s.0)
+                .unwrap_or_else(|e| e.into_inner());
+            g.0
+        }
+        /// Lets the held report go on.
+        pub(crate) fn open(&self) {
+            self.state.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
+            self.cv.notify_all();
+        }
+    }
+
+    /// Installs the seam for one signature (replacing any other).
+    #[cfg(test)]
+    pub(crate) fn intake_seam_install(sig: &str) -> std::sync::Arc<IntakeSeam> {
+        let s = std::sync::Arc::new(IntakeSeam {
+            sig: sig.to_string(),
+            state: Mutex::new((false, false)),
+            cv: std::sync::Condvar::new(),
+        });
+        *INTAKE_SEAM.lock().unwrap_or_else(|e| e.into_inner()) = Some(s.clone());
+        s
+    }
+
+    /// Removes the seam.
+    #[cfg(test)]
+    pub(crate) fn intake_seam_clear() {
+        *INTAKE_SEAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    #[cfg(test)]
+    fn intake_seam_pause(sig: &str) {
+        let seam = INTAKE_SEAM
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(s) = seam.filter(|s| s.sig == sig) else {
+            return;
+        };
+        let mut g = s.state.lock().unwrap_or_else(|e| e.into_inner());
+        g.0 = true;
+        s.cv.notify_all();
+        let _ =
+            s.cv.wait_timeout_while(g, std::time::Duration::from_secs(20), |st| !st.1)
+                .unwrap_or_else(|e| e.into_inner());
+    }
+
     /// RULINGS DA2: takes one place in this lane's hour of new signatures if there is room — the
     /// check and the take are ONE step under the quota mutex. `false` = the hour is full.
     fn reserve_intake(key: &(PathBuf, String), now: f64) -> bool {
@@ -1306,6 +1372,8 @@ mod ledger_verbs {
             let fresh = intake::excluded(&rep.rel, error, ctx.windows).is_none()
                 && intake::load_row(&intake::row_path_in(&ctx.root, &ctx.lane, &rep.signature))?
                     .is_none();
+            #[cfg(test)]
+            intake_seam_pause(&rep.signature); // DJ2: the observe / reserve boundary, held by a test
             let reserved = fresh && reserve_intake(&key, ctx.now);
             let room = if fresh && !reserved {
                 intake::INTAKE_NEW_SIGNATURES_PER_HOUR // no room: the record answers over quota
@@ -4143,12 +4211,18 @@ pub(crate) const INTAKE_LOCK_SHARDS: usize = 16;
 /// reserved separately and atomically (DA2). The ONE entry point for every intake writer: the
 /// `report` verb and the repeated-failure detector (`alerts.rs`, unit T3e). Poison is tolerated.
 pub(crate) fn intake_lock_for(signature: &str) -> std::sync::MutexGuard<'static, ()> {
-    use std::hash::{Hash, Hasher};
     static SHARDS: [Mutex<()>; INTAKE_LOCK_SHARDS] = [const { Mutex::new(()) }; INTAKE_LOCK_SHARDS];
+    SHARDS[intake_shard_of(signature)]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Which of the [`INTAKE_LOCK_SHARDS`] intake locks a signature takes (stable within a process).
+pub(crate) fn intake_shard_of(signature: &str) -> usize {
+    use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     signature.hash(&mut h);
-    let i = (h.finish() % INTAKE_LOCK_SHARDS as u64) as usize;
-    SHARDS[i].lock().unwrap_or_else(|e| e.into_inner())
+    (h.finish() % INTAKE_LOCK_SHARDS as u64) as usize
 }
 
 /// RULINGS DA1 — what decides a target's class is the FILE, not its spelling. For a target outside

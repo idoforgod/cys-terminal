@@ -4279,3 +4279,117 @@ fn dj1_names_that_do_not_exist_yet() {
     assert!(begin(3, "other/\u{c0c8}.md").is_ok());
     assert!(begin(13, "other/plain.md").is_ok());
 }
+
+/// RULINGS DJ2 — the race of DA2, made deterministic: report X (a new signature, at 199 of 200) is
+/// HELD at the boundary between "observed: new" and "reserved"; meanwhile report Y (another new
+/// signature, on another intake lock) runs to its end and takes the 200th place; then X goes on
+/// and must find the hour full. With the observe and the take split (the code before DA2), X
+/// would write too: 201 rows.
+#[test]
+fn dj2_observe_reserve_boundary_is_one_step() {
+    use super::ledger_verbs::{intake_seam_clear, intake_seam_install};
+    let r = rig("dj2-race");
+    let w = seat(3, "worker");
+    for i in 0..199 {
+        let v = r
+            .call(
+                T0,
+                &w,
+                "report",
+                json!({"file": "bin/a.py", "error": format!("E: slot {i}")}),
+            )
+            .unwrap();
+        assert_eq!(v["accepted"], true, "{i}: {v}");
+    }
+    let sig = |e: &str| {
+        cys::repair::intake::parse_report("bin/a.py", e)
+            .unwrap()
+            .signature
+    };
+    let ex = "E: held at the boundary";
+    let ey = (0..)
+        .map(|k| format!("E: passes the held one {k}"))
+        .find(|e| intake_shard_of(&sig(e)) != intake_shard_of(&sig(ex)))
+        .unwrap();
+    let seam = intake_seam_install(&sig(ex));
+    let (held, passer) = std::thread::scope(|s| {
+        let h = s.spawn(|| {
+            r.call(
+                T0,
+                &seat(3, "worker"),
+                "report",
+                json!({"file": "bin/a.py", "error": ex}),
+            )
+            .unwrap()
+        });
+        let arrived = seam.wait_arrived(std::time::Duration::from_secs(20));
+        let y = r
+            .call(T0, &w, "report", json!({"file": "bin/a.py", "error": ey}))
+            .unwrap();
+        seam.open();
+        let x = h.join().unwrap();
+        assert!(arrived, "the held report never reached the boundary");
+        (x, y)
+    });
+    intake_seam_clear();
+    assert_eq!(passer["accepted"], true, "{passer}");
+    assert_eq!(
+        held["over_quota"], true,
+        "the held report used a place it had only observed: {held}"
+    );
+    let rows = std::fs::read_dir(r.root.join("intake").join(&r.lane.0))
+        .unwrap()
+        .count();
+    assert_eq!(rows, 200);
+}
+
+/// RULINGS DJ2: a reservation is RETURNED after a failed write — at 199 of 200, a new signature
+/// whose row cannot be written (the lane's intake folder made read-only) fails; the next new
+/// signature then gets the 200th place, and the one after it is over quota.
+#[cfg(unix)]
+#[test]
+fn dj2_failed_write_returns_its_reservation() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = rig("dj2-fail");
+    let w = seat(3, "worker");
+    for i in 0..199 {
+        r.call(
+            T0,
+            &w,
+            "report",
+            json!({"file": "bin/a.py", "error": format!("E: slot {i}")}),
+        )
+        .unwrap();
+    }
+    let dir = r.root.join("intake").join(&r.lane.0);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let failed = r.call(
+        T0,
+        &w,
+        "report",
+        json!({"file": "bin/a.py", "error": "E: cannot be written"}),
+    );
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(failed.is_err(), "the write did not fail: {failed:?}");
+    let v = r
+        .call(
+            T0,
+            &w,
+            "report",
+            json!({"file": "bin/a.py", "error": "E: takes the returned place"}),
+        )
+        .unwrap();
+    assert_eq!(
+        v["accepted"], true,
+        "the failed write kept its reservation: {v}"
+    );
+    let v = r
+        .call(
+            T0,
+            &w,
+            "report",
+            json!({"file": "bin/a.py", "error": "E: one too many"}),
+        )
+        .unwrap();
+    assert_eq!(v["over_quota"], true, "{v}");
+}
