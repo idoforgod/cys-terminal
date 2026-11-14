@@ -788,3 +788,64 @@ fn a_put_back_finding_survives_a_crash_before_it_is_written() {
     let third = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 7200.0, &lock)).unwrap();
     assert!(!third.iter().any(|x| x.kind == "reverted"), "idempotent: {third:?}");
 }
+
+// ───────────────────────────── RULINGS CU1 — one bad record never stops the job ─────────────────────────────
+
+/// CU1: one unreadable (corrupt) record among three repairs in probation — the other two are
+/// re-checked, the scan runs, the job state is written; the bad repair is filed as ONE intake row
+/// (not again on the next run). Without CU1 the whole tick aborted every 2 minutes.
+#[cfg(target_os = "macos")]
+#[test]
+fn one_unreadable_record_never_stops_the_job() {
+    let r = rig("cu1corrupt");
+    for (n, rel) in [(1, "hooks/c1.sh"), (2, "hooks/c2.sh"), (3, "hooks/c3.sh")] {
+        committed_general(&r, &rid(&format!("R-{n}")), rel, Some(b"PRE\n"), Some(b"POST\n"));
+    }
+    std::fs::write(ledger::record_path_in(&r.root, &rid("R-2")), b"{ not json").unwrap();
+    let checked = RefCell::new(Vec::new());
+    let check = |rel: &str, _: &Path, _: Duration| {
+        checked.borrow_mut().push(rel.to_string());
+        outcome(CheckResult::Pass, 5)
+    };
+    let filed = RefCell::new(Vec::new());
+    let intake = |rel: &str, line: &str| filed.borrow_mut().push((rel.to_string(), line.to_string()));
+    let d = Doubles { check: &check, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &intake, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), true).unwrap();
+    assert!(checked.borrow().contains(&"hooks/c1.sh".to_string()) && checked.borrow().contains(&"hooks/c3.sh".to_string()), "{:?}", checked.borrow());
+    assert!(read_job_state_in(&r.root, &r.lane).is_some(), "the job state is written");
+    assert_eq!(filed.borrow().len(), 1, "one intake row: {:?}", filed.borrow());
+    assert!(rep.lines.iter().any(|l| l.starts_with("R-2:")), "{:?}", rep.lines);
+    // the next probation run: logged again, filed no more
+    let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 700.0, &lock), false).unwrap();
+    assert_eq!(filed.borrow().len(), 1, "filed once per repair");
+}
+
+/// CU1: a failing re-check whose revert errors every time ends in a truthful FAILED state — the row
+/// 충돌 with its probation closed `실패 — …` — and is never closed 사용 중 at 24 hours. Without CU1
+/// the error aborted the tick every 2 minutes and the repair ended 사용 중.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_revert_that_errors_every_time_ends_failed() {
+    let r = rig("cu1revert");
+    let a = rid("R-1");
+    let rec = committed_general(&r, &a, "hooks/e.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    // the pre-image copy is damaged: every revert errors
+    if let crate::repair::ledger::PreImage::Slot { slot_dir, .. } = &rec.files[0].pre {
+        let p = crate::repair::vault::Slot::at(slot_dir, "hooks/e.sh").payload();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&p, b"DAMAGED").unwrap();
+    }
+    let fails = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Fail("bad".into()), 5);
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    assert!(rep.reported_only.iter().any(|(i, _)| *i == a), "{rep:?}");
+    let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
+    assert_eq!(row.state, crate::repair::types::LaneState::Conflict);
+    assert!(row.probation.as_ref().unwrap().closed.as_deref().unwrap().starts_with("실패"));
+    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 2.0 * 86_400.0, &lock), false).unwrap();
+    assert!(!rep.ended.contains(&a), "never 사용 중");
+    assert_ne!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::InUse);
+}

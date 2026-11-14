@@ -156,6 +156,18 @@ pub(crate) fn own_check(rel: &str, holder: &Path) -> Option<bool> {
     (rel == "schedule.json").then(|| crate::schedule::schedule_file_passes_own_check(holder))
 }
 
+/// How many intake rows of `lane` were FIRST seen within the last hour (the hourly quota's count).
+pub(crate) fn new_intake_rows_in_last_hour(root: &Path, lane: &LaneKey, now: f64) -> usize {
+    let dir = root.join("intake").join(&lane.0);
+    std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| cys::repair::intake::load_row(&e.path()).ok().flatten())
+        .filter(|row| now - row.first_seen <= 3600.0)
+        .count()
+}
+
 /// One run of the job on its thread (production environment).
 fn run_job(daemon: &Arc<Daemon>, force_sweep: bool) {
     let root = job_root(daemon);
@@ -172,13 +184,16 @@ fn run_job(daemon: &Arc<Daemon>, force_sweep: bool) {
     let lane_for_intake = lane.clone();
     let intake = move |rel: &str, err: &str| {
         if let Ok(report) = cys::repair::intake::parse_report(rel, err) {
+            // CU4: the REAL count of new rows this lane wrote in the last hour (the quota of C7 /
+            // T3 — never bypassed by a constant 0), read from the rows themselves
+            let new_in_last_hour = new_intake_rows_in_last_hour(&root_for_intake, &lane_for_intake, now);
             let _ = cys::repair::intake::record_in(
                 &root_for_intake,
                 &lane_for_intake,
                 &report,
                 "daemon",
                 now,
-                0,
+                new_in_last_hour,
                 windows,
                 err,
             );

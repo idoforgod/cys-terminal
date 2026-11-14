@@ -189,17 +189,53 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
         }
         Err(e) => return Err(RepairError::Io(e)),
     }
+    // CU1: ONE bad record never stops the job's work — every pass is fault-isolated (a failure is a
+    // line and, per repair, ONE intake row); the job state is written for the parts that ran
     if d.first_of_incarnation {
-        report.lines.extend(start_time_pass(env)?);
+        match start_time_pass(env) {
+            Ok(lines) => report.lines.extend(lines),
+            Err(e) => report.lines.push(format!("시작 때 정리를 다 하지 못했습니다 — 다음 시작 때 다시({e:?})")),
+        }
+        let swept = super::vault::sweep_stale_temps(root);
+        if !swept.is_empty() {
+            report.lines.push(format!("끝난 프로세스가 남긴 임시 항목 {}개를 치웠습니다", swept.len()));
+        }
     }
     if d.probation {
-        probation_pass(env, &mut report)?;
+        probation_pass(env, &mut report);
     }
     if d.sweep {
-        report.m10 = m10_sweep(env)?;
+        match m10_sweep(env) {
+            Ok(f) => report.m10 = f,
+            Err(e) => report.lines.push(format!("미승인 변경 검사를 마치지 못했습니다 — 다음 차례에 다시({e:?})")),
+        }
     }
     write_job_state(root, lane, env.incarnation, now, &d)?;
     Ok(report)
+}
+
+/// `<root>/lanes/<lane>.job-faults.json` — the repairs whose fault this lane's job already filed as
+/// an intake row (CU1: once per repair).
+fn faults_path_in(root: &Path, lane: &LaneKey) -> PathBuf {
+    root.join("lanes").join(format!("{}.job-faults.json", lane.0))
+}
+
+/// CU1: a repair the job could not handle — logged in the tick's lines every time, filed as ONE
+/// intake row (through the job's intake writer, which applies the hourly quota) the first time.
+fn fault_once(env: &JobEnv<'_>, id: &RepairId, rel: &str, line: &str, report: &mut TickReport) {
+    report.lines.push(format!("{}: {line} — 이 수리는 건너뛰고 나머지는 계속합니다", id.as_str()));
+    let path = faults_path_in(env.op.root, env.op.lane);
+    let mut seen: std::collections::BTreeMap<String, String> = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    if seen.contains_key(id.as_str()) {
+        return;
+    }
+    seen.insert(id.as_str().to_string(), line.chars().take(300).collect());
+    if super::durable::write_json_durable(&path, &seen).is_ok() {
+        (env.intake)(rel, &format!("자체 해결 작업이 수리 {}를 처리하지 못함 — {line}", id.as_str()));
+    }
 }
 
 // ───────────────────────────── the start-time pass (AK7 + DEFERRED #49) ─────────────────────────────
@@ -245,8 +281,10 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
                     repair: rec.id.clone(),
                 };
                 if super::tombstones::load_in(root, lane).is_ok_and(|ts| !ts.contains(&t)) {
-                    super::tombstones::record_in(root, lane, &t)?;
-                    lines.push(format!("{}: 확정된 삭제의 묘비를 다시 세웠습니다 — {rel}", rec.id.as_str()));
+                    match super::tombstones::record_in(root, lane, &t) {
+                        Ok(()) => lines.push(format!("{}: 확정된 삭제의 묘비를 다시 세웠습니다 — {rel}", rec.id.as_str())),
+                        Err(e) => lines.push(format!("{}: 묘비를 다시 세우지 못했습니다 — {rel}({e:?})", rec.id.as_str())),
+                    }
                 }
             }
         }
@@ -289,12 +327,15 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
             let rootb = root.to_path_buf();
             let idc = rec.id.clone();
             let lanec = lane.clone();
-            (env.locked)(&rec.id, &mut || {
+            if let Err(e) = (env.locked)(&rec.id, &mut || {
                 if ledger::read_lane_in(&rootb, &idc, &lanec)?.is_none() {
                     ledger::write_lane_in(&rootb, &new_row)?;
                 }
                 Ok(())
-            })?;
+            }) {
+                lines.push(format!("{}: 끊긴 확정의 부서 행을 쓰지 못했습니다({e:?})", rec.id.as_str()));
+                continue;
+            }
             lines.push(format!(
                 "{}: 끊긴 확정의 부서 행을 썼습니다{}",
                 rec.id.as_str(),
@@ -317,8 +358,13 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
             }
         }
         // (b2) older in-force repairs on the same targets
-        for oid in supersede_older(root, lane, rec, env.locked)? {
-            lines.push(format!("{}: 같은 파일의 더 새 수리 {} 로 대체됨", oid.as_str(), rec.id.as_str()));
+        match supersede_older(root, lane, rec, env.locked) {
+            Ok(ids) => {
+                for oid in ids {
+                    lines.push(format!("{}: 같은 파일의 더 새 수리 {} 로 대체됨", oid.as_str(), rec.id.as_str()));
+                }
+            }
+            Err(e) => lines.push(format!("{}: 더 오래된 수리를 정리하지 못했습니다({e:?})", rec.id.as_str())),
         }
     }
     Ok(lines)
@@ -351,8 +397,9 @@ fn supersede_older(
     for oid in ledger::list_ids_in(root).into_iter().filter(|o| *o < newer.id).rev() {
         let mut changed = false;
         let rootb = root.to_path_buf();
-        locked(&oid, &mut || {
-            let Some(mut r) = ledger::read_record_in(&rootb, &oid)? else {
+        let _ = locked(&oid, &mut || {
+            // CU1: an unreadable older record is skipped (never stops the pass)
+            let Ok(Some(mut r)) = ledger::read_record_in(&rootb, &oid) else {
                 return Ok(());
             };
             if r.origin_lane == *lane && in_force(&r) && r.files.iter().any(|f| targets.contains(&f.rel)) {
@@ -361,7 +408,7 @@ fn supersede_older(
                 changed = true;
             }
             Ok(())
-        })?;
+        });
         if changed {
             out.push(oid);
         }
@@ -544,12 +591,18 @@ fn note_timeouts(env: &JobEnv<'_>, id: &RepairId, timeouts: &[(String, f64)]) ->
 
 /// Every repair in probation in THIS lane re-checked — only repaired files (no full sweep), with
 /// the file's own check (never seat readiness — "보류" is not failure).
-fn probation_pass(env: &JobEnv<'_>, report: &mut TickReport) -> Result<(), RepairError> {
+fn probation_pass(env: &JobEnv<'_>, report: &mut TickReport) {
     let root = env.op.root;
     let lane = env.op.lane;
     for id in ledger::list_ids_in(root) {
-        let Ok(Some(row)) = ledger::read_lane_in(root, &id, lane) else {
-            continue;
+        let ledger_rel = format!("repairs/{}/record.json", id.as_str());
+        let row = match ledger::read_lane_in(root, &id, lane) {
+            Ok(Some(row)) => row,
+            Ok(None) => continue,
+            Err(e) => {
+                fault_once(env, &id, &ledger_rel, &format!("이 부서의 행을 읽을 수 없습니다({e:?})"), report);
+                continue;
+            }
         };
         let Some(p) = row.probation.clone() else {
             continue;
@@ -557,15 +610,52 @@ fn probation_pass(env: &JobEnv<'_>, report: &mut TickReport) -> Result<(), Repai
         if p.closed.is_some() {
             continue;
         }
-        let Ok(Some(rec)) = ledger::read_record_in(root, &id) else {
-            continue;
+        let rec = match ledger::read_record_in(root, &id) {
+            Ok(Some(rec)) => rec,
+            Ok(None) => continue,
+            Err(e) => {
+                fault_once(env, &id, &ledger_rel, &format!("수리 기록을 읽을 수 없습니다(손상 또는 더 높은 판의 기록 — {e:?})"), report);
+                continue;
+            }
         };
         if rec.origin_lane == *lane && !in_force(&rec) {
             continue;
         }
-        recheck_one(env, &rec, &row, report)?;
+        if let Err(e) = recheck_one(env, &rec, &row, report) {
+            let rel = ledger::file_targets(&rec).map(|f| f.rel.clone()).next().unwrap_or(ledger_rel);
+            fault_once(env, &id, &rel, &format!("재검사를 마치지 못했습니다({e:?})"), report);
+        }
     }
-    Ok(())
+}
+
+/// CU1 / CU4: a failing re-check that could NOT be reverted (or, on Windows, is never reverted
+/// automatically) ends in a truthful FAILED state the ledger shows — the lane row 충돌 with its
+/// probation closed `실패 — …` (never closed 사용 중 later); the record keeps its state with a line.
+fn close_failed(env: &JobEnv<'_>, id: &RepairId, why: &str) -> Result<(), RepairError> {
+    let root = env.op.root.to_path_buf();
+    let lane = env.op.lane.clone();
+    let now = env.op.now;
+    let idc = id.clone();
+    let why = why.to_string();
+    (env.locked)(id, &mut || {
+        if let Some(mut row) = ledger::read_lane_in(&root, &idc, &lane)? {
+            row.state = super::types::LaneState::Conflict;
+            if let Some(p) = row.probation.as_mut() {
+                if p.closed.is_none() {
+                    p.closed = Some(format!("실패 — {why}").chars().take(400).collect());
+                }
+            }
+            row.updated_at = now;
+            ledger::write_lane_in(&root, &row)?;
+        }
+        if let Some(mut r) = ledger::read_record_in(&root, &idc)? {
+            if r.origin_lane == lane {
+                r.methods.push(format!("실패 — {why}").chars().take(300).collect());
+                ledger::write_record_durable_in(&root, &r)?;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// The probation re-check of ONE repair in this lane.
@@ -643,31 +733,43 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, repor
         }
     }
     if let Some(why) = failure {
+        let first_rel = ledger::file_targets(rec).map(|f| f.rel.as_str()).next().unwrap_or("");
         if env.op.form == ApplyForm::Exchange {
             let r = crate::pack_apply_lock::with_apply_lock(env.apply_lock, || {
                 revert_in(&env.op, id, RevertCaller::DaemonAuto, env.hooks, env.locked)
             })
-            .map_err(RepairError::Io)??;
-            (env.intake)(
-                ledger::file_targets(rec).map(|f| f.rel.as_str()).next().unwrap_or(""),
-                &format!("시험 기간 재검사 실패로 수리 {}를 되돌림 — {why}", id.as_str()),
-            );
-            if r.outcome == ApplyOutcome::Applied {
-                report.reverted.push(id.clone());
-                report.lines.push(format!("{}: 시험 기간 재검사 실패 — 이 수리 한 건만 되돌렸습니다(고친 사본은 보관소에) · {why}", id.as_str()));
-            } else {
-                report.superseded.push(id.clone());
-                report.lines.push(format!("{}: 재검사 실패, 되돌리기는 대체됨 — {:?}", id.as_str(), r.outcome));
+            .map_err(RepairError::Io)
+            .and_then(|r| r);
+            (env.intake)(first_rel, &format!("시험 기간 재검사 실패로 수리 {}를 되돌림 — {why}", id.as_str()));
+            match r {
+                Ok(r) if r.outcome == ApplyOutcome::Applied => {
+                    report.reverted.push(id.clone());
+                    report.lines.push(format!("{}: 시험 기간 재검사 실패 — 이 수리 한 건만 되돌렸습니다(고친 사본은 보관소에) · {why}", id.as_str()));
+                }
+                Ok(r) if matches!(r.outcome, ApplyOutcome::Superseded(_)) && r.files.iter().all(|(_, o)| *o != ApplyOutcome::Applied) => {
+                    // nothing was changed: the live files are not the applied state (대체됨 recorded)
+                    report.superseded.push(id.clone());
+                    report.lines.push(format!("{}: 재검사 실패, 되돌리기는 대체됨 — {:?}", id.as_str(), r.outcome));
+                }
+                other => {
+                    // CU1: a failure that could not be reverted is never closed 사용 중 — failed state
+                    let detail = match &other {
+                        Ok(r) => format!("{:?}", r.outcome),
+                        Err(e) => format!("{e:?}"),
+                    };
+                    close_failed(env, id, &format!("재검사 실패, 되돌리지 못했습니다({detail}) · {why} — 워커 검토"))?;
+                    report.reported_only.push((id.clone(), why.clone()));
+                    report.lines.push(format!("{}: 재검사 실패 — 되돌리지 못해 실패로 기록했습니다({detail}) · {why}", id.as_str()));
+                }
             }
         } else {
-            // Windows 0.15.0: automatic return is off — recorded (one intake row) and reported only
+            // Windows 0.15.0: automatic return is off — ONE intake row and a FAILED end of this
+            // probation (CU4: never 사용 중 later; the row closed, so it is not re-filed every check)
             note_timeouts(env, id, &timeouts)?;
-            (env.intake)(
-                ledger::file_targets(rec).map(|f| f.rel.as_str()).next().unwrap_or(""),
-                &format!("시험 기간 재검사 실패(이 운영체제에서는 자동으로 되돌리지 않음) — 수리 {} · {why}", id.as_str()),
-            );
+            (env.intake)(first_rel, &format!("시험 기간 재검사 실패(이 운영체제에서는 자동으로 되돌리지 않음) — 수리 {} · {why}", id.as_str()));
+            close_failed(env, id, &format!("재검사 실패(이 운영체제에서는 자동으로 되돌리지 않음 — 기록·알림) · {why} — 워커 검토"))?;
             report.reported_only.push((id.clone(), why.clone()));
-            report.lines.push(format!("{}: 재검사 실패 — 이 운영체제에서는 자동으로 되돌리지 않고 기록·알림만 합니다 · {why}", id.as_str()));
+            report.lines.push(format!("{}: 재검사 실패 — 이 운영체제에서는 자동으로 되돌리지 않고 실패로 기록·알림만 합니다 · {why}", id.as_str()));
         }
         return Ok(());
     }

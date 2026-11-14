@@ -189,3 +189,23 @@ fn job_module_sends_nothing() {
         assert!(!prod.contains(needle), "repair_job.rs contains {needle:?}");
     }
 }
+
+/// CU4: the job's intake writer counts the lane's REAL new rows of the last hour (rows first seen
+/// within 3600 s) — the quota is never bypassed by a constant 0.
+#[test]
+fn job_intake_counts_the_real_hourly_rows() {
+    let root = std::env::temp_dir().join(format!("cys-cu4-intake-{}-{}", std::process::id(), now_ms()));
+    let lane = cys::repair::types::LaneKey("base".into());
+    let dir = root.join("intake").join(&lane.0);
+    std::fs::create_dir_all(&dir).unwrap();
+    let row = |sig: &str, first_seen: f64| {
+        serde_json::json!({"schema": 1, "signature": sig, "lane": "base", "rel": "hooks/a.sh", "error_class": "x",
+            "first_line": "x", "first_seen": first_seen, "last_seen": first_seen, "count": 1, "reporters": ["daemon"]})
+    };
+    let now = 1_800_000_000.0;
+    for (sig, t) in [("a", now - 10.0), ("b", now - 3000.0), ("c", now - 4000.0)] {
+        std::fs::write(dir.join(format!("{sig}.json")), serde_json::to_vec(&row(sig, t)).unwrap()).unwrap();
+    }
+    assert_eq!(new_intake_rows_in_last_hour(&root, &lane, now), 2);
+    let _ = std::fs::remove_dir_all(&root);
+}
