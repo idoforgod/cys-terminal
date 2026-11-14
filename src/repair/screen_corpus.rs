@@ -919,65 +919,110 @@ pub fn i4_region<'a>(text: &'a str, first: &str, last: &str) -> Option<String> {
 
 // ───────────────────────────── census (iii) — deny rules and branches ─────────────────────────────
 
-/// The CENSUS LINES of a released device (AY2 census (iii)): every line that holds a deny site
-/// (`out_deny(`, `emit_deny`, `exit 2`, `_undecidable(`, a `"deny"` decision, a `DENY` marker) or
-/// an environment branch (`os.environ`, `getenv`, a shell parameter default `${…:-` / `${…:+` /
-/// `${…-`, a file test `[ -e` / `[ -f` / `[ -L` / `[ -S` / `-x`, `command -v`). Leading and
-/// trailing white space is dropped; the order is kept.
-pub fn census_lines(text: &str) -> Vec<String> {
-    const NEEDLES: &[&str] = &[
-        "out_deny(",
-        "emit_deny",
-        "exit 2",
-        "_undecidable(",
-        "\"deny\"",
-        "DENY",
-        "os.environ",
-        "getenv",
-        ":-",
-        ":+",
-        "[ -e ",
-        "[ -f ",
-        "[ -L ",
-        "[ -S ",
-        "[ -x ",
-        "[ -h ",
-        "command -v",
-    ];
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter(|l| NEEDLES.iter().any(|n| l.contains(n)))
-        .map(str::to_string)
-        .collect()
+/// The text an anchor of [`CENSUS_PINS`] is compared with: the line without quote, bracket and
+/// backslash characters, white space collapsed to single spaces and trimmed — so the pin table holds
+/// plain strings (no escape, no bracket inside the block — RULINGS CO1 / CS1).
+pub fn anchor_text(line: &str) -> String {
+    let kept: String = line
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\'' | '[' | ']' | '\\'))
+        .collect();
+    kept.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// sha256 (hex) of the census lines joined by LF.
-pub fn census_digest(text: &str) -> (usize, String) {
+/// RULINGS CZ7 — one census region of a device text: from the ONE line whose [`anchor_text`] is
+/// `start` up to, not including, the ONE line whose anchor text is `end` (`""` = to the end of the
+/// text). Each anchor must occur exactly once in the whole text, the end after the start. Returns
+/// (line count, sha256 hex of the region's lines joined by LF) — the region pinned WHOLE.
+pub fn census_region(text: &str, start: &str, end: &str) -> Result<(usize, String), String> {
     use sha2::{Digest, Sha256};
-    let lines = census_lines(text);
-    let h = Sha256::digest(lines.join("\n").as_bytes());
-    (lines.len(), h.iter().map(|b| format!("{b:02x}")).collect())
+    let lines: Vec<&str> = text.split('\n').collect();
+    let at = |a: &str| -> Result<usize, String> {
+        let hits: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| anchor_text(l) == a)
+            .map(|(i, _)| i)
+            .collect();
+        match hits.as_slice() {
+            [i] => Ok(*i),
+            [] => Err(format!("anchor not found: {a:?}")),
+            _ => Err(format!("anchor occurs {} times: {a:?}", hits.len())),
+        }
+    };
+    let s = at(start)?;
+    let e = if end.is_empty() { lines.len() } else { at(end)? };
+    if e <= s {
+        return Err(format!("anchor {end:?} does not follow {start:?}"));
+    }
+    let region = lines[s..e].join("\n");
+    let h = Sha256::digest(region.as_bytes());
+    Ok((e - s, h.iter().map(|b| format!("{b:02x}")).collect()))
 }
 
-/// Census (iii) anchors: per released device the count and digest of its census lines when the
-/// tables above were last reviewed against it. A change of a deny rule or an environment branch
-/// changes the digest and fails the test `screen::tests::census_iii_deny_rules_and_branches_pinned`
-/// until the tables are reviewed and this pin is updated with them (CM4: a lib-suite test).
-pub const CENSUS_PINS: &[(&str, usize, &str)] = &[
+/// RULINGS CZ7 — census (iii): each released device's DENY-DECISION region and ENVIRONMENT-BRANCH
+/// region(s), pinned WHOLE between explicit anchors ([`census_region`]): (device, region, start
+/// anchor, end anchor — `""` = to the end, line count, sha256 of the region). guard.sh: its bash head
+/// (lane redirect, script folder, the autopilot flag files of the test mode, the interpreter
+/// resolution, the deny output, the flag trust check, the python environment reads and input parse,
+/// the normalisers), its python decision code (protected names, wrappers, STRICT allow-lists and
+/// `git`/`cys` gating, the LOOSE rules — the `gh pr create/merge` condition among them — and the
+/// dispatch), and its bash tail (constitution token, bash backstop, dispatch). The gate: its bash
+/// head (lane redirect, role cache, gated-role predicate, role resolution, self-test switch, the
+/// big-input and no-interpreter branches) and its python decision code up to the self-tests (every
+/// table — WRITE_SHELL_CMDS, GIT_WRITE_SUBS, CSO_CYS_SUBVERBS, BUILDER_ENV_WRITE … — and `main`).
+/// `_lib.sh`: everything after its header (interpreter resolution and shim checks, lane redirect,
+/// role helpers). Headers, comments outside the regions and the gate's self-tests are not pinned. A
+/// change inside a region fails `screen::tests::census_iii_deny_rules_and_branches_pinned` until the
+/// corpora and cells are reviewed against the device and this table is updated with them (CM4: a
+/// lib-suite test).
+pub const CENSUS_PINS: &[(&str, &str, &str, &str, usize, &str)] = &[
     (
         "hooks/guard.sh",
-        81,
-        "2b8866374c67d4029b86bab6ab98f933c6d37184f9804bef96f8d81462a8f410",
+        "environment-head",
+        "command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect $@",
+        "def _strip_hidden(s):",
+        90,
+        "df69e734af1511381e3ab5c7e560d348a7b30cfb76effaa517f463be739ff3ec",
+    ),
+    (
+        "hooks/guard.sh",
+        "deny-decision",
+        "def _strip_hidden(s):",
+        "PY",
+        897,
+        "51e6619b1db565200afdd6dcf4bc8f1d6915f6cd88d089fb127726d709ef8b81",
+    ),
+    (
+        "hooks/guard.sh",
+        "backstop-and-dispatch",
+        "PY",
+        "",
+        69,
+        "f61562abaffeddd6a51f08ac239b6d5b1d6cf1b3c6950f7328374b9dc48f24f5",
     ),
     (
         "hooks/role-capability-gate.sh",
-        152,
-        "d37d36c2ef45343549c03ab4569d543704bd7066d3f803e2240b73270f2da1bc",
+        "environment-head",
+        "command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect $@",
+        "exec $CYS_PY - <<PYEOF",
+        276,
+        "3b869a6f67b58b414efa99fa5c9350f5a331b8f357d4b1dcaf16f649c73edb39",
+    ),
+    (
+        "hooks/role-capability-gate.sh",
+        "deny-decision",
+        "exec $CYS_PY - <<PYEOF",
+        "def self_test():",
+        3095,
+        "bbaa170bc98b3f380936aece6cdde45e365a635ea0186ce07eaa39cd3115e8cb",
     ),
     (
         "hooks/_lib.sh",
-        105,
-        "8070c1a4fef7792d3844d3b7f5a635ca70931965df29ff48d30020fc05ec8d6c",
+        "environment",
+        "-n ${CYS_LIB_SH_LOADED:-} && return 0",
+        "",
+        1063,
+        "e03702093e8d982f160ccb39c495851614e0e439e219cb1c862351d0e79f4413",
     ),
 ];
