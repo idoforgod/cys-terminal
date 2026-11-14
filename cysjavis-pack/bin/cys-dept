@@ -1646,7 +1646,7 @@ CEO_PENDING="$HOME/.cys/state/ceo-pending"
 CEO_RECEIPT_NAME=".ceo-receipt.json"
 ceo_py(){  # $1 = superset | state | compose | demote | verify | promoted | recover
   python3 - "$@" <<'PY'
-import errno, hashlib, json, math, os, re, sys, tempfile, time
+import errno, hashlib, json, math, os, re, stat, sys, tempfile, time
 
 # 구분선 — scripts/gen_ceo_template.py SEPARATOR 와 같은 바이트(O-C11-2 · test_ceo_composition 이 고정한다).
 SEP = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n".encode("utf-8")
@@ -1666,13 +1666,74 @@ def sha(b):
     return hashlib.sha256(b).hexdigest()
 
 
-def read(p):
-    """bytes | None(부재). 그 밖의 판독 실패는 OSError 로 올린다(호출부 = 판독 불능)."""
+class HoldSwap(Exception):
+    """동작(조립·강등)을 끝낼 수 없어 보류한다 — 살아 있는 지침은 사용자의 판(또는 그대로), 살아 있던 모든 판은 보관 폴더에(알림은
+    던지기 전에 남겼다). rc = 입구의 종료 코드(6 보류 · 9 계속 바뀜)."""
+    def __init__(self, why, rc=6):
+        Exception.__init__(self, why)
+        self.rc = rc
+
+
+class Unknown(HoldSwap):
+    """★RULINGS FY1 — 읽기가 실패했다: 답은 '있다'도 '없다'도 아닌 **모른다**. 어느 호출부도 이것을 '없음'·기본값·갈래 선택으로
+    바꾸지 않는다 — 그대로 올라가 입구가 보류한다(기록·파일 무변경 · 알림 1건 · 다음 입구가 다시 읽는다: 지나가는 실패는 저절로
+    풀리고 오래가는 실패는 보류로 남는다). 윈도우에서 편집기·검사기가 읽기 공유 없이 연 파일이 이렇게 답한다."""
+    def __init__(self, path, error):
+        HoldSwap.__init__(self, "읽지 못함: %s (%s)" % (path, error), 6)
+        self.path, self.error = path, error
+
+
+def fs_read(p):
+    """★RULINGS FY1 — 이 경로의 유일한 읽기. bytes(있다) · None(없다) · Unknown(모른다 — 던진다)."""
     try:
         with open(p, "rb") as f:
             return f.read()
     except FileNotFoundError:
         return None
+    except OSError as e:
+        raise Unknown(p, e)
+
+
+def fs_kind(p):
+    """★FY1 — 이름 하나의 종류: absent · regular · link · dir · other · Unknown(모른다 — 던진다). 링크는 따라가지 않는다."""
+    try:
+        m = os.lstat(p).st_mode
+    except FileNotFoundError:
+        return "absent"
+    except OSError as e:
+        raise Unknown(p, e)
+    return ("regular" if stat.S_ISREG(m) else "link" if stat.S_ISLNK(m) else "dir" if stat.S_ISDIR(m)
+            else "other")
+
+
+def fs_list(d):
+    """★FY1 — 폴더의 이름들(정렬) · [](폴더가 없다) · Unknown(모른다 — 던진다)."""
+    try:
+        return sorted(os.listdir(d))
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        raise Unknown(d, e)
+
+
+def fs_mode(p):
+    """★FY1 — 권한 비트 · None(없다) · Unknown(모른다 — 던진다)."""
+    try:
+        return os.stat(p).st_mode & 0o7777
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise Unknown(p, e)
+
+
+def read(p):
+    """bytes | None(부재) — 실패는 Unknown(fs_read)."""
+    return fs_read(p)
+
+
+def present(p):
+    """이름이 있다(사전적 — 끊긴 링크·폴더도 '있다') · 실패는 Unknown."""
+    return fs_kind(p) != "absent"
 
 
 def split(b):
@@ -1698,11 +1759,9 @@ def plain_master(b):
 
 
 def receipt_load(p):
-    """('absent', None) | ('valid', dict) | ('invalid', 사유) — preflight C03 과 같은 규칙."""
-    try:
-        raw = read(p)
-    except OSError as e:
-        return "invalid", "판독 불가(%s)" % e
+    """('absent', None) | ('valid', dict) | ('invalid', 사유) — preflight C03 과 같은 규칙. 읽기 실패는 Unknown(★FY1 — '손상'이 아니다:
+    손상으로 보면 조립이 영수증을 다시 쓴다)."""
+    raw = read(p)
     if raw is None:
         return "absent", None
     try:
@@ -1726,11 +1785,8 @@ def receipt_load(p):
 
 
 def legacy_hash(p):
-    """0.14.x 영수증(.ceo-template-applied) — 그때 복사한 지침의 sha256 hex(관용: 첫 64자리 hex)."""
-    try:
-        raw = read(p)
-    except OSError:
-        return None
+    """0.14.x 영수증(.ceo-template-applied) — 그때 복사한 지침의 sha256 hex(관용: 첫 64자리 hex). 읽기 실패는 Unknown(★FY1)."""
+    raw = read(p)
     if raw is None:
         return None
     m = re.search(r"\b[0-9a-fA-F]{64}\b", raw.decode("utf-8", "replace"))
@@ -1781,11 +1837,6 @@ def silent_unlink(p):
         pass
 
 
-def read_bytes(p):
-    with open(p, "rb") as f:
-        return f.read()
-
-
 def write_temp(path, data, expect=None):
     """같은 폴더 임시 파일에 다 쓰고 flush·fsync, (expect) 다시 읽어 확인 — 그 경로. 실패하면 임시 파일을 남기지 않는다."""
     d = os.path.dirname(os.path.abspath(path))
@@ -1796,15 +1847,15 @@ def write_temp(path, data, expect=None):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+        mode = fs_mode(path)                    # 기존 파일의 권한을 그대로(cp 와 같은 결과 · 없으면 644 · 모르면 Unknown)
         try:
-            os.chmod(tmp, os.stat(path).st_mode & 0o7777)   # 기존 파일의 권한을 그대로(cp 와 같은 결과)
+            os.chmod(tmp, 0o644 if mode is None else mode)
         except OSError:
-            try:
-                os.chmod(tmp, 0o644)
-            except OSError:
-                pass
-        if expect is not None and not expect(read_bytes(tmp)):
-            raise ValueError("다시 읽은 후보가 조립 결과와 다르다(반쪽 기록 — 교체하지 않음)")
+            pass
+        if expect is not None:
+            back = fs_read(tmp)
+            if back is None or not expect(back):
+                raise ValueError("다시 읽은 후보가 조립 결과와 다르다(반쪽 기록 — 교체하지 않음)")
         done = True
         return tmp
     finally:
@@ -1831,18 +1882,6 @@ def write_new(path, data):
     except BaseException:
         silent_unlink(tmp)
         raise
-
-
-def side_name(path, kind):
-    """덮지 않는 옆 이름 — <path>.<kind>.<UTC>[-n]."""
-    first = "%s.%s.%s" % (path, kind, stamp()) if kind else "%s.%s" % (path, stamp())
-    p, n = first, 1
-    while os.path.lexists(p):
-        n += 1
-        if n > 999:
-            raise OSError("옆 이름을 만들지 못했다(%s)" % first)
-        p = "%s-%d" % (first, n)
-    return p
 
 
 KEPT_DIR = ".ceo-kept"
@@ -1904,7 +1943,7 @@ def rename_into(src, dst):
         except OSError as e:
             if e.errno not in _NO_EXCHANGE:
                 raise
-    if os.path.lexists(dst):
+    if present(dst):
         raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), dst)
     os.rename(src, dst)
     return dst
@@ -1934,7 +1973,7 @@ def keep_file(src, md, reason, name=None):
     로 **옮긴다**(지우지 않는다 · 다시 쓰지 않는다 · 덮지 않는 이름 <UTC>-<pid>-<n>.<reason>). 옮긴 뒤 그 순간의 바이트 해시를
     곁 파일 <이름>.kept 에 **단독 생성**(O_EXCL)으로 적는다 — 공유 원장을 다시 쓰지 않는다. 나중에 그 파일에 저장이 들어가면
     (교체 전에 열린 편집기 핸들) preflight C03 이 해시로 알아보고 알린다(FA1). 이 사본을 지우는 것은 오너나 워커의 몫이다 —
-    승격·강등은 지우지 않는다. 돌려주는 값 = (보관 경로, 보관 시각의 sha256 | None(읽을 수 없는 항목))."""
+    승격·강등은 지우지 않는다. 돌려주는 값 = (보관 경로, 곁 파일이 적은 sha256 | None(일반 파일이 아님 · 읽지 못함))."""
     kd = kept_dir(md)
     os.makedirs(kd, exist_ok=True)
     if name is not None:                # 의도 기록이 미리 정한 이름(EY2) — 있으면 덮지 않고 실패
@@ -1944,7 +1983,7 @@ def keep_file(src, md, reason, name=None):
         base = "%s-%d" % (stamp(), os.getpid())
         for n in range(1, 1000):
             kept = os.path.join(kd, "%s-%d.%s" % (base, n, reason))
-            if os.path.lexists(kept) or os.path.lexists(kept + ".kept"):
+            if present(kept) or present(kept + ".kept"):
                 continue
             try:
                 rename_into(src, kept)
@@ -1953,36 +1992,55 @@ def keep_file(src, md, reason, name=None):
             break
         else:
             raise OSError("보관 이름을 만들지 못했다(%s)" % kd)
-    return kept, write_sidecar(kept, reason, os.path.basename(src))
+    return kept, write_sidecar(kept, reason, os.path.basename(src)).get("sha256")
 
 
 def write_sidecar(kept, reason, origin):
-    """★RULINGS FL6 — 보관 사본의 곁 파일 <이름>.kept(보관 시각 바이트의 sha256)를 **통째로** 게시한다: 옆의 임시 파일에 다 쓰고
-    (fsync) 덮지 않게 놓는다 — 어느 걸음에서 멈춰도 빈·반쪽 곁 파일은 생기지 않는다(codex B6: 단독 생성 뒤 쓰기 전에 멈추면 빈
-    곁 파일이 남았다). 남을 수 있는 것은 점으로 시작하는 임시 파일뿐이고 C03 은 그것을 보관 사본으로 세지 않는다. 곁 파일이
-    이미 있으면 그대로 두고 그 값을 돌려준다(읽을 수 없으면 지금 바이트의 해시 — C03 이 그 사본을 '미확인'으로 보인다)."""
-    try:
-        data = read_bytes(kept) if os.path.isfile(kept) and not os.path.islink(kept) else None
-    except OSError:
-        data = None
-    digest = sha(data) if data is not None else None
+    """★RULINGS FL6·FY1·FY2c — 보관 사본의 곁 파일 <이름>.kept 를 **통째로** 게시한다(옆의 임시 파일에 다 쓰고 덮지 않게 놓는다).
+    곁 파일은 보관한 것의 **종류**(regular · link · dir · other)를 적고, 일반 파일이면 보관 시각 바이트의 sha256 을 적는다. 그 순간
+    읽지 못한 일반 파일은 '일반 파일이 아니었다'가 아니라 **읽지 못했다**(unread: true · sha256 null)로 적는다 — C03 은 그 사본을
+    '미확인'으로 보인다. sha256 null 은 일반 파일이 아닐 때와 unread 일 때뿐이다. 곁 파일이 이미 있으면 그대로 두고 그 내용을
+    돌려준다(형식이 틀리면 {} — 부르는 쪽이 지금 바이트를 다시 읽는다: kept_hash). 돌려주는 값 = 곁 파일의 내용(dict)."""
     side_p = kept + ".kept"
-    if not os.path.lexists(side_p):
-        side = {"schema": 1, "sha256": digest, "size": len(data) if data is not None else None, "reason": reason,
-                "from": origin, "kept_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    if not present(side_p):
+        kind = fs_kind(kept)
+        if kind == "absent":
+            raise Unknown(kept, "보관한 직후 그 이름이 없다")
+        data, unread = None, False
+        if kind == "regular":
+            try:
+                data = fs_read(kept)
+            except Unknown:
+                unread = True           # ★FY2c: 읽지 못했다는 사실을 적는다(다른 종류로 적지 않는다)
+            if data is None and not unread:
+                raise Unknown(kept, "보관한 직후 그 이름이 없다")
+        side = {"schema": 2, "kind": kind, "sha256": sha(data) if data is not None else None,
+                "size": len(data) if data is not None else None, "unread": unread, "reason": reason, "from": origin,
+                "kept_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         try:
             write_new(side_p, (json.dumps(side, ensure_ascii=False) + "\n").encode("utf-8"))
             fsync_dir(os.path.dirname(kept))
-            return digest
+            return side
         except FileExistsError:
             pass
+    raw = fs_read(side_p)
     try:
-        with open(side_p, encoding="utf-8") as f:
-            got = json.load(f).get("sha256")
-        return got if isinstance(got, str) and HEX64.fullmatch(got) else digest
-    except (OSError, ValueError, AttributeError):
-        return digest
+        got = json.loads(raw.decode("utf-8")) if raw is not None else {}
+    except (UnicodeDecodeError, ValueError):
+        got = {}
+    return got if isinstance(got, dict) else {}
 
+
+def kept_hash(kept, side):
+    """★FY1 — 보관한 판의 검증 해시: 곁 파일이 일반 파일의 해시를 적었으면 그것, 아니면(읽지 못함·형식 틀림) 지금 다시 읽는다 —
+    읽기 실패는 Unknown(보류 · 다음 입구가 다시 읽는다). 이름이 없거나 일반 파일이 아니면 검증할 수 없다(Unknown)."""
+    h = side.get("sha256")
+    if side.get("kind") == "regular" and not side.get("unread") and isinstance(h, str) and HEX64.fullmatch(h):
+        return h
+    data = fs_read(kept) if fs_kind(kept) == "regular" else None
+    if data is None:
+        raise Unknown(kept, "밀려난 판을 일반 파일로 읽을 수 없다(검증 불가)")
+    return sha(data)
 
 class LockBusy(Exception):
     """승격·강등 잠금을 정해진 시간 안에 잡지 못했다 — 잠금 없이 진행하지 않는다(보류)."""
@@ -2167,14 +2225,6 @@ STEPS = ("run", "swap", "swapped")
 _IID = [0]
 
 
-class HoldSwap(Exception):
-    """동작(조립·강등)을 끝낼 수 없어 보류한다 — 살아 있는 지침은 사용자의 판(또는 그대로), 살아 있던 모든 판은 보관 폴더에(알림은
-    던지기 전에 남겼다). rc = 입구의 종료 코드(6 보류 · 9 계속 바뀜)."""
-    def __init__(self, why, rc=6):
-        Exception.__init__(self, why)
-        self.rc = rc
-
-
 def intent_path(md):
     return os.path.join(os.path.dirname(os.path.abspath(md)), INTENT)
 
@@ -2196,7 +2246,7 @@ def reserve_names(md, reason=None):
         iid = new_iid()
         cand_p = candidate_path(md, iid)
         kept_p = os.path.join(kept_dir(md), "%s.%s" % (iid, reason)) if reason else None
-        if not any(os.path.lexists(x) for x in (cand_p, kept_p, kept_p and kept_p + ".kept") if x):
+        if not any(present(x) for x in (cand_p, kept_p, kept_p and kept_p + ".kept") if x):
             return iid, cand_p, kept_p
     raise OSError("후보·보관 이름을 만들지 못했다(%s)" % os.path.dirname(os.path.abspath(md)))
 
@@ -2211,12 +2261,16 @@ def write_candidate(cand_p, data, like, expect=None):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        try:
-            os.chmod(cand_p, os.stat(like).st_mode & 0o7777)
-        except OSError:
-            pass
-        if expect is not None and not expect(read_bytes(cand_p)):
-            raise ValueError("다시 읽은 후보가 조립 결과와 다르다(반쪽 기록 — 교체하지 않음)")
+        mode = fs_mode(like)
+        if mode is not None:
+            try:
+                os.chmod(cand_p, mode)
+            except OSError:
+                pass
+        if expect is not None:
+            back = fs_read(cand_p)
+            if back is None or not expect(back):
+                raise ValueError("다시 읽은 후보가 조립 결과와 다르다(반쪽 기록 — 교체하지 않음)")
         done = True
     finally:
         if not done:
@@ -2235,11 +2289,9 @@ def _plain_name(n):
 
 
 def read_intent(md):
-    """None(없음) | dict(읽을 수 있는 기록 — 스키마 2) | "bad"(있지만 읽을 수 없거나 형식이 틀림)."""
-    try:
-        raw = read(intent_path(md))
-    except OSError:
-        return "bad"
+    """None(없음) | dict(읽을 수 있는 기록 — 스키마 2) | "bad"(있지만 형식이 틀림). 읽기 실패는 Unknown(★FY1 — 장벽과 같이
+    아무것도 옮기지 않고 보류하되, 다음 입구가 다시 읽는다)."""
+    raw = read(intent_path(md))
     if raw is None:
         return None
     try:
@@ -2322,11 +2374,7 @@ def park_unnamed_candidates(md, named=()):
     잠금 안에서만 부른다. 읽을 수 없는 기록이 있으면 부르지 않는다(장벽 — 무엇이 필요한지 모른다)."""
     d = os.path.dirname(os.path.abspath(md))
     pre = "." + os.path.basename(md) + "."
-    try:
-        names = os.listdir(d)
-    except OSError:
-        return
-    for n in sorted(names):
+    for n in fs_list(d):
         if n.startswith(pre) and n.endswith(".candidate") and n not in named:
             discard_candidate(md, os.path.join(d, n))
 
@@ -2356,16 +2404,10 @@ def hold_unflushed(md, nf, what, e):
 def hold_record(md, nf, title, body):
     """기록을 그대로 두고 보류한다(다음 입구가 다시 본다). 알림은 같은 기록에 한 번(FA3 — 틱마다 보내지 않는다): 표지
     <기록>.held 에 기록 바이트의 해시를 알림을 남긴 **뒤에** 적는다(먼저 적고 멈추면 알림 없이 표지만 남는다)."""
-    try:
-        raw = read(intent_path(md)) or b""
-    except OSError:
-        raw = b""
+    raw = read(intent_path(md)) or b""
     key = sha(raw)
     mark = intent_path(md) + ".held"
-    try:
-        seen = (read(mark) or b"").decode("utf-8", "replace").strip()
-    except OSError:
-        seen = ""
+    seen = (read(mark) or b"").decode("utf-8", "replace").strip()
     err("CEO 지침 교체 보류: %s" % title)
     if seen != key and note(nf, title, body) and nf:
         try:
@@ -2455,20 +2497,13 @@ def swap_names(md, rec, nf):
     try:
         keep_file(md, md, sw["reason"], name=sw["kept"])            # 살아 있는 파일 → 보관 폴더(★FL3 한 번의 이름 바꾸기)
     except FileNotFoundError:
-        if not os.path.lexists(os.path.join(kept_dir(md), sw["kept"])):
+        if not present(os.path.join(kept_dir(md), sw["kept"])):
             return                  # 살아 있는 지침이 없다 — 바꾸지 않았다
         raise
     try:
         place_candidate(cand_p, md)
     except FileExistsError:
         pass                        # 비어 있던 순간 편집기가 만든 새 파일이 이긴다 — settle 이 우리 후보를 정리한다
-
-
-def read_or_none(p):
-    try:
-        return read_bytes(p)
-    except FileNotFoundError:
-        return None
 
 
 def finish_swap(md, rec, nf):
@@ -2480,40 +2515,46 @@ def finish_swap(md, rec, nf):
     sw = rec["swap"]
     d = os.path.dirname(os.path.abspath(md))
     cand_p, kept_p = os.path.join(d, sw["candidate"]), os.path.join(kept_dir(md), sw["kept"])
-    if not os.path.lexists(kept_p):
-        try:
-            csha = sha(read_bytes(cand_p)) if os.path.lexists(cand_p) else None
-        except OSError:
-            csha = None
-        if sw["mode"] == "exchange" and csha is not None and csha != sw["candidate_sha256"]:
+    if not present(kept_p):
+        # ★FY1: 먼저 다 읽는다 — 어느 읽기든 실패하면 Unknown 이 올라가고 아무것도 옮기지 않는다(기록 그대로)
+        cand = fs_read(cand_p) if present(cand_p) else None
+        live = fs_read(md)
+        csha = sha(cand) if cand is not None else None
+        lsha = sha(live) if live is not None else None
+        if sw["mode"] == "exchange" and cand is not None and csha != sw["candidate_sha256"]:
             keep_file(cand_p, md, sw["reason"], name=sw["kept"])    # 맞바꾼 뒤에 멈췄다 — 후보 이름의 것은 밀려난 파일이다
         else:
             # 바꾸기 전에 멈췄다(살아 있는 파일은 옮겨지지 않았다) — 후보는 살아 있던 적이 없다(보관 폴더로 · FL2)
-            had_cand = os.path.lexists(cand_p)
-            if had_cand:
-                discard_candidate(md, cand_p)
-            live = read_or_none(md)
-            lsha = sha(live) if live is not None else None
             if sw["purpose"] == "restore" and lsha != sw["candidate_sha256"]:
                 if lsha == sw["read_sha256"]:
+                    if cand is not None:
+                        discard_candidate(md, cand_p)
                     return "redo"   # 우리 낡은 후보가 아직 살아 있다 — 되돌리기를 그 source 에서 다시(새 진실은 보관 폴더에)
                 if lsha is not None:
+                    if cand is not None:
+                        discard_candidate(md, cand_p)
                     two_edits(md, rec, nf, os.path.join(kept_dir(md), sw["source"]))    # 그 뒤 또 저장됐다 — 끝(보류)
-            elif sw["purpose"] == "op" and not had_cand and lsha is not None and lsha == sw["candidate_sha256"]:
+            elif sw["purpose"] == "op" and cand is None and lsha is not None and lsha == sw["candidate_sha256"]:
                 hold_record(md, nf, T_INTENT_CHECK,
                             "끝나지 않은 본부 지침 교체에서 밀려난 판(%s)이 어디에도 없습니다(이 제품 밖에서 지워졌습니다) — 그 사이의 "
                             "저장이 사라지지 않았는지 잴 수 없어 CEO 지침을 더 바꾸지 않고 보류했습니다. 기록(%s)은 그대로 "
                             "두었습니다 — 오너 지시로 확인하십시오." % (kept_p, intent_path(md)))
+            if cand is not None:
+                discard_candidate(md, cand_p)
             set_step(md, rec, "run", nf)    # 동작을 지금 판으로 다시 계획한다
             return None
-    ksha = write_sidecar(kept_p, sw["reason"], os.path.basename(md))   # 곁 파일이 없으면 지금 게시한다
-    if not os.path.lexists(md):
+    ksha = kept_hash(kept_p, write_sidecar(kept_p, sw["reason"], os.path.basename(md)))   # 곁 파일이 없으면 지금 게시
+    if not present(md):
         # 맡기고 먼저의 두 걸음 사이에서 멈췄다(FA4) — 빈 살아 있는 이름을 채운다(후보 → 덮지 않게 · 후보가 없으면 보관된 판의 사본)
+        cand = fs_read(cand_p) if present(cand_p) else None
         src = cand_p
+        if cand is None or sha(cand) != sw["candidate_sha256"]:
+            kb = fs_read(kept_p)
+            if kb is None:
+                raise Unknown(kept_p, "보관된 판이 없다")
+            src = reserve_names(md)[1]                  # ★EY3: 보관된 판의 사본을 후보로 **다** 쓴 뒤
+            write_candidate(src, kb, kept_p)
         try:
-            if not (os.path.lexists(cand_p) and sha(read_bytes(cand_p)) == sw["candidate_sha256"]):
-                src = reserve_names(md)[1]              # ★EY3: 보관된 판의 사본을 후보로 **다** 쓴 뒤
-                write_candidate(src, read_bytes(kept_p), kept_p)
             place_candidate(src, md)                    # 덮지 않는 이동으로 놓는다(살아 있는 경로에 직접 쓰지 않는다)
         except FileExistsError:
             if src != cand_p:
@@ -2535,9 +2576,9 @@ def settle(md, rec, nf, ksha):
     sw = rec["swap"]
     d = os.path.dirname(os.path.abspath(md))
     cand_p, kept_p = os.path.join(d, sw["candidate"]), os.path.join(kept_dir(md), sw["kept"])
-    if os.path.lexists(cand_p):
+    live = fs_read(md)                      # ★FY1: 읽기 먼저(실패면 아무것도 옮기지 않는다)
+    if present(cand_p):
         discard_candidate(md, cand_p)       # 놓이지 않은 후보(그 사이 저장이 살아 있는 이름을 만들었다) — 살아 있던 적이 없다
-    live = read_or_none(md)
     lsha = sha(live) if live is not None else None
     if kept_p not in rec["kept_report"]:
         rec["kept_report"].append(kept_p)
@@ -2584,8 +2625,8 @@ def complete(md, rec, nf):
     kept = os.path.join(kept_dir(md), sw["kept"])
     if rec["op"] == "compose":
         print("[cys-dept] 이전 본부 지침 파일 보관: %s" % kept)
-        live = read_or_none(md)
-        if done.get("pre") and not pre_present(pre_p) and live is not None and sha(live) == sw["candidate_sha256"]:
+        live = fs_read(md)
+        if done.get("pre") and live is not None and sha(live) == sw["candidate_sha256"] and not pre_present(pre_p):
             c = split(live)
             if c is not None:
                 best_effort(write_new, pre_p, c[2])     # 백업 = 이 조립에 쓴 사용자 본부 지침(덮지 않는다)
@@ -2637,8 +2678,10 @@ def run_record(md, nf, rec, args, until_run=False):
                 note(nf, changing, "본부 지침이 CEO %s 중에 계속 저장되어 보류했습니다. 살아 있던 모든 판은 %s 에 있고, 다음 "
                                    "승격 확인이 기록에서 이어 갑니다." % (action, kept_dir(md)))
                 raise HoldSwap("changing", 9)
-            swap_unit(md, read_bytes(os.path.join(kept_dir(md), src)), displace, "restore", "replaced", nf=nf, rec=rec,
-                      source=src)
+            data = fs_read(os.path.join(kept_dir(md), src))
+            if data is None:
+                raise Unknown(os.path.join(kept_dir(md), src), "되돌릴 판이 보관 폴더에 없다")
+            swap_unit(md, data, displace, "restore", "replaced", nf=nf, rec=rec, source=src)
             continue
         if step == "swapped":
             return complete(md, rec, nf)
@@ -2708,7 +2751,7 @@ def load_preflight(pack_bin, self_path):
     cands = [os.path.join(pack_bin, "javis_preflight.py"),
              os.path.join(os.path.dirname(os.path.realpath(self_path)), "javis_preflight.py")]
     for c in cands:
-        if os.path.isfile(c):
+        if fs_kind(c) == "regular":
             sys.path.insert(0, os.path.dirname(c))
             import javis_preflight
             return javis_preflight
@@ -2794,7 +2837,7 @@ V014_TEMPLATE_SHA256 = frozenset((   # 배포된 CEO_TEMPLATE.md 전문(15종 �
 def pre_present(pre_p):
     """★CG2 — .pre-ceo 의 실재 판정은 한 가지: 항목이 있다(사전적 의미 — 끊긴 링크·읽을 수 없는 파일·폴더도 '있다').
     지키는 방향이다. 같은 판정: javis_preflight `_c03_pre_ceo_present` · javis_org · A12 · 앱 `ceo_promoted_at`."""
-    return os.path.lexists(pre_p)
+    return present(pre_p)
 
 
 def promoted(mb, pre_exists):
@@ -2850,6 +2893,16 @@ T_TWO_EDITS = "CEO 지침 교체 보류(두 저장이 겹침)"
 T_INTENT_CHECK = "CEO 지침 교체 기록 확인 필요"
 T_NO_SAFE_SWAP = "CEO 지침 교체 보류(이 디스크에서는 안전하게 바꿀 수 없음)"
 T_WAIT_RECOMPOSE = "CEO 승격 보류(다시 조립 대기)"
+T_READ_UNKNOWN = "CEO 지침 보류(파일을 읽지 못함)"
+
+
+def notice_unknown(nf, h):
+    """★RULINGS FY1 — 읽기가 실패해 보류했다는 알림 1건(같은 제목은 한 번만 올라간다)."""
+    err("CEO 지침 보류: %s — 읽지 못한 것을 '없음'으로 다루지 않는다. 아무것도 옮기거나 바꾸지 않았다(다음 입구가 다시 읽는다)" % h)
+    note(nf, T_READ_UNKNOWN, "본부 지침의 승격·강등·복구 중에 %s 을(를) 읽지 못해(%s) 아무것도 옮기거나 바꾸지 않고 보류했습니다 — "
+                             "읽지 못한 것을 '없음'이나 '바뀌지 않음'으로 다루지 않습니다. 끝나지 않은 교체 기록이 있으면 그대로 두었고, "
+                             "다음 승격 확인(부서 켜기·대기 틱)이 다시 읽어 이어 갑니다(지나가는 실패면 저절로 풀립니다). 같은 일이 "
+                             "계속되면 그 파일을 열어 둔 프로그램(편집기·검사기)이나 권한을 확인하십시오." % (h.path, h.error))
 TICK_LOCK_WAIT_S = 2.0
 SEP_LINE = "# [본문 — 표준 MASTER 운영 계약 전문]"
 
@@ -2860,14 +2913,17 @@ def copy_title(kind, path):
 
 
 def pre_read(pre_p):
-    """('absent', None) | ('ok', bytes) | ('unreadable', 사유) — 실재는 사전적(pre_present)으로 본다."""
-    if not pre_present(pre_p):
+    """('absent', None) | ('ok', bytes) | ('unreadable', 사유) — 실재는 사전적(pre_present)으로 본다. 'unreadable' 은 읽을 수 없는
+    **종류**(폴더·끊긴 링크 등 — 확정된 답)일 때뿐이다. 읽기 실패는 Unknown(★FY1 — 보류)."""
+    kind = fs_kind(pre_p)
+    if kind == "absent":
         return "absent", None
-    try:
-        with open(pre_p, "rb") as f:
-            return "ok", f.read()
-    except OSError as e:
-        return "unreadable", str(e)
+    if kind != "regular":
+        return "unreadable", "일반 파일이 아니다(%s)" % kind
+    b = fs_read(pre_p)
+    if b is None:
+        raise Unknown(pre_p, "읽는 사이에 사라졌다")
+    return "ok", b
 
 
 def pre_unusable(pstate, pb):
@@ -2925,7 +2981,7 @@ def released_equal(mb, tb, leg):
 
 def held_symlink(nf, md, pre_p, title):
     for path in (md, pre_p):
-        if os.path.islink(path):
+        if fs_kind(path) == "link":
             err("%s 은(는) 심볼릭 링크다 — 일반 파일로 바꿔 쓰지 않고 보류한다" % path)
             note(nf, title, "본부 지침 파일(%s)이 심볼릭 링크라 CEO 지침을 바꾸지 않았습니다(링크를 일반 파일로 "
                             "덮어쓰지 않습니다). 링크를 실제 파일로 바꾼 뒤 다시 시도하십시오. 지침은 그대로입니다." % path)
@@ -2944,10 +3000,9 @@ def do_promoted(a):
     # a = md — CB1 술어(파리티 시험용): yes/no 한 줄.
     md = a[0]
     try:
-        mb = read(md)
-    except OSError:
-        mb = None
-    print("yes" if promoted(mb, pre_present(md + ".pre-ceo")) else "no")
+        print("yes" if promoted(read(md), pre_present(md + ".pre-ceo")) else "no")
+    except Unknown:
+        print("unknown")                    # ★FY1 — 읽지 못한 것은 '아니다'가 아니다
     return 0
 
 
@@ -2956,40 +3011,37 @@ def do_state(a):
     #   current(현행 머리말·유효 영수증·백업) · current-fix(영수증/백업 보정만) · drift(머리말 낡음 — 조립)
     #   legacy(0.14.x 승격 — 양성 증거, CG1) · unproven(구분선만 있고 승격 증거 없음 — CB2) · uncomposed · missing · unreadable
     tmpl, md = a[0], a[1]
-    d = os.path.dirname(md)
     try:
-        tb, mb = read(tmpl), read(md)
-    except OSError:
-        print("unreadable")
-        return 0
-    if os.path.lexists(intent_path(md)):
-        print("intent")                         # ★EY2 — 끝나지 않은 교체: 조립 경로가 먼저 마무리한다(현행 아님)
-        return 0
+        print(state_word(tmpl, md))
+    except Unknown:
+        print("unreadable")                     # ★FY1 — 읽지 못함은 '없음'도 '현행'도 아니다
+    return 0
+
+
+def state_word(tmpl, md):
+    d = os.path.dirname(md)
+    tb, mb = read(tmpl), read(md)
+    if present(intent_path(md)):
+        return "intent"                         # ★EY2 — 끝나지 않은 교체: 조립 경로가 먼저 마무리한다(현행 아님)
     if mb is None:
-        print("missing")
-        return 0
+        return "missing"
     mc = split(mb)
     if mc is None:
-        print("uncomposed")
-        return 0
+        return "uncomposed"
     rs, rd = receipt_load(os.path.join(d, RECEIPT))
     leg_p = os.path.join(d, LEGACY_RECEIPT)
     legm = legacy_matches(legacy_hash(leg_p), mb)
     pexist = pre_present(md + ".pre-ceo")
     if not evidence(mc[0], rs, legm, pexist):
-        print("unproven")
-        return 0
+        return "unproven"
     if is_v014(mc[0], rs, legm):
-        print("legacy")
-        return 0
+        return "legacy"
     tc = split(tb)
     if tc is None or mc[0] != tc[0]:
-        print("drift")
-        return 0
+        return "drift"
     ok = (rs == "valid" and rd["header_sha256"] == sha(tc[0]) and rd["separator"].encode("utf-8") == mc[1] and pexist
-          and not os.path.lexists(leg_p))      # ★DC2: 남은 0.14 영수증이 있으면 현행이 아니다 — 보정 갈래가 치운다
-    print("current" if ok else "current-fix")
-    return 0
+          and not present(leg_p))      # ★DC2: 남은 0.14 영수증이 있으면 현행이 아니다 — 보정 갈래가 치운다
+    return "current" if ok else "current-fix"
 
 
 def pre_differs(pstate, pb, body, rs):
@@ -3022,6 +3074,8 @@ def locked_attempts(md, nf, op, args, busy_title, action):
             rec, resumed, rop = close_intent(md, nf, op, args)     # ★EY2·FL4 — 남은 동작을 무엇보다 먼저 끝낸다
             rc = run_record(md, nf, rec or new_record(op, args), args)
         except HoldSwap as h:
+            if isinstance(h, Unknown):
+                notice_unknown(nf, h)       # ★FY1 — 읽기 실패 = 보류(기록·파일 무변경 · 알림 1건 · 다음 입구가 다시 읽는다)
             return h.rc
         if rop == op and resumed in (0, 12) and rc in (10, 11):
             rc = resumed            # 앞 입구가 바꾼 지침을 이 입구가 마무리했다 — 바뀐 사실(재주입)을 그대로 알린다
@@ -3097,7 +3151,7 @@ def compose_once(tmpl, md, tsha, nf):
                     wrote.append("영수증")
                 if pstate == "absent" and best_effort(write_new, pre_p, tail) is not None:
                     wrote.append(".pre-ceo")    # 승격 중 .pre-ceo = 지금 본문(덮지 않는다 — 그 사이 생긴 것은 그대로)
-                if os.path.lexists(leg_p) and best_effort(drop_legacy, leg_p):
+                if present(leg_p) and best_effort(drop_legacy, leg_p):
                     wrote.append("옛 영수증 정리")   # ★DC2: 남은 0.14 영수증은 언제나 치운다(빠른 경로가 여기로 보낸다)
                 # 현행 머리말 = 이 0.15.0 조립 자신의 결과다 — .pre-ceo 는 그때의 백업이고 CEO 동안 고친 본문과 다른 것이
                 #   정상이다(알림 없음 · 바이트 무이동 — CG1 "stale .pre-ceo changes nothing").
@@ -3275,7 +3329,11 @@ def do_recover(a):
     #   검사 뒤에 바뀌었다(지침은 사용자의 판 그대로 — bash 가 PENDING 을 남겨 다음 틱의 승격 확인이 새 틀을 검사해 조립한다).
     md = a[0]
     nf = a[1] if len(a) > 1 else ""
-    if not os.path.lexists(intent_path(md)):
+    try:
+        if not present(intent_path(md)):
+            return 0
+    except Unknown as h:
+        notice_unknown(nf, h)
         return 0
     try:
         lk = take_lock(md, wait=TICK_LOCK_WAIT_S)
@@ -3289,7 +3347,9 @@ def do_recover(a):
                                        "지우지 않았습니다.")
             return 3
         return 0
-    except HoldSwap:
+    except HoldSwap as h:
+        if isinstance(h, Unknown):
+            notice_unknown(nf, h)
         return 0
     finally:
         lk.close()
@@ -3297,7 +3357,15 @@ def do_recover(a):
 def do_verify(a):
     # a = tmpl md — promote-ceo 의 승격 확인(C11 11.10 · O-C11-1). stdout 한 줄 = 판정 사유.
     tmpl, md = a[0], a[1]
-    if os.path.lexists(intent_path(md)):
+    try:
+        return verify_once(tmpl, md)
+    except Unknown as h:
+        print("읽지 못했다(%s) — 확인할 수 없다(통과가 아니다)" % h)     # ★FY1
+        return 1
+
+
+def verify_once(tmpl, md):
+    if present(intent_path(md)):
         print("본부 지침 교체가 끝나지 않았다(%s) — 다음 승격 확인이 마무리한다" % INTENT)
         return 1
     tb, mb = read(tmpl), read(md)
@@ -3395,7 +3463,7 @@ CEO_NOTICE_CLOSE_DECISION="ceo-promoted"
 ceo_notices_close(){
   local ids id n=0
   ids="$(env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
-    | LC_ALL=C awk -F'\t' '$2=="[pending]" && ($4=="CEO 승격 보류(부트 필요)" || $4=="CEO 승격 대기" || $4=="CEO 승격 보류(템플릿 상위집합 검사 실패)" || $4=="CEO 승격 보류(영수증 손상)" || $4=="CEO 승격 보류(본부 지침에 조립 구분선 — 승격 기록 없음)" || $4=="CEO 승격 보류(본부 지침 확인 필요)" || $4=="CEO 승격 보류(다른 승격·강등이 진행 중)" || $4=="CEO 승격 보류(본부 지침이 조립 중에 계속 바뀜)" || $4=="CEO 지침 교체 보류(두 저장이 겹침)" || $4=="CEO 지침 교체 기록 확인 필요" || $4=="CEO 승격 보류(다시 조립 대기)"){print $1}')" \
+    | LC_ALL=C awk -F'\t' '$2=="[pending]" && ($4=="CEO 승격 보류(부트 필요)" || $4=="CEO 승격 대기" || $4=="CEO 승격 보류(템플릿 상위집합 검사 실패)" || $4=="CEO 승격 보류(영수증 손상)" || $4=="CEO 승격 보류(본부 지침에 조립 구분선 — 승격 기록 없음)" || $4=="CEO 승격 보류(본부 지침 확인 필요)" || $4=="CEO 승격 보류(다른 승격·강등이 진행 중)" || $4=="CEO 승격 보류(본부 지침이 조립 중에 계속 바뀜)" || $4=="CEO 지침 교체 보류(두 저장이 겹침)" || $4=="CEO 지침 교체 기록 확인 필요" || $4=="CEO 승격 보류(다시 조립 대기)" || $4=="CEO 지침 보류(파일을 읽지 못함)"){print $1}')" \
     || return 0
   for id in $ids; do
     [ "$n" -lt 20 ] || break

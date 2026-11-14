@@ -1519,6 +1519,143 @@ class CrashProperty(Rig):
         self.assertGreater(stats["second faults"], stats["crash points"])
 
 
+class ReadUnknown(Rig):
+    """★RULINGS FY1 — 이 경로의 모든 읽기는 한 읽기 함수를 지나고 답은 셋이다: 바이트 · 없음 · 모른다(오류). 어느 호출부도 '모른다'를
+    '없음'·기본값·갈래 선택으로 바꾸지 않는다 — 기록은 그대로, 아무것도 옮기지 않고, 그 걸음은 알림과 함께 보류되며, 다음 입구가
+    다시 읽는다(지나가는 실패는 저절로 풀리고 오래가는 실패는 보류로 남는다). 실패는 윈도우의 공유 위반처럼 open 이 PermissionError
+    로 답하게 끼워 넣는다(시간이 아니라)."""
+    SAVE = "USERSAVE-FY1 읽은 뒤에 저장한 줄\n"
+    TITLE = "CEO 지침 보류(파일을 읽지 못함)"
+
+    def failing_open(self, ns, hit, times=None):
+        """ns 안의 open 이 hit(경로) 가 참인 경로를 읽을 때 PermissionError — times 번(None = 계속). 쓰기는 그대로."""
+        real, left = open, [times]
+
+        def fake(path, mode="r", *a, **kw):
+            if ("r" in mode and "+" not in mode and hit(os.path.abspath(str(path)))
+                    and (left[0] is None or left[0] > 0)):
+                if left[0] is not None:
+                    left[0] -= 1
+                raise PermissionError(13, "sharing violation (injected)", str(path))
+            return real(path, mode, *a, **kw)
+        ns["open"] = fake
+
+    def snapshot(self):
+        out = {}
+        for root, _dirs, files in os.walk(self.dirs):
+            for f in files:
+                if not f.endswith(".promote.lock"):
+                    q = os.path.join(root, f)
+                    out[os.path.relpath(q, self.dirs)] = _slurp(q, "rb")
+        return out
+
+    def compose(self, ns, nf):
+        return ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), nf])
+
+    def crash_after_exchange_with_a_save(self):
+        """B 를 읽은 뒤 B+E 저장 → 낡은 후보 H+S+B 가 맞바꿔 들어감 → 밀려난 B+E 를 보관하기 전에 멈춤. 돌려주는 값 = 후보 이름."""
+        ns = ceo_py_module()
+        real = ns["exchange_fn"]()
+
+        def ex(a, b):
+            if not a.endswith(".candidate"):
+                return real(a, b)
+            _write(self.p("MASTER_DIRECTIVE.md"), USER + self.SAVE)
+            real(a, b)
+            raise SystemExit("crash right after the exchange")
+        ns["exchange_fn"] = lambda: ex
+        with self.assertRaises(SystemExit):
+            self.compose(ns, "")
+        cands = [f for f in os.listdir(self.dirs) if f.endswith(".candidate")]
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(_slurp(self.p(cands[0]), encoding="utf-8"), USER + self.SAVE, "시험 전제: 후보 이름에 밀려난 저장")
+        return self.p(cands[0])
+
+    def test_an_unreadable_candidate_after_the_exchange_holds_and_moves_nothing(self):
+        """codex R1 — 맞바꾼 뒤 멈춘 기록의 후보(= 밀려난 새 저장)를 읽지 못하면, 종전에는 '맞바꾸지 않았다'로 읽혀 새 저장이 쓰이지
+        않은 후보로 치워지고 낡은 조립이 현행으로 받아들여졌다. 이제 보류다 — 한 번 실패도, 계속 실패도. 풀리면 저장으로 조립한다."""
+        if ceo_py_module()["exchange_fn"]() is None:
+            self.skipTest("이 플랫폼에는 원자 맞바꾸기가 없다")
+        for times in (1, None):
+            with self.subTest(failure="once" if times else "lasting"):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                cand = self.crash_after_exchange_with_a_save()
+                before = self.snapshot()
+                for attempt in range(1 if times else 2):
+                    ns = ceo_py_module()
+                    self.failing_open(ns, lambda q: q == os.path.abspath(cand), times)
+                    nf = os.path.join(self.tmp, "nf-r1-%d.txt" % attempt)
+                    rc = self.compose(ns, nf)
+                    self.assertEqual(rc, 6, "후보를 읽지 못했는데 보류하지 않았다(codex R1)")
+                    self.assertEqual(self.snapshot(), before, "읽지 못했는데 무언가를 옮기거나 바꿨다")
+                    self.assertIn(self.TITLE, _slurp(nf, encoding="utf-8"))
+                rc, out, err = self.run_dept("promote-ceo")
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER + self.SAVE,
+                                 "풀린 뒤에도 낡은 조립이 남았다 — 밀려난 저장으로 조립해야 한다")
+                self.assertIsNone(self.read(".ceo-intent.json"))
+
+    def test_every_read_of_the_path_holds_when_it_fails(self):
+        """살아 있는 지침 · 틀 · 영수증 · 0.14 영수증 · .pre-ceo · 끝나지 않은 교체 기록 — 어느 것을 읽지 못해도 보류(rc 6 · 알림 ·
+        파일 무변경)하고, 풀리면 다음 입구가 바르게 끝낸다(종전: 영수증은 '손상'으로 다시 쓰였고, 0.14 영수증·.pre-ceo 는 '없음'처럼
+        지나갔고, 기록은 '형식이 틀린 기록'의 장벽 문구로 갔고, 지침·틀은 예외로 죽었다)."""
+        def promoted():
+            self.seed()
+            self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+
+        def crashed_record():
+            self.seed()
+            ns = ceo_py_module()
+            orig = ns["write_intent"]
+
+            def stop(*a, **kw):
+                orig(*a, **kw)
+                raise SystemExit("crash after the record")
+            ns["write_intent"] = stop
+            with self.assertRaises(SystemExit):
+                self.compose(ns, "")
+
+        def legacy():
+            self.seed()
+            _write(self.p(".ceo-template-applied"), sha("다른 옛 지침\n") + "\n")    # 남은(낡은) 0.14 영수증
+        cases = [("live", self.seed, "MASTER_DIRECTIVE.md"), ("template", self.seed, "CEO_TEMPLATE.md"),
+                 ("receipt", promoted, ".ceo-receipt.json"), ("legacy receipt", legacy, ".ceo-template-applied"),
+                 (".pre-ceo", promoted, "MASTER_DIRECTIVE.md.pre-ceo"), ("record", crashed_record, ".ceo-intent.json")]
+        for label, setup, name in cases:
+            with self.subTest(unreadable=label):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                setup()
+                target = os.path.abspath(self.p(name))
+                before = self.snapshot()
+                ns = ceo_py_module()
+                self.failing_open(ns, lambda q: q == target)
+                nf = os.path.join(self.tmp, "nf-%s.txt" % name)
+                rc = self.compose(ns, nf)
+                self.assertEqual(rc, 6, "%s 를 읽지 못했는데 보류하지 않았다" % label)
+                self.assertEqual(self.snapshot(), before, "%s 를 읽지 못했는데 무언가를 바꿨다" % label)
+                self.assertIn(self.TITLE, _slurp(nf, encoding="utf-8"))
+                rc, out, err = self.run_dept("promote-ceo")
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER)
+                self.assertIsNone(self.read(".ceo-intent.json"))
+
+    def test_a_file_unreadable_when_kept_is_recorded_as_unread(self):
+        """보관한 순간 읽지 못한 일반 파일은 '일반 파일이 아니었다'(sha256 null 만)가 아니라 **읽지 못했다**로 적힌다(FY1 · FY2c)."""
+        self.seed()
+        ns = ceo_py_module()
+        kd = os.path.abspath(os.path.join(self.dirs, ".ceo-kept"))
+        self.failing_open(ns, lambda q: os.path.dirname(q) == kd and not q.endswith(".kept"))
+        src = self.p("MASTER_DIRECTIVE.md.scratch")
+        _write(src, "보관할 바이트\n")
+        kept, _side = ns["keep_file"](src, self.p("MASTER_DIRECTIVE.md"), "test")
+        doc = json.loads(_slurp(kept + ".kept", encoding="utf-8"))
+        self.assertEqual(doc.get("kind"), "regular", "읽지 못한 일반 파일을 다른 종류로 적었다: %r" % doc)
+        self.assertIs(doc.get("unread"), True, "읽지 못했다는 사실을 적지 않았다: %r" % doc)
+        self.assertIsNone(doc.get("sha256"))
+        self.assertEqual(_slurp(kept, encoding="utf-8"), "보관할 바이트\n")
+
+
 class SafePrimitives(Rig):
     """★RULINGS EY3 — 살아 있는 이름은 반쪽 지침을 드러낼 수 없는 방법으로만 바뀐다: 맞바꾸기(맥·리눅스), 그것이 없으면 맡기고
     먼저(살아 있는 파일을 보관 폴더로 옮긴 뒤 **다 쓴** 후보를 덮지 않는 이동으로 놓기 — 의도 기록 아래). 살아 있는 이름에 직접
