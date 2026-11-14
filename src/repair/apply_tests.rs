@@ -435,8 +435,12 @@ fn rule_one_property_every_op_every_point() {
                     }
                     // P3
                     if r.live(case.rel) == TargetState::Absent {
+                        // EJ1 (old: absent only where a target state is absent): after a generation
+                        // change the deposit-first abandonment places nothing of the old generation
                         assert!(
-                            case.incoming.is_none() || case.before.is_none(),
+                            case.incoming.is_none()
+                                || case.before.is_none()
+                                || (matches!(action, Action::BumpGeneration) && case.form == ApplyForm::DepositFirst),
                             "P3 {tag}: the live path ended absent"
                         );
                     }
@@ -525,7 +529,10 @@ fn seal_is_the_next_operation_after_every_exchange_and_move() {
     let src = include_str!("apply.rs");
     let prod = &src[..src.find("#[cfg(test)]\n#[path = \"apply_tests.rs\"]").unwrap()];
     let mut seen = 0;
-    for needle in ["exchange(live, &slot.payload())", "exchange(&live, &slot.payload())", "place_no_replace(live, &slot.payload())"] {
+    // EJ1 (REWRITTEN needles — old: the direct calls `exchange(live, &slot.payload())`,
+    // `exchange(&live, &slot.payload())`, `place_no_replace(live, &slot.payload())`): every exchange
+    // and move into a slot now goes through THE door
+    for needle in ["DoorAct::Exchange { payload: &slot.payload() }", "DoorAct::MoveOut { into: &slot.payload() }"] {
         for (at, _) in prod.match_indices(needle) {
             seen += 1;
             // the statement after the call's error arm (which only closes the record and returns)
@@ -789,12 +796,14 @@ fn windows_form_auto_off_manual_deposit_first_boot_critical_pending() {
 }
 
 /// OQ-D8: interrupted between the two moves → the next run RESUMES when the staged copy and the
-/// generation are unchanged, and ABANDONS (a copy of the deposit placed back) when the generation
-/// moved; an occupied path stops it, nothing deleted.
+/// generation are unchanged; when the generation moved it ABANDONS, and — EJ1 (REWRITTEN; old
+/// expectation `(bump) → OLD`: "a copy of the deposit placed back") — the abandonment carries the
+/// operation's binding, so the door places NOTHING of the old generation into the new one: the path
+/// stays empty, the deposit stays in the vault; an occupied path stops it, nothing deleted.
 #[cfg(target_os = "macos")]
 #[test]
 fn windows_interruption_between_the_two_moves_resume_or_abandon() {
-    for (bump, occupy, want) in [(false, false, b"NEW\n".to_vec()), (true, false, b"OLD\n".to_vec()), (false, true, b"THIRD\n".to_vec())] {
+    for (bump, occupy, want) in [(false, false, Some(b"NEW\n".to_vec())), (true, false, None), (false, true, Some(b"THIRD\n".to_vec()))] {
         let r = rig("oqd8");
         r.put("bin/w.py", b"OLD\n", 0o644);
         let (src, st) = r.source("w.py", b"NEW\n", 0o644);
@@ -811,7 +820,7 @@ fn windows_interruption_between_the_two_moves_resume_or_abandon() {
         }
         let calm = NoFaults;
         resume_interrupted_in(&r.env(&calm, ApplyForm::DepositFirst)).unwrap();
-        assert_eq!(std::fs::read(r.pack.join("bin/w.py")).unwrap(), want);
+        assert_eq!(std::fs::read(r.pack.join("bin/w.py")).ok(), want);
         assert!(r.vault_bytes().contains(&b"OLD\n".to_vec()), "the deposit is never deleted");
         assert!(wal::unfinished_for_lane(&r.root, &r.lane).is_empty());
     }
@@ -1842,7 +1851,7 @@ fn approved_apply_property_every_file_every_point() {
                     assert!(!n.starts_with(".building") && !n.starts_with(".screen") && !n.contains(".part-"), "P2 {tag}: left behind: {n}");
                     if crate::repair::ledger::is_slot_name(&n) {
                         for sub in ["sealed", "meta"] {
-                            for f in std::fs::read_dir(e.path().join(sub)).unwrap().flatten() {
+                            for f in std::fs::read_dir(e.path().join(sub)).into_iter().flatten().flatten() {
                                 assert!(!f.file_name().to_string_lossy().contains(".part-"), "P2 {tag}: temporary entry in a slot");
                             }
                         }

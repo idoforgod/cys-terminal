@@ -1060,7 +1060,15 @@ fn every_broken_member_makes_the_approved_copy_unknown_on_both_paths() {
                 std::fs::write(crate::repair::wal::op_path_in(&r.root, &id, &op.op), b"{ unreadable").unwrap();
             }
         }
-        assert!(matches!(crate::repair::apply::resolve_approved_copy_in(&r.root, &r.pack, &r.lane, rel), crate::repair::apply::ApprovedCopy::Unknown(_)), "{member}");
+        // EN4 (REWRITTEN for the unreadable members — old: Unknown for every member): an unreadable
+        // record or row makes the LEDGER incomplete → `LedgerUnreadable`, one finding for the cause
+        let unreadable = matches!(member, "record" | "row");
+        let answer = crate::repair::apply::resolve_approved_copy_in(&r.root, &r.pack, &r.lane, rel);
+        if unreadable {
+            assert!(matches!(answer, crate::repair::apply::ApprovedCopy::LedgerUnreadable { .. }), "{member}: {answer:?}");
+        } else {
+            assert!(matches!(answer, crate::repair::apply::ApprovedCopy::Unknown(_)), "{member}: {answer:?}");
+        }
         // recognition: the approved bytes live are not "approved" — the check runs
         assert!(!crate::repair::apply::approved_copy_of_current_generation_in(&r.root, &r.pack, &r.lane, rel).unwrap(), "{member}: recognised");
         let checked = RefCell::new(0);
@@ -1074,14 +1082,18 @@ fn every_broken_member_makes_the_approved_copy_unknown_on_both_paths() {
         let lock = r.base.join(".pack-apply.lock");
         let d = Doubles { check: &pass, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
         m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
-        assert!(*checked.borrow() >= 1, "{member}: no check is skipped");
+        assert!(unreadable || *checked.borrow() >= 1, "{member}: no check is skipped");
         // restoration: a failing file — nothing put back
         r.put(rel, b"#!/bin/bash\nbroken(\n", 0o755);
         let fails = |x: &str, _: &Path, _: Duration| if x == rel { outcome(CheckResult::Fail("bad".into()), 5) } else { outcome(CheckResult::Pass, 5) };
         let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
         let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0, &lock)).unwrap();
         assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"#!/bin/bash\nbroken(\n", "{member}: nothing put back");
-        assert!(f.iter().any(|x| x.rel == rel && x.kind == "approval-unknown"), "{member}: {f:?}");
+        if unreadable {
+            assert!(f.iter().any(|x| x.kind == "ledger-unreadable") || f.is_empty(), "{member}: {f:?}");
+        } else {
+            assert!(f.iter().any(|x| x.rel == rel && x.kind == "approval-unknown"), "{member}: {f:?}");
+        }
     }
 }
 
