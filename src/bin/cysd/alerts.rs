@@ -1700,16 +1700,68 @@ fn detector_enabled() -> bool {
     *E.get_or_init(|| crate::alert_route::enabled_from(std::env::var(DEFECT_INTAKE_ENV).ok().as_deref()))
 }
 
-/// How the flusher is started: once per process (`once`), by `start` (RULINGS BF6 — injectable).
+/// The longest wait between two attempts to start the flusher thread (seconds — RULINGS DD5).
+pub const FLUSHER_RETRY_MAX_SECS: f64 = 300.0;
+
+/// RULINGS DD5 (J7 I6) — the flusher's start, as observed: `started` is set ONLY when the thread was created;
+/// a failed creation counts in `attempts`, keeps its message in `last_error` and is retried on a later identified
+/// failure once `next_try_mono` is reached (1 s, doubling, at most [`FLUSHER_RETRY_MAX_SECS`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FlusherState {
+    pub started: bool,
+    pub attempts: u64,
+    pub next_try_mono: f64,
+    pub last_error: Option<String>,
+}
+
+/// The process's flusher start state (one flusher thread per process).
+static FLUSHER_STATE: Mutex<FlusherState> =
+    Mutex::new(FlusherState { started: false, attempts: 0, next_try_mono: 0.0, last_error: None });
+
+/// How the flusher is started (RULINGS BF6, DD5 — injectable): its state, the start itself (Err = the thread
+/// was not created) and the current monotonic time in seconds.
 pub struct FlusherStart<'a> {
-    pub once: &'a OnceLock<()>,
-    pub start: &'a dyn Fn(),
+    pub state: &'a Mutex<FlusherState>,
+    pub start: &'a dyn Fn() -> Result<(), String>,
+    pub now: f64,
+}
+
+impl FlusherStart<'_> {
+    /// Starts the flusher unless it runs or a retry is not yet due; true when it runs after the call.
+    fn ensure(&self) -> bool {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.started {
+            return true;
+        }
+        if st.attempts > 0 && self.now < st.next_try_mono {
+            return false;
+        }
+        st.attempts += 1;
+        match (self.start)() {
+            Ok(()) => {
+                st.started = true;
+                st.last_error = None;
+                true
+            }
+            Err(e) => {
+                let exp = (st.attempts - 1).min(16) as i32;
+                st.next_try_mono = self.now + 2f64.powi(exp).min(FLUSHER_RETRY_MAX_SECS);
+                st.last_error = Some(e);
+                false
+            }
+        }
+    }
+}
+
+/// The process's monotonic seconds (the flusher start's clock).
+fn process_mono() -> f64 {
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
 }
 
 /// ① The `usage.event` arm's call — never fails the request, never panics out.
 pub fn observe_tool_event(daemon: &Arc<Daemon>, o: &ToolObservation<'_>) {
-    static FLUSHER: OnceLock<()> = OnceLock::new();
-    observe_tool_event_with(daemon, o, &FlusherStart { once: &FLUSHER, start: &start_flusher_thread });
+    observe_tool_event_with(daemon, o, &FlusherStart { state: &FLUSHER_STATE, start: &start_flusher_thread, now: process_mono() });
 }
 
 /// [`observe_tool_event`] with the flusher's start injected. The command is classified BEFORE the
@@ -1730,7 +1782,7 @@ pub fn observe_tool_event_with(daemon: &Arc<Daemon>, o: &ToolObservation<'_>, fl
             record(&mut d, c, now)
         };
         if r == Observed::Failure {
-            flusher.once.get_or_init(|| (flusher.start)());
+            flusher.ensure(); // RULINGS DD5: recorded as started only when it started; retried with a backoff
         }
     }));
 }
@@ -1881,6 +1933,11 @@ pub fn flush_defect_intake(daemon: &Arc<Daemon>, root: &std::path::Path, cfg: &A
     rep
 }
 
+/// RULINGS DD5 — the flusher's start state as data (the snapshot and the daemon log line).
+fn flusher_state_json(st: &FlusherState) -> Value {
+    json!({"started": st.started, "attempts": st.attempts, "last_error": st.last_error})
+}
+
 /// The detector's and the share's counters (the daemon log line; tests).
 pub fn defect_intake_snapshot(daemon: &Arc<Daemon>, mono: f64) -> Value {
     let intake = intake_for(daemon);
@@ -1900,6 +1957,7 @@ pub fn defect_intake_snapshot(daemon: &Arc<Daemon>, mono: f64) -> Value {
         "corrupt_rows": c.corrupt_rows, "write_failed": c.write_failed,
         "tracked_rels": tracked.0, "tracked_signatures": tracked.1, "pending_signatures": tracked.2,
         "share": share,
+        "flusher": flusher_state_json(&FLUSHER_STATE.lock().unwrap_or_else(|e| e.into_inner())),
     })
 }
 
@@ -1971,7 +2029,7 @@ fn log_flush(daemon: &Arc<Daemon>, rep: &FlushReport, mono: f64) -> bool {
 /// The production start of the flusher thread (`cysd-defect-intake`): a loop of [`flusher_pass`] every
 /// [`FLUSH_TICK_SECS`]. Started lazily by the first identified failure — the daemon's start order is
 /// untouched. In this binary's tests it starts nothing (they drive [`flusher_pass`] directly).
-fn start_flusher_thread() {
+fn start_flusher_thread() -> Result<(), String> {
     #[cfg(not(test))]
     {
         let spawned = std::thread::Builder::new()
@@ -1981,9 +2039,11 @@ fn start_flusher_thread() {
                 let _ = flusher_pass(&registered_lanes, &AlertConfig::load, &intake_root);
             });
         if let Err(e) = spawned {
-            eprintln!("[cysd] defect-intake: flusher thread not started ({e}) — rows are not written");
+            eprintln!("[cysd] defect-intake: flusher thread not started ({e}) — rows are not written until a later attempt starts it");
+            return Err(e.to_string());
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2803,6 +2863,59 @@ mod defect_intake_tests {
         let kept = daemon.repair_mutexes.lock().unwrap().get(&format!("intake:{held_sig}")).cloned();
         assert!(kept.is_some_and(|k| Arc::ptr_eq(&k, &held)), "an entry another holder had was taken away");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RULINGS DD5 (J7 I6) — the flusher's start is recorded only when it started: an injected failed start
+    /// (the thread was not created) is observable (`attempts`, `last_error`), is NOT retried inside its backoff,
+    /// IS retried on a later identified failure once the backoff passed, and succeeds — only then `started`;
+    /// later failures start nothing more. The backoff doubles and is bounded by `FLUSHER_RETRY_MAX_SECS`.
+    #[test]
+    fn dd5_a_failed_flusher_start_is_retried() {
+        let daemon = crate::team_gate_tests::tmp_daemon("t3e-dd5", false);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let state = Mutex::new(FlusherState::default());
+        let start = || -> Result<(), String> {
+            match calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Err("Resource temporarily unavailable (os error 35)".into()),
+                _ => Ok(()),
+            }
+        };
+        let at = |now: f64| FlusherStart { state: &state, start: &start, now };
+        let x = bash("python3 ~/.cys/pack/bin/a.py");
+        let failure = |now: f64| {
+            observe_tool_event_with(&daemon, &pre(&x), &at(now));
+            observe_tool_event_with(&daemon, &fail(&x, Some("Exit code 1\nE: a")), &at(now));
+        };
+        failure(100.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        {
+            let st = state.lock().unwrap();
+            assert_eq!((st.started, st.attempts, st.next_try_mono), (false, 1, 101.0), "a failed start was latched: {st:?}");
+            assert!(st.last_error.as_deref().is_some_and(|e| e.contains("os error 35")));
+            assert_eq!(flusher_state_json(&st)["attempts"], 1, "the failed start is not observable");
+        }
+        failure(100.5);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "retried inside the backoff");
+        failure(101.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "a failed start was latched as started — no retry");
+        assert_eq!(*state.lock().unwrap(), FlusherState { started: true, attempts: 2, next_try_mono: 101.0, last_error: None });
+        failure(500.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "a running flusher was started again");
+        // the backoff doubles and is bounded
+        let st2 = Mutex::new(FlusherState::default());
+        let never = || -> Result<(), String> { Err("no thread".into()) };
+        let mut now = 0.0;
+        let mut delays = Vec::new();
+        for _ in 0..12 {
+            let f = FlusherStart { state: &st2, start: &never, now };
+            assert!(!f.ensure());
+            let next = st2.lock().unwrap().next_try_mono;
+            delays.push(next - now);
+            now = next;
+        }
+        assert_eq!(&delays[..10], &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, FLUSHER_RETRY_MAX_SECS]);
+        assert!(delays.iter().all(|d| *d <= FLUSHER_RETRY_MAX_SECS));
+        assert_eq!(st2.lock().unwrap().attempts, 12);
     }
 
     /// RULINGS BY1 — the interpreter must be the script's own: every interpreter head (bare, with its
@@ -3639,13 +3752,14 @@ mod defect_intake_tests {
             "fn cli_cut_tail(",
             "fn canonical_line_survives_cut(",
             "fn owns_its_failure(",
+            "fn ensure(",
         ] {
             let b = body(head);
             for n in io.iter().chain(send.iter()) {
                 assert!(!b.contains(n), "{head} reaches `{n}` — the hook path must stay memory-only");
             }
         }
-        assert!(body("pub fn observe_tool_event_with(").contains("flusher.once.get_or_init("), "the flusher must start once, through the injected hook");
+        assert!(body("pub fn observe_tool_event_with(").contains("flusher.ensure()"), "the flusher must start through the injected hook (RULINGS DD5)");
         // RULINGS CC2: the hook path's ONLY file-system access is ONE lstat of the named script
         let fsb = body("fn is_pack_file(");
         assert_eq!(fsb.matches("std::fs::").count(), 1, "is_pack_file does more than one file-system call");
@@ -4002,11 +4116,12 @@ mod defect_intake_tests {
     fn first_failure_starts_the_flusher_once_and_a_pass_writes_the_row() {
         let daemon = crate::team_gate_tests::tmp_daemon("t3b-pass", false);
         let starts = std::sync::atomic::AtomicUsize::new(0);
-        let once = OnceLock::new();
-        let start = || {
+        let state = Mutex::new(FlusherState::default());
+        let start = || -> Result<(), String> {
             starts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         };
-        let fl = FlusherStart { once: &once, start: &start };
+        let fl = FlusherStart { state: &state, start: &start, now: 100.0 };
         let x = bash("python3 ~/.cys/pack/bin/a.py");
         let g = bash("grep a ~/.cys/pack/bin/a.py");
         observe_tool_event_with(&daemon, &pre(&x), &fl);
