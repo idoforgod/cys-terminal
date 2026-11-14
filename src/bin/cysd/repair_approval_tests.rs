@@ -608,6 +608,37 @@ fn approval_verify_apply_consume() {
     );
 }
 
+/// RULINGS DE3: an approved change is applied WHOLE — a repair that deletes one file and edits
+/// another hands BOTH targets to the apply (the deletion as its empty staged path), never only the file.
+#[test]
+fn approved_deletion_and_edit_both_reach_the_apply() {
+    let r = rig("de3");
+    let id = r.signed_repair();
+    let mut rec = r.rec(&id);
+    rec.files.push(FileChange {
+        rel: "hooks/gone.sh".into(),
+        kind: ChangeKind::Delete,
+        pre: PreImage::Absent,
+        post: TargetState::Absent,
+        diff: None,
+    });
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let fp = fp_of(&r, &id);
+    for a in [&mut rec.worker_record, &mut rec.verify, &mut rec.audit].into_iter().flatten() {
+        a.fingerprint_sha256 = fp.clone();
+    }
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let t = Mutex::new(ApprovalTable::default());
+    let eff = Arc::new(effects());
+    let rid = pending(&r, &t, &eff, T0);
+    approve(&r, &t, eff.clone(), &rid, T0 + 10.0, T0 + 20.0);
+    assert_eq!(state_of(&t, &rid), ReqState::Approved);
+    assert_eq!(
+        eff.applied.lock().unwrap().clone(),
+        vec![vec!["hooks/gone.sh".to_string(), "hooks/h.sh".to_string()]]
+    );
+}
+
 /// Design D:767: the helper failing (exit ≠ 0), being killed by a signal, or failing to spawn is
 /// NOT an approval — nothing is applied.
 #[test]
