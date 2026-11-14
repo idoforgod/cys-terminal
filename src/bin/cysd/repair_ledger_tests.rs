@@ -3931,3 +3931,48 @@ fn da1_leaf_link_into_the_pack_refused_at_begin() {
     assert!(e.message.contains("팩 안의 경로"), "{}", e.message);
     assert!(!r.root.exists());
 }
+
+/// RULINGS DA2: at 199 of the hour's 200 new signatures, eight concurrent reports of eight NEW
+/// signatures (behind a barrier) yield exactly ONE new row; the others are over quota.
+#[test]
+fn da2_intake_quota_reserved_atomically() {
+    let r = rig("da2");
+    let w = seat(3, "worker");
+    for i in 0..199 {
+        let v = r
+            .call(
+                T0,
+                &w,
+                "report",
+                json!({"file": "bin/a.py", "error": format!("E: case {i}")}),
+            )
+            .unwrap();
+        assert_eq!(v["accepted"], true, "{i}: {v}");
+    }
+    let barrier = std::sync::Barrier::new(8);
+    let outs: Vec<Value> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..8)
+            .map(|k| {
+                let (b, r) = (&barrier, &r);
+                s.spawn(move || {
+                    b.wait();
+                    r.call(
+                        T0,
+                        &seat(3, "worker"),
+                        "report",
+                        json!({"file": "bin/a.py", "error": format!("E: racer {k}")}),
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let accepted = outs.iter().filter(|v| v["accepted"] == true).count();
+    let over = outs.iter().filter(|v| v["over_quota"] == true).count();
+    assert_eq!((accepted, over), (1, 7), "{outs:?}");
+    let rows = std::fs::read_dir(r.root.join("intake").join(&r.lane.0))
+        .unwrap()
+        .count();
+    assert_eq!(rows, 200, "the hour's quota was exceeded");
+}

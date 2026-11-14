@@ -1238,6 +1238,31 @@ mod ledger_verbs {
         Q.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
+    /// RULINGS DA2: takes one place in this lane's hour of new signatures if there is room — the
+    /// check and the take are ONE step under the quota mutex. `false` = the hour is full.
+    fn reserve_intake(key: &(PathBuf, String), now: f64) -> bool {
+        let mut q = intake_quota().lock().unwrap_or_else(|e| e.into_inner());
+        let e = q.entry(key.clone()).or_default();
+        while e.0.front().is_some_and(|t| now - *t > 3600.0) {
+            e.0.pop_front();
+        }
+        if e.0.len() >= intake::INTAKE_NEW_SIGNATURES_PER_HOUR {
+            return false;
+        }
+        e.0.push_back(now);
+        true
+    }
+
+    /// RULINGS DA2: gives back a place taken by [`reserve_intake`] (the row was not written).
+    fn release_intake(key: &(PathBuf, String), now: f64) {
+        let mut q = intake_quota().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = q.get_mut(key) {
+            if let Some(i) = e.0.iter().rposition(|t| *t == now) {
+                e.0.remove(i);
+            }
+        }
+    }
+
     pub(crate) fn intake_over_quota(ctx: &Ctx<'_>) -> u64 {
         let q = intake_quota().lock().unwrap_or_else(|e| e.into_inner());
         q.get(&(ctx.root.clone(), ctx.lane.0.clone()))
@@ -1271,27 +1296,38 @@ mod ledger_verbs {
         let rep = intake::parse_report(file, error)
             .map_err(|e| VerbError::invalid(VerbError::from(e).message))?;
         let key = (ctx.root.clone(), ctx.lane.0.clone());
-        let new_in_hour = {
-            let mut q = intake_quota().lock().unwrap_or_else(|e| e.into_inner());
-            let e = q.entry(key.clone()).or_default();
-            while e.0.front().is_some_and(|t| ctx.now - *t > 3600.0) {
-                e.0.pop_front();
-            }
-            e.0.len()
-        };
         let label = caller.label();
-        let outcome = ctx.locked(&format!("intake:{}", rep.signature), || {
-            intake::record_in(
+        // DA2: whether the signature is new is read under the row's lock, and a new one RESERVES
+        // its place in the hour's quota in one step (check + take under the quota mutex); a write
+        // that fails returns the reservation.
+        let outcome = ctx.locked(
+            &format!("intake:{}", rep.signature),
+            || -> Result<intake::Recorded, VerbError> {
+            let fresh = intake::excluded(&rep.rel, error, ctx.windows).is_none()
+                && intake::load_row(&intake::row_path_in(&ctx.root, &ctx.lane, &rep.signature))?
+                    .is_none();
+            let reserved = fresh && reserve_intake(&key, ctx.now);
+            let room = if fresh && !reserved {
+                intake::INTAKE_NEW_SIGNATURES_PER_HOUR // no room: the record answers over quota
+            } else {
+                0
+            };
+            let r = intake::record_in(
                 &ctx.root,
                 &ctx.lane,
                 &rep,
                 &label,
                 ctx.now,
-                new_in_hour,
+                room,
                 ctx.windows,
                 error,
-            )
-        })?;
+            );
+            if reserved && !matches!(r, Ok(intake::Recorded::New(_))) {
+                release_intake(&key, ctx.now);
+            }
+                Ok(r?)
+            },
+        )?;
         let mut out = json!({
             "signature": rep.signature,
             "rel": rep.rel,
@@ -1300,10 +1336,6 @@ mod ledger_verbs {
         });
         match outcome {
             intake::Recorded::New(row) | intake::Recorded::Updated(row) => {
-                if row.count == 1 {
-                    let mut q = intake_quota().lock().unwrap_or_else(|e| e.into_inner());
-                    q.entry(key).or_default().0.push_back(ctx.now);
-                }
                 out["accepted"] = json!(true);
                 out["count"] = json!(row.count);
             }
