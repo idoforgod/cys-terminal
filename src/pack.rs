@@ -7767,14 +7767,166 @@ pub fn install_staged(
 // pack-update만 apply_pack_transactional로 감싼다. R2CODE HIGH #1 해소.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// ★M15-다 / GX4 (0.15.0 「스스로 해결」 T9): the journal location of binaries BEFORE 0.15.0 — ONE folder shared by every
+/// lane (`<pack parent>/.pack-journal`). A journal there names neither its lane nor its apply, so guessing its owner is
+/// the defect itself (a department's start rolled the base's bytes into its own pack — stage-1 tests `m15_da_*`). No
+/// lane reads it into a pack, moves it or deletes it.
 const PACK_JOURNAL_DIR: &str = ".pack-journal";
 
-/// 백업 저널 디렉터리(~/.cys/.pack-journal) — pack_dir 형제(staging·lock·accepted와 동일 루트).
+/// ★GX1: the parent of every lane's OWN journal folder — `<pack parent>/.pack-journal.d/<lane>/`. A new name, so no
+/// older binary (which reads only [`PACK_JOURNAL_DIR`]) ever sees a new journal.
+pub const PACK_JOURNAL_ROOT: &str = ".pack-journal.d";
+
+/// ★GX2: the transaction's LAST hard commit — a marker INSIDE the pack carrying THIS apply's id (+ target tuple + items
+/// digest). Recovery calls an apply finished only when this marker carries the journal's apply id — never by
+/// `.pack-version`, which a same-base-version revision (다-2) leaves unchanged.
+pub const PACK_APPLIED_FILE: &str = ".pack-applied.json";
+
+/// ★GX3: the journal's writer, recorded FIRST in the journal folder (before any backup).
+const JOURNAL_WRITER_FILE: &str = "writer.json";
+
+/// ★GX1: THIS lane's own journal folder (lane = the pack folder's name: `pack`, `pack-dept-<name>`).
 pub fn pack_journal_dir() -> PathBuf {
-    pack_dir()
+    pack_journal_dir_for(&pack_dir())
+}
+
+/// ★GX1: the journal folder of the lane whose pack is `pack`.
+pub fn pack_journal_dir_for(pack: &Path) -> PathBuf {
+    let root = pack
         .parent()
+        .map(|p| p.join(PACK_JOURNAL_ROOT))
+        .unwrap_or_else(|| PathBuf::from(PACK_JOURNAL_ROOT));
+    match pack.file_name() {
+        Some(lane) => root.join(lane),
+        None => root.join("pack"),
+    }
+}
+
+/// ★GX4: the old shared location beside `pack` (named only — never read, moved or deleted).
+pub fn legacy_pack_journal_dir_for(pack: &Path) -> PathBuf {
+    pack.parent()
         .map(|p| p.join(PACK_JOURNAL_DIR))
         .unwrap_or_else(|| PathBuf::from(PACK_JOURNAL_DIR))
+}
+
+/// ★GX3: who wrote a journal — pid + the process's native start time (µs since the epoch, as
+/// [`crate::process_observation`] reads it; `None` = it could not be read when the journal was written).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct JournalWriter {
+    pid: u32,
+    #[serde(default)]
+    birth_us: Option<u64>,
+}
+
+impl JournalWriter {
+    fn current() -> Self {
+        let pid = std::process::id();
+        let birth_us = crate::process_observation::observe(pid)
+            .ok()
+            .map(|o| birth_us_of(&o.identity));
+        JournalWriter { pid, birth_us }
+    }
+}
+
+fn birth_us_of(i: &crate::process_observation::Identity) -> u64 {
+    i.birth_seconds
+        .saturating_mul(1_000_000)
+        .saturating_add(i.birth_microseconds)
+}
+
+/// ★GX3: the writer's state from ONE observation — nothing waits.
+#[derive(Debug, PartialEq, Eq)]
+enum WriterLife {
+    /// The recorded process is gone (no such process, or the pid now belongs to a process born at another time).
+    Gone,
+    /// The recorded process is still running — its journal is not touched.
+    Running,
+    /// Liveness cannot be decided — the journal is not touched now; the next start looks again.
+    Unknown(String),
+}
+
+/// ★GX3 (pure — the one decision rule, unit-tested): `seen` = the birth (µs) of the process now holding `w.pid`, or the
+/// observation's failure.
+fn writer_life(
+    w: &JournalWriter,
+    seen: Result<u64, crate::process_observation::Failure>,
+) -> WriterLife {
+    use crate::process_observation::Failure;
+    match (seen, w.birth_us) {
+        (Err(Failure::Dead), _) => WriterLife::Gone,
+        (Ok(now), Some(recorded)) if now != recorded => WriterLife::Gone,
+        (Ok(_), Some(_)) => WriterLife::Running,
+        (Ok(_), None) => WriterLife::Unknown(format!(
+            "작성 프로세스(pid {})의 시작 시각이 기록되지 않았고 그 번호의 프로세스가 살아 있음",
+            w.pid
+        )),
+        (Err(e), _) => WriterLife::Unknown(format!("작성 프로세스(pid {}) 확인 불가: {e:?}", w.pid)),
+    }
+}
+
+fn observe_writer(w: &JournalWriter) -> WriterLife {
+    writer_life(
+        w,
+        crate::process_observation::observe(w.pid).map(|o| birth_us_of(&o.identity)),
+    )
+}
+
+/// ★GX2: what the commit marker (and the journal's index) says about ONE apply.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct PackApplied {
+    apply_id: String,
+    /// The target tuple (base version, channel, revision).
+    target: PackState,
+    /// [`pack_items_sha256`] of the applied items.
+    items_digest: String,
+}
+
+/// ★GX2: a fresh id for one apply (process, clock, sequence, content) — unique per apply, not a secret.
+fn new_apply_id(items_digest: &str, target: &PackState) -> String {
+    use sha2::{Digest, Sha256};
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h = Sha256::new();
+    h.update(format!(
+        "{}\0{nanos}\0{}\0{items_digest}\0{}\0{}\0{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+        target.base_version,
+        target.channel,
+        target.pro_revision
+    ));
+    format!("{:x}", h.finalize())[..32].to_string()
+}
+
+/// ★GX6: the step boundaries of the transaction. The production entry passes a callback that always continues; the
+/// crash proof stops the REAL transaction right after each boundary, as a dying process would (no rollback runs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TxStep {
+    /// ⓪ done (the lane's own journal recovered or absent).
+    Recovered,
+    /// ① the writer recorded, no backup yet.
+    WriterRecorded,
+    /// ① every backup written, the index not yet.
+    BackedUp,
+    /// ① the index written (the journal is complete).
+    Journaled,
+    /// ② the files applied (install record included).
+    Installed,
+    /// ③ `.pack-state.json` written.
+    StateWritten,
+    /// ④ `.pack-version` written.
+    VersionWritten,
+    /// ④' the commit marker written — the apply is finished from here on.
+    Committed,
+    /// ⑤ the post-commit callback returned.
+    PostCommitted,
+}
+
+fn stopped_at(s: TxStep) -> String {
+    format!("[pack-journal] transaction stopped after {s:?} (crash proof seam)")
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -7801,16 +7953,39 @@ struct JournalIndex {
     /// recovery는 디스크 `.pack-version`이 이 값과 같은지로 커밋 완료를 판정한다.
     target_version: String,
     entries: Vec<JournalEntry>,
+    /// ★GX2: THIS apply (id + target tuple + items digest). Optional only so that an index without it parses — such an
+    /// index (not written by this version) is never acted on by [`recover_pack_journal`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    apply: Option<PackApplied>,
+    /// ★GX3: who wrote this journal (also in `writer.json`, written before any backup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    writer: Option<JournalWriter>,
 }
 
 /// apply 전 backup journal 작성: backup_set의 각 파일 기존 bytes를 저널에 복사(+fsync)하고
 /// 인덱스(목표 버전·existed 플래그)를 기록(+fsync)한다. 잔존 저널은 먼저 비운다.
+/// ★GX1–GX3 (T9): the journal is THIS lane's folder ([`pack_journal_dir`]); the writer is recorded FIRST
+/// (`writer.json`), then the backups, then the index carrying the apply record and the writer. Only called after the
+/// transaction's ⓪ found no journal it could not resolve (a kept journal makes ⓪ fail, so it is never wiped here).
+/// Returns `Ok(false)` when the step callback stopped it (the crash proof).
 fn write_journal(
     target_version: &str,
     backup_set: &std::collections::BTreeSet<String>,
-) -> Result<(), String> {
+    apply: &PackApplied,
+    writer: &JournalWriter,
+    step: &mut dyn FnMut(TxStep) -> bool,
+) -> Result<bool, String> {
     let jdir = pack_journal_dir();
     let _ = std::fs::remove_dir_all(&jdir);
+    std::fs::create_dir_all(&jdir)
+        .map_err(|e| format!("journal dir 생성 실패 {}: {e}", jdir.display()))?;
+    let writer_json =
+        serde_json::to_vec(writer).map_err(|e| format!("journal 작성자 직렬화 실패: {e}"))?;
+    write_atomic(&jdir.join(JOURNAL_WRITER_FILE), &writer_json)
+        .map_err(|e| format!("journal 작성자 쓰기 실패: {e}"))?;
+    if !step(TxStep::WriterRecorded) {
+        return Ok(false);
+    }
     let files_dir = jdir.join("files");
     std::fs::create_dir_all(&files_dir)
         .map_err(|e| format!("journal files dir 생성 실패 {}: {e}", files_dir.display()))?;
@@ -7843,16 +8018,21 @@ fn write_journal(
             });
         }
     }
+    if !step(TxStep::BackedUp) {
+        return Ok(false);
+    }
     let index = JournalIndex {
         target_version: target_version.to_string(),
         entries,
+        apply: Some(apply.clone()),
+        writer: Some(writer.clone()),
     };
     let json =
         serde_json::to_vec_pretty(&index).map_err(|e| format!("journal 인덱스 직렬화 실패: {e}"))?;
     // 인덱스는 마지막에(원자) — 인덱스 부재 = '백업 미완 = 미커밋'(원본 미변경)을 의미.
     write_atomic(&jdir.join("index.json"), &json)
         .map_err(|e| format!("journal 인덱스 쓰기 실패: {e}"))?;
-    Ok(())
+    Ok(true)
 }
 
 /// M15-가 (0.15.0 · design §4-15 가): put one journaled file back WITH its mode.
@@ -7950,33 +8130,80 @@ fn journal_text(path: &Path, what: &str) -> Result<String, String> {
     }
 }
 
-/// crash recovery(§7-⑤): orphan 저널을 발견하면 `.pack-version`(= hard commit marker)을 저널의
-/// 목표 버전과 대조한다. 같으면 커밋은 성공했고 저널 정리 중 crash였으므로 저널만 삭제(롤백 금지).
-/// 다르면 미커밋(부분적용)이므로 rollback으로 pre-state 자가치유. 인덱스 부재(백업 도중 crash)는
-/// 원본 미변경이므로 잔존 저널만 폐기. 저널 완전 부재면 no-op. 반환: 복구를 수행했으면 true.
-/// ★pack-update 착수 시·cysd 기동 시(install(false) 전)에 호출해 부분적용을 선치유한다.
+/// crash recovery(§7-⑤) of THIS lane's journal — called before a pack update and by cysd before its boot install
+/// (`src/bin/cysd/main.rs`, separate blocking pool, no lock — unchanged, OQ-H-11). ★M15-다 / 다-2 (0.15.0 T9, RULINGS
+/// GX1–GX5), in this order, and nothing ever waits:
+/// 1. GX4 — a legacy journal at the old shared location is never read, moved or deleted.
+/// 2. GX1 — only this lane's own folder is looked at; absent, or a folder with neither index nor writer (the writer
+///    had not even recorded itself) = nothing to recover → `Ok(false)`, nothing touched.
+/// 3. GX3 — the writer (index, else `writer.json`) is observed once: still running, or liveness unknown → the journal
+///    and the pack are NOT touched, `Err(<one line>)` (cysd prints it; a pack update refuses to start instead of
+///    overwriting the journal). Gone → go on.
+/// 4. No index (the backups were never completed — no pack file is written before the index) → the folder is removed.
+/// 5. GX2 — the pack's `.pack-applied.json` carries the journal's apply id → committed: the journal is removed (no
+///    rollback). Absent, or the id of another apply → not committed: [`rollback_journal`] (bytes + modes + the version
+///    marker, which is in the backup set) and the journal is removed. Any unreadable piece (index, writer, marker) or an
+///    index without an apply record / writer → nothing is touched, `Err(<one line>)`.
+/// Returns `Ok(true)` when it rolled back or cleaned a journal. The T2g start-path readers are kept: every read here is
+/// bounded and never blocks (`journal_text` / `read_start_meta`).
 pub fn recover_pack_journal() -> Result<bool, String> {
-    let jdir = pack_journal_dir();
+    let pack = pack_dir();
+    let jdir = pack_journal_dir_for(&pack);
     let index_path = jdir.join("index.json");
-    if !index_path.is_file() {
-        // 인덱스 없는 잔존 디렉터리 = 백업 미완(원본 미변경) → 통째 폐기.
-        if jdir.exists() {
-            let _ = std::fs::remove_dir_all(&jdir);
-            return Ok(true);
-        }
+    let writer_path = jdir.join(JOURNAL_WRITER_FILE);
+    let has_index = std::fs::symlink_metadata(&index_path).is_ok();
+    if !has_index && std::fs::symlink_metadata(&writer_path).is_err() {
         return Ok(false);
     }
-    // ★T2i(RULINGS FP2): 시작 경로의 판독기 — 판독 불가 = 종전 읽기 오류 갈래(인덱스: Err = 복구 건너뜀 · `.pack-version`: 빈 값 =
-    //   종전 읽기 실패와 같은 '미커밋' 판정).
-    let s = journal_text(&index_path, "journal 인덱스 읽기 실패")?;
-    let index: JournalIndex =
-        serde_json::from_str(&s).map_err(|e| format!("journal 인덱스 파싱 실패(손상): {e}"))?;
-    let disk_version = read_start_meta(&pack_dir().join(PACK_VERSION_FILE))
-        .text()
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    if !disk_version.is_empty() && disk_version == index.target_version {
-        // 커밋 성공(.pack-version == target) → 저널 정리만(롤백 금지).
+    let kept = |why: String| format!("journal kept, nothing rolled back ({}): {why}", jdir.display());
+    let index: Option<JournalIndex> = if has_index {
+        let s = journal_text(&index_path, "journal 인덱스 읽기 실패").map_err(&kept)?;
+        Some(
+            serde_json::from_str(&s)
+                .map_err(|e| kept(format!("journal 인덱스 파싱 실패(손상): {e}")))?,
+        )
+    } else {
+        None
+    };
+    let writer: JournalWriter = match index.as_ref() {
+        Some(ix) => ix
+            .writer
+            .clone()
+            .ok_or_else(|| kept("인덱스에 작성자 기록이 없음(이 버전이 쓴 저널이 아님)".into()))?,
+        None => {
+            let s = journal_text(&writer_path, "journal 작성자 읽기 실패").map_err(&kept)?;
+            serde_json::from_str(&s).map_err(|e| kept(format!("journal 작성자 파싱 실패: {e}")))?
+        }
+    };
+    match observe_writer(&writer) {
+        WriterLife::Gone => {}
+        WriterLife::Running => {
+            return Err(kept(format!("작성 프로세스(pid {})가 아직 실행 중", writer.pid)))
+        }
+        WriterLife::Unknown(why) => return Err(kept(why)),
+    }
+    let Some(index) = index else {
+        // 인덱스 없는 잔존 = 백업 미완(원본 미변경 — 팩 파일은 인덱스 뒤에야 쓰인다), 작성자 종료 → 통째 폐기.
+        let _ = std::fs::remove_dir_all(&jdir);
+        return Ok(true);
+    };
+    let apply = index
+        .apply
+        .as_ref()
+        .ok_or_else(|| kept("인덱스에 적용 기록(apply id)이 없음(이 버전이 쓴 저널이 아님)".into()))?;
+    let marker = pack.join(PACK_APPLIED_FILE);
+    let committed = match read_start_meta(&marker) {
+        StartRead::Missing => false,
+        StartRead::Bytes(b) => match serde_json::from_slice::<PackApplied>(&b) {
+            Ok(m) => m.apply_id == apply.apply_id,
+            Err(e) => return Err(kept(format!("커밋 표지 {} 파싱 실패: {e}", marker.display()))),
+        },
+        StartRead::Unreadable(e) => {
+            return Err(kept(format!("커밋 표지 {} 판독 불가: {e}", marker.display())))
+        }
+    };
+    if committed {
+        // 커밋 성공(표지 = 이 적용) → 저널 정리만(롤백 금지).
         let _ = std::fs::remove_dir_all(&jdir);
     } else {
         // 미커밋 → 롤백(pre-state 복원 + 저널 삭제).
@@ -7994,6 +8221,10 @@ pub fn recover_pack_journal() -> Result<bool, String> {
 /// 없음 — 낡은 accepted는 안전 방향(버전 게이트·신선도 창이 방어)이며 self-heal이 수렴.
 /// loud + 반환 bool로 구분 보고) → ⑥저널 삭제.
 /// ③까지 실패 시 rollback(pre-state 복원·부분적용 0). 반환: (written, kept, post_commit_ok).
+/// ★M15-다 / 다-2 (0.15.0 T9, RULINGS GX2 · GX5): the steps keep their order; ① journals `.pack-version` too and records
+/// this apply (`apply_id` + target tuple = `state` + [`pack_items_sha256`] of `items`) and its writer; right after ④ the
+/// commit marker [`PACK_APPLIED_FILE`] carrying the apply id is written — the LAST hard commit (④'). A failure up to and
+/// including ④' rolls back. The signature is unchanged (the tuple and the digest come from `state` and `items`).
 pub fn apply_pack_transactional<F>(
     items: &[(&str, &str)],
     target_version: &str,
@@ -8004,8 +8235,29 @@ pub fn apply_pack_transactional<F>(
 where
     F: FnOnce() -> Result<(), String>,
 {
+    apply_pack_transactional_steps(items, target_version, state, auth, post_commit, &mut |_| true)
+}
+
+/// [`apply_pack_transactional`] with a step callback (★GX6): `step(s)` is asked after each boundary; `false` stops the
+/// transaction right there with NO rollback — the on-disk state a process dying at that point leaves. Production passes
+/// a callback that always continues.
+fn apply_pack_transactional_steps<F>(
+    items: &[(&str, &str)],
+    target_version: &str,
+    state: &PackState,
+    auth: Option<PackWriteAuth>,
+    post_commit: F,
+    step: &mut dyn FnMut(TxStep) -> bool,
+) -> Result<(usize, usize, bool), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
     // ⓪ 직전 crash로 남은 orphan 저널 자가치유(새 트랜잭션 전 pre-state 확정).
+    // ★GX3: a journal it must keep (writer running / unknown / unreadable) makes this fail — never overwritten below.
     recover_pack_journal()?;
+    if !step(TxStep::Recovered) {
+        return Err(stopped_at(TxStep::Recovered));
+    }
     let dir = pack_dir();
     // ★W0-d: 저널·파일 반영 어떤 부수효과보다 먼저 라이브 인가 검사(비라이브·인가 보유는 통과).
     authorize_pack_write(&dir, auth)?;
@@ -8024,6 +8276,9 @@ where
     }
     backup_set.insert(INSTALL_MANIFEST.to_string());
     backup_set.insert(PACK_STATE_FILE.to_string());
+    // ★GX2: the version marker joins the backup set — a rollback before the commit marker restores it (a crash after ④
+    //   no longer leaves "new label, old files").
+    backup_set.insert(PACK_VERSION_FILE.to_string());
     // ★커스터마이즈 절충 부수효과(.pristine/·.new·.user·병합 원장)도 저널 편입 — rollback이
     // pre-state 를 **글자 단위로** 복원한다는 기존 계약(mid_apply_fault 테스트)을 부수효과까지 확장.
     // 대부분 부재 경로라 저널 증가는 미미하다(write_journal 은 존재/부재를 그대로 스냅샷).
@@ -8042,7 +8297,19 @@ where
     backup_set.extend(side_paths);
     backup_set.insert(MERGE_PENDING_FILE.to_string());
     // ★MERGE_AUDIT_FILE 은 의도적 비등재 — append-only 감사 원장은 rollback 을 생존한다(G3-축3).
-    write_journal(target_version, &backup_set)?;
+    // ★GX2/GX3: this apply's record and its writer.
+    let items_digest = pack_items_sha256(items);
+    let apply = PackApplied {
+        apply_id: new_apply_id(&items_digest, state),
+        target: state.clone(),
+        items_digest,
+    };
+    if !write_journal(target_version, &backup_set, &apply, &JournalWriter::current(), step)? {
+        return Err("[pack-journal] transaction stopped inside ① (crash proof seam)".to_string());
+    }
+    if !step(TxStep::Journaled) {
+        return Err(stopped_at(TxStep::Journaled));
+    }
     // ② 파일 반영(transactional=true) — .pack-version은 여기서 쓰지 않고(④에서 commit marker로),
     //    .install-manifest.json write 실패는 fail-closed로 Err가 되어 아래 rollback을 탄다.
     let (written, kept) =
@@ -8053,15 +8320,39 @@ where
                 return Err(format!("파일 반영 실패(rollback 완료): {e}"));
             }
         };
+    if !step(TxStep::Installed) {
+        return Err(stopped_at(TxStep::Installed));
+    }
     // ③ `.pack-state.json` 기록 — journal 백업 대상이므로 실패 시 rollback으로 전체 복원.
     if let Err(e) = write_pack_state(&dir, state) {
         let _ = rollback_journal();
         return Err(format!("state 기록 실패(rollback 완료): {e}"));
     }
-    // ④ .pack-version = 마지막 hard commit marker(결과 검사 — best-effort 금지).
+    if !step(TxStep::StateWritten) {
+        return Err(stopped_at(TxStep::StateWritten));
+    }
+    // ④ .pack-version(결과 검사 — best-effort 금지). ★GX2: no longer the commit marker by itself.
     if let Err(e) = write_atomic(&dir.join(PACK_VERSION_FILE), target_version.as_bytes()) {
         let _ = rollback_journal();
         return Err(format!(".pack-version 커밋 실패(rollback 완료): {e}"));
+    }
+    if !step(TxStep::VersionWritten) {
+        return Err(stopped_at(TxStep::VersionWritten));
+    }
+    // ④' ★GX2: the commit marker carrying THIS apply's id = the LAST hard commit (atomic). Failure → rollback.
+    let marker = match serde_json::to_vec_pretty(&apply) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = rollback_journal();
+            return Err(format!("커밋 표지 직렬화 실패(rollback 완료): {e}"));
+        }
+    };
+    if let Err(e) = write_atomic(&dir.join(PACK_APPLIED_FILE), &marker) {
+        let _ = rollback_journal();
+        return Err(format!("커밋 표지 기록 실패(rollback 완료): {e}"));
+    }
+    if !step(TxStep::Committed) {
+        return Err(stopped_at(TxStep::Committed));
     }
     // ⑤ post-commit(record_accepted) — 커밋은 이미 유효. 실패 = loud + false 반환(침묵 포장 금지).
     let post_commit_ok = match post_commit() {
@@ -8074,6 +8365,9 @@ where
             false
         }
     };
+    if !step(TxStep::PostCommitted) {
+        return Err(stopped_at(TxStep::PostCommitted));
+    }
     // ⑥ 커밋 성공 → 저널 삭제.
     let _ = std::fs::remove_dir_all(pack_journal_dir());
     Ok((written, kept, post_commit_ok))
@@ -13045,6 +13339,9 @@ mod tests {
 
     /// orphan 저널 recovery: 디스크 .pack-version != 저널 target(미커밋)이면 rollback으로
     /// pre-state 자가치유. crash로 남은 부분적용(README.md=PARTIAL·new.txt 생성)을 되돌린다.
+    /// REWRITTEN for T9 stage 2 (RULINGS GX2/GX3): the hand-built journal gets this version's form — an apply record and
+    /// a finished writer (`t9_finish_journal`); "not committed" = no commit marker carrying its apply id in the pack.
+    /// Every original assertion is kept.
     #[test]
     fn orphan_journal_recovery_rolls_back() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
@@ -13064,6 +13361,7 @@ mod tests {
             ]
         });
         std::fs::write(jdir.join("index.json"), index.to_string()).unwrap();
+        t9_finish_journal(&jdir);
 
         let recovered = recover_pack_journal();
 
@@ -13082,6 +13380,9 @@ mod tests {
 
     /// orphan 저널 recovery: 디스크 .pack-version == 저널 target(커밋 성공·정리 중 crash)이면
     /// rollback 없이 저널만 삭제(커밋된 새 내용을 되돌리지 않는다).
+    /// REWRITTEN for T9 stage 2 (RULINGS GX2): "committed" = the pack's commit marker `.pack-applied.json` carries the
+    /// journal's apply id (was: `.pack-version == target_version`, which a same-base revision cannot tell — 다-2). The
+    /// journal is in this version's form with a finished writer. Every original assertion is kept.
     #[test]
     fn orphan_journal_committed_only_cleaned() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
@@ -13096,6 +13397,13 @@ mod tests {
             "entries": [{"rel": "README.md", "existed": true}]
         });
         std::fs::write(jdir.join("index.json"), index.to_string()).unwrap();
+        t9_finish_journal(&jdir);
+        let marker = serde_json::json!({
+            "apply_id": T9_TEST_APPLY,
+            "target": {"channel": "free", "base_version": "2.0.0", "pro_revision": 0},
+            "items_digest": ""
+        });
+        std::fs::write(pd.join(PACK_APPLIED_FILE), marker.to_string()).unwrap();
 
         let recovered = recover_pack_journal();
 
@@ -13155,7 +13463,7 @@ mod tests {
         let pre = fingerprint_dir_with_modes(&pd);
         let set: std::collections::BTreeSet<String> =
             files.iter().map(|(r, _, _)| (*r).to_string()).collect();
-        write_journal("2.0.0", &set).expect("write_journal");
+        t9_write_journal("2.0.0", &set).expect("write_journal");
         for (rel, _, _) in &files {
             write_atomic(&pd.join(rel), b"PARTIAL-APPLY").unwrap();
         }
@@ -13194,7 +13502,7 @@ mod tests {
         m15_set_mode(&pd.join("bin/plain.sh"), 0o644);
         let set: std::collections::BTreeSet<String> =
             ["bin/plain.sh"].iter().map(|s| (*s).to_string()).collect();
-        write_journal("2.0.0", &set).expect("write_journal");
+        t9_write_journal("2.0.0", &set).expect("write_journal");
         write_atomic(&pd.join("bin/plain.sh"), b"#!/bin/sh\necho partial\n").unwrap();
         m15_set_mode(&pd.join("bin/plain.sh"), 0o755);
         let rolled = rollback_journal();
@@ -13212,7 +13520,8 @@ mod tests {
     }
 
     /// I-F3-09 arm 2 (in-process form of the boot-time path): an orphan journal written by
-    /// `write_journal` is rolled back by `recover_pack_journal` (`.pack-version` != target) and
+    /// `write_journal` is rolled back by `recover_pack_journal` (no commit marker of its apply — T9 GX2; its writer
+    /// marked finished — GX3) and
     /// `bin/cys-dept` keeps its exec bit — the `[ -x "$pk/bin/cys-dept" ] || exit 0` guards of the
     /// built-in `formation-heartbeat` / `ceo-promote-pending-tick` jobs (`schedule.rs` 407, 429) would
     /// otherwise stop silently (design §2-11 가, "주기 자가치유 전멸").
@@ -13234,11 +13543,12 @@ mod tests {
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        write_journal("2.0.0", &set).expect("write_journal");
+        t9_write_journal("2.0.0", &set).expect("write_journal");
         // crash mid-apply: both files rewritten 0644, one new file created, marker still 1.0.0
         write_atomic(&pd.join("bin/cys-dept"), b"#!/bin/bash\necho partial\n").unwrap();
         write_atomic(&pd.join("README.md"), b"PARTIAL").unwrap();
         write_atomic(&pd.join("new.txt"), b"ORPHAN-NEW").unwrap();
+        t9_finish_journal(&pack_journal_dir());
 
         let recovered = recover_pack_journal();
         let post = fingerprint_dir_with_modes(&pd);
@@ -13274,7 +13584,7 @@ mod tests {
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        write_journal("2.0.0", &set).expect("write_journal");
+        t9_write_journal("2.0.0", &set).expect("write_journal");
         let raw = std::fs::read_to_string(pack_journal_dir().join("index.json")).unwrap();
         let _ = std::fs::remove_dir_all(&base);
 
@@ -13335,6 +13645,10 @@ mod tests {
             ]
         });
         std::fs::write(jdir.join("index.json"), index.to_string()).unwrap();
+        // T9 stage 2: entries without `mode` now come only from Windows (a journal of an older binary lives at the old
+        // shared location and is recovered by nobody — GX4); the restore rule for them is unchanged. Finished writer —
+        // GX3.
+        t9_finish_journal(&jdir);
 
         let recovered = recover_pack_journal();
         let tool = std::fs::read_to_string(pd.join("bin/tool.sh")).unwrap();
@@ -13388,7 +13702,7 @@ mod tests {
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        write_journal("2.0.0", &set).expect("write_journal");
+        t9_write_journal("2.0.0", &set).expect("write_journal");
         let raw = std::fs::read_to_string(pack_journal_dir().join("index.json")).unwrap();
         let _ = std::fs::remove_dir_all(&base);
 
@@ -13415,9 +13729,9 @@ mod tests {
 
     // ── M15-다 / M15-다-2 reproduction (0.15.0 「스스로 해결」 T9 stage 1 · ticket T9r) ─────────────────────
     // Design §2-11 다 / 다-2, §4-15 다, §6-15 다; appendix A-1 #3, A-2 #13, #14. Plan: impl/plans/T9.md.
-    // A REPRODUCTION, NOT A FIX: every test below asserts the CORRECT end state, so on the tip it FAILS by
-    // design and is #[ignore]d with the reason; the fix (T9 stage 2) un-ignores them (or rewrites them to
-    // the fix's contract — never weaker; TESTPLAN_RULINGS OQ-H-11: the fix adds no boot lock).
+    // Every test below asserts the CORRECT end state. They FAILED on the tip before the fix (stage 1, b729efac,
+    // rebased 9d34f0bf — runs/T9-repro-b729efac.out); T9 stage 2 (RULINGS GX1–GX5) makes them pass and un-ignores
+    // them. Stage-2 rewrite: the crash model marks the captured journal's writer as a finished process (GX3).
     // Synthetic lanes under a temporary root: `<root>/pack` (base) and `<root>/pack-dept-d1` (department) —
     // the same `<root>/pack` layout as `txn_prestate`, so both lanes' journal is `<root>/.pack-journal`
     // exactly as both live lanes' journal is `~/.cys/.pack-journal`. A daemon's boot recovery is the exact
@@ -13629,9 +13943,11 @@ mod tests {
             apply_pack_transactional(&items, "0.15.1", &test_free_state("0.15.1"), None, || {
                 // The other lane's daemon starts now: cysd main.rs `recover_pack_journal`, no lock.
                 let _e = EnvGuard::set(ENV_PACK_DIR, &bt);
-                let present = pack_journal_dir().join("index.json").is_file();
+                // The UPDATING lane's journal (stage 2: measured at its own path — with one shared folder in
+                // stage 1 the booter's `pack_journal_dir()` was the same path).
+                let present = journal_of_updater.join("index.json").is_file();
                 let rec = recover_pack_journal();
-                let left = pack_journal_dir().join("index.json").is_file();
+                let left = journal_of_updater.join("index.json").is_file();
                 *boot.borrow_mut() = Some((present, rec, left));
                 Ok(())
             });
@@ -13693,7 +14009,6 @@ mod tests {
     /// written, journal not yet deleted) when a department daemon starts. Correct: the department pack
     /// is untouched and the base's journal is not taken.
     #[test]
-    #[ignore = "M15-다 reproduction (T9 stage 1 · design §2-11 다): FAILS on the tip by design — a department daemon's boot recovery rolls the base lane's in-flight pack-update journal into the department pack and deletes it; un-ignore with the fix (T9 stage 2)"]
     fn m15_da_dept_boot_recovery_during_base_update_writes_base_bytes_into_dept_pack() {
         // A failing (ignored-by-design) test must not poison the lock for the next one.
         let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -13708,7 +14023,6 @@ mod tests {
     /// M15-다, the reverse: a `cys pack-update` run in a department seat (env `CYS_PACK_DIR` = the
     /// department pack; nothing refuses it) is in flight when the BASE daemon starts.
     #[test]
-    #[ignore = "M15-다 reproduction (T9 stage 1 · design §2-11 다, reverse): FAILS on the tip by design — the base daemon's boot recovery rolls a department lane's in-flight pack-update journal into the base pack and deletes it; un-ignore with the fix (T9 stage 2)"]
     fn m15_da_base_boot_recovery_during_dept_update_writes_dept_bytes_into_base_pack() {
         // A failing (ignored-by-design) test must not poison the lock for the next one.
         let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -13760,6 +14074,8 @@ mod tests {
         assert_eq!(m15da_lane(root, name, version, files, extra, state), pd);
         let before = m15da_state(&pd);
         copy_dir_all(&captured, &journal).unwrap();
+        // T9 stage 2 (GX3): the writer of a crashed journal is gone; the in-process stop leaves this process alive.
+        t9_finish_journal(&journal);
         let _ = std::fs::remove_dir_all(&captured);
         let changed: Vec<(&str, &str)> = items
             .iter()
@@ -13794,7 +14110,6 @@ mod tests {
     /// Control arm (must pass on the tip): the same crash state with ONLY the base daemon booting is
     /// rolled back exactly — so any difference in the main arm is caused by the department's boot.
     #[test]
-    #[ignore = "M15-다 reproduction (T9 stage 1 · design §2-11 다, crash variant): FAILS on the tip by design — a department daemon booting first consumes the base's orphan journal (rollback into the department pack + delete) and the base stays half-applied; un-ignore with the fix (T9 stage 2)"]
     fn m15_da_dept_boot_recovery_takes_base_crash_journal_and_base_stays_half_applied() {
         // A failing (ignored-by-design) test must not poison the lock for the next one.
         let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -13893,7 +14208,6 @@ mod tests {
     /// journal "committed" by ITS OWN `.pack-version` and deletes it without rolling anything back.
     /// Correct: the base pack is rolled back to its pre-state at the base's boot.
     #[test]
-    #[ignore = "M15-다 reproduction (T9 stage 1 · design §2-11 다, delete variant): FAILS on the tip by design — a department at the base's target version deletes the base's orphan journal as 'committed' and the base stays half-applied; un-ignore with the fix (T9 stage 2)"]
     fn m15_da_dept_at_target_version_deletes_base_crash_journal() {
         // A failing (ignored-by-design) test must not poison the lock for the next one.
         let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -13957,7 +14271,6 @@ mod tests {
     /// recovery rolls the uncommitted apply back to the exact pre-state.
     /// Also MEASURED (printed, not asserted): whether the next run of the same update heals the result.
     #[test]
-    #[ignore = "M15-다-2 reproduction (T9 stage 1 · design §2-11 다-2): FAILS on the tip by design — recovery judges an uncommitted same-base pro-revision apply 'committed' by the unchanged .pack-version, deletes its journal and leaves a half-applied pack; un-ignore with the fix (T9 stage 2)"]
     fn m15_da2_same_base_revision_crash_in_step_2_is_not_rolled_back() {
         // A failing (ignored-by-design) test must not poison the lock for the next one.
         let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -14023,6 +14336,310 @@ mod tests {
             boot_diff.is_empty(),
             "M15-다-2: the boot recovery did not roll the uncommitted apply back\n{evidence}"
         );
+    }
+
+    // ── T9 stage 2 test helpers (journal form of RULINGS GX2/GX3) ────────────────────────────────────────────────────
+    const T9_TEST_APPLY: &str = "t9-test-apply-id";
+
+    /// A writer that has finished: a short child process spawned and reaped. Its pid names no live process — or, if the
+    /// pid is reused at once, a process born after the recorded start time 0 — so `observe_writer` says Gone.
+    fn t9_finished_writer() -> serde_json::Value {
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "exit 0"]);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = std::process::Command::new("true");
+        let mut child = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a short child");
+        let pid = child.id();
+        child.wait().expect("reap the short child");
+        serde_json::json!({"pid": pid, "birth_us": 0})
+    }
+
+    /// Marks the journal in `jdir` (when there is one) as written by a finished process — what a crash leaves; a hand-built
+    /// index without an apply record gets one (`T9_TEST_APPLY`).
+    pub(super) fn t9_finish_journal(jdir: &Path) {
+        if !jdir.is_dir() {
+            return;
+        }
+        let w = t9_finished_writer();
+        std::fs::write(jdir.join(JOURNAL_WRITER_FILE), w.to_string()).unwrap();
+        let ip = jdir.join("index.json");
+        if let Ok(s) = std::fs::read_to_string(&ip) {
+            let mut v: serde_json::Value = serde_json::from_str(&s).unwrap();
+            v["writer"] = w;
+            if v.get("apply").is_none() {
+                let tv = v["target_version"].as_str().unwrap_or("").to_string();
+                v["apply"] = serde_json::json!({
+                    "apply_id": T9_TEST_APPLY,
+                    "target": {"channel": "free", "base_version": tv, "pro_revision": 0},
+                    "items_digest": ""
+                });
+            }
+            std::fs::write(&ip, v.to_string()).unwrap();
+        }
+    }
+
+    /// `write_journal` as the transaction calls it: an apply record and this process as the writer.
+    fn t9_write_journal(
+        target: &str,
+        set: &std::collections::BTreeSet<String>,
+    ) -> Result<(), String> {
+        let apply = PackApplied {
+            apply_id: T9_TEST_APPLY.to_string(),
+            target: test_free_state(target),
+            items_digest: String::new(),
+        };
+        write_journal(target, set, &apply, &JournalWriter::current(), &mut |_| true).map(|_| ())
+    }
+
+    // ── T9 stage 2 (0.15.0 「스스로 해결」 · RULINGS GX1–GX7): the fix of M15-다 / 다-2 ─────────────────────────────
+    // GX6 proof besides the five `m15_da*` tests above: a crash after EVERY step of the REAL transaction, the writer rule,
+    // and the legacy journal. A "crash" is the real transaction stopped at a step boundary through the step callback of
+    // `apply_pack_transactional_steps` (no rollback runs — what a dying process leaves) and the journal's writer marked
+    // as a finished process (a real crash leaves no live writer; an in-process stop leaves the test process alive).
+
+    /// The commit marker of an EARLIER apply, already in the pack before the update (a later apply must not take it
+    /// for its own).
+    const T9_PREVIOUS_MARKER: &str = "{\"apply_id\":\"an-earlier-apply\",\"target\":{\"channel\":\"free\",\"base_version\":\"0.15.0\",\"pro_revision\":0},\"items_digest\":\"\"}";
+
+    /// Every file of a state except the commit marker (whose apply id differs per run).
+    fn t9_without_marker(s: &M15daState) -> M15daState {
+        s.iter()
+            .filter(|(rel, _)| rel.as_str() != PACK_APPLIED_FILE)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    fn t9_marker_of(s: &M15daState) -> Option<PackApplied> {
+        s.get(PACK_APPLIED_FILE)
+            .and_then(|v| serde_json::from_str::<PackApplied>(&v.0).ok())
+    }
+
+    const T9_STEPS: [TxStep; 9] = [
+        TxStep::Recovered,
+        TxStep::WriterRecorded,
+        TxStep::BackedUp,
+        TxStep::Journaled,
+        TxStep::Installed,
+        TxStep::StateWritten,
+        TxStep::VersionWritten,
+        TxStep::Committed,
+        TxStep::PostCommitted,
+    ];
+
+    /// GX6 (one crash test, every step): for a version change (0.15.0 → 0.15.1, free) AND a same-base-version revision
+    /// (0.15.0 pro 1 → 0.15.0 pro 2 — 다-2), the REAL transaction is stopped after each step boundary (plus the stage-1
+    /// crash inside ② after the first rewritten file). Then, with the writer gone:
+    /// 1. the DEPARTMENT lane's recovery runs first — its pack and the base's journal must be unchanged (OQ-H-12 e);
+    /// 2. the base lane's own recovery runs — the base pack must be EXACTLY its pre-state (bytes + modes, the earlier
+    ///    apply's marker included) for every stop before the commit marker, and EXACTLY the state of a complete apply
+    ///    (every file; the marker carrying the stopped run's apply id) for a stop at or after it; the journal is gone.
+    #[test]
+    fn t9_crash_after_every_step_is_entirely_old_or_entirely_new() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pro = |rev: u32| PackState {
+            channel: "pro".to_string(),
+            base_version: "0.15.0".to_string(),
+            pro_revision: rev,
+        };
+        let marker_extra: [(&str, &str); 1] = [(PACK_APPLIED_FILE, T9_PREVIOUS_MARKER)];
+        let items = m15da_v2_items(M15DA_BASE);
+        // (name, lane state before, target label, target tuple)
+        let scenarios: [(&str, Option<PackState>, &str, PackState); 2] = [
+            ("version-change", None, "0.15.1", test_free_state("0.15.1")),
+            ("same-base-revision", Some(pro(1)), "0.15.0", pro(2)),
+        ];
+        let mut failures: Vec<String> = Vec::new();
+        for (name, before_state, target, new_state) in scenarios.iter() {
+            // The complete apply, for "entirely new".
+            let ref_root = m15da_root(&format!("t9-every-ref-{name}"));
+            let ref_pd = m15da_lane(&ref_root, "pack", "0.15.0", M15DA_BASE, &marker_extra, before_state.clone());
+            let complete = {
+                let _e = set_pack_env(&ref_pd, ref_root.join("cfg"));
+                apply_pack_transactional(&items, target, new_state, None, || Ok(()))
+                    .expect("the complete reference apply");
+                m15da_state(&ref_pd)
+            };
+            let _ = std::fs::remove_dir_all(&ref_root);
+            let mut stops: Vec<Option<TxStep>> = T9_STEPS.iter().copied().map(Some).collect();
+            stops.push(None); // None = the stage-1 crash inside ② (after the first rewritten file)
+            for stop in stops {
+                let label = format!("{name} / stop after {stop:?}");
+                let root = m15da_root(&format!("t9-every-{name}-{}", stop.map(|s| format!("{s:?}")).unwrap_or_else(|| "mid-2".into())));
+                let dept = m15da_lane(&root, "pack-dept-d1", "0.15.0", M15DA_DEPT, M15DA_SIDECARS, None);
+                let _env = set_pack_env(root.join("pack"), root.join("cfg"));
+                let pre = m15da_state(&m15da_lane(&root.join("pre"), "pack", "0.15.0", M15DA_BASE, &marker_extra, before_state.clone()));
+                let base = match stop {
+                    Some(s) => {
+                        let pd = m15da_lane(&root, "pack", "0.15.0", M15DA_BASE, &marker_extra, before_state.clone());
+                        let r = apply_pack_transactional_steps(&items, target, new_state, None, || Ok(()), &mut |at| at != s);
+                        if r.is_ok() {
+                            failures.push(format!("{label}: the step callback did not stop the transaction"));
+                        }
+                        t9_finish_journal(&pack_journal_dir());
+                        pd
+                    }
+                    None => {
+                        let lane = ("0.15.0", M15DA_BASE, &marker_extra[..], before_state.clone());
+                        m15da_crash_in_step_2(&root, "pack", lane, &items, target, new_state, 1).0
+                    }
+                };
+                let crashed = m15da_state(&base);
+                let jdir = pack_journal_dir();
+                let journal_before = m15da_state(&jdir);
+                let stopped_id = std::fs::read_to_string(jdir.join("index.json"))
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<JournalIndex>(&s).ok())
+                    .and_then(|i| i.apply)
+                    .map(|a| a.apply_id);
+                // 1. the department daemon starts first.
+                let dept_pre = m15da_state(&dept);
+                let dept_rec = {
+                    let _e = EnvGuard::set(ENV_PACK_DIR, &dept);
+                    recover_pack_journal()
+                };
+                let dept_diff = m15da_diff(&dept_pre, &m15da_state(&dept));
+                let journal_diff = m15da_diff(&journal_before, &m15da_state(&jdir));
+                if dept_rec != Ok(false) || !dept_diff.is_empty() || !journal_diff.is_empty() {
+                    failures.push(format!(
+                        "{label}: the department's recovery touched something: rec={dept_rec:?} dept={dept_diff:?} base journal={journal_diff:?}"
+                    ));
+                }
+                if m15da_diff(&crashed, &m15da_state(&base)).len() != 0 {
+                    failures.push(format!("{label}: the department's recovery changed the base pack"));
+                }
+                // 2. the base daemon starts.
+                let rec = recover_pack_journal();
+                let after = m15da_state(&base);
+                let journal_left = jdir.exists();
+                let expect_new = matches!(stop, Some(TxStep::Committed) | Some(TxStep::PostCommitted));
+                if expect_new {
+                    let d = m15da_diff(&t9_without_marker(&complete), &t9_without_marker(&after));
+                    let m = t9_marker_of(&after);
+                    let ref_m = t9_marker_of(&complete);
+                    let marker_ok = m.as_ref().map(|m| Some(&m.apply_id) == stopped_id.as_ref()).unwrap_or(false)
+                        && m.as_ref().map(|m| (&m.target, &m.items_digest)) == ref_m.as_ref().map(|m| (&m.target, &m.items_digest));
+                    if !d.is_empty() || !marker_ok || rec != Ok(true) {
+                        failures.push(format!(
+                            "{label}: expected ENTIRELY NEW; rec={rec:?} marker={m:?} journal id={stopped_id:?} diff vs complete apply={d:?}"
+                        ));
+                    }
+                } else {
+                    let d = m15da_diff(&pre, &after);
+                    let crash_changed_something = !m15da_diff(&pre, &crashed).is_empty() || !journal_before.is_empty();
+                    let rec_ok = if crash_changed_something { rec == Ok(true) } else { rec == Ok(false) };
+                    if !d.is_empty() || !rec_ok {
+                        failures.push(format!("{label}: expected ENTIRELY OLD; rec={rec:?} diff vs pre-state={d:?}"));
+                    }
+                }
+                if journal_left {
+                    failures.push(format!("{label}: the journal is still there after the base's recovery"));
+                }
+                drop(_env);
+                let _ = std::fs::remove_dir_all(&root);
+            }
+        }
+        assert!(failures.is_empty(), "GX6 crash proof:\n  {}", failures.join("\n  "));
+    }
+
+    /// GX3: a journal whose writer is still running — or whose liveness cannot be decided — is not touched (pack,
+    /// journal), the recovery says so in one line (Err), and a pack update of that lane refuses instead of overwriting it.
+    #[test]
+    fn t9_journal_of_a_running_or_unknown_writer_is_not_touched() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let items = m15da_v2_items(M15DA_BASE);
+        let st = test_free_state("0.15.1");
+        let mut failures: Vec<String> = Vec::new();
+        // (stop, how the writer is set)
+        for (stop, writer) in [
+            (TxStep::Installed, "running"),
+            (TxStep::WriterRecorded, "running"),
+            (TxStep::Installed, "unknown"),
+            (TxStep::WriterRecorded, "unknown"),
+        ] {
+            let label = format!("stop after {stop:?}, writer {writer}");
+            let root = m15da_root(&format!("t9-live-{stop:?}-{writer}"));
+            let pd = m15da_lane(&root, "pack", "0.15.0", M15DA_BASE, &[], None);
+            let _env = set_pack_env(&pd, root.join("cfg"));
+            let _ = apply_pack_transactional_steps(&items, "0.15.1", &st, None, || Ok(()), &mut |at| at != stop);
+            let jdir = pack_journal_dir();
+            if writer == "unknown" {
+                // this live process, but without a recorded start time = liveness cannot be decided
+                let w = serde_json::json!({"pid": std::process::id(), "birth_us": null});
+                std::fs::write(jdir.join(JOURNAL_WRITER_FILE), w.to_string()).unwrap();
+                if let Ok(s) = std::fs::read_to_string(jdir.join("index.json")) {
+                    let mut v: serde_json::Value = serde_json::from_str(&s).unwrap();
+                    v["writer"] = w;
+                    std::fs::write(jdir.join("index.json"), v.to_string()).unwrap();
+                }
+            }
+            let pack_before = m15da_state(&pd);
+            let journal_before = m15da_state(&jdir);
+            let rec = recover_pack_journal();
+            let again = apply_pack_transactional(&items, "0.15.1", &st, None, || Ok(()));
+            let pack_diff = m15da_diff(&pack_before, &m15da_state(&pd));
+            let journal_diff = m15da_diff(&journal_before, &m15da_state(&jdir));
+            if rec.is_ok() || again.is_ok() || !pack_diff.is_empty() || !journal_diff.is_empty() || journal_before.is_empty() {
+                failures.push(format!(
+                    "{label}: rec={rec:?} update again={again:?} pack={pack_diff:?} journal={journal_diff:?} journal files={}",
+                    journal_before.len()
+                ));
+            }
+            drop(_env);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        assert!(failures.is_empty(), "GX3:\n  {}", failures.join("\n  "));
+    }
+
+    /// GX3 (the decision rule, pure): one observation decides; only proof of death (no such process, or the pid now
+    /// held by a process born at another time) lets a recovery act.
+    #[test]
+    fn t9_writer_life_is_decided_from_one_observation() {
+        use crate::process_observation::Failure;
+        let w = JournalWriter { pid: 4242, birth_us: Some(1_000) };
+        let blind = JournalWriter { pid: 4242, birth_us: None };
+        assert_eq!(writer_life(&w, Err(Failure::Dead)), WriterLife::Gone);
+        assert_eq!(writer_life(&blind, Err(Failure::Dead)), WriterLife::Gone);
+        assert_eq!(writer_life(&w, Ok(2_000)), WriterLife::Gone, "pid reused by a younger process");
+        assert_eq!(writer_life(&w, Ok(1_000)), WriterLife::Running);
+        for e in [
+            Failure::Unknown { stage: "proc_pidinfo", os_error: Some(1) },
+            Failure::Changed,
+            Failure::InvalidPid,
+            Failure::Malformed("x"),
+            Failure::UnsupportedPlatform,
+        ] {
+            assert!(matches!(writer_life(&w, Err(e.clone())), WriterLife::Unknown(_)), "{e:?}");
+        }
+        assert!(matches!(writer_life(&blind, Ok(1_000)), WriterLife::Unknown(_)));
+        // the real query on this live process
+        let me = JournalWriter::current();
+        assert!(me.birth_us.is_some(), "this process's start time must be readable here");
+        assert_eq!(observe_writer(&me), WriterLife::Running);
+        let gone = serde_json::from_value::<JournalWriter>(t9_finished_writer()).unwrap();
+        assert_eq!(observe_writer(&gone), WriterLife::Gone);
+    }
+
+    /// GX1: every lane's journal is its own folder under `.pack-journal.d`, never the legacy shared folder.
+    #[test]
+    fn t9_each_lane_has_its_own_journal_folder() {
+        let root = Path::new("/x/.cys");
+        let base = pack_journal_dir_for(&root.join("pack"));
+        let d1 = pack_journal_dir_for(&root.join("pack-dept-d1"));
+        let d10 = pack_journal_dir_for(&root.join("pack-dept-d10"));
+        assert_eq!(base, root.join(".pack-journal.d/pack"));
+        assert_eq!(d1, root.join(".pack-journal.d/pack-dept-d1"));
+        assert!(base != d1 && d1 != d10 && base != d10);
+        assert_eq!(legacy_pack_journal_dir_for(&root.join("pack-dept-d1")), root.join(".pack-journal"));
+        assert_eq!(PACK_JOURNAL_ROOT, ".pack-journal.d");
     }
 
     /// ★핵심(R2CODE2 HIGH #1): pack-update 트랜잭션에서 .install-manifest.json write_atomic 실패
@@ -17286,7 +17903,19 @@ mod m11_tests {
         }
         // ★T2i(RULINGS FP2): 데몬이 듣기 전의 저널 복구 — 정상 저널(인덱스 + 백업)에서 인덱스 · 백업 · `.pack-version` 자리에 같은
         //   형태를 두어도 복구는 시한 안에 돌아온다(복구의 순서 · 판정은 그대로 — 판독 불가 = 종전 읽기 오류 갈래).
-        for (ti, target) in ["index.json", "files/a.txt", "../pack/.pack-version"].iter().enumerate() {
+        // ★T9 stage 2 (RULINGS GX1–GX3): the journal lives in the lane's own folder and is acted on only when its writer
+        //   is gone, so the planted journal names a finished writer (otherwise nothing past the writer would be read); the
+        //   commit marker and `writer.json` (read when there is no index) are on this path now and get the same forms.
+        for (ti, target) in [
+            "index.json",
+            "files/a.txt",
+            "../../pack/.pack-version",
+            "../../pack/.pack-applied.json",
+            "writer.json",
+        ]
+        .iter()
+        .enumerate()
+        {
             for form in &forms {
                 let root = rig.base.join(format!("j{ti}-{form}"));
                 let pack = root.join("pack");
@@ -17294,7 +17923,7 @@ mod m11_tests {
                 std::fs::write(pack.join("a.txt"), "new").unwrap();
                 std::fs::write(pack.join(PACK_VERSION_FILE), "1.0.0
 ").unwrap();
-                let jdir = root.join(".pack-journal");
+                let jdir = pack_journal_dir_for(&pack);
                 std::fs::create_dir_all(jdir.join("files")).unwrap();
                 std::fs::write(
                     jdir.join("index.json"),
@@ -17302,6 +17931,10 @@ mod m11_tests {
                 )
                 .unwrap();
                 std::fs::write(jdir.join("files").join("a.txt"), "old").unwrap();
+                super::tests::t9_finish_journal(&jdir);
+                if *target == "writer.json" {
+                    std::fs::remove_file(jdir.join("index.json")).unwrap();
+                }
                 let p = jdir.join(target);
                 plant_special(&p, form, &root, &format!("journal {target} as {form}"));
                 let _env = EnvGuard::set("CYS_PACK_DIR", &pack);
