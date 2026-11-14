@@ -8620,13 +8620,13 @@ fn run_init_pack(force: bool, no_install_hook: bool, claude_settings: Option<Str
     // W0-d: cys init-pack CLI 핸들러는 라이브 팩 쓰기 프로덕션 진입점 — 인가 부여.
     // ★G3(--no-install-hook 일관성): 훅 억제는 개인 프로필(~/.claude*)뿐 아니라 격리 config dir
     // 훅 병합까지 일관 적용된다(install_hooks = !no_install_hook — 모든 계급의 훅 등록 억제).
-    let (written, kept) = match cys::pack::install_staged(
-        force,
-        Some(cys::pack::PackWriteAuth::production()),
-        !no_install_hook,
-    ) {
-        Ok(wk) => wk,
-        Err(e) => {
+    // ★T2h(RULINGS CW2): init-pack 은 팩 적용 잠금(`with_apply_lock`) 안에서 — 기동 설치 · 팩 동사의 보존-후-쓰기와 겹치지 않는다.
+    let staged = with_apply_lock(&pack_state_base().join(".pack-apply.lock"), || {
+        cys::pack::install_staged(force, Some(cys::pack::PackWriteAuth::production()), !no_install_hook)
+    });
+    let (written, kept) = match staged {
+        Ok(Ok(wk)) => wk,
+        Ok(Err(e)) | Err(e) => {
             eprintln!("error: {e}");
             return 1;
         }
@@ -27359,25 +27359,31 @@ fn run_pack_heal(rel: &str, yes: bool) -> i32 {
     // capture-failed) 의 .user 는 자동 병합 실패 때 살아남은 유일 원본이라, 아래 백업이 이를
     // 침묵 클로버하면 영구 소실이었다. 이번 백업 내용(현 디스크 바이트)과 다르면
     // .user.prev-<ts> 세대 개명 후 진행 · 개명 실패 = fail-closed 거부(무변경).
-    if target.exists() {
-        match preserve_prior_user_generation(&dir, rel, std::fs::read(&target).ok().as_deref()) {
-            Ok(Some(prev)) => println!("기존 보존본 세대 보존: {}", prev.display()),
-            Ok(None) => {}
-            Err(e) => {
-                eprintln!("{e} — fail-closed 거부(무변경)");
-                return 1;
+    // ★T2h(RULINGS CW2): 세대 보존(⑤-0)과 백업(⑤)은 팩 적용 잠금(`with_apply_lock` · `pack_state_base()/.pack-apply.lock`) 안에서
+    //   — 기동 설치 · 다른 팩 동사의 같은 단계와 겹치지 않는다. 확인 질문은 이미 위에서 끝났다(잠금을 쥔 채 묻지 않는다).
+    let step = with_apply_lock(&pack_state_base().join(".pack-apply.lock"), || -> Result<(), String> {
+        if target.exists() {
+            match preserve_prior_user_generation(&dir, rel, std::fs::read(&target).ok().as_deref()) {
+                Ok(Some(prev)) => println!("기존 보존본 세대 보존: {}", prev.display()),
+                Ok(None) => {}
+                Err(e) => return Err(format!("{e} — fail-closed 거부(무변경)")),
             }
         }
-    }
-    // ⑤ 백업 선행 — 판독 가능=.user 전문 · 판독 불가(존재 시)=바이트 백업 · 실패=fail-closed 거부.
-    if let Some(d) = disk.as_deref() {
-        if let Err(e) = cys::pack::write_atomic(&dir.join(format!("{rel}.user")), d.as_bytes()) {
-            eprintln!("백업 쓰기 실패({e}) — fail-closed 거부(무변경)");
-            return 1;
+        // ⑤ 백업 선행 — 판독 가능=.user 전문 · 판독 불가(존재 시)=바이트 백업 · 실패=fail-closed 거부.
+        if let Some(d) = disk.as_deref() {
+            cys::pack::write_atomic(&dir.join(format!("{rel}.user")), d.as_bytes())
+                .map_err(|e| format!("백업 쓰기 실패({e}) — fail-closed 거부(무변경)"))?;
+        } else if target.exists() {
+            cys::pack::byte_backup_user(&dir, rel, &target).map_err(|e| {
+                format!("바이트 백업 실패({e}) — fail-closed 거부(무변경 · L0 강행 예외는 무인 스윕 전용)")
+            })?;
         }
-    } else if target.exists() {
-        if let Err(e) = cys::pack::byte_backup_user(&dir, rel, &target) {
-            eprintln!("바이트 백업 실패({e}) — fail-closed 거부(무변경 · L0 강행 예외는 무인 스윕 전용)");
+        Ok(())
+    });
+    match step {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) | Err(e) => {
+            eprintln!("{e}");
             return 1;
         }
     }
@@ -27533,17 +27539,20 @@ fn run_pack_revert_merge(dir: &std::path::Path, rel: &str, yes: bool, sources: &
     let target = dir.join(rel);
     let merged_now = std::fs::read_to_string(&target).unwrap_or_default();
     // ★T4-fix(R1-적대 #2 동계열): 이전 세대 .user(병합 이전 치유·충돌의 보존본) 침묵 클로버 방지.
-    match preserve_prior_user_generation(dir, rel, Some(merged_now.as_bytes())) {
-        Ok(Some(prev)) => println!("기존 보존본 세대 보존: {}", prev.display()),
-        Ok(None) => {}
-        Err(e) => {
+    // ★T2h(RULINGS CW2): 보존-후-쓰기 단계는 팩 적용 잠금(`with_apply_lock` · `pack_state_base()/.pack-apply.lock`) 안에서.
+    let step = with_apply_lock(&pack_state_base().join(".pack-apply.lock"), || -> Result<Option<std::path::PathBuf>, String> {
+        let prev = preserve_prior_user_generation(dir, rel, Some(merged_now.as_bytes()))?;
+        cys::pack::write_atomic(&dir.join(format!("{rel}.user")), merged_now.as_bytes())
+            .map_err(|e| format!("백업 쓰기 실패({e})"))?;
+        Ok(prev)
+    });
+    match step {
+        Ok(Ok(Some(prev))) => println!("기존 보존본 세대 보존: {}", prev.display()),
+        Ok(Ok(None)) => {}
+        Ok(Err(e)) | Err(e) => {
             eprintln!("{e} — fail-closed 거부(무변경)");
             return 1;
         }
-    }
-    if let Err(e) = cys::pack::write_atomic(&dir.join(format!("{rel}.user")), merged_now.as_bytes()) {
-        eprintln!("백업 쓰기 실패({e}) — fail-closed 거부(무변경)");
-        return 1;
     }
     // H-08
     let prior = cys::pack::current_mode(&target);

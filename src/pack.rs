@@ -4408,6 +4408,24 @@ pub fn preserve_prior_user_generation(
     rel: &str,
     incoming: Option<&[u8]>,
 ) -> Result<Option<PathBuf>, String> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    preserve_prior_user_generation_at(dir, rel, incoming, ts, &mut |_| {})
+}
+
+/// ★T2h(RULINGS CW2 · 검토자 B2): 세대 자리는 **배타적으로 예약**한다 — 후보 이름을 `create_new`(O_EXCL · 윈도우 CREATE_NEW)로
+/// 만들어 차지한 뒤에만 `.user` 를 그 자리로 옮긴다(교체되는 것은 방금 차지한 빈 자리뿐). 다른 쓰는 쪽이 같은 이름을 먼저
+/// 차지했으면 다음 이름으로 넘어간다 — 확인과 이름 바꾸기 사이에 남의 세대를 덮던 창(종전 `exists()` 뒤 `rename`)이 없다.
+/// 다른 쓰는 쪽이 이미 `.user` 를 옮겼으면 보존할 것이 없다(Ok(None)). `before_reserve` = 시험의 끼어들기 지점(제품은 빈 함수).
+fn preserve_prior_user_generation_at(
+    dir: &Path,
+    rel: &str,
+    incoming: Option<&[u8]>,
+    ts: u64,
+    before_reserve: &mut dyn FnMut(&Path),
+) -> Result<Option<PathBuf>, String> {
     let prior = dir.join(format!("{rel}.user"));
     if !prior.exists() {
         return Ok(None);
@@ -4417,18 +4435,82 @@ pub fn preserve_prior_user_generation(
             return Ok(None);
         }
     }
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let mut dest = dir.join(format!("{rel}.user.prev-{ts}"));
-    let mut n = 1u32;
-    while dest.exists() {
-        n += 1;
-        dest = dir.join(format!("{rel}.user.prev-{ts}-{n}"));
+    for n in 1u32..=10_000 {
+        let dest = if n == 1 {
+            dir.join(format!("{rel}.user.prev-{ts}"))
+        } else {
+            dir.join(format!("{rel}.user.prev-{ts}-{n}"))
+        };
+        before_reserve(&dest);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&dest) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("기존 {rel}.user 세대 자리 예약 실패({e})")),
+        }
+        return match std::fs::rename(&prior, &dest) {
+            Ok(()) => Ok(Some(dest)),
+            Err(e) => {
+                let _ = std::fs::remove_file(&dest);
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(None)
+                } else {
+                    Err(format!("기존 {rel}.user 세대 보존 실패({e})"))
+                }
+            }
+        };
     }
-    std::fs::rename(&prior, &dest).map_err(|e| format!("기존 {rel}.user 세대 보존 실패({e})"))?;
-    Ok(Some(dest))
+    Err(format!("기존 {rel}.user 세대 자리를 찾지 못했습니다"))
+}
+
+/// ★T2h(RULINGS CW2): 팩 적용 잠금(`<팩 부모>/.pack-apply.lock` — `cys` 바이너리의 `with_apply_lock` 과 **같은 파일 · 같은
+/// flock**)을 **유한 대기**로 잡고 f 를 실행한다 — 데몬의 기동 설치(`install`)가 쓴다. 시한 안에 잡지 못하거나 잠금 파일을 열 수
+/// 없으면 stderr 한 줄을 남기고 잠금 없이 진행한다(시작이 멈추지 않는다 · 세대는 배타 자리 예약이 따로 지킨다). 잠금 파일은
+/// 링크를 따르지 않고 막히지 않게 연다. 윈도우: 잠금 없이 실행한다(`with_apply_lock` 의 비unix 동작과 같다).
+pub fn with_pack_apply_lock_bounded<T>(
+    lock_path: &Path,
+    wait: std::time::Duration,
+    f: impl FnOnce() -> T,
+) -> T {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(lock_path);
+        let Ok(file) = file else {
+            eprintln!("[init-pack] ⚠ 팩 적용 잠금 파일을 열 수 없어 잠금 없이 진행합니다: {}", lock_path.display());
+            return f();
+        };
+        let fd = file.as_raw_fd();
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                let out = f();
+                unsafe {
+                    libc::flock(fd, libc::LOCK_UN);
+                }
+                return out;
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "[init-pack] ⚠ 팩 적용 잠금을 {}초 안에 잡지 못해 잠금 없이 진행합니다(다른 팩 쓰기가 진행 중): {}",
+                    wait.as_secs(),
+                    lock_path.display()
+                );
+                return f();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (lock_path, wait);
+        f()
+    }
 }
 
 /// 설치 실행부 전용 세대 보존: `{rel}.user` 가 **일반 파일**일 때만 이전 세대로 비켜 세운다. 그 자리에 파일이
@@ -4968,7 +5050,21 @@ pub fn restore_update_snapshot(
 /// force=false: 사용자 수정 파일 불가침 + **비수정 파일은 임베드 신버전으로 자동 갱신**
 /// (설치 매니페스트의 설치-당시 해시와 현재 파일 해시가 일치 = 비수정). 매니페스트가
 /// 없는 구설치본 파일은 종전대로 보존한다(안전측). 반환: (written, kept).
+/// ★T2h(RULINGS CW2): 이 설치는 팩 적용 잠금 안에서 돈다(유한 대기 — [`with_pack_apply_lock_bounded`]) — 같은 팩의 `pack-heal` ·
+/// 팩 동사 · `init-pack` · `pack-update` 와 보존-후-쓰기 단계가 겹치지 않는다.
 pub fn install(force: bool, auth: Option<PackWriteAuth>) -> Result<(usize, usize), String> {
+    let run = || install_unlocked(force, auth);
+    match pack_dir().parent() {
+        Some(base) => with_pack_apply_lock_bounded(
+            &base.join(".pack-apply.lock"),
+            std::time::Duration::from_secs(10),
+            run,
+        ),
+        None => run(),
+    }
+}
+
+fn install_unlocked(force: bool, auth: Option<PackWriteAuth>) -> Result<(usize, usize), String> {
     // 얇은 래퍼: embed PACK_ALL(git-추적 전체 트리)를 입력원으로 install_from_iter에 위임한다.
     // ★외부 동작(반환값·디스크 결과·부수효과)은 완전 불변 — C/D/E 호출처 무영향(§3 하위호환).
     // auth는 라이브 대상 쓰기 인가(W0-d) — install_from_iter가 pack_dir()에 쓰므로 그대로 전달한다.
@@ -14524,6 +14620,74 @@ mod m11_tests {
             assert!(matches!(read_start_meta(&dir.join("l")), StartRead::Unreadable(_)), "메타: 링크 비추종");
             assert_eq!(read_start_live(&dir.join("l")), StartRead::Bytes(b"x".to_vec()), "살아 있는 파일: 일반 파일 링크 추종");
         }
+    }
+
+    /// ★T2h(RULINGS CW2 · 검토자 B2): 보관된 세대는 결코 덮이지 않는다 — 두 쓰는 쪽을 결정적으로 끼워 넣는다: A 가 `.user`(U)를
+    /// `prev-100` 에 보존하고 V 를 쓴 뒤, 같은 초의 B 가 고른 후보 자리를 **예약 직전에** 세 번째 쓰는 쪽(X)이 차지한다(종전 코드는
+    /// 존재 확인 뒤 `rename` 으로 그 자리를 덮었다). B 는 다음 자리로 넘어가고 U · V · X 가 모두 남는다. 다른 쓰는 쪽이 이미 `.user`
+    /// 를 옮겼으면 보존할 것이 없다.
+    #[test]
+    fn t2h_cw2_an_archived_generation_is_never_replaced() {
+        let rig = Rig::new("cw2");
+        let rel = "hooks/x.sh";
+        let user = |c: &[u8]| rig.write(&format!("{rel}.user"), c);
+        user(b"U\n");
+        let a = preserve_prior_user_generation_at(&rig.pack, rel, Some(b"V\n"), 100, &mut |_| {}).unwrap().unwrap();
+        assert_eq!(a, rig.pack.join(format!("{rel}.user.prev-100")));
+        user(b"V\n");
+        let mut taken: Vec<PathBuf> = Vec::new();
+        let b = preserve_prior_user_generation_at(&rig.pack, rel, Some(b"W\n"), 100, &mut |cand| {
+            if taken.is_empty() && !cand.exists() {
+                std::fs::write(cand, "X\n").unwrap();
+                taken.push(cand.to_path_buf());
+            }
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(taken.len(), 1, "끼어든 쓰는 쪽이 B 의 첫 후보를 차지했다");
+        assert_ne!(b, taken[0], "B 는 차지된 자리를 쓰지 않는다");
+        let read = |p: &Path| std::fs::read_to_string(p).unwrap();
+        assert_eq!(read(&a), "U\n", "A 의 세대(U) 그대로");
+        assert_eq!(read(&taken[0]), "X\n", "끼어든 세대(X) 그대로");
+        assert_eq!(read(&b), "V\n", "B 의 세대(V)");
+        let gens: Vec<String> = std::fs::read_dir(rig.pack.join("hooks"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("x.sh.user.prev-"))
+            .map(|e| read(&e.path()))
+            .collect();
+        assert_eq!(gens.len(), 3, "{gens:?}");
+        // 다른 쓰는 쪽이 이미 옮겼다 → 보존할 것 없음.
+        assert_eq!(preserve_prior_user_generation_at(&rig.pack, rel, None, 100, &mut |_| {}).unwrap(), None);
+    }
+
+    /// ★T2h(RULINGS CW2): 기동 설치의 팩 적용 잠금 — 쥔 쪽이 있으면 기다렸다가 그 뒤에 돈다(직렬화), 시한을 넘기면 잠금 없이
+    /// 진행한다(시작이 멈추지 않는다 · 시한 = 유한).
+    #[cfg(unix)]
+    #[test]
+    fn t2h_cw2_pack_apply_lock_serializes_and_never_blocks_the_start() {
+        let rig = Rig::new("cw2lock");
+        let lock = rig.base.join(".pack-apply.lock");
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let run = |wait_ms: u64| {
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (l1, k1) = (log.clone(), lock.clone());
+            let a = std::thread::spawn(move || {
+                with_pack_apply_lock_bounded(&k1, std::time::Duration::from_secs(5), || {
+                    l1.lock().unwrap().push("A-in");
+                    held_tx.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    l1.lock().unwrap().push("A-out");
+                })
+            });
+            held_rx.recv().unwrap();
+            let l2 = log.clone();
+            with_pack_apply_lock_bounded(&lock, std::time::Duration::from_millis(wait_ms), || l2.lock().unwrap().push("B"));
+            a.join().unwrap();
+            std::mem::take(&mut *log.lock().unwrap())
+        };
+        assert_eq!(run(5_000), vec!["A-in", "A-out", "B"], "쥔 쪽이 끝난 뒤에 돈다");
+        assert_eq!(run(50), vec!["A-in", "B", "A-out"], "시한(50ms)을 넘기면 잠금 없이 진행한다");
     }
 
     /// 부록 A-2 #4(백업이 없으면 덮지 않는다): 기동 필수 파일의 사용자본을 보관할 수 없으면 vendor 본을 쓰지 않고 격리.
