@@ -43,23 +43,26 @@ streaming pass in archive order — never by seeking back in a compressed stream
 reads of the real 0.14.56 archive rewound the gzip ~3,864 times, ~35 minutes per pass). The output line
 `archive read in one pass: <members> members, <read> of <size> compressed bytes` is measured from the real
 reads (`read` can only exceed `size` if something rewound).
-Tar HARD-LINK members are judged as the product's extractor treats them (RULINGS DB5, DI2). The tar archives this
-gate reads are the updater archive `cys.app.tar.gz` (release.yml, build-macos-signed.sh); the app unpacks it in
-tauri-plugin-updater 2.10.1 (`src/updater.rs:1236–1250`, macOS `install_inner`) by calling, for every member,
-`entry.unpack(<file path>)` of the Rust `tar` crate 0.4.46 (Cargo.lock), and on the first error it deletes what it
-extracted and abandons the update. `Entry::unpack(dst)` is `unpack(None, dst)` (`tar-0.4.46/src/entry.rs:203–204`);
-for a hard link with no target base it takes the stored link name as it is (`:528–545`) — a path relative to the
-updater process's working directory, not to the extraction folder — and calls `fs::hard_link` on it (`:548`). So a
-hard-link member, whether its target comes before or after it, does not produce the packed file: every hard-link
-member FAILs with "the archive cannot be extracted as packed". (The system tar's handling is not documented in the
-local man page and is not the product's extractor.)
-Symbolic links are followed component by component as the file system does after extraction (RULINGS DI3, DI4):
-`.` and empty components are dropped, a component that is itself a symbolic-link member is replaced by its target,
-`..` climbs one level (above the root of the tree: refused as an unsafe link); a loop is an actual revisit — a link
-whose own resolution needs itself — and a valid chain of any length resolves (each link is resolved once, memoised).
-Every load command of every Mach-O is checked (RULINGS DI1): each must start and end inside `sizeofcmds`, whatever
-its size; the commands are read one by one (header, and the version field only where needed), forward, so a large
-command area is read in bounded steps, never skipped.
+Links and names (RULINGS DL1 — one closed form; it replaces DB5, DI2, DI3, DI4):
+  (1) every member name, hard-link name and link target is brought to ONE normal form as it is read (`normal`):
+      split at `/`, drop empty and `.` components; an absolute path anywhere, or `..` in a member or hard-link
+      name, is not measurable (exit 2, naming the member);
+  (2) a symbolic link is resolved the way the kernel resolves a path (`resolve`, iterative): component by
+      component, every intermediate component must be a directory of the archive (or a link to one), `..` steps
+      to the real parent, at most MAXSYMLINKS (32, the macOS SDK's <sys/param.h>) link expansions in total, a
+      revisit of the same link with the same remaining path is a loop; a REQUIRED entry point that does not
+      resolve FAILS with the reason (not a directory / missing component / too many links / loop / dangling);
+  (3) EVERY tar hard-link member FAILS: the updater unpacks the updater archive (`cys.app.tar.gz`, the only tar
+      this gate is given — release.yml, build-macos-signed.sh) with tauri-plugin-updater 2.10.1
+      (`src/updater.rs:1236–1250`), whose `entry.unpack(<file>)` of the Rust `tar` crate 0.4.46
+      (`src/entry.rs:203–204, 528–548`) takes a hard link's stored name relative to the process's working
+      directory, not the extraction folder — so the archive does not guarantee which file the link names; it
+      depends on what exists outside the extraction folder;
+  (4) the checker's own failure — recursion, memory, any unexpected exception — is exit 2, never exit 1.
+Every load command of every Mach-O is checked (RULINGS DI1, DL2): each must start and end inside `sizeofcmds`,
+read one by one and forward; the streaming reader keeps only the lookback the next read needs (its buffer stays
+around two 64 KiB chunks however many commands follow each other); a load-command area over 16 MiB, or a single
+read over 1 MiB, exceeds the checker's resource cap and is not measurable (exit 2).
 
 Reads bytes only: no `lipo`, `otool`, `file` or `vtool` (they are not on a stock Mac and not needed),
 no execution of anything it inspects, no network. Standard library only (python 3.8+).
@@ -97,9 +100,18 @@ TARGETS = {
 SATISFIES = {"x86_64": ("x86_64",), "arm64": ("arm64", "arm64v8")}
 # entry points whose minimum macOS is printed (relative-path suffixes; Contents/MacOS/* is added by rule)
 ENTRY_SUFFIXES = ("python/bin/python3", "node/bin/node", "git/bin/git", "uv/uv")
-HARD_LINK_WHY = ("the archive cannot be extracted as packed — this member is a tar hard link (to %s); the updater's "
-                 "extractor (the Rust tar crate's Entry::unpack) makes it from that name taken relative to its working "
-                 "directory, not inside the extraction folder, so it fails and the update is abandoned (RULINGS DI2)")
+# RULINGS DL1 (3) — the sentence for EVERY hard-link member (the updater's extractor, tauri-plugin-updater 2.10.1
+# src/updater.rs:1236–1250 → tar 0.4.46 src/entry.rs:203–204, 528–548, takes the stored name relative to the process's
+# working directory, not the extraction folder)
+HARD_LINK_WHY = ("%s: a tar hard link (to %s) — the archive does not guarantee which file this link names: the "
+                 "updater's extractor takes the stored name relative to its working directory, so the result depends "
+                 "on what exists outside the extraction folder (RULINGS DL1 (3))")
+# the platform's limit of link expansions in one path lookup — MAXSYMLINKS in the macOS SDK's <sys/param.h>
+# (/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/param.h:197: `#define MAXSYMLINKS 32`)
+MAXSYMLINKS = 32
+# RULINGS DL2 — the checker's resource caps (beyond them: not measurable, exit 2)
+MAX_CMDS_AREA = 16 << 20      # a load-command area larger than 16 MiB (real ones are kilobytes)
+READ_CAP = 1 << 20            # no single read of a header / table / command field is larger than this
 
 
 class Unjudgeable(Exception):
@@ -146,6 +158,9 @@ def _thin(read, off, end, where):
         raise Unjudgeable("Mach-O header runs past the end of %s" % where)
     cputype, subtype = struct.unpack(endian + "II", hdr[4:12])
     ncmds, sizeofcmds = struct.unpack(endian + "II", hdr[16:24])
+    if sizeofcmds > MAX_CMDS_AREA:
+        raise Unjudgeable("a load-command area of %d bytes exceeds the checker's resource cap of %d bytes — not "
+                          "measurable (RULINGS DL2)" % (sizeofcmds, MAX_CMDS_AREA))
     if end is not None and off + hsize + sizeofcmds > end:
         raise Unjudgeable("load commands (%d bytes) run past the end of %s" % (sizeofcmds, where))
     # RULINGS DI1: EVERY load command is checked (no early stop), read one by one and forward — a command area of
@@ -237,30 +252,38 @@ def is_entry(rel):
 # ── sources: one pass over a directory tree or a tar archive → records ─────────────────────────────────
 
 class ForwardReader:
-    """read(offset, n) over a stream that can only go forward (a tar member read in streaming mode)."""
+    """read(offset, n) over a stream that can only go forward (a tar member read in streaming mode). RULINGS DL2:
+    it keeps only the lookback the next read can need — every caller reads at non-decreasing offsets, so bytes
+    before the current offset are dropped (in steps of CHUNK, amortised); `peak` is the largest buffer it held."""
+    CHUNK = 1 << 16
 
     def __init__(self, f):
-        self.f, self.base, self.buf = f, 0, b""
+        self.f, self.base, self.buf, self.peak = f, 0, b"", 0
 
     def read(self, off, n):
         if off < self.base:
             raise Unjudgeable("internal: a backward read at %d (stream at %d)" % (off, self.base))
+        if n > READ_CAP:
+            raise Unjudgeable("a read of %d bytes exceeds the checker's cap of %d bytes — not measurable" % (n, READ_CAP))
         have_end = self.base + len(self.buf)
-        if off > have_end:                       # skip forward without keeping the bytes
+        if off >= have_end:                      # nothing kept is needed: skip forward without keeping the bytes
             gap = off - have_end
             while gap > 0:
-                chunk = self.f.read(min(gap, 1 << 16))
+                chunk = self.f.read(min(gap, self.CHUNK))
                 if not chunk:
                     break
                 gap -= len(chunk)
             self.base, self.buf = off - gap, b""
+        elif off - self.base >= self.CHUNK:      # drop what no later read can need (amortised)
+            self.buf, self.base = self.buf[off - self.base:], off
         need = off + n - (self.base + len(self.buf))
         while need > 0:
-            chunk = self.f.read(max(need, 1 << 16))
+            chunk = self.f.read(max(need, self.CHUNK))
             if not chunk:
                 break
             self.buf += chunk
             need -= len(chunk)
+        self.peak = max(self.peak, len(self.buf))
         start = off - self.base
         return self.buf[start:start + n]
 
@@ -281,24 +304,60 @@ class CountingFile:
         self.f.close()
 
 
+# ── RULINGS DL1: ONE normal form for every name ───────────────────────────────────────────────────────
+
+def normal(path):
+    """THE normal form (DL1 (1)) of a member name, a hard-link name or a link target: split at `/`, drop empty and
+    `.` components (a leading `./`, an inner `./`, a repeated `/`). `..` is kept (it is meaningful in a link target)."""
+    return "/".join(c for c in path.split("/") if c not in ("", "."))
+
+
+def name_problem(name, kind):
+    """DL1 (1): an absolute path anywhere, or `..` in a member / hard-link name, is not measurable."""
+    if name.startswith("/"):
+        return "%s %r is an absolute path" % (kind, name)
+    if kind != "link target" and ".." in name.split("/"):
+        return "%s %r contains `..`" % (kind, name)
+    return None
+
+
+class Tree:
+    """What one pass over a directory tree or an archive found, every name in the normal form."""
+
+    def __init__(self):
+        self.records, self.links, self.files, self.problems = {}, {}, set(), []
+        self.hardlinks, self.dirs, self.absolute = {}, set(), set()
+
+    def add_link(self, rel, target):
+        p = name_problem(target, "link target")
+        if p:
+            self.problems.append("%s: not measurable — %s" % (rel, p))
+            self.absolute.add(rel)
+        self.links[rel] = normal(target)
+
+    def finish(self):
+        for key in list(self.records) + list(self.files) + list(self.links) + list(self.hardlinks):
+            parts = key.split("/")
+            for i in range(1, len(parts)):       # every parent of a member exists after extraction
+                self.dirs.add("/".join(parts[:i]))
+
+
 def scan_dir(root, target_arch):
-    """→ (records, links, files, problems, hardlinks): records {rel: inspect() result} for Mach-O files; links
-    {rel: target}; files = every regular file (Mach-O or not); problems [str] (cannot judge); hardlinks {} (on a
-    directory tree a hard link is simply another regular file)."""
-    records, links, files, problems = {}, {}, set(), []
+    """One pass over a directory tree → Tree (on a directory tree a hard link is simply another regular file)."""
+    tree = Tree()
     base = os.path.basename(os.path.normpath(root)) if root.rstrip("/").endswith(".app") else ""
 
     def rel_of(full):
         rel = os.path.relpath(full, root).replace(os.sep, "/")
-        return base + "/" + rel if base else rel
+        return normal(base + "/" + rel if base else rel)
 
     def one(full, rel):
         if os.path.islink(full):
-            links[rel] = os.readlink(full)
+            tree.add_link(rel, os.readlink(full))
             return
         if not os.path.isfile(full):
             return
-        files.add(rel)
+        tree.files.add(rel)
         try:
             size = os.path.getsize(full)
             with open(full, "rb") as f:
@@ -307,145 +366,156 @@ def scan_dir(root, target_arch):
                     return f.read(n)
                 info = inspect(read, size, target_arch)
         except Unjudgeable as e:
-            problems.append("%s: %s" % (rel, e))
+            tree.problems.append("%s: %s" % (rel, e))
             return
         except OSError as e:
-            problems.append("%s: unreadable (%s)" % (rel, e.strerror or e))
+            tree.problems.append("%s: unreadable (%s)" % (rel, e.strerror or e))
             return
         if info is not None:
-            records[rel] = info
+            tree.records[rel] = info
 
     if os.path.isfile(root) and not os.path.islink(root):
         one(root, os.path.basename(root))
-        return records, links, files, problems, {}
+        tree.finish()
+        return tree
 
     def onerror(e):
-        problems.append("%s: unreadable directory (%s)" % (rel_of(e.filename) if e.filename else root, e.strerror or e))
+        tree.problems.append("%s: unreadable directory (%s)" % (rel_of(e.filename) if e.filename else root, e.strerror or e))
 
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=onerror):
+        if rel_of(dirpath):
+            tree.dirs.add(rel_of(dirpath))
         for name in sorted(filenames):
             full = os.path.join(dirpath, name)
             one(full, rel_of(full))
         for d in sorted(dirnames):
             full = os.path.join(dirpath, d)
             if os.path.islink(full):
-                links[rel_of(full)] = os.readlink(full)
-    return records, links, files, problems, {}
-
-
-def _arc_rel(name):
-    return name[2:] if name.startswith("./") else name
+                tree.add_link(rel_of(full), os.readlink(full))
+    tree.finish()
+    return tree
 
 
 def scan_tar(path, target_arch, out):
-    """ONE streaming pass in archive order (CA1). → (records, links, files, problems, hardlinks): hardlinks
-    {rel: stored link name} — every one is judged as the updater's extractor treats it (RULINGS DI2)."""
-    records, links, files, problems, hardlinks = {}, {}, set(), [], {}
+    """ONE streaming pass in archive order (CA1) → Tree. Every name is brought to the normal form as it is met
+    (DL1 (1)); a hard-link member is recorded with its stored link name (DL1 (3))."""
+    tree = Tree()
     raw = CountingFile(path)
     members = 0
     try:
         with tarfile.open(fileobj=raw, mode="r|*") as tar:
             for m in tar:
                 members += 1
-                rel = _arc_rel(m.name)
+                p = name_problem(m.name, "member name")
+                if m.islnk() and not p:
+                    p = name_problem(m.linkname, "hard-link name")
+                if p:
+                    tree.problems.append("%s: not measurable — %s" % (m.name, p))
+                    continue
+                rel = normal(m.name)
                 if m.islnk():
-                    hardlinks[rel] = m.linkname
+                    tree.hardlinks[rel] = m.linkname
+                    continue
+                if m.isdir():
+                    tree.dirs.add(rel)
                     continue
                 if m.issym():
-                    links[rel] = m.linkname
+                    tree.add_link(rel, m.linkname)
                     continue
                 if not m.isfile():
                     continue
-                files.add(rel)
+                tree.files.add(rel)
                 fobj = tar.extractfile(m)
                 try:
                     info = inspect(ForwardReader(fobj).read, m.size, target_arch)
                 except Unjudgeable as e:
-                    problems.append("%s: %s" % (rel, e))
+                    tree.problems.append("%s: %s" % (rel, e))
                     continue
                 if info is not None:
-                    records[rel] = info
+                    tree.records[rel] = info
         while raw.read(1 << 16):        # the end-of-archive padding / gzip trailer: count it, still one pass
             pass
     finally:
         raw.close()
     out.append("  archive read in one pass: %d members, %d of %d compressed bytes"
                % (members, raw.read_bytes, os.path.getsize(path)))
-    return records, links, files, problems, hardlinks
+    tree.finish()
+    return tree
 
 
-def _components(path):
-    return [c for c in path.split("/") if c not in ("", ".")]
-
-
-def _realpath(path, links, hardlinks, memo, active):
-    """PATH (relative to the root of the tree) resolved component by component as the file system does after
-    extraction → (components | None, why). A component that is a symbolic-link member is replaced by its target,
-    relative to the link's directory; `..` climbs one level; each link is resolved once (MEMO) and a link met again
-    while its own resolution is still under way (ACTIVE) is a real loop (RULINGS DI3, DI4)."""
-    done = []
-    for c in _components(path):
+def resolve(rel, tree):
+    """RULINGS DL1 (2) — REL resolved the way the kernel resolves a path, ITERATIVELY → (resolved key | None, why):
+    component by component; a component that is a symbolic-link member is replaced by its target (relative to the
+    link's directory); every INTERMEDIATE component must be a directory of the archive (or a link to one); `..`
+    steps to the real parent; at most MAXSYMLINKS link expansions in total; a revisit of the same link with the
+    same remaining path is a loop. A hard link anywhere on the way is DL1 (3)."""
+    pending = rel.split("/") if rel else []
+    done, expansions, seen = [], 0, set()
+    while pending:
+        c = pending.pop(0)
         if c == "..":
             if not done:
-                return None, "unsafe link: it climbs above the root of the tree"
+                return None, "outside the archive: `..` climbs above its root"
             done.pop()
             continue
         cand = "/".join(done + [c])
-        if cand in hardlinks:
-            return None, "through %s, which %s" % (cand, HARD_LINK_WHY % hardlinks[cand])
-        if cand in links:
-            if cand not in memo:
-                if cand in active:
-                    return None, "link loop"
-                target = links[cand]
-                if target.startswith("/"):
-                    memo[cand] = (None, "absolute link outside the tree")
-                else:
-                    active.add(cand)
-                    memo[cand] = _realpath("/".join(done + [target]), links, hardlinks, memo, active)
-                    active.discard(cand)
-            res = memo[cand]
-            if res[0] is None:
-                return res
-            done = list(res[0])
+        if cand in tree.hardlinks:
+            return None, HARD_LINK_WHY % (cand, tree.hardlinks[cand])
+        if cand in tree.links:
+            if cand in tree.absolute:
+                return None, "absolute link target (not measurable — named below)"
+            expansions += 1
+            if expansions > MAXSYMLINKS:
+                return None, ("too many links: more than %d link expansions (the platform's MAXSYMLINKS) — the "
+                              "kernel would not resolve it" % MAXSYMLINKS)
+            state = (cand, tuple(pending))
+            if state in seen:
+                return None, "link loop (%s is met again with the same remaining path)" % cand
+            seen.add(state)
+            target = tree.links[cand]
+            pending = (target.split("/") if target else []) + pending
             continue
+        if pending:
+            if cand in tree.dirs:
+                done.append(c)
+                continue
+            if cand in tree.files:
+                return None, "not a directory: %s is a file" % cand
+            return None, "missing component: %s" % cand
         done.append(c)
-    return done, ""
-
-
-def _resolve(rel, links, records, files, hardlinks=None, memo=None):
-    """Follow links inside the tree → (resolved rel | None, why)."""
-    hardlinks = hardlinks or {}
-    memo = {} if memo is None else memo
-    if rel in hardlinks:
-        return None, HARD_LINK_WHY % hardlinks[rel]
-    try:
-        comps, why = _realpath(rel, links, hardlinks, memo, set())
-    except RecursionError:
-        return None, "cannot judge: the link chain is too deep to follow"
-    if comps is None:
-        return None, why
-    final = "/".join(comps)
-    if final in records:
+    final = "/".join(done)
+    if final in tree.records:
         return final, ""
-    if final in files:
+    if final in tree.files:
         return None, "not a Mach-O file"
-    return None, ("missing" if final == "/".join(_components(rel)) else "dangling link")
+    if final in tree.dirs:
+        return None, "a directory, not a Mach-O file"
+    return None, "dangling link: no member %s" % final if final != rel else "missing"
 
 
 def check_one(path, target_arch, requires, quiet, out):
+    """RULINGS DL1 (4): the checker's own failure — recursion, memory, any unexpected exception — is exit 2."""
+    head = len(out)
+    try:
+        return _check_one(path, target_arch, requires, quiet, out)
+    except Exception as e:                                    # noqa: BLE001 — never dressed as a FAIL (1)
+        del out[head:]
+        out.append("== %s" % path.rstrip("/"))
+        out.append("CANNOT JUDGE: the checker itself failed (%s: %s) — not measurable" % (type(e).__name__, e))
+        return EXIT_UNJUDGEABLE
+
+
+def _check_one(path, target_arch, requires, quiet, out):
     label = path.rstrip("/")
     head = len(out)
     out.append("== %s" % label)
     is_tar = os.path.isfile(path) and (path.endswith((".tar.gz", ".tgz", ".tar")) or tarfile.is_tarfile(path))
     try:
-        if is_tar:
-            records, links, files, problems, hardlinks = scan_tar(path, target_arch, out)
-        else:
-            records, links, files, problems, hardlinks = scan_dir(path, target_arch)
+        tree = scan_tar(path, target_arch, out) if is_tar else scan_dir(path, target_arch)
     except (tarfile.TarError, OSError, EOFError, zlib.error) as e:
         out.append("CANNOT JUDGE: %s unreadable (%s)" % (path, e))
         return EXIT_UNJUDGEABLE
+    records, links, files, problems, hardlinks = tree.records, tree.links, tree.files, tree.problems, tree.hardlinks
     counts = {}
     failures = []
     for rel in sorted(records):
@@ -457,24 +527,23 @@ def check_one(path, target_arch, requires, quiet, out):
         for msg in info.get("mismatch", ()):
             failures.append("%s: %s — a loader picks the slice by the table and then loads what the slice holds "
                             "(RULINGS DB4)" % (rel, msg))
-    for rel in sorted(hardlinks):                     # RULINGS DI2: the updater cannot extract a hard-link member
-        failures.append("%s: %s" % (rel, HARD_LINK_WHY % hardlinks[rel]))
-    memo = {}
+    for rel in sorted(hardlinks):                     # RULINGS DL1 (3): every hard-link member fails
+        failures.append(HARD_LINK_WHY % (rel, hardlinks[rel]))
     entries = []
     for rel in sorted(set([r for r in records if is_entry(r)] + [r for r in links if is_entry(r)]
                           + [r for r in hardlinks if is_entry(r)])):
-        real, _ = _resolve(rel, links, records, files, hardlinks, memo)
+        real, _ = resolve(rel, tree)
         entries.append((rel, real, records.get(real)))
     for req in requires:
-        req = req.strip("/")
+        req = normal(req)
         hits = sorted(r for r in set(records) | set(links) | files | set(hardlinks) if r == req or r.endswith("/" + req))
         if not hits:
             failures.append("required entry point %s: missing" % req)
             continue
         for r in hits:
             if r in hardlinks:
-                continue                              # named above: the archive cannot be extracted as packed
-            real, why = _resolve(r, links, records, files, hardlinks, memo)
+                continue                              # named above (DL1 (3))
+            real, why = resolve(r, tree)
             if real is None:
                 failures.append("required entry point %s: %s" % (r, why))
             elif not records[real]["ok"]:
@@ -499,7 +568,7 @@ def check_one(path, target_arch, requires, quiet, out):
         out.append("  entry points (minimum macOS):")
         for rel, real, info in entries:
             shown = rel if real in (None, rel) else "%s -> %s" % (rel, posixpath.basename(real))
-            archs = "+".join(info["archs"]) if info else ("(tar hard link)" if rel in hardlinks else "(not a Mach-O file)")
+            archs = "+".join(info["archs"]) if info else ("(tar hard link)" if rel in tree.hardlinks else "(not a Mach-O file)")
             out.append("    %-60s %-14s min %s" % (shown, archs, (info or {}).get("minos") or "?"))
     if plist_min is not None and not quiet:
         out.append("  Info.plist LSMinimumSystemVersion = %s" % plist_min)
