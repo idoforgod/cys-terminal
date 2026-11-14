@@ -97,8 +97,9 @@ def ustar_archive(path, fmt=tarfile.USTAR_FORMAT):
     bsdtar_shape(path)
 
 
-def raw_header(name, kind=b"0", size=0, link=b"", size_field=None):
-    """One POSIX ustar header in the measured form (size: eleven octal digits and a space)."""
+def raw_header(name, kind=b"0", size=0, link=b"", size_field=None, magic=b"ustar\x0000", checksum_form=b"%06o\0 "):
+    """One POSIX ustar header in the measured form (size: eleven octal digits and a space; checksum: six digits,
+    NUL, space) — SIZE_FIELD / MAGIC / CHECKSUM_FORM let a control plant one deviation."""
     h = bytearray(512)
     h[0:len(name)] = name
     h[100:108], h[108:116], h[116:124] = b"0000755\0", b"0000000\0", b"0000000\0"
@@ -106,9 +107,9 @@ def raw_header(name, kind=b"0", size=0, link=b"", size_field=None):
     h[136:148] = b"00000000000 "
     h[156:157] = kind
     h[157:157 + len(link)] = link
-    h[257:265] = b"ustar\x0000"
+    h[257:265] = magic
     h[148:156] = b" " * 8
-    h[148:156] = b"%06o\0 " % sum(h)
+    h[148:156] = checksum_form % sum(h)
     return bytes(h)
 
 
@@ -973,6 +974,54 @@ class Gate(unittest.TestCase):
         rc, out = self.raw_gate(None, gz=good, name="plain.tar.gz")
         self.assertEqual(rc, 2, out)
         self.assertIn("it is not a gzip file", out)
+        self.assertNotIn("truncated", out)                         # nothing unmeasured is called truncated
+
+    def test_a_zero_block_ends_the_archive(self):
+        # ET1, codex's case (an honest storage / copy fault): a size-0 directory header zero-filled, members behind it
+        # — tarfile stops there, so they would go unchecked; the END is two zero blocks and nothing after
+        zeroed = b"\0" * 512                                       # was raw_header(b"cys.app/Contents/Resources/x/", b"5")
+        rc, out = self.raw_gate(self.raw_app(zeroed, raw_member(b"cys.app/Contents/Resources/x/arm", thin(ARM64))))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("a zero block is followed by further records", out)
+        self.assertNotIn("RESULT: PASS", out)
+
+    def first_reason(self, out):
+        m = re.search(r"the archive is not in the plain shape \(RULINGS DU1\) — (.*)", out)
+        self.assertIsNotNone(m, out)
+        return m.group(1)
+
+    def test_every_refusal_condition_has_its_own_control_and_names_the_true_cause(self):
+        # ET2: one deviation each, and the FIRST reason named is that deviation
+        app = self.raw_app
+        hdr = raw_header
+        cases = (
+            ("checksum field form", app(hdr(b"cys.app/Contents/Resources/c1", checksum_form=b"%07o\0")),
+             None, "its checksum field"),
+            ("checksum mismatch", None, None, "its header checksum does not match"),
+            ("size field form", app(hdr(b"cys.app/Contents/Resources/c3", size_field=b"00000000000\0")),
+             None, "its size field b'00000000000\\x00' is not eleven octal digits and a space"),
+            ("non-regular size", app(hdr(b"cys.app/Contents/Resources/c4", b"2", 512, link=b"x") + b"\0" * 512),
+             None, "a '2' record with size 512"),
+            ("unknown kind", app(hdr(b"cys.app/Contents/Resources/c5", b"Z")), None, "its record kind 'Z' is not in"),
+            ("PAX header", app(hdr(b"PaxHeader/c6", b"x", 20) + b"20 path=cys.app/c6\n".ljust(512, b"\0")),
+             None, "PAX local extended header"),
+            ("GNU magic", app(hdr(b"cys.app/Contents/Resources/c7", magic=b"ustar  \0")), None, "is not POSIX ustar"),
+            ("truncated", app()[:-1024], None, "it is truncated"),
+            ("after the end", app() + b"\0" * 512, None, "512 bytes follow the end-of-archive blocks"),
+            ("zero block then records", app(b"\0" * 512, hdr(b"cys.app/Contents/Resources/c10", b"5")), None,
+             "a zero block is followed by further records"),
+            ("not gzip", None, app(), "it is not a gzip file"),
+            ("gzip truncated", None, gzip.compress(app(), mtime=0)[:-40], "the gzip stream ends before its end"),
+            ("two gzip members", None, gzip.compress(app(), mtime=0) + gzip.compress(b"\0" * 1024, mtime=0),
+             "bytes follow the gzip member"))
+        for label, tar_bytes, gz, expect in cases:
+            if label == "checksum mismatch":
+                flipped = bytearray(app())
+                flipped[512 * 3 + 10] ^= 1
+                tar_bytes = bytes(flipped)
+            rc, out = self.raw_gate(tar_bytes, gz=gz)
+            self.assertEqual(rc, 2, label + "\n" + out)
+            self.assertIn(expect, self.first_reason(out), label + "\n" + out)
 
     def test_absolute_names_dotdot_and_odd_components_in_member_names_are_not_measurable(self):
         for name in ("cys.app/../evil", "/abs/evil", "cys.app//evil", "cys.app/./evil"):
