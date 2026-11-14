@@ -896,6 +896,39 @@ fn verdict_is_bound_to_the_inputs_tested() {
     cleanup(&root);
 }
 
+/// RULINGS CZ6: a live difference in the first pass whose repeat runs out of time is NOT "not written
+/// again" — the screen refuses (and says it could not measure). The old code dropped the repeat's
+/// out-of-time flag and accepted with a note.
+#[test]
+fn incomplete_repeat_is_a_failure() {
+    let root = test_root("cz6");
+    let lane = lane_of(&root, &[]);
+    let cand = candidate_of(&root, &[]);
+    let mut c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-1"]), false);
+    let deadline = Duration::from_secs(8);
+    let t0 = std::time::Instant::now();
+    let lib = lane.join("hooks/_lib.sh");
+    c.between_snapshots = Some(Arc::new(move |pass| {
+        if pass == 1 {
+            // a write to a live listed file during the first pass
+            let mut t = std::fs::read_to_string(&lib).unwrap();
+            t.push_str("\n# written during the first pass\n");
+            std::fs::write(&lib, t).unwrap();
+        } else {
+            // the repeat gets no time
+            let end = t0 + deadline + Duration::from_millis(300);
+            std::thread::sleep(end.saturating_duration_since(std::time::Instant::now()));
+        }
+    }));
+    let mut rep = screen_with(&c, &cand, &lane, deadline).unwrap();
+    assert!(!rep.after_run.first.is_empty(), "{:?}", rep.after_run);
+    assert!(rep.after_run.repeat_incomplete, "{:?}", rep.after_run);
+    judge_after_run(&mut rep, &|_| false);
+    assert_eq!(rep.verdict, ScreenVerdict::Refused, "{:?}", rep.refusals);
+    assert!(!rep.not_measurable.is_empty());
+    cleanup(&root);
+}
+
 /// I4: a candidate guard.sh whose backstop region differs from the released copy → REFUSED; a
 /// candidate whose region anchor is gone → REFUSED; a lane whose own copy differs and a candidate
 /// that does not touch guard.sh → a lane finding (BA4).
