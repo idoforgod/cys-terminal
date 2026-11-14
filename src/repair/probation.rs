@@ -395,7 +395,8 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
         // modification time never decides anything — so the reconstructed row is written CLOSED 대체됨:
         // nothing is re-checked or put back against a generation nobody can confirm
         if row.is_none() {
-            let gen = apply::pack_generation(env.op.pack);
+            // EJ1 / EN3: a reconstructed row's generation is UNKNOWN (written as "")
+            let (gen_version, gen_pro) = apply::Bound::Unknown.row_fields();
             let confirmed = false;
             let new_row = LaneRecord {
                 schema: super::REPAIR_SCHEMA,
@@ -403,8 +404,8 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
                 lane: lane.clone(),
                 state: super::types::LaneState::Verified,
                 probation: Some(ledger::Probation {
-                    pack_generation: gen.version,
-                    pro_revision: gen.pro_revision,
+                    pack_generation: gen_version,
+                    pro_revision: gen_pro,
                     applied_at: env.op.now,
                     expected: rec.committed.clone(),
                     closed: (!confirmed).then(|| "대체됨 — 기록에 확정 때의 팩 세대가 없어 시험 기간을 다시 열지 않습니다(워커 검토)".to_string()),
@@ -748,13 +749,11 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, repor
     };
     let id = &rec.id;
     // the binding: this lane, the pack generation, the expected live states
-    let gen = apply::pack_generation(env.op.pack);
-    let bound = PackGeneration {
-        version: p.pack_generation.clone(),
-        pro_revision: p.pro_revision,
-    };
-    if gen != bound {
-        let why = format!("팩 세대가 바뀌었습니다({} → {}) — 아무것도 되돌리지 않습니다(새 버전 우선)", bound.version, gen.version);
+    if !apply::Bound::from_row(p).equals_now(env.op.pack) {
+        let why = format!(
+            "팩 세대가 적용 때와 다르거나 알 수 없습니다(지금 {}) — 아무것도 되돌리지 않습니다(새 버전 우선)",
+            apply::pack_generation(env.op.pack).version
+        );
         close_row(env, id, &format!("대체됨 — {why}"), &[], Some(RepairState::Superseded))?;
         report.superseded.push(id.clone());
         report.lines.push(format!("{}: {why}", id.as_str()));
@@ -1033,6 +1032,7 @@ fn m10_sweep_with(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
     // DR6: the operations whose finding is recorded in this sweep — acknowledged write-once next to
     // the operation's own record AFTER the findings are saved
     let mut to_ack: Vec<String> = Vec::new();
+    let mut ledger_unreadable: Option<(String, Vec<String>)> = None;
     // CT9: a put-back's finding survives a crash between the exchange and the findings write — it is
     // rebuilt idempotently from the completed operation records of the M10 sub-ledger
     let sub_root = m10_root_in(root, lane);
@@ -1080,7 +1080,7 @@ fn m10_sweep_with(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
         // CT5: the binding is taken at sampling — the pack generation FIRST, then the live state and
         // the source of the right bytes; it is revalidated under the pack-apply lock right before a
         // put-back (any change → no put-back in this tick)
-        let bound_gen = apply::pack_generation(pack);
+        let bound = apply::Bound::now(pack);
         let live = pack.join(rel);
         let Ok(m) = std::fs::symlink_metadata(&live) else {
             continue; // absent: not a changed file (the heal paths own a missing file)
@@ -1146,6 +1146,12 @@ fn m10_sweep_with(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
             if std::fs::read(holder).ok().as_deref() == Some(bytes.as_slice()) {
                 continue;
             }
+        }
+        // EN4: an unreadable ledger member suspends every put-back of this lane — the file is listed in
+        // ONE finding for the cause (written at the end of the sweep), nothing per file
+        if let apply::ApprovedCopy::LedgerUnreadable { cause } = &approved {
+            ledger_unreadable.get_or_insert_with(|| (cause.clone(), Vec::new())).1.push(rel.to_string());
+            continue;
         }
         let approval_unknown = match &approved {
             apply::ApprovedCopy::Unknown(why) => Some(why.clone()),
@@ -1246,7 +1252,7 @@ fn m10_sweep_with(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
         // the put-back content: the approved copy of the current generation, else our original of it
         let target: Option<(Vec<u8>, u32)> = match &approved {
             apply::ApprovedCopy::Approved { state: TargetState::File { mode, .. }, holder, .. } => std::fs::read(holder).ok().map(|b| (b, *mode)),
-            apply::ApprovedCopy::Approved { .. } | apply::ApprovedCopy::Unknown(_) => None,
+            apply::ApprovedCopy::Approved { .. } | apply::ApprovedCopy::Unknown(_) | apply::ApprovedCopy::LedgerUnreadable { .. } => None,
             apply::ApprovedCopy::NoApproval => original.clone().map(|o| (o, live_mode)),
         };
         let Some((orig, mode)) = target else {
@@ -1288,11 +1294,11 @@ fn m10_sweep_with(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
             expected: sampled_live.clone(),
             incoming: TargetState::File { sha256: source_sha.clone(), mode },
             source: Some(src_file.clone()),
-            generation: Some(bound_gen.clone()),
+            bound: bound.clone(),
         };
         let r = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || -> Result<Option<apply::OpDone>, RepairError> {
             // CT5: THE binding, revalidated under the lock — generation, live state, source of the bytes
-            if apply::pack_generation(pack) != bound_gen {
+            if !bound.equals_now(pack) {
                 return Ok(None);
             }
             if TargetState::read(&live)? != sampled_live {
@@ -1300,7 +1306,7 @@ fn m10_sweep_with(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
             }
             let source_now: Option<String> = match apply::resolve_approved_copy_in(root, pack, lane, rel) {
                 apply::ApprovedCopy::Approved { state: TargetState::File { .. }, holder, .. } => std::fs::read(&holder).ok().map(|b| sha_hex(&b)),
-                apply::ApprovedCopy::Approved { .. } | apply::ApprovedCopy::Unknown(_) => None,
+                apply::ApprovedCopy::Approved { .. } | apply::ApprovedCopy::Unknown(_) | apply::ApprovedCopy::LedgerUnreadable { .. } => None,
                 apply::ApprovedCopy::NoApproval => (env.original)(rel).map(|o| sha_hex(&o)),
             };
             if source_now.as_deref() != Some(source_sha.as_str()) {
@@ -1352,6 +1358,26 @@ fn m10_sweep_with(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
     for f in new_findings.iter_mut() {
         finalize_finding(f, pack);
     }
+    // EN4: ONE finding for the CAUSE of a suspended scan (the unreadable record, the files inside it)
+    if let Some((cause, rels)) = ledger_unreadable {
+        let key = sha_hex(cause.as_bytes());
+        if !existing.iter().chain(new_findings.iter()).any(|f| f.kind == "ledger-unreadable" && f.sha256 == key) {
+            new_findings.push(Finding {
+                rel: cause.clone(),
+                sha256: key,
+                kind: "ledger-unreadable".into(),
+                at: env.op.now,
+                notice: true,
+                notified: false,
+                slot: None,
+                kept_copy: None,
+                note: format!(
+                    "장부의 {cause} 을(를) 읽을 수 없어 이 부서의 한 시간마다 되돌리기를 멈췄습니다(워커가 그 기록을 고칠 때까지) — 해당 파일: {}",
+                    rels.join(", ")
+                ),
+            });
+        }
+    }
     if !new_findings.is_empty() {
         existing.extend(new_findings.iter().cloned());
         save_findings(root, lane, &existing)?;
@@ -1379,8 +1405,7 @@ fn m10_ack_path(sub_root: &Path, op: &str) -> PathBuf {
 /// the pack's generation is this binary's own (version = this build's version, free channel) —
 /// otherwise unknown (never an older or foreign generation's bytes).
 pub fn embedded_original_for(pack: &Path, rel: &str) -> Option<Vec<u8>> {
-    let gen = apply::pack_generation(pack);
-    if gen.version != env!("CARGO_PKG_VERSION") || gen.pro_revision.is_some() {
+    if !apply::Bound::now(pack).is_release(env!("CARGO_PKG_VERSION")) {
         return None;
     }
     crate::pack::PACK

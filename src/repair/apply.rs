@@ -134,8 +134,9 @@ pub struct OpSpec {
     pub incoming: TargetState,
     /// The file holding the incoming bytes (a `File` incoming state).
     pub source: Option<PathBuf>,
-    /// The pack generation the operation is bound to (`None` = the current one at step 0).
-    pub generation: Option<PackGeneration>,
+    /// The generation this operation is bound to (EJ1: required — Known or Unknown; Unknown places
+    /// nothing).
+    pub bound: Bound,
 }
 
 /// The result of one operation.
@@ -171,6 +172,90 @@ pub fn pack_generation(pack: &Path) -> PackGeneration {
     PackGeneration {
         version,
         pro_revision,
+    }
+}
+
+/// RULINGS EJ1 / EN3 — the BOUND generation of an operation: `Known`, or `Unknown`, which equals
+/// nothing. It is created ONCE, at the operation's birth (its first durable record — the apply
+/// intent, the revert intent from the lane row, the scan's sampling written into its operation
+/// record), and carried from there to every nested operation; nobody substitutes "current" or
+/// "none".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Bound {
+    Known(PackGeneration),
+    Unknown,
+}
+
+impl Bound {
+    /// THE one reading of a generation value (EN3): the empty string and the literal `unknown` are
+    /// Unknown; nothing else in the repair module compares the raw string.
+    pub fn of(g: Option<PackGeneration>) -> Bound {
+        match g {
+            Some(g) if !g.version.is_empty() && g.version != "unknown" => Bound::Known(g),
+            _ => Bound::Unknown,
+        }
+    }
+    /// THE one reading of a lane row's probation generation (EN3; a reconstructed row holds "").
+    pub fn from_row(p: &ledger::Probation) -> Bound {
+        Bound::of(Some(PackGeneration { version: p.pack_generation.clone(), pro_revision: p.pro_revision }))
+    }
+    /// The pack's generation read at this moment.
+    pub fn now(pack: &Path) -> Bound {
+        Bound::of(Some(pack_generation(pack)))
+    }
+    /// Known AND equal to the pack's generation read now (Unknown equals nothing).
+    pub fn equals_now(&self, pack: &Path) -> bool {
+        matches!((self, Bound::now(pack)), (Bound::Known(a), Bound::Known(b)) if *a == b)
+    }
+    pub fn known(&self) -> Option<PackGeneration> {
+        match self {
+            Bound::Known(g) => Some(g.clone()),
+            Bound::Unknown => None,
+        }
+    }
+    /// Whether this is the free-channel generation of release `version` (the binary's own).
+    pub fn is_release(&self, version: &str) -> bool {
+        matches!(self, Bound::Known(g) if g.pro_revision.is_none() && g.version == version)
+    }
+    /// The two probation fields a lane row stores for this binding (Unknown → "" — EN3).
+    pub fn row_fields(&self) -> (String, Option<u64>) {
+        match self {
+            Bound::Known(g) => (g.version.clone(), g.pro_revision),
+            Bound::Unknown => (String::new(), None),
+        }
+    }
+}
+
+/// The acts of THE door (EJ1).
+#[derive(Debug, Clone, Copy)]
+enum DoorAct<'a> {
+    /// `renamex_np(RENAME_SWAP)` of the live entry with a slot payload.
+    Exchange { payload: &'a Path },
+    /// A no-replace placement of a non-slot copy at the (absent) live path.
+    Place { copy: &'a Path },
+    /// The live entry moved into a fresh slot payload (no replace).
+    MoveOut { into: &'a Path },
+    /// The missing live parent folders of a placement.
+    MakeParents,
+}
+
+/// RULINGS EJ1 — THE door into a live pack path: every rename, exchange, placement or folder
+/// creation at a live path of the repair module happens here (pinned by
+/// `live_writes_go_through_the_one_door`). It reads the pack's generation AT THIS MOMENT and acts
+/// only when the operation's bound generation is Known and equal; otherwise `Superseded`, nothing
+/// touched.
+fn door(env: &OpEnv<'_>, bound: &Bound, live: &Path, act: DoorAct<'_>) -> Result<(), RepairError> {
+    if !bound.equals_now(env.pack) {
+        return Err(RepairError::Superseded(format!(
+            "{}: 팩 세대가 이 동작이 묶인 세대와 다르거나 알 수 없어 살아 있는 자리를 바꾸지 않았습니다",
+            live.display()
+        )));
+    }
+    match act {
+        DoorAct::Exchange { payload } => exchange(live, payload),
+        DoorAct::Place { copy } => place_no_replace(copy, live),
+        DoorAct::MoveOut { into } => place_no_replace(live, into),
+        DoorAct::MakeParents => std::fs::create_dir_all(live).map_err(|e| RepairError::Io(format!("{}: {e}", live.display()))),
     }
 }
 
@@ -342,6 +427,21 @@ fn new_record(env: &OpEnv<'_>, spec: &OpSpec, op: &str, form: &str, gen: &PackGe
     }
 }
 
+/// The door refused an act: a generation mismatch / an occupied place → `superseded`, anything
+/// else → `declined`; the operation's record is closed with it (nothing was touched).
+fn door_refused(env: &OpEnv<'_>, rec: &mut OpRecord, spec: &OpSpec, e: RepairError) -> Result<OpDone, RepairError> {
+    match e {
+        RepairError::Superseded(m) => {
+            wal::finish(env.root, rec, "superseded", &m, env.now)?;
+            Ok(done(ApplyOutcome::Superseded(m), Some(rec)))
+        }
+        e => {
+            wal::finish(env.root, rec, "declined", &format!("{e:?}"), env.now)?;
+            Ok(done(ApplyOutcome::Declined(format!("{}: {e:?}", spec.rel)), Some(rec)))
+        }
+    }
+}
+
 fn same_entry(a: &Identity, b: &(String, u64)) -> bool {
     a.volume_uuid == b.0 && a.inode == b.1
 }
@@ -359,9 +459,13 @@ fn run_op_depth(env: &OpEnv<'_>, spec: &OpSpec, depth: u8) -> Result<OpDone, Rep
         .parent()
         .ok_or_else(|| RepairError::Precondition(format!("{}: 부모 폴더가 없습니다", spec.rel)))?
         .to_path_buf();
-    if spec.expected == TargetState::Absent && spec.incoming != TargetState::Absent {
-        std::fs::create_dir_all(&parent)
-            .map_err(|e| RepairError::Io(format!("{}: {e}", parent.display())))?;
+    if spec.expected == TargetState::Absent && spec.incoming != TargetState::Absent && std::fs::symlink_metadata(&parent).is_err() {
+        if let Err(e) = door(env, &spec.bound, &parent, DoorAct::MakeParents) {
+            return match e {
+                RepairError::Superseded(m) => Ok(done(ApplyOutcome::Superseded(m), None)),
+                e => Err(e),
+            };
+        }
     }
     // step 0 — same filesystem (the repair's vault folder vs the live PARENT, real device ids)
     let vault_dir = vault::vault_dir_in(env.root, &spec.id);
@@ -394,18 +498,17 @@ fn run_op_depth(env: &OpEnv<'_>, spec: &OpSpec, depth: u8) -> Result<OpDone, Rep
             None,
         ));
     }
-    let gen = pack_generation(env.pack);
-    if let Some(bound) = &spec.generation {
-        if *bound != gen {
-            return Ok(done(
-                ApplyOutcome::Superseded(format!(
-                    "{}: 팩 세대가 바뀌었습니다({} → {}) — 옛 세대의 바이트는 되살리지 않습니다",
-                    spec.rel, bound.version, gen.version
-                )),
-                None,
-            ));
-        }
-    }
+    // EJ1: the bound generation must be Known and the pack's now (Unknown equals nothing)
+    let Some(gen) = spec.bound.known().filter(|_| spec.bound.equals_now(env.pack)) else {
+        return Ok(done(
+            ApplyOutcome::Superseded(format!(
+                "{}: 팩 세대가 이 동작이 묶인 세대와 다르거나 알 수 없습니다(지금 {}) — 옛 세대의 바이트는 되살리지 않습니다",
+                spec.rel,
+                pack_generation(env.pack).version
+            )),
+            None,
+        ));
+    };
     if spec.incoming == spec.expected {
         return Ok(done(ApplyOutcome::Applied, None));
     }
@@ -482,9 +585,8 @@ fn op_exchange(
         return Err(stop(Point::AfterRecord));
     }
     // step 3: the exchange; the seal is the very next filesystem operation (M2)
-    if let Err(e) = exchange(live, &slot.payload()) {
-        wal::finish(env.root, &mut rec, "declined", &format!("{e:?}"), env.now)?;
-        return Ok(done(ApplyOutcome::Declined(format!("{}: {e:?}", spec.rel)), Some(&rec)));
+    if let Err(e) = door(env, &spec.bound, live, DoorAct::Exchange { payload: &slot.payload() }) {
+        return door_refused(env, &mut rec, spec, e);
     }
     seal_now(env, &slot, live)?;
     after_seal_exchange(env, spec, &mut rec, &slot, live, depth)
@@ -521,8 +623,7 @@ fn step4(
     deposit: &TargetState,
     depth: u8,
 ) -> Result<OpDone, RepairError> {
-    let gen_after = pack_generation(env.pack);
-    let gen_ok = rec.pack_generation.as_ref() == Some(&gen_after);
+    let gen_ok = Bound::of(rec.pack_generation.clone()).equals_now(env.pack);
     let expected = parse_canon(&rec.expected).unwrap_or(TargetState::Absent);
     if *deposit == expected && gen_ok {
         // CT3 — the outcome reported is the outcome measured: what is NOW live must be the state
@@ -550,7 +651,7 @@ fn step4(
                     expected: live_now,
                     incoming: deposit.clone(),
                     source: Some(holder),
-                    generation: None,
+                    bound: Bound::of(rec.pack_generation.clone()),
                 };
                 let r = run_op_depth(env, &back, depth + 1)?;
                 if r.outcome == ApplyOutcome::Applied {
@@ -612,7 +713,7 @@ fn step4(
                 expected: TargetState::read(live)?,
                 incoming: deposit.clone(),
                 source: Some(holder),
-                generation: None,
+                bound: Bound::of(rec.pack_generation.clone()),
             };
             let r = run_op_depth(env, &relive, depth + 1)?;
             if r.outcome == ApplyOutcome::Applied {
@@ -675,9 +776,8 @@ fn op_move_in(
     if env.faults.at(Point::AfterRecord, live, Some(&slot)) {
         return Err(stop(Point::AfterRecord));
     }
-    if let Err(e) = place_no_replace(live, &slot.payload()) {
-        wal::finish(env.root, &mut rec, "declined", &format!("{e:?}"), env.now)?;
-        return Ok(done(ApplyOutcome::Declined(format!("{}: {e:?}", spec.rel)), Some(&rec)));
+    if let Err(e) = door(env, &spec.bound, live, DoorAct::MoveOut { into: &slot.payload() }) {
+        return door_refused(env, &mut rec, spec, e);
     }
     seal_now(env, &slot, live)?;
     after_seal_move_in(env, spec, &mut rec, &slot, live, depth)
@@ -698,7 +798,7 @@ fn after_seal_move_in(
         return Err(stop(Point::AfterSeal));
     }
     let expected = parse_canon(&rec.expected).unwrap_or(TargetState::Absent);
-    let gen_ok = rec.pack_generation.as_ref() == Some(&pack_generation(env.pack));
+    let gen_ok = Bound::of(rec.pack_generation.clone()).equals_now(env.pack);
     if facts.sealed_state == expected && gen_ok {
         if env.faults.at(Point::BeforeDone, live, Some(slot)) {
             return Err(stop(Point::BeforeDone));
@@ -732,7 +832,7 @@ fn after_seal_move_in(
                 expected: TargetState::Absent,
                 incoming: facts.sealed_state.clone(),
                 source: Some(holder),
-                generation: None,
+                bound: Bound::of(rec.pack_generation.clone()),
             };
             let r = run_op_depth(env, &relive, depth + 1)?;
             if r.outcome == ApplyOutcome::Applied {
@@ -779,7 +879,7 @@ fn verify_placed(
             expected: live_now,
             incoming: previous.0,
             source: previous.1,
-            generation: None,
+            bound: Bound::of(rec.pack_generation.clone()),
         };
         let r = run_op_depth(env, &back, depth + 1)?;
         if r.outcome == ApplyOutcome::Applied {
@@ -832,7 +932,7 @@ fn op_place(
     if env.faults.at(Point::AfterRecord, live, None) {
         return Err(stop(Point::AfterRecord));
     }
-    match place_no_replace(&copy, live) {
+    match door(env, &spec.bound, live, DoorAct::Place { copy: &copy }) {
         Ok(()) => {}
         Err(RepairError::Superseded(m)) => {
             drop_copy(&copy);
@@ -910,10 +1010,9 @@ fn op_deposit_first(
         return Err(stop(Point::AfterRecord));
     }
     // first move: the live file into the slot (a held file fails here → stop, delete nothing)
-    if let Err(e) = place_no_replace(live, &slot.payload()) {
+    if let Err(e) = door(env, &spec.bound, live, DoorAct::MoveOut { into: &slot.payload() }) {
         let _ = std::fs::remove_file(&copy);
-        wal::finish(env.root, &mut rec, "declined", &format!("{e:?}"), env.now)?;
-        return Ok(done(ApplyOutcome::Declined(format!("{}: {e:?}", spec.rel)), Some(&rec)));
+        return door_refused(env, &mut rec, spec, e);
     }
     seal_now(env, &slot, live)?;
     flush_parents(live, &slot)?;
@@ -935,7 +1034,7 @@ fn second_move(
     let rel = rec.rel.clone();
     let deposit = vault::deposit_of(slot).map(|(s, _)| s);
     let expected = parse_canon(&rec.expected).unwrap_or(TargetState::Absent);
-    let gen_ok = rec.pack_generation.as_ref() == Some(&pack_generation(env.pack));
+    let gen_ok = Bound::of(rec.pack_generation.clone()).equals_now(env.pack);
     let copy_ok = match (&rec.incoming_copy, &rec.incoming_copy_identity) {
         (Some(c), Some(want)) => identity_of(c).ok().as_ref() == Some(want),
         _ => false,
@@ -944,7 +1043,7 @@ fn second_move(
     if copy_ok && gen_ok && deposit_ok {
         // RESUME (OQ-D8): the staged copy still matches and the generation is unchanged
         let copy = rec.incoming_copy.clone().unwrap_or_default();
-        match place_no_replace(&copy, live) {
+        match door(env, &Bound::of(rec.pack_generation.clone()), live, DoorAct::Place { copy: &copy }) {
             Ok(()) => {
                 if let Some(p) = live.parent() {
                     super::durable::full_flush_dir(p)?;
@@ -1000,7 +1099,7 @@ fn second_move(
                 expected: TargetState::Absent,
                 incoming: st,
                 source: Some(holder),
-                generation: None,
+                bound: Bound::of(rec.pack_generation.clone()),
             };
             match run_op_depth(env, &back, 1) {
                 Ok(r) if r.outcome == ApplyOutcome::Applied => format!("{rel}: 끊긴 동작을 그만두고 보관한 바이트의 사본을 되놓았습니다"),
@@ -1029,7 +1128,7 @@ pub fn resume_op(env: &OpEnv<'_>, mut rec: OpRecord) -> Result<OpDone, RepairErr
         expected: parse_canon(&rec.expected).unwrap_or(TargetState::Absent),
         incoming: parse_canon(&rec.incoming).unwrap_or(TargetState::Absent),
         source: None,
-        generation: rec.pack_generation.clone(),
+        bound: Bound::of(rec.pack_generation.clone()),
     };
     let slot = rec.slot.as_ref().map(|d| Slot::at(d, &rec.rel));
     let live_entry = entry_identity(&live).ok();
@@ -1461,8 +1560,8 @@ fn recover_one_revert(
     hooks: &HookStepFn<'_>,
     locked: &RepairLock<'_>,
 ) -> Result<RevertReport, RepairError> {
-    if let Some(bound) = &ri.pack_generation {
-        if *bound != pack_generation(env.pack) {
+    {
+        if !Bound::of(ri.pack_generation.clone()).equals_now(env.pack) {
             let r = close_superseded(env, rec, "되돌리기 중에 끊긴 뒤 팩 세대가 바뀌었습니다 — 아무것도 더 되돌리지 않았습니다(새 버전 우선 · 워커 검토)", locked)?;
             ri.state = "superseded".into();
             ri.updated_at = env.now;
@@ -1488,7 +1587,7 @@ fn recover_one_revert(
                     expected: applied,
                     incoming: pre,
                     source: holder,
-                    generation: ri.pack_generation.clone(),
+                    bound: Bound::of(ri.pack_generation.clone()),
                 },
             )?
             .outcome
@@ -1569,10 +1668,7 @@ pub fn revert_in(
             rec.state.label_ko()
         )));
     }
-    let bound = row.probation.as_ref().map(|p| PackGeneration {
-        version: p.pack_generation.clone(),
-        pro_revision: p.pro_revision,
-    });
+    let bound = row.probation.as_ref().map(Bound::from_row).unwrap_or(Bound::Unknown);
     // step 0 for EVERY target before anything changes
     let mut plan: Vec<OpSpec> = Vec::new();
     for (rel, canon) in &row.applied {
@@ -1590,15 +1686,13 @@ pub fn revert_in(
                 locked,
             )?);
         }
-        if let Some(b) = &bound {
-            if *b != pack_generation(env.pack) {
-                return Ok(close_superseded(
-                    env,
-                    &rec,
-                    "팩 세대가 적용 때와 다릅니다 — 옛 세대의 바이트는 되살리지 않습니다(아무것도 되돌리지 않았습니다)",
-                    locked,
-                )?);
-            }
+        if !bound.equals_now(env.pack) {
+            return Ok(close_superseded(
+                env,
+                &rec,
+                "팩 세대가 적용 때와 다르거나 알 수 없습니다 — 옛 세대의 바이트는 되살리지 않습니다(아무것도 되돌리지 않았습니다)",
+                locked,
+            )?);
         }
         let (pre, holder) = pre_image_for(env.root, &rec, env.lane, rel)?;
         plan.push(OpSpec {
@@ -1608,7 +1702,7 @@ pub fn revert_in(
             expected,
             incoming: pre,
             source: holder,
-            generation: bound.clone(),
+            bound: bound.clone(),
         });
     }
     let by_label = match by {
@@ -1630,7 +1724,7 @@ pub fn revert_in(
             .map(|sp| RevertTarget { rel: sp.rel.clone(), applied: sp.expected.canon(), pre: sp.incoming.canon() })
             .collect(),
         has_hooks,
-        pack_generation: bound.clone(),
+        pack_generation: bound.known(),
         by: by_label.clone(),
         created_at: env.now,
         updated_at: env.now,
@@ -1872,37 +1966,72 @@ pub enum ApprovedCopy {
     Approved { id: RepairId, state: TargetState, holder: PathBuf },
     NoApproval,
     Unknown(String),
+    /// EN4: a record or lane row of the ledger cannot be read — the ledger is not complete, so no
+    /// file of this lane can be answered NO APPROVAL; `cause` names the unreadable member.
+    LedgerUnreadable { cause: String },
 }
 
+/// EN4: the first record or lane row of THIS lane's ledger that cannot be read (its path relative
+/// to the repairs root), if any.
+pub fn unreadable_ledger_member(root: &Path, lane: &LaneKey) -> Option<String> {
+    let rel_of = |p: PathBuf| p.strip_prefix(root).map(|r| r.display().to_string()).unwrap_or_else(|_| p.display().to_string());
+    for id in ledger::list_ids_in(root) {
+        if ledger::read_record_in(root, &id).is_err() {
+            return Some(rel_of(ledger::record_path_in(root, &id)));
+        }
+        if ledger::read_lane_in(root, &id, lane).is_err() {
+            return Some(rel_of(ledger::lane_path_in(root, &id, lane)));
+        }
+    }
+    None
+
 pub fn resolve_approved_copy_in(root: &Path, pack: &Path, lane: &LaneKey, rel: &str) -> ApprovedCopy {
-    let gen = pack_generation(pack);
+    // EJ1 / EN4: NO APPROVAL only from a COMPLETE, readable ledger of this lane — absence is never
+    // evidence
+    if let Some(cause) = unreadable_ledger_member(root, lane) {
+        return ApprovedCopy::LedgerUnreadable { cause };
+    }
     for id in ledger::list_ids_in(root).into_iter().rev() {
-        let row = match ledger::read_lane_in(root, &id, lane) {
-            Ok(Some(r)) => r,
-            Ok(None) => continue,
-            Err(e) => return ApprovedCopy::Unknown(format!("{}: 이 부서의 행을 읽을 수 없습니다({e:?})", id.as_str())),
+        let (Ok(row), Ok(rec)) = (ledger::read_lane_in(root, &id, lane), ledger::read_record_in(root, &id)) else {
+            return ApprovedCopy::LedgerUnreadable { cause: id.as_str().to_string() };
+        };
+        let Some(row) = row else {
+            // a MISSING member: an in-force approved repair of this lane that committed the file but
+            // whose lane row is not (yet) reconstructed
+            if let Some(r) = &rec {
+                if r.origin_lane == *lane
+                    && is_approval_class(r.classification)
+                    && matches!(r.state, RepairState::Probation | RepairState::InUse)
+                    && r.committed.iter().any(|(c, _)| c == rel)
+                {
+                    return ApprovedCopy::Unknown(format!("{}: 이 파일을 확정했는데 이 부서의 행이 아직 없습니다", id.as_str()));
+                }
+            }
+            continue;
         };
         let Some(p) = row.probation.as_ref() else {
             continue;
         };
-        if p.pack_generation != gen.version || p.pro_revision != gen.pro_revision {
-            continue;
-        }
         if !row.applied.iter().any(|(r, _)| r == rel) {
             continue;
+        }
+        match Bound::from_row(p) {
+            Bound::Unknown => {
+                return ApprovedCopy::Unknown(format!("{}: 이 파일을 말하는 행의 팩 세대를 알 수 없습니다(재구성된 행)", id.as_str()))
+            }
+            b if !b.equals_now(pack) => continue, // another generation's row
+            _ => {}
         }
         if p.closed.as_deref().is_some_and(|c| c.starts_with("되돌려짐") || c.starts_with("실패")) {
             continue; // reverted or failed: it no longer defines the right bytes
         }
-        let rec = match ledger::read_record_in(root, &id) {
-            Ok(Some(r)) => r,
-            Ok(None) => return ApprovedCopy::Unknown(format!("{}: 행은 이 파일을 말하는데 수리 기록이 없습니다", id.as_str())),
-            Err(e) => return ApprovedCopy::Unknown(format!("{}: 수리 기록을 읽을 수 없습니다({e:?})", id.as_str())),
+        let Some(rec) = rec else {
+            return ApprovedCopy::Unknown(format!("{}: 행은 이 파일을 말하는데 수리 기록이 없습니다", id.as_str()));
         };
         if !is_approval_class(rec.classification) {
             continue;
         }
-        return match f9_agreement(root, &rec, &row, lane, rel) {
+        return match f9_agreement(root, pack, &rec, &row, lane, rel) {
             Ok((state, holder)) => ApprovedCopy::Approved { id, state, holder },
             Err(why) => ApprovedCopy::Unknown(format!("{}: {why}", id.as_str())),
         };
@@ -1913,6 +2042,7 @@ pub fn resolve_approved_copy_in(root: &Path, pack: &Path, lane: &LaneKey, rel: &
 /// The full F9 agreement of one claiming repair (DR2); Ok = the verified approved copy.
 fn f9_agreement(
     root: &Path,
+    pack: &Path,
     rec: &RepairRecord,
     row: &ledger::LaneRecord,
     lane: &LaneKey,
@@ -1957,6 +2087,10 @@ fn f9_agreement(
         }
     }
     let op = applied_op(rel).ok_or_else(|| "이 파일의 적용 작업 기록이 없습니다".to_string())?;
+    // EJ1: the apply operation's DURABLE generation equals the pack's generation now
+    if !Bound::of(op.pack_generation.clone()).equals_now(pack) {
+        return Err("적용 작업이 묶인 팩 세대가 지금 세대와 다르거나 알 수 없습니다".into());
+    }
     let incoming = parse_canon(&op.incoming).ok_or_else(|| "적용 작업의 상태를 읽을 수 없습니다".to_string())?;
     let expected = parse_canon(&op.expected).unwrap_or(TargetState::Absent);
     if expected != TargetState::Absent {
@@ -2271,7 +2405,7 @@ fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &Repair
     // COMPLETES forward (its lane row written from the record and the intent, the intent applied);
     // never an undo of a committed apply
     if matches!(rec.state, RepairState::Probation | RepairState::InUse) {
-        let gen = intent.pack_generation.clone().unwrap_or_else(|| pack_generation(env.pack));
+        let (gen_version, gen_pro) = Bound::of(intent.pack_generation.clone()).row_fields();
         let root = env.root.to_path_buf();
         let lane = env.lane.clone();
         let idc = id.clone();
@@ -2289,8 +2423,8 @@ fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &Repair
                         lane: lane.clone(),
                         state: LaneState::Verified,
                         probation: Some(ledger::Probation {
-                            pack_generation: gen.version.clone(),
-                            pro_revision: gen.pro_revision,
+                            pack_generation: gen_version.clone(),
+                            pro_revision: gen_pro,
                             applied_at,
                             expected: committed.clone(),
                             closed: None,
@@ -2316,12 +2450,11 @@ fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &Repair
         return Ok(format!("{}: 끊긴 적용은 기록이 확정되어 있어 앞으로 마쳤습니다(부서 행)", id.as_str()));
     }
     // DR1 — no put-back across a generation change: the intent's binding is checked first
-    if let Some(bound) = &intent.pack_generation {
-        let now_gen = pack_generation(env.pack);
-        if *bound != now_gen {
+    if !Bound::of(intent.pack_generation.clone()).equals_now(env.pack) {
+        {
             let why = format!(
-                "적용 중에 끊긴 뒤 팩 세대가 바뀌었습니다({} → {}) — 아무것도 되돌리지 않았습니다(새 버전 우선 · 워커 검토)",
-                bound.version, now_gen.version
+                "적용 중에 끊긴 뒤 팩 세대가 바뀌었거나 알 수 없습니다(지금 {}) — 아무것도 되돌리지 않았습니다(새 버전 우선 · 워커 검토)",
+                pack_generation(env.pack).version
             );
             void_approval(env, &id, &why, locked)?;
             set_intent_state(env.root, intent, "superseded", &why, env.now)?;
@@ -2339,7 +2472,7 @@ fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &Repair
             expected: pre,
             incoming,
             source: None,
-            generation: intent.pack_generation.clone(),
+            bound: Bound::of(intent.pack_generation.clone()),
         });
     }
     let left = undo_applied_with(env, &specs, &rec, true)?;
@@ -2555,6 +2688,11 @@ pub fn apply_candidate_in(
     {
         return decline(why);
     }
+    // EJ1: the apply's binding is born HERE, once (written into its intent before any exchange)
+    let apply_bound = Bound::now(env.pack);
+    if apply_bound == Bound::Unknown {
+        return decline(format!("{}: 팩 세대를 알 수 없어 적용하지 않았습니다(아무것도 바꾸지 않음)", id.as_str()));
+    }
     // step 0 of every target first: the live state is the pre-image recorded at `begin`
     let mut plan: Vec<(OpSpec, Option<Slot>)> = Vec::new();
     for (rel, slot) in &slots {
@@ -2581,8 +2719,8 @@ pub fn apply_candidate_in(
                 expected: pre,
                 incoming,
                 source: slot.as_ref().map(|s| s.payload()),
-                // DR1: bound to the generation of step 0 (its undo carries the same binding)
-                generation: Some(pack_generation(env.pack)),
+                // EJ1: bound to the apply's binding (its undo carries the same binding)
+                bound: apply_bound.clone(),
             },
             slot.clone(),
         ));
@@ -2599,7 +2737,7 @@ pub fn apply_candidate_in(
             .map(|(sp, _)| IntentTarget { rel: sp.rel.clone(), pre: sp.expected.canon(), incoming: sp.incoming.canon() })
             .collect(),
         note: String::new(),
-        pack_generation: Some(pack_generation(env.pack)),
+        pack_generation: apply_bound.known(),
         created_at: env.now,
         updated_at: env.now,
     };
@@ -2734,7 +2872,7 @@ pub fn apply_candidate_in(
     }
     // record: committed states, 시험 기간, this lane's row (O1(a) approval_ref), older repairs superseded
     let committed: Vec<(String, String)> = live_states.iter().map(|(r, s)| (r.clone(), s.canon())).collect();
-    let gen = pack_generation(env.pack);
+    let (gen_version, gen_pro) = apply_bound.row_fields();
     let lane = env.lane.clone();
     let root = env.root.to_path_buf();
     let now = env.now;
@@ -2760,8 +2898,8 @@ pub fn apply_candidate_in(
             lane: lane.clone(),
             state: LaneState::Verified,
             probation: Some(ledger::Probation {
-                pack_generation: gen.version.clone(),
-                pro_revision: gen.pro_revision,
+                pack_generation: gen_version.clone(),
+                pro_revision: gen_pro,
                 applied_at: now,
                 expected: committed.clone(),
                 closed: None,
@@ -2847,7 +2985,13 @@ fn exchange_prepared(
     if env.faults.at(Point::AfterValidation, &live, Some(slot)) {
         return Err(stop(Point::AfterValidation));
     }
-    let gen = pack_generation(env.pack);
+    // EJ1: the operation's record carries the apply's binding (born with its intent), never "now"
+    let Some(gen) = spec.bound.known().filter(|_| spec.bound.equals_now(env.pack)) else {
+        return Ok(done(
+            ApplyOutcome::Superseded(format!("{}: 팩 세대가 적용이 묶인 세대와 다르거나 알 수 없습니다", spec.rel)),
+            None,
+        ));
+    };
     let (slot_identity, live_identity) = match (identity_of(&slot.payload()), identity_of(&live)) {
         (Ok(a), Ok(b)) => (a, b),
         (Err(e), _) | (_, Err(e)) => {
@@ -2875,9 +3019,8 @@ fn exchange_prepared(
     if env.faults.at(Point::AfterRecord, &live, Some(slot)) {
         return Err(stop(Point::AfterRecord));
     }
-    if let Err(e) = exchange(&live, &slot.payload()) {
-        wal::finish(env.root, &mut rec, "declined", &format!("{e:?}"), env.now)?;
-        return Ok(done(ApplyOutcome::Declined(format!("{}: {e:?}", spec.rel)), Some(&rec)));
+    if let Err(e) = door(env, &spec.bound, &live, DoorAct::Exchange { payload: &slot.payload() }) {
+        return door_refused(env, &mut rec, spec, e);
     }
     seal_now(env, slot, &live)?;
     after_seal_exchange(env, spec, &mut rec, slot, &live, 0)
@@ -2921,7 +3064,7 @@ fn undo_applied_with(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord, on
             incoming: pre,
             source: holder,
             // DR1: the apply's binding goes with its undo (a different generation → nothing back)
-            generation: spec.generation.clone(),
+            bound: spec.bound.clone(),
         };
         let r = run_op(env, &back)?;
         if r.outcome != ApplyOutcome::Applied {
@@ -2950,7 +3093,7 @@ fn mark_incomplete_apply(
             applied_now.push((spec.rel.clone(), live_now.canon()));
         }
     }
-    let gen = pack_generation(env.pack);
+    let (gen_version, gen_pro) = plan.first().map(|s| s.bound.clone()).unwrap_or(Bound::Unknown).row_fields();
     let root = env.root.to_path_buf();
     let lane = env.lane.clone();
     let now = env.now;
@@ -2965,8 +3108,8 @@ fn mark_incomplete_apply(
             lane: lane.clone(),
             state: LaneState::Conflict,
             probation: Some(ledger::Probation {
-                pack_generation: gen.version.clone(),
-                pro_revision: gen.pro_revision,
+                pack_generation: gen_version.clone(),
+                pro_revision: gen_pro,
                 applied_at: now,
                 expected: applied_now.clone(),
                 closed: None,

@@ -321,7 +321,7 @@ fn rule_one_property_every_op_every_point() {
                         expected: expected.clone(),
                         incoming: incoming.clone(),
                         source,
-                        generation: None,
+                        bound: Bound::now(&r.pack),
                     };
                     let first = run_op(&env, &spec);
                     if let Err(e) = &first {
@@ -474,7 +474,7 @@ fn every_form_applies_with_mode_and_fresh_mtime() {
         expected: r.live("hooks/a.sh"),
         incoming: st.clone(),
         source: Some(src),
-        generation: None,
+        bound: Bound::now(&r.pack),
     })
     .unwrap();
     assert_eq!(d.outcome, ApplyOutcome::Applied);
@@ -494,7 +494,7 @@ fn every_form_applies_with_mode_and_fresh_mtime() {
         expected: r.live("hooks/c.sh"),
         incoming: TargetState::Absent,
         source: None,
-        generation: None,
+        bound: Bound::now(&r.pack),
     })
     .unwrap();
     assert_eq!(d.outcome, ApplyOutcome::Applied);
@@ -510,7 +510,7 @@ fn every_form_applies_with_mode_and_fresh_mtime() {
         expected: TargetState::Absent,
         incoming: st,
         source: Some(src),
-        generation: None,
+        bound: Bound::now(&r.pack),
     })
     .unwrap();
     assert!(matches!(d.outcome, ApplyOutcome::Superseded(_)));
@@ -587,7 +587,7 @@ fn displaced_garbage_is_never_relived() {
             expected: r.live("schedule.json"),
             incoming: st,
             source: Some(src),
-            generation: None,
+            bound: Bound::now(&r.pack),
         })
         .unwrap();
         assert!(matches!(d.outcome, ApplyOutcome::Superseded(_)), "{:?}", d.outcome);
@@ -800,7 +800,7 @@ fn windows_interruption_between_the_two_moves_resume_or_abandon() {
         let (src, st) = r.source("w.py", b"NEW\n", 0o644);
         let inj = Inject::new(Point::AfterFirstMove, Action::Stop, None, &r.pack);
         let env = r.env(&inj, ApplyForm::DepositFirst);
-        let first = run_op(&env, &OpSpec { id: rid("R-9"), rel: "bin/w.py".into(), kind: "revert".into(), expected: r.live("bin/w.py"), incoming: st, source: Some(src), generation: None });
+        let first = run_op(&env, &OpSpec { id: rid("R-9"), rel: "bin/w.py".into(), kind: "revert".into(), expected: r.live("bin/w.py"), incoming: st, source: Some(src), bound: Bound::now(&r.pack) });
         assert!(first.is_err());
         assert_eq!(r.live("bin/w.py"), TargetState::Absent, "the path is empty between the two moves");
         if bump {
@@ -842,7 +842,7 @@ fn staged_pack_swap_during_an_operation_then_second_install() {
     }
     let f = Swap(&r, Cell::new(false));
     let env = r.env(&f, ApplyForm::Exchange);
-    let d = run_op(&env, &OpSpec { id: rid("R-10"), rel: "hooks/a.sh".into(), kind: "apply".into(), expected: r.live("hooks/a.sh"), incoming: st, source: Some(src), generation: None }).unwrap();
+    let d = run_op(&env, &OpSpec { id: rid("R-10"), rel: "hooks/a.sh".into(), kind: "apply".into(), expected: r.live("hooks/a.sh"), incoming: st, source: Some(src), bound: Bound::now(&r.pack) }).unwrap();
     assert!(matches!(d.outcome, ApplyOutcome::Superseded(_)), "{:?}", d.outcome);
     // second install: the pack swapped again (pack.prev deleted by the installer)
     let _ = std::fs::remove_dir_all(r.base.join("pack.prev"));
@@ -1224,7 +1224,7 @@ fn hook_step_timeout_and_resume_after_a_crash() {
     let rec = OpRecord {
         schema: 1, op: wal::new_op_id(2.0, "hook-unregister"), repair: id2.clone(), lane_key: r.lane.clone(),
         kind: "hook-unregister".into(), form: "hook".into(), rel: String::new(), pre_existed: false,
-        expected: String::new(), incoming: String::new(), pack_generation: None, slot: None, slot_identity: None,
+        expected: String::new(), incoming: String::new(), pack_bound: Bound::now(&r.pack), slot: None, slot_identity: None,
         live_identity: None, incoming_copy: None, incoming_copy_identity: None, step: "recorded".into(),
         hooks: vec![wal::HookLine { event: "Stop".into(), script: "z.sh".into(), targets: Vec::new() }],
         finished: false, outcome: None, note: String::new(), created_at: 2.0, updated_at: 2.0,
@@ -1354,7 +1354,7 @@ fn failing_exchange_declines_and_closes_the_record() {
     r.put("hooks/z.sh", b"LIVE\n", 0o755);
     let (src, st) = r.source("z.sh", b"NEW\n", 0o755);
     let env = r.env(&Vanish, ApplyForm::Exchange);
-    let d = run_op(&env, &OpSpec { id: rid("R-34"), rel: "hooks/z.sh".into(), kind: "apply".into(), expected: r.live("hooks/z.sh"), incoming: st, source: Some(src), generation: None }).unwrap();
+    let d = run_op(&env, &OpSpec { id: rid("R-34"), rel: "hooks/z.sh".into(), kind: "apply".into(), expected: r.live("hooks/z.sh"), incoming: st, source: Some(src), bound: Bound::now(&r.pack) }).unwrap();
     assert!(matches!(d.outcome, ApplyOutcome::Declined(ref m) if m.contains("ENOENT")), "{:?}", d.outcome);
     assert_eq!(std::fs::read(r.pack.join("hooks/z.sh")).unwrap(), b"LIVE\n");
     let (ops, _) = wal::list_in(&r.root, &rid("R-34"));
@@ -1381,7 +1381,7 @@ fn flush_failure_after_the_exchange_keeps_the_evidence() {
     let r = rig("ct2op");
     let before = r.put("hooks/f.sh", b"OLD\n", 0o755);
     let (src, incoming) = r.source("f-new", b"NEW\n", 0o755);
-    let spec = OpSpec { id: rid("R-6"), rel: "hooks/f.sh".into(), kind: "revert".into(), expected: before, incoming: incoming.clone(), source: Some(src), generation: None };
+    let spec = OpSpec { id: rid("R-6"), rel: "hooks/f.sh".into(), kind: "revert".into(), expected: before, incoming: incoming.clone(), source: Some(src), bound: Bound::now(&r.pack) };
     let faults = FailFlushAfterExchange;
     let res = run_op(&r.env(&faults, ApplyForm::Exchange), &spec);
     crate::repair::durable::INJECT_FLUSH_ERRNO.with(|c| c.set((0, 0)));
@@ -2037,7 +2037,7 @@ fn recovery_never_touches_a_live_operation() {
     // a file operation stopped after its record, still owned
     let before = r.put("hooks/l2.sh", b"OLD\n", 0o755);
     let (src, incoming) = r.source("l2-new", b"NEW\n", 0o755);
-    let spec = OpSpec { id: rid("R-39"), rel: "hooks/l2.sh".into(), kind: "revert".into(), expected: before, incoming, source: Some(src), generation: None };
+    let spec = OpSpec { id: rid("R-39"), rel: "hooks/l2.sh".into(), kind: "revert".into(), expected: before, incoming, source: Some(src), bound: Bound::now(&r.pack) };
     let stop = StopOn { rel: "hooks/l2.sh", point: Point::AfterRecord, fired: Cell::new(false) };
     assert!(run_op(&r.env(&stop, ApplyForm::Exchange), &spec).is_err());
     let rec = wal::unfinished_for_lane(&r.root, &r.lane).into_iter().next().unwrap();
@@ -2179,4 +2179,91 @@ fn the_hook_step_removes_only_hook_tombstones() {
     let left = crate::repair::tombstones::load_in(&r.root, &r.lane).unwrap();
     assert!(left.contains(&file_t), "the file was not restored: its tombstone stays: {left:?}");
     assert!(!left.contains(&hook_t), "the hook tombstone is removed by the hook step: {left:?}");
+}
+
+// ───────────────────────────── RULINGS EJ1 / EN3 / EN4 — the door, the binding, completeness ─────────────────────────────
+
+/// EJ1 (codex r3 I1): a Windows deposit-first revert interrupted after its first move (the live file
+/// in the vault), then G2 installed with that target absent — the recovery's abandonment would put
+/// the G1 deposit back: the door refuses (the abandonment carries the operation's G1 binding), the
+/// place stays absent, nothing of G1 lands in G2. Without EJ1 the nested placement ran unbound.
+#[test]
+fn an_abandonment_never_places_g1_bytes_into_g2() {
+    let r = rig("ej1abandon");
+    let before = r.put("bin/w2.py", b"G1-LIVE\n", 0o644);
+    let (src, st) = r.source("w2-new", b"G1-NEW\n", 0o644);
+    let spec = OpSpec { id: rid("R-50"), rel: "bin/w2.py".into(), kind: "revert".into(), expected: before, incoming: st, source: Some(src), bound: Bound::now(&r.pack) };
+    let stop = StopOn { rel: "bin/w2.py", point: Point::AfterFirstMove, fired: Cell::new(false) };
+    assert!(run_op(&r.env(&stop, ApplyForm::DepositFirst), &spec).is_err());
+    assert_eq!(r.live("bin/w2.py"), TargetState::Absent, "the first move happened");
+    std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
+    resume_interrupted_in(&r.env(&NoFaults, ApplyForm::DepositFirst)).unwrap();
+    assert_eq!(r.live("bin/w2.py"), TargetState::Absent, "no G1 bytes placed into G2");
+    assert!(wal::unfinished_for_lane(&r.root, &r.lane).is_empty());
+    assert!(r.vault_bytes().contains(&b"G1-LIVE\n".to_vec()), "the G1 bytes stay in the vault");
+}
+
+/// EJ1 (codex r3 I2): a lane row that was not reconstructed yet, and a reconstructed row (its
+/// generation UNKNOWN — ""), are missing / unknown members: the one resolution answers UNKNOWN,
+/// never NO APPROVAL and never APPROVED.
+#[test]
+fn a_missing_or_reconstructed_row_makes_the_approved_copy_unknown() {
+    let r = rig("ej1row");
+    let id = rid("R-51");
+    approved_and_applied(&r, &id, "hooks/r.sh", b"VENDOR\n", b"APPROVED\n");
+    std::fs::remove_file(ledger::lane_path_in(&r.root, &id, &r.lane)).unwrap();
+    assert!(matches!(resolve_approved_copy_in(&r.root, &r.pack, &r.lane, "hooks/r.sh"), ApprovedCopy::Unknown(_)), "missing row");
+    let mut row_fields = Bound::Unknown.row_fields();
+    assert_eq!(row_fields.0, "", "Unknown is written as the empty string");
+    row_fields.0.clear();
+    let committed = ledger::read_record_in(&r.root, &id).unwrap().unwrap().committed;
+    lane_row(&r, &id, committed, Vec::new());
+    let mut row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+    row.probation.as_mut().unwrap().pack_generation = String::new();
+    row.probation.as_mut().unwrap().closed = Some("대체됨 — 재구성".into());
+    ledger::write_lane_in(&r.root, &row).unwrap();
+    assert!(matches!(resolve_approved_copy_in(&r.root, &r.pack, &r.lane, "hooks/r.sh"), ApprovedCopy::Unknown(_)), "reconstructed row");
+}
+
+/// EJ1: every rename / exchange / placement into a live path of the repair module is inside `fn
+/// door` (the form of `h08_target_write_site_census`): the production text of `apply.rs` calls
+/// `exchange(` and `place_no_replace(` only inside the door, and `probation.rs` never.
+#[test]
+fn live_writes_go_through_the_one_door() {
+    let src = include_str!("apply.rs");
+    let prod = &src[..src.find("#[cfg(test)]\n#[path = \"apply_tests.rs\"]").unwrap()];
+    let door_at = prod.find("fn door(").expect("the door");
+    let door_end = door_at + prod[door_at..].find("\n}\n").unwrap();
+    for needle in ["place_no_replace(", " exchange(", "(exchange(", "swap_paths("] {
+        for (at, _) in prod.match_indices(needle) {
+            let line_start = prod[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let line = &prod[line_start..prod[at..].find('\n').map(|i| at + i).unwrap_or(prod.len())];
+            if line.trim_start().starts_with("//") || line.contains("use super::exchange") {
+                continue;
+            }
+            assert!(at > door_at && at < door_end, "a live write outside the door: {}", line.trim());
+        }
+    }
+    let prob = include_str!("probation.rs");
+    let prob = &prob[..prob.find("#[cfg(test)]\n#[path").unwrap_or(prob.len())];
+    for needle in ["place_no_replace(", "exchange(", "swap_paths(", "std::fs::rename("] {
+        assert!(!prob.contains(needle), "probation.rs writes a live path itself: {needle}");
+    }
+}
+
+/// EN3: the raw generation string is read in ONE place — `Bound::from_row` / `Bound::of`; nothing
+/// else in the repair module compares `pack_generation` strings or the literal "unknown".
+#[test]
+fn the_generation_string_is_read_in_one_place() {
+    for (name, src) in [("apply.rs", include_str!("apply.rs")), ("probation.rs", include_str!("probation.rs"))] {
+        let prod = &src[..src.find("#[cfg(test)]\n#[path").unwrap_or(src.len())];
+        let bound_impl = prod.find("impl Bound {").map(|a| (a, a + prod[a..].find("\n}\n").unwrap()));
+        let gen_fn = prod.find("pub fn pack_generation(").map(|a| (a, a + prod[a..].find("\n}\n").unwrap()));
+        for needle in ["\"unknown\"", "pack_generation !=", "pack_generation ==", ".version !=", ".version =="] {
+            for (at, _) in prod.match_indices(needle) {
+                let inside = |r: Option<(usize, usize)>| r.is_some_and(|(a, b)| at > a && at < b);
+                assert!(inside(bound_impl) || inside(gen_fn), "{name}: a raw generation comparison outside Bound: {needle}");
+            }
+        }
+    }
 }

@@ -663,7 +663,7 @@ fn recovery_waits_for_an_active_writer() {
             p == crate::repair::apply::Point::AfterRecord
         }
     }
-    let spec = crate::repair::apply::OpSpec { id: rid("R-7"), rel: "hooks/w.sh".into(), kind: "revert".into(), expected: before, incoming, source: Some(src), generation: None };
+    let spec = crate::repair::apply::OpSpec { id: rid("R-7"), rel: "hooks/w.sh".into(), kind: "revert".into(), expected: before, incoming, source: Some(src), bound: crate::repair::apply::Bound::now(&r.pack) };
     assert!(crate::repair::apply::run_op(&r.env(&StopAfterRecord, ApplyForm::Exchange), &spec).is_err());
     assert_eq!(crate::repair::wal::unfinished_for_lane(&r.root, &r.lane).len(), 1);
     let lock = r.base.join(".pack-apply.lock");
@@ -1121,4 +1121,34 @@ fn the_job_never_waits_for_the_pack_apply_lock() {
     holder.join().unwrap();
     let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 1.0, &lock), false).unwrap();
     assert!(rep.reverted.contains(&a), "reverted at the next tick: {:?}", rep.lines);
+}
+
+// ───────────────────────────── RULINGS EN4 — an unreadable ledger suspends the put-back ─────────────────────────────
+
+/// EN4: while a record of the lane's ledger cannot be read, NO file of the lane is put back (the
+/// ledger is not complete — absence is never evidence) and the sweep records ONE finding for the
+/// CAUSE, naming the unreadable record and listing the affected files, notified once — not one per
+/// file, not one per tick. Without EN4 the scan answered NO APPROVAL and put the original back.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unreadable_ledger_suspends_the_put_back_with_one_finding() {
+    let Some(rel) = listed() else {
+        return;
+    };
+    let r = rig("en4ledger");
+    committed_general(&r, &rid("R-1"), "hooks/other.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    std::fs::write(ledger::record_path_in(&r.root, &rid("R-1")), b"{ unreadable").unwrap();
+    r.put(rel, b"#!/bin/bash\nbroken(\n", 0o755);
+    let fails = |x: &str, _: &Path, _: Duration| if x == rel { outcome(CheckResult::Fail("bad".into()), 5) } else { outcome(CheckResult::Pass, 5) };
+    let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"#!/bin/bash\nbroken(\n", "nothing put back");
+    let cause: Vec<_> = f.iter().filter(|x| x.kind == "ledger-unreadable").collect();
+    assert_eq!(cause.len(), 1, "ONE finding for the cause: {f:?}");
+    assert!(cause[0].rel.contains("R-1") && cause[0].note.contains(rel) && cause[0].notice);
+    assert!(f.iter().all(|x| x.kind == "ledger-unreadable"), "no finding per file: {f:?}");
+    let again = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0, &lock)).unwrap();
+    assert!(again.is_empty(), "not again next hour: {again:?}");
 }
