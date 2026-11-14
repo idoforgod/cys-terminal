@@ -8779,8 +8779,16 @@ def _notice_mark(task, fp, state):
 
 
 def _notice_create_mark(path):
-    """배타 생성 — 이미 있으면 FileExistsError, 만들 수 없으면 OSError(호출부가 가른다)."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    """배타 생성 — 그 표지가 이미 있으면 FileExistsError, 만들 수 없으면 그 밖의 OSError(호출부가 가른다). 표지 폴더 자리가
+    폴더가 아니면(파일 · 링크) FileExistsError 가 아니라 NotADirectoryError 다 — '이미 있음'으로 읽히면 기록 없이 매 점검 다시
+    적재하게 된다."""
+    d = os.path.dirname(path)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except FileExistsError as e:
+        raise NotADirectoryError(errno.ENOTDIR, "알림 기록 자리가 폴더가 아니다", d) from e
+    if os.path.islink(d) or not os.path.isdir(d):
+        raise NotADirectoryError(errno.ENOTDIR, "알림 기록 자리가 폴더가 아니다", d)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
     try:
         os.write(fd, json.dumps({"pid": os.getpid(), "at": _notice_now()}).encode("utf-8"))

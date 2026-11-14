@@ -448,6 +448,29 @@ class NoticeMarksRealQueue(Rig):
         self.assertEqual(self.queued(), [])
         self.assertEqual(err.getvalue().count("적재하지 않음"), 3)
 
+    def test_marks_folder_that_is_not_a_folder_is_not_read_as_pending(self):
+        # ★T2i(EC6 수정 — 적색 실행이 찾음): 표지 폴더 자리가 **파일**이면 `makedirs` 가 FileExistsError 를 냈고, 그것이 '보내는
+        #   중 표지가 이미 있음'으로 읽혀 기록 없이 매 점검 다시 적재했다. 폴더 자리가 파일 · 파일을 가리키는 링크면 '기록 불가'다.
+        st = os.path.join(self.pack, "state")
+        os.makedirs(st, exist_ok=True)
+        marks = os.path.join(st, "notice-marks")
+        other = os.path.join(self.root, "a-file")
+        with open(other, "w") as f:
+            f.write("x")
+        for form in ("file", "link-to-file"):
+            if os.path.lexists(marks):
+                os.remove(marks)
+            if form == "file":
+                with open(marks, "w") as f:
+                    f.write("x")
+            else:
+                os.symlink(other, marks)
+            with self.assertRaises(NotADirectoryError, msg=form):
+                pf._notice_create_mark(self.mark("t", "f1", "pending"))
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "unrecorded", form)
+            self.assertEqual(self.queued(), [], form)
+
     def test_failed_enqueue_leaves_no_mark(self):
         self.assertEqual(pf._notice_once("t", "f1", lambda: False), "failed")
         self.assertFalse(os.path.exists(self.mark("t", "f1", "pending")), "다음 점검이 곧바로 다시 시도한다")
