@@ -450,10 +450,13 @@ def cys_sub_strict(args):
 GATE_BUDGET_S = 1.0      # 게이팅 1회당 외부 조회 합산 상한
 PROBE_CAP_S   = 0.6      # 단일 조회 상한(하나가 예산을 독식해 뒤 조회를 굶기지 못하게)
 MIN_SLICE_S   = 0.05     # 남은 예산이 이보다 적으면 조회를 시작하지 않는다(시작해도 무의미)
+GUARD_TEST_BUDGET_CEIL_S = 20.0   # 테스트 전용 예산의 상한(RULINGS EH1)
 if os.environ.get("GUARD_TEST_MODE", "0") == "1" and os.environ.get("GUARD_TEST_GATE_BUDGET_MS", ""):
     try:                                                  # 테스트 전용(잔여4 GUARD_TEST_MODE 관용구)
-        GATE_BUDGET_S = float(os.environ["GUARD_TEST_GATE_BUDGET_MS"]) / 1000.0
-        PROBE_CAP_S = min(PROBE_CAP_S, GATE_BUDGET_S)
+        GATE_BUDGET_S = min(float(os.environ["GUARD_TEST_GATE_BUDGET_MS"]) / 1000.0, GUARD_TEST_BUDGET_CEIL_S)
+        # EH1: 1초를 넘는 테스트 예산이면 단일 조회 상한도 그만큼 늘린다 — 데몬 자신의 답을 더 오래 기다릴 뿐
+        #      거부를 허용으로 바꾸지 않는다(판정은 여전히 데몬의 종료 코드). 1초 이하는 종전처럼 줄이기만 한다.
+        PROBE_CAP_S = GATE_BUDGET_S if GATE_BUDGET_S > 1.0 else min(PROBE_CAP_S, GATE_BUDGET_S)
     except Exception:
         pass
 GATE_T0 = time.monotonic()
