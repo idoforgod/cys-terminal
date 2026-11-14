@@ -1258,36 +1258,65 @@ fn i3_refuses_registrar_swallowing_the_gate_output() {
     );
 }
 
-/// RULINGS DF2 — behaviour decides the other way too: a command outside CZ1's closed grammar that
-/// really runs the gate (`exec sh <gate>`) IS registered — no I3 probe is refused. (Under the grammar
-/// alone this candidate was refused.)
+/// RULINGS DF2 → EL2 (rewritten): a command outside CZ1's closed grammar that really runs the gate
+/// (`exec sh <gate>`) is NOT the entry the released registrar writes — EL2 compares the entry as a
+/// whole, so it is not shown registered and I3 REFUSES. (Old expectation, DF2: `(s3.released,
+/// s3.clean) == (Answer::Deny, Some(Answer::Deny))` and no I3 probe refused — behaviour alone decided.)
 #[test]
 fn i3_accepts_a_registration_that_really_runs_the_gate() {
-    let root = test_root("df2-exec");
-    let lane = lane_of(&root, &[]);
-    let pf = released("bin/javis_preflight.py");
-    assert_eq!(pf.matches(REGISTRAR_FORM).count(), 1);
-    let cand = candidate_of(
-        &root,
-        &[(
-            "bin/javis_preflight.py",
-            Some(pf.replace(REGISTRAR_FORM, "    return \"exec sh \" + script")),
-        )],
+    i3_refuses_registrar_mutation("df2-exec", REGISTRAR_FORM, "    return \"exec sh \" + script");
+}
+
+/// RULINGS EL2 / EO2 — real registrar mutations whose command still denies the reviewer probe R-4, or
+/// whose attributes the harness would honour: each differs from the released entry → REFUSED.
+#[test]
+fn i3_refuses_registrar_with_a_tiny_timeout() {
+    i3_refuses_registrar_mutation(
+        "el2-timeout",
+        "entry[\"hooks\"][0][\"timeout\"] = timeout",
+        "entry[\"hooks\"][0][\"timeout\"] = 0.001",
     );
-    let c = cfg(&root, Some(vec![]), Some(vec![]), true);
-    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
-    let i3: Vec<&ProbeResult> = rep.probes.iter().filter(|p| p.test == "I3").collect();
-    let s3 = i3
-        .iter()
-        .find(|p| p.cell == "L1/S3/run1" && p.class == "I3:.claude")
-        .unwrap_or_else(|| panic!("no L1/S3 probe: {i3:#?}"));
-    assert_eq!((s3.released, s3.clean), (Answer::Deny, Some(Answer::Deny)), "{s3:#?}");
-    assert!(
-        i3.iter().all(|p| p.decision != ProbeDecision::Refused),
-        "{:#?}",
-        i3.iter().filter(|p| p.decision == ProbeDecision::Refused).collect::<Vec<_>>()
+}
+
+#[test]
+fn i3_refuses_registrar_with_async() {
+    i3_refuses_registrar_mutation(
+        "el2-async",
+        "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd}]}",
+        "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd, \"async\": True}]}",
     );
-    cleanup(&root);
+}
+
+#[test]
+fn i3_refuses_registrar_with_an_extra_key() {
+    i3_refuses_registrar_mutation(
+        "el2-key",
+        "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd}]}",
+        "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd, \"statusMessage\": \"x\"}]}",
+    );
+}
+
+#[test]
+fn i3_refuses_registrar_wrapping_the_command() {
+    i3_refuses_registrar_mutation("el2-wrap", REGISTRAR_FORM, "    return \"sleep 2; sh \" + script");
+}
+
+/// EO2: a role-conditional command denies the one reviewer probe and switches the gate off for a CSO
+/// seat — not the released entry → REFUSED.
+#[test]
+fn i3_refuses_registrar_with_a_role_condition() {
+    i3_refuses_registrar_mutation(
+        "eo2-role",
+        REGISTRAR_FORM,
+        "    return '[ \"$CYS_ROLE\" = cso ] || sh ' + script",
+    );
+}
+
+/// EL2: `bash <gate>` passes CZ1's grammar and denies R-4, yet differs from the released `sh <gate>`
+/// entry → REFUSED (the case only the whole-entry comparison catches).
+#[test]
+fn i3_refuses_registrar_naming_another_interpreter() {
+    i3_refuses_registrar_mutation("el2-bash", REGISTRAR_FORM, "    return \"bash \" + script");
 }
 
 /// I4: a candidate guard.sh whose backstop region differs from the released copy → REFUSED; a
