@@ -622,7 +622,7 @@ class DriverShapeTests(unittest.TestCase):
 
 class WorkflowTests(unittest.TestCase):
     ALLOWED_USES = {"actions/checkout@v4", "actions/setup-python@v5", "actions/upload-artifact@v4",
-                    "actions/download-artifact@v4", "dtolnay/rust-toolchain@stable", "swatinem/rust-cache@v2"}
+                    "dtolnay/rust-toolchain@stable", "swatinem/rust-cache@v2"}
 
     @classmethod
     def setUpClass(cls):
@@ -716,6 +716,18 @@ class WorkflowTests(unittest.TestCase):
 
     def test_measured_tools_run_without_utf8_mode_in_the_environment(self):
         self.assertNotRegex(self.text, r"(?m)^\s+PYTHONUTF8:", "PYTHONUTF8 in the job environment would leak into the measured product")
+
+    def test_the_repositorys_workflow_census_accepts_this_file(self):
+        """scripts/tests/test_c8_ci_consumer.py reads EVERY workflow (an action allow-list, cargo routes). This unit
+        edits no existing file, so its workflow must pass that census as it is."""
+        sys.path.insert(0, HERE)
+        try:
+            import test_c8_ci_consumer as c8
+        except Exception as e:  # noqa: BLE001
+            self.skipTest("the census module could not be imported here: %s" % e)
+        from pathlib import Path
+        problems = [p for p in c8.unread_cargo_routes(Path(REPO)) if "windows-measure.yml" in p]
+        self.assertEqual(problems, [])
 
     def test_optional_yaml_load(self):
         try:

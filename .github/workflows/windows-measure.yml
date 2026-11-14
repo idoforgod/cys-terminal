@@ -3,8 +3,9 @@ name: windows-measure (TW1 · release-1 Windows record)
 # Purpose (release 0.15.0, self-repair; impl RULINGS CW7 and EQ1-EQ6): MEASURE on GitHub's real Windows runner a real
 #   update of the released v0.14.56 to the build of this commit (and a following transition), and write a row-by-row
 #   record (tw1-record.json / tw1-record.md) in which a probe that did not run can never count as a pass.
-#   - The installer under test is the artifact of the windows-build run at THIS commit (nothing is built twice;
-#     windows-build.yml is not edited). The only thing built here is the following-version pair cys.exe + cysd.exe.
+#   - The installer under test is the artifact of the windows-build run at THIS commit, fetched through the REST API
+#     (nothing is built twice; windows-build.yml is not edited). The only thing built here is the following-version
+#     pair cys.exe + cysd.exe.
 #   - Nothing is published: no release, no tag, no secret. The only cache written is the following-version build's.
 #   - The verdict of every row is computed by scripts/windows-measure/tw1_record.py from recorded observations.
 #   - The job is red on any MEASURED-FAIL (after every probe ran) or a failed set-up / identity of the installation.
@@ -96,22 +97,10 @@ jobs:
       - name: Driver self-test (a driver whose own rules fail measures nothing)
         shell: pwsh
         run: python -X utf8 scripts/tests/windows_measure_selftest.py
-      - name: Download the installer under test (windows-build artifact at this commit)
-        id: dl
-        if: ${{ needs.wait-build.outputs.found == 'true' }}
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: cys-windows-x64-nsis
-          path: ${{ runner.temp }}/tw1/candidate
-          run-id: ${{ needs.wait-build.outputs.run_id }}
-          github-token: ${{ github.token }}
-      - name: Download the following-version pair
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: tw1-tnv-binaries
-          path: ${{ runner.temp }}/tw1/tnv
+      # The installer under test (artifact cys-windows-x64-nsis of the windows-build run at this commit) and the
+      # following-version pair (artifact tw1-tnv-binaries of this run) are fetched by the driver through the REST API
+      # (stage S0). actions/download-artifact is not used: scripts/tests/test_c8_ci_consumer.py keeps an allow-list of
+      # actions and this unit edits no existing file.
       - name: Measure (stages, probes, record)
         shell: pwsh
         env:
@@ -120,7 +109,6 @@ jobs:
           TW1_BUILD_CONCLUSION: ${{ needs.wait-build.outputs.conclusion }}
           TW1_BUILD_REASON: ${{ needs.wait-build.outputs.reason }}
           TW1_TNV_RESULT: ${{ needs.tnv-build.result }}
-          TW1_DL_OUTCOME: ${{ steps.dl.outcome }}
           TW1_PHASE: ${{ inputs.phase || '1' }}
         run: python -X utf8 scripts/windows-measure/tw1_main.py run --work "$env:RUNNER_TEMP\tw1" --out "$env:RUNNER_TEMP\tw1-record" --phase $env:TW1_PHASE
       - name: Stop everything this run started (always)

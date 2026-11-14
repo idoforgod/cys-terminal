@@ -466,6 +466,21 @@ def repo_slug():
     return os.environ.get("GITHUB_REPOSITORY", "")
 
 
+def fetch_artifact(run_id, name, dest, token, work):
+    """Download and unpack artifact `name` of workflow run `run_id` into dest. -> (ok, note)."""
+    try:
+        arts = api("/repos/%s/actions/runs/%s/artifacts?per_page=100" % (repo_slug(), run_id), token)
+        art = next((a for a in arts.get("artifacts", []) if a.get("name") == name and not a.get("expired")), None)
+        if not art:
+            return False, "artifact %s not listed in run %s" % (name, run_id)
+        z = download(art["archive_download_url"], os.path.join(work, "dl", name + ".zip"), token=token)
+        with zipfile.ZipFile(z) as zf:
+            zf.extractall(dest)
+        return True, "downloaded %s (%s bytes) from run %s" % (name, art.get("size_in_bytes"), run_id)
+    except Exception as e:  # noqa: BLE001 - recorded, never raised
+        return False, "artifact %s from run %s failed: %s" % (name, run_id, e)
+
+
 # ───────────────────────────── S0 — environment and installers ─────────────────────────────
 
 def _git(args, timeout=120):
@@ -581,28 +596,21 @@ def probe_s0_env(pr):
     mv = re.search(r'(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"', cargo)
     f["cargo_version"] = mv.group(1) if mv else None
     f["candidate_version4"] = (f["candidate_version"] + ".0") if f["candidate_version"] else None
-    # ── the candidate installer (download-artifact, else REST) ──
+    # ── the candidate installer: an artifact of the windows-build run at this commit (REST) ──
     cand_dir = os.path.join(pr.work, "candidate")
-    found = [p for p in find_files(cand_dir, "*-setup.exe")]
-    via = "download-artifact" if found else None
     token = os.environ.get("GH_TOKEN", "")
     run_id = os.environ.get("TW1_BUILD_RUN_ID", "")
     f["build_run_id"] = run_id or None
     f["build_conclusion"] = os.environ.get("TW1_BUILD_CONCLUSION") or None
-    if not found and run_id and token and repo_slug():
-        try:
-            arts = api("/repos/%s/actions/runs/%s/artifacts?per_page=100" % (repo_slug(), run_id), token)
-            art = next((a for a in arts.get("artifacts", []) if a.get("name") == "cys-windows-x64-nsis"), None)
-            if art:
-                z = download(art["archive_download_url"], os.path.join(pr.work, "candidate-rest.zip"), token=token)
-                with zipfile.ZipFile(z) as zf:
-                    zf.extractall(os.path.join(cand_dir, "rest"))
-                found = find_files(cand_dir, "*-setup.exe")
-                via = "rest" if found else None
-            else:
-                f["candidate_rest_note"] = "artifact cys-windows-x64-nsis not in run %s" % run_id
-        except Exception as e:  # noqa: BLE001 - recorded
-            f["candidate_rest_note"] = "REST fallback failed: %s" % e
+    f["build_lookup_reason"] = os.environ.get("TW1_BUILD_REASON") or None
+    found, via, note = [], None, None
+    if run_id and token and repo_slug():
+        ok, note = fetch_artifact(run_id, "cys-windows-x64-nsis", cand_dir, token, pr.work)
+        found = find_files(cand_dir, "*-setup.exe") if ok else []
+        via = "rest" if found else None
+    else:
+        note = "no windows-build run id / token / repository in the environment"
+    f["candidate_note"] = note
     f["candidate_obtained"] = bool(found)
     f["candidate_via"] = via
     cand = found[0] if found else None
@@ -640,8 +648,13 @@ def probe_s0_env(pr):
     f["cand_cysd_shas"] = sorted({sha256_file(x) for x in got.get("cysd.exe", [])})
     pr.ctx_updates["candidate_bins"] = got
     pr.ctx_updates["candidate_shas"] = {"cys.exe": f["cand_cys_shas"], "cysd.exe": f["cand_cysd_shas"]}
-    # ── the following-version pair (RULINGS EQ2 D4) ──
+    # ── the following-version pair (RULINGS EQ2 D4): an artifact of THIS run (REST) ──
     tnv_dir = os.path.join(pr.work, "tnv")
+    own = os.environ.get("GITHUB_RUN_ID", "")
+    if own and token and repo_slug():
+        ok, f["tnv_note"] = fetch_artifact(own, "tw1-tnv-binaries", tnv_dir, token, pr.work)
+    else:
+        f["tnv_note"] = "no run id / token / repository in the environment"
     tc = find_files(tnv_dir, "cys.exe")
     td = find_files(tnv_dir, "cysd.exe")
     tj = find_files(tnv_dir, "tnv-prepare.json")
