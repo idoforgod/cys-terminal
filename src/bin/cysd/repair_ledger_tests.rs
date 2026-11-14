@@ -4286,11 +4286,15 @@ fn dj1_names_that_do_not_exist_yet() {
     );
 }
 
-/// RULINGS DJ2 — the race of DA2, made deterministic: report X (a new signature, at 199 of 200) is
-/// HELD at the boundary between "observed: new" and "reserved"; meanwhile report Y (another new
-/// signature, on another intake lock) runs to its end and takes the 200th place; then X goes on
-/// and must find the hour full. With the observe and the take split (the code before DA2), X
-/// would write too: 201 rows.
+/// RULINGS DJ2, rewritten for RULINGS ED2 — the race of DA2, made deterministic, with the stop
+/// INSIDE the step the fix made atomic: at 199 of 200, report X is held after it observed room and
+/// before it takes the place; report Y (another new signature, on another intake lock) then comes
+/// to the quota. The probe tells whether Y finds the quota mutex held: with the fix it is (X holds
+/// it across observe and take), so X is let go first and Y finds the hour full; with the check and
+/// the take in two critical sections it is not, Y runs to its end in the gap and X takes a place it
+/// only observed → 201 rows. REWRITTEN EXPECTATION (ED2): the old stop was BEFORE the quota was
+/// observed (`intake_seam_install(&sig(ex))`, X resumed after Y finished), which that mutation
+/// also passed; asserted now: exactly ONE of X and Y accepted, 200 rows.
 #[test]
 fn dj2_observe_reserve_boundary_is_one_step() {
     use super::ledger_verbs::{intake_seam_clear, intake_seam_install};
@@ -4317,36 +4321,44 @@ fn dj2_observe_reserve_boundary_is_one_step() {
         .map(|k| format!("E: passes the held one {k}"))
         .find(|e| intake_shard_of(&sig(e)) != intake_shard_of(&sig(ex)))
         .unwrap();
-    let seam = intake_seam_install(&sig(ex));
-    let (held, passer) = std::thread::scope(|s| {
-        let h = s.spawn(|| {
-            r.call(
-                T0,
-                &seat(3, "worker"),
-                "report",
-                json!({"file": "bin/a.py", "error": ex}),
-            )
-            .unwrap()
-        });
-        let arrived = seam.wait_arrived(std::time::Duration::from_secs(20));
-        let y = r
-            .call(T0, &w, "report", json!({"file": "bin/a.py", "error": ey}))
-            .unwrap();
-        seam.open();
-        let x = h.join().unwrap();
-        assert!(arrived, "the held report never reached the boundary");
-        (x, y)
+    let seam = intake_seam_install(&sig(ex), &sig(&ey));
+    let call = |e: &str| {
+        r.call(
+            T0,
+            &seat(3, "worker"),
+            "report",
+            json!({"file": "bin/a.py", "error": e}),
+        )
+        .unwrap()
+    };
+    let (x, y, held) = std::thread::scope(|s| {
+        let hx = s.spawn(|| call(ex));
+        assert!(
+            seam.wait_arrived(std::time::Duration::from_secs(20)),
+            "X never reached the boundary"
+        );
+        let hy = s.spawn(|| call(&ey));
+        let held = seam
+            .wait_probe(std::time::Duration::from_secs(20))
+            .expect("Y never came to the quota");
+        let (x, y) = if held {
+            seam.open(); // the fix: Y waits for X's one step
+            let x = hx.join().unwrap();
+            (x, hy.join().unwrap())
+        } else {
+            let y = hy.join().unwrap(); // two critical sections: Y runs in the gap
+            seam.open();
+            (hx.join().unwrap(), y)
+        };
+        (x, y, held)
     });
     intake_seam_clear();
-    assert_eq!(passer["accepted"], true, "{passer}");
-    assert_eq!(
-        held["over_quota"], true,
-        "the held report used a place it had only observed: {held}"
-    );
+    let accepted = [&x, &y].iter().filter(|v| v["accepted"] == true).count();
+    assert_eq!(accepted, 1, "held={held}: X={x} Y={y}");
     let rows = std::fs::read_dir(r.root.join("intake").join(&r.lane.0))
         .unwrap()
         .count();
-    assert_eq!(rows, 200);
+    assert_eq!(rows, 200, "the hour's quota was exceeded");
 }
 
 /// RULINGS DJ2: a reservation is RETURNED after a failed write — at 199 of 200, a new signature

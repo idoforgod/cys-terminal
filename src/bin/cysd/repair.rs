@@ -1238,13 +1238,16 @@ mod ledger_verbs {
         Q.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    /// RULINGS DJ2 — a test seam at the boundary between "this signature is new" (observed) and
-    /// "its quota place is reserved" in `report` (test builds only): a test holds ONE signature's
-    /// report there until it opens the gate (bounded: 20 s).
+    /// RULINGS DJ2 / ED2 — test seams of `report` (test builds only), keyed by signature: the
+    /// PAUSE holds one signature's report INSIDE the step the fix made atomic — after the hour's
+    /// room was observed and before the place is taken, with the quota mutex held — until the test
+    /// opens it (bounded: 20 s); the PROBE tells the test, for another signature, whether the
+    /// quota mutex is held at the moment that report is about to take it (never blocking).
     #[cfg(test)]
     pub(crate) struct IntakeSeam {
-        sig: String,
-        state: Mutex<(bool, bool)>, // (arrived, open)
+        pause_sig: String,
+        probe_sig: String,
+        state: Mutex<(bool, bool, Option<bool>)>, // (arrived, open, probe: quota mutex held?)
         cv: std::sync::Condvar,
     }
 
@@ -1253,7 +1256,7 @@ mod ledger_verbs {
 
     #[cfg(test)]
     impl IntakeSeam {
-        /// Waits until the held report reached the boundary (bounded).
+        /// Waits until the held report reached the pause (bounded).
         pub(crate) fn wait_arrived(&self, within: std::time::Duration) -> bool {
             let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let (g, _) = self
@@ -1262,6 +1265,15 @@ mod ledger_verbs {
                 .unwrap_or_else(|e| e.into_inner());
             g.0
         }
+        /// Waits for the probe's answer (bounded): `Some(true)` = the quota mutex was held.
+        pub(crate) fn wait_probe(&self, within: std::time::Duration) -> Option<bool> {
+            let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (g, _) = self
+                .cv
+                .wait_timeout_while(g, within, |s| s.2.is_none())
+                .unwrap_or_else(|e| e.into_inner());
+            g.2
+        }
         /// Lets the held report go on.
         pub(crate) fn open(&self) {
             self.state.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
@@ -1269,31 +1281,39 @@ mod ledger_verbs {
         }
     }
 
-    /// Installs the seam for one signature (replacing any other).
+    /// Installs the seams: `pause_sig` is held at the pause, `probe_sig` answers the probe.
     #[cfg(test)]
-    pub(crate) fn intake_seam_install(sig: &str) -> std::sync::Arc<IntakeSeam> {
+    pub(crate) fn intake_seam_install(
+        pause_sig: &str,
+        probe_sig: &str,
+    ) -> std::sync::Arc<IntakeSeam> {
         let s = std::sync::Arc::new(IntakeSeam {
-            sig: sig.to_string(),
-            state: Mutex::new((false, false)),
+            pause_sig: pause_sig.to_string(),
+            probe_sig: probe_sig.to_string(),
+            state: Mutex::new((false, false, None)),
             cv: std::sync::Condvar::new(),
         });
         *INTAKE_SEAM.lock().unwrap_or_else(|e| e.into_inner()) = Some(s.clone());
         s
     }
 
-    /// Removes the seam.
+    /// Removes the seams.
     #[cfg(test)]
     pub(crate) fn intake_seam_clear() {
         *INTAKE_SEAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     #[cfg(test)]
-    fn intake_seam_pause(sig: &str) {
-        let seam = INTAKE_SEAM
+    fn intake_seam() -> Option<std::sync::Arc<IntakeSeam>> {
+        INTAKE_SEAM
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let Some(s) = seam.filter(|s| s.sig == sig) else {
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn intake_seam_pause(sig: &str) {
+        let Some(s) = intake_seam().filter(|s| s.pause_sig == sig) else {
             return;
         };
         let mut g = s.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1304,9 +1324,27 @@ mod ledger_verbs {
                 .unwrap_or_else(|e| e.into_inner());
     }
 
+    #[cfg(test)]
+    fn intake_seam_probe(sig: &str) {
+        let Some(s) = intake_seam().filter(|s| s.probe_sig == sig) else {
+            return;
+        };
+        let held = matches!(
+            intake_quota().try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        s.state.lock().unwrap_or_else(|e| e.into_inner()).2 = Some(held);
+        s.cv.notify_all();
+    }
+
     /// RULINGS DA2: takes one place in this lane's hour of new signatures if there is room — the
-    /// check and the take are ONE step under the quota mutex. `false` = the hour is full.
-    fn reserve_intake(key: &(PathBuf, String), now: f64) -> bool {
+    /// check and the take are ONE step under the quota mutex (ED2: the test's pause sits inside
+    /// it). `false` = the hour is full.
+    fn reserve_intake(key: &(PathBuf, String), now: f64, sig: &str) -> bool {
+        #[cfg(test)]
+        intake_seam_probe(sig);
+        #[cfg(not(test))]
+        let _ = sig;
         let mut q = intake_quota().lock().unwrap_or_else(|e| e.into_inner());
         let e = q.entry(key.clone()).or_default();
         while e.0.front().is_some_and(|t| now - *t > 3600.0) {
@@ -1315,6 +1353,8 @@ mod ledger_verbs {
         if e.0.len() >= intake::INTAKE_NEW_SIGNATURES_PER_HOUR {
             return false;
         }
+        #[cfg(test)]
+        intake_seam_pause(sig); // ED2: between observing room and taking it, the mutex held
         e.0.push_back(now);
         true
     }
@@ -1372,9 +1412,7 @@ mod ledger_verbs {
             let fresh = intake::excluded(&rep.rel, error, ctx.windows).is_none()
                 && intake::load_row(&intake::row_path_in(&ctx.root, &ctx.lane, &rep.signature))?
                     .is_none();
-            #[cfg(test)]
-            intake_seam_pause(&rep.signature); // DJ2: the observe / reserve boundary, held by a test
-            let reserved = fresh && reserve_intake(&key, ctx.now);
+            let reserved = fresh && reserve_intake(&key, ctx.now, &rep.signature);
             let room = if fresh && !reserved {
                 intake::INTAKE_NEW_SIGNATURES_PER_HOUR // no room: the record answers over quota
             } else {
