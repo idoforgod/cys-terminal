@@ -3815,3 +3815,830 @@ fn bj5_one_open_repair_per_file() {
     assert_eq!(p["begin"], "new");
     assert_ne!(p["repair"], json!(done));
 }
+
+// ───────────────────────────── T3d (RULINGS DA1–DA5; codex J4) ─────────────────────────────
+
+/// RULINGS DA1: a target that is the SAME FILE as a rule document or a system-locked file (a real
+/// hard link) is refused at `begin` naming the protected file; where the rule documents cannot be
+/// enumerated (a `*_DIRECTIVE.md` outside the listed places) a target with more than one name is
+/// refused conservatively; a general file with one name still begins.
+#[test]
+fn da1_hard_link_aliases_refused_at_begin() {
+    let r = rig("da1-begin");
+    let w = seat(3, "worker");
+    std::fs::write(r.pack.join("soul.md"), b"# soul\n").unwrap();
+    std::fs::write(r.pack.join("trusted-keys.json"), b"{}\n").unwrap();
+    std::fs::create_dir_all(r.pack.join("notes")).unwrap();
+    std::fs::create_dir_all(r.pack.join("extra")).unwrap();
+    std::fs::write(r.pack.join("extra/NEW_DIRECTIVE.md"), b"# d\n").unwrap();
+    std::fs::hard_link(r.pack.join("soul.md"), r.pack.join("notes/repair.txt")).unwrap();
+    std::fs::hard_link(
+        r.pack.join("trusted-keys.json"),
+        r.pack.join("notes/k.json"),
+    )
+    .unwrap();
+    std::fs::hard_link(
+        r.pack.join("extra/NEW_DIRECTIVE.md"),
+        r.pack.join("notes/d.txt"),
+    )
+    .unwrap();
+    for (rel, names) in [
+        ("notes/repair.txt", "soul.md"),
+        ("notes/k.json", "trusted-keys.json"),
+        ("notes/d.txt", "하드 링크"),
+    ] {
+        let e = r
+            .call(
+                T0,
+                &w,
+                "begin",
+                json!({"trigger": "owner_order", "files": [rel]}),
+            )
+            .unwrap_err();
+        assert_eq!(e.code, "repair_precondition", "{rel}: {}", e.message);
+        assert!(e.message.contains(names), "{rel}: {}", e.message);
+    }
+    assert!(!r.root.exists(), "a refused begin wrote something");
+    std::fs::write(r.pack.join("notes/plain.txt"), b"plain\n").unwrap();
+    let ok = r
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/plain.txt"]}),
+        )
+        .unwrap();
+    assert_eq!(ok["begin"], "new");
+}
+
+/// RULINGS DA1: a target that BECOMES a second name of a rule document after `begin` is refused at
+/// `record`; nothing is recorded.
+#[test]
+fn da1_alias_made_after_begin_refused_at_record() {
+    let r = rig("da1-record");
+    let w = seat(3, "worker");
+    std::fs::write(r.pack.join("soul.md"), b"# soul\n").unwrap();
+    std::fs::create_dir_all(r.pack.join("notes")).unwrap();
+    std::fs::write(r.pack.join("notes/x.txt"), b"x\n").unwrap();
+    let id = r
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/x.txt"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::remove_file(r.pack.join("notes/x.txt")).unwrap();
+    std::fs::hard_link(r.pack.join("soul.md"), r.pack.join("notes/x.txt")).unwrap();
+    let e = r
+        .call(
+            T0 + 1.0,
+            &w,
+            "record",
+            json!({"repair": id, "note": "edited"}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    assert!(e.message.contains("soul.md"), "{}", e.message);
+    assert!(
+        r.record_of(&id).worker_record.is_none(),
+        "the alias was recorded"
+    );
+}
+
+/// RULINGS DA1 (the link form of "the same file"): an existing leaf link into the pack — here to a
+/// directive in a place the pack does not list — is refused at `begin`.
+#[cfg(unix)]
+#[test]
+fn da1_leaf_link_into_the_pack_refused_at_begin() {
+    let r = rig("da1-link");
+    std::fs::create_dir_all(r.pack.join("extra")).unwrap();
+    std::fs::create_dir_all(r.pack.join("notes")).unwrap();
+    std::fs::write(r.pack.join("extra/BAR_DIRECTIVE.md"), b"# d\n").unwrap();
+    std::os::unix::fs::symlink("../extra/BAR_DIRECTIVE.md", r.pack.join("notes/s.txt")).unwrap();
+    let e = r
+        .call(
+            T0,
+            &seat(3, "worker"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/s.txt"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    assert!(e.message.contains("팩 안의 경로"), "{}", e.message);
+    assert!(!r.root.exists());
+}
+
+/// RULINGS DA2: at 199 of the hour's 200 new signatures, eight concurrent reports of eight NEW
+/// signatures (behind a barrier) yield exactly ONE new row; the others are over quota.
+#[test]
+fn da2_intake_quota_reserved_atomically() {
+    let r = rig("da2");
+    let w = seat(3, "worker");
+    for i in 0..199 {
+        let v = r
+            .call(
+                T0,
+                &w,
+                "report",
+                json!({"file": "bin/a.py", "error": format!("E: case {i}")}),
+            )
+            .unwrap();
+        assert_eq!(v["accepted"], true, "{i}: {v}");
+    }
+    let barrier = std::sync::Barrier::new(8);
+    let outs: Vec<Value> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..8)
+            .map(|k| {
+                let (b, r) = (&barrier, &r);
+                s.spawn(move || {
+                    b.wait();
+                    r.call(
+                        T0,
+                        &seat(3, "worker"),
+                        "report",
+                        json!({"file": "bin/a.py", "error": format!("E: racer {k}")}),
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let accepted = outs.iter().filter(|v| v["accepted"] == true).count();
+    let over = outs.iter().filter(|v| v["over_quota"] == true).count();
+    assert_eq!((accepted, over), (1, 7), "{outs:?}");
+    let rows = std::fs::read_dir(r.root.join("intake").join(&r.lane.0))
+        .unwrap()
+        .count();
+    assert_eq!(rows, 200, "the hour's quota was exceeded");
+}
+
+/// RULINGS DA3: once the quota is full, a loop of reports with UNIQUE signatures adds no entry to
+/// the daemon's lock registry (a refusal costs nothing); intake holds one lock per lane.
+#[test]
+fn da3_refusal_loop_adds_no_lock_entry() {
+    let r = rig("da3");
+    let w = seat(3, "worker");
+    for i in 0..200 {
+        r.call(
+            T0,
+            &w,
+            "report",
+            json!({"file": "bin/a.py", "error": format!("E: fill {i}")}),
+        )
+        .unwrap();
+    }
+    let before = r.mutexes.lock().unwrap().len();
+    assert!(before <= 1, "intake made {before} locks for one lane");
+    for i in 0..100 {
+        let v = r
+            .call(
+                T0,
+                &w,
+                "report",
+                json!({"file": "bin/a.py", "error": format!("E: refused {i}")}),
+            )
+            .unwrap();
+        assert_eq!(v["over_quota"], true, "{i}: {v}");
+    }
+    assert_eq!(
+        r.mutexes.lock().unwrap().len(),
+        before,
+        "the lock registry grew under refusals"
+    );
+}
+
+/// RULINGS DA3: the intake lock set is FIXED and is the entry point other intake writers call
+/// (`intake_lock_for` — the repeated-failure detector, unit T3e).
+#[test]
+fn da3_intake_lock_set_is_fixed() {
+    assert_eq!(INTAKE_LOCK_SHARDS, 16);
+    drop(intake_lock_for("sig-a"));
+    drop(intake_lock_for("sig-a")); // released on drop: taking it twice in a row never blocks
+}
+
+/// RULINGS DA4: one open repair per FILE — `notes/ITEM.txt` beside an open `notes/item.txt` (the
+/// same file on this case-insensitive volume), the same for a file that does not exist yet, one
+/// `begin` naming one file twice, and two hard-linked names of a general file.
+#[test]
+fn da4_one_open_repair_per_file_not_per_spelling() {
+    let r = rig("da4");
+    std::fs::create_dir_all(r.pack.join("notes")).unwrap();
+    std::fs::write(r.pack.join("notes/item.txt"), b"item\n").unwrap();
+    let a = r
+        .call(
+            T0,
+            &seat(3, "worker"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/item.txt"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b = seat(13, "worker-3");
+    let e = r
+        .call(
+            T0 + 1.0,
+            &b,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/ITEM.txt"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    assert!(e.message.contains(&a), "{}", e.message);
+    // a file that does not exist yet: the folded name decides
+    let a2 = r
+        .call(
+            T0,
+            &seat(3, "worker"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/new.txt"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let e = r
+        .call(
+            T0 + 1.0,
+            &b,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/NEW.txt"]}),
+        )
+        .unwrap_err();
+    assert!(e.message.contains(&a2), "{}", e.message);
+    // one begin naming one file twice
+    std::fs::write(r.pack.join("notes/other.txt"), b"o\n").unwrap();
+    let e = r
+        .call(
+            T0 + 1.0,
+            &b,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/other.txt", "notes/OTHER.txt"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "invalid_params", "{}", e.message);
+    // two hard-linked names of a general file: neither name is a second repair
+    std::fs::write(r.pack.join("notes/h1.txt"), b"h\n").unwrap();
+    std::fs::hard_link(r.pack.join("notes/h1.txt"), r.pack.join("notes/h2.txt")).unwrap();
+    for rel in ["notes/h1.txt", "notes/h2.txt"] {
+        let e = r
+            .call(
+                T0 + 1.0,
+                &b,
+                "begin",
+                json!({"trigger": "owner_order", "files": [rel]}),
+            )
+            .unwrap_err();
+        assert_eq!(e.code, "repair_precondition", "{rel}: {}", e.message);
+    }
+    assert_eq!(
+        ledger::list_ids_in(&r.root).len(),
+        2,
+        "a second open repair was made"
+    );
+}
+
+/// RULINGS DA4: `same_target` follows the file's identity when both live files exist (a hard link
+/// is the same file, another file is not) and the folded name when one does not exist yet.
+#[test]
+fn da4_same_target_follows_identity_then_name() {
+    let r = rig("da4-same");
+    std::fs::create_dir_all(r.pack.join("notes")).unwrap();
+    std::fs::write(r.pack.join("notes/one.txt"), b"1\n").unwrap();
+    std::fs::hard_link(r.pack.join("notes/one.txt"), r.pack.join("notes/two.txt")).unwrap();
+    std::fs::write(r.pack.join("notes/three.txt"), b"3\n").unwrap();
+    assert!(
+        same_target(&r.pack, "notes/one.txt", "notes/two.txt"),
+        "a hard link is the same file"
+    );
+    assert!(!same_target(&r.pack, "notes/one.txt", "notes/three.txt"));
+    assert!(same_target(&r.pack, "notes/absent.txt", "NOTES/Absent.TXT"));
+    assert!(!same_target(
+        &r.pack,
+        "notes/absent.txt",
+        "notes/absent2.txt"
+    ));
+}
+
+/// A deletion repair committed, reopened by the audit, picked up, recorded and verified again —
+/// ready for its re-commit (the target is Absent: no check child runs).
+fn reopened_deletion(tag: &str) -> (Rig, String) {
+    let r = rig(tag);
+    let w = seat(3, "worker");
+    let id = r
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::remove_file(r.pack.join("bin/a.py")).unwrap();
+    r.call(
+        T0 + 1.0,
+        &w,
+        "record",
+        json!({"repair": id, "note": "delete"}),
+    )
+    .unwrap();
+    r.call(
+        T0 + 2.0,
+        &seat(7, "reviewer-codex"),
+        "attest_verify",
+        json!({"repair": id, "verdict": "pass", "note": "ok"}),
+    )
+    .unwrap();
+    r.call(T0 + 3.0, &w, "commit", json!({"repair": id}))
+        .unwrap();
+    r.call(
+        T0 + 4.0,
+        &seat(8, "reviewer-gemini"),
+        "attest_audit",
+        json!({"repair": id, "verdict": "finding", "note": "again"}),
+    )
+    .unwrap();
+    assert_eq!(
+        r.call(
+            T0 + 5.0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]})
+        )
+        .unwrap()["begin"],
+        "picked-up"
+    );
+    r.call(
+        T0 + 6.0,
+        &w,
+        "record",
+        json!({"repair": id, "note": "delete again"}),
+    )
+    .unwrap();
+    r.call(
+        T0 + 7.0,
+        &seat(7, "reviewer-codex"),
+        "attest_verify",
+        json!({"repair": id, "verdict": "pass", "note": "ok"}),
+    )
+    .unwrap();
+    (r, id)
+}
+
+/// RULINGS DA5: a re-commit meets this lane's row corrupt, or of a newer schema: the commit is
+/// refused saying why, the row's bytes stay as they were, and the record does not change state.
+#[test]
+fn da5_unreadable_lane_row_never_overwritten() {
+    for (tag, newer) in [("da5-corrupt", false), ("da5-future", true)] {
+        let (r, id) = reopened_deletion(tag);
+        let rid = RepairId::parse(&id).unwrap();
+        let path = ledger::lane_path_in(&r.root, &rid, &r.lane);
+        let bytes: Vec<u8> = if newer {
+            let mut v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            v["schema"] = json!(999);
+            serde_json::to_vec(&v).unwrap()
+        } else {
+            b"{ not json".to_vec()
+        };
+        std::fs::write(&path, &bytes).unwrap();
+        let before = r.record_of(&id);
+        let e = r
+            .call(
+                T0 + 8.0,
+                &seat(3, "worker"),
+                "commit",
+                json!({"repair": id}),
+            )
+            .unwrap_err();
+        assert_eq!(e.code, "repair_corrupt", "{tag}: {}", e.message);
+        assert!(e.message.contains("lanes"), "{tag}: {}", e.message);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "{tag}: the lane row was overwritten"
+        );
+        let after = r.record_of(&id);
+        assert_eq!(
+            after.state,
+            RepairState::InProgress,
+            "{tag}: the record moved"
+        );
+        assert_eq!(after.committed, before.committed, "{tag}");
+    }
+}
+
+/// RULINGS DJ1, rewritten for RULINGS ED1 (one comparison, made now): the NFC / NFD pair of one
+/// name → the second refused; `a.txt` / `A.txt` → the second refused saying that names
+/// differing only in case are one file on some volumes; two different ASCII names → both
+/// allowed. REWRITTEN EXPECTATION (ED1): the old last case read "a non-ASCII creation beside an
+/// ASCII creation in the same folder → both allowed" (`assert!(begin(13, "other/plain.md").is_ok())`);
+/// under ED1 a not-yet-existing tail holding a non-ASCII character equals every other tail under
+/// its deepest existing folder, so the ASCII creation is refused with the conditional sentence
+/// until the first repair is finished. Each case has its own folder.
+#[test]
+fn dj1_names_that_do_not_exist_yet() {
+    let r = rig("dj1");
+    for d in ["n1", "n2", "n3", "n4"] {
+        std::fs::create_dir_all(r.pack.join(d)).unwrap();
+    }
+    let begin = |sid: u64, rel: &str| {
+        r.call(
+            T0,
+            &seat(sid, if sid == 3 { "worker" } else { "worker-3" }),
+            "begin",
+            json!({"trigger": "owner_order", "files": [rel]}),
+        )
+    };
+    let id_of = |v: Value| v["repair"].as_str().unwrap().to_string();
+    let nfc = id_of(begin(3, "n1/caf\u{e9}.txt").unwrap());
+    let e = begin(13, "n1/cafe\u{301}.txt").unwrap_err();
+    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    assert!(
+        e.message.contains(&nfc) && e.message.contains("ASCII"),
+        "{}",
+        e.message
+    );
+    let a = id_of(begin(3, "n2/a.txt").unwrap());
+    let e = begin(13, "n2/A.txt").unwrap_err();
+    assert!(
+        e.message.contains(&a)
+            && e.message
+                .contains("대소문자만 다른 이름은 볼륨에 따라 같은 파일"),
+        "{}",
+        e.message
+    );
+    assert!(begin(3, "n3/x1.txt").is_ok());
+    assert!(begin(13, "n3/x2.txt").is_ok());
+    let k = id_of(begin(3, "n4/\u{c0c8}.md").unwrap());
+    let e = begin(13, "n4/plain.md").unwrap_err();
+    assert!(
+        e.message.contains(&k) && e.message.contains("볼륨에 따라 같은 파일일 수 있습니다"),
+        "{}",
+        e.message
+    );
+}
+
+/// RULINGS DJ2, rewritten for RULINGS ED2 — the race of DA2, made deterministic, with the stop
+/// INSIDE the step the fix made atomic: at 199 of 200, report X is held after it observed room and
+/// before it takes the place; report Y (another new signature, on another intake lock) then comes
+/// to the quota. The probe tells whether Y finds the quota mutex held: with the fix it is (X holds
+/// it across observe and take), so X is let go first and Y finds the hour full; with the check and
+/// the take in two critical sections it is not, Y runs to its end in the gap and X takes a place it
+/// only observed → 201 rows. REWRITTEN EXPECTATION (ED2): the old stop was BEFORE the quota was
+/// observed (`intake_seam_install(&sig(ex))`, X resumed after Y finished), which that mutation
+/// also passed; asserted now: exactly ONE of X and Y accepted, 200 rows.
+#[test]
+fn dj2_observe_reserve_boundary_is_one_step() {
+    use super::ledger_verbs::{intake_seam_clear, intake_seam_install};
+    let r = rig("dj2-race");
+    let w = seat(3, "worker");
+    for i in 0..199 {
+        let v = r
+            .call(
+                T0,
+                &w,
+                "report",
+                json!({"file": "bin/a.py", "error": format!("E: slot {i}")}),
+            )
+            .unwrap();
+        assert_eq!(v["accepted"], true, "{i}: {v}");
+    }
+    let sig = |e: &str| {
+        cys::repair::intake::parse_report("bin/a.py", e)
+            .unwrap()
+            .signature
+    };
+    let ex = "E: held at the boundary";
+    let ey = (0..)
+        .map(|k| format!("E: passes the held one {k}"))
+        .find(|e| intake_shard_of(&sig(e)) != intake_shard_of(&sig(ex)))
+        .unwrap();
+    let seam = intake_seam_install(&sig(ex), &sig(&ey));
+    let call = |e: &str| {
+        r.call(
+            T0,
+            &seat(3, "worker"),
+            "report",
+            json!({"file": "bin/a.py", "error": e}),
+        )
+        .unwrap()
+    };
+    let (x, y, held) = std::thread::scope(|s| {
+        let hx = s.spawn(|| call(ex));
+        assert!(
+            seam.wait_arrived(std::time::Duration::from_secs(20)),
+            "X never reached the boundary"
+        );
+        let hy = s.spawn(|| call(&ey));
+        let held = seam
+            .wait_probe(std::time::Duration::from_secs(20))
+            .expect("Y never came to the quota");
+        let (x, y) = if held {
+            seam.open(); // the fix: Y waits for X's one step
+            let x = hx.join().unwrap();
+            (x, hy.join().unwrap())
+        } else {
+            let y = hy.join().unwrap(); // two critical sections: Y runs in the gap
+            seam.open();
+            (hx.join().unwrap(), y)
+        };
+        (x, y, held)
+    });
+    intake_seam_clear();
+    let accepted = [&x, &y].iter().filter(|v| v["accepted"] == true).count();
+    assert_eq!(accepted, 1, "held={held}: X={x} Y={y}");
+    let rows = std::fs::read_dir(r.root.join("intake").join(&r.lane.0))
+        .unwrap()
+        .count();
+    assert_eq!(rows, 200, "the hour's quota was exceeded");
+}
+
+/// RULINGS DJ2: a reservation is RETURNED after a failed write — at 199 of 200, a new signature
+/// whose row cannot be written (the lane's intake folder made read-only) fails; the next new
+/// signature then gets the 200th place, and the one after it is over quota.
+#[cfg(unix)]
+#[test]
+fn dj2_failed_write_returns_its_reservation() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = rig("dj2-fail");
+    let w = seat(3, "worker");
+    for i in 0..199 {
+        r.call(
+            T0,
+            &w,
+            "report",
+            json!({"file": "bin/a.py", "error": format!("E: slot {i}")}),
+        )
+        .unwrap();
+    }
+    let dir = r.root.join("intake").join(&r.lane.0);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let failed = r.call(
+        T0,
+        &w,
+        "report",
+        json!({"file": "bin/a.py", "error": "E: cannot be written"}),
+    );
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(failed.is_err(), "the write did not fail: {failed:?}");
+    let v = r
+        .call(
+            T0,
+            &w,
+            "report",
+            json!({"file": "bin/a.py", "error": "E: takes the returned place"}),
+        )
+        .unwrap();
+    assert_eq!(
+        v["accepted"], true,
+        "the failed write kept its reservation: {v}"
+    );
+    let v = r
+        .call(
+            T0,
+            &w,
+            "report",
+            json!({"file": "bin/a.py", "error": "E: one too many"}),
+        )
+        .unwrap();
+    assert_eq!(v["over_quota"], true, "{v}");
+}
+
+/// RULINGS DJ3: a second name of the key file is refused naming the canonical file and its only
+/// way (`cys pack-heal`), never the owner-token route of the rule documents.
+#[test]
+fn dj3_key_file_alias_names_the_canonical_file_and_pack_heal() {
+    let r = rig("dj3");
+    std::fs::write(r.pack.join("trusted-keys.json"), b"{}\n").unwrap();
+    std::fs::create_dir_all(r.pack.join("notes")).unwrap();
+    std::fs::hard_link(
+        r.pack.join("trusted-keys.json"),
+        r.pack.join("notes/k.json"),
+    )
+    .unwrap();
+    let e = r
+        .call(
+            T0,
+            &seat(3, "worker"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/k.json"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    assert!(
+        e.message.contains("`trusted-keys.json`")
+            && e.message.contains("cys pack-heal trusted-keys.json"),
+        "{}",
+        e.message
+    );
+    assert!(
+        !e.message.contains("주인 지시 표"),
+        "the owner-token route was offered: {}",
+        e.message
+    );
+}
+
+/// RULINGS ED1, codex's sequence (a): on a volume that may treat composed and decomposed names as
+/// one, the PARENT does not exist yet either — `p/caf\u{e9}/x.txt` then `p/cafe\u{301}/x.txt`:
+/// one existing ancestor (`p`), tails with a non-ASCII character → the second is refused.
+#[test]
+fn ed1_parent_absent_composed_and_decomposed() {
+    let r = rig("ed1-a");
+    std::fs::create_dir_all(r.pack.join("p")).unwrap();
+    let first = r
+        .call(
+            T0,
+            &seat(3, "worker"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["p/caf\u{e9}/x.txt"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let e = r
+        .call(
+            T0,
+            &seat(13, "worker-3"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["p/cafe\u{301}/x.txt"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    assert!(e.message.contains(&first), "{}", e.message);
+}
+
+/// RULINGS ED1, codex's sequence (b): a repair opened on an EXISTING `q/caf\u{e9}.txt` deletes it;
+/// `begin` under the decomposed name is compared with the recorded target AS IT IS NOW (both
+/// absent, one ancestor, non-ASCII tails) → refused.
+#[test]
+fn ed1_existing_file_deleted_then_other_composition() {
+    let r = rig("ed1-b");
+    std::fs::create_dir_all(r.pack.join("q")).unwrap();
+    std::fs::write(r.pack.join("q/caf\u{e9}.txt"), b"c\n").unwrap();
+    let first = r
+        .call(
+            T0,
+            &seat(3, "worker"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["q/caf\u{e9}.txt"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::remove_file(r.pack.join("q/caf\u{e9}.txt")).unwrap();
+    let e = r
+        .call(
+            T0,
+            &seat(13, "worker-3"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["q/cafe\u{301}.txt"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    assert!(e.message.contains(&first), "{}", e.message);
+}
+
+/// RULINGS ED1: the conservative refusal lasts only while the first repair is open — once it is
+/// committed (in force, no longer being worked) the case-twin name begins.
+#[test]
+fn ed1_finished_repair_no_longer_refuses() {
+    let r = rig("ed1-done");
+    std::fs::create_dir_all(r.pack.join("f")).unwrap();
+    let w = seat(3, "worker");
+    let other = seat(13, "worker-3");
+    let id = r
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["f/a.txt"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(r
+        .call(
+            T0,
+            &other,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["f/A.txt"]})
+        )
+        .is_err());
+    std::fs::write(r.pack.join("f/a.txt"), b"a\n").unwrap();
+    r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "n"}))
+        .unwrap();
+    r.call(
+        T0 + 2.0,
+        &seat(7, "reviewer-codex"),
+        "attest_verify",
+        json!({"repair": id, "verdict": "pass", "note": "ok"}),
+    )
+    .unwrap();
+    r.call(T0 + 3.0, &w, "commit", json!({"repair": id}))
+        .unwrap();
+    let p = r
+        .call(
+            T0 + 4.0,
+            &other,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["f/A.txt"]}),
+        )
+        .unwrap();
+    assert_eq!(p["begin"], "new", "{p}");
+}
+
+/// RULINGS ED3: two names in ONE `begin` that only the conservative rule equates (case twins
+/// that do not exist yet) get the conditional sentence — "같은 파일입니다" is said only for one
+/// identity.
+#[test]
+fn ed3_one_begin_conservative_pair_gets_the_conditional_sentence() {
+    let r = rig("ed3");
+    std::fs::create_dir_all(r.pack.join("g")).unwrap();
+    let e = r
+        .call(
+            T0,
+            &seat(3, "worker"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["g/a.txt", "g/A.txt"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "invalid_params", "{}", e.message);
+    assert!(
+        e.message.contains("볼륨에 따라 같은 파일일 수 있습니다"),
+        "{}",
+        e.message
+    );
+    assert!(!e.message.contains("같은 파일입니다"), "{}", e.message);
+}
+
+/// RULINGS EG1: a lookup that FAILS is never evidence of "different" — with an injected failing
+/// lookup (test builds only, no platform trick) for the NEW target's ancestor, for the OPEN
+/// repair's ancestor and for an EXISTING file's identity, the second `begin` is refused saying it
+/// could not be determined; positive "different" cases still open.
+#[test]
+fn eg1_a_failed_lookup_refuses_like_same() {
+    let r = rig("eg1");
+    for d in ["u1", "u2", "v1", "v2", "w", "z"] {
+        std::fs::create_dir_all(r.pack.join(d)).unwrap();
+    }
+    std::fs::write(r.pack.join("w/x.txt"), b"x\n").unwrap();
+    let begin = |sid: u64, rel: &str| {
+        r.call(
+            T0,
+            &seat(sid, if sid == 3 { "worker" } else { "worker-3" }),
+            "begin",
+            json!({"trigger": "owner_order", "files": [rel]}),
+        )
+    };
+    let id_of = |v: Value| v["repair"].as_str().unwrap().to_string();
+    let unknown = |e: VerbError, first: &str| {
+        assert_eq!(e.code, "repair_precondition", "{}", e.message);
+        assert!(
+            e.message.contains(first) && e.message.contains("확인할 수 없습니다"),
+            "{}",
+            e.message
+        );
+    };
+    // the new target's ancestor cannot be read
+    let a = id_of(begin(3, "u1/a.txt").unwrap());
+    lookup_fail_install(&r.pack.join("u2"));
+    unknown(begin(13, "u2/b.txt").unwrap_err(), &a);
+    lookup_fail_clear(&r.pack.join("u2"));
+    // the open repair's ancestor cannot be read
+    let c = id_of(begin(3, "v1/c.txt").unwrap());
+    lookup_fail_install(&r.pack.join("v1"));
+    let e = begin(13, "v2/d.txt").unwrap_err();
+    lookup_fail_clear(&r.pack.join("v1"));
+    unknown(e, &c);
+    // an existing file's identity cannot be read
+    let x = id_of(begin(3, "w/x.txt").unwrap());
+    lookup_fail_install(&r.pack.join("w/x.txt"));
+    let e = begin(13, "w/y.txt").unwrap_err();
+    lookup_fail_clear(&r.pack.join("w/x.txt"));
+    unknown(e, &x);
+    // positive "different": with every lookup readable the same begins open
+    assert!(begin(13, "u2/b.txt").is_ok());
+    assert!(begin(13, "v2/d.txt").is_ok());
+    assert!(
+        begin(13, "w/y.txt").is_ok(),
+        "an existing file and an absent name are different"
+    );
+    std::fs::write(r.pack.join("z/one.txt"), b"1\n").unwrap();
+    std::fs::write(r.pack.join("z/two.txt"), b"2\n").unwrap();
+    assert!(begin(3, "z/one.txt").is_ok());
+    assert!(
+        begin(13, "z/two.txt").is_ok(),
+        "two existing files with two identities are different"
+    );
+}

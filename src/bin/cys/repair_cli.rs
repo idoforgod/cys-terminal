@@ -552,6 +552,13 @@ fn print_ok(out: &mut dyn Write, verb: &str, v: &Value, json_out: bool) {
             }
             r.and_then(|_| writeln!(out, "열린 결함 {}건", s(v, "open_defects")))
         }
+        // RULINGS DA6: a record that cannot be read is named with its diagnosis (the daemon answers
+        // `{repair, corrupt}` for it) — never printed as a record with empty fields
+        "status" if v.get("corrupt").is_some_and(|c| c.is_string()) => writeln!(
+            out,
+            "{id}: 수리 기록을 읽을 수 없습니다 — {}",
+            s(v, "corrupt")
+        ),
         "status" if v.get("repair").is_some() => writeln!(
             out,
             "{id}: {} · {} · 시도 {}/{} · 부서별: {}{}",
@@ -1313,6 +1320,29 @@ mod tests {
         let (c, o, e) = run(&["rule-doc-allowed", "--path", "soul.md"], json!({"allowed": false, "path": "soul.md", "reason": "no"}));
         assert_eq!((c, o.as_str()), (95, ""));
         assert!(e.contains("허용하지 않음"));
+    }
+
+    /// RULINGS DA6: `cys repair status <R>` names a corrupt record in its normal output (not only
+    /// with `--json`).
+    #[test]
+    fn status_prints_the_corrupt_diagnosis() {
+        let rpc = |_m: &str, _p: Value| -> Result<Value, String> {
+            Ok(json!({"repair": "R-7", "corrupt": "repairs/R-7/record.json: not JSON (line 1)"}))
+        };
+        let cmd = parse(&["status", "R-7"]).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(run_with(&cmd, &mut out, &mut Vec::new(), &rpc), 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("R-7")
+                && text.contains("읽을 수 없습니다")
+                && text.contains("not JSON (line 1)"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("시도"),
+            "the empty fields of a readable record were printed: {text}"
+        );
     }
 
     /// O-C3-6 exit mapping (+ Z1), the old-daemon sentence, an unreachable daemon → 98, and a

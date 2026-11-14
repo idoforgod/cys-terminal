@@ -1238,6 +1238,137 @@ mod ledger_verbs {
         Q.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
+    /// RULINGS DJ2 / ED2 — test seams of `report` (test builds only), keyed by signature: the
+    /// PAUSE holds one signature's report INSIDE the step the fix made atomic — after the hour's
+    /// room was observed and before the place is taken, with the quota mutex held — until the test
+    /// opens it (bounded: 20 s); the PROBE tells the test, for another signature, whether the
+    /// quota mutex is held at the moment that report is about to take it (never blocking).
+    #[cfg(test)]
+    pub(crate) struct IntakeSeam {
+        pause_sig: String,
+        probe_sig: String,
+        state: Mutex<(bool, bool, Option<bool>)>, // (arrived, open, probe: quota mutex held?)
+        cv: std::sync::Condvar,
+    }
+
+    #[cfg(test)]
+    static INTAKE_SEAM: Mutex<Option<std::sync::Arc<IntakeSeam>>> = Mutex::new(None);
+
+    #[cfg(test)]
+    impl IntakeSeam {
+        /// Waits until the held report reached the pause (bounded).
+        pub(crate) fn wait_arrived(&self, within: std::time::Duration) -> bool {
+            let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (g, _) = self
+                .cv
+                .wait_timeout_while(g, within, |s| !s.0)
+                .unwrap_or_else(|e| e.into_inner());
+            g.0
+        }
+        /// Waits for the probe's answer (bounded): `Some(true)` = the quota mutex was held.
+        pub(crate) fn wait_probe(&self, within: std::time::Duration) -> Option<bool> {
+            let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (g, _) = self
+                .cv
+                .wait_timeout_while(g, within, |s| s.2.is_none())
+                .unwrap_or_else(|e| e.into_inner());
+            g.2
+        }
+        /// Lets the held report go on.
+        pub(crate) fn open(&self) {
+            self.state.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
+            self.cv.notify_all();
+        }
+    }
+
+    /// Installs the seams: `pause_sig` is held at the pause, `probe_sig` answers the probe.
+    #[cfg(test)]
+    pub(crate) fn intake_seam_install(
+        pause_sig: &str,
+        probe_sig: &str,
+    ) -> std::sync::Arc<IntakeSeam> {
+        let s = std::sync::Arc::new(IntakeSeam {
+            pause_sig: pause_sig.to_string(),
+            probe_sig: probe_sig.to_string(),
+            state: Mutex::new((false, false, None)),
+            cv: std::sync::Condvar::new(),
+        });
+        *INTAKE_SEAM.lock().unwrap_or_else(|e| e.into_inner()) = Some(s.clone());
+        s
+    }
+
+    /// Removes the seams.
+    #[cfg(test)]
+    pub(crate) fn intake_seam_clear() {
+        *INTAKE_SEAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    #[cfg(test)]
+    fn intake_seam() -> Option<std::sync::Arc<IntakeSeam>> {
+        INTAKE_SEAM
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn intake_seam_pause(sig: &str) {
+        let Some(s) = intake_seam().filter(|s| s.pause_sig == sig) else {
+            return;
+        };
+        let mut g = s.state.lock().unwrap_or_else(|e| e.into_inner());
+        g.0 = true;
+        s.cv.notify_all();
+        let _ =
+            s.cv.wait_timeout_while(g, std::time::Duration::from_secs(20), |st| !st.1)
+                .unwrap_or_else(|e| e.into_inner());
+    }
+
+    #[cfg(test)]
+    fn intake_seam_probe(sig: &str) {
+        let Some(s) = intake_seam().filter(|s| s.probe_sig == sig) else {
+            return;
+        };
+        let held = matches!(
+            intake_quota().try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        s.state.lock().unwrap_or_else(|e| e.into_inner()).2 = Some(held);
+        s.cv.notify_all();
+    }
+
+    /// RULINGS DA2: takes one place in this lane's hour of new signatures if there is room — the
+    /// check and the take are ONE step under the quota mutex (ED2: the test's pause sits inside
+    /// it). `false` = the hour is full.
+    fn reserve_intake(key: &(PathBuf, String), now: f64, sig: &str) -> bool {
+        #[cfg(test)]
+        intake_seam_probe(sig);
+        #[cfg(not(test))]
+        let _ = sig;
+        let mut q = intake_quota().lock().unwrap_or_else(|e| e.into_inner());
+        let e = q.entry(key.clone()).or_default();
+        while e.0.front().is_some_and(|t| now - *t > 3600.0) {
+            e.0.pop_front();
+        }
+        if e.0.len() >= intake::INTAKE_NEW_SIGNATURES_PER_HOUR {
+            return false;
+        }
+        #[cfg(test)]
+        intake_seam_pause(sig); // ED2: between observing room and taking it, the mutex held
+        e.0.push_back(now);
+        true
+    }
+
+    /// RULINGS DA2: gives back a place taken by [`reserve_intake`] (the row was not written).
+    fn release_intake(key: &(PathBuf, String), now: f64) {
+        let mut q = intake_quota().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = q.get_mut(key) {
+            if let Some(i) = e.0.iter().rposition(|t| *t == now) {
+                e.0.remove(i);
+            }
+        }
+    }
+
     pub(crate) fn intake_over_quota(ctx: &Ctx<'_>) -> u64 {
         let q = intake_quota().lock().unwrap_or_else(|e| e.into_inner());
         q.get(&(ctx.root.clone(), ctx.lane.0.clone()))
@@ -1271,27 +1402,37 @@ mod ledger_verbs {
         let rep = intake::parse_report(file, error)
             .map_err(|e| VerbError::invalid(VerbError::from(e).message))?;
         let key = (ctx.root.clone(), ctx.lane.0.clone());
-        let new_in_hour = {
-            let mut q = intake_quota().lock().unwrap_or_else(|e| e.into_inner());
-            let e = q.entry(key.clone()).or_default();
-            while e.0.front().is_some_and(|t| ctx.now - *t > 3600.0) {
-                e.0.pop_front();
-            }
-            e.0.len()
-        };
         let label = caller.label();
-        let outcome = ctx.locked(&format!("intake:{}", rep.signature), || {
-            intake::record_in(
+        // DA3: the row's read-modify-write under the BOUNDED lock of its signature (a fixed set —
+        // no map entry per request). DA2: whether the signature is new is read under that lock, and
+        // a new one RESERVES its place in the hour's quota in one step (check + take under the
+        // quota mutex); a write that fails returns the reservation.
+        let outcome = {
+            let _row_lock = super::intake_lock_for(&rep.signature);
+            let fresh = intake::excluded(&rep.rel, error, ctx.windows).is_none()
+                && intake::load_row(&intake::row_path_in(&ctx.root, &ctx.lane, &rep.signature))?
+                    .is_none();
+            let reserved = fresh && reserve_intake(&key, ctx.now, &rep.signature);
+            let room = if fresh && !reserved {
+                intake::INTAKE_NEW_SIGNATURES_PER_HOUR // no room: the record answers over quota
+            } else {
+                0
+            };
+            let r = intake::record_in(
                 &ctx.root,
                 &ctx.lane,
                 &rep,
                 &label,
                 ctx.now,
-                new_in_hour,
+                room,
                 ctx.windows,
                 error,
-            )
-        })?;
+            );
+            if reserved && !matches!(r, Ok(intake::Recorded::New(_))) {
+                release_intake(&key, ctx.now);
+            }
+            r?
+        };
         let mut out = json!({
             "signature": rep.signature,
             "rel": rep.rel,
@@ -1300,10 +1441,6 @@ mod ledger_verbs {
         });
         match outcome {
             intake::Recorded::New(row) | intake::Recorded::Updated(row) => {
-                if row.count == 1 {
-                    let mut q = intake_quota().lock().unwrap_or_else(|e| e.into_inner());
-                    q.entry(key).or_default().0.push_back(ctx.now);
-                }
                 out["accepted"] = json!(true);
                 out["count"] = json!(row.count);
             }
@@ -1536,6 +1673,30 @@ mod ledger_verbs {
         for rel in &files {
             target_rules(ctx, rel)?;
         }
+        // DA4 / ED3: one file named twice is one target; the sentence says what is known — one
+        // identity ("같은 파일입니다") or only the conservative rule (one file on some volumes)
+        for (i, a) in files.iter().enumerate() {
+            if let Some((b, how)) =
+                files[i + 1..]
+                    .iter()
+                    .find_map(|b| match super::same_now(&ctx.pack_dir, a, b) {
+                        super::Verdict::Different => None,
+                        v => Some((b, v)),
+                    })
+            {
+                return Err(VerbError::invalid(match how {
+                    super::Verdict::Same(super::Same::Identity | super::Same::Spelling) => {
+                        format!("{a} 와 {b} 는 같은 파일입니다 — 한 번만 지정하세요(RULINGS DA4)")
+                    }
+                    super::Verdict::Same(_) => format!(
+                        "{a} 와 {b} 는 볼륨에 따라 같은 파일일 수 있습니다(대소문자만 다르거나 ASCII 가 아닌 아직 없는 이름) — 한 수리에 함께 지정하지 마세요(RULINGS DJ1 · ED3)"
+                    ),
+                    super::Verdict::Different | super::Verdict::Unknown => format!(
+                        "{a} 와 {b} 가 같은 파일인지 확인할 수 없습니다(파일 시스템 조회 실패) — 한 수리에 함께 지정하지 마세요(RULINGS EG1)"
+                    ),
+                }));
+            }
+        }
         // T4 (C10 10.6 · AD6 replaced · AW8): the rule-document branch — a rule document (any
         // spelling that folds to one, also through `--joins`) starts only with a valid owner token.
         if let Some(v) = begin_rule_document(ctx, caller, p, trigger, &files, &hooks, joins, resolves)? {
@@ -1696,15 +1857,12 @@ mod ledger_verbs {
             if r.resolves == resolves && theirs == key {
                 continue; // a pick-up candidate (handled above)
             }
-            if let Some(shared) = key.iter().find(|k| theirs.contains(k)) {
-                return Err(VerbError::new(
-                    cys::repair::types::ERR_PRECONDITION,
-                    format!(
-                        "{shared}: 이 파일을 고치는 수리 {id} 가 이미 열려 있습니다(대상 파일 묶음 또는 --resolves 가 다릅니다) — `--joins {id}` 로 합류하거나, 같은 파일들({})로 `cys repair begin` 해서 그 수리를 이어받으세요. 한 파일에 열린 수리는 하나뿐입니다(RULINGS BJ5)",
-                        theirs.join(", "),
-                        id = r.id.as_str()
-                    ),
-                ));
+            // DA4 / DJ1: the same FILE, not the same spelling; for a name that does not exist yet
+            // the conservative key (ASCII case fold; one creating repair per folder for non-ASCII)
+            for k in key {
+                if let Some(why) = super::open_overlap(&ctx.pack_dir, k, &r) {
+                    return Err(VerbError::new(cys::repair::types::ERR_PRECONDITION, why));
+                }
             }
         }
         // A new repair — created ALREADY LOCKED through the ledger's seam (AD9 S1 / G1 "lock first"):
@@ -2078,6 +2236,13 @@ mod ledger_verbs {
             )));
         }
         cys::repair::types::parent_chain_link(&ctx.pack_dir, rel)?;
+        // DA1: the FILE decides — a name that is no rule document must not be another name of one
+        // (or of a locked file); a rule-document name goes through the owner's token (T4's branch).
+        if super::rule_document_name(rel).is_none() {
+            if let Some(why) = super::identity_refusal(&ctx.pack_dir, rel) {
+                return Err(VerbError::new(cys::repair::types::ERR_PRECONDITION, why));
+            }
+        }
         Ok(())
     }
 
@@ -2093,6 +2258,23 @@ mod ledger_verbs {
             .collect()
     }
 
+    /// RULINGS DA5 (O-C1-6 / O-C1-7): `commit` writes this lane's row; a row that exists but is
+    /// corrupt or of a newer schema is never overwritten — refused with the reason, bytes kept.
+    fn lane_row_readable(ctx: &Ctx<'_>, id: &RepairId) -> Result<(), VerbError> {
+        match ledger::read_lane_in(&ctx.root, id, &ctx.lane) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(VerbError::new(
+                cys::repair::types::ERR_CORRUPT,
+                format!(
+                    "{}: 이 부서의 수리 행({})을 읽을 수 없습니다(손상되었거나 더 새 형식) — 원본을 그대로 두고 확정하지 않습니다: {}",
+                    id.as_str(),
+                    ledger::lane_path_in(&ctx.root, id, &ctx.lane).display(),
+                    VerbError::from(e).message
+                ),
+            )),
+        }
+    }
+
     /// RULINGS AW3 (b) / (c) over a repair's file targets: no link / junction in a target's parent
     /// chain inside the lane's pack (the leaf may be a link — U2); with `states`, a `Link` state is
     /// refused when it points to a directory or into any lane's pack.
@@ -2103,6 +2285,13 @@ mod ledger_verbs {
     ) -> Result<(), VerbError> {
         for f in file_targets(rec) {
             cys::repair::types::parent_chain_link(&ctx.pack_dir, &f.rel)?;
+            // DA1: re-checked at `record` (and `commit`) — a target may have become another name of
+            // a rule document after `begin`; a rule-document repair is the owner's token route.
+            if rec.classification != Classification::RuleDocument {
+                if let Some(why) = super::identity_refusal(&ctx.pack_dir, &f.rel) {
+                    return Err(VerbError::new(cys::repair::types::ERR_PRECONDITION, why));
+                }
+            }
         }
         for (rel, st) in states.unwrap_or(&[]) {
             if let TargetState::Link { target } = st {
@@ -2699,6 +2888,9 @@ mod ledger_verbs {
                     format!("{}: 검증 서명이 고친 좌석의 것입니다 — 다른 좌석의 리뷰어1 서명이 필요합니다", id.as_str()),
                 ));
             }
+            // DA5: this lane's row must be absent or readable — a corrupt or newer-schema row is never
+            // overwritten (O-C1-6 / O-C1-7): refused BEFORE any state transition.
+            lane_row_readable(ctx, &id)?;
             path_rules(ctx, &rec, None)?;
             let states = current_states(ctx, &rec)?;
             path_rules(ctx, &rec, Some(states.as_slice()))?;
@@ -2724,6 +2916,7 @@ mod ledger_verbs {
             }
             path_rules(ctx, &rec, Some(states.as_slice()))?;
             cys::repair::boot_critical::refuse_identity_alias(&ctx.pack_dir, file_targets(&rec).map(|f| f.rel.as_str())).map_err(|why| VerbError::new(cys::repair::types::ERR_PRECONDITION, why))?; // RULINGS AW3 (d)
+            lane_row_readable(ctx, &id)?; // DA5
             if current_states(ctx, &rec)? != states {
                 return Err(VerbError::new(
                     "target_changed",
@@ -2844,7 +3037,24 @@ mod ledger_verbs {
                 }
             }
             let (version, pro) = pack_generation(&ctx.pack_dir);
-            let previous = ledger::read_lane_in(&ctx.root, &id, &ctx.lane).ok().flatten();
+            // DA5: read again — a row that became unreadable since step (3a) is left as it is
+            let previous = match ledger::read_lane_in(&ctx.root, &id, &ctx.lane) {
+                Ok(p) => p,
+                Err(e) => {
+                    warnings.push(format!(
+                        "이 부서의 수리 행을 읽을 수 없게 되어 그대로 두었습니다(덮어쓰지 않음) — {}",
+                        VerbError::from(e).message
+                    ));
+                    return Ok(reply(ctx, &rec, json!({
+                        "committed": committed,
+                        "audit_due_at": rec.audit_due_at,
+                        "hook_step": if !has_hooks { json!(null) } else if let Some(e) = &step_error { json!({"error": e}) } else { json!("ok") },
+                        "superseded": superseded.iter().map(|r| r.as_str().to_string()).collect::<Vec<_>>(),
+                        "warnings": warnings,
+                        "lane_row": "unreadable",
+                    })));
+                }
+            };
             let mut applied_history = previous.as_ref().map(|r| r.applied_history.clone()).unwrap_or_default();
             if let Some(prev) = &previous {
                 if !prev.applied.is_empty() && prev.applied != committed {
@@ -4041,6 +4251,336 @@ pub(crate) fn mark_app_typing(prompts: &Mutex<HashMap<u64, PromptOrigin>>, seat:
         .entry(seat)
         .or_default()
         .typing_mark = Some(at);
+}
+
+/// RULINGS DA3: how many intake locks exist — a FIXED number, whatever the callers report.
+pub(crate) const INTAKE_LOCK_SHARDS: usize = 16;
+
+/// RULINGS DA3 — the bounded intake lock: one of [`INTAKE_LOCK_SHARDS`] process-wide mutexes,
+/// chosen by the signature (a refused or unique report adds no entry to any map). Every
+/// read-modify-write of an intake row runs under the lock of its signature; the hour's quota is
+/// reserved separately and atomically (DA2). The ONE entry point for every intake writer: the
+/// `report` verb and the repeated-failure detector (`alerts.rs`, unit T3e). Poison is tolerated.
+pub(crate) fn intake_lock_for(signature: &str) -> std::sync::MutexGuard<'static, ()> {
+    static SHARDS: [Mutex<()>; INTAKE_LOCK_SHARDS] = [const { Mutex::new(()) }; INTAKE_LOCK_SHARDS];
+    SHARDS[intake_shard_of(signature)]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Which of the [`INTAKE_LOCK_SHARDS`] intake locks a signature takes (stable within a process).
+pub(crate) fn intake_shard_of(signature: &str) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    signature.hash(&mut h);
+    (h.finish() % INTAKE_LOCK_SHARDS as u64) as usize
+}
+
+/// RULINGS DA1 — what decides a target's class is the FILE, not its spelling. For a target outside
+/// the rule-document route (its name is no rule document — those go through the owner's token,
+/// T4), `Some(reason)` when its live file is: (c) a leaf link whose target lies in a pack or is a
+/// folder (a link is another name of its target — the AW3 (c) rule, applied to the live leaf); (a)
+/// the same file (volume + file id) as one of the pack's protected names it can list — the
+/// `SYSTEM_LOCKED` files and the rule documents of the pack root and `directives/`; (b) a file with
+/// more than one name (hard links): rule documents named `*_DIRECTIVE.md` may lie anywhere in the
+/// pack and cannot all be listed, so a second name is refused conservatively. An absent target
+/// has no identity to compare (`None`). `boot_critical::refuse_identity_alias` (T5a) covers the
+/// two compiled lists in the classification.
+pub(crate) fn identity_refusal(pack: &Path, rel: &str) -> Option<String> {
+    use cys::repair::boot_critical::file_identity;
+    use cys::repair::types::{fold_name, link_count, link_target_refusal};
+    let live = pack.join(rel);
+    let meta = std::fs::symlink_metadata(&live).ok()?;
+    if meta.file_type().is_symlink() {
+        if let Ok(t) = std::fs::read_link(&live) {
+            if let Some(why) = link_target_refusal(pack, rel, &t.to_string_lossy()) {
+                return Some(why);
+            }
+        }
+    }
+    let id = file_identity(&live)?;
+    let key = fold_name(&rel.replace('\\', "/"));
+    for name in protected_names(pack) {
+        if fold_name(&name) != key && file_identity(&pack.join(&name)) == Some(id) {
+            // DJ3: the way that exists for the protected file — the key file has none but pack-heal
+            if let Some(locked) = cys::repair::types::system_locked_entry(&name) {
+                return Some(format!(
+                    "{rel}: 서명 키 파일 `{locked}` 과 같은 파일입니다(하드 링크 등 같은 파일의 다른 이름) — 서명 키 파일은 어떤 이름으로도 수리 대상이 아닙니다. 사본이 손상됐다면 `cys pack-heal {locked}` 로 내장본을 되살립니다(RULINGS AU4 · DA1)"
+                ));
+            }
+            return Some(format!(
+                "{rel}: 규칙 문서 `{name}` 과 같은 파일입니다(하드 링크 등 같은 파일의 다른 이름) — 규칙 문서는 그 이름 `{name}` 으로, 주인 지시 표가 있을 때만 고칩니다(RULINGS DA1)"
+            ));
+        }
+    }
+    if std::fs::metadata(&live).is_ok_and(|m| m.is_file()) {
+        if let Some(n) = link_count(&live).filter(|n| *n > 1) {
+            return Some(format!(
+                "{rel}: 이름이 {n}개인 파일입니다(하드 링크) — 규칙 문서의 다른 이름일 수 있어 수리 대상으로 받지 않습니다(RULINGS DA1)"
+            ));
+        }
+    }
+    None
+}
+
+/// RULINGS DA1: the protected names DA1 can list in a pack — its `SYSTEM_LOCKED` files and the
+/// rule documents (by [`rule_document_name`]) of the pack root and of `directives/`.
+fn protected_names(pack: &Path) -> Vec<String> {
+    let mut out: Vec<String> = cys::repair::types::system_locked_names()
+        .iter()
+        .map(|n| n.to_string())
+        .collect();
+    for dir in ["", "directives"] {
+        let Ok(rd) = std::fs::read_dir(pack.join(dir)) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if rule_document_name(&name).is_some() {
+                out.push(if dir.is_empty() {
+                    name
+                } else {
+                    format!("{dir}/{name}")
+                });
+            }
+        }
+    }
+    out
+}
+
+/// How two targets are one file (RULINGS DA4 / ED1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Same {
+    /// both live files exist and have one identity (volume + file id)
+    Identity,
+    /// the same spelling
+    Spelling,
+    /// not-yet-existing tails under one existing folder, equal after ASCII case folding
+    CaseFold,
+    /// not-yet-existing tails under one existing folder, one of them holding a non-ASCII character
+    NonAscii,
+}
+
+/// RULINGS EG1 — the answer of comparing two targets: SAME (how), DIFFERENT (only on positive
+/// evidence), or UNKNOWN (a lookup failed or could not be made) — and UNKNOWN refuses like SAME.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    Same(Same),
+    Different,
+    Unknown,
+}
+
+/// RULINGS EG1 — one file-system lookup with three answers: the path EXISTS (its identity:
+/// volume + file id, links followed), is ABSENT (the system said it is not there), or UNKNOWN
+/// (any other failure — never evidence of anything).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lookup {
+    Exists((u64, u64)),
+    Absent,
+    Unknown,
+}
+
+/// RULINGS EG1 — the identity of `path` now ([`Lookup`]); directories included.
+pub(crate) fn identity_now(path: &Path) -> Lookup {
+    #[cfg(test)]
+    if lookup_fails(path) {
+        return Lookup::Unknown;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(path) {
+            Ok(m) => Lookup::Exists((m.dev(), m.ino())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Lookup::Absent,
+            Err(_) => Lookup::Unknown,
+        }
+    }
+    #[cfg(windows)]
+    {
+        // RULINGS EG2: an open that permits DIRECTORIES (FILE_FLAG_BACKUP_SEMANTICS, no data
+        // access), then the same by-handle facts as `boot_critical::file_identity` (volume serial,
+        // 64-bit file index) — so a folder's identity is read and the usual case is decided.
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let f = match std::fs::OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Lookup::Absent,
+            Err(_) => return Lookup::Unknown,
+        };
+        // SAFETY: a zeroed BY_HANDLE_FILE_INFORMATION is a valid out-parameter; the handle is
+        // owned by `f`, which outlives the call.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) } == 0 {
+            return Lookup::Unknown;
+        }
+        Lookup::Exists((
+            u64::from(info.dwVolumeSerialNumber),
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Lookup::Unknown
+    }
+}
+
+/// Test builds only: paths whose lookup a test makes FAIL (an injected failure — no platform
+/// trick), exact paths as the daemon builds them.
+#[cfg(test)]
+static LOOKUP_FAILS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn lookup_fail_install(path: &Path) {
+    LOOKUP_FAILS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(path.to_path_buf());
+}
+
+#[cfg(test)]
+pub(crate) fn lookup_fail_clear(path: &Path) {
+    LOOKUP_FAILS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|p| p != path);
+}
+
+#[cfg(test)]
+fn lookup_fails(path: &Path) -> bool {
+    LOOKUP_FAILS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|p| p == path)
+}
+
+/// RULINGS ED1 / EG1: a target resolved against the file system NOW — `Some((identity of its
+/// deepest EXISTING ancestor — the target itself when it exists, not-yet-existing tail))`; walking
+/// up passes only paths the system says are ABSENT. `None` = UNKNOWN: a lookup failed (or not
+/// even the pack root exists) — never "absent".
+fn resolve_now(pack: &Path, rel: &str) -> Option<((u64, u64), Vec<String>)> {
+    let parts: Vec<&str> = rel
+        .split(['/', '\\'])
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    for k in (0..=parts.len()).rev() {
+        let path = parts[..k]
+            .iter()
+            .fold(pack.to_path_buf(), |acc, c| acc.join(c));
+        match identity_now(&path) {
+            Lookup::Exists(id) => {
+                return Some((id, parts[k..].iter().map(|s| s.to_string()).collect()))
+            }
+            Lookup::Absent => continue,
+            Lookup::Unknown => return None,
+        }
+    }
+    None
+}
+
+/// RULINGS DA4 / ED1 / EG1 — ONE comparison, made NOW, for both targets. SAME when (i) both exist
+/// and have one identity, or (ii) they share the deepest existing ancestor and their
+/// not-yet-existing tails are equal after ASCII case folding — a tail holding ANY non-ASCII
+/// character equals every other tail under that ancestor (no normalisation library — RULINGS
+/// CD1). DIFFERENT only on positive evidence: two identities read and unequal; one target exists
+/// and the other does not; two different deepest ancestors read; one ancestor and unequal ASCII
+/// tails. Every failed lookup → UNKNOWN. Hook lines (`settings:…`) compare only with hook lines.
+pub(crate) fn same_now(pack: &Path, a: &str, b: &str) -> Verdict {
+    let hook = |s: &str| s.starts_with("settings:");
+    if hook(a) || hook(b) {
+        return if !(hook(a) && hook(b) && a.eq_ignore_ascii_case(b)) {
+            Verdict::Different
+        } else if a == b {
+            Verdict::Same(Same::Spelling)
+        } else {
+            Verdict::Same(Same::CaseFold)
+        };
+    }
+    if a == b {
+        return Verdict::Same(Same::Spelling);
+    }
+    let (Some(ra), Some(rb)) = (resolve_now(pack, a), resolve_now(pack, b)) else {
+        return Verdict::Unknown;
+    };
+    match (ra.1.is_empty(), rb.1.is_empty()) {
+        (true, true) if ra.0 == rb.0 => Verdict::Same(Same::Identity),
+        (true, true) => Verdict::Different,
+        (true, false) | (false, true) => Verdict::Different,
+        (false, false) if ra.0 != rb.0 => Verdict::Different,
+        (false, false) => {
+            if ra.1.iter().chain(rb.1.iter()).any(|c| !c.is_ascii()) {
+                Verdict::Same(Same::NonAscii)
+            } else if ra.1.len() == rb.1.len()
+                && ra
+                    .1
+                    .iter()
+                    .zip(&rb.1)
+                    .all(|(x, y)| x.eq_ignore_ascii_case(y))
+            {
+                Verdict::Same(Same::CaseFold)
+            } else {
+                Verdict::Different
+            }
+        }
+    }
+}
+
+/// [`same_now`] as a yes / no (the tests' shorthand; the verbs use `same_now` for its sentence):
+/// `true` for SAME and for UNKNOWN (both refuse).
+#[cfg(test)]
+pub(crate) fn same_target(pack: &Path, a: &str, b: &str) -> bool {
+    same_now(pack, a, b) != Verdict::Different
+}
+
+/// RULINGS DA4 / ED1 / EG1 — the refusal sentence when the new target `new` may be, NOW, the
+/// same file as a target of the being-worked repair `rec` of this lane ([`same_now`]), or
+/// `None` (DIFFERENT for every target). The sentence says what is known: one identity / one
+/// spelling → BJ5's sentence; the conservative rule → a conditional sentence; UNKNOWN → it
+/// could not be determined.
+pub(crate) fn open_overlap(
+    pack: &Path,
+    new: &str,
+    rec: &cys::repair::ledger::RepairRecord,
+) -> Option<String> {
+    let id = rec.id.as_str();
+    let theirs: Vec<&str> = rec.files.iter().map(|f| f.rel.as_str()).collect();
+    for t in &theirs {
+        match same_now(pack, new, t) {
+            Verdict::Different => continue,
+            Verdict::Same(Same::Identity | Same::Spelling) => {
+                return Some(format!(
+                    "{new}: 이 파일을 고치는 수리 {id} 가 이미 열려 있습니다(대상 파일 묶음 또는 --resolves 가 다릅니다) — `--joins {id}` 로 합류하거나, 같은 파일들({})로 `cys repair begin` 해서 그 수리를 이어받으세요. 한 파일에 열린 수리는 하나뿐입니다(RULINGS BJ5)",
+                    theirs.join(", ")
+                ))
+            }
+            Verdict::Same(Same::CaseFold) => {
+                return Some(format!(
+                    "{new}: 수리 {id} 가 연 `{t}` 와 대소문자만 다른 이름입니다 — 대소문자만 다른 이름은 볼륨에 따라 같은 파일이라 동시에 열지 않습니다. 먼저 열린 수리 {id} 가 끝난 뒤 다시 하세요(RULINGS DJ1 · ED1)"
+                ))
+            }
+            Verdict::Same(Same::NonAscii) => {
+                return Some(format!(
+                    "{new}: 아직 없는 이름이 ASCII 가 아닌 글자를 담고 있어, 같은 폴더 아래의 수리 {id} 대상 `{t}` 와 볼륨에 따라 같은 파일일 수 있습니다(정규화 형식만 다른 이름을 가릴 수 없음) — {id} 가 끝난 뒤 다시 하세요(RULINGS ED1)"
+                ))
+            }
+            Verdict::Unknown => {
+                return Some(format!(
+                    "{new}: 수리 {id} 의 대상 `{t}` 와 같은 파일인지 확인할 수 없습니다(파일 시스템 조회 실패) — 같은 파일일 수 있어 {id} 가 끝난 뒤 다시 하세요(RULINGS EG1)"
+                ))
+            }
+        }
+    }
+    None
 }
 
 /// C10's rule-document base names (as `guard.sh:PROTECTED_NAMES`), lower-cased.
