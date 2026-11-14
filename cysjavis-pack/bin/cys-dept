@@ -2369,6 +2369,11 @@ def read_intent(md):
             or not isinstance(rec.get("kept_report"), list) or any(not isinstance(k, str) for k in rec["kept_report"])
             or not isinstance(rec.get("done", {}), dict)):
         return "bad"
+    owed = rec.get("owed", [])
+    if (not isinstance(owed, list) or not isinstance(rec.get("closing", False), bool)
+            or any(not (isinstance(o, dict) and all(isinstance(o.get(k), str) for k in ("key", "title", "body"))
+                        and re.fullmatch(r"[0-9a-f]{32}", o["key"])) for o in owed)):
+        return "bad"
     if rec["step"] != "run":
         sw = rec.get("swap")
         if (not isinstance(sw, dict) or sw.get("purpose") not in ("op", "restore")
@@ -2647,30 +2652,54 @@ def settle(md, rec, nf, ksha):
 def two_edits(md, rec, nf, earlier):
     """읽은 뒤의 저장(보관 폴더의 earlier)과 그 뒤의 저장(살아 있다)이 겹쳤다 — 둘 다 남기고 보류(동작 끝 · 기록 제거 · 알림 1건)."""
     err("CEO 지침 교체 보류: 교체 뒤 살아 있는 지침도 저장됐다 — 두 판을 합치지 않는다(앞의 판: %s)" % earlier)
-    ok = note(T_TWO_EDITS, "본부 지침을 바꾸는 동안 저장이 두 번 겹쳤습니다. 지금 살아 있는 지침(나중 저장)은 그대로 두었고, "
+    note(T_TWO_EDITS, "본부 지침을 바꾸는 동안 저장이 두 번 겹쳤습니다. 지금 살아 있는 지침(나중 저장)은 그대로 두었고, "
                           "앞의 저장은 %s 에 그대로 보관했습니다 — 자동으로 합치지 않습니다. 앞의 판의 내용이 필요하면 오너 "
                           "지시로 워커가 본문에 옮기십시오." % earlier)
-    close_record(md, rec, nf, notices=False, ok=ok)
+    close_record(md, rec, nf, notices=False)
     raise HoldSwap("two edits")
 
 
-def close_record(md, rec, nf, notices=True, ok=True):
-    """★FL4·FY3 — 동작이 끝났다(완료 또는 보류): 기록에 남긴 알림을 영속 알림함에 **먼저** 넣고(키 = 동작의 정체 op:<id>), 보관
-    경로를 돌려준 뒤 기록을 지운다(마지막 걸음). 알림 하나라도 알림함에 넣지 못했으면(ok=False 포함) 기록을 지우지 않는다 — 알림은
-    기록에 남고 다음 입구가 다시 넣은 뒤 지운다(그동안 새 동작은 시작하지 않는다 · stderr + preflight 기록 행). 돌려주는 값 =
-    기록을 지웠다(True) | 남겼다(False)."""
+def close_record(md, rec, nf, notices=True):
+    """★FL4·FY3·GQ1 — 동작이 끝났다(완료 또는 보류): 기록에 남긴 알림을 영속 알림함에 **먼저** 넣고(키 = 동작의 정체 op:<id>),
+    보관 경로를 돌려준 뒤 기록을 지운다(마지막 걸음). 알림함에 넣는 일의 답은 동작의 결과다: 이 실행에서 넣지 못한 알림이 하나라도
+    있으면(기록의 알림이든, 계획·보류가 낸 알림이든) 기록을 지우지 않는다 — 그 알림을 키와 함께 기록에 담아(owed · closing) 그 단계
+    그대로 남기고, 다음 입구와 틱(기록이 있으면 늘 돈다)이 한 실행에 한 번 다시 넣은 뒤 지운다(되풀이 없음 · 부서 켜기는 막지
+    않는다). 기록이 디스크에 없던 보류면 담을 기록이 없다 — stderr 만. 돌려주는 값 = 기록을 지웠다(True) | 남겼다(False)."""
     if notices:
         for t, b in rec.get("notices") or []:
-            ok = note(t, b, about="op:%s" % rec["id"]) and ok
+            note(t, b, about="op:%s" % rec["id"])
     for k in rec.get("kept_report") or []:
         note_kept(nf, k)
-    if not ok:
-        err("CEO 지침: 알림을 알림함에 넣지 못해 동작 기록(%s)을 남겼다 — 다음 입구가 다시 넣고 지운다" % intent_path(md))
+    owed = take_unpublished()
+    if owed and rec.get("_disk"):
+        keep_owed(md, rec, owed)
         return False
+    if owed:
+        err("CEO 지침: 기록이 없는 보류의 알림 %d건을 알림함에 넣지 못했다 — 같은 상태면 다음 입구가 다시 낸다" % len(owed))
     if rec.get("_disk"):
         remove_intent(md)
         rec["_disk"] = False
     return True
+
+
+def keep_owed(md, rec, owed):
+    """★GQ1 — 알림함에 넣지 못한 알림을 기록에 담아 기록을 남긴다(단계는 그대로 · closing = 동작은 끝났고 알림만 남았다)."""
+    have = {o["key"] for o in rec.get("owed") or []}
+    rec["owed"] = list(rec.get("owed") or []) + [o for o in owed if o["key"] not in have]
+    rec["closing"] = True
+    err("CEO 지침: 알림 %d건을 알림함에 넣지 못해 동작 기록(%s)을 남겼다 — 다음 입구·틱이 다시 넣고 지운다"
+        % (len(rec["owed"]), intent_path(md)))
+    try:
+        save_record(md, rec)
+    except OSError as e:
+        err("그 알림을 기록에 담지도 못했다(%s) — 기록은 그대로 남아 다음 입구가 그 단계에서 다시 낸다" % e)
+
+
+def publish_owed(md, rec):
+    """★GQ1 — 남은 기록이 빚진 알림을 (한 실행에 한 번) 알림함에 넣는다. 다 넣었으면 True."""
+    ok = all([publish_notice(md, o["key"], o["title"], o["body"]) for o in rec.get("owed") or []])
+    take_unpublished()                  # 기록이 이미 담고 있다
+    return ok
 
 
 def complete(md, rec, nf):
@@ -2748,11 +2777,11 @@ def run_record(md, nf, rec, args, until_run=False):
             return None
         if attempts >= SWAP_ATTEMPTS:
             err("CEO %s 보류: 본부 지침이 %d번 연달아 읽은 뒤에 바뀌었다 — %s 을(를) 마치지 않았다" % (action, SWAP_ATTEMPTS, action))
-            ok = note(changing, "본부 지침의 CEO %s을(를) 하는 동안 지침이 %d번 연달아 저장되어(편집 중) %s을(를) 마치지 않고 "
+            note(changing, "본부 지침의 CEO %s을(를) 하는 동안 지침이 %d번 연달아 저장되어(편집 중) %s을(를) 마치지 않고 "
                                "보류했습니다. 살아 있는 지침은 마지막으로 저장된 판이고, 그 사이 살아 있던 판들은 보관 폴더 %s 에 "
                                "있습니다(지우지 않았습니다). 편집을 마치면 다음 승격 확인 때 다시 합니다."
                                % (action, SWAP_ATTEMPTS, action, kept_dir(md)))
-            close_record(md, rec, nf, ok=ok)
+            close_record(md, rec, nf)
             raise HoldSwap("changing", 9)
         if attempts:
             err("CEO %s: 읽은 뒤에 지침이 저장됐다 — 다시 읽어 처음부터 한다(%d/%d)" % (action, attempts, SWAP_ATTEMPTS))
@@ -2778,6 +2807,14 @@ def close_intent(md, nf, op=None, args=None):
     park_unnamed_candidates(md, named)      # ★FL2 — 기록이 이름 대지 않는 후보는 보관 폴더로(지우지 않는다)
     if rec is None:
         return None, None, None
+    if rec.get("closing"):
+        # ★GQ1: 동작은 끝났고(완료·보류) 알림만 남았다 — 한 번 넣어 보고, 다 들어가면 기록을 지운다(마지막 걸음)
+        if publish_owed(md, rec):
+            remove_intent(md)
+            return None, None, rec["op"]
+        err("CEO 지침 보류: 끝난 동작의 알림을 아직 알림함에 넣지 못했다 — 기록(%s)을 그대로 두고 다음 입구가 다시 한다"
+            % intent_path(md))
+        raise HoldSwap("owed notices still unpublished")
     rc = run_record(md, nf, rec, rec["args"], until_run=(op == rec["op"]))
     if rc is None:
         return rec, None, rec["op"]
@@ -2950,30 +2987,52 @@ def note(title, body, about=None):
     못하면 stderr 한 줄(★CG2: 이미 끝난 교체의 결과는 그대로 · 기록이 있으면 preflight 기록 행이 그 상태를 보인다). 돌려주는 값 =
     알림함(또는 sent/)에 있다(True) | 넣지 못했다(False)."""
     md = _CTX["md"]
-    clean = lambda t: t.replace("\t", " ").replace("\r", " ").replace("\n", " ")
     if md is None:
         err("알림 기록 실패(본부 지침을 모른다 — 알림함을 정할 수 없다): %s" % title)
         return False
+    return publish_notice(md, notice_key(title, about if about is not None else notice_about(md)), title, body)
+
+
+_UNPUBLISHED = []
+
+
+def notice_key(title, about):
+    """알림의 안정된 키 — 제목 + 그 알림이 다루는 것."""
+    return sha(("%s\0%s" % (title, about)).encode("utf-8"))[:32]
+
+
+def publish_notice(md, key, title, body):
+    """★FY3·GQ1 — 키 하나의 알림을 영속 알림함에 통째 파일로 놓는다(이미 알림함·sent/ 에 있으면 그대로 True). 넣지 못하면 stderr
+    한 줄과 함께 그 알림(키·제목·본문)을 이 실행의 '못 넣은 알림'에 남긴다 — 동작 기록은 그것을 담은 채 지워지지 않는다(close_record).
+    돌려주는 값 = 알림함(또는 sent/)에 있다(True) | 넣지 못했다(False)."""
+    clean = lambda t: t.replace("\t", " ").replace("\r", " ").replace("\n", " ")
     box = outbox_dir(md)
+    name = key + ".notice"
     try:
-        key = sha(("%s\0%s" % (title, about if about is not None else notice_about(md))).encode("utf-8"))[:32]
-        name = key + ".notice"
         if present(os.path.join(box, name)) or present(os.path.join(box, "sent", name)):
             return True
         fs_mkdir(box)
         tmp = write_temp(os.path.join(box, name), ("%s\n%s\n" % (clean(title), clean(body))).encode("utf-8"))
         try:
             fs_rename_into(tmp, os.path.join(box, name))   # 덮지 않는 한 번의 이름 바꾸기 — 알림함의 이름은 이 잠금 아래의 우리만 만든다
+        except FileExistsError:
+            silent_unlink(tmp)
+            return True                 # 같은 키가 이미 놓였다(같은 알림)
         except BaseException:
             silent_unlink(tmp)
             raise
         fs_sync_dir(box)
         return True
-    except FileExistsError:
-        return True
     except (OSError, ValueError, Unknown) as e:
         err("알림 기록 실패(알림함 %s: %s) — 결과는 그대로다: %s" % (box, e, title))
+        _UNPUBLISHED.append({"key": key, "title": clean(title), "body": clean(body)})
         return False
+
+
+def take_unpublished():
+    out = list(_UNPUBLISHED)
+    del _UNPUBLISHED[:]
+    return out
 
 
 def note_kept(nf, kept):
@@ -3173,6 +3232,7 @@ def locked_attempts(md, nf, op, args, busy_title, action):
     완료나 보류까지 한다(run_record — 읽은 뒤의 저장은 되돌린 뒤 다시 계획 · 시도 유한). 잠금을 못 잡으면 rc 8, 원본이 계속
     바뀌면 rc 9, 보류 rc 6 — 셋 다 알림 1건 · 호출부는 0 으로 끝난다."""
     use_md(md)
+    take_unpublished()
     try:
         lk = take_lock(md)
     except LockBusy:
@@ -3443,6 +3503,7 @@ def do_recover(a):
     md = a[0]
     nf = a[1] if len(a) > 1 else ""
     use_md(md)
+    take_unpublished()
     try:
         if not present(intent_path(md)):
             return 0

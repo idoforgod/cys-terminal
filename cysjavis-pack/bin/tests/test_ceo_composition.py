@@ -2093,6 +2093,41 @@ class DurableOutbox(Rig):
         rc, out, err = self.run_dept("promote-ceo")
         self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), 1, "닫은 알림이 같은 기록에 다시 나왔다")
 
+    def test_an_unpublished_hold_notice_keeps_its_record_until_published(self):
+        """★GQ1(codex M1) — 알림함에 넣는 일의 답은 동작의 결과다. 바꾸기 기록을 남긴 뒤 맞바꾸기 전에 멈춤 → 빈 지침이 경로로 저장됨
+        → 알림함을 쓸 수 없다 → 복구(틱)가 쓰이지 않은 후보를 보관하고 다시 계획해 보류하는데, 종전에는 그 보류 알림의 '넣지 못함'을
+        무시하고 기록을 닫아 지웠다 — 승격 대기 표지도 없으니 그 알림을 다시 낼 것이 남지 않았다. 이제 기록은 그 알림을 담은 채 남고,
+        알림함이 다시 쓰이면 다음 틱이 알림을 넣은 뒤 기록을 닫는다."""
+        self.seed()
+        ns = ceo_py_module()
+        orig = ns["write_intent"]
+
+        def stop(*a, **kw):
+            orig(*a, **kw)
+            raise SystemExit("crash after the swap intent, before the exchange")
+        ns["write_intent"] = stop
+        with self.assertRaises(SystemExit):
+            ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), ""])
+        _write(self.p("MASTER_DIRECTIVE.md"), "")                          # 경로로 저장된 빈 지침
+        bad_box = os.path.join(self.tmp, "outbox-is-a-file")
+        _write(bad_box, "x\n")
+        os.environ["CYS_CEO_OUTBOX"] = bad_box
+        try:
+            self.assertEqual(ceo_py_module()["do_recover"]([self.p("MASTER_DIRECTIVE.md"), ""]), 0)
+        finally:
+            del os.environ["CYS_CEO_OUTBOX"]
+        self.assertFalse(os.path.exists(self.pending_path()), "시험 전제: 승격 대기 표지가 없다")
+        rec = json.loads(self.read(".ceo-intent.json") or "null")
+        self.assertIsNotNone(rec, "보류 알림이 알림함에 없는데 기록을 지웠다(codex M1)")
+        self.assertTrue(any(o["title"] == "CEO 승격 보류(본부 지침 확인 필요)" for o in rec.get("owed") or []),
+                        "기록이 넣지 못한 알림을 담고 있지 않다: %r" % rec)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), "", "보류인데 지침을 바꿨다")
+        self.tick()                                                         # 알림함이 다시 쓰인다 — 다음 틱
+        self.assertEqual(self.pushes("CEO 승격 보류(본부 지침 확인 필요)"), 1, "다음 틱이 그 알림을 내지 않았다")
+        self.assertIsNone(self.read(".ceo-intent.json"), "알림을 넣은 뒤에도 기록을 닫지 않았다")
+        self.tick()
+        self.assertEqual(self.pushes("CEO 승격 보류(본부 지침 확인 필요)"), 1, "같은 알림을 또 냈다")
+
     def test_the_record_is_removed_only_after_its_notices_are_in_the_outbox(self):
         """기록이 담은 알림(보관 사본 알림 — 그 동작의 정체가 키)이 알림함에 들어가지 못하면 기록은 지워지지 않는다(★FY3 i ·
         종전: 알림은 임시 파일에만 있었고 기록은 먼저 지워졌다). 알림함이 고쳐지면 다음 입구가 넣고 지운다."""
