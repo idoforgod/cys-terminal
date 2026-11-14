@@ -16,10 +16,13 @@
 
 실행: CYS_PACK_DIR="$(mktemp -d)" python3 cysjavis-pack/bin/tests/test_preflight_update_rules.py
 """
+import contextlib
+import io
 import json
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -211,11 +214,16 @@ class LedgerKinds(Rig):
             return [json.loads(line) for line in f]
 
     def delivered(self):
-        p = os.path.join(self.pack, "state", "merge-notice-delivered.json")
-        if not os.path.exists(p):
+        # ★T2i(RULINGS EC6): '보냄' 표지(지문마다 배타 생성) → {과제: 지문}.
+        d = os.path.join(self.pack, "state", "notice-marks")
+        if not os.path.isdir(d):
             return {}
-        with open(p, encoding="utf-8") as f:
-            return json.load(f)
+        out = {}
+        for n in os.listdir(d):
+            if n.endswith(".sent"):
+                task, fp, _s = n.rsplit(".", 2)
+                out[task] = fp
+        return out
 
     def test_parked_merge_task_one_key_per_parked_set(self):
         # ★r2(RULINGS AC7): 같은 보관 집합은 **한 번만** 적재한다(배달한 지문을 레인 상태에 둔다) — 종전 r1 은 매 점검마다
@@ -262,19 +270,23 @@ class LedgerKinds(Rig):
         self.run_check("c62_pack_heal_ledger", "C62")
         self.assertEqual(len([x for x in self.wakes(log) if "parked-merge" in x]), 2, "다음 점검이 다시 시도한다")
 
-    # ★T2h(RULINGS CW4 · 검토자 B4): 배달 기록을 남길 수 없어도 같은 알림이 매 점검 다시 가지 않는다 — 기록 자리가 폴더면
-    #   큐 옆 표지로 데몬 기동당 한 번만(세 번 점검 → 한 번). C68 의 기한 초과 알림도 같다.
+    # ★T2h(RULINGS CW4) → ★T2i(RULINGS EC6 — 기대가 바뀜): 알림 기록('보내는 중' 표지)을 남길 수 없으면 **적재하지 않는다**
+    #   (종전: 큐 옆 표지로 데몬 기동당 한 번 보냈다) — 쓸 수 없는 저장소에서 매 점검 되풀이 없음 · stderr 한 줄.
     def _store_unwritable(self):
-        os.makedirs(os.path.join(self.pack, "state", "merge-notice-delivered.json"), exist_ok=True)
+        os.makedirs(os.path.join(self.pack, "state"), exist_ok=True)
+        with open(os.path.join(self.pack, "state", "notice-marks"), "w") as f:
+            f.write("not a directory")
 
-    def test_parked_notice_store_unwritable_sent_at_most_once(self):
+    def test_parked_notice_store_unwritable_enqueues_nothing(self):
         log = self._wake_rig()
         self._store_unwritable()
         self.ledger({"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "version": "0.15.0", "ts": 1}})
-        for _ in range(3):
-            self.run_check("c62_pack_heal_ledger", "C62")
-        self.assertEqual(len([x for x in self.wakes(log) if "parked-merge" in x]), 1,
-                         "기록을 못 남겨도 데몬 기동당 한 번 — 매 점검 재전송 고리 없음")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for _ in range(3):
+                self.run_check("c62_pack_heal_ledger", "C62")
+        self.assertEqual([x for x in self.wakes(log) if "parked-merge" in x], [], "기록을 못 남기면 적재하지 않는다")
+        self.assertEqual(err.getvalue().count("알림 'parked-merge' 적재하지 않음"), 3, "점검마다 stderr 한 줄")
 
     def _stale_ledger(self):
         self.ledger({"hooks/b.sh": {"kind": "vendor-first", "side": "hooks/b.sh.user", "version": "0.15.0", "ts": 1}})
@@ -288,16 +300,17 @@ class LedgerKinds(Rig):
         self.assertEqual(len(w), 1, "같은 잔존 상태는 한 번만(배달 뒤 다시 적재하지 않는다)")
         self.assertIn("merge-review", self.delivered(), "지문이 레인 상태에 기록된다")
         st, detail = self.run_check("c68_merge_pending_age", "C68")
-        self.assertIn("wakeup enqueue 생략(같은 상태 이미 알림)", detail)
+        self.assertIn("wakeup 생략(같은 상태를 이미 보냈거나 다른 점검이 지금 보내는 중)", detail)
 
-    def test_c68_notice_store_unwritable_sent_at_most_once(self):
+    def test_c68_notice_store_unwritable_enqueues_nothing(self):
         log = self._wake_rig()
         self._store_unwritable()
         self._stale_ledger()
-        for _ in range(3):
-            self.run_check("c68_merge_pending_age", "C68")
-        self.assertEqual(len([x for x in self.wakes(log) if "merge-review" in x]), 1,
-                         "기록을 못 남겨도 데몬 기동당 한 번")
+        with contextlib.redirect_stderr(io.StringIO()):
+            for _ in range(3):
+                st, detail = self.run_check("c68_merge_pending_age", "C68")
+        self.assertEqual([x for x in self.wakes(log) if "merge-review" in x], [], "기록을 못 남기면 적재하지 않는다")
+        self.assertIn("wakeup 적재하지 않음(알림 기록을 남길 수 없음 — 기록 없이 보내면 매 점검 되풀이된다)", detail)
 
     def test_legacy_user_list_shown_once_per_set(self):
         log = self._wake_rig()
@@ -316,6 +329,134 @@ class LedgerKinds(Rig):
         self.ledger({"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "version": "0.15.0", "ts": 1}})
         self.run_check("c62_pack_heal_ledger", "C62", fix=False)
         self.assertEqual(self.wakes(log), [], "report 모드는 관찰만")
+
+
+class NoticeMarksRealQueue(Rig):
+    """★T2i(RULINGS EC6): 실제 큐(`javis_wakeup.py` enqueue)와 실제 drain(드라이런 — 배달 명령을 실행하지 않고 대기열을 비운다)으로
+    — 끼어들기 지점마다 · 두 점검의 엇갈림 · 쓸 수 없는 저장소. 시계는 `pf._notice_now` 를 바꿔 움직인다(잠 없음)."""
+
+    def setUp(self):
+        super().setUp()
+        self.ws = os.path.join(self.root, "ws")
+        os.makedirs(os.path.join(self.ws, "_round"), exist_ok=True)
+        os.environ["JAVIS_ROOT"] = self.ws
+        os.environ["JAVIS_WAKEUP_LIVENESS"] = "alive"
+        wk = os.path.join(self.pack, "bin")
+        os.makedirs(wk, exist_ok=True)
+        self.wakeup = os.path.join(wk, "javis_wakeup.py")
+        with open(self.wakeup, "w", encoding="utf-8") as f:
+            f.write("import runpy, sys\nsys.path.insert(0, %r)\nrunpy.run_path(%r, run_name='__main__')\n"
+                    % (BIN, os.path.join(BIN, "javis_wakeup.py")))
+        self.clock = [1_000_000.0]
+        real_now = pf._notice_now
+        pf._notice_now = lambda: self.clock[0]
+        self.addCleanup(setattr, pf, "_notice_now", real_now)
+
+    def queued(self):
+        d = os.path.join(self.ws, "_round", "wakeups", "pending")
+        if not os.path.isdir(d):
+            return []
+        out = []
+        for n in sorted(os.listdir(d)):
+            if n.endswith(".json"):
+                with open(os.path.join(d, n), encoding="utf-8") as f:
+                    out.append(json.load(f))
+        return out
+
+    def drain(self):
+        r = subprocess.run([sys.executable, self.wakeup, "drain"], capture_output=True, text=True, timeout=60,
+                           env=dict(os.environ))
+        last = (r.stdout.strip().splitlines() or [""])[-1]
+        return 0 if last == "nothing pending" else json.loads(last)["delivered"]
+
+    def enqueue(self, task, fp):
+        return lambda: pf._wakeup_enqueue(self.wakeup, task, "ec6 notice", "%s-%s" % (task, fp))
+
+    def mark(self, task, fp, state):
+        return os.path.join(self.pack, "state", "notice-marks", "%s.%s.%s" % (task, fp, state))
+
+    def test_normal_once_then_drain(self):
+        self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "sent")
+        self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "already")
+        self.assertEqual(len(self.queued()), 1)
+        self.assertEqual(self.drain(), 1)
+        self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "already", "배달 뒤에도 다시 적재하지 않는다")
+        self.assertEqual(self.drain(), 0)
+        self.assertTrue(os.path.exists(self.mark("t", "f1", "pending")) and os.path.exists(self.mark("t", "f1", "sent")))
+
+    def test_interrupted_before_enqueue(self):
+        # '보내는 중'만 남기고 멈춘 점검(적재 전) — 방금이면 다른 점검이 보내는 중으로 보고 건드리지 않고, 시간이 지난 뒤의
+        # 점검이 같은 키로 적재한다(알림을 잃지 않는다).
+        pf._notice_create_mark(self.mark("t", "f1", "pending"))
+        self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "already")
+        self.assertEqual(self.queued(), [])
+        self.clock[0] += pf.NOTICE_PENDING_STALE_S
+        self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "sent")
+        self.assertEqual(self.drain(), 1)
+
+    def test_interrupted_between_acceptance_and_sent(self):
+        # 큐가 받은 뒤 '보냄' 전에 멈춤 → 다음 점검이 같은 키로 다시 적재: 아직 대기 중이면 큐가 묶는다(배달 1회).
+        self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "sent")
+        os.remove(self.mark("t", "f1", "sent"))
+        self.clock[0] += pf.NOTICE_PENDING_STALE_S
+        self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "sent")
+        self.assertEqual(len(self.queued()), 1, "대기 중인 같은 키는 묶인다")
+        self.assertEqual(self.drain(), 1)
+        # 이미 배달된 뒤에 멈춘 경우 → 최악은 한 번 더(그 뒤로는 '보냄'이 있어 되풀이 없음).
+        os.remove(self.mark("t", "f1", "sent"))
+        self.clock[0] += pf.NOTICE_PENDING_STALE_S
+        self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "sent")
+        self.assertEqual(self.drain(), 1, "한 번 더 배달(최악)")
+        for _ in range(3):
+            self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "already")
+        self.assertEqual(self.drain(), 0, "되풀이 없음")
+
+    def test_two_concurrent_preflights_enqueue_once(self):
+        # A 가 '보내는 중'을 만든 뒤 적재하기 직전에 B 가 끝까지 돈다 → B 는 적재하지 않는다(배타 생성이 적재할 쪽을 정한다).
+        seen = []
+
+        def a_enqueue():
+            seen.append(pf._notice_once("t", "f1", self.enqueue("t", "f1")))
+            return self.enqueue("t", "f1")()
+
+        self.assertEqual(pf._notice_once("t", "f1", a_enqueue), "sent")
+        self.assertEqual(seen, ["already"])
+        # A 가 적재한 뒤 '보냄' 전에 B 가 돈다 → 역시 적재하지 않는다.
+        seen.clear()
+
+        def a_enqueue_then_b():
+            ok = self.enqueue("t", "f2")()
+            seen.append(pf._notice_once("t", "f2", self.enqueue("t", "f2")))
+            return ok
+
+        self.assertEqual(pf._notice_once("t", "f2", a_enqueue_then_b), "sent")
+        self.assertEqual(seen, ["already"])
+        q = self.queued()
+        self.assertEqual(len(q), 1, "한 과제(t)의 대기 기록 하나")
+        self.assertEqual(q[0]["idempotency_keys"], ["t-f1", "t-f2"], "각 지문은 한 번씩만 적재됐다")
+        self.assertEqual(q[0]["coalesced_count"], 1)
+        self.assertEqual(self.drain(), 1)
+
+    def test_unwritable_store_enqueues_nothing(self):
+        os.makedirs(os.path.join(self.pack, "state"), exist_ok=True)
+        with open(os.path.join(self.pack, "state", "notice-marks"), "w") as f:
+            f.write("x")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for _ in range(3):
+                self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "unrecorded")
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(err.getvalue().count("적재하지 않음"), 3)
+
+    def test_failed_enqueue_leaves_no_mark(self):
+        self.assertEqual(pf._notice_once("t", "f1", lambda: False), "failed")
+        self.assertFalse(os.path.exists(self.mark("t", "f1", "pending")), "다음 점검이 곧바로 다시 시도한다")
+        self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "sent")
+
+    def test_result_sentences(self):
+        self.assertEqual(set(pf.NOTICE_RESULT_SENTENCES), {"sent", "already", "unrecorded", "failed"})
+        self.assertEqual(pf.NOTICE_RESULT_SENTENCES["unrecorded"],
+                         "wakeup 적재하지 않음(알림 기록을 남길 수 없음 — 기록 없이 보내면 매 점검 되풀이된다)")
 
 
 class ScheduleWriters(Rig):
