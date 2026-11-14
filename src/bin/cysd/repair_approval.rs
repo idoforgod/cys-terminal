@@ -1702,8 +1702,35 @@ pub(crate) fn route(
     }))
 }
 
-/// The approval part of `repair.status` (AU5: the worker reads a returned candidate's reason there).
+/// RULINGS DF3: the repairs of `lane` whose owner HAS A CARD now — a request past step 3 whose
+/// decision is pending (`Pending`, `Verifying`). The report gate counts these, never the record's
+/// 승인 대기 state (which a request in step 3 and an expired one also show) — so a fix-and-resubmit
+/// cycle whose step 3 refuses tells the master nothing.
+pub(crate) fn approval_cards(table: &Mutex<ApprovalTable>, lane: &str) -> Vec<String> {
+    let tbl = table.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ids: Vec<String> = tbl
+        .requests
+        .iter()
+        .filter(|r| r.lane_key == lane && matches!(r.state, ReqState::Pending | ReqState::Verifying))
+        .map(|r| r.repair.clone())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// The approval part of `repair.status` (AU5: the worker reads a returned candidate's reason there)
+/// and of `repair.list` (DF3: `approval_cards`, the repairs the owner has a card for).
 pub(crate) fn augment_status(daemon: &Arc<Daemon>, sub: &str, p: &Value, mut v: Value) -> Value {
+    if sub == "list" {
+        if let Some(o) = v.as_object_mut() {
+            let lane = o.get("lane").and_then(|l| l.as_str()).unwrap_or("").to_string();
+            o.insert(
+                "approval_cards".into(),
+                json!(approval_cards(&daemon.repair_approvals, &lane)),
+            );
+        }
+    }
     if sub == "status" {
         let repair = p.get("repair").and_then(|x| x.as_str());
         if let Some(o) = v.as_object_mut() {
