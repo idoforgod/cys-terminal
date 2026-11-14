@@ -836,12 +836,19 @@ pub fn acquire_settings_lock(settings: &Path) -> Option<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
         let lock_path = PathBuf::from(format!("{}.cys-lock", settings.display()));
+        // ★T2i(RULINGS EC5): 막히지 않게 연다 — 그 자리가 FIFO(읽는 쪽 없음)면 열기가 영원히 멈췄다. 일반 파일만 잠근다(그
+        //   밖 = 잠금 없음 · 종전 열기 실패와 같은 갈래).
         let f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .custom_flags(libc::O_NONBLOCK)
             .open(&lock_path)
             .ok()?;
+        if !f.metadata().map(|m| m.is_file()).unwrap_or(false) {
+            return None;
+        }
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return None;
         }
@@ -867,6 +874,26 @@ pub fn acquire_settings_lock(settings: &Path) -> Option<std::fs::File> {
 ///  · 쓰기는 `write_atomic`(tmp+rename+fsync) — 반쪽 파일이 굳으면 훅 등록부 전체가 사라진다.
 ///
 /// 반환: 실제로 추가한 항목의 사람용 라벨(`"SessionStart←session-start.sh"`). 빈 벡터 = 이미 충족.
+/// ★T2i(RULINGS EC5): 설정 파일(`settings.json`)의 시작 경로 판독 — 막히지 않게 열고 일반 파일 · 상한 이하만(링크는 일반
+/// 파일을 가리킬 때만 따른다 — 지금 동작). 부재 = `Ok(None)`(빈 설정으로 시작하는 호출부 규칙 그대로), 판독 불가 · UTF-8
+/// 아님 = `Err`(종전 `read_to_string` 의 그 밖의 오류와 같은 갈래 — 덮어쓰지 않는다).
+fn settings_read_bounded(settings_path: &Path) -> Result<Option<String>, String> {
+    match read_start_live(settings_path) {
+        StartRead::Missing => Ok(None),
+        StartRead::Unreadable(e) => Err(format!("settings read error: {e}")),
+        StartRead::Bytes(b) => {
+            String::from_utf8(b).map(Some).map_err(|e| format!("settings read error: not UTF-8 ({e})"))
+        }
+    }
+}
+
+/// ★T2i(RULINGS EC5): `<settings>.bak-cys` 를 **이미 읽은 바이트**로 쓴다(종전 `std::fs::copy` 는 원본을 다시 열었다 — 그
+/// 사이에 FIFO 로 바뀌면 막혔다). 원본의 권한 비트를 그대로(복사가 하던 일).
+fn settings_backup_from(settings_path: &Path, body: &str) -> Result<(), String> {
+    let backup = PathBuf::from(format!("{}.bak-cys", settings_path.display()));
+    write_atomic_mode(&backup, body.as_bytes(), existing_file_mode(settings_path)).map_err(|e| e.to_string())
+}
+
 pub fn merge_desired_hooks(
     settings_path: &Path,
     pack_dir: &Path,
@@ -887,13 +914,14 @@ pub fn merge_desired_hooks(
     //   바인딩 이름을 `_lock` 으로 두는 것이 계약이다(`_` 하나면 즉시 drop = 락 미성립).
     let _lock = acquire_settings_lock(settings_path);
     let existed = settings_path.exists();
-    let mut root: serde_json::Value = match std::fs::read_to_string(settings_path) {
-        Ok(s) if s.trim().is_empty() => serde_json::json!({}),
-        Ok(s) => serde_json::from_str(&s).map_err(|e| format!("settings parse error: {e}"))?,
+    // ★T2i(RULINGS EC5): 시작 경로의 단일 판독기(막히지 않음 · 일반 파일 · 상한) — 백업도 이 바이트로 쓴다(다시 열지 않는다).
+    let raw = settings_read_bounded(settings_path)?;
+    let mut root: serde_json::Value = match raw.as_deref() {
+        Some(s) if s.trim().is_empty() => serde_json::json!({}),
+        Some(s) => serde_json::from_str(s).map_err(|e| format!("settings parse error: {e}"))?,
         // 파일 없음일 때만 빈 설정으로 시작 — 권한 등 다른 읽기 에러를 무시하면
         // 기존 settings.json이 hooks만 남은 JSON으로 대체될 수 있다.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(format!("settings read error: {e}")),
+        None => serde_json::json!({}),
     };
     if !root.is_object() {
         return Err("settings root is not an object".into());
@@ -940,9 +968,8 @@ pub fn merge_desired_hooks(
         return Ok(added);
     }
     // backup — 실제 write가 발생할 때만(멱등 재실행이 정상 백업을 클로버하지 않게).
-    if existed {
-        let backup = format!("{}.bak-cys", settings_path.display());
-        std::fs::copy(settings_path, &backup).map_err(|e| e.to_string())?;
+    if let (true, Some(body)) = (existed, raw.as_deref()) {
+        settings_backup_from(settings_path, body)?;
     }
     let body = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
     write_atomic(settings_path, body.as_bytes()).map_err(|e| e.to_string())?;
@@ -1012,12 +1039,13 @@ pub fn retune_registered_hook_timeouts(
     //   존재 검사 뒤에 잡는다: 파일이 없으면 만질 것도 없고, 그때 락 파일을 만들면 '없으면
     //   만들지 않는다' 경계(위 한 줄)를 잔재로 뚫는다.
     let _lock = acquire_settings_lock(settings_path);
-    let mut root: serde_json::Value = match std::fs::read_to_string(settings_path) {
+    // ★T2i(RULINGS EC5): 시작 경로의 단일 판독기 — 백업도 이 바이트로 쓴다.
+    let raw = settings_read_bounded(settings_path)?;
+    let mut root: serde_json::Value = match raw.as_deref() {
         // 빈 파일 = 등록 0 — 만질 것이 없다(빈 객체로 덮어쓰지 않는다).
-        Ok(s) if s.trim().is_empty() => return Ok(vec![]),
-        Ok(s) => serde_json::from_str(&s).map_err(|e| format!("settings parse error: {e}"))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) => return Err(format!("settings read error: {e}")),
+        Some(s) if s.trim().is_empty() => return Ok(vec![]),
+        Some(s) => serde_json::from_str(s).map_err(|e| format!("settings parse error: {e}"))?,
+        None => return Ok(vec![]),
     };
     if !root.is_object() {
         return Err("settings root is not an object".into());
@@ -1036,8 +1064,7 @@ pub fn retune_registered_hook_timeouts(
     if raised.is_empty() {
         return Ok(raised);
     }
-    let backup = format!("{}.bak-cys", settings_path.display());
-    std::fs::copy(settings_path, &backup).map_err(|e| e.to_string())?;
+    settings_backup_from(settings_path, raw.as_deref().unwrap_or_default())?;
     let body = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
     write_atomic(settings_path, body.as_bytes()).map_err(|e| e.to_string())?;
     Ok(raised)
@@ -1053,8 +1080,9 @@ pub fn verify_desired_hooks_registered(
     pack_dir: &Path,
     hooks: &[DesiredHook],
 ) -> Vec<String> {
-    let root: serde_json::Value = std::fs::read_to_string(settings_path)
-        .ok()
+    // ★T2i(RULINGS EC5): 시작 경로의 단일 판독기(판독 불가 = 빈 설정 = 전부 미등록으로 보고 — 지금과 같은 방향).
+    let root: serde_json::Value = read_start_live(settings_path)
+        .text()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     hooks
@@ -1853,15 +1881,28 @@ pub fn seed_first_run_gates_at(
 ) -> SeedOutcome {
     let path = cfg.join(CLAUDE_CONFIG_FILE);
     let existed = path.exists();
+    // ★T2i(RULINGS EC5): 시작 경로의 단일 판독기(막히지 않음 · 일반 파일 · 상한) — 백업은 이 바이트로 쓴다(다시 열지 않는다).
+    let mut original: Vec<u8> = Vec::new();
     let existing = if existed {
-        match std::fs::read_to_string(&path) {
-            Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
-                Ok(v) => v,
-                Err(e) => {
-                    return SeedOutcome::Refused(format!("{} 파싱 불가 — 보존: {e}", path.display()))
+        match read_start_live(&path) {
+            StartRead::Bytes(b) => {
+                let parsed = std::str::from_utf8(&b)
+                    .map_err(|e| e.to_string())
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).map_err(|e| e.to_string()));
+                match parsed {
+                    Ok(v) => {
+                        original = b;
+                        v
+                    }
+                    Err(e) => {
+                        return SeedOutcome::Refused(format!("{} 파싱 불가 — 보존: {e}", path.display()))
+                    }
                 }
-            },
-            Err(e) => {
+            }
+            StartRead::Missing => {
+                return SeedOutcome::Refused(format!("{} 읽기 불가 — 보존: 사라짐", path.display()))
+            }
+            StartRead::Unreadable(e) => {
                 return SeedOutcome::Refused(format!("{} 읽기 불가 — 보존: {e}", path.display()))
             }
         }
@@ -1882,7 +1923,8 @@ pub fn seed_first_run_gates_at(
     //   (claude 가 다음 기동에 종전과 같은 신규 프로필을 다시 만든다). 백업 부재는 곧
     //   "시드 이전에는 이 파일이 존재하지 않았다" 의 기록이므로 정보가 사라지지 않는다.
     if existed {
-        if let Err(e) = std::fs::copy(&path, cfg.join(FIRST_RUN_SEED_BACKUP)) {
+        let mode = existing_file_mode(&path).or(Some(0o600));
+        if let Err(e) = write_atomic_mode(&cfg.join(FIRST_RUN_SEED_BACKUP), &original, mode) {
             return SeedOutcome::Refused(format!("백업 실패 — 시드 보류: {e}"));
         }
     }
@@ -1900,8 +1942,8 @@ pub fn seed_first_run_gates_at(
 
     // 사후 검증 — '썼다'는 주장이 아니라 **되읽기**로 확인한다. 같은 순수 계획기를 다시 돌려
     // "이제 추가할 것이 없다" 를 오라클로 쓴다(판정 사본 0).
-    let verified = std::fs::read_to_string(&path)
-        .ok()
+    let verified = read_start_live(&path)
+        .text()
         .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
         .map(|v| {
             let re = plan_first_run_seed(&v, workspaces, premise);
@@ -2030,10 +2072,14 @@ fn channel_guard_and_heal(dir: &Path) -> Option<String> {
         ),
         PackStateRead::Valid(st) => {
             // channel=free — 정합 검사(state.base ↔ .pack-version).
-            let disk_v = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-            if st.base_version == disk_v {
+            // ★T2i(RULINGS EC5): 시작 경로의 단일 판독기(막히지 않음 · 일반 파일 · 상한). 판독 불가(FIFO · 장치 · 폴더 · 상한
+            //   초과)면 아래 증거 검사는 그대로 하되 자가치유(상태 쓰기)는 하지 않는다 — 모르는 값으로 기록을 고치지 않는다.
+            let (disk_v, unreadable) = match read_start_meta(&dir.join(PACK_VERSION_FILE)) {
+                StartRead::Missing => (String::new(), None),
+                StartRead::Bytes(b) => (String::from_utf8(b).map(|s| s.trim().to_string()).unwrap_or_default(), None),
+                StartRead::Unreadable(e) => (String::new(), Some(e)),
+            };
+            if unreadable.is_none() && st.base_version == disk_v {
                 return None;
             }
             // 불일치 — 음성 pro 증거 검사(v6·R5 codex 결착: "정상 JSON이지만 거짓 free" 차단).
@@ -2066,6 +2112,10 @@ fn channel_guard_and_heal(dir: &Path) -> Option<String> {
                      → 보존·내장 팩 미반영. 복구: cys pack-repair-channel"
                         .to_string(),
                 );
+            }
+            if let Some(e) = unreadable {
+                eprintln!("[init-pack] ⚠ {PACK_VERSION_FILE} 판독 불가({e}) — state 자가치유 생략(다음 기동 재시도)");
+                return None;
             }
             // 증거 없음 → 제한적 자가치유: base_version만 동기화(loud) 후 진행.
             let mut healed = st;
@@ -14575,6 +14625,236 @@ mod m11_tests {
         assert_eq!(rig.read(rel).as_deref(), Some(v1), "기동 필수 = vendor 먼저");
         assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some(mine), "내 사본 보관");
         assert_eq!(rig.kind(rel).as_deref(), Some("vendor-first"), "기록과 함께");
+    }
+
+    /// ★T2i(RULINGS EC5): 시작 경로의 남은 판독 — **정상 free 상태**(`.pack-state.json` = free · 기록 불일치라 자가치유 경로까지
+    /// 간다)에서 `.pack-version` · 상위의 `.pack-accepted.json` · 설치 기록 · 상태 파일 자리에 FIFO · 폴더 · 상한 초과 · FIFO 를
+    /// 가리키는 링크 · 장치(`/dev/zero`)를 가리키는 링크를 두어도 설치는 각자의 시한 안에 끝나고, 읽을 수 없는 `.pack-version` 으로
+    /// 상태를 고치지 않는다(종전: 빈 값으로 자가치유). 설정 파일 판독기(`settings.json` 병합 · 재조정 · 검증, 첫기동 관문 시드의
+    /// `.claude.json`, 잠금 파일 `<settings>.cys-lock`)도 같은 자리에서 시한 안에 끝나고 아무것도 덮지 않는다.
+    #[test]
+    fn ec5_start_path_free_state_and_settings_readers_never_block() {
+        let rig = Rig::new("ec5");
+        let old = "{\"agents\": 1}\n";
+        let new = "{\"agents\": 2}\n";
+        let items: Vec<(String, String)> = vec![("agents.json".into(), new.into())];
+        let setup = |root: &Path| -> PathBuf {
+            let pack = root.join("pack");
+            std::fs::create_dir_all(&pack).unwrap();
+            std::fs::write(pack.join("agents.json"), old).unwrap();
+            std::fs::write(pack.join(PACK_VERSION_FILE), "1.0.0\n").unwrap();
+            let st = PackState { channel: "free".into(), base_version: "0.9.0".into(), pro_revision: 0 };
+            write_pack_state(&pack, &st).unwrap();
+            let m: std::collections::BTreeMap<String, String> =
+                [("agents.json".to_string(), content_hash(old))].into_iter().collect();
+            std::fs::write(pack.join(INSTALL_MANIFEST), serde_json::to_string(&m).unwrap()).unwrap();
+            pack
+        };
+        fn deadline<T: Send + 'static>(case: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(f());
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("{case}: did not finish within its deadline (blocked on a start-path read)"))
+        }
+        let run = |case: &str, pack: PathBuf| -> bool {
+            let it = items.clone();
+            deadline(case, move || {
+                install_into_with(
+                    pack,
+                    it.iter().map(|(a, b)| (a.as_str(), b.as_str())),
+                    false,
+                    "9.9.9",
+                    false,
+                    false,
+                    PackScope::Base,
+                    None,
+                    None,
+                    &UpdateSources::none(),
+                )
+                .is_ok()
+            })
+        };
+        let base_of = |pack: &Path| match read_pack_state(pack) {
+            PackStateRead::Valid(st) => Some(st.base_version),
+            _ => None,
+        };
+        // 대조: 정상 free 상태 · 기록 불일치 → 자가치유 → 설치 → 기록 = 설치한 판.
+        let ctl = setup(&rig.base.join("control"));
+        assert!(run("control", ctl.clone()), "control install");
+        assert_eq!(std::fs::read_to_string(ctl.join("agents.json")).unwrap(), new, "control: 갱신");
+        assert_eq!(base_of(&ctl).as_deref(), Some("9.9.9"), "control: 기록 수렴");
+        let mut forms: Vec<&str> = vec!["dir", "oversized"];
+        #[cfg(unix)]
+        forms.extend(["fifo", "link-to-fifo", "link-to-device"]);
+        let targets = [PACK_VERSION_FILE, "../.pack-accepted.json", INSTALL_MANIFEST, PACK_STATE_FILE];
+        let mut cases = 0usize;
+        for (ti, target) in targets.iter().enumerate() {
+            for form in &forms {
+                let case = format!("{target} as {form}");
+                let root = rig.base.join(format!("e{ti}-{form}"));
+                let pack = setup(&root);
+                let p = match target.strip_prefix("../") {
+                    Some(name) => root.join(name),
+                    None => pack.join(target),
+                };
+                plant_special(&p, form, &root, &case);
+                let _ = run(&case, pack.clone());
+                if *target == PACK_VERSION_FILE {
+                    assert_ne!(base_of(&pack).as_deref(), Some(""), "{case}: 읽을 수 없는 판 값으로 기록을 고치지 않는다");
+                }
+                cases += 1;
+                let _ = std::fs::remove_dir_all(&root);
+            }
+        }
+        assert_eq!(cases, targets.len() * forms.len());
+        // 설정 파일 판독기 — 같은 형태를 `settings.json` · `.claude.json` · 잠금 파일 자리에.
+        for form in &forms {
+            let root = rig.base.join(format!("s-{form}"));
+            let cfg = root.join("cfg");
+            std::fs::create_dir_all(&cfg).unwrap();
+            let settings = cfg.join("settings.json");
+            plant_special(&settings, form, &root, &format!("settings.json as {form}"));
+            let pk = root.join("pack");
+            for which in ["merge", "retune", "verify"] {
+                let (s, pk2) = (settings.clone(), pk.clone());
+                let case = format!("{which}: settings.json as {form}");
+                let r = deadline(&case, move || match which {
+                    "merge" => merge_desired_hooks(&s, &pk2, &AWAKENING_HOOKS).map(|_| ()),
+                    "retune" => retune_registered_hook_timeouts(&s, &pk2, &AWAKENING_HOOKS).map(|_| ()),
+                    _ => {
+                        let missing = verify_desired_hooks_registered(&s, &pk2, &AWAKENING_HOOKS);
+                        if missing.len() == AWAKENING_HOOKS.len() { Err("all missing".into()) } else { Ok(()) }
+                    }
+                });
+                // 읽을 수 없는 설정은 덮지 않는다(병합 · 재조정 = 오류, 검증 = 전부 미등록) — 폴더는 재조정의 '없으면 만들지 않는다'가
+                // 아니라 판독 불가 갈래다.
+                assert!(r.is_err(), "{case}: {r:?}");
+                assert!(!cfg.join("settings.json.bak-cys").exists(), "{case}: 백업도 쓰지 않는다");
+            }
+            let claude = cfg.join(CLAUDE_CONFIG_FILE);
+            plant_special(&claude, form, &root, &format!(".claude.json as {form}"));
+            let c2 = cfg.clone();
+            let out = deadline(&format!("seed: .claude.json as {form}"), move || {
+                seed_first_run_gates_at(&c2, &["/w".to_string()], AuthPremise::Unproven)
+            });
+            assert!(matches!(out, SeedOutcome::Refused(_)), ".claude.json as {form}: {out:?}");
+            assert!(!cfg.join(FIRST_RUN_SEED_BACKUP).exists(), ".claude.json as {form}: 백업 없음");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // 잠금 파일 자리의 FIFO → 잠금 없이 진행(종전 열기 실패와 같은 갈래) · 병합은 끝난다.
+        #[cfg(unix)]
+        {
+            let root = rig.base.join("lock-fifo");
+            let cfg = root.join("cfg");
+            std::fs::create_dir_all(&cfg).unwrap();
+            let settings = cfg.join("settings.json");
+            std::fs::write(&settings, "{}").unwrap();
+            plant_special(&cfg.join("settings.json.cys-lock"), &"fifo", &root, "lock as fifo");
+            let (s, pk) = (settings.clone(), root.join("pack"));
+            let r = deadline("merge: lock as fifo", move || merge_desired_hooks(&s, &pk, &AWAKENING_HOOKS));
+            assert!(r.is_ok(), "{r:?}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// EC5 시험의 형태 심기 — 폴더 · 상한 초과(성긴 파일) · FIFO · FIFO 를 가리키는 링크 · 장치(`/dev/zero`)를 가리키는 링크.
+    fn plant_special(p: &Path, form: &str, root: &Path, case: &str) {
+        let _ = std::fs::remove_file(p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        match form {
+            "dir" => std::fs::create_dir_all(p).unwrap(),
+            "oversized" => std::fs::File::create(p).unwrap().set_len(START_LIVE_CAP.max(START_META_CAP) + 1).unwrap(),
+            #[cfg(unix)]
+            "fifo" | "link-to-fifo" => {
+                use std::os::unix::ffi::OsStrExt;
+                let fifo = if form == "fifo" { p.to_path_buf() } else { root.join(format!("elsewhere-{}.fifo", p.file_name().unwrap().to_string_lossy())) };
+                let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "{case}: mkfifo");
+                if form == "link-to-fifo" {
+                    std::os::unix::fs::symlink(&fifo, p).unwrap();
+                }
+            }
+            #[cfg(unix)]
+            "link-to-device" => std::os::unix::fs::symlink("/dev/zero", p).unwrap(),
+            _ => unreachable!("{form}"),
+        }
+    }
+
+    /// ★T2i(RULINGS EC5): 시작 경로 판독 조사(census) — 데몬의 기동 설치(`install_into_with`)에서 닿는 함수 가운데 파일을 읽는
+    /// 것은 시작 경로의 두 판독기(`read_start_meta` · `read_start_live`)로만 읽는다. 아래 목록은 호출 그래프로 찾은 것이다(보고서
+    /// R3 EC5 절 — 기계 조사 · 판독 함수 27곳 + `packsig::read_accepted`). 각 몸통에 날것의 판독(`std::fs::read(` · `read_to_string(` · `std::fs::copy(` ·
+    /// `File::open(`)이 없어야 한다. `write_atomic_mode_inner` 의 `File::open(parent)` 는 폴더를 여는 것(내용 판독 아님)이라 뺀다.
+    #[test]
+    fn ec5_start_path_read_census() {
+        let pack_src = include_str!("pack.rs");
+        let sig_src = include_str!("packsig.rs");
+        let body_of = |src: &str, head: &str| -> String {
+            let at = src.find(head).unwrap_or_else(|| panic!("census: {head} not found"));
+            let rest = &src[at..];
+            let open = rest.find('{').unwrap();
+            let mut depth = 0i32;
+            for (i, ch) in rest[open..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return rest[..open + i + 1].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("census: {head} unbalanced")
+        };
+        let readers = [
+            "fn channel_guard_and_heal(",
+            "fn pro_file_evidence(",
+            "pub fn read_pack_state(",
+            "fn load_manifest_state(",
+            "pub fn load_merge_pending(",
+            "fn merge_audit_keep_rels(",
+            "fn classify_stale_entry(",
+            "pub fn classify_stale_entry_with(",
+            "fn ensure_pristine_checked(",
+            "fn load_verified_base(",
+            "fn byte_backup_user(",
+            "fn park_user_copy(",
+            "fn park_user_kept(",
+            "fn plan_install_core(",
+            "fn preserve_prior_user_generation_at(",
+            "fn ceo_promoted_in(",
+            "fn seed_dept_soul_content(",
+            "pub fn create_update_snapshot(",
+            "pub fn read_update_snapshot_meta(",
+            "fn take_update_snapshot(",
+            "pub fn merge_desired_hooks(",
+            "pub fn retune_registered_hook_timeouts(",
+            "pub fn verify_desired_hooks_registered(",
+            "pub fn seed_first_run_gates_at(",
+            "fn settings_read_bounded(",
+            "fn settings_backup_from(",
+            "pub fn install_into_with<",
+        ];
+        let raw = ["std::fs::read(", "read_to_string(", "std::fs::copy(", "File::open("];
+        let mut bad = Vec::new();
+        for head in readers {
+            let b = body_of(pack_src, head);
+            for r in raw {
+                if b.lines().any(|l| l.contains(r) && !l.trim_start().starts_with("//")) {
+                    bad.push(format!("{head} {r}"));
+                }
+            }
+        }
+        let acc = body_of(sig_src, "fn read_accepted(");
+        for r in raw {
+            if acc.lines().any(|l| l.contains(r) && !l.trim_start().starts_with("//")) {
+                bad.push(format!("packsig read_accepted {r}"));
+            }
+        }
+        assert!(bad.is_empty(), "start-path raw reads: {bad:?}");
     }
 
     /// ★T2h(RULINGS CW3 · 검토자 B3): 시작 경로(데몬의 기동 설치 — 바인드 전)는 장부·메타 파일 하나로 멈추지 않는다 — 감사 원장 ·
