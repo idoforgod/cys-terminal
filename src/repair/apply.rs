@@ -82,6 +82,8 @@ pub enum Point {
     /// CT12 — the approved apply: the slot was validated against the approved state, its operation
     /// not yet recorded or exchanged.
     AfterValidation,
+    /// DX2 — the approved apply's record is committed (시험 기간), its lane row not yet written.
+    AfterRecordCommit,
 }
 
 /// Fault injection (tests). `at` returns `true` to make the operation stop right there as if the
@@ -2015,6 +2017,10 @@ pub struct ApplyIntent {
     pub targets: Vec<IntentTarget>,
     #[serde(default)]
     pub note: String,
+    /// DR1: the pack generation the apply was bound to, recorded BEFORE the first exchange — no
+    /// undo ever puts bytes back across a different generation.
+    #[serde(default)]
+    pub pack_generation: Option<PackGeneration>,
     pub created_at: f64,
     pub updated_at: f64,
 }
@@ -2071,12 +2077,66 @@ fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &Repair
     let id = intent.repair.clone();
     let rec = ledger::read_record_in(env.root, &id)?
         .ok_or_else(|| RepairError::Corrupt(format!("{}: 적용 의도는 있는데 수리 기록이 없습니다", id.as_str())))?;
-    let row = ledger::read_lane_in(env.root, &id, env.lane)?;
-    if matches!(rec.state, RepairState::Probation | RepairState::InUse)
-        && row.as_ref().is_some_and(|r| r.probation.is_some() && r.state != LaneState::Conflict)
-    {
-        set_intent_state(env.root, intent, "applied", "기록과 부서 행이 이미 확정되어 있었습니다", env.now)?;
-        return Ok(format!("{}: 끊긴 적용은 이미 끝나 있었습니다(의도 기록만 마저 씀)", id.as_str()));
+    // DX2 — the record's durable transition is the commit point: in force (시험 기간) → the apply
+    // COMPLETES forward (its lane row written from the record and the intent, the intent applied);
+    // never an undo of a committed apply
+    if matches!(rec.state, RepairState::Probation | RepairState::InUse) {
+        let gen = intent.pack_generation.clone().unwrap_or_else(|| pack_generation(env.pack));
+        let root = env.root.to_path_buf();
+        let lane = env.lane.clone();
+        let idc = id.clone();
+        let applied_at = intent.created_at;
+        let committed = rec.committed.clone();
+        let request = rec.approval.as_ref().map(|a| a.request_id.clone());
+        let now = env.now;
+        locked(&id, &mut || {
+            if ledger::read_lane_in(&root, &idc, &lane)?.is_none() {
+                ledger::write_lane_in(
+                    &root,
+                    &ledger::LaneRecord {
+                        schema: super::REPAIR_SCHEMA,
+                        repair: idc.clone(),
+                        lane: lane.clone(),
+                        state: LaneState::Verified,
+                        probation: Some(ledger::Probation {
+                            pack_generation: gen.version.clone(),
+                            pro_revision: gen.pro_revision,
+                            applied_at,
+                            expected: committed.clone(),
+                            closed: None,
+                            check_timings: Vec::new(),
+                            check_timeouts: Vec::new(),
+                        }),
+                        merge: None,
+                        merge_history: Vec::new(),
+                        approval_ref: request.clone(),
+                        conflict_live: Vec::new(),
+                        applied: committed.clone(),
+                        applied_history: Vec::new(),
+                        merge_base: Vec::new(),
+                        merge_lock: None,
+                        merge_attempt: 0,
+                        updated_at: now,
+                    },
+                )?;
+            }
+            Ok(())
+        })?;
+        set_intent_state(env.root, intent, "applied", "기록이 이미 시험 기간이었습니다 — 부서 행을 마저 쓰고 끝냄", env.now)?;
+        return Ok(format!("{}: 끊긴 적용은 기록이 확정되어 있어 앞으로 마쳤습니다(부서 행)", id.as_str()));
+    }
+    // DR1 — no put-back across a generation change: the intent's binding is checked first
+    if let Some(bound) = &intent.pack_generation {
+        let now_gen = pack_generation(env.pack);
+        if *bound != now_gen {
+            let why = format!(
+                "적용 중에 끊긴 뒤 팩 세대가 바뀌었습니다({} → {}) — 아무것도 되돌리지 않았습니다(새 버전 우선 · 워커 검토)",
+                bound.version, now_gen.version
+            );
+            void_approval(env, &id, &why, locked)?;
+            set_intent_state(env.root, intent, "superseded", &why, env.now)?;
+            return Ok(format!("{}: {why}", id.as_str()));
+        }
     }
     let mut specs = Vec::new();
     for t in &intent.targets {
@@ -2089,7 +2149,7 @@ fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &Repair
             expected: pre,
             incoming,
             source: None,
-            generation: None,
+            generation: intent.pack_generation.clone(),
         });
     }
     let left = undo_applied_with(env, &specs, &rec, true)?;
@@ -2105,7 +2165,6 @@ fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &Repair
     set_intent_state(env.root, intent, "incomplete", &why, env.now)?;
     Ok(format!("{}: {why}", id.as_str()))
 }
-
 
 /// What the approved apply did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2332,7 +2391,8 @@ pub fn apply_candidate_in(
                 expected: pre,
                 incoming,
                 source: slot.as_ref().map(|s| s.payload()),
-                generation: None,
+                // DR1: bound to the generation of step 0 (its undo carries the same binding)
+                generation: Some(pack_generation(env.pack)),
             },
             slot.clone(),
         ));
@@ -2349,6 +2409,7 @@ pub fn apply_candidate_in(
             .map(|(sp, _)| IntentTarget { rel: sp.rel.clone(), pre: sp.expected.canon(), incoming: sp.incoming.canon() })
             .collect(),
         note: String::new(),
+        pack_generation: Some(pack_generation(env.pack)),
         created_at: env.now,
         updated_at: env.now,
     };
@@ -2489,6 +2550,7 @@ pub fn apply_candidate_in(
     let now = env.now;
     let idc = id.clone();
     let request_id = approval.request_id.clone();
+    let first_live = env.pack.join(slots.first().map(|(r, _)| r.as_str()).unwrap_or(""));
     locked(id, &mut || {
         let Some(mut r) = ledger::read_record_in(&root, &idc)? else {
             return Ok(());
@@ -2497,6 +2559,10 @@ pub fn apply_candidate_in(
         r.state = RepairState::Probation;
         r.lock = None;
         ledger::write_record_durable_in(&root, &r)?;
+        // DX2's window (tests): the record is committed, the lane row not yet written
+        if env.faults.at(Point::AfterRecordCommit, &first_live, None) {
+            return Err(stop(Point::AfterRecordCommit));
+        }
         let previous = ledger::read_lane_in(&root, &idc, &lane)?;
         let row = ledger::LaneRecord {
             schema: super::REPAIR_SCHEMA,
@@ -2664,7 +2730,8 @@ fn undo_applied_with(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord, on
             expected: live_now,
             incoming: pre,
             source: holder,
-            generation: None,
+            // DR1: the apply's binding goes with its undo (a different generation → nothing back)
+            generation: spec.generation.clone(),
         };
         let r = run_op(env, &back)?;
         if r.outcome != ApplyOutcome::Applied {
@@ -2773,6 +2840,10 @@ fn mark_reverted_after_apply_check(
     locked(id, &mut || {
         if let Some(mut r) = ledger::read_record_in(&root, &idc)? {
             r.state = RepairState::Reverted;
+            // DX2: an undone apply never keeps its approval
+            if let Some(a) = r.approval.as_mut() {
+                a.approved = false;
+            }
             r.methods.push(format!("적용 직후 검사 실패로 되돌림: {why}").chars().take(300).collect());
             ledger::write_record_durable_in(&root, &r)?;
         }
