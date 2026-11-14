@@ -1784,8 +1784,10 @@ pub fn approved_copy_resolution_in(root: &Path, pack: &Path, lane: &LaneKey, rel
         if !stands || !row.applied.iter().any(|(r, _)| r == rel) {
             continue;
         }
+        // a ledger row alone is never evidence (F9): without the daemon's finished apply operation the
+        // row is not an approved apply at all
         let Some(op) = applied_op_for(root, &id, lane, rel) else {
-            return ApprovedCopy::Unverifiable(id);
+            continue;
         };
         let (Some(dir), Some(want)) = (op.incoming_copy.as_ref(), op.incoming_copy_identity.as_ref()) else {
             return ApprovedCopy::Unverifiable(id);
