@@ -6342,6 +6342,11 @@ mod swap_seam {
 
 /// cross-device 대비 rename(§3.1-5) — 같은 볼륨이면 원자 rename, 실패 시 copy 후 원본 삭제
 /// fallback(EXDEV 등). staging은 pack_dir 형제라 정상 경로는 원자 rename이다(Windows도 동일 볼륨 전제).
+/// ★T9a (RULINGS FS2): `src` is ONLY ever the staging folder this install itself just wrote — the one place the
+/// copy-then-delete fallback may remain. Never the live pack and never `pack.prev` (a folder that may hold the only copy
+/// of a user's bytes): TW1 run 1 measured this fallback, applied to the live pack, deleting the pack file by file up to
+/// a held file and answering "교체 안 함" with the visited files gone. [`atomic_swap_with`] moves those two by a plain
+/// rename only.
 fn rename_dir_or_move(src: &Path, dst: &Path, rename: &SwapRename) -> std::io::Result<()> {
     if rename(src, dst).is_ok() {
         return Ok(());
@@ -6353,6 +6358,19 @@ fn rename_dir_or_move(src: &Path, dst: &Path, rename: &SwapRename) -> std::io::R
 
 /// 원자 교체(§3.1-3): pack_dir→pack_dir.prev, staging→pack_dir. 2번째 rename 실패 시 역rename으로
 /// pre-state 복구. pack_dir.prev는 1세대만 보존. 반환 Err = 교체 안 됨(기존 팩 온전).
+///
+/// ★T9a (RULINGS FS2–FS3 · design §4-15 라 · measured by TW1 run 1): the sentence above is now TRUE on every path —
+/// - FS2: moving the LIVE pack aside is ONE rename and nothing else. When it is refused (Windows: a file in the pack held
+///   open without delete sharing, os error 32) no byte of the live pack is copied-then-deleted, removed or moved; the
+///   answer is "교체 안 함" and the update then happens IN PLACE through the per-file update rules that already run (the
+///   daemon's boot install `install(false, …)`, whose gate stays open because `.pack-version` was not touched).
+/// - FS3: nothing that may hold the only copy of a user's bytes is deleted before the swap has succeeded. The previous
+///   generation (`pack.prev`) is moved aside by one rename (to [`swap_superseded_prev_dir`]) and deleted only after the
+///   swap succeeded; when the live pack is absent, `pack.prev` is not touched at all (it may then hold the whole old
+///   pack). The recovery after a failed staging move puts `pack.prev` back by a plain rename, else by a COPY that leaves
+///   `pack.prev` in place — never copy-then-delete.
+/// The normal path (every rename succeeds — macOS/Linux always) ends exactly as before: pack = the staging, `pack.prev`
+/// = the replaced pack, nothing else left.
 ///
 /// L6 전제 명문화: 두 rename 사이엔 pack_dir가 잠깐 **부재하는 창**이 있다(원자 교체지만 순간 공백).
 /// 이는 **데몬 미가동/init 시점**(팩을 읽는 상주 소비자가 없는 때)을 전제로 안전하다 — 무중단
@@ -6371,24 +6389,84 @@ pub fn atomic_swap(dir: &Path, staging: &Path) -> Result<(), String> {
 /// held open on Windows, os error 32, cannot be produced on macOS/Linux, where a folder with open files renames fine).
 fn atomic_swap_with(dir: &Path, staging: &Path, rename: &SwapRename) -> Result<(), String> {
     let prev = pack_prev_dir(dir);
-    // 직전 세대 정리(1세대 보존).
-    let _ = std::fs::remove_dir_all(&prev);
     let had_old = dir.exists();
-    if had_old {
-        rename_dir_or_move(dir, &prev, rename)
-            .map_err(|e| format!("pack_dir→prev rename 실패(교체 안 함): {e}"))?;
+    // 직전 세대(1세대 보존) — ★T9a FS3: not deleted before the swap succeeded. Only when the live pack must take its
+    // name is it moved aside, by one rename; when the live pack is absent it is left where it is (it may then be the
+    // only copy of the whole old pack — a failed recovery's leftover).
+    let superseded = swap_superseded_prev_dir(staging);
+    let parked = had_old && std::fs::symlink_metadata(&prev).is_ok();
+    if parked {
+        rename(&prev, &superseded)
+            .map_err(|e| format!("pack_dir.prev 비우기 rename 실패(교체 안 함 — 기존 팩 그대로): {e}"))?;
     }
-    match rename_dir_or_move(staging, dir, rename) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // 역rename 복구: (실패한 fallback이 만든 부분/빈 dir 정리 후) prev→pack_dir 복원.
-            if had_old {
-                let _ = std::fs::remove_dir_all(dir);
-                let _ = rename_dir_or_move(&prev, dir, rename);
-            }
-            Err(format!("staging→pack_dir rename 실패(pre-state 복구 시도): {e}"))
+    // Puts the previous generation back under its name; on failure says where it is (it is never deleted here).
+    let unpark = || -> String {
+        if !parked || rename(&superseded, &prev).is_ok() {
+            String::new()
+        } else {
+            format!(" · 직전 세대 보존본은 {} 에 그대로 있음", superseded.display())
+        }
+    };
+    if had_old {
+        // ★T9a FS2: the LIVE pack moves by ONE rename and nothing else — no copy-then-delete fallback here.
+        if let Err(e) = rename(dir, &prev) {
+            return Err(format!("pack_dir→prev rename 실패(교체 안 함): {e}{}", unpark()));
         }
     }
+    match rename_dir_or_move(staging, dir, rename) {
+        Ok(()) => {
+            // The swap succeeded — only now may the superseded generation go (1-generation retention as before).
+            if parked {
+                let _ = std::fs::remove_dir_all(&superseded);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // 역rename 복구: (실패한 fallback이 만든 부분/빈 dir 정리 후) prev→pack_dir 복원.
+            // `dir` holds only what the staging fallback copied (a copy of the staging this install wrote — the user's
+            // originals are in `prev`). `prev` holds the old live pack: a plain rename back, else a COPY that leaves
+            // `prev` in place (★T9a FS2 — never copy-then-delete of it).
+            let mut note = String::new();
+            if had_old {
+                let _ = std::fs::remove_dir_all(dir);
+                match rename(&prev, dir) {
+                    Ok(()) => note = unpark(),
+                    Err(re) => {
+                        note = match copy_dir_all(&prev, dir) {
+                            Ok(()) => format!(
+                                " · 역rename 거부({re}) — 기존 팩을 복사로 되살림(원본은 {} 에 그대로)",
+                                prev.display()
+                            ),
+                            Err(ce) => {
+                                // A partial copy would make the next swap treat it as the live pack (and drop the
+                                // superseded generation after that swap succeeds); it holds only copies — remove it,
+                                // so the next install sees no live pack and leaves `prev` untouched.
+                                let _ = std::fs::remove_dir_all(dir);
+                                format!(
+                                    " · 역rename 거부({re})·복사 실패({ce}) — 기존 팩은 {} 에 그대로 있음",
+                                    prev.display()
+                                )
+                            }
+                        };
+                        if parked {
+                            note.push_str(&format!(" · 직전 세대 보존본은 {} 에 그대로 있음", superseded.display()));
+                        }
+                    }
+                }
+            }
+            Err(format!("staging→pack_dir rename 실패(pre-state 복구 시도): {e}{note}"))
+        }
+    }
+}
+
+/// ★T9a (RULINGS FS3): where [`atomic_swap_with`] keeps the previous generation (`pack.prev`) while the live pack takes
+/// that name — `<staging>.superseded-prev`, beside the staging and named after it, so a crash's leftover is staging
+/// residue for the paths that already handle `.pack-staging*` (`cys doctor` staging-residue, factory reset, the hud
+/// bridge's install-in-progress check). Deleted only after the swap succeeded.
+fn swap_superseded_prev_dir(staging: &Path) -> PathBuf {
+    let mut name = staging.as_os_str().to_os_string();
+    name.push(".superseded-prev");
+    PathBuf::from(name)
 }
 
 /// staging 검증(§3.1-2): 임베드 전 파일이 staging에 실재하는가(파일 수·존재). pack-update의
@@ -6495,9 +6573,10 @@ pub fn install_staged(
         return Err(e);
     }
     // ④ 원자 교체(실패 시 pre-state 복구·staging 정리).
+    // ★T9a (RULINGS FS4): any tally the staged pass printed above describes the staging, which no Err path installs.
     if let Err(e) = atomic_swap(&dir, &staging) {
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(e);
+        return Err(format!("{e} — 이 실행이 위에 출력한 [init-pack] 집계(있다면)는 설치되지 않은 준비본의 것입니다(준비본은 버렸습니다)"));
     }
     // ⑤ 교체 후 실 pack_dir 기준 config 격리 셋업(pack_dir 형제 — staging 대상이 아니었다).
     setup_isolated_config_dir(install_hooks);
@@ -12427,6 +12506,434 @@ mod tests {
             "pre-state 온전(반쯤 쓰인 팩 없음)"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ─── T9a (RULINGS FS1–FS5 · design §4-15 라 · TW1 run 1 report §10): a failed rename of the LIVE pack changes
+    /// nothing. On macOS/Linux a folder with open files renames fine, so the Windows refusal (os error 32 — a file held
+    /// open without delete sharing, measured by TW1 run 1) is INJECTED through `swap_seam`.
+    mod t9a {
+        use super::*;
+        use crate::pack::swap_seam;
+        use std::cell::RefCell;
+        use std::collections::BTreeMap;
+        use std::rc::Rc;
+
+        type CallLog = Rc<RefCell<Vec<(PathBuf, PathBuf, bool)>>>;
+
+        fn scratch(tag: &str) -> PathBuf {
+            let base = std::env::temp_dir().join(format!(
+                "cys-t9a-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            base
+        }
+
+        fn write_tree(root: &Path, files: &[(&str, &str)]) {
+            for (rel, body) in files {
+                let p = root.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, body).unwrap();
+            }
+        }
+
+        /// Tree manifest: relative path → kind + sha256 of the bytes (+ permission bits on Unix). Absent root = empty.
+        fn manifest(root: &Path) -> BTreeMap<String, String> {
+            fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
+                for e in std::fs::read_dir(dir).unwrap() {
+                    let p = e.unwrap().path();
+                    let rel = p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+                    let meta = std::fs::symlink_metadata(&p).unwrap();
+                    #[cfg(unix)]
+                    let mode = {
+                        use std::os::unix::fs::PermissionsExt;
+                        format!(":{:o}", meta.permissions().mode() & 0o7777)
+                    };
+                    #[cfg(not(unix))]
+                    let mode = String::new();
+                    if meta.file_type().is_symlink() {
+                        out.insert(rel, format!("link:{}", std::fs::read_link(&p).unwrap().display()));
+                    } else if meta.is_dir() {
+                        out.insert(rel, format!("dir{mode}"));
+                        walk(root, &p, out);
+                    } else {
+                        out.insert(rel, format!("file:{}{mode}", sha256_hex(&std::fs::read(&p).unwrap())));
+                    }
+                }
+            }
+            let mut out = BTreeMap::new();
+            if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
+                walk(root, root, &mut out);
+            }
+            out
+        }
+
+        /// Entry names directly under `base`, sorted — every leftover a swap could leave beside the pack.
+        fn entries(base: &Path) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(base)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        }
+
+        /// Installs, on this thread, a rename that refuses the moves `refuse` names — with the text TW1 run 1 measured
+        /// (os error 32) — and performs every other move with `std::fs::rename`. Returns the guard and the call log
+        /// (source, destination, refused).
+        fn refusing(refuse: impl Fn(&Path, &Path) -> bool + 'static) -> (swap_seam::Guard, CallLog) {
+            let log: CallLog = Rc::new(RefCell::new(Vec::new()));
+            let seen = log.clone();
+            let guard = swap_seam::install(move |src: &Path, dst: &Path| {
+                let refused = refuse(src, dst);
+                seen.borrow_mut().push((src.to_path_buf(), dst.to_path_buf(), refused));
+                if refused {
+                    Err(std::io::Error::other(
+                        "The process cannot access the file because it is being used by another process. \
+                         (os error 32 — injected)",
+                    ))
+                } else {
+                    std::fs::rename(src, dst)
+                }
+            });
+            (guard, log)
+        }
+
+        fn the_move(from: &Path, to: &Path) -> impl Fn(&Path, &Path) -> bool + 'static {
+            let (from, to) = (from.to_path_buf(), to.to_path_buf());
+            move |src: &Path, dst: &Path| src == from && dst == to
+        }
+
+        /// FS5 (1) · FS2: the rename of the live pack is refused → the live pack is byte-identical (nothing copied-then-
+        /// deleted, removed or moved), the previous generation is back under its name, nothing is left beside them, and
+        /// the answer is "not replaced". Before the fix the fallback copied the pack to `.prev` and deleted the live pack
+        /// (TW1 run 1: deleted in name order up to the held file; here, with nothing held, the delete completes and the
+        /// swap even answers Ok).
+        #[test]
+        fn live_pack_rename_refused_changes_nothing() {
+            let base = scratch("live");
+            let dir = base.join("pack");
+            let prev = pack_prev_dir(&dir);
+            let staging = base.join(".pack-staging-init-t9a");
+            write_tree(
+                &dir,
+                &[
+                    ("acl.json", "{\"user\":\"acl\"}"),
+                    ("agents.json", "{\"user\":\"agents\"}"),
+                    ("bin/javis_bootstrap.py", "# the user's edit of a boot-critical file\n"),
+                    ("bin/javis_event.py", "# the file a Python tool holds open\n"),
+                    ("hooks/session-start.sh", "#!/bin/sh\n# user edit\n"),
+                ],
+            );
+            write_tree(&prev, &[("bin/javis_bootstrap.py", "# previous generation\n")]);
+            write_tree(&staging, &[("bin/javis_bootstrap.py", "# vendor 0.15.0\n"), ("NEW.md", "new\n")]);
+            let (m_dir, m_prev, m_staging) = (manifest(&dir), manifest(&prev), manifest(&staging));
+            let names = entries(&base);
+
+            let (seam, log) = refusing(the_move(&dir, &prev));
+            let r = atomic_swap(&dir, &staging);
+            drop(seam);
+
+            let err = r.expect_err("a refused rename of the live pack must answer 'not replaced'");
+            assert!(err.contains("교체 안 함"), "the answer says 'not replaced': {err}");
+            assert_eq!(manifest(&dir), m_dir, "FS2: the live pack is byte-identical");
+            assert_eq!(manifest(&prev), m_prev, "the previous generation is back under its name");
+            assert_eq!(manifest(&staging), m_staging, "the swap leaves the staging to its caller");
+            assert_eq!(entries(&base), names, "nothing is left beside the pack");
+            let touches = log.borrow().iter().filter(|(s, _, _)| s == &dir).count();
+            assert_eq!(touches, 1, "the live pack meets ONE rename attempt and nothing else");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// FS5 (2) · FS2: the real staged install (`cys init-pack --no-install-hook`, the app's post-update command) meets
+        /// a refused live-pack rename → "not replaced", the pack byte-identical, no staging residue; the in-place install
+        /// that follows (the daemon's boot install, `install(false, …)`, whose gate is open because `.pack-version` was not
+        /// touched) then meets every user edit: the edited boot-critical LISTED file is parked vendor-first (vendor bytes
+        /// live, the user's bytes in `<rel>.user`, ledger kind `vendor-first`) and the edited user-owned file is kept.
+        /// TW1 run 1: the fallback deleted the user's edit of `bin/javis_bootstrap.py` and the daemon re-created it from
+        /// the embed — no `.user`, no record.
+        #[test]
+        fn refused_staged_install_then_in_place_install_parks_listed_keeps_user_owned() {
+            let _g = PACK_ENV_LOCK.lock().unwrap();
+            let base = scratch("inplace");
+            let pd = base.join("pack");
+            let _env = set_pack_env(&pd, base.join("claude"));
+            let _cap = EnvGuard::set("CYS_PACK_CAPTURES_DIR", base.join("captures"));
+            let listed = "bin/javis_bootstrap.py";
+            let user_owned = "agents.json";
+            assert!(boot_critical_rel(listed), "premise: {listed} is on the compiled boot-critical list");
+            assert!(is_user_owned(user_owned), "premise: {user_owned} is user-owned");
+            let embed_of = |rel: &str| PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c).unwrap();
+
+            // An installed pack with a previous generation, then the state an older release leaves: an older
+            // `.pack-version`; for the listed file the older vendor bytes recorded as its base (manifest hash + the
+            // `.pristine` mirror, as every install writes them); then two user edits.
+            crate::pack::install_staged(false, None, false).unwrap();
+            crate::pack::install_staged(false, None, false).unwrap();
+            assert!(pack_prev_dir(&pd).is_dir(), "premise: a previous generation exists");
+            std::fs::write(pd.join(PACK_VERSION_FILE), "0.1.0").unwrap();
+            let old_vendor = "# vendor bytes of an older release\n";
+            let mpath = pd.join(INSTALL_MANIFEST);
+            let mut m: BTreeMap<String, String> =
+                serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+            m.insert(listed.to_string(), content_hash(old_vendor));
+            std::fs::write(&mpath, serde_json::to_string(&m).unwrap()).unwrap();
+            let pristine = pd.join(PRISTINE_DIR).join(listed);
+            std::fs::create_dir_all(pristine.parent().unwrap()).unwrap();
+            std::fs::write(&pristine, old_vendor).unwrap();
+            let user_boot = "# the user's repair of the boot-critical file\n";
+            let user_agents = "{\"user\":\"my seats\"}\n";
+            std::fs::write(pd.join(listed), user_boot).unwrap();
+            std::fs::write(pd.join(user_owned), user_agents).unwrap();
+            assert_ne!(embed_of(listed), user_boot, "premise: the vendor bytes differ from the user's");
+            let m_before = manifest(&pd);
+            let m_prev_before = manifest(&pack_prev_dir(&pd));
+
+            let (seam, _log) = refusing(the_move(&pd, &pack_prev_dir(&pd)));
+            let r = crate::pack::install_staged(false, None, false);
+            drop(seam);
+
+            let err = r.expect_err("a refused live-pack rename fails the staged install");
+            assert!(err.contains("교체 안 함"), "{err}");
+            assert!(err.contains("설치되지 않은 준비본"), "FS4: the answer disowns the staged pass's tally: {err}");
+            assert_eq!(manifest(&pd), m_before, "FS2: the live pack is byte-identical after the refused swap");
+            assert_eq!(manifest(&pack_prev_dir(&pd)), m_prev_before, "the previous generation is untouched");
+            let left: Vec<String> =
+                entries(&base).into_iter().filter(|n| n.starts_with(".pack-staging")).collect();
+            assert!(left.is_empty(), "no staging residue: {left:?}");
+
+            // The in-place install that follows: the daemon's boot install (src/bin/cysd/main.rs — gated by
+            // `pack_current_for`, open because the refused swap did not touch `.pack-version`).
+            assert!(!pack_current_for(env!("CARGO_PKG_VERSION")), "the daemon's install gate is open");
+            crate::pack::install(false, None).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(pd.join(listed)).unwrap(),
+                embed_of(listed),
+                "vendor-first: the vendor bytes of the listed file are live"
+            );
+            assert_eq!(
+                std::fs::read_to_string(pd.join(format!("{listed}.user"))).unwrap(),
+                user_boot,
+                "vendor-first: the user's bytes are parked in <rel>.user"
+            );
+            assert_eq!(
+                load_merge_pending(&pd).get(listed).and_then(|e| e["kind"].as_str()),
+                Some("vendor-first"),
+                "vendor-first: the record"
+            );
+            assert_eq!(
+                std::fs::read_to_string(pd.join(user_owned)).unwrap(),
+                user_agents,
+                "the user-owned edit is kept"
+            );
+            assert_eq!(
+                std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap().trim(),
+                env!("CARGO_PKG_VERSION"),
+                "the update happened, in place"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// One case of FS5 (3): the live pack moved to `.prev`, then moving the staging in fails; returns false when the
+        /// case could not be produced (see `second_move_refused_restores_old_pack_complete`).
+        fn second_move_case(tag: &str, prepare: impl FnOnce(&Path) -> bool, refuse_staging: bool) -> bool {
+            let base = scratch(tag);
+            let dir = base.join("pack");
+            let prev = pack_prev_dir(&dir);
+            let staging = base.join(".pack-staging-init-t9a");
+            write_tree(
+                &dir,
+                &[("agents.json", "{\"u\":1}"), ("bin/javis_bootstrap.py", "# user\n"), ("z/deep/f.txt", "z")],
+            );
+            write_tree(&prev, &[("old-gen.txt", "previous generation")]);
+            if !prepare(&staging) {
+                let _ = std::fs::remove_dir_all(&base);
+                return false;
+            }
+            let (m_dir, m_prev) = (manifest(&dir), manifest(&prev));
+
+            let (seam, log) = refusing({
+                let refuse = the_move(&staging, &dir);
+                move |s: &Path, t: &Path| refuse_staging && refuse(s, t)
+            });
+            let r = atomic_swap(&dir, &staging);
+            drop(seam);
+
+            assert!(r.is_err(), "[{tag}] the swap failed: {r:?}");
+            assert!(
+                log.borrow().iter().any(|(s, t, refused)| s == &dir && t == &prev && !refused),
+                "[{tag}] premise: the live pack had moved to .prev"
+            );
+            assert_eq!(manifest(&dir), m_dir, "[{tag}] the old pack is live again, complete");
+            assert_eq!(manifest(&prev), m_prev, "[{tag}] the previous generation is back at .prev");
+            let left: Vec<String> = entries(&base)
+                .into_iter()
+                .filter(|n| n != "pack" && n != "pack.prev" && n != ".pack-staging-init-t9a")
+                .collect();
+            assert!(left.is_empty(), "[{tag}] nothing else is left beside the pack: {left:?}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    staging.join("zz-unreadable"),
+                    std::fs::Permissions::from_mode(0o644),
+                );
+            }
+            let _ = std::fs::remove_dir_all(&base);
+            true
+        }
+
+        /// FS5 (3): the first rename succeeded and moving the staging in fails → the old pack is live again, complete,
+        /// and the previous generation is back at `.prev`. (a) the staging is absent — its rename and its copy fallback
+        /// both fail on every platform and privilege; (b, Unix) the staging rename is refused and the copy fallback stops
+        /// part-way at an unreadable file (a partial copy at the pack path, the Windows shape) — produced only when the
+        /// file really is unreadable (not under a privileged user). Before the fix `.prev` was deleted first.
+        #[test]
+        fn second_move_refused_restores_old_pack_complete() {
+            assert!(second_move_case("second-absent", |_staging| true, true));
+            #[cfg(unix)]
+            {
+                let produced = second_move_case(
+                    "second-partial",
+                    |staging| {
+                        use std::os::unix::fs::PermissionsExt;
+                        write_tree(staging, &[("a.txt", "new a"), ("m/b.txt", "new b"), ("zz-unreadable", "x")]);
+                        let f = staging.join("zz-unreadable");
+                        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+                        std::fs::read(&f).is_err()
+                    },
+                    true,
+                );
+                if !produced {
+                    eprintln!("[t9a] case (b) not produced: a mode-000 file is readable for this user (privileged)");
+                }
+            }
+        }
+
+        /// FS5 (4) · FS3: nothing that may hold the only copy of a user's bytes is deleted before the swap succeeded.
+        /// (a) `.prev` holds the only copy of an edit (an older failed swap copied it there and the live file was then
+        ///     re-created from the embed) and the live-pack rename is refused → `.prev` intact;
+        /// (b) the live pack is absent and `.prev` holds the whole old pack (a failed recovery's leftover) → the swap
+        ///     installs the staging and keeps `.prev`;
+        /// (c) the recovery rename `.prev` → pack is refused → nothing is deleted: `.prev` keeps the old live pack
+        ///     complete, the pack path gets a complete copy of it, the previous generation still exists;
+        /// (d) as (c) and the restoring copy fails too → `.prev` intact, no partial copy left at the pack path.
+        /// Before the fix: (a)/(b) the unconditional `remove_dir_all(.prev)`, (c) the copy-then-delete of `.prev`,
+        /// (d) the partial copy left behind.
+        #[test]
+        fn nothing_holding_user_bytes_is_deleted_before_the_swap_succeeds() {
+            // (a)
+            let base = scratch("only-copy-prev");
+            let dir = base.join("pack");
+            let prev = pack_prev_dir(&dir);
+            let staging = base.join(".pack-staging-init-t9a");
+            write_tree(&dir, &[("bin/javis_bootstrap.py", "# vendor bytes re-created from the embed\n")]);
+            write_tree(&prev, &[("bin/javis_bootstrap.py", "# the ONLY copy of the user's edit\n")]);
+            write_tree(&staging, &[("bin/javis_bootstrap.py", "# vendor 0.15.0\n")]);
+            let (m_dir, m_prev) = (manifest(&dir), manifest(&prev));
+            let (seam, _log) = refusing(the_move(&dir, &prev));
+            assert!(atomic_swap(&dir, &staging).is_err());
+            drop(seam);
+            assert_eq!(manifest(&prev), m_prev, "(a) the only copy in .prev survives a refused swap");
+            assert_eq!(manifest(&dir), m_dir, "(a) the live pack is untouched");
+            let _ = std::fs::remove_dir_all(&base);
+
+            // (b)
+            let base = scratch("absent-live");
+            let dir = base.join("pack");
+            let prev = pack_prev_dir(&dir);
+            let staging = base.join(".pack-staging-init-t9a");
+            write_tree(&prev, &[("agents.json", "{\"only\":\"copy\"}"), ("bin/javis_bootstrap.py", "# user\n")]);
+            write_tree(&staging, &[("bin/javis_bootstrap.py", "# vendor\n")]);
+            let (m_prev, m_staging) = (manifest(&prev), manifest(&staging));
+            let (seam, _log) = refusing(|_: &Path, _: &Path| false);
+            atomic_swap(&dir, &staging).unwrap();
+            drop(seam);
+            assert_eq!(manifest(&dir), m_staging, "(b) the staging is installed");
+            assert_eq!(manifest(&prev), m_prev, "(b) .prev — the whole old pack — is kept");
+            let _ = std::fs::remove_dir_all(&base);
+
+            // (c)
+            let base = scratch("recovery-refused");
+            let dir = base.join("pack");
+            let prev = pack_prev_dir(&dir);
+            let staging = base.join(".pack-staging-init-t9a-absent"); // the staging move fails at rename and copy
+            write_tree(&dir, &[("agents.json", "{\"u\":1}"), ("bin/javis_bootstrap.py", "# user\n")]);
+            write_tree(&prev, &[("old-gen.txt", "previous generation")]);
+            let (m_dir, m_prev) = (manifest(&dir), manifest(&prev));
+            let (seam, _log) = refusing(the_move(&prev, &dir));
+            let r = atomic_swap(&dir, &staging);
+            drop(seam);
+            assert!(r.is_err(), "(c) the swap failed: {r:?}");
+            assert_eq!(manifest(&prev), m_dir, "(c) .prev still holds the old live pack, complete");
+            assert_eq!(manifest(&dir), m_dir, "(c) the pack path has the old pack again (a copy)");
+            let older_kept = entries(&base).iter().any(|n| manifest(&base.join(n)) == m_prev);
+            assert!(older_kept, "(c) the previous generation was not deleted: {:?}", entries(&base));
+            let _ = std::fs::remove_dir_all(&base);
+
+            // (d, Unix) as (c), and the restoring copy also fails part-way (an unreadable file in `.prev`) → `.prev`
+            // intact, and no partial copy is left at the pack path (it would be taken for the live pack next time).
+            // Produced only when the file really is unreadable (not under a privileged user).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let base = scratch("recovery-copy-fails");
+                let dir = base.join("pack");
+                let prev = pack_prev_dir(&dir);
+                let staging = base.join(".pack-staging-init-t9a-absent");
+                write_tree(&dir, &[("a.txt", "user a"), ("m/b.txt", "user b"), ("zz-unreadable", "user z")]);
+                let m_dir = manifest(&dir);
+                let held = dir.join("zz-unreadable");
+                std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o000)).unwrap();
+                if std::fs::read(&held).is_err() {
+                    let (seam, _log) = refusing(the_move(&prev, &dir));
+                    let r = atomic_swap(&dir, &staging);
+                    drop(seam);
+                    assert!(r.is_err(), "(d) the swap failed: {r:?}");
+                    let in_prev = prev.join("zz-unreadable");
+                    std::fs::set_permissions(&in_prev, std::fs::Permissions::from_mode(0o644)).unwrap();
+                    assert_eq!(manifest(&prev), m_dir, "(d) .prev still holds the old live pack, complete");
+                    assert!(
+                        std::fs::symlink_metadata(&dir).is_err(),
+                        "(d) no partial copy left at the pack path: {:?}",
+                        manifest(&dir)
+                    );
+                } else {
+                    eprintln!("[t9a] case (d) not produced: a mode-000 file is readable for this user (privileged)");
+                }
+                let _ = std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o644));
+                let _ = std::fs::remove_dir_all(&base);
+            }
+        }
+
+        /// FS5 (5): both renames succeed (macOS/Linux always; Windows when nothing holds a pack file) → the end state is
+        /// today's: pack = the staging, `.prev` = the replaced pack, the staging consumed, nothing else left — with and
+        /// without an earlier `.prev`.
+        #[test]
+        fn normal_swap_end_state_unchanged() {
+            for with_prev in [true, false] {
+                let base = scratch(if with_prev { "normal-prev" } else { "normal-noprev" });
+                let dir = base.join("pack");
+                let prev = pack_prev_dir(&dir);
+                let staging = base.join(".pack-staging-init-t9a");
+                write_tree(&dir, &[("a.txt", "old"), ("bin/javis_bootstrap.py", "# user\n")]);
+                if with_prev {
+                    write_tree(&prev, &[("a.txt", "older")]);
+                }
+                write_tree(&staging, &[("a.txt", "new"), ("b.txt", "b")]);
+                let (m_dir, m_staging) = (manifest(&dir), manifest(&staging));
+                let (seam, log) = refusing(|_: &Path, _: &Path| false);
+                atomic_swap(&dir, &staging).unwrap();
+                drop(seam);
+                assert_eq!(manifest(&dir), m_staging, "[prev={with_prev}] the staging is live");
+                assert_eq!(manifest(&prev), m_dir, "[prev={with_prev}] .prev = the replaced pack");
+                assert_eq!(entries(&base), vec!["pack".to_string(), "pack.prev".to_string()]);
+                assert!(log.borrow().iter().all(|(_, _, refused)| !refused));
+                let _ = std::fs::remove_dir_all(&base);
+            }
+        }
     }
 
     /// 검증 실패 = 임베드 파일 누락 시 Err(교체 전 차단 방어선).
