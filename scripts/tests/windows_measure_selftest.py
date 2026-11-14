@@ -627,7 +627,7 @@ class WorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         with open(WORKFLOW, encoding="utf-8") as f:
-            cls.text = f.read()
+            cls.text = f.read().replace("\r\n", "\n")  # .gitattributes checks out LF; a CRLF checkout must not void the step
         cls.jobs = cls._jobs(cls.text)
 
     @staticmethod
