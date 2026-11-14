@@ -1236,7 +1236,7 @@ fn hook_step_timeout_and_resume_after_a_crash() {
         expected: String::new(), incoming: String::new(), pack_generation: None, slot: None, slot_identity: None,
         live_identity: None, incoming_copy: None, incoming_copy_identity: None, step: "recorded".into(),
         hooks: vec![wal::HookLine { event: "Stop".into(), script: "z.sh".into(), targets: Vec::new() }],
-        finished: false, outcome: None, note: String::new(), created_at: 2.0, updated_at: 2.0,
+        finished: false, outcome: None, note: String::new(), created_at: 2.0, updated_at: 2.0, notice: None,
     };
     wal::write_in(&r.root, &rec).unwrap();
     let ok = |_: &Path, _: bool| -> Result<String, RepairError> { Ok(report_json(&[("Stop", "z.sh", "unregistered", &[("/s.json", "unregistered")])])) };

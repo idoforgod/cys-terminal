@@ -276,6 +276,7 @@ mod tests {
             note: String::new(),
             created_at: 1.0,
             updated_at: 1.0,
+            notice: None,
         };
         write_in(&root, &r).unwrap();
         assert_eq!(read_in(&root, &id, &r.op).unwrap().unwrap(), r);
