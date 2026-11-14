@@ -1882,3 +1882,53 @@ fn a_view_changed_during_the_screen_declines() {
     assert!(matches!(rep.outcome, ApplyOutcome::Declined(ref m) if m.contains("보호장치 검사가 본 내용")), "{:?}", rep.outcome);
     assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"PRE-1\n");
 }
+
+// ───────────────────────────── RULINGS DR3 — the runner never blocks ─────────────────────────────
+
+/// DR3: after a SUCCESSFUL exit, a descendant that closed stdout but lives on in the child's group is
+/// killed and reported (never left running while later checks start). Without DR3 the success path
+/// returned `Ok` with the descendant alive.
+#[cfg(unix)]
+#[test]
+fn a_live_descendant_after_a_successful_exit_is_killed_and_reported() {
+    use crate::SpawnPolicy as _;
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c").arg("sleep 30 >/dev/null 2>&1 & echo ok $!");
+    cmd.spawn_policy(crate::ChildLifetime::GroupScoped);
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    let t = std::time::Instant::now();
+    let res = run_bounded(cmd, Duration::from_secs(4));
+    assert!(t.elapsed() < Duration::from_secs(6), "within the deadline (+ scheduling)");
+    let msg = match res {
+        Err(RepairError::CheckFailed(m)) => m,
+        other => panic!("a live descendant is reported: {other:?}"),
+    };
+    assert!(msg.contains("자손이 남아"), "{msg}");
+    let pid: i32 = msg.split("ok ").nth(1).and_then(|t| t.split_whitespace().next()).and_then(|p| p.parse().ok()).expect("pid");
+    assert!(pid_gone(pid), "the descendant (pid {pid}) was killed");
+}
+
+/// DR3: a child that ignores SIGTERM (and would take long to end) is stopped and the call returns
+/// within its deadline; a kill that FAILS is reported truthfully, the call still returns.
+#[cfg(unix)]
+#[test]
+fn a_stubborn_child_and_a_failing_kill_never_hold_the_runner() {
+    use crate::SpawnPolicy as _;
+    let mk = || {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg("trap '' TERM; sleep 30");
+        cmd.spawn_policy(crate::ChildLifetime::GroupScoped);
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+        cmd
+    };
+    let t = std::time::Instant::now();
+    assert!(matches!(run_bounded(mk(), Duration::from_secs(2)), Err(RepairError::CheckTimeout(_))));
+    assert!(t.elapsed() < Duration::from_secs(4));
+    FAIL_GROUP_KILL.with(|c| c.set(libc::EPERM));
+    let t = std::time::Instant::now();
+    let res = run_bounded(mk(), Duration::from_secs(2));
+    FAIL_GROUP_KILL.with(|c| c.set(0));
+    assert!(t.elapsed() < Duration::from_secs(4), "returns in every case");
+    let msg = format!("{res:?}");
+    assert!(msg.contains("멈추지 못했습니다"), "the failed kill is reported: {msg}");
+}

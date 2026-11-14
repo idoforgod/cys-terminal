@@ -2898,93 +2898,248 @@ pub fn run_registrar(pack: &Path, dry_run: bool) -> Result<String, RepairError> 
     run_bounded(cmd, RECONCILE_DEADLINE)
 }
 
-/// RULINGS CT6 / CZ10 — THE bounded child discipline of the job and of every apply (the registrar):
-/// ONE deadline covers the child's run, the termination of its whole process group, the reaping and
-/// the collection of its output. The child should lead its own process group (the caller's spawn
-/// policy `GroupScoped`). After the child exits, its output must reach EOF before `deadline − reserve`
-/// (`reserve` = ¼ of the deadline, at most 2 s); otherwise — or when the child itself is still running
-/// then — the whole group is killed (unix `killpg(SIGKILL)`; Windows: the child only — residual),
-/// the child reaped, and the output collected until the deadline; a descendant that escaped the
-/// group and still holds the pipe cannot hold this call: the reader thread is left to it and the
-/// call returns at the deadline. What was left behind is RETURNED in the error, never swallowed.
+/// RULINGS CT6 / CZ10 / DR3 — THE bounded child runner of the job and of every apply (the
+/// registrar). It NEVER blocks: ONE loop with ONE deadline reads every pipe without blocking (unix:
+/// `O_NONBLOCK`; Windows: a detached reader thread whose chunks the loop takes without waiting) and
+/// polls the child's exit (`try_wait`). Whenever the child is still running at `deadline − grace`,
+/// its output has not ended, or — after a SUCCESSFUL exit too — members of its process group are
+/// still alive, the group is killed (`killpg(SIGKILL)`; the child itself as well) and the loop polls
+/// the exit and drains the output for the short fixed grace; then it RETURNS in every case, saying
+/// truthfully what it could not kill or reap — a child it could not reap is left to a detached reap
+/// thread (the caller never waits for it) — and what it received. The child should lead its own
+/// process group (spawn policy `GroupScoped`). Windows residual: descendants are not killed there.
 pub fn run_bounded(mut cmd: std::process::Command, deadline: Duration) -> Result<String, RepairError> {
     let start = std::time::Instant::now();
-    let reserve = (deadline / 4).min(Duration::from_secs(2));
-    let exit_by = deadline.saturating_sub(reserve);
+    let grace = (deadline / 4).min(Duration::from_millis(1500));
+    let run_until = deadline.saturating_sub(grace);
     let mut child = cmd
         .spawn()
         .map_err(|e| RepairError::Io(format!("등록기를 시작할 수 없습니다: {e}")))?;
     let pid = child.id();
-    // whether the child leads its own process group — measured NOW (spawn returns after exec, the
-    // session already made): once the child is reaped its pid no longer answers, but its group
-    // (the descendants) still exists under that id
+    // measured NOW (spawn returns after exec — the session already made): once the child is reaped
+    // its pid no longer answers, but its group still exists under that id
     let leads = leads_own_group(pid);
-    let out = child.stdout.take();
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let _ = std::thread::Builder::new().name("cys-bounded-reader".into()).spawn(move || {
-        let mut s = String::new();
-        if let Some(mut o) = out {
-            let _ = std::io::Read::read_to_string(&mut o, &mut s);
+    let mut pipe = OutPipe::new(child.stdout.take());
+    let mut status: Option<std::process::ExitStatus> = None;
+    let mut problems: Vec<String> = Vec::new();
+    loop {
+        pipe.pump();
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(st) => status = st,
+                Err(e) => {
+                    problems.push(format!("자식 상태를 읽을 수 없습니다: {e}"));
+                    break;
+                }
+            }
         }
-        let _ = tx.send(s);
-    });
-    let left = |d: Duration| d.saturating_sub(start.elapsed());
-    // (1) the child's own run, until `exit_by`
-    let mut status = None;
-    while start.elapsed() < exit_by {
-        match child.try_wait() {
-            Ok(Some(st)) => {
-                status = Some(st);
+        if status.is_some() && pipe.eof {
+            break;
+        }
+        if start.elapsed() >= run_until {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let timed_out = status.is_none();
+    let group_alive = leads && group_has_members(pid);
+    if status.is_none() || !pipe.eof || group_alive || !problems.is_empty() {
+        if leads {
+            match kill_group_of(pid) {
+                Ok(()) if group_alive && status.is_some() => {
+                    problems.push(format!("자식은 끝났지만 그 프로세스 그룹(pgid {pid})에 자손이 남아 있어 멈췄습니다"))
+                }
+                Ok(()) => {}
+                Err(e) => problems.push(format!("프로세스 그룹(pgid {pid})을 멈추지 못했습니다: {e}")),
+            }
+        }
+        if status.is_none() {
+            if let Err(e) = child.kill() {
+                problems.push(format!("자식(pid {pid})을 멈추지 못했습니다: {e}"));
+            }
+        }
+        // the short fixed grace: poll the exit and drain the output — never past the deadline
+        while start.elapsed() < deadline {
+            pipe.pump();
+            if status.is_none() {
+                if let Ok(Some(st)) = child.try_wait() {
+                    status = Some(st);
+                }
+            }
+            if status.is_some() && pipe.eof {
                 break;
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => {
-                kill_group_of(pid, leads);
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(RepairError::Io(format!("등록기 상태를 읽을 수 없어 그 프로세스 그룹을 멈췄습니다: {e}")));
-            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !pipe.eof {
+            problems.push("출력 파이프를 그룹 밖의 자손이 아직 쥐고 있어 기한에 읽기를 그만두었습니다".to_string());
         }
     }
-    // (2) its output, until `exit_by` as well
-    let mut output = match status {
-        Some(_) => rx.recv_timeout(left(exit_by)).ok(),
-        None => None,
-    };
-    if status.is_some() && output.is_some() {
-        let st = status.unwrap_or_else(|| unreachable!());
-        let s = output.unwrap_or_default();
-        if !st.success() {
-            return Err(RepairError::CheckFailed(format!("등록기가 실패했습니다(종료 {:?})", st.code())));
-        }
-        return Ok(s);
-    }
-    // (3) termination of the whole group, reaping, and the rest of the output — within the deadline
-    kill_group_of(pid, leads);
-    let _ = child.kill();
-    let reaped = child.wait().ok();
-    if output.is_none() {
-        output = rx.recv_timeout(left(deadline)).ok();
-    }
-    let got = output.as_deref().unwrap_or("");
+    let got = String::from_utf8_lossy(&pipe.buf).to_string();
     let shown: String = got.chars().take(400).collect();
-    let pipe = if output.is_none() {
-        " · 그룹 밖으로 나간 자손이 출력 파이프를 아직 쥐고 있어 읽기를 기다리지 않고 돌아왔습니다"
-    } else {
-        ""
-    };
-    if status.is_none() {
+    let Some(st) = status else {
+        // not reaped within the deadline: a detached reap, never waited for by this thread
+        let _ = std::thread::Builder::new()
+            .name("cys-bounded-reap".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+        problems.push(format!("자식(pid {pid})을 기한 안에 거두지 못해 따로 거두게 두었습니다(기다리지 않음)"));
         return Err(RepairError::CheckTimeout(format!(
-            "등록기가 {}초 안에 끝나지 않아 그 프로세스 그룹(pgid {pid})을 멈추고 거두었습니다(종료 {:?}){pipe} — 받은 출력 {}바이트: {shown}",
+            "등록기가 {}초 안에 끝나지 않았습니다 — {} — 받은 출력 {}바이트: {shown}",
             deadline.as_secs(),
-            reaped.and_then(|s| s.code()),
+            problems.join(" · "),
+            got.len()
+        )));
+    };
+    if timed_out {
+        return Err(RepairError::CheckTimeout(format!(
+            "등록기가 {}초 안에 끝나지 않아 멈추고 거두었습니다(종료 {:?}){}{} — 받은 출력 {}바이트: {shown}",
+            deadline.as_secs(),
+            st.code(),
+            if problems.is_empty() { "" } else { " — " },
+            problems.join(" · "),
             got.len()
         )));
     }
-    Err(RepairError::CheckFailed(format!(
-        "등록기는 끝났지만 그 자손이 출력 파이프를 쥐고 있어 기한 안에 보고를 다 받지 못했습니다 — 프로세스 그룹(pgid {pid})을 멈췄습니다{pipe} — 받은 출력 {}바이트: {shown}",
-        got.len()
-    )))
+    if !problems.is_empty() {
+        return Err(RepairError::CheckFailed(format!(
+            "등록기 실행이 깨끗하게 끝나지 않았습니다(종료 {:?}) — {} — 받은 출력 {}바이트: {shown}",
+            st.code(),
+            problems.join(" · "),
+            got.len()
+        )));
+    }
+    if !st.success() {
+        return Err(RepairError::CheckFailed(format!("등록기가 실패했습니다(종료 {:?})", st.code())));
+    }
+    Ok(got)
+}
+
+/// The child's stdout read WITHOUT blocking (DR3).
+struct OutPipe {
+    #[cfg(unix)]
+    pipe: Option<std::process::ChildStdout>,
+    #[cfg(not(unix))]
+    rx: Option<std::sync::mpsc::Receiver<Option<Vec<u8>>>>,
+    buf: Vec<u8>,
+    eof: bool,
+}
+
+impl OutPipe {
+    fn new(out: Option<std::process::ChildStdout>) -> OutPipe {
+        let eof = out.is_none();
+        #[cfg(unix)]
+        {
+            if let Some(o) = &out {
+                use std::os::unix::io::AsRawFd;
+                let fd = o.as_raw_fd();
+                // SAFETY: fcntl on a descriptor we own for the lifetime of `o`.
+                unsafe {
+                    let fl = libc::fcntl(fd, libc::F_GETFL);
+                    if fl >= 0 {
+                        libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+                    }
+                }
+            }
+            OutPipe { pipe: out, buf: Vec::new(), eof }
+        }
+        #[cfg(not(unix))]
+        {
+            let rx = out.map(|mut o| {
+                let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+                let _ = std::thread::Builder::new().name("cys-bounded-pipe".into()).spawn(move || {
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        match std::io::Read::read(&mut o, &mut chunk) {
+                            Ok(0) | Err(_) => {
+                                let _ = tx.send(None);
+                                break;
+                            }
+                            Ok(n) => {
+                                if tx.send(Some(chunk[..n].to_vec())).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+                rx
+            });
+            OutPipe { rx, buf: Vec::new(), eof }
+        }
+    }
+
+    /// Takes whatever output is available now; never waits.
+    fn pump(&mut self) {
+        if self.eof {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let Some(p) = self.pipe.as_mut() else {
+                self.eof = true;
+                return;
+            };
+            let mut chunk = [0u8; 8192];
+            loop {
+                match std::io::Read::read(p, &mut chunk) {
+                    Ok(0) => {
+                        self.eof = true;
+                        return;
+                    }
+                    Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        self.eof = true;
+                        return;
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let Some(rx) = self.rx.as_ref() else {
+                self.eof = true;
+                return;
+            };
+            loop {
+                match rx.try_recv() {
+                    Ok(Some(c)) => self.buf.extend_from_slice(&c),
+                    Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.eof = true;
+                        return;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                }
+            }
+        }
+    }
+}
+
+/// Whether the process group `pgid` still has a member (unix; `false` elsewhere).
+fn group_has_members(pgid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(p) = i32::try_from(pgid) else {
+            return false;
+        };
+        // SAFETY: signal 0 only probes the group.
+        let rc = unsafe { libc::killpg(p, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
+        false
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only (DR3): the next group kills fail with this errno (0 = off).
+    pub(crate) static FAIL_GROUP_KILL: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether `pid` leads its own process group (never the daemon's own group).
@@ -3004,20 +3159,33 @@ fn leads_own_group(pid: u32) -> bool {
     }
 }
 
-/// Kills the process group `pid` led at spawn (unix, only when it did — never the daemon's group);
-/// elsewhere nothing (the caller kills the child itself).
-fn kill_group_of(pid: u32, leads: bool) {
-    #[cfg(unix)]
-    if leads {
-        if let Ok(p) = i32::try_from(pid) {
-            // SAFETY: killpg takes plain integers; the group was measured to be the child's own.
-            unsafe {
-                libc::killpg(p, libc::SIGKILL);
-            }
+/// Kills the process group `pid` led at spawn (unix); the error is returned, never swallowed. A
+/// group that has no member any more (ESRCH) is not an error.
+fn kill_group_of(pid: u32) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let e = FAIL_GROUP_KILL.with(|c| c.get());
+        if e != 0 {
+            return Err(std::io::Error::from_raw_os_error(e).to_string());
         }
     }
+    #[cfg(unix)]
+    {
+        let p = i32::try_from(pid).map_err(|e| e.to_string())?;
+        // SAFETY: killpg takes plain integers; the group was measured to be the child's own.
+        if unsafe { libc::killpg(p, libc::SIGKILL) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::ESRCH) {
+                return Err(e.to_string());
+            }
+        }
+        Ok(())
+    }
     #[cfg(not(unix))]
-    let _ = (pid, leads);
+    {
+        let _ = pid;
+        Ok(())
+    }
 }
 
 /// Parses the registrar's Y2(a) JSON into a report.
