@@ -1755,7 +1755,12 @@ enum RowOutcome {
 }
 
 /// T3's per-file mutex for intake rows (`ledger_verbs::report` takes the same key in the same map):
-/// one writer per row file inside this daemon.
+/// one writer per row file inside this daemon. RULINGS DD4 (J7 I5) — the detector RETAINS no entry: after
+/// its write it removes the entry when nobody else holds it (strong count 1 under the map lock — every
+/// holder, `repair.report` too, clones the entry under that lock, so a removed entry is held and awaited
+/// by nobody; an entry someone still has stays, and the exclusion with `repair.report` is kept). This is
+/// the ONE function the detector takes its row lock through: unit T3d's bounded lock set
+/// (`repair::intake_lock_for`) replaces its body — a one-function swap.
 fn with_row_mutex<T>(daemon: &Daemon, sig: &str, f: impl FnOnce() -> T) -> T {
     let m = {
         let mut map = daemon.repair_mutexes.lock().unwrap_or_else(|e| e.into_inner());
@@ -1764,8 +1769,17 @@ fn with_row_mutex<T>(daemon: &Daemon, sig: &str, f: impl FnOnce() -> T) -> T {
                 .or_insert_with(|| Arc::new(Mutex::new(()))),
         )
     };
-    let _g = m.lock().unwrap_or_else(|e| e.into_inner());
-    f()
+    let out = {
+        let _g = m.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    };
+    drop(m);
+    let key = format!("intake:{sig}");
+    let mut map = daemon.repair_mutexes.lock().unwrap_or_else(|e| e.into_inner());
+    if map.get(&key).is_some_and(|e| Arc::strong_count(e) == 1) {
+        map.remove(&key);
+    }
+    out
 }
 
 /// ② Writes the rows the detector owes, under the intake's OWN quota. Runs on the flusher thread (and in
@@ -2762,6 +2776,33 @@ mod defect_intake_tests {
         assert!(tail_tb.len() > 10 * 1024 && cli_cut(&tail_tb).contains("Traceback (most recent call last)"));
         assert!(matches!(classify(&fail(&x, Some(&cli_cut(&tail_tb))), &base(), false), Classified::Failure { .. }), "a traceback inside the tail lost its row");
         eprintln!("[t3e-dd3] {} texts: {same} same signature, {declined} declined", texts.len());
+    }
+
+    /// RULINGS DD4 (J7 I5) — the detector retains NO lock per signature: fresh batches of distinct signatures of a
+    /// qualifying script, flushed again and again (most rows held by the intake's hourly share), leave no
+    /// `intake:` entry of the detector behind in `daemon.repair_mutexes`; an entry another holder still has
+    /// (`repair.report` in flight) is never taken away from it.
+    #[test]
+    fn dd4_the_detector_retains_no_lock_per_signature() {
+        let daemon = crate::team_gate_tests::tmp_daemon("t3e-dd4", false);
+        let root = tmp_root("dd4");
+        let intake_keys = || daemon.repair_mutexes.lock().unwrap().keys().filter(|k| k.starts_with("intake:")).count();
+        let x = bash("python3 ~/.cys/pack/bin/javis_x.py run");
+        let held_sig = intake::parse_report("bin/javis_x.py", "Exit code 1\nE0-0: x").unwrap().signature;
+        let held = Arc::new(Mutex::new(()));
+        daemon.repair_mutexes.lock().unwrap().insert(format!("intake:{held_sig}"), Arc::clone(&held));
+        for batch in 0..6 {
+            for i in 0..40 {
+                observe_tool_event(&daemon, &pre(&x));
+                observe_tool_event(&daemon, &fail(&x, Some(&format!("Exit code 1\nE{batch}-{i}: x"))));
+            }
+            let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now::at(10.0 + batch as f64));
+            assert!(rep.due > 0, "{rep:?}");
+            assert_eq!(intake_keys(), 1, "batch {batch}: the detector left per-signature locks behind ({rep:?})");
+        }
+        let kept = daemon.repair_mutexes.lock().unwrap().get(&format!("intake:{held_sig}")).cloned();
+        assert!(kept.is_some_and(|k| Arc::ptr_eq(&k, &held)), "an entry another holder had was taken away");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// RULINGS BY1 — the interpreter must be the script's own: every interpreter head (bare, with its
