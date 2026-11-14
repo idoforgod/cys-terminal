@@ -3876,55 +3876,12 @@ mod apply_verbs {
                 ));
             }
         }
-        // CT8: ONE re-application per parked edit ACROSS lanes — a durable exclusive claim keyed by R
-        // in the shared ledger (no-replace placement; no cross-lane lock); the scan above stays as
-        // the sequential check of records that already name R
-        let holder_alive = |h: &RepairId| {
-            ledger::read_record_in(&ctx.root, h)
-                .ok()
-                .flatten()
-                .is_some_and(|o| being_worked(o.state) || matches!(o.state, RepairState::Probation | RepairState::InUse))
-        };
-        let k = match cys::repair::reapply_claim::claim_in(&ctx.root, &r_id, &ctx.lane, ctx.now, &holder_alive) {
-            Ok(k) => k,
-            Err(cys::repair::reapply_claim::ClaimRefused::Held { holder }) => {
-                let s = ledger::read_record_in(&ctx.root, &holder)
-                    .ok()
-                    .flatten()
-                    .map(|o| o.state.label_ko())
-                    .unwrap_or("?");
-                return Err(VerbError::new(
-                    cys::repair::types::ERR_PRECONDITION,
-                    format!(
-                        "{r}: 이미 {o} 가 {r} 의 수정본을 다시 입히고 있습니다(상태: {s}) — 두 번 입히지 않습니다. 그 수리가 적용되면 전파로 이 부서에도 닿습니다",
-                        r = r_id.as_str(),
-                        o = holder.as_str()
-                    ),
-                ));
-            }
-            Err(cys::repair::reapply_claim::ClaimRefused::Starting { .. }) | Err(cys::repair::reapply_claim::ClaimRefused::LostRace) => {
-                return Err(VerbError::new(
-                    cys::repair::types::ERR_PRECONDITION,
-                    format!(
-                        "{r}: 다른 부서가 방금 {r} 의 수정본을 다시 입히기 시작했습니다 — 두 번 입히지 않습니다. 그 수리가 적용되면 전파로 이 부서에도 닿습니다",
-                        r = r_id.as_str()
-                    ),
-                ));
-            }
-            Err(cys::repair::reapply_claim::ClaimRefused::Io(e)) => return Err(VerbError::new("io", e)),
-        };
+        // CT8 / DR4 — ONE re-application per parked edit ACROSS lanes, by the grant's claim protocol:
+        // (1) bind R′ first — `begin` (R′ holds its own lock) and `reapplies: R` under R′'s mutex;
+        // (2) place claim k naming R′ (no-replace); (3) after placement, our claim must not be
+        // closed. A refusal at (2)/(3) closes R′ (truthfully: overtaken) and answers with the holder.
         let files: Vec<String> = parked.iter().map(|(rel, _)| rel.clone()).collect();
-        let mut out = match super::ledger_verbs::begin(
-            ctx,
-            caller,
-            &json!({"files": files, "trigger": "update"}),
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = cys::repair::reapply_claim::close_in(&ctx.root, &r_id, k, "begin 이 거절됨", ctx.now);
-                return Err(e);
-            }
-        };
+        let mut out = super::ledger_verbs::begin(ctx, caller, &json!({"files": files, "trigger": "update"}))?;
         let new_id = out
             .get("repair")
             .and_then(|x| x.as_str())
@@ -3937,7 +3894,47 @@ mod apply_verbs {
             rec.reapplies = Some(r_id.clone());
             ledger::write_record_durable_in(&ctx.root, &rec).map_err(VerbError::from)
         })?;
-        cys::repair::reapply_claim::set_holder_in(&ctx.root, &r_id, k, &new_id).map_err(VerbError::from)?;
+        let holder_of = |h: &RepairId| match ledger::read_record_in(&ctx.root, h) {
+            Ok(Some(o)) if being_worked(o.state) || matches!(o.state, RepairState::Probation | RepairState::InUse) => {
+                cys::repair::reapply_claim::Holder::Alive
+            }
+            Ok(Some(_)) => cys::repair::reapply_claim::Holder::Ended,
+            // unreadable holder evidence (or a holder that is gone) — assume held (G7)
+            Ok(None) | Err(_) => cys::repair::reapply_claim::Holder::Unreadable,
+        };
+        let refused = match cys::repair::reapply_claim::claim_in(&ctx.root, &r_id, &ctx.lane, &new_id, ctx.now, &holder_of) {
+            Ok(_) => None,
+            Err(cys::repair::reapply_claim::ClaimRefused::Held { holder }) => {
+                let s = ledger::read_record_in(&ctx.root, &holder)
+                    .ok()
+                    .flatten()
+                    .map(|o| o.state.label_ko())
+                    .unwrap_or("확인할 수 없음");
+                Some(format!(
+                    "{r}: 이미 {o} 가 {r} 의 수정본을 다시 입히고 있습니다(상태: {s}) — 두 번 입히지 않습니다. 그 수리가 적용되면 전파로 이 부서에도 닿습니다",
+                    r = r_id.as_str(),
+                    o = holder.as_str()
+                ))
+            }
+            Err(cys::repair::reapply_claim::ClaimRefused::LostRace) | Err(cys::repair::reapply_claim::ClaimRefused::ClosedAfterPlacement { .. }) => Some(format!(
+                "{r}: 다른 부서가 방금 {r} 의 수정본을 다시 입히기 시작했습니다 — 두 번 입히지 않습니다. 그 수리가 적용되면 전파로 이 부서에도 닿습니다",
+                r = r_id.as_str()
+            )),
+            Err(cys::repair::reapply_claim::ClaimRefused::Io(e)) => Some(format!("{}: 다시 입히기 주장을 남기지 못했습니다 — {e}", r_id.as_str())),
+        };
+        if let Some(why) = refused {
+            // the bound R′ is closed: it never re-applies anything
+            let _ = ctx.locked(new_id.as_str(), || -> Result<(), VerbError> {
+                if let Some(mut rec) = ledger::read_record_in(&ctx.root, &new_id).map_err(VerbError::from)? {
+                    rec.state = RepairState::Superseded;
+                    rec.lock = None;
+                    rec.methods.push(format!("다시 입히기 주장에서 밀려 닫음 — {why}").chars().take(300).collect());
+                    ledger::write_record_durable_in(&ctx.root, &rec).map_err(VerbError::from)?;
+                }
+                Ok(())
+            });
+            return Err(VerbError::new(cys::repair::types::ERR_PRECONDITION, why));
+        }
         out["reapplies"] = json!(r_id.as_str());
         out["parked"] = json!(parked
             .iter()

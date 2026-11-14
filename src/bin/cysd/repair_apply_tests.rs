@@ -340,9 +340,11 @@ fn reapply_refusal_is_true_with_and_without_the_kept_copy() {
     assert_eq!(v["begin"], "new", "{v}");
 }
 
-/// CT8: AR1 across lanes — another lane's claim on R (made a moment ago, its R′ not yet begun) is a
-/// durable exclusive claim in the shared ledger: this lane's `reapply R` is refused and starts
-/// nothing. Without CT8 both lanes passed the record scan and each began its own R′.
+/// CT8 / DR4: AR1 across lanes — another lane's claim on R, naming its live R′, is a durable
+/// exclusive claim in the shared ledger: this lane's `reapply R` binds its own R′, loses the claim,
+/// closes that R′ (it re-applies nothing) and answers naming the holder. (REWRITTEN with DR4 — old
+/// expectation: the refusal said "다른 부서가 방금" and `list_ids_in(..).len() == 1` "nothing
+/// started"; under the grant protocol R′ is bound BEFORE the claim, so it exists and is closed.)
 #[test]
 fn reapply_respects_another_lanes_claim() {
     let r = rig("ct8claim");
@@ -354,10 +356,18 @@ fn reapply_respects_another_lanes_claim() {
     ledger::write_record_in(&r.root, &rec).unwrap();
     let rid = cys::repair::types::RepairId::parse(&id).unwrap();
     let other = cys::repair::types::LaneKey("dept-9".into());
-    assert_eq!(cys::repair::reapply_claim::claim_in(&r.root, &rid, &other, T0 + 11.0, &|_| true), Ok(1));
+    let theirs = cys::repair::types::RepairId::parse("R-77").unwrap();
+    assert_eq!(
+        cys::repair::reapply_claim::claim_in(&r.root, &rid, &other, &theirs, T0 + 11.0, &|_| cys::repair::reapply_claim::Holder::Alive),
+        Ok(1)
+    );
     let e = r.call(T0 + 12.0, &w, "reapply", json!({"repair": id})).unwrap_err();
-    assert!(e.message.contains("다른 부서가 방금"), "{}", e.message);
-    assert_eq!(ledger::list_ids_in(&r.root).len(), 1, "nothing started");
+    assert!(e.message.contains("R-77") && e.message.contains("두 번 입히지 않습니다"), "{}", e.message);
+    let ids = ledger::list_ids_in(&r.root);
+    assert_eq!(ids.len(), 2, "our R′ was bound, then closed");
+    let ours = r.record_of(ids.last().unwrap().as_str());
+    assert_eq!(ours.state, RepairState::Superseded, "our R′ re-applies nothing");
+    assert!(ours.lock.is_none());
 }
 
 /// CU4: a parked `<rel>.user` that is NOT R's own edit (its bytes differ from R's repaired state)
