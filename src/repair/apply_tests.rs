@@ -320,7 +320,7 @@ fn rule_one_property_every_op_every_point() {
                         kind: "revert".into(),
                         expected: expected.clone(),
                         incoming: incoming.clone(),
-                        source,
+                        source: source.clone().map(Source::Fresh).unwrap_or(Source::None),
                         bound: Bound::now(&r.pack),
                     };
                     let first = run_op(&env, &spec);
@@ -480,7 +480,7 @@ fn every_form_applies_with_mode_and_fresh_mtime() {
         kind: "apply".into(),
         expected: r.live("hooks/a.sh"),
         incoming: st.clone(),
-        source: Some(src),
+        source: Source::Fresh(src),
         bound: Bound::now(&r.pack),
     })
     .unwrap();
@@ -500,7 +500,7 @@ fn every_form_applies_with_mode_and_fresh_mtime() {
         kind: "revert".into(),
         expected: r.live("hooks/c.sh"),
         incoming: TargetState::Absent,
-        source: None,
+        source: Source::None,
         bound: Bound::now(&r.pack),
     })
     .unwrap();
@@ -516,7 +516,7 @@ fn every_form_applies_with_mode_and_fresh_mtime() {
         kind: "revert".into(),
         expected: TargetState::Absent,
         incoming: st,
-        source: Some(src),
+        source: Source::Fresh(src),
         bound: Bound::now(&r.pack),
     })
     .unwrap();
@@ -596,7 +596,7 @@ fn displaced_garbage_is_never_relived() {
             kind: "apply".into(),
             expected: r.live("schedule.json"),
             incoming: st,
-            source: Some(src),
+            source: Source::Fresh(src),
             bound: Bound::now(&r.pack),
         })
         .unwrap();
@@ -812,7 +812,7 @@ fn windows_interruption_between_the_two_moves_resume_or_abandon() {
         let (src, st) = r.source("w.py", b"NEW\n", 0o644);
         let inj = Inject::new(Point::AfterFirstMove, Action::Stop, None, &r.pack);
         let env = r.env(&inj, ApplyForm::DepositFirst);
-        let first = run_op(&env, &OpSpec { id: rid("R-9"), rel: "bin/w.py".into(), kind: "revert".into(), expected: r.live("bin/w.py"), incoming: st, source: Some(src), bound: Bound::now(&r.pack) });
+        let first = run_op(&env, &OpSpec { id: rid("R-9"), rel: "bin/w.py".into(), kind: "revert".into(), expected: r.live("bin/w.py"), incoming: st, source: Source::Fresh(src), bound: Bound::now(&r.pack) });
         assert!(first.is_err());
         assert_eq!(r.live("bin/w.py"), TargetState::Absent, "the path is empty between the two moves");
         if bump {
@@ -854,7 +854,7 @@ fn staged_pack_swap_during_an_operation_then_second_install() {
     }
     let f = Swap(&r, Cell::new(false));
     let env = r.env(&f, ApplyForm::Exchange);
-    let d = run_op(&env, &OpSpec { id: rid("R-10"), rel: "hooks/a.sh".into(), kind: "apply".into(), expected: r.live("hooks/a.sh"), incoming: st, source: Some(src), bound: Bound::now(&r.pack) }).unwrap();
+    let d = run_op(&env, &OpSpec { id: rid("R-10"), rel: "hooks/a.sh".into(), kind: "apply".into(), expected: r.live("hooks/a.sh"), incoming: st, source: Source::Fresh(src), bound: Bound::now(&r.pack) }).unwrap();
     assert!(matches!(d.outcome, ApplyOutcome::Superseded(_)), "{:?}", d.outcome);
     // second install: the pack swapped again (pack.prev deleted by the installer)
     let _ = std::fs::remove_dir_all(r.base.join("pack.prev"));
@@ -1366,7 +1366,7 @@ fn failing_exchange_declines_and_closes_the_record() {
     r.put("hooks/z.sh", b"LIVE\n", 0o755);
     let (src, st) = r.source("z.sh", b"NEW\n", 0o755);
     let env = r.env(&Vanish, ApplyForm::Exchange);
-    let d = run_op(&env, &OpSpec { id: rid("R-34"), rel: "hooks/z.sh".into(), kind: "apply".into(), expected: r.live("hooks/z.sh"), incoming: st, source: Some(src), bound: Bound::now(&r.pack) }).unwrap();
+    let d = run_op(&env, &OpSpec { id: rid("R-34"), rel: "hooks/z.sh".into(), kind: "apply".into(), expected: r.live("hooks/z.sh"), incoming: st, source: Source::Fresh(src), bound: Bound::now(&r.pack) }).unwrap();
     assert!(matches!(d.outcome, ApplyOutcome::Declined(ref m) if m.contains("ENOENT")), "{:?}", d.outcome);
     assert_eq!(std::fs::read(r.pack.join("hooks/z.sh")).unwrap(), b"LIVE\n");
     let (ops, _) = wal::list_in(&r.root, &rid("R-34"));
@@ -1393,7 +1393,7 @@ fn flush_failure_after_the_exchange_keeps_the_evidence() {
     let r = rig("ct2op");
     let before = r.put("hooks/f.sh", b"OLD\n", 0o755);
     let (src, incoming) = r.source("f-new", b"NEW\n", 0o755);
-    let spec = OpSpec { id: rid("R-6"), rel: "hooks/f.sh".into(), kind: "revert".into(), expected: before, incoming: incoming.clone(), source: Some(src), bound: Bound::now(&r.pack) };
+    let spec = OpSpec { id: rid("R-6"), rel: "hooks/f.sh".into(), kind: "revert".into(), expected: before, incoming: incoming.clone(), source: Source::Fresh(src), bound: Bound::now(&r.pack) };
     let faults = FailFlushAfterExchange;
     let res = run_op(&r.env(&faults, ApplyForm::Exchange), &spec);
     crate::repair::durable::INJECT_FLUSH_ERRNO.with(|c| c.set((0, 0)));
@@ -2062,7 +2062,7 @@ fn recovery_never_touches_a_live_operation() {
     // a file operation stopped after its record, still owned
     let before = r.put("hooks/l2.sh", b"OLD\n", 0o755);
     let (src, incoming) = r.source("l2-new", b"NEW\n", 0o755);
-    let spec = OpSpec { id: rid("R-39"), rel: "hooks/l2.sh".into(), kind: "revert".into(), expected: before, incoming, source: Some(src), bound: Bound::now(&r.pack) };
+    let spec = OpSpec { id: rid("R-39"), rel: "hooks/l2.sh".into(), kind: "revert".into(), expected: before, incoming, source: Source::Fresh(src), bound: Bound::now(&r.pack) };
     let stop = StopOn { rel: "hooks/l2.sh", point: Point::AfterRecord, fired: Cell::new(false) };
     assert!(run_op(&r.env(&stop, ApplyForm::Exchange), &spec).is_err());
     let rec = wal::unfinished_for_lane(&r.root, &r.lane).into_iter().next().unwrap();
@@ -2217,7 +2217,7 @@ fn an_abandonment_never_places_g1_bytes_into_g2() {
     let r = rig("ej1abandon");
     let before = r.put("bin/w2.py", b"G1-LIVE\n", 0o644);
     let (src, st) = r.source("w2-new", b"G1-NEW\n", 0o644);
-    let spec = OpSpec { id: rid("R-50"), rel: "bin/w2.py".into(), kind: "revert".into(), expected: before, incoming: st, source: Some(src), bound: Bound::now(&r.pack) };
+    let spec = OpSpec { id: rid("R-50"), rel: "bin/w2.py".into(), kind: "revert".into(), expected: before, incoming: st, source: Source::Fresh(src), bound: Bound::now(&r.pack) };
     let stop = StopOn { rel: "bin/w2.py", point: Point::AfterFirstMove, fired: Cell::new(false) };
     assert!(run_op(&r.env(&stop, ApplyForm::DepositFirst), &spec).is_err());
     assert_eq!(r.live("bin/w2.py"), TargetState::Absent, "the first move happened");
@@ -2973,6 +2973,7 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("apply.rs", "run_registrar", "not-a-read", 1, "the process environment (current executable)"),
     ("apply.rs", "second_move", "conservative", 1, "an unreadable deposit → not resumed: abandoned, only bytes the record vouches for go back"),
     ("apply.rs", "second_move", "not-a-read", 1, "the copy path, present when copy_ok"),
+    ("apply.rs", "slot_binding", "evidence", 1, "GK1: unreadable slot metadata → Unknown binding: never put back"),
     ("apply.rs", "step4", "conservative", 2, "sealed copy if present else payload — either is verified against the expected state before use"),
     ("apply.rs", "unreadable_intents_in", "reported", 1, "an unlistable root is reported by the recovery and the passes"),
     ("apply.rs", "unreadable_ledger_member", "display", 1, "a path shown relative when it can be"),
@@ -3023,7 +3024,8 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("intake.rs", "load_row", "outside", 1, "another track's file, not changed by T6"),
     ("ledger.rs", "allocate_id_in", "outside", 2, "another track's file, not changed by T6"),
     ("ledger.rs", "copy_preimage_in", "not-a-read", 1, "a path's last part"),
-    ("ledger.rs", "copy_preimage_in", "evidence", 1, "FI1 seam: an unreadable generation is recorded as none (Unknown)"),
+    ("ledger.rs", "copy_preimage_in", "evidence", 2, "GK1 seam: the generation read before and after the copy — unreadable → none recorded (Unknown)"),
+    ("ledger.rs", "copy_preimage_in", "conservative", 1, "GM1: an unreadable copy is treated as a script whose mode may lag → no generation"),
     ("ledger.rs", "held_by_seat_in", "outside", 1, "another track's file, not changed by T6"),
     ("ledger.rs", "lane_rows_in", "outside", 1, "another track's file, not changed by T6"),
     ("ledger.rs", "list_ids_checked_in", "not-a-read", 1, "FG1 seam: a name that is not an id is not a repair"),
@@ -3069,6 +3071,7 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("types.rs", "repair_number", "outside", 1, "another track's file, not changed by T6"),
     ("vault.rs", "basename", "not-a-read", 1, "a path's last part"),
     ("vault.rs", "build_slot", "not-a-read", 1, "the clock"),
+    ("vault.rs", "build_slot", "evidence", 2, "GK1: the generation read before and after the copy — unreadable → none recorded (Unknown)"),
     ("vault.rs", "deposit_of", "reported", 2, "unreadable metadata → Err(Superseded)"),
     ("vault.rs", "deposit_of", "conservative", 1, "every deposit is verified against its recorded hash"),
     ("vault.rs", "finish_seal_with", "conservative", 1, "a failed probe of the record → the no-replace publication fails loudly"),
@@ -3115,6 +3118,90 @@ fn an_applying_intent_naming_the_file_is_a_claim() {
     std::fs::write(intent_path_in(&r.root, &id, &r.lane), b"{ broken").unwrap();
     assert!(matches!(resolve_approved_copy_in(&r.root, &r.pack, &r.lane, "hooks/other.sh"), ApprovedCopy::LedgerUnreadable { .. }));
     assert_eq!(unreadable_intents_in(&r.root, &r.lane).len(), 1);
+}
+
+// ───────────────────────────── RULINGS GK1 — the door takes the generation from the slot ─────────────────────────────
+
+/// GK1 (a) (codex r5 B1): an update completing BETWEEN the pre-image's copy and the second reading
+/// of the generation leaves the slot without a generation (Unknown) — never stamped with the newer
+/// generation while holding the older bytes. Without GK1 the generation was read once, after the
+/// copy: the slot said G2 with G1 bytes.
+#[test]
+fn an_update_between_the_copy_and_the_metadata_leaves_the_generation_unknown() {
+    let r = rig("gk1copy");
+    let id = rid("R-71");
+    r.put("bin/u.py", b"print('g1')\n", 0o644);
+    let pack = r.pack.clone();
+    ledger::BETWEEN_PREIMAGE_COPY_AND_GENERATION.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move || std::fs::write(pack.join(".pack-version"), "0.15.1\n").unwrap()));
+    });
+    let pre = ledger::copy_preimage_in(&r.root, &id, &r.lane, "bin/u.py", &r.pack.join("bin/u.py"), 1.0);
+    ledger::BETWEEN_PREIMAGE_COPY_AND_GENERATION.with(|h| *h.borrow_mut() = None);
+    let PreImage::Slot { slot_dir, .. } = pre.unwrap() else { panic!("slot") };
+    assert_eq!(vault::slot_generation(&slot_dir).unwrap(), None, "an unstable reading records no generation");
+    // a stable reading records it
+    let id2 = rid("R-72");
+    let pre = ledger::copy_preimage_in(&r.root, &id2, &r.lane, "bin/u.py", &r.pack.join("bin/u.py"), 2.0).unwrap();
+    let PreImage::Slot { slot_dir, .. } = pre else { panic!("slot") };
+    assert_eq!(vault::slot_generation(&slot_dir).unwrap().unwrap().version, "0.15.1");
+}
+
+/// GK1 (a) / GM1: a `#!` pre-image WITHOUT the owner's execute bit gets no generation (its mode may
+/// not be its generation's final one — the non-transactional install sets the bit after
+/// `.pack-version`); with the bit, the generation.
+#[cfg(unix)]
+#[test]
+fn a_shebang_pre_image_without_its_execute_bit_has_no_generation() {
+    let r = rig("gm1");
+    r.put("hooks/s.sh", b"#!/bin/sh\necho s\n", 0o644);
+    let PreImage::Slot { slot_dir, .. } = ledger::copy_preimage_in(&r.root, &rid("R-73"), &r.lane, "hooks/s.sh", &r.pack.join("hooks/s.sh"), 1.0).unwrap() else { panic!("slot") };
+    assert_eq!(vault::slot_generation(&slot_dir).unwrap(), None, "0644 → UNKNOWN");
+    r.put("hooks/s.sh", b"#!/bin/sh\necho s\n", 0o755);
+    let PreImage::Slot { slot_dir, .. } = ledger::copy_preimage_in(&r.root, &rid("R-74"), &r.lane, "hooks/s.sh", &r.pack.join("hooks/s.sh"), 2.0).unwrap() else { panic!("slot") };
+    assert_eq!(vault::slot_generation(&slot_dir).unwrap().unwrap().version, "0.15.0", "0755 → the generation");
+}
+
+/// GK1 (b) (codex r5 B1): a PENDING revert (its intent `reverting`, bound to the generation now)
+/// whose pre-image slot records no generation — or another one — puts nothing back: the put-back
+/// takes the binding from the slot itself, the intent's generation never stands in. Without GK1 the
+/// recovery bound the put-back to the intent's generation and restored the bytes.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_pending_revert_never_puts_back_a_slot_without_its_generation_or_with_another() {
+    for (tag, slot_gen) in [("none", None), ("other", Some(serde_json::json!({"version": "0.14.0", "pro_revision": null})))] {
+        let r = rig(&format!("gk1pending{tag}"));
+        let id = rid("R-75");
+        let rec = committed_general(&r, &id, "hooks/v.sh", Some(b"PRE\n"), Some(b"POST\n"));
+        let PreImage::Slot { slot_dir, .. } = &rec.files[0].pre else { panic!("slot") };
+        let p = slot_dir.join("meta").join("pre.json");
+        let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        match &slot_gen {
+            None => {
+                v.as_object_mut().unwrap().remove("pack_generation");
+            }
+            Some(g) => v["pack_generation"] = g.clone(),
+        }
+        std::fs::write(&p, serde_json::to_vec(&v).unwrap()).unwrap();
+        let applied = r.live("hooks/v.sh").canon();
+        let pre_state = rec.files[0].pre.state().canon();
+        let ri = RevertIntent {
+            schema: 1,
+            repair: id.clone(),
+            lane_key: r.lane.clone(),
+            op_tag: "t".into(),
+            state: "reverting".into(),
+            targets: vec![RevertTarget { rel: "hooks/v.sh".into(), applied, pre: pre_state }],
+            has_hooks: false,
+            pack_generation: Bound::now(&r.pack).known(),
+            by: "사람".into(),
+            created_at: 1.0,
+            updated_at: 1.0,
+        };
+        write_revert_intent(&r.root, &ri).unwrap();
+        let env = r.env(&NoFaults, ApplyForm::Exchange);
+        let _ = recover_revert_intents_in(&env, &no_hooks, &no_repair_lock);
+        assert_eq!(std::fs::read(r.pack.join("hooks/v.sh")).unwrap(), b"POST\n", "{tag}: nothing put back");
+    }
 }
 
 // ───────────────────────────── RULINGS EJ4 — one ownership per repair ─────────────────────────────

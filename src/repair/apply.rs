@@ -135,11 +135,82 @@ pub struct OpSpec {
     pub expected: TargetState,
     /// The state put live.
     pub incoming: TargetState,
-    /// The file holding the incoming bytes (a `File` incoming state).
-    pub source: Option<PathBuf>,
+    /// Where the incoming bytes come from (RULINGS GK1: bytes held in a vault slot are bound by the
+    /// generation that slot recorded — the engine reads it; no caller hands it in).
+    pub source: Source,
     /// The generation this operation is bound to (EJ1: required — Known or Unknown; Unknown places
     /// nothing).
     pub bound: Bound,
+}
+
+/// RULINGS GK1 — where an operation's incoming bytes come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// Nothing is copied (an entry moved out; a link put live from its target string).
+    None,
+    /// Bytes that were never live in a pack: an approved candidate's staging, this binary's
+    /// original of the current generation (bound by the operation's own binding).
+    Fresh(PathBuf),
+    /// Bytes HELD IN A VAULT SLOT — a pre-image, an apply-displaced copy, an approved copy: putting
+    /// them live is bound by the generation THAT SLOT recorded when it was filled (absent, unreadable
+    /// or another generation → never put back).
+    Slot { holder: PathBuf },
+}
+
+impl Source {
+    /// The file holding the bytes, if any.
+    pub fn holder(&self) -> Option<&Path> {
+        match self {
+            Source::None => None,
+            Source::Fresh(p) | Source::Slot { holder: p } => Some(p.as_path()),
+        }
+    }
+
+    /// A holder returned by the vault (`sealed/<base>` or `payload/<base>` of a slot), or none.
+    pub fn of_slot(holder: Option<PathBuf>) -> Source {
+        match holder {
+            Some(holder) => Source::Slot { holder },
+            None => Source::None,
+        }
+    }
+
+    /// GK1: the binding of a slot's bytes — read from the slot's own write-once metadata (`None` =
+    /// the bytes are not a slot's; `Some(Unknown)` = the slot records no readable generation, or the
+    /// holder is not inside a slot).
+    fn slot_binding(&self) -> Option<Bound> {
+        let Source::Slot { holder } = self else {
+            return None;
+        };
+        let in_slot = holder.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()).is_some_and(|n| n == "sealed" || n == "payload");
+        Some(match holder.parent().and_then(Path::parent) {
+            Some(slot) if in_slot => match vault::slot_generation(slot) {
+                Ok(g) => Bound::of(g),
+                Err(_) => Bound::Unknown,
+            },
+            _ => Bound::Unknown,
+        })
+    }
+}
+
+/// RULINGS GK1 — what the door checks before it touches a live path: the operation's own binding
+/// AND, for bytes held in a vault slot, the generation the slot recorded. Built only here — from an
+/// operation (its spec) or from an operation's durable record — never from a value a caller passes.
+struct Binding {
+    op: Bound,
+    bytes: Option<Bound>,
+}
+
+impl Binding {
+    fn of_spec(spec: &OpSpec) -> Binding {
+        Binding { op: spec.bound.clone(), bytes: spec.source.slot_binding() }
+    }
+    /// A resumed operation: its record's generation was checked against its slot's when it was born.
+    fn of_record(rec: &OpRecord) -> Binding {
+        Binding { op: Bound::of(rec.pack_generation.clone()), bytes: None }
+    }
+    fn holds_now(&self, pack: &Path) -> bool {
+        self.op.equals_now(pack) && self.bytes.as_ref().is_none_or(|b| b.equals_now(pack))
+    }
 }
 
 /// The result of one operation.
@@ -302,8 +373,9 @@ enum DoorAct<'a> {
 /// `live_writes_go_through_the_one_door`). It reads the pack's generation AT THIS MOMENT and acts
 /// only when the operation's bound generation is Known and equal; otherwise `Superseded`, nothing
 /// touched.
-fn door(env: &OpEnv<'_>, bound: &Bound, live: &Path, act: DoorAct<'_>) -> Result<(), RepairError> {
-    if !bound.equals_now(env.pack) {
+fn door(env: &OpEnv<'_>, binding: &Binding, live: &Path, act: DoorAct<'_>) -> Result<(), RepairError> {
+    // GK1: the operation's binding AND the generation of the slot whose bytes go live
+    if !binding.holds_now(env.pack) {
         return Err(RepairError::Superseded(format!(
             "{}: 팩 세대가 이 동작이 묶인 세대와 다르거나 알 수 없어 살아 있는 자리를 바꾸지 않았습니다",
             live.display()
@@ -519,7 +591,7 @@ fn run_op_depth(env: &OpEnv<'_>, spec: &OpSpec, depth: u8) -> Result<OpDone, Rep
         .ok_or_else(|| RepairError::Precondition(format!("{}: 부모 폴더가 없습니다", spec.rel)))?
         .to_path_buf();
     if spec.expected == TargetState::Absent && spec.incoming != TargetState::Absent && std::fs::symlink_metadata(&parent).is_err() {
-        if let Err(e) = door(env, &spec.bound, &parent, DoorAct::MakeParents) {
+        if let Err(e) = door(env, &Binding::of_spec(spec), &parent, DoorAct::MakeParents) {
             return match e {
                 RepairError::Superseded(m) => Ok(done(ApplyOutcome::Superseded(m), None)),
                 e => Err(e),
@@ -553,6 +625,17 @@ fn run_op_depth(env: &OpEnv<'_>, spec: &OpSpec, depth: u8) -> Result<OpDone, Rep
                 spec.rel,
                 spec.expected.canon(),
                 now_state.canon()
+            )),
+            None,
+        ));
+    }
+    // GK1: bytes held in a vault slot are put live only when THAT SLOT's recorded generation is the
+    // pack's now (absent / unreadable / another generation → nothing put back)
+    if !Binding::of_spec(spec).holds_now(env.pack) && spec.bound.equals_now(env.pack) {
+        return Ok(done(
+            ApplyOutcome::Superseded(format!(
+                "{}: 되살릴 바이트의 보관 칸이 기록한 팩 세대가 지금과 다르거나 없습니다 — 자동으로 되놓지 않습니다",
+                spec.rel
             )),
             None,
         ));
@@ -592,7 +675,7 @@ fn op_exchange(
     gen: &PackGeneration,
     depth: u8,
 ) -> Result<OpDone, RepairError> {
-    let staged = staged_of(&spec.incoming, spec.source.as_deref())?;
+    let staged = staged_of(&spec.incoming, spec.source.holder())?;
     let slot = vault::build_slot(
         env.root,
         &spec.id,
@@ -603,7 +686,7 @@ fn op_exchange(
         &spec.expected,
         &staged,
         env.now,
-        Bound::now(env.pack).known().as_ref(),
+        env.pack,
     )?;
     if env.faults.at(Point::AfterSlot, live, Some(&slot)) {
         return Err(stop(Point::AfterSlot));
@@ -644,7 +727,7 @@ fn op_exchange(
         return Err(stop(Point::AfterRecord));
     }
     // step 3: the exchange; the seal is the very next filesystem operation (M2)
-    if let Err(e) = door(env, &spec.bound, live, DoorAct::Exchange { payload: &slot.payload() }) {
+    if let Err(e) = door(env, &Binding::of_spec(spec), live, DoorAct::Exchange { payload: &slot.payload() }) {
         return door_refused(env, &mut rec, spec, e);
     }
     seal_now(env, &slot, live)?;
@@ -709,7 +792,7 @@ fn step4(
                     kind: "undo-mismatch".into(),
                     expected: live_now,
                     incoming: deposit.clone(),
-                    source: Some(holder),
+                    source: Source::Slot { holder },
                     bound: Bound::of(rec.pack_generation.clone()),
                 };
                 let r = run_op_depth(env, &back, depth + 1)?;
@@ -771,7 +854,7 @@ fn step4(
                 kind: "undo-superseded".into(),
                 expected: TargetState::read(live)?,
                 incoming: deposit.clone(),
-                source: Some(holder),
+                source: Source::Slot { holder },
                 bound: Bound::of(rec.pack_generation.clone()),
             };
             let r = run_op_depth(env, &relive, depth + 1)?;
@@ -807,7 +890,7 @@ fn op_move_in(
         &spec.expected,
         &Staged::Empty,
         env.now,
-        Bound::now(env.pack).known().as_ref(),
+        env.pack,
     )?;
     if env.faults.at(Point::AfterSlot, live, Some(&slot)) {
         return Err(stop(Point::AfterSlot));
@@ -836,7 +919,7 @@ fn op_move_in(
     if env.faults.at(Point::AfterRecord, live, Some(&slot)) {
         return Err(stop(Point::AfterRecord));
     }
-    if let Err(e) = door(env, &spec.bound, live, DoorAct::MoveOut { into: &slot.payload() }) {
+    if let Err(e) = door(env, &Binding::of_spec(spec), live, DoorAct::MoveOut { into: &slot.payload() }) {
         return door_refused(env, &mut rec, spec, e);
     }
     seal_now(env, &slot, live)?;
@@ -891,7 +974,7 @@ fn after_seal_move_in(
                 kind: "undo-superseded".into(),
                 expected: TargetState::Absent,
                 incoming: facts.sealed_state.clone(),
-                source: Some(holder),
+                source: Source::Slot { holder },
                 bound: Bound::of(rec.pack_generation.clone()),
             };
             let r = run_op_depth(env, &relive, depth + 1)?;
@@ -938,7 +1021,7 @@ fn verify_placed(
             kind: "undo-mismatch".into(),
             expected: live_now,
             incoming: previous.0,
-            source: previous.1,
+            source: Source::of_slot(previous.1),
             bound: Bound::of(rec.pack_generation.clone()),
         };
         let r = run_op_depth(env, &back, depth + 1)?;
@@ -958,7 +1041,7 @@ fn op_place(
     live: &Path,
     gen: &PackGeneration,
 ) -> Result<OpDone, RepairError> {
-    let copy = incoming_copy(env, &spec.id, op, &spec.incoming, spec.source.as_deref())?;
+    let copy = incoming_copy(env, &spec.id, op, &spec.incoming, spec.source.holder())?;
     let drop_copy = |c: &Path| {
         let _ = std::fs::remove_file(c); // our own non-slot copy
     };
@@ -992,7 +1075,7 @@ fn op_place(
     if env.faults.at(Point::AfterRecord, live, None) {
         return Err(stop(Point::AfterRecord));
     }
-    match door(env, &spec.bound, live, DoorAct::Place { copy: &copy }) {
+    match door(env, &Binding::of_spec(spec), live, DoorAct::Place { copy: &copy }) {
         Ok(()) => {}
         Err(RepairError::Superseded(m)) => {
             drop_copy(&copy);
@@ -1039,12 +1122,12 @@ fn op_deposit_first(
         &spec.expected,
         &Staged::Empty,
         env.now,
-        Bound::now(env.pack).known().as_ref(),
+        env.pack,
     )?;
     if env.faults.at(Point::AfterSlot, live, Some(&slot)) {
         return Err(stop(Point::AfterSlot));
     }
-    let copy = incoming_copy(env, &spec.id, op, &spec.incoming, spec.source.as_deref())?;
+    let copy = incoming_copy(env, &spec.id, op, &spec.incoming, spec.source.holder())?;
     let (live_identity, copy_identity) = match (identity_of(live), identity_of(&copy)) {
         (Ok(a), Ok(b)) => (a, b),
         (Err(e), _) | (_, Err(e)) => {
@@ -1071,7 +1154,7 @@ fn op_deposit_first(
         return Err(stop(Point::AfterRecord));
     }
     // first move: the live file into the slot (a held file fails here → stop, delete nothing)
-    if let Err(e) = door(env, &spec.bound, live, DoorAct::MoveOut { into: &slot.payload() }) {
+    if let Err(e) = door(env, &Binding::of_spec(spec), live, DoorAct::MoveOut { into: &slot.payload() }) {
         let _ = std::fs::remove_file(&copy);
         return door_refused(env, &mut rec, spec, e);
     }
@@ -1104,7 +1187,7 @@ fn second_move(
     if copy_ok && gen_ok && deposit_ok {
         // RESUME (OQ-D8): the staged copy still matches and the generation is unchanged
         let copy = rec.incoming_copy.clone().unwrap_or_default();
-        match door(env, &Bound::of(rec.pack_generation.clone()), live, DoorAct::Place { copy: &copy }) {
+        match door(env, &Binding::of_record(rec), live, DoorAct::Place { copy: &copy }) {
             Ok(()) => {
                 if let Some(p) = live.parent() {
                     super::durable::full_flush_dir(p)?;
@@ -1160,7 +1243,7 @@ fn second_move(
                 kind: "undo-superseded".into(),
                 expected: TargetState::Absent,
                 incoming: st,
-                source: Some(holder),
+                source: Source::Slot { holder },
                 bound: Bound::of(rec.pack_generation.clone()),
             };
             match run_op_depth(env, &back, 1) {
@@ -1189,7 +1272,7 @@ pub fn resume_op(env: &OpEnv<'_>, mut rec: OpRecord) -> Result<OpDone, RepairErr
         kind: rec.kind.clone(),
         expected: canon_req(&rec.expected, &rec.rel)?,
         incoming: canon_req(&rec.incoming, &rec.rel)?,
-        source: None,
+        source: Source::None,
         bound: Bound::of(rec.pack_generation.clone()),
     };
     let slot = rec.slot.as_ref().map(|d| Slot::at(d, &rec.rel));
@@ -1784,7 +1867,9 @@ fn recover_one_revert(
                     kind: "revert".into(),
                     expected: applied,
                     incoming: pre,
-                    source: holder,
+                    // GK1: the pre-image's OWN slot binds the put-back (the intent's generation is
+                    // never a substitute)
+                    source: Source::of_slot(holder),
                     bound: Bound::of(ri.pack_generation.clone()),
                 },
             )?
@@ -1906,7 +1991,7 @@ pub fn revert_in(
             kind: "revert".into(),
             expected,
             incoming: pre,
-            source: holder,
+            source: Source::of_slot(holder),
             bound,
         });
     }
@@ -2762,7 +2847,7 @@ fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &Repair
             kind: "apply".into(),
             expected: pre,
             incoming,
-            source: None,
+            source: Source::None,
             bound: Bound::of(intent.pack_generation.clone()),
         });
     }
@@ -2913,7 +2998,7 @@ pub fn apply_candidate_in(
             &pre,
             &staged,
             env.now,
-            Bound::now(env.pack).known().as_ref(),
+            env.pack,
         )?;
         slot_states.push((f.rel.clone(), TargetState::read(&slot.payload())?));
         slots.push((f.rel.clone(), Some(slot)));
@@ -3014,7 +3099,8 @@ pub fn apply_candidate_in(
                 kind: "apply".into(),
                 expected: pre,
                 incoming,
-                source: slot.as_ref().map(|s| s.payload()),
+                // GK1: the fingerprinted slot holds the candidate — its own generation binds it
+                source: Source::of_slot(slot.as_ref().map(|s| s.payload())),
                 // EJ1: bound to the apply's binding (its undo carries the same binding)
                 bound: apply_bound.clone(),
             },
@@ -3065,7 +3151,7 @@ pub fn apply_candidate_in(
                         },
                     },
                     env.now,
-                    Bound::now(env.pack).known().as_ref(),
+                    env.pack,
                 )
                 .ok()
                 .filter(|_| matches!(spec.incoming, TargetState::File { .. }));
@@ -3319,7 +3405,7 @@ fn exchange_prepared(
     if env.faults.at(Point::AfterRecord, &live, Some(slot)) {
         return Err(stop(Point::AfterRecord));
     }
-    if let Err(e) = door(env, &spec.bound, &live, DoorAct::Exchange { payload: &slot.payload() }) {
+    if let Err(e) = door(env, &Binding::of_spec(spec), &live, DoorAct::Exchange { payload: &slot.payload() }) {
         return door_refused(env, &mut rec, spec, e);
     }
     seal_now(env, slot, &live)?;
@@ -3362,7 +3448,7 @@ fn undo_applied_with(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord, on
             kind: "revert".into(),
             expected: live_now,
             incoming: pre,
-            source: holder,
+            source: Source::of_slot(holder),
             // FI1: the binding of the bytes put back (a removal: the apply's binding — DR1)
             bound: put_back_bound(slot.as_deref(), &spec.bound),
         };

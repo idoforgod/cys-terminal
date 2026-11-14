@@ -1747,7 +1747,15 @@ fn m10_sweep_full(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
         let sub = m10_root_in(root, lane);
         std::fs::create_dir_all(&sub).map_err(|e| RepairError::Io(format!("{}: {e}", sub.display())))?;
         let src_file = sub.join(format!(".original-{}", super::wal::new_op_id(env.op.now, "orig")));
-        apply::write_new(&src_file, &orig, mode)?;
+        // GK1: an approved copy is a slot's bytes — that slot's own generation binds the put-back;
+        // our original of the current generation is fresh bytes (bound by the scan's sampling)
+        let source = match &approved {
+            apply::ApprovedCopy::Approved { holder, .. } => apply::Source::Slot { holder: holder.clone() },
+            _ => {
+                apply::write_new(&src_file, &orig, mode)?;
+                apply::Source::Fresh(src_file.clone())
+            }
+        };
         let sub_env = OpEnv {
             root: &sub,
             pack,
@@ -1763,7 +1771,7 @@ fn m10_sweep_full(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
             kind: "m10-revert".into(),
             expected: sampled_live.clone(),
             incoming: TargetState::File { sha256: source_sha.clone(), mode },
-            source: Some(src_file.clone()),
+            source,
             bound: bound.clone(),
         };
         let busy = std::cell::Cell::new(false);

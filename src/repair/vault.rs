@@ -372,8 +372,12 @@ pub fn build_slot(
     expected: &TargetState,
     staged: &Staged,
     now: f64,
-    generation: Option<&super::ledger::PackGeneration>,
+    pack: &Path,
 ) -> Result<Slot, RepairError> {
+    // RULINGS GK1 (a): the pack generation read BEFORE and AFTER the bytes are copied — equal →
+    // recorded with the slot; unequal or unreadable → no generation (UNKNOWN: never put back
+    // automatically)
+    let generation_before = super::apply::pack_generation_checked(pack).ok();
     let vault = vault_dir_in(root, id);
     if std::fs::symlink_metadata(&vault).is_err() {
         std::fs::create_dir_all(&vault).map_err(|e| io(&vault, e))?;
@@ -432,10 +436,13 @@ pub fn build_slot(
             "mode": mode,
             "link_target": link_target,
         });
-        // RULINGS FI1: the pack generation in which this slot's bytes are live, read when the slot is
-        // filled (absent = Unknown — the caller could not read it)
-        if let Some(g) = generation {
-            pre["pack_generation"] = serde_json::json!(g);
+        // RULINGS FI1 / GK1: the pack generation in which this slot's bytes are live — stable around
+        // the copy, else absent (Unknown)
+        let generation_after = super::apply::pack_generation_checked(pack).ok();
+        if let (Some(b), Some(a)) = (&generation_before, &generation_after) {
+            if b == a {
+                pre["pack_generation"] = serde_json::json!(b);
+            }
         }
         let mut bytes =
             serde_json::to_vec_pretty(&pre).map_err(|e| RepairError::Io(e.to_string()))?;
@@ -764,7 +771,7 @@ mod tests {
                     mode: 0o755,
                 },
                 1_800_000_000.0,
-                None,
+                &root,
             )
             .unwrap();
             assert!(super::super::ledger::is_slot_name(&s.name()), "{}", s.name());
@@ -815,7 +822,7 @@ mod tests {
                 mode: 0o755,
             },
             1.0,
-            None,
+            &root,
         )
         .unwrap();
         let m = std::fs::metadata(s.payload()).unwrap();
@@ -844,7 +851,7 @@ mod tests {
                 mode: 0o644,
             },
             2.0,
-            None,
+            &root,
         )
         .unwrap();
         let mut held = std::fs::OpenOptions::new()

@@ -37,6 +37,13 @@ fn rig(tag: &str) -> Rig {
     std::fs::write(pack.join(".pack-version"), "0.15.0\n").unwrap();
     std::fs::write(pack.join("bin/a.py"), b"print('a')\n").unwrap();
     std::fs::write(pack.join("hooks/h.sh"), b"#!/bin/sh\necho h\n").unwrap();
+    // GM1: a `#!` file is captured with a generation only with its execute bit (the rig's script is
+    // an executable hook, as installed)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(pack.join("hooks/h.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     Rig {
         root: base.join("local").join("repairs"),
         pack,

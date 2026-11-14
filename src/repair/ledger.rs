@@ -984,6 +984,13 @@ fn copy_link_new(target: &str, dst: &Path) -> Result<(), RepairError> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only (T6 · GK1): runs between the pre-image's copy and the second reading of the
+    /// generation (an update completing there).
+    pub(crate) static BETWEEN_PREIMAGE_COPY_AND_GENERATION: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// C2 2.3(a) / C1 1.7 — the `begin` pre-image: an existing live entry is COPIED into a fresh,
 /// write-once vault slot `displaced/R-<n>/<시각>/payload/<basename>` with `meta/pre.json` (the live
 /// file is not touched); a path that does not exist is recorded as `absent` (no copy). The slot and
@@ -1001,6 +1008,18 @@ pub fn copy_preimage_in(
     if state == TargetState::Absent {
         return Ok(PreImage::Absent);
     }
+    // T6 · RULINGS FI1 / GK1 (a granted seam in T3's begin): the pack is `live` without `rel` — every
+    // caller passes `pack.join(rel)`; when it is not, the generation is absent (Unknown). Read here,
+    // BEFORE the copy (and again after it, below).
+    let pack_of_live = {
+        let mut p = live.to_path_buf();
+        let mut ok = true;
+        for _ in rel.split('/').filter(|c| !c.is_empty()) {
+            ok &= p.pop();
+        }
+        (ok && p.join(rel) == live).then_some(p)
+    };
+    let generation_before = pack_of_live.as_ref().and_then(|p| super::apply::pack_generation_checked(p).ok());
     let io = |p: &Path, e: std::io::Error| RepairError::Io(format!("{}: {e}", p.display()));
     let vault = vault_dir_in(root, id);
     std::fs::create_dir_all(&vault).map_err(|e| io(&vault, e))?;
@@ -1044,22 +1063,26 @@ pub fn copy_preimage_in(
         "mode": mode,
         "link_target": link_target,
     });
-    // T6 · RULINGS FI1 (a granted seam in T3's begin): the pack generation in which these bytes are
-    // live, read NOW (the slot's fill). The pack is `live` without `rel` — every caller passes
-    // `pack.join(rel)`; when it is not, or the generation cannot be read (FG1), the field is absent
-    // (Unknown) and the repair will not be put back automatically.
-    let pack_of_live = {
-        let mut p = live.to_path_buf();
-        let mut ok = true;
-        for _ in rel.split('/').filter(|c| !c.is_empty()) {
-            ok &= p.pop();
-        }
-        (ok && p.join(rel) == live).then_some(p)
-    };
-    if let Some(g) = pack_of_live.and_then(|p| super::apply::pack_generation_checked(&p).ok()) {
-        pre["pack_generation"] = serde_json::json!(g);
-    }
+    // (T6 · FI1 / GK1: the generation measured around the copy is written below)
     let pre_path = meta.join("pre.json");
+    // T6 · RULINGS GK1 (a) / GM1 (the seam): the generation read BEFORE and AFTER the copy — equal →
+    // recorded; unequal or unreadable → absent (Unknown); and a `#!` regular file without the
+    // owner's execute bit (unix) → absent: its mode may not be the generation's final one (the
+    // non-transactional install sets that bit after `.pack-version`)
+    #[cfg(test)]
+    BETWEEN_PREIMAGE_COPY_AND_GENERATION.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f();
+        }
+    });
+    let generation_after = pack_of_live.as_ref().and_then(|p| super::apply::pack_generation_checked(p).ok());
+    let stable = matches!((&generation_before, &generation_after), (Some(b), Some(a)) if b == a);
+    let mode_may_lag = cfg!(unix) && link_target.is_none() && mode & 0o100 == 0 && std::fs::read(&dst).map(|b| b.starts_with(b"#!")).unwrap_or(true);
+    if stable && !mode_may_lag {
+        if let Some(g) = &generation_before {
+            pre["pack_generation"] = serde_json::json!(g);
+        }
+    }
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
