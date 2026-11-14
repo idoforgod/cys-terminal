@@ -206,6 +206,9 @@ struct Rec {
     step3_fail: Mutex<Option<String>>,
     helper_exit: Mutex<Option<i32>>,
     apply_answer: Mutex<Option<cys::repair::apply::ApplyOutcome>>,
+    /// DE4: the table and request whose state the apply observes while it runs
+    probe: Mutex<Option<(Arc<Mutex<ApprovalTable>>, String)>>,
+    seen_during_apply: Mutex<Vec<ReqState>>,
 }
 
 impl Effects for Rec {
@@ -252,6 +255,10 @@ impl Effects for Rec {
             .lock()
             .unwrap()
             .push(files.iter().map(|f| f.rel.clone()).collect());
+        if let Some((t, rid)) = self.probe.lock().unwrap().clone() {
+            let st = t.lock().unwrap().find(&rid).map(|r| r.state);
+            self.seen_during_apply.lock().unwrap().extend(st);
+        }
         Ok(self
             .apply_answer
             .lock()
@@ -285,7 +292,7 @@ fn effects() -> Rec {
 
 /// submit + step 3 → a pending card; returns the request id.
 fn pending(r: &Rig, t: &Mutex<ApprovalTable>, eff: &Rec, now: f64) -> String {
-    let (out, s3) = submit(&r.ctx(now), &worker(), &json!({"repair": "R-1"}), t, Ok(())).unwrap();
+    let (out, s3) = submit(&r.ctx(now), &worker(), &json!({"repair": "R-1"}), t, eff, Ok(())).unwrap();
     let rid = out["request_id"].as_str().unwrap().to_string();
     run_step3(&r.ctx(now), t, eff, &rid, &s3.unwrap());
     rid
@@ -403,7 +410,7 @@ fn submit_returns_at_once_and_table_is_memory_only() {
     let r = rig("submit");
     let id = r.signed_repair();
     let t = Mutex::new(ApprovalTable::default());
-    let (out, s3) = submit(&r.ctx(T0), &worker(), &json!({"repair": "R-1"}), &t, Ok(())).unwrap();
+    let (out, s3) = submit(&r.ctx(T0), &worker(), &json!({"repair": "R-1"}), &t, &Rec::default(), Ok(())).unwrap();
     assert!(s3.is_some());
     assert_eq!(out["state"], json!("checking"));
     let rid = out["request_id"].as_str().unwrap().to_string();
@@ -434,6 +441,7 @@ fn submit_returns_at_once_and_table_is_memory_only() {
         &worker(),
         &json!({"repair": "R-1"}),
         &t,
+        &Rec::default(),
         Ok(())
     )
     .is_err());
@@ -450,25 +458,25 @@ fn submit_needs_both_signatures_over_the_staged_states() {
     let audit = rec.audit.take();
     ledger::write_record_in(&r.root, &rec).unwrap();
     assert!(
-        submit(&r.ctx(T0), &worker(), &json!({"repair": "R-1"}), &t, Ok(())).is_err(),
+        submit(&r.ctx(T0), &worker(), &json!({"repair": "R-1"}), &t, &Rec::default(), Ok(())).is_err(),
         "no audit signature"
     );
     rec.audit = audit;
     ledger::write_record_in(&r.root, &rec).unwrap();
     std::fs::write(r.staged(&id), b"#!/bin/sh\necho fixeD\n").unwrap();
-    let e = submit(&r.ctx(T0), &worker(), &json!({"repair": "R-1"}), &t, Ok(())).unwrap_err();
+    let e = submit(&r.ctx(T0), &worker(), &json!({"repair": "R-1"}), &t, &Rec::default(), Ok(())).unwrap_err();
     assert_eq!(e.code, "target_changed");
     std::fs::write(r.staged(&id), b"#!/bin/sh\necho fixed\n").unwrap();
     cys::repair::replay::set_mode(&r.staged(&id), 0o644);
     assert_eq!(
-        submit(&r.ctx(T0), &worker(), &json!({"repair": "R-1"}), &t, Ok(()))
+        submit(&r.ctx(T0), &worker(), &json!({"repair": "R-1"}), &t, &Rec::default(), Ok(()))
             .unwrap_err()
             .code,
         "target_changed",
         "exec bit"
     );
     cys::repair::replay::set_mode(&r.staged(&id), 0o755);
-    assert!(submit(&r.ctx(T0), &worker(), &json!({"repair": "R-1"}), &t, Ok(())).is_ok());
+    assert!(submit(&r.ctx(T0), &worker(), &json!({"repair": "R-1"}), &t, &Rec::default(), Ok(())).is_ok());
 }
 
 /// Only the seat holding the repair's lock submits; another worker is refused.
@@ -479,7 +487,7 @@ fn submit_needs_the_lock() {
     let t = Mutex::new(ApprovalTable::default());
     let other = seat(6, "worker");
     assert_eq!(
-        submit(&r.ctx(T0), &other, &json!({"repair": "R-1"}), &t, Ok(()))
+        submit(&r.ctx(T0), &other, &json!({"repair": "R-1"}), &t, &Rec::default(), Ok(()))
             .unwrap_err()
             .code,
         cys::repair::types::ERR_LOCKED
@@ -499,6 +507,7 @@ fn platform_pending_submit_runs_nothing() {
         &worker(),
         &json!({"repair": "R-1"}),
         &t,
+        &Rec::default(),
         Err("윈도우 대기"),
     )
     .unwrap_err();
@@ -819,12 +828,258 @@ fn three_resubmissions_then_the_fourth_is_refused_line_once() {
         &worker(),
         &json!({"repair": "R-1"}),
         &t,
+        &eff,
         Ok(()),
     )
     .unwrap_err();
     assert!(e.message.contains("만료"), "{}", e.message);
     assert_eq!(eff.master.lock().unwrap().len(), 1, "the one line, once");
     assert!(r.staged(&id).exists());
+}
+
+/// RULINGS CZ2 / testplan D-20-05: the lane master's one line comes at the expiry E4 of the request
+/// the third resubmission S3 created — none at E1, E2, E3.
+#[test]
+fn budget_line_comes_at_the_fourth_expiry_not_before() {
+    let r = rig("budget-line");
+    r.signed_repair();
+    let t = Mutex::new(ApprovalTable::default());
+    let eff = effects();
+    let mut now = T0;
+    for expiry in 1..=4usize {
+        pending(&r, &t, &eff, now);
+        now += 1801.0;
+        sweep(&r.ctx(now), &t, &eff);
+        now += 1.0;
+        let lines = eff.master.lock().unwrap().len();
+        assert_eq!(lines, usize::from(expiry == 4), "after expiry E{expiry}");
+    }
+}
+
+/// RULINGS CZ2 (reviewer1 major 9): a `submit` that arrives after a restart but BEFORE the first sweep
+/// reconciles the previous incarnation's expired request first — its expiry is counted once, not
+/// overwritten and lost; the first sweep then leaves the new request alone. The same at the budget's
+/// edge: the reconciled E4 refuses the submit and sends the one line.
+#[test]
+fn submit_before_restart_reconciliation_counts_the_old_expiry() {
+    let r = rig("pre-recon");
+    let id = r.signed_repair();
+    let eff = effects();
+    let t = Mutex::new(ApprovalTable::default());
+    pending(&r, &t, &eff, T0);
+    drop(t); // a restart while S0 was pending
+    let t = Mutex::new(ApprovalTable::default());
+    let now = T0 + 1801.0; // S0's time has passed; no sweep has run yet
+    let rid = pending(&r, &t, &eff, now);
+    assert_eq!(r.rec(&id).resubmits, vec![(fp_of(&r, &id), 1)], "E1 counted by the reconciliation");
+    sweep(&r.ctx(now + 1.0), &t, &eff); // the first sweep: S1 is live — untouched, nothing counted again
+    assert_eq!(state_of(&t, &rid), ReqState::Pending);
+    assert_eq!(r.rec(&id).resubmits, vec![(fp_of(&r, &id), 1)]);
+    // E2, E3 by the sweep; S3 pending; a restart; S4 before the first sweep → E4 reconciled → refused
+    let mut now = now + 2.0;
+    for _ in 0..2 {
+        now += 1801.0;
+        sweep(&r.ctx(now), &t, &eff);
+        now += 1.0;
+        pending(&r, &t, &eff, now);
+    }
+    assert_eq!(r.rec(&id).resubmits, vec![(fp_of(&r, &id), 3)]);
+    assert!(eff.master.lock().unwrap().is_empty());
+    drop(t);
+    let t = Mutex::new(ApprovalTable::default());
+    now += 1801.0;
+    let e = submit(&r.ctx(now), &worker(), &json!({"repair": "R-1"}), &t, &eff, Ok(())).unwrap_err();
+    assert!(e.message.contains("만료"), "{}", e.message);
+    assert_eq!(r.rec(&id).resubmits, vec![(fp_of(&r, &id), 4)]);
+    assert_eq!(eff.master.lock().unwrap().len(), 1, "the one line, once");
+    sweep(&r.ctx(now + 1.0), &t, &eff);
+    assert_eq!(eff.master.lock().unwrap().len(), 1, "never a second line");
+}
+
+/// RULINGS DF5 (joins CZ2): a durable `approval: approved` a crash left between its write and the
+/// apply is cleared by the restart's reconciliation — it is never a consumable approval.
+#[test]
+fn restart_clears_an_unconsumed_approval() {
+    let r = rig("crash-approved");
+    let id = r.signed_repair();
+    let eff = effects();
+    let t = Mutex::new(ApprovalTable::default());
+    let rid = pending(&r, &t, &eff, T0);
+    let fp = fp_of(&r, &id);
+    let mut rec = r.rec(&id);
+    rec.approval = Some(ApprovalResult {
+        request_id: rid,
+        fingerprint_sha256: fp.clone(),
+        decided_at: T0 + 20.0,
+        approved: true,
+    });
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    drop(t); // the crash
+    let t = Mutex::new(ApprovalTable::default());
+    sweep(&r.ctx(T0 + 60.0), &t, &eff);
+    let rec = r.rec(&id);
+    assert_eq!((rec.pending_request, rec.approval), (None, None));
+}
+
+/// RULINGS CZ2 — deterministic interleaving: `first` runs on this thread; at its record write (after
+/// its claim, inside the repair lock) the `others` are started on their own threads and given up to
+/// 300 ms each before the write goes on — exactly the window the old check-then-act let a second end
+/// through.
+fn interleave<'a>(first: &dyn Fn(), others: Vec<Box<dyn Fn() + Send + Sync + 'a>>) {
+    std::thread::scope(|s| {
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let n = others.len();
+        for o in &others {
+            let done_tx = done_tx.clone();
+            let go_rx = &go_rx;
+            s.spawn(move || {
+                let go = go_rx.lock().unwrap().recv();
+                if go.is_ok() {
+                    o();
+                }
+                let _ = done_tx.send(());
+            });
+        }
+        BEFORE_RECORD_WRITE.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                for _ in 0..n {
+                    let _ = go_tx.send(());
+                }
+                for _ in 0..n {
+                    let _ = done_rx.recv_timeout(Duration::from_millis(300));
+                }
+            }))
+        });
+        first();
+        let unfired = BEFORE_RECORD_WRITE.with(|h| h.borrow_mut().take());
+        let fired = unfired.is_none();
+        drop(unfired); // releases the waiting threads when the seam never ran
+        assert!(fired, "the first end never wrote the record");
+    });
+}
+
+/// RULINGS CZ2: reject ∥ expiry ∥ void over a PENDING request, each one first in turn — exactly one
+/// end wins: one terminal state, ONE delivery, the expiry counted once and only when it won.
+#[test]
+fn racing_enders_claim_once_over_a_pending_request() {
+    for first in ["reject", "expiry", "void"] {
+        let r = rig(&format!("race-p-{first}"));
+        let id = r.signed_repair();
+        let t = Mutex::new(ApprovalTable::default());
+        let eff = effects();
+        let rid = pending(&r, &t, &eff, T0);
+        t.lock().unwrap().restart_resolved = true;
+        let n0 = eff.delivered.lock().unwrap().len();
+        let op = |name: &str| {
+            match name {
+                "reject" => {
+                    let _ = approval_reject(&r.ctx(T0 + 5.0), &json!({"request_id": rid}), &t, &eff);
+                }
+                "expiry" => sweep(&r.ctx(T0 + 1801.0), &t, &eff),
+                _ => void_for_repair(&r.ctx(T0 + 5.0), &t, &eff, "R-1", "되돌림"),
+            }
+        };
+        let others: Vec<Box<dyn Fn() + Send + Sync + '_>> = ["reject", "expiry", "void"]
+            .into_iter()
+            .filter(|o| *o != first)
+            .map(|o| Box::new(move || op(o)) as Box<dyn Fn() + Send + Sync + '_>)
+            .collect();
+        interleave(&|| op(first), others);
+        let want = match first {
+            "reject" => ReqState::Rejected,
+            "expiry" => ReqState::Expired,
+            _ => ReqState::Voided,
+        };
+        assert_eq!(state_of(&t, &rid), want, "{first} first");
+        assert_eq!(eff.delivered.lock().unwrap().len(), n0 + 1, "{first} first: one delivery");
+        let rec = r.rec(&id);
+        let counted: Vec<(String, u32)> = if first == "expiry" {
+            vec![(fp_of(&r, &id), 1)]
+        } else {
+            vec![]
+        };
+        assert_eq!((rec.pending_request, rec.resubmits), (None, counted), "{first} first");
+        assert_eq!(rec.approval.map(|a| a.approved), (first == "reject").then_some(false));
+    }
+}
+
+/// RULINGS CZ2 / DE4: approve ∥ expiry ∥ void over a VERIFYING request, each one first in turn — the
+/// verification re-validates under its claim: an end that came first is never overwritten by an
+/// approval or an apply; an approval that came first is applied once and the others change nothing.
+#[test]
+fn racing_enders_claim_once_over_a_verifying_request() {
+    for first in ["approve", "expiry", "void"] {
+        let r = rig(&format!("race-v-{first}"));
+        let id = r.signed_repair();
+        let t = Mutex::new(ApprovalTable::default());
+        let eff = Arc::new(effects());
+        let rid = pending(&r, &t, &eff, T0);
+        t.lock().unwrap().restart_resolved = true;
+        let kids: Mutex<Vec<(String, std::process::Child)>> = Mutex::new(Vec::new());
+        let eff_dyn: Arc<dyn Effects> = eff.clone();
+        approval_start(
+            &r.ctx(T0 + 10.0),
+            &json!({"request_id": rid}),
+            &t,
+            &eff_dyn,
+            &|_r, n, c| kids.lock().unwrap().push((n, c)),
+        )
+        .unwrap();
+        let (nonce, child) = kids.lock().unwrap().pop().unwrap();
+        let verified = wait_helper(child);
+        assert!(verified);
+        let n0 = eff.delivered.lock().unwrap().len();
+        let op = |name: &str| match name {
+            "approve" => {
+                let _ = finish_verification(&r.ctx(T0 + 20.0), &t, eff.as_ref(), &rid, &nonce, true);
+            }
+            "expiry" => sweep(&r.ctx(T0 + 1801.0), &t, eff.as_ref()),
+            _ => void_for_repair(&r.ctx(T0 + 15.0), &t, eff.as_ref(), "R-1", "되돌림"),
+        };
+        let others: Vec<Box<dyn Fn() + Send + Sync + '_>> = ["approve", "expiry", "void"]
+            .into_iter()
+            .filter(|o| *o != first)
+            .map(|o| Box::new(move || op(o)) as Box<dyn Fn() + Send + Sync + '_>)
+            .collect();
+        interleave(&|| op(first), others);
+        let (want, applied) = match first {
+            "approve" => (ReqState::Approved, 1),
+            "expiry" => (ReqState::Expired, 0),
+            _ => (ReqState::Voided, 0),
+        };
+        assert_eq!(state_of(&t, &rid), want, "{first} first");
+        assert_eq!(eff.applied.lock().unwrap().len(), applied, "{first} first: applies");
+        assert_eq!(eff.delivered.lock().unwrap().len(), n0 + 1, "{first} first: one delivery");
+        let rec = r.rec(&id);
+        assert_eq!(rec.approval.map(|a| a.approved), (first == "approve").then_some(true), "{first} first");
+        assert_eq!(rec.pending_request, None, "{first} first");
+    }
+}
+
+/// RULINGS DE4: while the apply runs the table says `Applying` (never `Approved`); an applied request
+/// ends `Approved`, a declined one ends `Voided` — the truthful terminal state.
+#[test]
+fn the_table_says_approved_only_after_the_apply() {
+    for (answer, end) in [
+        (cys::repair::apply::ApplyOutcome::Applied, ReqState::Approved),
+        (
+            cys::repair::apply::ApplyOutcome::Declined("보호장치 심사".into()),
+            ReqState::Voided,
+        ),
+    ] {
+        let r = rig("de4");
+        r.signed_repair();
+        let t = Arc::new(Mutex::new(ApprovalTable::default()));
+        let eff = Arc::new(effects());
+        *eff.apply_answer.lock().unwrap() = Some(answer);
+        let rid = pending(&r, &t, &eff, T0);
+        *eff.probe.lock().unwrap() = Some((t.clone(), rid.clone()));
+        approve(&r, &t, eff.clone(), &rid, T0 + 10.0, T0 + 20.0);
+        assert_eq!(eff.seen_during_apply.lock().unwrap().clone(), vec![ReqState::Applying]);
+        assert_eq!(state_of(&t, &rid), end);
+    }
 }
 
 /// D-18-01 / V2(d): a request a previous daemon left pending is VOIDED by the restart when its time
@@ -854,6 +1109,7 @@ fn restart_voids_pending_without_counting() {
         &worker(),
         &json!({"repair": "R-1"}),
         &t,
+        &eff,
         Ok(())
     )
     .is_ok());
