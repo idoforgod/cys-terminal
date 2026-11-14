@@ -368,55 +368,36 @@ runpy.run_path(p,run_name="__main__")' "${LC_CTYPE+=$LC_CTYPE}" "$_cys_owned_lea
     # ★프로세스 **그룹** 종료: 대상만 죽이면 손자(대상이 띄운 자식)가 stdout 파이프를 계속 붙잡아
     #   호출측 `$(...)` 가 EOF 를 못 받고 그대로 행 걸린다(데드라인이 사실상 무효 — 실측 확인).
     #   그래서 새 세션으로 스폰하고 타임아웃 시 그룹 전체에 SIGKILL 을 보낸다.
-    # RULINGS ES1 (0.15.0 · T5c): the gate's role is the first line of what this wrapper relays, so its
-    #   interpreter starts ISOLATED with the --owned bootstrap's flags (-I -S -B -X utf8 — no PYTHON*
-    #   variable, no site, no working directory reaches it). It imports the standard library only, and
-    #   the command it runs inherits this process's environment UNCHANGED (no env= — only the wrapper's
-    #   interpreter is isolated). Failure mode (DY1): an interpreter that never ran this code (refused the
-    #   flags = usage error exit 2, or could not start) must not pass as the COMMAND's exit code — a Stop
-    #   hook's exit 2 blocks. The wrapper's first statement removes a mark file; a mark still there = the
-    #   command never ran → 126 and one line, the code a broken interpreter gives today; a command's own 2
-    #   stays 2. No mark (exit code passes as before) on MSYS / Cygwin — a native interpreter cannot open
-    #   a /tmp spelling — or when TMPDIR is not writable. No extra process: two file operations.
-    #   LC_CTYPE is put back exactly as the shell had it (PEP 538 coercion — see the --owned runner above).
-    _cys_tr_mark=""
-    case "${OSTYPE:-}" in
-      msys*|cygwin*|win32*) ;;
-      *) _cys_tr_mark="${TMPDIR:-/tmp}/.cys-tr-${BASHPID:-$$}-${RANDOM:-0}${RANDOM:-0}"
-         { : > "$_cys_tr_mark"; } 2>/dev/null || _cys_tr_mark="" ;;
-    esac
+    # RULINGS ES1 / FO1 (0.15.0 · T5c): the gate's role is the first line of what this wrapper relays, so
+    #   its interpreter starts ISOLATED — start-up flags and nothing else: -I (no PYTHON* variable, no user
+    #   site, no working directory), -S (no site), -B (no bytecode), -X utf8 (the UTF-8 mode PYTHONUTF8=1
+    #   gave). Every Python 3 this code can run on accepts the four (-I since 3.4; this code needs 3.3+ —
+    #   TimeoutExpired). It imports the standard library only; the command it runs inherits this process's
+    #   environment unchanged (no env=) and its exit code passes through as before (124 on the deadline).
+    #   One hand-back: on a C / POSIX locale CPython rewrites LC_CTYPE in its own environment (PEP 538) and
+    #   -I ignores a PYTHONCOERCECLOCALE=0 that stopped it — the first statement puts LC_CTYPE back as the
+    #   shell had it ("=value", or "" when unset), so the command sees the shell's environment.
     "$CYS_PY" -I -S -B -X utf8 -c 'import os,sys
 if sys.argv[1]:
-    try:
-        os.unlink(sys.argv[1])
-    except OSError:
-        pass
-if sys.argv[2]:
-    os.environ["LC_CTYPE"] = sys.argv[2][1:]
+    os.environ["LC_CTYPE"] = sys.argv[1][1:]
 else:
     os.environ.pop("LC_CTYPE", None)
 import signal,subprocess
 try:
-    p = subprocess.Popen(sys.argv[4:], start_new_session=True)
+    p = subprocess.Popen(sys.argv[3:], start_new_session=True)
 except FileNotFoundError:
     sys.exit(127)
 except Exception:
     sys.exit(126)
 try:
-    sys.exit(p.wait(timeout=float(sys.argv[3])))
+    sys.exit(p.wait(timeout=float(sys.argv[2])))
 except subprocess.TimeoutExpired:
     try:
         os.killpg(os.getpgid(p.pid), signal.SIGKILL)
     except Exception:
         p.kill()
-    sys.exit(124)' "$_cys_tr_mark" "${LC_CTYPE+=$LC_CTYPE}" "$_cys_to" "$@"
-    _cys_tr_rc=$?
-    if [ -n "$_cys_tr_mark" ] && [ -e "$_cys_tr_mark" ]; then
-      rm -f "$_cys_tr_mark" 2>/dev/null
-      echo "cys_timeout_run: 실행기 인터프리터가 격리 기동(-I -S -B -X utf8)을 거부했거나 시작하지 못했다(rc=$_cys_tr_rc · ${CYS_PY}) — 명령은 실행되지 않았다" >&2
-      return 126
-    fi
-    return $_cys_tr_rc
+    sys.exit(124)' "${LC_CTYPE+=$LC_CTYPE}" "$_cys_to" "$@"
+    return $?
   fi
   "$@"
   return $?

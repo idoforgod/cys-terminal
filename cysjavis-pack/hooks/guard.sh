@@ -1078,10 +1078,9 @@ fi
 #   없음) · `-S`(site 없음: .pth · sitecustomize · usercustomize 없음) · `-B`(바이트코드 없음) · `-X utf8`
 #   (좌석의 PYTHONUTF8=1 이 주던 UTF-8 모드를 명시로). 종전엔 파일 경로 실행이 TMPDIR 을, `-c` 가 작업 폴더를
 #   import 경로 맨 앞에 두었다 — 좌석이 쓸 수 있는 곳의 `json.py` 하나로 G 가 꺼졌다. 판정기는 표준
-#   라이브러리만 import 하고 PYTHON* 변수에 기대지 않는다. 고장 방식(DY1): 플래그를 거부하는 인터프리터는
-#   사용법 오류 exit 2 를 stdout 없이 낸다 — 판정기의 거부(exit 2)는 언제나 `DENY\t…` 를 찍으므로, stdout 이
-#   빈 exit 2 는 거부가 아니라 아래 '파서 크래시' 갈래(STRICT deny · LOOSE 백스톱 — 오늘 망가진 인터프리터의
-#   동작)로 간다. 추가 프로세스 0.
+#   라이브러리만 import 하고 PYTHON* 변수에 기대지 않는다. 고장 방식(RULINGS FO2): 플래그를 더하는 것 말고는
+#   바꾸지 않는다 — 네 플래그는 이 판정기가 돌 수 있는 모든 Python 3 가 받고(`-I` 는 3.4+), 시작하지 못하는
+#   인터프리터는 종전처럼 아래 '파서 크래시' 갈래(STRICT deny · LOOSE 백스톱)로 간다.
 GUARD_PYFILE="$(mktemp "${TMPDIR:-/tmp}/.guard_pysrc.XXXXXX" 2>/dev/null || printf '%s' '')"
 if [ -n "$GUARD_PYFILE" ] && printf '%s' "$PYSRC" > "$GUARD_PYFILE" 2>/dev/null; then
   PYOUT="$(printf '%s' "$INPUT" | GUARD_PAUSED="$GUARD_PAUSED" GUARD_ACTIVE="$GUARD_ACTIVE" GUARD_CONST_AUTH="$GUARD_CONST_AUTH" GUARD_CONST_SCOPE="$GUARD_CONST_SCOPE" GUARD_PREFLIGHT="$PREFLIGHT" "$PYBIN" -I -S -B -X utf8 "$(cys_native_path "$GUARD_PYFILE")" 2>/tmp/.guard_py_err.$$)"
@@ -1095,7 +1094,7 @@ fi
 rm -f /tmp/.guard_py_err.$$ 2>/dev/null
 if [ "$RC" -eq 0 ]; then
   exit 0
-elif [ "$RC" -eq 2 ] && [ -n "$PYOUT" ]; then
+elif [ "$RC" -eq 2 ]; then
   reason="${PYOUT#DENY$'\t'}"; [ "$reason" = "$PYOUT" ] && reason="$PYOUT"
   emit_deny "$reason"
 else

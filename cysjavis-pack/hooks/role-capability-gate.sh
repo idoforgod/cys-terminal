@@ -310,8 +310,8 @@ else
     [ -n "$CAPGATE_INPUT_FILE" ] || CAPGATE_INPUT_FILE="$CAPGATE_TMP_IN"
     export CAPGATE_INPUT_FILE
     # ★POSIX 원본 경로도 넘긴다: ⓐ변환된 경로를 못 열 때의 **두 번째 시도** ⓑ정리 대상.
-    #   정리는 판정기가 한다(종전엔 변환이 어긋나면 판정기가 **엉뚱한 경로**를 지워 본문 파일이 남았다) —
-    #   판정기는 이제 `exec` 로 셸을 치환하지 않으므로(RULINGS DY1) 위 trap 이 한 번 더 지운다.
+    #   아래 `exec` 는 이 셸을 **치환**하므로 trap 은 그 뒤에 돌지 않는다 — 정리는 판정기가 한다
+    #   (종전엔 변환이 어긋나면 판정기가 **엉뚱한 경로**를 지워 본문 파일이 남았다).
     CAPGATE_INPUT_TMP="$CAPGATE_TMP_IN"
     export CAPGATE_INPUT_TMP
   else
@@ -371,12 +371,11 @@ fi
 #   격리가 버리는 것 중 판정기에 필요한 것 — UTF-8 모드(한국어 윈도우 cp949 콘솔 즉사 방지 · src/lib.rs W-B2 가
 #   좌석에 싣는 PYTHONUTF8=1) — 은 명령줄에서 **명시적으로** 돌려준다: `-X utf8`. 판정기 본문은 표준 라이브러리만
 #   import 한다(hashlib json os re shlex subprocess sys tempfile time posixpath shutil — 팩 모듈 0).
-#   ★고장 방식(불변): 이 플래그를 거부하거나(3.4 미만 · `python` 이 Python 2 면 `-I` 에 사용법 오류 exit 2)
-#   시작하지 못하는 인터프리터 = 고장 난 게이트 = 종전의 통과 + stderr 한 줄(전부 거부 아님). 그래서 `exec`
-#   하지 않고 종료 코드를 받는다: 판정기 자신의 차단 종료(2)는 맨 끝에서 77 로 나오고 아래 `case` 가 2 로
-#   되돌린다 — 그러면 여기서 2 는 인터프리터 자신(사용법 오류)만 낼 수 있다. 한 도구 호출에 인터프리터는 여전히
-#   하나다(사전 탐침 없음). Windows 동봉 embeddable(`python312._pth`)에서의 동작은 미측정(보고서 T5c · TW1).
-"$CYS_PY" -I -S -B -X utf8 - <<'PYEOF'
+#   ★고장 방식(불변 · RULINGS FO2): 플래그를 더하는 것 말고는 아무것도 바꾸지 않는다 — 네 플래그는 이 판정기가
+#   돌 수 있는 모든 Python 3 가 받는다(`-I` 는 3.4+). 시작하지 못하는 인터프리터는 종전과 같다: `exec` 가
+#   실패하면 셸이 한 줄을 남기고 126/127 로 끝난다(비차단 = 고장 난 게이트의 통과 · 전부 거부 아님).
+#   Windows 동봉 embeddable(`python312._pth`)에서의 동작은 미측정(보고서 T5c · TW1).
+exec "$CYS_PY" -I -S -B -X utf8 - <<'PYEOF'
 import hashlib, json, os, re, shlex, subprocess, sys, tempfile, time
 
 # ── reviewer/planner 정책(종전 · 무변경) ─────────────────────────────────────
@@ -5204,32 +5203,8 @@ def run_self_test():
     sys.exit(0)
 
 
-# ★RULINGS DY1: 판정기 자신의 차단 종료(exit 2 — reviewer/planner fail-closed)는 77 로 내보낸다. 훅 셸이
-#   77 을 2 로 되돌리므로 셸에서 2 는 '인터프리터가 격리 플래그를 거부했다'만 뜻한다. 바꾸면 셸의 `case` 도.
-_CG_RC_BLOCK = 77
-
 if os.environ.get("CAPGATE_SELF_TEST"):
-    _cg_entry = run_self_test
+    run_self_test()
 else:
-    _cg_entry = main
-try:
-    _cg_entry()
-except SystemExit as _cg_exit:
-    if _cg_exit.code == 2:
-        sys.exit(_CG_RC_BLOCK)
-    raise
+    main()
 PYEOF
-_cg_judge_rc=$?
-case "$_cg_judge_rc" in
-  77) exit 2 ;;
-  2|126|127)
-    # 인터프리터가 격리 기동을 거부했거나(2 = 사용법 오류) 실행되지 못했다(126 · 127) — 판정기는 한 줄도
-    # 돌지 않았다. 고장 난 게이트는 좌석을 막지 않는다: 한 줄 알리고 통과(self-test 는 실패로 알린다).
-    if [ -n "${CAPGATE_SELF_TEST:-}" ]; then
-      echo "role-capability-gate: 판정기 인터프리터가 격리 기동(-I -S -B -X utf8)을 거부했거나 시작하지 못했다(rc=$_cg_judge_rc · $CYS_PY) — self-test 불가" >&2
-      exit 2
-    fi
-    echo "role-capability-gate: 판정기 인터프리터가 격리 기동(-I -S -B -X utf8)을 거부했거나 시작하지 못했다(rc=$_cg_judge_rc · $CYS_PY · CPython 3.7+ 필요) — 게이트 고장, 집행 0" >&2
-    exit 0 ;;
-esac
-exit "$_cg_judge_rc"

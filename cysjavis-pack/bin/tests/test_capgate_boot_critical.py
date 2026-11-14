@@ -490,9 +490,8 @@ class GateWithBuiltBinary(_Env):
         self.assertNotEqual(self.decision(r)[0], "deny", "작업 사본 쓰기가 막혔다")
 
 
-NEW_START = "\"$CYS_PY\" -I -S -B -X utf8 - <<'PYEOF'\n"
-# the starts of the earlier heads, rebuilt in a copy of the hook (`exec` = the shell is replaced, so the
-# judge's own blocking exit must be 2 again in such a copy — see `_CG_RC_BLOCK`)
+NEW_START = "exec \"$CYS_PY\" -I -S -B -X utf8 - <<'PYEOF'\n"
+# the starts of the earlier heads, rebuilt in a copy of the hook (the judge body unchanged)
 START_017768BF = ("exec \"$CYS_PY\" -B -s - <<'PYEOF'\nimport sys\n"
                   "sys.path[:] = [p for p in sys.path if p and (p[0] in \"/\\\\\" or p[1:3] in (\":\\\\\", \":/\"))]\n")
 START_DBEC50E0 = "exec \"$CYS_PY\" - <<'PYEOF'\n"
@@ -560,9 +559,6 @@ class JudgeIsolation(_PlantedVectors, _Env):
         src = HOOK.read_text(encoding="utf-8")
         self.assertEqual(src.count(NEW_START), 1, "the isolated start is not in the hook")
         old = src.replace(NEW_START, start)
-        if start.startswith("exec "):
-            self.assertEqual(old.count("_CG_RC_BLOCK = 77\n"), 1)
-            old = old.replace("_CG_RC_BLOCK = 77\n", "_CG_RC_BLOCK = 2\n")
         copy = self.root / ("hooks-" + tag)
         copy.mkdir()
         (copy / "role-capability-gate.sh").write_text(old, encoding="utf-8")
@@ -712,56 +708,58 @@ class JudgeIsolation(_PlantedVectors, _Env):
                              "%s: these vectors did not fail on the old start — the test above would not "
                              "see the fault: %r" % (tag, {k: got[k] for k in expected[tag]}))
 
-    def fake_python(self, name, body):
-        p = self.fakebin / name
-        p.write_text(body, encoding="utf-8")
-        p.chmod(0o755)
-        return p
+    def test_the_four_flags_are_accepted_by_every_interpreter_reachable_here(self):
+        """RULINGS FO1 / FO2 — no detector: the flags are accepted by every interpreter the product can run on.
+        Measured on each one reachable here (this interpreter, the system `python3` = the macOS CLT 3.9, a
+        Homebrew one, the installed app's bundled runtime — run read-only with -B): the four flags start it and
+        are in force (isolated, no site, no bytecode, UTF-8 mode)."""
+        seen = set()
+        for py in (sys.executable, "/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+                   "/Applications/cys.app/Contents/Resources/runtime/python/bin/python3"):
+            if not os.path.isfile(py) or os.path.realpath(py) in seen:
+                continue
+            probe = subprocess.run([py, "-c", "pass"], capture_output=True, timeout=30)
+            if probe.returncode != 0:
+                continue            # a stub that cannot run (macOS CLT shim) is not an interpreter the hook picks
+            seen.add(os.path.realpath(py))
+            r = subprocess.run([py, "-I", "-S", "-B", "-X", "utf8", "-c",
+                                "import sys; f = sys.flags; print(f.isolated, f.no_site, f.dont_write_bytecode, f.utf8_mode, "
+                                "'%d.%d' % sys.version_info[:2])"], capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 0, "%s refused the flags: %r" % (py, r.stderr[-300:]))
+            self.assertEqual(r.stdout.split()[:4], ["1", "1", "1", "1"], "%s: %r" % (py, r.stdout))
+        self.assertTrue(seen, "no interpreter to measure")
 
-    def test_an_interpreter_that_refuses_the_flags_is_a_broken_gate_not_a_wall(self):
-        """DY1 failure mode (unchanged): an interpreter that refuses the isolation flags (a Python 2 /
-        pre-3.4 `-I` → usage error, exit 2) or cannot start (a dead `#!`) is a BROKEN gate = pass-through
-        with one stderr line from the gate — for every role, also for a write the judge would refuse;
-        never a blocking exit, never a deny; ONE interpreter launch per tool call (no probe); the
-        `--self-test` fails loudly. Negative control: the same isolated start under `exec` (no exit-code
-        mapping) blocks every tool call of every seat."""
-        log = self.root / "py-launches.log"
-        refuses = self.fake_python("python2-like", "#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %s\n"
-                                   "for a in \"$@\"; do [ \"$a\" = -I ] && { echo 'Unknown option: -I' >&2; "
-                                   "echo 'usage: python [option] ... [-c cmd | -m mod | file | -] [arg] ...' >&2; "
-                                   "exit 2; }; done\nexec %s \"$@\"\n" % (log, sys.executable))
-        dead = self.fake_python("python-dead", "#!/nonexistent/interpreter/python3\n")
+    def test_an_interpreter_that_cannot_start_is_the_broken_gate_it_was(self):
+        """DY1 failure mode, unchanged (FO2): an interpreter that cannot start (a dead `#!`) gives exactly what the
+        start of dbec50e0 gave for the same input — for every role and a write the judge would refuse: the same
+        exit code (non-blocking: the shell's exec failure), nothing on stdout (no deny), the shell's one line
+        naming the interpreter; the self-test fails loudly. Never deny-everything. (A missing CYS_PY is not this
+        case: the prelude resolves the next interpreter on PATH, as before.)"""
+        dead = self.fakebin / "python-dead"
+        dead.write_text("#!/nonexistent/interpreter/python3\n", encoding="utf-8")
+        dead.chmod(0o755)
+        old = self.hook_with_start(START_DBEC50E0, "dbec50e0")
         (self.pack / "round" / "_reviews").mkdir(parents=True, exist_ok=True)
         forbidden = {"file_path": str(self.pack / "hooks" / "x.sh"), "content": "x"}
-        for py in (refuses, dead):
-            for role in ("reviewer-codex", "cso", "worker"):
-                n0 = len(log.read_text().splitlines()) if log.exists() else 0
-                r, _ = self.run_hook("Write", forbidden, CYS_ROLE=role, CYS_PY=str(py))
-                self.assertEqual(r.returncode, 0, "%s %s: a broken gate must not block: rc=%d %r"
-                                 % (py.name, role, r.returncode, r.stderr[-300:]))
-                self.assertEqual(r.stdout.strip(), "", "%s %s: a broken gate must not deny: %r" % (py.name, role, r.stdout))
-                self.assertEqual(r.stderr.count("role-capability-gate: 판정기 인터프리터가 격리 기동"), 1,
-                                 "%s %s: not the one stderr line: %r" % (py.name, role, r.stderr[-400:]))
-                if py == refuses:
-                    lines = log.read_text().splitlines()[n0:]
-                    self.assertEqual(len(lines), 1, "%s: one interpreter per tool call, got %r" % (role, lines))
-                    self.assertTrue(lines[0].startswith("-I -S -B -X utf8 -"), lines)
-            st = subprocess.run([SH, str(HOOK), "--self-test"], env=dict(self.env, CYS_PY=str(py)),
-                                capture_output=True, text=True, timeout=60)
-            self.assertEqual(st.returncode, 2, "%s: the self-test must fail loudly: %r" % (py.name, st.stderr[-300:]))
-        # negative control: `exec` with the same flags and no mapping → exit 2 = every tool call blocked
-        walled = self.hook_with_start("exec " + NEW_START, "exec-no-mapping")
-        r, _ = self.run_hook("Write", {"file_path": str(self.pack / "round" / "_reviews" / "v.md"),
-                                       "content": "x"}, hook=walled, CYS_ROLE="worker", CYS_PY=str(refuses))
-        self.assertEqual(r.returncode, 2, "the negative control did not reproduce the wall: rc=%d %r"
-                         % (r.returncode, r.stderr[-300:]))
+        py = str(dead)
+        for role in ("reviewer-codex", "cso", "worker"):
+            got = []
+            for hook in (HOOK, old):
+                r, _ = self.run_hook("Write", forbidden, hook=hook, CYS_ROLE=role, CYS_PY=py)
+                got.append((r.returncode, r.stdout.strip(), sum(1 for l in r.stderr.splitlines() if "python-dead" in l)))
+            self.assertEqual(got[0], got[1], "%s: differs from the start of dbec50e0" % role)
+            self.assertNotIn(got[0][0], (0, 2), "%s: %r" % (role, got[0]))
+            self.assertEqual((got[0][1], got[0][2]), ("", 1), "%s: %r" % (role, got[0]))
+        st = subprocess.run([SH, str(HOOK), "--self-test"], env=dict(self.env, CYS_PY=py),
+                            capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(st.returncode, 0, "the self-test must fail loudly")
 
 
 # RULINGS ES1 — the two interpreter starts of `_lib.sh` (the --owned runner and the deadline wrapper), as
 # they are now and as they were at 288de708 (rebuilt in a copy for the negative controls)
 LIB_NEW_OWNED = '    "$CYS_PY" -I -S -B -X utf8 -c \'import os,runpy,sys\nif sys.argv[1]:\n    os.environ["LC_CTYPE"]=sys.argv[1][1:]\nelse:\n    os.environ.pop("LC_CTYPE",None)\np=sys.argv[2]\nif os.name == "nt" and len(p)>3 and p[0]=="/" and p[2]=="/" and p[1].isalpha():\n    p=p[1]+":"+p[2:]\nsys.argv=[p]+sys.argv[3:]\nrunpy.run_path(p,run_name="__main__")\' "${LC_CTYPE+=$LC_CTYPE}" "$_cys_owned_leaf"'
 LIB_OLD_OWNED = '    "$CYS_PY" -B -c \'import sys\nsys.path[:]=[x for x in sys.path if x]\nimport os,runpy\np=sys.argv[1]\nif os.name == "nt" and len(p)>3 and p[0]=="/" and p[2]=="/" and p[1].isalpha():\n    p=p[1]+":"+p[2:]\nsys.argv=[p]+sys.argv[2:]\nrunpy.run_path(p,run_name="__main__")\' "$_cys_owned_leaf"'
-LIB_NEW_FALLBACK = '    _cys_tr_mark=""\n    case "${OSTYPE:-}" in\n      msys*|cygwin*|win32*) ;;\n      *) _cys_tr_mark="${TMPDIR:-/tmp}/.cys-tr-${BASHPID:-$$}-${RANDOM:-0}${RANDOM:-0}"\n         { : > "$_cys_tr_mark"; } 2>/dev/null || _cys_tr_mark="" ;;\n    esac\n    "$CYS_PY" -I -S -B -X utf8 -c \'import os,sys\nif sys.argv[1]:\n    try:\n        os.unlink(sys.argv[1])\n    except OSError:\n        pass\nif sys.argv[2]:\n    os.environ["LC_CTYPE"] = sys.argv[2][1:]\nelse:\n    os.environ.pop("LC_CTYPE", None)\nimport signal,subprocess\ntry:\n    p = subprocess.Popen(sys.argv[4:], start_new_session=True)\nexcept FileNotFoundError:\n    sys.exit(127)\nexcept Exception:\n    sys.exit(126)\ntry:\n    sys.exit(p.wait(timeout=float(sys.argv[3])))\nexcept subprocess.TimeoutExpired:\n    try:\n        os.killpg(os.getpgid(p.pid), signal.SIGKILL)\n    except Exception:\n        p.kill()\n    sys.exit(124)\' "$_cys_tr_mark" "${LC_CTYPE+=$LC_CTYPE}" "$_cys_to" "$@"\n    _cys_tr_rc=$?\n    if [ -n "$_cys_tr_mark" ] && [ -e "$_cys_tr_mark" ]; then\n      rm -f "$_cys_tr_mark" 2>/dev/null\n      echo "cys_timeout_run: 실행기 인터프리터가 격리 기동(-I -S -B -X utf8)을 거부했거나 시작하지 못했다(rc=$_cys_tr_rc · ${CYS_PY}) — 명령은 실행되지 않았다" >&2\n      return 126\n    fi\n    return $_cys_tr_rc\n'
+LIB_NEW_FALLBACK = '    "$CYS_PY" -I -S -B -X utf8 -c \'import os,sys\nif sys.argv[1]:\n    os.environ["LC_CTYPE"] = sys.argv[1][1:]\nelse:\n    os.environ.pop("LC_CTYPE", None)\nimport signal,subprocess\ntry:\n    p = subprocess.Popen(sys.argv[3:], start_new_session=True)\nexcept FileNotFoundError:\n    sys.exit(127)\nexcept Exception:\n    sys.exit(126)\ntry:\n    sys.exit(p.wait(timeout=float(sys.argv[2])))\nexcept subprocess.TimeoutExpired:\n    try:\n        os.killpg(os.getpgid(p.pid), signal.SIGKILL)\n    except Exception:\n        p.kill()\n    sys.exit(124)\' "${LC_CTYPE+=$LC_CTYPE}" "$_cys_to" "$@"\n    return $?\n'
 LIB_OLD_FALLBACK = '    "$CYS_PY" -B -c \'import sys\nsys.path[:]=[x for x in sys.path if x]\nimport os,signal,subprocess\ntry:\n    p = subprocess.Popen(sys.argv[2:], start_new_session=True)\nexcept FileNotFoundError:\n    sys.exit(127)\nexcept Exception:\n    sys.exit(126)\ntry:\n    sys.exit(p.wait(timeout=float(sys.argv[1])))\nexcept subprocess.TimeoutExpired:\n    try:\n        os.killpg(os.getpgid(p.pid), signal.SIGKILL)\n    except Exception:\n        p.kill()\n    sys.exit(124)\' "$_cys_to" "$@"\n    return $?\n'
 LEAF = BIN / "_owned_process.py"
 
@@ -804,8 +802,9 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
     it) and the `--owned` runner. For each DY1 vector the planted code does not run and the answer is
     whole; through the gate the role answered is the daemon's whatever a planted module prints; the
     command a wrapper runs keeps exactly the environment it had; the wrappers import the standard
-    library only; an interpreter that refuses the flags is a broken wrapper, never the command's verdict.
-    Negative controls: a copy of `_lib.sh` with the starts of 288de708 runs the planted code."""
+    library only; exit codes pass through exactly as the wrapper of dbec50e0 passed them (FO1: start-up flags
+    and nothing else — no file, no inference). Negative controls: a copy of `_lib.sh` with the starts of
+    288de708 (= dbec50e0 for this file) runs the planted code."""
 
     def setUp(self):
         super().setUp()
@@ -879,12 +878,6 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
         bad = {k: v for k, v in got.items() if v}
         self.assertEqual(bad, {}, "\n".join("%s: %s" % (k, " | ".join(v)) for k, v in bad.items()))
         # the command's own exit codes pass unchanged (the DY1 mark must not eat a real 2)
-        for code in (2, 3, 77, 124):
-            rc, so, se = self.lib_run(["5", self.answer, code], {}, self.root)
-            self.assertEqual((rc, so), (code, b"reviewer-codex\n"), se[-200:])
-            self.assertNotIn("격리 기동", se)
-        self.assertEqual([n for n in os.listdir(str(self.tmpdir)) if n.startswith(".cys-tr-")], [],
-                         "a wrapper mark file was left behind")
 
     def test_negative_control_the_old_wrappers_run_the_planted_code(self):
         """The same table against a copy of `_lib.sh` with the starts of 288de708 (`-B -c` + '' removed):
@@ -1010,7 +1003,7 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
         i1 = src.index(k) + len(k)
         j1 = src.index("' \"${LC_CTYPE+=$LC_CTYPE}\" \"$_cys_owned_leaf\"", i1)
         i2 = src.index(k, j1) + len(k)
-        j2 = src.index("' \"$_cys_tr_mark\"", i2)
+        j2 = src.index("' \"${LC_CTYPE+=$LC_CTYPE}\" \"$_cys_to\"", i2)
         bodies = [src[i1:j1], src[i2:j2]]
         names = set()
         for b in bodies + [LEAF.read_text(encoding="utf-8")]:
@@ -1018,47 +1011,37 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
         self.assertTrue({"os", "sys", "runpy", "signal", "subprocess"} <= names, sorted(names))
         self.assertEqual(sorted(n for n in names if not _is_stdlib(n)), [], "a wrapper imports outside the stdlib")
 
-    def refusing_python(self, log):
-        p = self.fakebin / "python2-like"
-        p.write_text("#!/bin/sh\nprintf 'launch %%s\\n' \"$1\" >> %s\n"
-                     "for a in \"$@\"; do [ \"$a\" = -I ] && { echo 'Unknown option: -I' >&2; exit 2; }; done\n"
-                     "exec %s \"$@\"\n" % (log, sys.executable), encoding="utf-8")
-        p.chmod(0o755)
-        return p
-
-    def test_an_interpreter_that_refuses_the_flags_is_a_broken_wrapper(self):
-        """ES1 / DY1 failure mode: with an interpreter that refuses `-I` (usage error, exit 2) the deadline
-        wrapper does NOT run the command and returns 126 with one line — never the interpreter's 2 as if
-        it were the command's (a Stop hook would block on it) — and ONE launch per call (no probe); the
-        --owned runner ends without records (the callers' existing 'unmeasured' branch, as for any broken
-        interpreter). Negative control: the same start without the mark returns the interpreter's 2."""
-        log = self.root / "launches.log"
-        py = self.refusing_python(log)
-        for code in (0, 2):
-            n0 = len(log.read_text().splitlines()) if log.exists() else 0
-            rc, so, se = self.lib_run(["5", self.answer, code], {"CYS_PY": str(py)}, self.root)
-            self.assertEqual((rc, so), (126, b""), se[-300:])
-            self.assertEqual(se.count("cys_timeout_run: 실행기 인터프리터가 격리 기동"), 1, se[-300:])
-            self.assertEqual(len(log.read_text().splitlines()) - n0, 1, "one interpreter launch per call")
-        self.assertEqual([n for n in os.listdir(str(self.tmpdir)) if n.startswith(".cys-tr-")], [])
-        rc, so, se = self.lib_run(["--owned", "30", str(LEAF), "--records", "--", "/bin/true"], {"CYS_PY": str(py)}, self.root)
-        self.assertNotEqual(rc, 0)
-        self.assertNotIn(b"_OWNED_RETURNED", so, "the callers read a run without this record as unmeasured")
-        nomark = self.lib_copy("no-mark", [('         { : > "$_cys_tr_mark"; } 2>/dev/null || _cys_tr_mark="" ;;',
-                                            '         _cys_tr_mark="" ;;')])
-        rc, so, se = self.lib_run(["5", self.answer, 0], {"CYS_PY": str(py)}, self.root, lib=nomark / "_lib.sh")
-        self.assertEqual(rc, 2, "the negative control did not reproduce the interpreter's 2 passing as a verdict")
-
+    def test_exit_codes_pass_through_exactly_as_before(self):
+        """FO1 — the wrapped command's exit code passes through exactly as the deadline wrapper of dbec50e0 passed
+        it, for the same inputs: a command's 0 / 1 / 2 / 126 / 127, a command killed by a signal, the deadline (124);
+        an interpreter that is missing or cannot start gives what it gave there; the stdout is the same; nothing
+        is created under TMPDIR."""
+        old = self.old_lib() / "_lib.sh"
+        before = sorted(os.listdir(str(self.tmpdir)))
+        cases = [(["5", self.answer, c], {}) for c in (0, 1, 2, 126, 127)]
+        cases += [(["5", "/bin/sh", "-c", "kill -9 $$"], {}),
+                  (["1", "/bin/sleep", "30"], {}),                    # the 1 s deadline ends a 30 s sleep: 124
+                  (["5", self.answer, 0], {"CYS_PY": str(self.fakebin / "python-missing")})]
+        dead = self.fakebin / "python-dead"
+        dead.write_text("#!/nonexistent/interpreter/python3\n", encoding="utf-8")
+        dead.chmod(0o755)
+        cases.append((["5", self.answer, 0], {"CYS_PY": str(dead)}))
+        for args, extra in cases:
+            new_rc, new_out, _ = self.lib_run(args, extra, self.root)
+            old_rc, old_out, _ = self.lib_run(args, extra, self.root, lib=old)
+            self.assertEqual((new_rc, new_out), (old_rc, old_out), "%r %r" % (args, extra))
+        rc, out, _ = self.lib_run(["5", self.answer, 2], {}, self.root)
+        self.assertEqual((rc, out), (2, b"reviewer-codex\\n"), "a command's own 2 (a Stop hook's block) passes")
+        self.assertEqual(sorted(os.listdir(str(self.tmpdir))), before, "the wrapper created something under TMPDIR")
 
 
 # RULINGS ES1 — the judge of protection G (`hooks/guard.sh`): its two interpreter starts (the source written
-# to a temp file — the usual one — and `-c` when no temp file can be made) and the exit-2 rule, as they are
-# now and as they were at f5b684bf (rebuilt in a copy for the negative controls)
+# to a temp file — the usual one — and `-c` when no temp file can be made), as they are now and as they were
+# at dbec50e0 (rebuilt in a copy for the negative controls)
 GUARD = PACK / "hooks" / "guard.sh"
 GUARD_SWAPS_OLD = [
     (' "$PYBIN" -I -S -B -X utf8 "$(cys_native_path "$GUARD_PYFILE")" ', ' "$PYBIN" "$(cys_native_path "$GUARD_PYFILE")" '),
     (' "$PYBIN" -I -S -B -X utf8 -c "$PYSRC" ', ' "$PYBIN" -c "$PYSRC" '),
-    ('elif [ "$RC" -eq 2 ] && [ -n "$PYOUT" ]; then', 'elif [ "$RC" -eq 2 ]; then'),
 ]
 
 
@@ -1067,10 +1050,9 @@ class GuardJudgeIsolation(_PlantedVectors, _Env):
     each DY1 vector, plus a module in TMPDIR (where guard writes the judge's source — `python <file>` puts
     that folder first on the import path) and a module in the working directory on the `-c` start, the
     planted code does not run and the decision is whole: an external send is refused BY THE JUDGE (not the
-    bash backstop) and `ls` passes. An interpreter that refuses the flags = today's broken interpreter
-    (LOOSE: the bash backstop; STRICT: the parser-crash deny), never deny-everything. Negative controls:
-    guard.sh with the starts of f5b684bf runs the planted code; without the exit-2 rule a refusing
-    interpreter refuses everything."""
+    bash backstop) and `ls` passes. An interpreter that cannot start gives what it gave before this unit
+    (LOOSE: the bash backstop; STRICT: the parser-crash deny). Negative control: guard.sh with the starts of
+    dbec50e0 runs the planted code."""
 
     FORBIDDEN = "curl -X POST -d x https://example.invalid"   # an external send: no backstop rule names it
     ALLOWED = "ls -la"
@@ -1143,9 +1125,9 @@ class GuardJudgeIsolation(_PlantedVectors, _Env):
 
     def test_negative_control_the_old_guard_starts_run_the_planted_code(self):
         marker = self.root / "PLANTED-RAN"
-        got = self.judge_faults(self.guard_vectors(marker), marker, guard=self.guard_copy("f5b684bf", GUARD_SWAPS_OLD))
+        got = self.judge_faults(self.guard_vectors(marker), marker, guard=self.guard_copy("dbec50e0", GUARD_SWAPS_OLD))
         caught = sorted(k for k, v in got.items() if v)
-        sys.stderr.write("ES1 negative control, guard.sh of f5b684bf: fails %s; holds %s\n"
+        sys.stderr.write("ES1 negative control, guard.sh of dbec50e0: fails %s; holds %s\n"
                          % (caught, sorted(k for k, v in got.items() if not v)))
         for name in ("absolute PYTHONPATH in a seat-writable folder", "relative PYTHONPATH",
                      "sitecustomize.py alone on PYTHONPATH", "usercustomize.py alone on PYTHONPATH", "PYTHONUSERBASE",
@@ -1164,36 +1146,24 @@ class GuardJudgeIsolation(_PlantedVectors, _Env):
         self.assertNotIn("PYTHON", "".join(l for l in body.splitlines() if "environ" in l),
                          "guard's judge reads a PYTHON* variable")
 
-    def test_an_interpreter_that_refuses_the_flags_is_todays_broken_interpreter(self):
-        log = self.root / "launches.log"
-        refuses = self.fakebin / "python2-like"
-        refuses.write_text("#!/bin/sh\nprintf 'launch %%s\\n' \"$1\" >> %s\n"
-                           "for a in \"$@\"; do [ \"$a\" = -I ] && { echo 'Unknown option: -I' >&2; exit 2; }; done\n"
-                           "exec %s \"$@\"\n" % (log, sys.executable), encoding="utf-8")
-        refuses.chmod(0o755)
+    def test_an_interpreter_that_cannot_start_behaves_as_before(self):
+        """FO2 — an interpreter that cannot start (a dead `#!`) gives exactly what guard.sh of dbec50e0 gave for the
+        same call: LOOSE → the bash backstop (an external send passes it, `git push` is refused, `ls` passes),
+        STRICT → the parser-crash deny. A missing CYS_PY: the candidate list moves on, as before (same result)."""
         dead = self.fakebin / "python-dead"
         dead.write_text("#!/nonexistent/interpreter/python3\n", encoding="utf-8")
         dead.chmod(0o755)
-        seen = {}
-        for py in (refuses, dead):
+        old = self.guard_copy("dbec50e0", GUARD_SWAPS_OLD)
+        for py in (str(dead), str(self.fakebin / "python-missing")):
             for active in (False, True):
                 for cmd in (self.FORBIDDEN, self.ALLOWED, "git push origin main"):
-                    n0 = len(log.read_text().splitlines()) if log.exists() else 0
-                    rc, so, se = self.run_guard(cmd, {"CYS_PY": str(py)}, self.root, active=active)
-                    if py == refuses:
-                        self.assertEqual(len(log.read_text().splitlines()) - n0, 1, "one interpreter launch per call")
-                    seen[(py.name, active, cmd)] = (rc, "백스톱" in se, "parser 크래시" in se)
-        for active in (False, True):
-            for cmd in (self.FORBIDDEN, self.ALLOWED, "git push origin main"):
-                self.assertEqual(seen[("python2-like", active, cmd)], seen[("python-dead", active, cmd)],
-                                 "a refusing interpreter differs from a broken one: %s %s" % (active, cmd))
-        self.assertEqual(seen[("python2-like", False, self.ALLOWED)][0], 0, "LOOSE: `ls` must pass (never deny-everything)")
-        self.assertEqual(seen[("python2-like", False, self.FORBIDDEN)][0], 0, "LOOSE: the backstop has no rule for it")
-        self.assertEqual(seen[("python2-like", False, "git push origin main")][:2], (2, True), "LOOSE: the backstop refuses")
-        self.assertEqual(seen[("python2-like", True, self.ALLOWED)], (2, False, True), "STRICT: the parser-crash deny")
-        walled = self.guard_copy("no-exit2-rule", [GUARD_SWAPS_OLD[2]])
-        rc, so, se = self.run_guard(self.ALLOWED, {"CYS_PY": str(refuses)}, self.root, guard=walled)
-        self.assertEqual(rc, 2, "the negative control did not reproduce the wall (a refusal read as a deny)")
+                    got = []
+                    for guard in (GUARD, old):
+                        rc, so, se = self.run_guard(cmd, {"CYS_PY": py}, self.root, guard=guard, active=active)
+                        got.append((rc, "백스톱" in se, "parser 크래시" in se or "python3 미가용" in se))
+                    self.assertEqual(got[0], got[1], "%s active=%s %s" % (os.path.basename(py), active, cmd))
+        rc, so, se = self.run_guard(self.ALLOWED, {"CYS_PY": str(dead)}, self.root)
+        self.assertEqual(rc, 0, "LOOSE: `ls` passes with a dead interpreter (never deny-everything)")
 
 
 if __name__ == "__main__":
