@@ -79,6 +79,9 @@ pub enum Point {
     InMetaPartial,
     /// CT1 — `meta/sealed.json` complete and flushed, not yet placed.
     InMetaWritten,
+    /// CT12 — the approved apply: the slot was validated against the approved state, its operation
+    /// not yet recorded or exchanged.
+    AfterValidation,
 }
 
 /// Fault injection (tests). `at` returns `true` to make the operation stop right there as if the
@@ -2226,8 +2229,18 @@ pub fn apply_candidate_in(
             id.as_str()
         ));
     }
-    // the protection screen at apply (AY5), over exactly the slots' bytes
-    let view = vault::vault_dir_in(env.root, id).join(format!(".screen-{op_tag}"));
+    // the protection screen at apply (AY5), over exactly the slots' bytes. CT12: the view is removed
+    // on EVERY exit (a drop guard — a panic included; a crash's leftover is swept by the start pass:
+    // its name carries this process's pid) and its bytes are bound back to the slot states after
+    // the screen, before anything is exchanged
+    struct ViewGuard(PathBuf);
+    impl Drop for ViewGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0); // our own view of the slots' bytes (never a slot)
+        }
+    }
+    let view = vault::vault_dir_in(env.root, id).join(format!(".screen-{}-{op_tag}", std::process::id()));
+    let view_guard = ViewGuard(view.clone());
     let screen_result = (|| -> Result<(), String> {
         for (rel, slot) in &slots {
             if let Some(s) = slot {
@@ -2252,10 +2265,28 @@ pub fn apply_candidate_in(
             files: view.clone(),
             targets: slot_states.clone(),
         };
-        screen(id, &cand, env.pack)
+        screen(id, &cand, env.pack)?;
+        for (rel, st) in &slot_states {
+            if *st == TargetState::Absent {
+                continue;
+            }
+            let seen = TargetState::read(&view.join(rel)).map_err(|e| format!("{e:?}"))?;
+            if seen != *st {
+                return Err(format!(
+                    "{rel}: 보호장치 검사가 본 내용이 보관 칸의 승인된 상태와 다릅니다 — 적용하지 않습니다"
+                ));
+            }
+        }
+        Ok(())
     })();
-    let _ = std::fs::remove_dir_all(&view); // our own view of the slots' bytes (never a slot)
+    drop(view_guard);
     if let Err(why) = screen_result {
+        return decline(why);
+    }
+    // CU4: the alias check repeated right before the exchanges (the screen may have run for minutes)
+    if let Err(why) =
+        super::boot_critical::refuse_identity_alias(env.pack, files.iter().map(|f| f.rel.as_str()))
+    {
         return decline(why);
     }
     // step 0 of every target first: the live state is the pre-image recorded at `begin`
@@ -2538,6 +2569,9 @@ fn exchange_prepared(
             )),
             None,
         ));
+    }
+    if env.faults.at(Point::AfterValidation, &live, Some(slot)) {
+        return Err(stop(Point::AfterValidation));
     }
     let gen = pack_generation(env.pack);
     let (slot_identity, live_identity) = match (identity_of(&slot.payload()), identity_of(&live)) {

@@ -1771,3 +1771,114 @@ fn f9_is_an_agreement_of_its_members() {
     std::fs::write(slot.meta_pre(), serde_json::to_vec(&pre).unwrap()).unwrap();
     assert!(!approved_copy_of_current_generation_in(&r.root, &r.pack, &r.lane, rel).unwrap(), "(c)");
 }
+
+// ───────────────────────────── RULINGS CT12 / CU3 — the approved apply as one transaction ─────────────────────────────
+
+/// CT12 / CU3: THE property over the COMPLETE approved-apply transaction of a two-file candidate —
+/// a crash at every point of either file's operation (between the slot's validation and its
+/// exchange, after the record, after the exchange, inside the seal on both seal paths, inside
+/// `meta/sealed.json`, after the seal, before done), then a SECOND crash at the same point during the
+/// first recovery, then the recovery runs: (P0) each live file is exactly one of its legitimate
+/// versions — the whole set at the pre-images (undone) or, when no crash fired, the whole set at the
+/// approved states; (P4) no operation unfinished; the intent ends `undone` / `applied`; (P2) no slot
+/// half-made, no temporary entry, no screen view left.
+#[cfg(target_os = "macos")]
+#[test]
+fn approved_apply_property_every_file_every_point() {
+    let points = [
+        Point::AfterValidation,
+        Point::AfterRecord,
+        Point::AfterExchange,
+        Point::InSealCreated,
+        Point::InSealPartial,
+        Point::InSealWritten,
+        Point::InSealPlaced,
+        Point::InMetaPartial,
+        Point::InMetaWritten,
+        Point::AfterSeal,
+        Point::BeforeDone,
+    ];
+    let mut fired = 0;
+    for target in ["hooks/a1.sh", "hooks/a2.sh"] {
+        for point in points {
+            for byte_copy in [false, true] {
+                let r = rig("ct12prop");
+                let id = rid("R-42");
+                let files = two_target_candidate(&r, &id);
+                crate::repair::vault::FORCE_BYTE_COPY_SEAL.with(|c| c.set(byte_copy));
+                let faults = StopOn { rel: target, point, fired: Cell::new(false) };
+                let res = apply_candidate_in(&r.env(&faults, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock);
+                let crashed = faults.fired.get();
+                if crashed {
+                    fired += 1;
+                    assert!(res.is_err(), "{target}/{point:?}: the stop is a crash");
+                    let again = StopOn { rel: target, point, fired: Cell::new(false) };
+                    let _ = resume_interrupted_in(&r.env(&again, ApplyForm::Exchange));
+                }
+                let calm = r.env(&NoFaults, ApplyForm::Exchange);
+                resume_interrupted_in(&calm).unwrap();
+                let _ = recover_apply_intents_in(&calm, &no_repair_lock);
+                crate::repair::vault::FORCE_BYTE_COPY_SEAL.with(|c| c.set(false));
+                let tag = format!("{target} at {point:?}{}", if byte_copy { " (byte-copy seal)" } else { "" });
+                let a1 = std::fs::read(r.pack.join("hooks/a1.sh")).unwrap();
+                let a2 = std::fs::read(r.pack.join("hooks/a2.sh")).unwrap();
+                if crashed {
+                    assert_eq!((a1.as_slice(), a2.as_slice()), (&b"PRE-1\n"[..], &b"PRE-2\n"[..]), "P0 {tag}: the whole set undone");
+                    assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "undone", "{tag}");
+                } else {
+                    assert_eq!((a1.as_slice(), a2.as_slice()), (&b"NEW-1\n"[..], &b"NEW-2\n"[..]), "P0 {tag}: the whole set applied");
+                    assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "applied", "{tag}");
+                }
+                assert!(wal::unfinished_for_lane(&r.root, &r.lane).is_empty(), "P4 {tag}");
+                let vault_dir = vault::vault_dir_in(&r.root, &id);
+                for e in std::fs::read_dir(&vault_dir).unwrap().flatten() {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    assert!(!n.starts_with(".building") && !n.starts_with(".screen") && !n.contains(".part-"), "P2 {tag}: left behind: {n}");
+                    if crate::repair::ledger::is_slot_name(&n) {
+                        for sub in ["sealed", "meta"] {
+                            for f in std::fs::read_dir(e.path().join(sub)).unwrap().flatten() {
+                                assert!(!f.file_name().to_string_lossy().contains(".part-"), "P2 {tag}: temporary entry in a slot");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(fired >= 30, "only {fired} crashes fired");
+}
+
+/// CT12: the temporary screen view is removed on EVERY exit — a screen that panics included.
+/// Without CT12 a panic (or a crash) left `.screen-*` behind.
+#[test]
+fn the_screen_view_is_removed_even_when_the_screen_panics() {
+    let r = rig("ct12view");
+    let id = rid("R-43");
+    let files = two_target_candidate(&r, &id);
+    let screen = |_: &RepairId, _: &crate::repair::screen::ScreenCandidate, _: &Path| -> Result<(), String> { panic!("screen blew up") };
+    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        apply_candidate_in(&env, &id, &files, &screen, &pass_check, &pass_ref, &no_repair_lock)
+    }));
+    assert!(res.is_err());
+    let left: Vec<String> = std::fs::read_dir(vault::vault_dir_in(&r.root, &id)).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| n.starts_with(".screen")).collect();
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"PRE-1\n");
+}
+
+/// CT12: the view's bytes are bound back to the slot states after the screen — a view changed while
+/// the screen ran (the screen judged other bytes than those that would be applied) declines.
+#[test]
+fn a_view_changed_during_the_screen_declines() {
+    let r = rig("ct12rebind");
+    let id = rid("R-44");
+    let files = two_target_candidate(&r, &id);
+    let screen = |_: &RepairId, c: &crate::repair::screen::ScreenCandidate, _: &Path| -> Result<(), String> {
+        std::fs::write(c.files.join("hooks/a1.sh"), b"OTHER\n").unwrap();
+        Ok(())
+    };
+    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let rep = apply_candidate_in(&env, &id, &files, &screen, &pass_check, &pass_ref, &no_repair_lock).unwrap();
+    assert!(matches!(rep.outcome, ApplyOutcome::Declined(ref m) if m.contains("보호장치 검사가 본 내용")), "{:?}", rep.outcome);
+    assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"PRE-1\n");
+}
