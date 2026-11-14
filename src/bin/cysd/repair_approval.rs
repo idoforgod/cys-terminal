@@ -811,16 +811,17 @@ pub(crate) fn production_step3(s3: &Step3Input) -> Result<Step3Ok, String> {
     if rep.verdict == ScreenVerdict::Refused {
         return Err(format!("보호장치 심사 거부 — {}", rep.refusals.join(" / ")));
     }
-    let verdict = screen::RecordedVerdict {
-        schema: screen::SCREEN_SCHEMA,
-        verdict: rep.verdict,
-        input_fingerprint: rep.input_fingerprint.clone(),
-        build_id: rep.build_id.clone(),
-        notes: rep.notes.clone(),
-        at: cys::repair::ledger::now_epoch(),
-    };
-    screen::write_verdict_in(&s3.root, &s3.repair, &verdict)
-        .map_err(|e| format!("심사 결과를 기록하지 못했습니다 — {e:?}"))?;
+    // RULINGS CZ5: recorded only while the live inputs still match what the screen tested
+    let mut notes = rep.notes.clone();
+    match screen::recordable_verdict(&rep, &cand, &s3.pack)
+        .map_err(|e| format!("심사 결과를 기록할지 판단하지 못했습니다 — {e:?}"))?
+    {
+        Some(verdict) => screen::write_verdict_in(&s3.root, &s3.repair, &verdict)
+            .map_err(|e| format!("심사 결과를 기록하지 못했습니다 — {e:?}"))?,
+        None => notes.push(
+            "심사하는 동안 레인의 입력이 바뀌어 심사 결과를 기록하지 않았습니다 — 적용할 때 다시 심사합니다".into(),
+        ),
+    }
     summary.push(format!("보호장치 심사 {}ms", rep.duration_ms));
     let device_of = |line: &str| -> String {
         if line.contains("guard.sh") {
@@ -833,7 +834,7 @@ pub(crate) fn production_step3(s3: &Step3Input) -> Result<Step3Ok, String> {
     };
     Ok(Step3Ok {
         rehearsal_summary: summary.join(" · "),
-        screen_notes: rep.notes.clone(),
+        screen_notes: notes,
         lane_findings: rep
             .lane_findings
             .iter()
