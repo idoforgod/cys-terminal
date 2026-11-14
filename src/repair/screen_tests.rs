@@ -721,6 +721,142 @@ fn i3_refuses_registrar_that_unregisters() {
     cleanup(&root);
 }
 
+/// RULINGS CZ1: "registered" = the hook EXECUTES the gate. Each form is read under the closed grammar;
+/// the old substring check (`command.contains(<gate path>)`) called every `false` row below registered.
+#[test]
+fn gate_registration_reads_the_effective_invocation() {
+    let root = test_root("cz1-unit");
+    let pack = root.join("pack");
+    let gate = pack.join("hooks").join(CAPGATE_SCRIPT);
+    std::fs::create_dir_all(gate.parent().unwrap()).unwrap();
+    std::fs::write(&gate, "#!/bin/sh\nexit 0\n").unwrap();
+    replay::set_mode(&gate, 0o644);
+    let g = gate.to_string_lossy().into_owned();
+    let hook = |cmd: &str| serde_json::json!({"type": "command", "command": cmd, "timeout": 15});
+    let rows: Vec<(&str, serde_json::Value, bool)> = vec![
+        ("the registrar's form", hook(&format!("sh {g}")), true),
+        ("double-quoted path", hook(&format!("sh \"{g}\"")), true),
+        ("single-quoted path", hook(&format!("sh '{g}'")), true),
+        ("absolute interpreter", hook(&format!("/bin/sh {g}")), true),
+        ("bash", hook(&format!("bash {g}")), true),
+        ("no timeout (the tool's default)", serde_json::json!({"type": "command", "command": format!("sh {g}")}), true),
+        ("comment", hook(&format!("true # sh {g}")), false),
+        ("no-op wrapper", hook(&format!("true sh {g}")), false),
+        ("colon wrapper", hook(&format!(": sh {g}")), false),
+        ("syntax-check-only flag", hook(&format!("sh -n {g}")), false),
+        ("conditional", hook(&format!("[ -n \"$CYS_NEVER\" ] && sh {g}")), false),
+        ("or-true", hook(&format!("sh {g} || true")), false),
+        ("sequence", hook(&format!("exit 0; sh {g}")), false),
+        ("an argument", hook(&format!("sh {g} --self-test")), false),
+        ("an assignment in front", hook(&format!("CAPGATE_SELF_TEST=1 sh {g}")), false),
+        ("env wrapper", hook(&format!("env sh {g}")), false),
+        ("redirection", hook(&format!("sh {g} 2>/dev/null")), false),
+        ("expansion in quotes", hook(&format!("sh \"$HOME{g}\"")), false),
+        ("another interpreter", hook(&format!("zsh {g}")), false),
+        ("quoted interpreter", hook(&format!("'sh' {g}")), false),
+        ("another path", hook(&format!("sh {}/hooks/../hooks/{CAPGATE_SCRIPT}", pack.display())), false),
+        ("direct, not executable", hook(&g), false),
+        ("incompatible type", serde_json::json!({"type": "prompt", "command": format!("sh {g}")}), false),
+        ("no type", serde_json::json!({"command": format!("sh {g}")}), false),
+        ("timeout below the floor", serde_json::json!({"type": "command", "command": format!("sh {g}"), "timeout": 1}), false),
+        ("timeout not a number", serde_json::json!({"type": "command", "command": format!("sh {g}"), "timeout": "15"}), false),
+        ("a key the registrar never writes", serde_json::json!({"type": "command", "command": format!("sh {g}"), "async": true}), false),
+    ];
+    let settings = root.join("settings.json");
+    let write = |doc: serde_json::Value| std::fs::write(&settings, doc.to_string()).unwrap();
+    let mut wrong = Vec::new();
+    for (name, h, want) in &rows {
+        write(serde_json::json!({"hooks": {"PreToolUse": [{"hooks": [h]}]}}));
+        if gate_registered(&settings, &pack) != Some(*want) {
+            wrong.push(*name);
+        }
+    }
+    // the direct form runs only an executable file
+    replay::set_mode(&gate, 0o755);
+    write(serde_json::json!({"hooks": {"PreToolUse": [{"hooks": [hook(&g)]}]}}));
+    if gate_registered(&settings, &pack) != Some(true) {
+        wrong.push("direct, executable");
+    }
+    // entry-level forms: a narrower matcher, an unknown entry key, every hook disabled, the gate gone
+    for (name, doc) in [
+        ("matcher Bash", serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [hook(&format!("sh {g}"))]}]}})),
+        ("unknown entry key", serde_json::json!({"hooks": {"PreToolUse": [{"if": "never", "hooks": [hook(&format!("sh {g}"))]}]}})),
+        ("disableAllHooks", serde_json::json!({"disableAllHooks": true, "hooks": {"PreToolUse": [{"hooks": [hook(&format!("sh {g}"))]}]}})),
+        ("another event", serde_json::json!({"hooks": {"PostToolUse": [{"hooks": [hook(&format!("sh {g}"))]}]}})),
+    ] {
+        write(doc);
+        if gate_registered(&settings, &pack) != Some(false) {
+            wrong.push(name);
+        }
+    }
+    std::fs::remove_file(&gate).unwrap();
+    write(serde_json::json!({"hooks": {"PreToolUse": [{"hooks": [hook(&format!("sh {g}"))]}]}}));
+    if gate_registered(&settings, &pack) != Some(false) {
+        wrong.push("gate file missing");
+    }
+    assert!(wrong.is_empty(), "misjudged forms: {wrong:?}");
+    cleanup(&root);
+}
+
+/// RULINGS CZ1 — a registrar-mutation regression per form: a candidate `javis_preflight.py` whose C28
+/// registration leaves an entry that names the gate but cannot run it is REFUSED on the real
+/// registrar's own run (L1, s3: starts unregistered), the released registrar registering it.
+fn i3_refuses_registrar_mutation(name: &str, from: &str, to: &str) {
+    let root = test_root(name);
+    let lane = lane_of(&root, &[]);
+    let pf = released("bin/javis_preflight.py");
+    assert_eq!(pf.matches(from).count(), 1, "{name}: mutation anchor");
+    let cand = candidate_of(
+        &root,
+        &[("bin/javis_preflight.py", Some(pf.replace(from, to)))],
+    );
+    let c = cfg(&root, Some(vec![]), Some(vec![]), true);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let i3: Vec<&ProbeResult> = rep.probes.iter().filter(|p| p.test == "I3").collect();
+    assert_eq!(rep.verdict, ScreenVerdict::Refused, "{name}: {i3:#?}");
+    let s3 = i3
+        .iter()
+        .find(|p| p.cell == "L1/S3/run1" && p.class == "I3:.claude")
+        .unwrap_or_else(|| panic!("{name}: no L1/S3 probe: {i3:#?}"));
+    // measured, not an error: the released registrar registers, the candidate's leaves it unrun
+    assert_eq!(
+        (s3.released, s3.clean, s3.decision),
+        (Answer::Deny, Some(Answer::Allow), ProbeDecision::Refused),
+        "{name}: {s3:#?}"
+    );
+    cleanup(&root);
+}
+
+const REGISTRAR_FORM: &str = "    return \"sh \" + script";
+
+#[test]
+fn i3_refuses_registrar_writing_a_comment() {
+    i3_refuses_registrar_mutation("cz1-comment", REGISTRAR_FORM, "    return \"true # sh \" + script");
+}
+
+#[test]
+fn i3_refuses_registrar_writing_a_noop_wrapper() {
+    i3_refuses_registrar_mutation("cz1-wrapper", REGISTRAR_FORM, "    return \"true sh \" + script");
+}
+
+#[test]
+fn i3_refuses_registrar_writing_a_conditional() {
+    i3_refuses_registrar_mutation(
+        "cz1-cond",
+        REGISTRAR_FORM,
+        "    return '[ -n \"$CYS_NEVER_SET\" ] && sh ' + script",
+    );
+}
+
+#[test]
+fn i3_refuses_registrar_writing_another_hook_type() {
+    i3_refuses_registrar_mutation(
+        "cz1-type",
+        "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd}]}",
+        "entry = {\"hooks\": [{\"type\": \"prompt\", \"command\": cmd}]}",
+    );
+}
+
 /// I4: a candidate guard.sh whose backstop region differs from the released copy → REFUSED; a
 /// candidate whose region anchor is gone → REFUSED; a lane whose own copy differs and a candidate
 /// that does not touch guard.sh → a lane finding (BA4).
