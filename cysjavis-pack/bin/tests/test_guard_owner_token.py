@@ -6,27 +6,31 @@
   1  표가 없으면(데몬이 거부) 규칙 문서 Write/Edit 은 배포본 그대로 차단된다(같은 deny 문장).
   2  데몬이 허용(rule-doc-allowed 종료 코드 0)하면 그 Write/Edit 만 통과하고, 조회는
      `cys --socket <s> repair rule-doc-allowed --path <파일>` 하나이며 CYS_NO_AUTOSTART=1 로 간다.
-  3  소켓 없음 · 옛 데몬(93) · 거부(95) · 시간 초과 → 오늘의 동작(차단). 시간 초과는 PATH 의 명령에 기대지 않고
-     막혀 있는 스텁(셸 내장 `read` 가 아무도 쓰지 않는 FIFO 를 읽는다)으로 재며, 통과 조건은 넷 다다(RULINGS ER2):
-     가드의 거부 문장 · 거부가 한도보다 **이르지 않음**(단조 시계 ≥) · 스텁이 기다리고 있었다는 증거(pid · waiting
-     표지) · 그 프로세스가 끝났음. 막기가 즉시 실패하는 스텁에서는 이 판정이 **실패**해야 한다(회귀 3e).
-  7  가드의 테스트 예산 손잡이가 실제로 쓰는 조회 한도(RULINGS ER1 · EM2 — 제품 변경 없이): 스텁이 **스스로
-     지키는 하한 지연 D** 뒤에야 "허용"으로 답한다. 허용 = 한도 ≥ D(가드가 D 이상 기다렸다 · 단조 ≥ D),
-     거부 = 스텁이 아직 기다리는 중에 끝났다는 증거 + 가드가 자기 한도 이상 기다린 뒤였다(단조 ≥). 다섯 설정:
-     예산 5초(허용 D=1.5) · 상한 넘는 60초(허용 D=3 · 거부 D=21 — 상한 20초) · 작은 예산 0.4초(거부 D=0.55 —
-     낮추기만) · 변수 없음(거부 D=0.9 — 기본 0.6초) · 테스트 모드 끔 + 변수 5초(거부 D=0.9 — 변수 무시).
+  3  소켓 없음 · 옛 데몬(93) · 거부(95) · 시간 초과 → 오늘의 동작(차단). 시간 초과는 스텁이 **스스로 잰** 기다림으로
+     판정한다(RULINGS EW1): 스텁(가짜 cys — 테스트를 돌리는 python 을 절대경로 shebang 으로 쓰는 작은 스크립트)은 첫
+     동작으로 자기 단조 시계 t0 를 찍고, 막기 모드에서 20ms 마다 "waiting Δ" 를 덧붙여 쓰며 끝내 답하지 않는다.
+     통과 = "start" + 하트비트 + "answered" 없음 + 마지막 하트비트 Δ 가 기대 한도의 [−하한 관용, +상한 관용] 안 +
+     그 프로세스가 끝났음. 가드의 거부 문장이나 훅 전체의 걸린 시간은 증거가 아니다. 즉시 실패하는 막기는
+     하트비트를 남기지 못하므로 실패한다(회귀 3e · 자기 점검 9).
+  7  가드의 테스트 예산 손잡이가 실제로 쓰는 조회 한도(RULINGS EW2 · ER1 · EM2 — 제품 변경 없이, 스텁이 잰 값으로):
+     예산 5초 → D=1.5초 뒤 "answered Δ≥D" 와 허용 · 상한 위 60초 → D=3초 뒤 허용, 그리고 막기 모드의 마지막
+     하트비트가 20초 근처(상한) · 작은 예산 0.3초 → 마지막 하트비트가 0.3초 근처 · 변수 없음 → 0.6초 근처 ·
+     테스트 모드 끔 + 변수 5초 → 0.6초 근처(변수 무시).
+  9  자기 점검(RULINGS EW2 음성 대조): 판정 함수에 지어낸 틀린 기록을 먹인다 — (i) 한도가 0.1초로 줄었는데 무관한
+     기동 지연으로 훅 전체가 0.8초 걸린 기록, (ii) 막기가 즉시 실패했는데 무관한 지연으로 훅 전체가 6초 걸린
+     기록, (iii) D 전에 답한 기록, (iv) 한도가 너무 긴 기록 — 모두 판정이 **실패**해야 한다.
   4  Bash 로 규칙 문서를 쓰는 경로(tee·sed -i·리다이렉트)는 표가 있어도 막힌다.
   5  corpus G 의 대표 호출(외부 발행·외부 전송·영구 삭제)은 표가 있든 없든 막힌다(AT9).
   6  규칙 문서가 아닌 쓰기는 조회 없이 통과한다(평시 동작 무변화).
 밀폐: 가짜 `cys` 스텁(PATH 선두) · 임시 디렉터리의 진짜 unix 소켓 파일 · GUARD_TEST_MODE 로 자율주행 깃발을
 임시 경로에 둔다 · HOME 임시. 데몬·라이브 팩 무접촉.
-시간 관용도(RULINGS EH1 · EA2 · EM1 · ER3): 관용도를 키웠을 뿐이며 조회는 여전히 남은 예산 안에 끝나야 한다.
-허용·거부 경우는 가드의 테스트 예산을 크게(`GUARD_TEST_GATE_BUDGET_MS=20000`) 주고, 시간 초과 경우는 5초 예산을
-쓴다. 스텁이 그 안에 기동해 답하거나 증거를 남기지 못할 만큼 극단적인 부하에서는 테스트가 **크게 실패**하고
-다시 돌린다 — 조용히 통과하지 않는다. 7 의 작은 예산(0.4초)·기본 한도(0.6초) 경우는 그 짧은 한도 안에 조회가
-시작돼야 하므로 부하에 가장 민감하다(실패하면 증거 부족으로 크게 실패한다). `STUB_START_DELAY=<초>` 로 스텁의
-느린 기동을 주입할 수 있다(부하 재현). 스텁의 지연은 절대경로 `/bin/sleep`(먼저 있는지 확인), 막기는 셸 내장
-`read` — PATH 의 명령에 기대지 않는다.
+시간 관용도(RULINGS EW1 · EW3): 한도에 대한 모든 판정은 스텁이 자기 시계로 잰 Δ 만 읽는다. 하한 관용은 스텁
+자신의 기동(t0 이전 · 가드의 시계로는 이미 흐른 시간)과 예산이 걸린 경우 가드 자신의 전처리(합산 예산 안에서
+조회 전에 쓴 시간), 그리고 하트비트 간격(20ms)을 흡수한다 — 그만큼 마지막 하트비트가 한도보다 이르게 찍히기
+때문이다. 상한 관용은 가드가 스케줄에서 밀려 시간 초과를 늦게 처리하는 만큼을 흡수한다(스텁은 죽은 뒤에 기록할
+수 없다). 허용·거부 경우는 큰 예산(20초)을 쓴다 — 관용도를 키웠을 뿐 조회는 여전히 남은 예산 안에 끝나야 한다.
+극단적 부하에서는 한 경우가 크게 실패하고 다시 돌린다 — 조용히 통과하지 않는다.
+`STUB_START_DELAY=<초>` 는 스텁의 t0 이전에 느린 기동을 주입한다(부하 재현).
 출력: PASS/FAIL 행 · 실패 시 exit 1 · 전부 통과 시 GUARD-OWNER-TOKEN-OK.
 """
 import json
@@ -51,37 +55,91 @@ def check(name, cond, detail=""):
         fails.append(name)
 
 
-STUB = r"""#!/bin/sh
-# fake cys: logs argv + CYS_NO_AUTOSTART, answers rule-doc-allowed with $STUB_RULEDOC_RC
-[ -n "${STUB_START_DELAY:-}" ] && /bin/sleep "$STUB_START_DELAY"   # injected slow start-up (load)
-printf '%s|NO_AUTOSTART=%s\n' "$*" "${CYS_NO_AUTOSTART:-}" >> "$STUB_LOG"
-case "$*" in
-  *"repair rule-doc-allowed"*)
-    [ -n "${STUB_EVIDENCE:-}" ] && echo $$ > "$STUB_EVIDENCE"      # evidence: the pid that waits
-    if [ -n "${STUB_BLOCK_FIFO:-}" ]; then
-      : > "$STUB_EVIDENCE.waiting"
-      read _ < "$STUB_BLOCK_FIFO"   # shell builtin on a FIFO nobody writes: blocks until killed
-      exit 97                       # reached only if the block failed at once: never an answer
-    fi
-    if [ -n "${STUB_ALLOW_AFTER:-}" ]; then
-      : > "$STUB_EVIDENCE.waiting"
-      /bin/sleep "$STUB_ALLOW_AFTER" || exit 98   # the lower bound D, enforced by the stub itself
-      : > "$STUB_EVIDENCE.answered"
-      exit 0                        # "allowed" — never before D
-    fi
-    exit "${STUB_RULEDOC_RC:-95}" ;;
-esac
-exit 1
+# The fake `cys` (RULINGS EW1): a small python script run by the test's own interpreter through an
+# absolute shebang (no command found through PATH). It takes its own monotonic t0 as its first act and
+# records every claim about the limit itself:
+#   STUB_MODE=answer-after (STUB_D=<s>): waits until its own delta >= D, writes "answered <delta>", exits 0
+#   STUB_MODE=block: appends "waiting <delta>" every 20 ms (flushed each time) and never answers
+#   STUB_MODE=block-fails: the blocking operation fails at once (a negative control) - exits 97
+STUB_BODY = r"""
+import os, sys, time
+_d = os.environ.get("STUB_START_DELAY")
+if _d:
+    time.sleep(float(_d))                    # injected slow start-up, BEFORE t0
+t0 = time.monotonic()
+
+
+def put(path, line):
+    if path:
+        with open(path, "a") as f:
+            f.write(line + "\n")
+            f.flush()
+
+
+args = " ".join(sys.argv[1:])
+put(os.environ.get("STUB_LOG"), "%s|NO_AUTOSTART=%s" % (args, os.environ.get("CYS_NO_AUTOSTART", "")))
+if "repair rule-doc-allowed" not in args:
+    sys.exit(1)
+ev = os.environ.get("STUB_EVIDENCE")
+put(ev, "start pid=%d" % os.getpid())
+mode = os.environ.get("STUB_MODE", "")
+if mode == "answer-after":
+    d = float(os.environ["STUB_D"])
+    while time.monotonic() - t0 < d:
+        time.sleep(min(0.01, max(0.0, d - (time.monotonic() - t0))))
+    put(ev, "answered %.4f" % (time.monotonic() - t0))
+    sys.exit(0)
+if mode == "block":
+    while True:
+        put(ev, "waiting %.4f" % (time.monotonic() - t0))
+        time.sleep(0.02)
+if mode == "block-fails":
+    sys.exit(97)
+sys.exit(int(os.environ.get("STUB_RULEDOC_RC", "95")))
 """
 
-# RULINGS EH1 / ER3: the allow / deny cases get a large budget (increased tolerance — the query must
+# RULINGS EH1 / ER3: the allow / deny cases get a large budget (increased tolerance - the query must
 # still finish within the remaining budget); the guard's test knob raises its per-query cap with it,
 # up to the guard's ceiling (20 s)
 BIG_BUDGET_MS = "20000"
-# the time-out case: generous enough for the stub's start-up (EM1), then the stub never answers
 TIMEOUT_BUDGET_MS = "5000"
-TIMEOUT_LIMIT_S = 5.0
-DENY_SOUL = "헌법파일(soul.md) Write 차단"   # the guard's refusal on this path (it has no separate time-out wording)
+# tolerances around an expected limit, applied to the stub's LAST heartbeat (EW1, see the header):
+# below = the stub's own start-up + the guard's prelude inside the budget + one heartbeat interval;
+# above = the guard handling its time-out late when it is descheduled
+TOL_SHORT = (0.25, 0.20)   # the 0.3 s and 0.6 s limits
+TOL_LONG = (0.50, 1.00)    # the 5 s and 20 s limits
+
+
+def parse_evidence(lines):
+    """The stub's own record: (started, pid, heartbeats [delta...], answered delta or None)."""
+    started, pid, beats, answered = False, None, [], None
+    for ln in lines:
+        parts = ln.split()
+        try:
+            if parts[0] == "start":
+                started = True
+                pid = int(parts[1].split("=", 1)[1])
+            elif parts[0] == "waiting":
+                beats.append(float(parts[1]))
+            elif parts[0] == "answered":
+                answered = float(parts[1])
+        except (IndexError, ValueError):
+            pass
+    return started, pid, beats, answered
+
+
+def allow_ok(rc, ev, d):
+    """ALLOW: the guard allowed AND the stub recorded "answered" with its own delta >= D."""
+    return rc == 0 and ev[3] is not None and ev[3] >= d
+
+
+def timeout_ok(rc, ev, expected, tol, pid_gone):
+    """TIME-OUT: started, heartbeats, NO answer, the last heartbeat (the measured limit) within
+    [expected - tol[0], expected + tol[1]], the process gone. The refusal itself is only rc 2 - the
+    guard's sentence and the whole-hook time are not evidence."""
+    started, pid, beats, answered = ev
+    return (rc == 2 and started and pid is not None and len(beats) >= 2 and answered is None
+            and expected - tol[0] <= beats[-1] <= expected + tol[1] and pid_gone)
 
 
 def main():
@@ -92,7 +150,7 @@ def main():
         os.makedirs(stubdir)
         stub = os.path.join(stubdir, "cys")
         with open(stub, "w") as f:
-            f.write(STUB)
+            f.write("#!%s -IS\n" % sys.executable + STUB_BODY)
         os.chmod(stub, 0o755)
         sock = os.path.join(root, "s.sock")
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -165,19 +223,12 @@ def main():
         check("3a 소켓 없음 → 조회 없이 차단", p.returncode == 2 and not calls, repr((p.returncode, calls)))
         p, _, _ = run({"file_path": soul, "content": "x"}, rc=93)
         check("3b 옛 데몬(93) → 차단", p.returncode == 2)
-        # evidence helpers (EM1 / ER1 / ER2)
+        # evidence helpers (EW1): the stub's own record
         seq = [0]
 
         def ev_path():
             seq[0] += 1
             return os.path.join(root, "ev%d" % seq[0])
-
-        def evidence(base):
-            try:
-                pid = int(open(base).read().strip())
-            except (OSError, ValueError):
-                pid = None
-            return pid, os.path.exists(base + ".waiting"), os.path.exists(base + ".answered")
 
         def gone(pid):
             if pid is None:
@@ -190,59 +241,69 @@ def main():
                 return False
             return False
 
-        # 3c — the daemon's answer never comes (RULINGS ER2 / EM1). Passes only with ALL of: the guard's
-        # refusal sentence, the refusal NO EARLIER than the limit (monotonic >=), the stub's evidence
-        # that it was waiting, and that process gone afterwards.
-        def timeout_case(fifo):
+        def drive(mode, budget_ms, d=None, test_mode=True):
             base = ev_path()
-            p, calls, el = run({"file_path": soul, "content": "x"}, rc=0, budget_ms=TIMEOUT_BUDGET_MS,
-                               extra={"STUB_EVIDENCE": base, "STUB_BLOCK_FIFO": fifo})
-            pid, waiting, answered = evidence(base)
-            ok = (p.returncode == 2 and DENY_SOUL in p.stderr and el >= TIMEOUT_LIMIT_S
-                  and pid is not None and waiting and not answered and gone(pid)
-                  and len(calls) == 1 and "repair rule-doc-allowed" in calls[0])
-            return ok, pid, (p.returncode, round(el, 3), pid, waiting, answered, gone(pid), calls)
+            extra = {"STUB_EVIDENCE": base, "STUB_MODE": mode}
+            if d is not None:
+                extra["STUB_D"] = "%g" % d
+            p, _, el = run({"file_path": soul, "content": "x"}, rc=0, budget_ms=budget_ms,
+                           test_mode=test_mode, extra=extra)
+            lines = open(base).read().splitlines() if os.path.exists(base) else []
+            ev = parse_evidence(lines)
+            return p, ev, gone(ev[1]), el
 
-        fifo = os.path.join(root, "never-written.fifo")
-        os.mkfifo(fifo)
-        ok, pid, detail = timeout_case(fifo)
-        check("3c 시간 초과 → 차단: 거부 문장 · %.1f초 이상 기다린 뒤 · 기다리던 스텁(pid=%s)의 증거 · 그 프로세스는 끝났다"
-              % (TIMEOUT_LIMIT_S, pid), ok, "" if ok else repr(detail))
-        # 3e — regression of the time-out judgment itself: a block that fails at once (its FIFO is
-        # missing) must make the time-out case FAIL — refused early, nothing waited
-        bad_ok, _, bad_detail = timeout_case(os.path.join(root, "missing.fifo"))
-        check("3e 막기가 즉시 실패하는 스텁에서는 시간 초과 판정이 통과하지 않는다", not bad_ok, repr(bad_detail))
+        def show(ev):
+            started, pid, beats, answered = ev
+            return "start=%s pid=%s heartbeats=%d last=%s answered=%s" % (
+                started, pid, len(beats), ("%.3f" % beats[-1]) if beats else None, answered)
 
-        # 7 — the knob's effective per-query limit, observed without a product change (RULINGS ER1): the
-        # stub answers "allowed" only after a delay D it enforces itself. ALLOW proves limit >= D (and the
-        # guard waited >= D); REFUSAL counts only with the stub's evidence that it was still waiting when
-        # ended and the guard having waited at least its limit (monotonic >=).
-        have_sleep = os.access("/bin/sleep", os.X_OK)
-        check("7- 스텁의 하한 지연에 쓰는 /bin/sleep 이 있다(PATH 에 기대지 않는다)", have_sleep)
+        def last(ev):
+            return ("%.3f" % ev[2][-1]) if ev[2] else "없음"
 
-        def limit_case(label, budget_ms, d, expect, limit_s=None, test_mode=True):
-            base = ev_path()
-            p, _, el = run({"file_path": soul, "content": "x"}, rc=0, budget_ms=budget_ms, test_mode=test_mode,
-                           extra={"STUB_EVIDENCE": base, "STUB_ALLOW_AFTER": "%g" % d})
-            pid, waiting, answered = evidence(base)
-            if expect == "allow":
-                ok = p.returncode == 0 and answered and el >= d
-            else:
-                ok = (p.returncode == 2 and DENY_SOUL in p.stderr and pid is not None and waiting
-                      and not answered and gone(pid) and el >= limit_s)
-            check(label, ok, "" if ok else repr((p.returncode, round(el, 3), pid, waiting, answered)))
+        # 3c — the daemon's answer never comes: the stub's LAST heartbeat is the limit it measured
+        p, ev, pid_gone, el = drive("block", TIMEOUT_BUDGET_MS)
+        ok = timeout_ok(p.returncode, ev, 5.0, TOL_LONG, pid_gone)
+        check("3c 시간 초과 → 차단: 스텁이 잰 마지막 하트비트 %s초(기대 5초 −%.2f/+%.2f) · 답 없음 · 그 프로세스는 끝났다"
+              % (last(ev), TOL_LONG[0], TOL_LONG[1]), ok,
+              "" if ok else "%s rc=%d hook=%.2fs" % (show(ev), p.returncode, el))
+        # 3e — a blocking operation that fails at once leaves no heartbeat: the time-out judgment FAILS
+        p, ev, pid_gone, el = drive("block-fails", TIMEOUT_BUDGET_MS)
+        bad = timeout_ok(p.returncode, ev, 5.0, TOL_LONG, pid_gone)
+        check("3e 막기가 즉시 실패한 스텁에서는 시간 초과 판정이 통과하지 않는다(스텁의 하트비트 %d개)" % len(ev[2]), not bad,
+              "" if not bad else "%s rc=%d" % (show(ev), p.returncode))
 
-        if have_sleep:
-            limit_case("7a 예산 5초 → D=1.5초 뒤의 허용을 기다렸다(한도가 예산을 따랐다 · ≥1.5초)", "5000", 1.5, "allow")
-            limit_case("7b 예산 60초(상한 위) → D=3초 뒤의 허용을 기다렸다(1초 넘는 예산은 한도를 올린다)", "60000", 3.0, "allow")
-            limit_case("7c 예산 60초 → D=21초를 기다리지 않고 20초 이상 기다린 뒤 거부(상한 20초 · 스텁은 기다리던 중)",
-                       "60000", 21.0, "refuse", limit_s=20.0)
-            limit_case("7d 작은 예산 0.4초 → D=0.55초 전에 거부(0.4초 이상 · 낮추기만 한다)", "400", 0.55, "refuse",
-                       limit_s=0.4)
-            limit_case("7e 변수 없음 → D=0.9초 전에 거부(기본 한도 0.6초 이상 기다린 뒤)", None, 0.9, "refuse",
-                       limit_s=0.6)
-            limit_case("7f 테스트 모드 끔 + 변수 5초 → D=0.9초 전에 거부(변수 무시 · 0.6초 이상 기다린 뒤)", "5000", 0.9,
-                       "refuse", limit_s=0.6, test_mode=False)
+        # 7 — the knob's effective per-query limit, from the stub's own measurement (RULINGS EW2)
+        def allow_case(label, budget_ms, d):
+            p, ev, _, el = drive("answer-after", budget_ms, d=d)
+            ok = allow_ok(p.returncode, ev, d)
+            check("%s — 스텁이 잰 답 시점 Δ=%s초 ≥ D=%g초, 가드 허용" % (
+                label, ("%.3f" % ev[3]) if ev[3] is not None else "없음", d), ok,
+                "" if ok else "%s rc=%d hook=%.2fs" % (show(ev), p.returncode, el))
+
+        def limit_case(label, budget_ms, expected, tol, test_mode=True):
+            p, ev, pid_gone, el = drive("block", budget_ms, test_mode=test_mode)
+            ok = timeout_ok(p.returncode, ev, expected, tol, pid_gone)
+            check("%s — 스텁이 잰 마지막 하트비트 %s초(기대 %g초 −%.2f/+%.2f)" % (
+                label, last(ev), expected, tol[0], tol[1]), ok,
+                "" if ok else "%s rc=%d hook=%.2fs" % (show(ev), p.returncode, el))
+
+        allow_case("7a 예산 5초 → 한도가 예산을 따랐다", "5000", 1.5)
+        allow_case("7b 예산 60초(상한 위) → 1초 넘는 예산은 한도를 올린다", "60000", 3.0)
+        limit_case("7c 예산 60초 → 상한 20초에서 끝났다", "60000", 20.0, TOL_LONG)
+        limit_case("7d 작은 예산 0.3초 → 한도를 낮추기만 한다", "300", 0.3, TOL_SHORT)
+        limit_case("7e 변수 없음 → 기본 한도 0.6초", None, 0.6, TOL_SHORT)
+        limit_case("7f 테스트 모드 끔 + 변수 5초 → 변수 무시, 0.6초", "5000", 0.6, TOL_SHORT, test_mode=False)
+
+        # 9 — self-checks of the predicates (RULINGS EW2 negative controls, fabricated wrong records)
+        lowered = parse_evidence(["start pid=1"] + ["waiting %.3f" % (0.02 * k) for k in range(1, 6)])
+        check("9i 한도가 0.1초로 줄어든 기록(훅 전체 0.8초여도) → 판정 실패", not timeout_ok(2, lowered, 0.6, TOL_SHORT, True))
+        no_beat = parse_evidence(["start pid=1"])
+        check("9ii 막기가 즉시 실패한 기록(훅 전체 6초여도) → 판정 실패", not timeout_ok(2, no_beat, 5.0, TOL_LONG, True))
+        early = parse_evidence(["start pid=1", "answered 0.0100"])
+        check("9iii D 전에 답한 기록 → 허용 판정 실패", not allow_ok(0, early, 1.5))
+        too_long = parse_evidence(["start pid=1"] + ["waiting %.3f" % (0.1 * k) for k in range(1, 60)])
+        check("9iv 한도가 너무 긴 기록(5.9초 · 기대 0.6초) → 판정 실패", not timeout_ok(2, too_long, 0.6, TOL_SHORT, True))
+
         # 4 — Bash writers of rule documents stay denied with a token
         for cmd in ("tee %s < /dev/null" % soul, "sed -i 's/a/b/' %s" % soul, "echo x > %s" % soul):
             p, _, _ = run({"command": cmd}, tool="Bash", rc=0)
