@@ -407,10 +407,23 @@ pub fn candidate_states_in(
     rels.dedup();
     let mut out = Vec::with_capacity(rels.len());
     for rel in rels {
-        out.push((rel.to_string(), read_under_no_link(&staging, rel)?));
+        // RULINGS GR5 (CCR-T5b-1): the candidate is read with a size limit
+        out.push((
+            rel.to_string(),
+            read_under_no_link_with(&staging, rel, &|p| {
+                TargetState::read_capped(p, MAX_CANDIDATE_BYTES)
+            })?,
+        ));
     }
     Ok(out)
 }
+
+/// RULINGS GR5 (CCR-T5b-1) — the most bytes the ONE candidate reader reads of one staged target:
+/// 8 MiB = 8,388,608 bytes, more than eight times the largest file the two compiled lists name
+/// (`bin/javis_preflight.py`, 780,355 bytes when measured — eight times is 6,242,840). A larger
+/// candidate is refused at once ("over the size limit"); `submit`, `finish_verification` and the
+/// apply all read through [`candidate_states_in`].
+pub const MAX_CANDIDATE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The record's FILE targets — every walker skips hook lines by kind (RULINGS W3(b)).
 pub fn file_targets(rec: &RepairRecord) -> impl Iterator<Item = &FileChange> {
@@ -430,6 +443,16 @@ pub fn hook_lines(rec: &RepairRecord) -> impl Iterator<Item = &FileChange> {
 /// parent chain inside `base` contains a symbolic link (the base itself must be a real directory,
 /// or absent → every entry is `Absent`).
 pub fn read_under_no_link(base: &Path, rel: &str) -> Result<TargetState, RepairError> {
+    read_under_no_link_with(base, rel, &TargetState::read)
+}
+
+/// [`read_under_no_link`]'s path checks with the final read given (RULINGS GR5: the candidate
+/// reader passes the capped read).
+fn read_under_no_link_with(
+    base: &Path,
+    rel: &str,
+    read: &dyn Fn(&Path) -> Result<TargetState, RepairError>,
+) -> Result<TargetState, RepairError> {
     let parts: Vec<&str> = rel.split('/').collect();
     if rel.is_empty()
         || parts
@@ -469,7 +492,7 @@ pub fn read_under_no_link(base: &Path, rel: &str) -> Result<TargetState, RepairE
         }
     }
     cur.push(parts[parts.len() - 1]);
-    TargetState::read(&cur)
+    read(&cur)
 }
 
 /// Round cap (C1 1.11).
