@@ -929,6 +929,55 @@ fn incomplete_repeat_is_a_failure() {
     cleanup(&root);
 }
 
+/// RULINGS DF1: exit 0 is a deny only when the whole trimmed output is exactly one deny object.
+#[test]
+fn deny_is_read_as_strictly_as_the_harness() {
+    let deny = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"x"}}"#;
+    let rows: Vec<(String, bool)> = vec![
+        (deny.to_string(), true),
+        (format!("\n  {deny}\n\n"), true),
+        (format!("one extra line\n{deny}\n"), false),
+        (format!("{deny}\nafter\n"), false),
+        (format!("{deny}\n{deny}\n"), false),
+        (r#"{"decision":"block"}"#.to_string(), false),
+        (deny.replace("deny\"", "allow\""), false),
+        (deny.replace("PreToolUse", "PostToolUse"), false),
+        ("[1]".to_string(), false),
+        (String::new(), false),
+    ];
+    for (out, want) in rows {
+        assert_eq!(deny_payload(out.as_bytes()), want, "{out:?}");
+    }
+}
+
+/// RULINGS DF1 regression: a candidate `hooks/_lib.sh` that makes every hook print ONE extra stdout
+/// line keeps a deny object in the output — the loose reading still saw DENY; the strict one sees no
+/// decision, so every R / C class the released gate denies here is REFUSED.
+#[test]
+fn extra_stdout_line_from_lib_refuses_every_gate_class() {
+    let root = test_root("df1");
+    let lane = lane_of(&root, &[]);
+    let lib = released("hooks/_lib.sh") + "\necho 'one extra line'\n";
+    let cand = candidate_of(&root, &[("hooks/_lib.sh", Some(lib))]);
+    let ids: Vec<&'static str> = corpus::CORPUS_R
+        .iter()
+        .chain(corpus::CORPUS_C.iter())
+        .map(|c| c.id)
+        .collect();
+    let c = cfg(&root, Some(ids.clone()), Some(vec!["E-1"]), false);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let mut bound = std::collections::BTreeSet::new();
+    for p in rep.probes.iter().filter(|p| p.test == "R" || p.test == "C") {
+        if p.released == Answer::Deny {
+            bound.insert(p.class.split('#').next().unwrap_or("").to_string());
+            assert_eq!(p.decision, ProbeDecision::Refused, "{p:#?}");
+        }
+    }
+    assert!(bound.len() >= 30, "R/C classes the released gate denies in E-1: {bound:?}");
+    assert_eq!(rep.verdict, ScreenVerdict::Refused);
+    cleanup(&root);
+}
+
 /// I4: a candidate guard.sh whose backstop region differs from the released copy → REFUSED; a
 /// candidate whose region anchor is gone → REFUSED; a lane whose own copy differs and a candidate
 /// that does not touch guard.sh → a lane finding (BA4).

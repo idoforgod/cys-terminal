@@ -826,19 +826,26 @@ fn answer_of(o: &replay::ChildOutcome) -> (Answer, String) {
     }
 }
 
-fn deny_payload(stdout: &[u8]) -> bool {
-    let s = String::from_utf8_lossy(stdout);
-    s.lines().any(|l| {
-        serde_json::from_str::<serde_json::Value>(l.trim())
-            .ok()
-            .map(|v| {
-                v.pointer("/hookSpecificOutput/permissionDecision")
-                    .and_then(|d| d.as_str())
-                    == Some("deny")
-                    || v.get("decision").and_then(|d| d.as_str()) == Some("block")
-            })
-            .unwrap_or(false)
-    })
+/// RULINGS DF1 — the screen reads a hook's answer at least as strictly as the harness: exit 0 is a
+/// DENY only when the WHOLE trimmed standard output is exactly ONE JSON object carrying the devices'
+/// deny decision (`hookSpecificOutput.permissionDecision` = `deny`, `hookEventName` = `PreToolUse`
+/// — the form both devices print). A deny object on one line among other output, two objects, or
+/// any other shape is no deny (a harness that parses the whole output sees no decision there).
+pub(crate) fn deny_payload(stdout: &[u8]) -> bool {
+    let Ok(s) = std::str::from_utf8(stdout) else {
+        return false;
+    };
+    // `from_str` refuses anything after the one value (trailing characters)
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(s.trim()) else {
+        return false;
+    };
+    v.is_object()
+        && v.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|d| d.as_str())
+            == Some("deny")
+        && v.pointer("/hookSpecificOutput/hookEventName")
+            .and_then(|d| d.as_str())
+            == Some("PreToolUse")
 }
 
 /// The budget counter file the gate keeps for a session (`<state>/capgate/<sha256(sid)[:32]>.calls`,
