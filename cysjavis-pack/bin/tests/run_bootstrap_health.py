@@ -1359,14 +1359,17 @@ def h_detect_10():
     #   ★PKG-3A (0.14.56): the hook-side `-c` sites now run `"$CYS_PY" -B -c` (bytecode seal; M1), and every
     #   real CYS_PY (bundled and system python) accepts that - so the mock also delegates an optional leading
     #   -B before -c. Narrower than a real interpreter, it answered the role lookup with 127 (HD10-MEASURE.md).
+    #   ★RULINGS ES1 (0.15.0 · T5c): the deadline wrapper's interpreter now starts `-I -S -B -X utf8 -c`
+    #   (every real CYS_PY >= 3.7 accepts it) - the mock delegates that form too, for the same reason.
     mock = ("#!/bin/sh\n"
             'case "$1" in\n'
             '  -c) exec "%s" "$@" ;;\n'
             '  -B) [ "${2-}" = -c ] && exec "%s" "$@" ;;\n'
+            '  -I) [ "${2-}" = -S ] && exec "%s" "$@" ;;\n'
             "  *javis_detect.py) exec \"%s\" \"$@\" ;;\n"
             "  *javis_mission.py) exec \"%s\" \"$@\" ;;\n"
             "esac\n"
-            "exit 127\n" % (real, real, real, real))
+            "exit 127\n" % (real, real, real, real, real))
     with tempfile.TemporaryDirectory() as tmp:
         env, _home, _pack, _bind, state = _rb_sandbox(tmp, mock_py=mock)
         r = _run_rb(env)

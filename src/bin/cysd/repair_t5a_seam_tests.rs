@@ -378,3 +378,79 @@ fn a_capital_sharp_s_spelling_of_an_absent_row_is_refused_naming_the_row() {
         Some("boss_directive.md")
     );
 }
+
+/// RULINGS FR1 (a) — the daemon's caller: a DANGLING link inside the pack to an ABSENT listed file (a
+/// write through it would create the listed file) is followed by its text and refused naming the row.
+#[cfg(unix)]
+#[test]
+fn a_dangling_link_to_an_absent_listed_file_is_refused_naming_the_row() {
+    let pack = scratch("fr1-pack");
+    for d in ["hooks", "notes"] {
+        std::fs::create_dir_all(pack.join(d)).unwrap();
+    }
+    std::os::unix::fs::symlink("../hooks/session-start.sh", pack.join("notes/ss.sh")).unwrap();
+    assert!(!pack.join("hooks/session-start.sh").exists());
+    let e = production_classify("notes/ss.sh", &pack).unwrap_err();
+    assert!(
+        format!("{e:?}").contains("`hooks/session-start.sh`"),
+        "{e:?}"
+    );
+    let _ = std::fs::remove_dir_all(&pack);
+}
+
+/// RULINGS CY1 / DY2 — the daemon's caller, first on the case ONLY the comparison of the REQUESTED
+/// spelling with the row catches: the listed file is ABSENT (so the live-file identity check of
+/// AW3 (d) has nothing to compare) and a parent-directory alias inside the pack (an alias directory;
+/// `..` after a link) names it → refused naming the listed spelling. (With the old comparison —
+/// `exact(a.rel.as_deref().unwrap_or(rel), e.rel)`, the identity that named the row — these two are
+/// classified as the row and NOT refused.) Then, with the file present, the same spellings and an
+/// alias of the file stay refused; an alias pointing out of the pack is General.
+#[cfg(unix)]
+#[test]
+fn an_in_pack_alias_of_a_listed_file_is_refused_naming_the_row() {
+    let pack = scratch("cy1-pack");
+    let out = scratch("cy1-out");
+    for d in ["hooks/sub", "notes"] {
+        std::fs::create_dir_all(pack.join(d)).unwrap();
+    }
+    std::os::unix::fs::symlink(pack.join("hooks"), pack.join("hooks-alias")).unwrap();
+    std::os::unix::fs::symlink(pack.join("hooks/sub"), pack.join("notes/sub-link")).unwrap();
+    std::os::unix::fs::symlink(&out, pack.join("out-alias")).unwrap();
+    let parent_aliases = [
+        "hooks-alias/session-start.sh",
+        "notes/sub-link/../session-start.sh",
+    ];
+    // the listed file is absent: the identity check (AW3 (d)) compares nothing …
+    assert!(!pack.join("hooks/session-start.sh").exists());
+    for spelled in parent_aliases {
+        assert!(
+            cys::repair::boot_critical::refuse_identity_alias(&pack, [spelled]).is_ok(),
+            "precondition: the identity check must have nothing to compare for {spelled}"
+        );
+        // … so only the comparison of the requested spelling with the row refuses
+        let e = production_classify(spelled, &pack).unwrap_err();
+        assert!(
+            format!("{e:?}").contains("`hooks/session-start.sh`"),
+            "{spelled} (listed file absent): {e:?}"
+        );
+    }
+    std::fs::write(pack.join("hooks/session-start.sh"), "#!/bin/sh\n").unwrap();
+    std::os::unix::fs::symlink(
+        pack.join("hooks/session-start.sh"),
+        pack.join("notes/ss.sh"),
+    )
+    .unwrap();
+    for spelled in parent_aliases.into_iter().chain(["notes/ss.sh"]) {
+        let e = production_classify(spelled, &pack).unwrap_err();
+        assert!(
+            format!("{e:?}").contains("`hooks/session-start.sh`"),
+            "{spelled} (listed file present): {e:?}"
+        );
+    }
+    assert_eq!(
+        production_classify("out-alias/session-start.sh", &pack).unwrap(),
+        Classification::General
+    );
+    let _ = std::fs::remove_dir_all(&pack);
+    let _ = std::fs::remove_dir_all(&out);
+}

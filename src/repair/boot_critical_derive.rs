@@ -1322,6 +1322,15 @@ pub fn preflight_census(pf: &str) -> Vec<String> {
     errs
 }
 
+/// RULINGS CY2 — a `hooks` table write in Python text: `setdefault(` followed (spaces allowed) by the
+/// literal `hooks` in EITHER quote (`setdefault("hooks"`, `setdefault('hooks'`, `setdefault( 'hooks'`).
+pub fn writes_hooks_table(text: &str) -> bool {
+    text.match_indices("setdefault(").any(|(at, m)| {
+        let rest = text[at + m.len()..].trim_start();
+        ["\"hooks\"", "'hooks'"].iter().any(|q| rest.starts_with(q))
+    })
+}
+
 /// Census of every pack Python file that writes a `hooks` table into a settings file.
 pub fn settings_writer_census(src: &Sources) -> Vec<String> {
     let mut errs = Vec::new();
@@ -1330,7 +1339,7 @@ pub fn settings_writer_census(src: &Sources) -> Vec<String> {
             continue;
         };
         let t = py_code_view(&lf(&t));
-        if t.contains("setdefault(\"hooks\"") && !KNOWN_SETTINGS_WRITERS.contains(&rel.as_str()) {
+        if writes_hooks_table(&t) && !KNOWN_SETTINGS_WRITERS.contains(&rel.as_str()) {
             errs.push(format!(
                 "census: `{rel}` writes a settings `hooks` table — a registrar outside the anchors (T5a derivation)"
             ));

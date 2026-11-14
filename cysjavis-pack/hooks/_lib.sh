@@ -316,6 +316,21 @@ cys_fix_locale() {
 #   ④ 셋 다 없으면 무-데드라인 직접 실행(정직한 강등 — 조용한 실패보다 낫다)
 # 반환 코드는 실행 대상의 것을 그대로 전달하고, **타임아웃은 124**(GNU 관례)다.
 # ★stdout 은 건드리지 않는다(호출측 `$(...)` 회수 계약 유지 · 프리루드 계약 ⓑ).
+# RULINGS ES1 / FU2 (0.15.0 · T5c) — what the isolated wrappers below hand back as LC_CTYPE: on a C / POSIX
+# locale CPython rewrites LC_CTYPE in its own environment (PEP 538) and -I ignores a PYTHONCOERCECLOCALE=0
+# that stopped it, so the wrapper puts back exactly what the command would have inherited: "=value" when
+# LC_CTYPE is EXPORTED (also exported-empty), "" when it is not in the environment (unset, or a shell
+# variable that was never exported — it must not be promoted), "?" when this shell cannot tell (no
+# `compgen`; the interpreter's value is then left as it is). Builtins only (`type`, `compgen`): no process.
+_cys_lc_handback() {
+  _cys_lc="?"
+  if type compgen >/dev/null 2>&1; then
+    _cys_lc=""
+    compgen -e -X '!LC_CTYPE' LC_CTYPE >/dev/null 2>&1 && _cys_lc="=${LC_CTYPE-}"
+  fi
+  return 0
+}
+
 cys_timeout_run() {
   # Opt-in only: GNU/System32 timeout and the old unbounded fallback cannot
   # bypass this path. The caller supplies the resolved leaf path explicitly.
@@ -328,17 +343,29 @@ cys_timeout_run() {
     fi
     # Bootstrap needs no external path converter. Drive-mounted MSYS paths
     # have a lexical native spelling; other paths retain ordinary semantics.
-    # -c puts '' (the session cwd = a project directory) first on sys.path, and runpy plus the leaf
-    # then import stdlib modules a project file can shadow (queue.py, json.py ...). Drop it before any
-    # import. Not -I: that implies -E and drops PYTHONHOME/PYTHONUTF8/PYTHONIOENCODING (PKG-3A M1).
-    "$CYS_PY" -B -c 'import sys
-sys.path[:]=[x for x in sys.path if x]
-import os,runpy
-p=sys.argv[1]
+    # RULINGS ES1 (0.15.0 · T5c — DY1 for every interpreter that feeds a protection's decision): this
+    # interpreter (the bootstrap + the leaf it runs in-process) starts ISOLATED, decided by its start-up
+    # flags before it starts, not by editing sys.path afterwards: -I (every PYTHON* variable ignored, no
+    # user site, neither the script folder nor the working directory on sys.path), -S (no site: no .pth,
+    # sitecustomize, usercustomize), -B (no bytecode), -X utf8 (the UTF-8 mode PYTHONUTF8=1 gave, given
+    # back explicitly; it replaces the PKG-3A M1 reason for not using -I). Bootstrap and leaf import the
+    # standard library only; the command the leaf runs gets this process's environment unchanged — with
+    # one hand-back: on a C / POSIX locale CPython rewrites LC_CTYPE in its own environment (PEP 538), and
+    # -I also ignores a PYTHONCOERCECLOCALE=0 that would have stopped it, so the first statement puts
+    # LC_CTYPE back exactly as the command would have inherited it (`_cys_lc_handback`). An interpreter
+    # that cannot start: its exit code with no records — the caller's existing "phase owner ended without
+    # completion; unmeasured" branch, as before this unit.
+    _cys_lc_handback
+    "$CYS_PY" -I -S -B -X utf8 -c 'import os,runpy,sys
+if sys.argv[1] == "":
+    os.environ.pop("LC_CTYPE",None)
+elif sys.argv[1][0] == "=":
+    os.environ["LC_CTYPE"]=sys.argv[1][1:]
+p=sys.argv[2]
 if os.name == "nt" and len(p)>3 and p[0]=="/" and p[2]=="/" and p[1].isalpha():
     p=p[1]+":"+p[2:]
-sys.argv=[p]+sys.argv[2:]
-runpy.run_path(p,run_name="__main__")' "$_cys_owned_leaf" --bounded "$_cys_owned_cap" "$@"
+sys.argv=[p]+sys.argv[3:]
+runpy.run_path(p,run_name="__main__")' "$_cys_lc" "$_cys_owned_leaf" --bounded "$_cys_owned_cap" "$@"
     return $?
   fi
   _cys_to="${1:-2}"
@@ -357,24 +384,36 @@ runpy.run_path(p,run_name="__main__")' "$_cys_owned_leaf" --bounded "$_cys_owned
     # ★프로세스 **그룹** 종료: 대상만 죽이면 손자(대상이 띄운 자식)가 stdout 파이프를 계속 붙잡아
     #   호출측 `$(...)` 가 EOF 를 못 받고 그대로 행 걸린다(데드라인이 사실상 무효 — 실측 확인).
     #   그래서 새 세션으로 스폰하고 타임아웃 시 그룹 전체에 SIGKILL 을 보낸다.
-    #   '' (the cwd) leaves sys.path first, for the same reason as the --owned bootstrap above.
-    "$CYS_PY" -B -c 'import sys
-sys.path[:]=[x for x in sys.path if x]
-import os,signal,subprocess
+    # RULINGS ES1 / FO1 (0.15.0 · T5c): the gate's role is the first line of what this wrapper relays, so
+    #   its interpreter starts ISOLATED — start-up flags and nothing else: -I (no PYTHON* variable, no user
+    #   site, no working directory), -S (no site), -B (no bytecode), -X utf8 (the UTF-8 mode PYTHONUTF8=1
+    #   gave). Every Python 3 this code can run on accepts the four (-I since 3.4; this code needs 3.3+ —
+    #   TimeoutExpired). It imports the standard library only; the command it runs inherits this process's
+    #   environment unchanged (no env=) and its exit code passes through as before (124 on the deadline).
+    #   One hand-back: on a C / POSIX locale CPython rewrites LC_CTYPE in its own environment (PEP 538) and
+    #   -I ignores a PYTHONCOERCECLOCALE=0 that stopped it — the first statement puts LC_CTYPE back exactly
+    #   as the command would have inherited it, exported or not (`_cys_lc_handback`).
+    _cys_lc_handback
+    "$CYS_PY" -I -S -B -X utf8 -c 'import os,sys
+if sys.argv[1] == "":
+    os.environ.pop("LC_CTYPE", None)
+elif sys.argv[1][0] == "=":
+    os.environ["LC_CTYPE"] = sys.argv[1][1:]
+import signal,subprocess
 try:
-    p = subprocess.Popen(sys.argv[2:], start_new_session=True)
+    p = subprocess.Popen(sys.argv[3:], start_new_session=True)
 except FileNotFoundError:
     sys.exit(127)
 except Exception:
     sys.exit(126)
 try:
-    sys.exit(p.wait(timeout=float(sys.argv[1])))
+    sys.exit(p.wait(timeout=float(sys.argv[2])))
 except subprocess.TimeoutExpired:
     try:
         os.killpg(os.getpgid(p.pid), signal.SIGKILL)
     except Exception:
         p.kill()
-    sys.exit(124)' "$_cys_to" "$@"
+    sys.exit(124)' "$_cys_lc" "$_cys_to" "$@"
     return $?
   fi
   "$@"
