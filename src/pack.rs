@@ -1969,10 +1969,14 @@ pub enum PackStateRead {
 
 pub fn read_pack_state(dir: &Path) -> PackStateRead {
     let path = dir.join(PACK_STATE_FILE);
-    let s = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PackStateRead::Absent,
-        Err(e) => return PackStateRead::Corrupt(format!("읽기 실패: {e}")),
+    // ★T2h(RULINGS CW3): 시작 경로 판독 — 링크 비추종 · 막히지 않음 · 일반 파일 · 상한.
+    let s = match read_start_meta(&path) {
+        StartRead::Bytes(b) => match String::from_utf8(b) {
+            Ok(s) => s,
+            Err(e) => return PackStateRead::Corrupt(format!("읽기 실패: {e}")),
+        },
+        StartRead::Missing => return PackStateRead::Absent,
+        StartRead::Unreadable(e) => return PackStateRead::Corrupt(format!("읽기 실패: {e}")),
     };
     match serde_json::from_str::<PackState>(&s) {
         Ok(st) if st.channel == "free" || st.channel == "pro" => PackStateRead::Valid(st),
@@ -2000,7 +2004,7 @@ pub fn remote_is_newer_tuple(remote: (&str, u32), disk: (&str, u32)) -> bool {
 /// 임베드 트리(PACK_ALL)에 없는 것이 있으면 pro overlay 실재로 본다. (판독 실패 = 증거 없음 —
 /// ①축 accepted.channel이 1차 권위라 이 축은 보조 휴리스틱이다.)
 pub fn pro_file_evidence(dir: &Path) -> bool {
-    let Ok(s) = std::fs::read_to_string(dir.join(INSTALL_MANIFEST)) else {
+    let Some(s) = read_start_meta(&dir.join(INSTALL_MANIFEST)).text() else {
         return false;
     };
     let Ok(m) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&s) else {
@@ -2245,6 +2249,98 @@ pub fn read_pack_text_bounded(p: &Path) -> std::io::Result<String> {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "크기 상한 초과"));
     }
     read_capped_utf8(f, HOOKS_READ_CAP)
+}
+
+/// ★T2h(RULINGS CW3 · 검토자 B3): 데몬 시작 경로(설치·업데이트 판정 — 바인드 전)가 읽는 파일 하나의 판독 결과. 부재 ·
+/// 판독 불가(사유) · 바이트. 판독 불가는 호출부의 **보수적 기본값**이 된다(시작을 막지 않는다).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartRead {
+    Missing,
+    Unreadable(String),
+    Bytes(Vec<u8>),
+}
+
+impl StartRead {
+    /// 바이트(부재·판독 불가 = None).
+    pub fn bytes(self) -> Option<Vec<u8>> {
+        match self {
+            StartRead::Bytes(b) => Some(b),
+            _ => None,
+        }
+    }
+    /// UTF-8 텍스트(부재·판독 불가·UTF-8 아님 = None).
+    pub fn text(self) -> Option<String> {
+        self.bytes().and_then(|b| String::from_utf8(b).ok())
+    }
+}
+
+/// ★T2h(RULINGS CW3): 장부·메타 파일(`.merge-audit.jsonl` · `.merge-pending.json` · 설치 기록 · `.pack-version` ·
+/// `.pack-state.json` · `.pristine/<rel>` · `<rel>.user` · `<rel>.new` · `<rel>.base` · 스냅샷 `meta.json`) 하나의 상한.
+pub const START_META_CAP: u64 = 64 * 1024 * 1024;
+/// ★T2h(RULINGS CW3): 살아 있는 팩 파일 하나의 상한(내장 팩의 가장 큰 파일은 약 1.3MB).
+pub const START_LIVE_CAP: u64 = 64 * 1024 * 1024;
+
+/// ★T2h(RULINGS CW3): 장부·메타 판독 — 마지막 성분의 링크를 **따르지 않고**(unix `O_NOFOLLOW` · windows 재해석 지점을 그대로
+/// 연다) **막히지 않게** 열어(unix `O_NONBLOCK` — 쓰는 쪽 없는 FIFO 도 즉시 열린다) 연 핸들이 일반 파일이고 상한 이하일 때만
+/// 읽는다(상한 + 1 바이트까지 읽어 넘치면 거부 — 읽는 동안 자라도 성공이 아니다). FIFO · 소켓 · 장치 · 폴더 · 링크 · 상한 초과
+/// = 판독 불가. 시작 경로가 이 파일들로 무기한 멈추지 않는다.
+pub fn read_start_meta(p: &Path) -> StartRead {
+    start_read(p, START_META_CAP, false)
+}
+
+/// ★T2h(RULINGS CW3): 살아 있는 팩 파일 판독 — 사용자가 둔 링크는 **일반 파일을 가리킬 때만** 따른다(지금 동작). 막히지 않게
+/// 열고 일반 파일 · 상한 이하만 읽는다 — FIFO · 장치 · 상한 초과 = 판독 불가(그 파일은 '판독 불가' 경로를 탄다).
+pub fn read_start_live(p: &Path) -> StartRead {
+    start_read(p, START_LIVE_CAP, true)
+}
+
+fn start_read(p: &Path, cap: u64, follow: bool) -> StartRead {
+    use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK | if follow { 0 } else { libc::O_NOFOLLOW });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        if !follow {
+            opts.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+    }
+    let f = match opts.open(p) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StartRead::Missing,
+        Err(e) => return StartRead::Unreadable(format!("열기 실패: {e}")),
+    };
+    let m = match f.metadata() {
+        Ok(m) => m,
+        Err(e) => return StartRead::Unreadable(format!("상태 확인 실패: {e}")),
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if !follow && m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return StartRead::Unreadable("재해석 지점(링크)은 따르지 않는다".into());
+        }
+    }
+    if !m.is_file() {
+        return StartRead::Unreadable("일반 파일이 아니다(FIFO·소켓·장치·폴더·링크)".into());
+    }
+    if m.len() > cap {
+        return StartRead::Unreadable(format!("크기 상한({cap}바이트) 초과"));
+    }
+    let mut bytes = Vec::new();
+    if let Err(e) = f.take(cap + 1).read_to_end(&mut bytes) {
+        return StartRead::Unreadable(format!("읽기 실패: {e}"));
+    }
+    if bytes.len() as u64 > cap {
+        return StartRead::Unreadable("크기 상한 초과(읽는 동안 커졌다)".into());
+    }
+    StartRead::Bytes(bytes)
 }
 
 /// ★F10 R2-m3: 상한 + 1 바이트까지 읽어 넘치면 거부한다 — stat 뒤에 파일이 자라도 앞부분(상한까지)만 해시한 '성공'이 나오지 않는다.
@@ -2744,7 +2840,8 @@ pub const MASTER_DIRECTIVE_REL: &str = "directives/MASTER_DIRECTIVE.md";
 /// (시험 `ceo_promoted_in_matches_the_shared_fixture`).
 pub fn ceo_promoted_in(dir: &Path) -> bool {
     ceo_pre_ceo_present_in(dir)
-        || std::fs::read(dir.join(MASTER_DIRECTIVE_REL))
+        || read_start_live(&dir.join(MASTER_DIRECTIVE_REL))
+            .bytes()
             .map(|b| has_ceo_separator(&b))
             .unwrap_or(false)
 }
@@ -2768,10 +2865,14 @@ fn has_ceo_separator(b: &[u8]) -> bool {
 /// 바 가드 2 — `.merge-audit.jsonl` 에서 사용자가 일부러 옛 버전을 유지한 기록이 있는 파일 집합.
 /// 행동 `keep-mine`(pack-merge)·`rollback`(pack-rollback)만 센다. 거부 기록(flags 에 `refused`)은
 /// 사용자의 선택이 아니라 게이트의 거부이므로 세지 않는다. 판독 실패 행은 건너뛴다(파일 부재 = 빈 집합).
-pub fn merge_audit_keep_rels(dir: &Path) -> std::collections::BTreeSet<String> {
+/// ★T2h(RULINGS CW3): `None` = 감사 원장을 읽을 수 없다(FIFO · 폴더 · 링크 · 상한 초과 · 읽기 오류) — 호출부는 **모든** user 소유
+/// 파일을 '내 것 유지'로 본다(보수적 기본값: 자동 갱신하지 않는다). 부재 = 빈 집합(지금 동작).
+pub fn merge_audit_keep_rels(dir: &Path) -> Option<std::collections::BTreeSet<String>> {
     let mut out = std::collections::BTreeSet::new();
-    let Ok(text) = std::fs::read_to_string(dir.join(MERGE_AUDIT_FILE)) else {
-        return out;
+    let text = match read_start_meta(&dir.join(MERGE_AUDIT_FILE)) {
+        StartRead::Missing => return Some(out),
+        StartRead::Unreadable(_) => return None,
+        StartRead::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
     };
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
@@ -2790,7 +2891,7 @@ pub fn merge_audit_keep_rels(dir: &Path) -> std::collections::BTreeSet<String> {
             out.insert(file.to_string());
         }
     }
-    out
+    Some(out)
 }
 
 /// 생명줄 훅 파일인가 — `hooks/<여섯 이름>`(CONTRACTS 8.7 · `repair::boot_critical::LIFELINE_HOOKS`).
@@ -3068,15 +3169,14 @@ pub fn lane_for_install(pack: &Path) -> Option<crate::repair::types::LaneKey> {
 
 /// 매니페스트 로드 + 깨짐 여부(파일이 있는데 JSON 으로 읽히지 않음). 깨지면 빈 표(지금 동작)와 true.
 pub fn load_manifest_state(dir: &Path) -> (std::collections::BTreeMap<String, String>, bool) {
-    match std::fs::read_to_string(dir.join(INSTALL_MANIFEST)) {
-        Ok(s) => match serde_json::from_str(&s) {
+    // ★T2h(RULINGS CW3): 시작 경로 판독 — 판독 불가(FIFO · 폴더 · 링크 · 상한 초과)는 '깨짐'과 같다(보수 경로).
+    match read_start_meta(&dir.join(INSTALL_MANIFEST)) {
+        StartRead::Bytes(b) => match serde_json::from_slice(&b) {
             Ok(m) => (m, false),
             Err(_) => (std::collections::BTreeMap::new(), true),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (std::collections::BTreeMap::new(), false)
-        }
-        Err(_) => (std::collections::BTreeMap::new(), true),
+        StartRead::Missing => (std::collections::BTreeMap::new(), false),
+        StartRead::Unreadable(_) => (std::collections::BTreeMap::new(), true),
     }
 }
 
@@ -3088,7 +3188,7 @@ pub struct UpdateContext<'s> {
     sources: &'s UpdateSources,
     manifest_corrupt: bool,
     ceo_promoted: bool,
-    audit_keep: std::cell::OnceCell<std::collections::BTreeSet<String>>,
+    audit_keep: std::cell::OnceCell<Option<std::collections::BTreeSet<String>>>,
 }
 
 impl<'s> UpdateContext<'s> {
@@ -3135,7 +3235,8 @@ impl<'s> UpdateContext<'s> {
                 f.audit_keep = self
                     .audit_keep
                     .get_or_init(|| merge_audit_keep_rels(&self.dir))
-                    .contains(rel);
+                    .as_ref()
+                    .is_none_or(|kept| kept.contains(rel));
                 f.ceo_promoted = rel == MASTER_DIRECTIVE_REL && self.ceo_promoted;
                 let unedited = manifest_hash == Some(dh.as_str()) || f.prev_vendor_match;
                 if unedited && is_constitution_file(rel) {
@@ -3149,8 +3250,8 @@ impl<'s> UpdateContext<'s> {
                 let parked = e.and_then(|e| e.get("kind")).and_then(|k| k.as_str()) == Some("user-kept")
                     && e.and_then(|e| e.get("reason")).and_then(|r| r.as_str()) != Some("capture-failed");
                 if parked {
-                    f.parked_same_vendor = std::fs::read_to_string(self.dir.join(format!("{rel}.new")))
-                        .ok()
+                    f.parked_same_vendor = read_start_meta(&self.dir.join(format!("{rel}.new")))
+                        .text()
                         .as_deref()
                         == Some(embed);
                 }
@@ -3331,9 +3432,10 @@ pub fn decide_file_action_with(
 
 /// 병합 대기 원장 로드(부재·손상 = 빈 원장, 기동 차단 0).
 pub fn load_merge_pending(dir: &Path) -> serde_json::Map<String, serde_json::Value> {
-    std::fs::read_to_string(dir.join(MERGE_PENDING_FILE))
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    // ★T2h(RULINGS CW3): 시작 경로 판독 — 판독 불가(FIFO · 폴더 · 링크 · 상한 초과)는 빈 원장(지금의 파싱 실패와 같다).
+    read_start_meta(&dir.join(MERGE_PENDING_FILE))
+        .bytes()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default()
 }
@@ -3362,11 +3464,32 @@ pub fn append_merge_audit(dir: &Path, entry: &serde_json::Value) -> Result<(), S
         serde_json::to_string(entry).map_err(|e| format!("감사 엔트리 직렬화 실패: {e}"))?;
     line.push('\n');
     let path = dir.join(MERGE_AUDIT_FILE);
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| format!("감사 원장 열기 실패 {}: {e}", path.display()))?;
+    // ★T2h(RULINGS CW3 · CW1): 링크를 따르지 않고(살아 있는 파일의 별칭에 덧붙이지 않는다) 막히지 않게 연다(읽는 쪽 없는
+    // FIFO 는 즉시 실패 — 설치가 멈추지 않는다) · 연 핸들이 일반 파일일 때만 쓴다.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut f = opts.open(&path).map_err(|e| format!("감사 원장 열기 실패 {}: {e}", path.display()))?;
+    let m = f.metadata().map_err(|e| format!("감사 원장 상태 확인 실패 {}: {e}", path.display()))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if m.file_attributes() & 0x400 != 0 {
+            return Err(format!("감사 원장 {} 이 재해석 지점(링크)입니다 — 쓰지 않습니다", path.display()));
+        }
+    }
+    if !m.is_file() {
+        return Err(format!("감사 원장 {} 이 일반 파일이 아닙니다 — 쓰지 않습니다", path.display()));
+    }
     f.write_all(line.as_bytes())
         .map_err(|e| format!("감사 원장 쓰기 실패 {}: {e}", path.display()))
 }
@@ -3605,8 +3728,8 @@ fn plan_install_core(
     let mut plan = InstallPlan::default();
     // 다운그레이드 차단 미러(install_into 와 동일 판정).
     if !force {
-        if let Some(dv) = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
-            .ok()
+        if let Some(dv) = read_start_meta(&dir.join(PACK_VERSION_FILE))
+            .text()
             .map(|s| s.trim().to_string())
         {
             if version_gt(&dv, target_version) {
@@ -3624,7 +3747,7 @@ fn plan_install_core(
     for (rel, content) in items.iter().copied() {
         let path = dir.join(rel);
         let exists = path.exists();
-        let disk = if exists { std::fs::read_to_string(&path).ok() } else { None };
+        let disk = if exists { read_start_live(&path).text() } else { None };
         let mh_raw = manifest.get(rel).map(String::as_str);
         // ★C-07(0.14.55 · P3): 분류 **직전** 낡은 항목 판정. decide_file_action 의 arm 은 무변경.
         let stale =
@@ -3697,7 +3820,7 @@ fn plan_install_core(
             {
                 continue;
             }
-            match std::fs::read_to_string(dir.join(rel)) {
+            match read_start_live(&dir.join(rel)).text().ok_or(()) {
                 Ok(existing) if mh.as_str() == content_hash(&existing).as_str() => {
                     plan.prune_delete.push(rel.clone());
                 }
@@ -3755,7 +3878,7 @@ pub fn pack_current_in(dir: &Path, binary_version: &str) -> bool {
     if !dir.join(INSTALL_MANIFEST).exists() {
         return false;
     }
-    let Ok(disk) = std::fs::read_to_string(dir.join(PACK_VERSION_FILE)) else {
+    let Some(disk) = read_start_meta(&dir.join(PACK_VERSION_FILE)).text() else {
         return false;
     };
     match (parse_semver(disk.trim()), parse_semver(binary_version)) {
@@ -4058,8 +4181,8 @@ pub fn classify_stale_entry(
     //   같으면 그 항목은 낡은 것이 아니라 **정상적인 드리프트/병합 상태의 기준선**이다.
     //   이 가드를 빼면 합법적인 로컬 수정(항목==조상 해시 · 건강한 3-way 경로)이 "출처 불명"으로
     //   오분류돼 3-way 병합이 사라진다(실측: lib 스위트 52건 적색).
-    let pristine_hash = std::fs::read_to_string(dir.join(PRISTINE_DIR).join(rel))
-        .ok()
+    let pristine_hash = read_start_meta(&dir.join(PRISTINE_DIR).join(rel))
+        .text()
         .map(|p| content_hash(&p));
     classify_stale_entry_with(
         rel,
@@ -4146,7 +4269,7 @@ pub fn is_system_manifest_entry(dir: &Path, rel: &str) -> bool {
     if ownership_name_scoped(rel, dir) != "system" {
         return false;
     }
-    let Ok(s) = std::fs::read_to_string(dir.join(INSTALL_MANIFEST)) else {
+    let Some(s) = read_start_meta(&dir.join(INSTALL_MANIFEST)).text() else {
         return false;
     };
     let Ok(m) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&s) else {
@@ -4180,7 +4303,7 @@ fn ensure_pristine(dir: &Path, rel: &str, content: &str) {
 /// healed 폴백으로 강등한다(손실 0 · v2 §4).
 fn ensure_pristine_checked(dir: &Path, rel: &str, content: &str) -> Result<(), String> {
     let p = dir.join(PRISTINE_DIR).join(rel);
-    if std::fs::read_to_string(&p).ok().as_deref() == Some(content) {
+    if read_start_meta(&p).text().as_deref() == Some(content) {
         return Ok(());
     }
     if let Some(parent) = p.parent() {
@@ -4244,7 +4367,14 @@ fn create_capture_segment(
 pub fn byte_backup_user(dir: &Path, rel: &str, src: &Path) -> Result<(), String> {
     let dst = dir.join(format!("{rel}.user"));
     let tmp = dir.join(format!("{rel}.user.tmp-{}", std::process::id()));
-    std::fs::copy(src, &tmp).map_err(|e| {
+    // ★T2h(RULINGS CW3): 시작 경로에서 FIFO · 장치 · 상한 초과 파일을 읽지 않는다 — 막히지 않게 연 핸들이 일반 파일일 때만
+    // 그 바이트를 백업한다(아니면 백업 실패 = 호출부의 격리 · 보안 자산은 종전 '무결성 우선' 예외 그대로).
+    let bytes = match read_start_live(src) {
+        StartRead::Bytes(b) => b,
+        StartRead::Missing => return Err(format!("바이트 백업 원본 없음 {}", src.display())),
+        StartRead::Unreadable(why) => return Err(format!("바이트 백업 원본 판독 불가 {}: {why}", src.display())),
+    };
+    std::fs::write(&tmp, &bytes).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("바이트 백업 복사 실패 {}: {e}", tmp.display())
     })?;
@@ -4259,7 +4389,7 @@ pub fn byte_backup_user(dir: &Path, rel: &str, src: &Path) -> Result<(), String>
 /// 미시도(decide L4 종전 거동 낙하) — 크래시·원장 손상·연쇄 릴리스 스큐가 전부 이 게이트에서
 /// "틀린 base 병합" 대신 손실 0 폴백으로 강등된다.
 fn load_verified_base(dir: &Path, rel: &str, manifest_hash: &str) -> Option<String> {
-    let pristine = std::fs::read_to_string(dir.join(PRISTINE_DIR).join(rel)).ok()?;
+    let pristine = read_start_meta(&dir.join(PRISTINE_DIR).join(rel)).text()?;
     if content_hash(&pristine) == manifest_hash {
         Some(pristine)
     } else {
@@ -4283,7 +4413,7 @@ pub fn preserve_prior_user_generation(
         return Ok(None);
     }
     if let Some(inc) = incoming {
-        if std::fs::read(&prior).ok().as_deref() == Some(inc) {
+        if read_start_meta(&prior).bytes().as_deref() == Some(inc) {
             return Ok(None);
         }
     }
@@ -4318,7 +4448,7 @@ fn preserve_prior_user_file(dir: &Path, rel: &str, incoming: Option<&[u8]>) -> R
 /// Err = 보관 불가(호출자는 덮지 않고 격리한다 — 부록 A-2 #4).
 fn park_user_copy(dir: &Path, rel: &str, bytes: &[u8]) -> Result<(), String> {
     let user_path = dir.join(format!("{rel}.user"));
-    if std::fs::read(&user_path).ok().as_deref() == Some(bytes) {
+    if read_start_meta(&user_path).bytes().as_deref() == Some(bytes) {
         return Ok(());
     }
     preserve_prior_user_file(dir, rel, Some(bytes))?;
@@ -4343,7 +4473,7 @@ fn park_user_kept(
     ts: u64,
 ) {
     let new_path = dir.join(format!("{rel}.new"));
-    if std::fs::read_to_string(&new_path).ok().as_deref() != Some(vendor) {
+    if read_start_meta(&new_path).text().as_deref() != Some(vendor) {
         if let Err(e) = write_atomic(&new_path, vendor.as_bytes()) {
             eprintln!("[init-pack] ⚠ {rel}: vendor 신버전 보관({rel}.new) 기록 실패({e}) — 사용자 파일은 그대로");
         }
@@ -4563,8 +4693,14 @@ pub fn create_update_snapshot(
             if !meta.is_file() {
                 continue;
             }
-            let data = std::fs::read(&src)
-                .map_err(|e| format!("스냅샷 원본 판독 실패 {}: {e}", src.display()))?;
+            // ★T2h(RULINGS CW3): 막히지 않는 판독 — lstat 뒤에 FIFO 로 바뀐 파일이 시작을 멈추지 못한다.
+            let data = match read_start_live(&src) {
+                StartRead::Bytes(b) => b,
+                StartRead::Missing => continue,
+                StartRead::Unreadable(why) => {
+                    return Err(format!("스냅샷 원본 판독 실패 {}: {why}", src.display()))
+                }
+            };
             std::fs::write(&dst, &data)
                 .map_err(|e| format!("스냅샷 사본 기록 실패 {}: {e}", dst.display()))?;
             bytes_total += data.len() as u64;
@@ -4678,8 +4814,12 @@ pub fn newest_update_snapshot(root: &Path, lane_key: &str) -> Option<PathBuf> {
 
 /// 스냅샷 메타 판독(스키마가 더 높으면 Err — 읽을 수 없음).
 pub fn read_update_snapshot_meta(snap: &Path) -> Result<SnapshotMeta, String> {
-    let s = std::fs::read_to_string(snap.join(UPDATE_SNAPSHOT_META))
-        .map_err(|e| format!("스냅샷 메타 판독 실패 {}: {e}", snap.display()))?;
+    let s = match read_start_meta(&snap.join(UPDATE_SNAPSHOT_META)) {
+        StartRead::Bytes(b) => String::from_utf8(b)
+            .map_err(|e| format!("스냅샷 메타 판독 실패 {}: {e}", snap.display()))?,
+        StartRead::Missing => return Err(format!("스냅샷 메타 판독 실패 {}: 없음", snap.display())),
+        StartRead::Unreadable(why) => return Err(format!("스냅샷 메타 판독 실패 {}: {why}", snap.display())),
+    };
     let m: SnapshotMeta =
         serde_json::from_str(&s).map_err(|e| format!("스냅샷 메타 파싱 실패: {e}"))?;
     if m.schema > UPDATE_SNAPSHOT_SCHEMA {
@@ -5159,7 +5299,7 @@ fn seed_dept_soul_content(dir: &Path, rel: &str, embed: &str) -> String {
     let base_soul = dir.parent().map(|p| p.join("pack").join("soul.md"));
     let inherited = base_soul
         .as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_start_live(p).text())
         .filter(|s| !s.trim().is_empty());
     // (a) 부서명 — 등재소 `dept_scope_of` 재사용(사본 드리프트 금지). 미판정도 시드는 진행한다.
     let dept = dept_name_for_seed(dir);
@@ -5338,8 +5478,8 @@ fn take_update_snapshot(
 ) -> Option<Result<SnapshotOutcome, String>> {
     let root = sources.snapshot_root.as_ref()?;
     let lane = sources.lane.as_ref()?;
-    let dv = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
-        .ok()
+    let dv = read_start_meta(&dir.join(PACK_VERSION_FILE))
+        .text()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())?;
     if dv == target_version || manifest.is_empty() {
@@ -5373,7 +5513,7 @@ fn take_update_snapshot(
         // 바이트가 그대로인 재기록(force · 디스크 = 새 바이트)은 되돌릴 것이 없다.
         let same = !is_link(r)
             && embed.get(r.as_str()).is_some_and(|c| {
-                std::fs::read(dir.join(r)).is_ok_and(|b| b == c.as_bytes())
+                read_start_live(&dir.join(r)).bytes().is_some_and(|b| b == c.as_bytes())
             });
         if !same && !rels.contains(r) {
             rels.push(r.clone());
@@ -5443,8 +5583,8 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     // 비강제 install이 비수정 파일·prune으로 신기능을 구 내용으로 후퇴시키는 사일런트 회귀를 막는다.
     // force(수동 init-pack --force)면 우회 — 의도적 재설치는 허용.
     if !force {
-        if let Some(dv) = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
-            .ok()
+        if let Some(dv) = read_start_meta(&dir.join(PACK_VERSION_FILE))
+            .text()
             .map(|s| s.trim().to_string())
         {
             if version_gt(&dv, target_version) {
@@ -5531,7 +5671,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     for (rel, content) in items.iter().copied() {
         let path = dir.join(rel);
         let exists = path.exists();
-        let disk = if exists { std::fs::read_to_string(&path).ok() } else { None };
+        let disk = if exists { read_start_live(&path).text() } else { None };
         // 판정 입력과 동일한 사실(존재하나 읽기 실패) — 소유권 술어를 다시 쓰지 않는다(SOT 분산 금지).
         let unreadable = exists && disk.is_none();
         let mhash_raw: Option<String> = manifest.get(rel).cloned();
@@ -5626,7 +5766,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             FileAction::VendorFirst { reason } => {
                 // ★M11 나(기동 필수 충돌): 사용자 수정본을 먼저 보관(이전 세대는 .user.prev-<시각>) —
                 // 보관이 안 되면 덮지 않는다(격리 · 부록 A-2 #4). 보관되면 아래 공용 경로가 vendor 본을 쓴다.
-                let user_bytes: Option<Vec<u8>> = std::fs::read(&path).ok();
+                let user_bytes: Option<Vec<u8>> = read_start_live(&path).bytes();
                 match user_bytes.as_deref().map(|b| park_user_copy(&dir, rel, b)) {
                     Some(Ok(())) => {
                         // 앞서 user-kept·new-pending 으로 보관하던 `.new` 는 이제 살아 있는 vendor 본과 같아진다 — 치운다.
@@ -5708,7 +5848,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 if new_pending {
                     // user-owned 보존 + 임베드 신버전 병치(idempotent) — '영구 동결'을 '보이는 병합 대기'로.
                     let new_path = dir.join(format!("{rel}.new"));
-                    if std::fs::read_to_string(&new_path).ok().as_deref() != Some(content) {
+                    if read_start_meta(&new_path).text().as_deref() != Some(content) {
                         let _ = write_atomic(&new_path, content.as_bytes());
                     }
                     upsert_pending(&mut pending, &mut pending_dirty, rel, "new-pending", format!("{rel}.new"));
@@ -5929,7 +6069,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 let user_src: Option<String> = fallback_user_src.or_else(|| disk.clone());
                 if let Some(d) = user_src.as_deref() {
                     let user_path = dir.join(format!("{rel}.user"));
-                    if std::fs::read_to_string(&user_path).ok().as_deref() != Some(d) {
+                    if read_start_meta(&user_path).text().as_deref() != Some(d) {
                         let backup = preserve_prior_user_file(&dir, rel, Some(d.as_bytes()))
                             .and_then(|_| {
                                 write_atomic(&user_path, d.as_bytes()).map_err(|e| e.to_string())
@@ -5968,7 +6108,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     // 이식 ① C안 요소 · backup_set side_paths 등재로 rollback 원자성 편입).
                     if let Some(b) = verified_base.as_deref() {
                         let base_path = dir.join(format!("{rel}.base"));
-                        if std::fs::read_to_string(&base_path).ok().as_deref() != Some(b) {
+                        if read_start_meta(&base_path).text().as_deref() != Some(b) {
                             let _ = write_atomic(&base_path, b.as_bytes());
                         }
                     }
@@ -6002,7 +6142,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     // best-effort 그대로이되, 이전 세대를 덮지 않는다(사 — `.user.prev-<시각>`).
                     if let Some(d) = disk.as_deref() {
                         let user_path = dir.join(format!("{rel}.user"));
-                        if std::fs::read_to_string(&user_path).ok().as_deref() != Some(d) {
+                        if read_start_meta(&user_path).text().as_deref() != Some(d) {
                             let _ = preserve_prior_user_file(&dir, rel, Some(d.as_bytes()));
                             let _ = write_atomic(&user_path, d.as_bytes());
                         }
@@ -6023,7 +6163,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         let backup = preserve_prior_user_file(
                             &dir,
                             rel,
-                            std::fs::read(&path).ok().as_deref(),
+                            read_start_live(&path).bytes().as_deref(),
                         )
                         .and_then(|_| byte_backup_user(&dir, rel, &path));
                         match backup {
@@ -6185,7 +6325,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     continue; // ★B2: user 소유·seed-once 상태는 영구 보존 — prune 대상 제외(스코프 인지)
                 }
                 let path = dir.join(&rel);
-                match std::fs::read_to_string(&path) {
+                match read_start_live(&path).text().ok_or(()) {
                     // 비수정(설치-당시 해시 == 디스크 해시) → 제거 + 매니페스트에서 삭제.
                     Ok(existing)
                         if manifest.get(&rel).map(String::as_str)
@@ -14253,6 +14393,137 @@ mod m11_tests {
         assert_eq!(rig.read(rel).as_deref(), Some(v1), "기동 필수 = vendor 먼저");
         assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some(mine), "내 사본 보관");
         assert_eq!(rig.kind(rel).as_deref(), Some("vendor-first"), "기록과 함께");
+    }
+
+    /// ★T2h(RULINGS CW3 · 검토자 B3): 시작 경로(데몬의 기동 설치 — 바인드 전)는 장부·메타 파일 하나로 멈추지 않는다 — 감사 원장 ·
+    /// 병합 대기 원장 · 설치 기록 · `.pack-version` · `.pack-state.json` · `.pristine/<rel>` · `<rel>.user` · `<rel>.new` 자리에
+    /// FIFO(쓰는 쪽 없음) · 폴더 · FIFO 를 가리키는 링크 · 상한 초과 파일(성긴 파일)을 두어도 설치는 **각자의 시한 안에** 끝난다
+    /// (시한을 넘기면 실패 — 회귀가 스위트를 멈추지 않는다). 감사 원장을 읽을 수 없으면 보수적 기본값: user 소유 파일을 자동
+    /// 갱신하지 않는다(대조: 감사 원장이 없으면 갱신한다).
+    #[test]
+    fn t2h_cw3_start_path_never_blocks_on_a_special_or_oversized_ledger() {
+        let rig = Rig::new("cw3");
+        let agents_old = "{\"agents\": 1}\n";
+        let agents_new = "{\"agents\": 2}\n";
+        let items: Vec<(String, String)> = vec![
+            ("agents.json".into(), agents_new.into()),
+            ("hooks/inject.sh".into(), "#!/bin/bash\necho V1\n".into()),
+            ("bin/drift.py".into(), "VENDOR-NEW\n".into()),
+            ("bin/kept.py".into(), "line1\nVENDOR\nline3\n".into()),
+        ];
+        let setup = |pack: &Path| {
+            let w = |rel: &str, c: &str| {
+                let p = pack.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, c).unwrap();
+            };
+            w("agents.json", agents_old);
+            w("hooks/inject.sh", "#!/bin/bash\necho USER\n");
+            w("bin/drift.py", "DRIFT\n");
+            w(".pristine/bin/drift.py", "BASE\n");
+            w("bin/kept.py", "line1\nMINE\nline3\n");
+            w("bin/kept.py.new", "line1\nVENDOR\nline3\n");
+            w(".pack-version", "1.0.0\n");
+            let m: std::collections::BTreeMap<String, String> = [
+                ("agents.json", content_hash(agents_old)),
+                ("bin/drift.py", content_hash("BASE\n")),
+                ("bin/kept.py", content_hash("line1\nline2\nline3\n")),
+            ]
+            .into_iter()
+            .map(|(r, h)| (r.to_string(), h))
+            .collect();
+            std::fs::write(pack.join(INSTALL_MANIFEST), serde_json::to_string(&m).unwrap()).unwrap();
+        };
+        let run = |case: &str, pack: PathBuf| -> bool {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let it = items.clone();
+            std::thread::spawn(move || {
+                let src = UpdateSources::none().with_boot_critical(bc_only(&["hooks/inject.sh"]));
+                let r = install_into_with(
+                    pack,
+                    it.iter().map(|(a, b)| (a.as_str(), b.as_str())),
+                    false,
+                    "9.9.9",
+                    false,
+                    false,
+                    PackScope::Base,
+                    None,
+                    None,
+                    &src,
+                );
+                let _ = tx.send(r.is_ok());
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("{case}: the install did not finish within its deadline (blocked on a start-path read)"))
+        };
+        // 대조: 감사 원장이 없으면 user 소유 비수정 파일은 갱신된다.
+        let ctl = rig.base.join("control");
+        setup(&ctl);
+        assert!(run("control", ctl.clone()), "control install");
+        assert_eq!(std::fs::read_to_string(ctl.join("agents.json")).unwrap(), agents_new, "control: 갱신");
+        let targets = [
+            MERGE_AUDIT_FILE,
+            MERGE_PENDING_FILE,
+            INSTALL_MANIFEST,
+            PACK_VERSION_FILE,
+            PACK_STATE_FILE,
+            ".pristine/bin/drift.py",
+            "hooks/inject.sh.user",
+            "bin/kept.py.new",
+        ];
+        let mut forms: Vec<&str> = vec!["dir", "oversized"];
+        #[cfg(unix)]
+        forms.extend(["fifo", "link-to-fifo"]);
+        let mut cases = 0usize;
+        for (ti, target) in targets.iter().enumerate() {
+            for form in &forms {
+                let case = format!("{target} as {form}");
+                let pack = rig.base.join(format!("c{ti}-{form}"));
+                setup(&pack);
+                let p = pack.join(target);
+                let _ = std::fs::remove_file(&p);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                match *form {
+                    "dir" => std::fs::create_dir_all(&p).unwrap(),
+                    "oversized" => std::fs::File::create(&p).unwrap().set_len(START_META_CAP + 1).unwrap(),
+                    #[cfg(unix)]
+                    "fifo" | "link-to-fifo" => {
+                        use std::os::unix::ffi::OsStrExt;
+                        let fifo = if *form == "fifo" { p.clone() } else { pack.join("elsewhere.fifo") };
+                        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+                        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "{case}: mkfifo");
+                        if *form == "link-to-fifo" {
+                            std::os::unix::fs::symlink(&fifo, &p).unwrap();
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                let _finished_ok = run(&case, pack.clone());
+                if *target == MERGE_AUDIT_FILE {
+                    assert_eq!(
+                        std::fs::read_to_string(pack.join("agents.json")).unwrap(),
+                        agents_old,
+                        "{case}: 감사 원장을 읽을 수 없으면 user 소유 파일을 자동 갱신하지 않는다"
+                    );
+                }
+                cases += 1;
+                let _ = std::fs::remove_dir_all(&pack);
+            }
+        }
+        assert_eq!(cases, targets.len() * forms.len());
+        // 판독기 자체: 일반 파일만 · 링크 비추종(메타) · 링크 추종(살아 있는 파일) · 부재.
+        let dir = rig.base.join("reader");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f"), "x").unwrap();
+        assert_eq!(read_start_meta(&dir.join("f")), StartRead::Bytes(b"x".to_vec()));
+        assert_eq!(read_start_meta(&dir.join("absent")), StartRead::Missing);
+        assert!(matches!(read_start_meta(&dir), StartRead::Unreadable(_)), "폴더");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("f"), dir.join("l")).unwrap();
+            assert!(matches!(read_start_meta(&dir.join("l")), StartRead::Unreadable(_)), "메타: 링크 비추종");
+            assert_eq!(read_start_live(&dir.join("l")), StartRead::Bytes(b"x".to_vec()), "살아 있는 파일: 일반 파일 링크 추종");
+        }
     }
 
     /// 부록 A-2 #4(백업이 없으면 덮지 않는다): 기동 필수 파일의 사용자본을 보관할 수 없으면 vendor 본을 쓰지 않고 격리.
