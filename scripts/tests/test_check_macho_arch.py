@@ -227,14 +227,16 @@ class Gate(unittest.TestCase):
         rc, out = self.one(thin(X86_64, subtype=X86_64H))
         self.assertEqual(rc, 1, out)
         self.assertIn("FAIL f: x86_64h (no slice", out)
-        rc, out = self.one(fat([(X86_64, thin(X86_64), X86_64H), (X86_64, thin(X86_64))]), name="g")
+        # (the x86_64h slice's own header says x86_64h too — RULINGS DB4 compares the table with it)
+        rc, out = self.one(fat([(X86_64, thin(X86_64, subtype=X86_64H), X86_64H), (X86_64, thin(X86_64))]), name="g")
         self.assertEqual(rc, 0, out)
 
     def test_arm64e_only_does_not_satisfy_arm64_but_beside_arm64_it_does(self):
         rc, out = self.one(thin(ARM64, subtype=ARM64E), "aarch64-apple-darwin")
         self.assertEqual(rc, 1, out)
         self.assertIn("FAIL f: arm64e (no slice", out)
-        rc, out = self.one(fat([(ARM64, thin(ARM64), 0x80000002), (ARM64, thin(ARM64))]), "aarch64-apple-darwin", "g")
+        rc, out = self.one(fat([(ARM64, thin(ARM64, subtype=0x80000002), 0x80000002), (ARM64, thin(ARM64))]),
+                           "aarch64-apple-darwin", "g")
         self.assertEqual(rc, 0, out)
 
     def test_capability_bits_of_the_subtype_are_masked(self):

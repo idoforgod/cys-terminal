@@ -120,18 +120,18 @@ def _thin(read, off, end, where):
     file, or of the fat slice — RULINGS DB4; None = unknown); WHERE names that span in messages. Raises
     Unjudgeable when cut short, or when the header, the load commands or one load command run past END /
     sizeofcmds."""
+    magic_b = _exact(read, off, 4, "Mach-O magic")           # the file itself ends: "cut short"
     if end is not None and off + 4 > end:
         raise Unjudgeable("Mach-O magic runs past the end of %s" % where)
-    magic_b = _exact(read, off, 4, "Mach-O magic")
     le = struct.unpack("<I", magic_b)[0]
     endian = "<" if le in (MH_MAGIC, MH_MAGIC_64) else ">"
     magic = struct.unpack(endian + "I", magic_b)[0]
     if magic not in (MH_MAGIC, MH_MAGIC_64):
         raise Unjudgeable("slice at offset %d does not start with a Mach-O magic" % off)
     hsize = 32 if magic == MH_MAGIC_64 else 28
-    if end is not None and off + hsize > end:
-        raise Unjudgeable("Mach-O header runs past the end of %s" % where)
     hdr = _exact(read, off, hsize, "Mach-O header")
+    if end is not None and off + hsize > end:                # the file goes on, the slice does not
+        raise Unjudgeable("Mach-O header runs past the end of %s" % where)
     cputype, subtype = struct.unpack(endian + "II", hdr[4:12])
     ncmds, sizeofcmds = struct.unpack(endian + "II", hdr[16:24])
     if end is not None and off + hsize + sizeofcmds > end:
