@@ -13413,6 +13413,618 @@ mod tests {
         );
     }
 
+    // ── M15-다 / M15-다-2 reproduction (0.15.0 「스스로 해결」 T9 stage 1 · ticket T9r) ─────────────────────
+    // Design §2-11 다 / 다-2, §4-15 다, §6-15 다; appendix A-1 #3, A-2 #13, #14. Plan: impl/plans/T9.md.
+    // A REPRODUCTION, NOT A FIX: every test below asserts the CORRECT end state, so on the tip it FAILS by
+    // design and is #[ignore]d with the reason; the fix (T9 stage 2) un-ignores them (or rewrites them to
+    // the fix's contract — never weaker; TESTPLAN_RULINGS OQ-H-11: the fix adds no boot lock).
+    // Synthetic lanes under a temporary root: `<root>/pack` (base) and `<root>/pack-dept-d1` (department) —
+    // the same `<root>/pack` layout as `txn_prestate`, so both lanes' journal is `<root>/.pack-journal`
+    // exactly as both live lanes' journal is `~/.cys/.pack-journal`. A daemon's boot recovery is the exact
+    // library call cysd makes before it listens (`src/bin/cysd/main.rs`
+    // `spawn_blocking(cys::pack::recover_pack_journal)`, no lock) with `CYS_PACK_DIR` naming that lane.
+    // Interleavings are controlled, never timed: (a) the real `apply_pack_transactional`'s `post_commit`
+    // seam (between ④ `.pack-version` and ⑥ journal deletion), or (b) step-wise: the on-disk state a crash
+    // in step ② leaves, built from the REAL journal (captured from a twin run of the real transaction) and
+    // the installer's own per-file calls.
+
+    type M15daState = std::collections::BTreeMap<String, (String, u32)>;
+
+    /// Every file under `root` → (text, mode). Mode is 0 off Unix.
+    fn m15da_state(root: &Path) -> M15daState {
+        fn walk(base: &Path, dir: &Path, out: &mut M15daState) {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(base, &p, out);
+                    } else if let Ok(bytes) = std::fs::read(&p) {
+                        let rel = p.strip_prefix(base).unwrap().to_string_lossy().into_owned();
+                        let mode = current_mode(&p).unwrap_or(0);
+                        out.insert(rel, (String::from_utf8_lossy(&bytes).into_owned(), mode));
+                    }
+                }
+            }
+        }
+        let mut out = M15daState::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    fn m15da_short(s: &str) -> String {
+        let one = s.replace('\n', "⏎");
+        if one.chars().count() > 72 {
+            format!("{}…", one.chars().take(72).collect::<String>())
+        } else {
+            one
+        }
+    }
+
+    /// One line per file that differs between two states of the same lane.
+    fn m15da_diff(before: &M15daState, after: &M15daState) -> Vec<String> {
+        let mut out = Vec::new();
+        for (rel, (c0, m0)) in before {
+            match after.get(rel) {
+                None => out.push(format!(
+                    "DELETED {rel} (was {:?} {m0:04o})",
+                    m15da_short(c0)
+                )),
+                Some((c1, m1)) if c1 != c0 => out.push(format!(
+                    "CHANGED {rel}: {:?} {m0:04o} -> {:?} {m1:04o}",
+                    m15da_short(c0),
+                    m15da_short(c1)
+                )),
+                Some((_, m1)) if m1 != m0 => {
+                    out.push(format!("MODE    {rel}: {m0:04o} -> {m1:04o}"))
+                }
+                _ => {}
+            }
+        }
+        for (rel, (c1, m1)) in after {
+            if !before.contains_key(rel) {
+                out.push(format!("ADDED   {rel}: {:?} {m1:04o}", m15da_short(c1)));
+            }
+        }
+        out
+    }
+
+    fn m15da_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("cys-m15da-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// A synthetic lane `<root>/<name>` as an install leaves it: `.pack-version`, the files (`#!` files
+    /// 0755 on Unix), `.install-manifest.json` = their hashes, optional `.pack-state.json`, plus `extra`
+    /// files that are NOT in the manifest (sidecars such as `<rel>.user`, `.merge-pending.json`).
+    fn m15da_lane(
+        root: &Path,
+        name: &str,
+        version: &str,
+        files: &[(&str, &str)],
+        extra: &[(&str, &str)],
+        state: Option<PackState>,
+    ) -> PathBuf {
+        let pd = root.join(name);
+        std::fs::create_dir_all(&pd).unwrap();
+        std::fs::write(pd.join(PACK_VERSION_FILE), version).unwrap();
+        let mut manifest = serde_json::Map::new();
+        for (rel, content) in files.iter().chain(extra.iter()) {
+            let p = pd.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+            #[cfg(unix)]
+            m15_set_mode(
+                &p,
+                if content.starts_with("#!") {
+                    0o755
+                } else {
+                    0o644
+                },
+            );
+        }
+        for (rel, content) in files {
+            manifest.insert((*rel).to_string(), serde_json::json!(content_hash(content)));
+        }
+        std::fs::write(
+            pd.join(INSTALL_MANIFEST),
+            serde_json::Value::Object(manifest).to_string(),
+        )
+        .unwrap();
+        if let Some(st) = state {
+            write_pack_state(&pd, &st).unwrap();
+        }
+        pd
+    }
+
+    /// The base lane at 0.15.0. Vendor files (`bin/`, README) plus the lane's own user-owned and
+    /// seed-once files (directive, soul, memory, schedule — `ownership()`), with the base's content.
+    const M15DA_BASE: &[(&str, &str)] = &[
+        ("bin/selfheal.sh", "#!/bin/sh\necho selfheal-v1\n"),
+        ("README.md", "README v1\n"),
+        (
+            "directives/MASTER_DIRECTIVE.md",
+            "BASE lane: CEO directive\n",
+        ),
+        ("soul.md", "BASE lane: soul (the owner's constitution)\n"),
+        ("memory/MEMORY.md", "BASE lane: memory\n"),
+        ("schedule.json", "{\"jobs\":[\"base-only-job\"]}\n"),
+    ];
+    /// The department lane d1 at the same vendor content, with ITS OWN user-owned / seed-once files.
+    const M15DA_DEPT: &[(&str, &str)] = &[
+        ("bin/selfheal.sh", "#!/bin/sh\necho selfheal-v1\n"),
+        ("README.md", "README v1\n"),
+        (
+            "directives/MASTER_DIRECTIVE.md",
+            "DEPT d1: department master directive\n",
+        ),
+        (
+            "soul.md",
+            "DEPT d1: soul (seeded from the base, then edited in the department)\n",
+        ),
+        ("memory/MEMORY.md", "DEPT d1: memory\n"),
+        ("schedule.json", "{\"jobs\":[\"dept-d1-job\"]}\n"),
+    ];
+    /// Sidecars the booting lane holds that the updating lane does not: the user's kept copy and the
+    /// merge ledger entry that points at it.
+    const M15DA_SIDECARS: &[(&str, &str)] = &[
+        ("README.md.user", "the user's own README, kept beside the vendor copy\n"),
+        (
+            MERGE_PENDING_FILE,
+            "{\"README.md\":{\"kind\":\"user-kept\",\"side\":\"README.md.user\",\"version\":\"0.15.0\",\"ts\":1}}\n",
+        ),
+    ];
+
+    /// The update's items for a lane: two vendor files change, one new script appears; the lane's own
+    /// user-owned / seed-once files are in the bundle with unchanged bytes (the installer leaves them).
+    /// Order = the installer's loop order (`install_into_with` iterates `items` as given).
+    fn m15da_v2_items(lane: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
+        let mut items: Vec<(&'static str, &'static str)> = vec![
+            ("bin/selfheal.sh", "#!/bin/sh\necho selfheal-v2\n"),
+            ("README.md", "README v2\n"),
+            ("bin/new-in-v2.sh", "#!/bin/sh\necho new-in-v2\n"),
+        ];
+        for (rel, c) in lane {
+            if !items.iter().any(|(r, _)| r == rel) {
+                items.push((*rel, *c));
+            }
+        }
+        items
+    }
+
+    struct M15daCross {
+        root: PathBuf,
+        journal_of_updater: PathBuf,
+        journal_of_booter: PathBuf,
+        apply: Result<(usize, usize, bool), String>,
+        /// (journal index present when the booter started, its recovery result, journal still there after)
+        boot: Option<(bool, Result<bool, String>, bool)>,
+        booter_before: M15daState,
+        booter_after: M15daState,
+        updater_after: M15daState,
+        booter_current_after: bool,
+    }
+
+    /// Lane `updater` runs the real pack-update transaction 0.15.0 → 0.15.1; inside its `post_commit`
+    /// seam (after ④, before ⑥) the daemon of lane `booter` starts and runs its boot recovery.
+    fn m15da_cross_lane_during_apply(
+        tag: &str,
+        updater: (&str, &'static [(&'static str, &'static str)]),
+        booter: (&str, &'static [(&'static str, &'static str)]),
+    ) -> M15daCross {
+        let root = m15da_root(tag);
+        let up = m15da_lane(&root, updater.0, "0.15.0", updater.1, &[], None);
+        let bt = m15da_lane(&root, booter.0, "0.15.0", booter.1, M15DA_SIDECARS, None);
+        let _env = set_pack_env(&up, root.join("cfg"));
+        let journal_of_updater = pack_journal_dir();
+        let journal_of_booter = {
+            let _e = EnvGuard::set(ENV_PACK_DIR, &bt);
+            pack_journal_dir()
+        };
+        let booter_before = m15da_state(&bt);
+        let items = m15da_v2_items(updater.1);
+        let boot = std::cell::RefCell::new(None);
+        let apply =
+            apply_pack_transactional(&items, "0.15.1", &test_free_state("0.15.1"), None, || {
+                // The other lane's daemon starts now: cysd main.rs `recover_pack_journal`, no lock.
+                let _e = EnvGuard::set(ENV_PACK_DIR, &bt);
+                let present = pack_journal_dir().join("index.json").is_file();
+                let rec = recover_pack_journal();
+                let left = pack_journal_dir().join("index.json").is_file();
+                *boot.borrow_mut() = Some((present, rec, left));
+                Ok(())
+            });
+        M15daCross {
+            booter_after: m15da_state(&bt),
+            updater_after: m15da_state(&up),
+            booter_current_after: pack_current_in(&bt, "0.15.0"),
+            root,
+            journal_of_updater,
+            journal_of_booter,
+            apply,
+            boot: boot.into_inner(),
+            booter_before,
+        }
+    }
+
+    fn m15da_assert_cross(r: M15daCross, booter_name: &str) {
+        let _ = std::fs::remove_dir_all(&r.root);
+        // Preconditions (pass on the tip): the updater's own transaction completed, the booter's
+        // recovery actually ran inside the seam.
+        let (present, rec, left) = r
+            .boot
+            .expect("precondition: the post_commit seam did not run");
+        r.apply
+            .as_ref()
+            .expect("precondition: the updating lane's transaction must succeed");
+        assert_eq!(
+            r.updater_after.get(".pack-version").map(|v| v.0.as_str()),
+            Some("0.15.1"),
+            "precondition: the updating lane must end at 0.15.1"
+        );
+        let diff = m15da_diff(&r.booter_before, &r.booter_after);
+        let evidence = format!(
+            "journal path, updating lane = {}\njournal path, booting lane  = {}\n\
+             updating lane's journal index present when the {booter_name} daemon booted: {present}\n\
+             {booter_name} boot recovery returned: {rec:?}\n\
+             updating lane's journal index still present after that boot recovery: {left}\n\
+             {booter_name} .pack-version after: {:?} · pack_current_in({booter_name}, \"0.15.0\") after = {} \
+             (true = the next boot does NOT reinstall: the state stays)\n\
+             {booter_name} pack, {} file(s) changed by ANOTHER lane's journal:\n  {}",
+            r.journal_of_updater.display(),
+            r.journal_of_booter.display(),
+            r.booter_after.get(".pack-version").map(|v| v.0.as_str()),
+            r.booter_current_after,
+            diff.len(),
+            diff.join("\n  ")
+        );
+        assert!(
+            left,
+            "M15-다: the {booter_name} daemon's boot recovery removed the updating lane's in-flight journal\n{evidence}"
+        );
+        assert!(
+            diff.is_empty(),
+            "M15-다: the {booter_name} daemon's boot recovery wrote another lane's pre-state into its own pack\n{evidence}"
+        );
+    }
+
+    /// M15-다, base → department: the base lane's pack-update is in flight (journal written, commit marker
+    /// written, journal not yet deleted) when a department daemon starts. Correct: the department pack
+    /// is untouched and the base's journal is not taken.
+    #[test]
+    #[ignore = "M15-다 reproduction (T9 stage 1 · design §2-11 다): FAILS on the tip by design — a department daemon's boot recovery rolls the base lane's in-flight pack-update journal into the department pack and deletes it; un-ignore with the fix (T9 stage 2)"]
+    fn m15_da_dept_boot_recovery_during_base_update_writes_base_bytes_into_dept_pack() {
+        // A failing (ignored-by-design) test must not poison the lock for the next one.
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let r = m15da_cross_lane_during_apply(
+            "fwd",
+            ("pack", M15DA_BASE),
+            ("pack-dept-d1", M15DA_DEPT),
+        );
+        m15da_assert_cross(r, "department");
+    }
+
+    /// M15-다, the reverse: a `cys pack-update` run in a department seat (env `CYS_PACK_DIR` = the
+    /// department pack; nothing refuses it) is in flight when the BASE daemon starts.
+    #[test]
+    #[ignore = "M15-다 reproduction (T9 stage 1 · design §2-11 다, reverse): FAILS on the tip by design — the base daemon's boot recovery rolls a department lane's in-flight pack-update journal into the base pack and deletes it; un-ignore with the fix (T9 stage 2)"]
+    fn m15_da_base_boot_recovery_during_dept_update_writes_dept_bytes_into_base_pack() {
+        // A failing (ignored-by-design) test must not poison the lock for the next one.
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let r = m15da_cross_lane_during_apply(
+            "rev",
+            ("pack-dept-d1", M15DA_DEPT),
+            ("pack", M15DA_BASE),
+        );
+        m15da_assert_cross(r, "base");
+    }
+
+    /// Builds lane `<root>/<name>` and leaves it in the on-disk state a crash of its pack-update leaves
+    /// when the process dies in step ② right after the installer rewrote the first `k` changed items:
+    /// 1. the lane is built and the REAL `apply_pack_transactional` runs on it; inside its `post_commit`
+    ///    seam (after ④, before ⑥) the lane's REAL journal is copied out;
+    /// 2. the lane is rebuilt from scratch with the same deterministic builder (= the exact pre-state the
+    ///    journal recorded) and the captured journal is put back at the lane's `pack_journal_dir()`;
+    /// 3. the first `k` changed items are written with the installer's own calls (`write_atomic` then
+    ///    `ensure_pristine` — `install_into_with`), which leave the default file mode (exec bits are set
+    ///    only after the loop); the install manifest (written after the loop), `.pack-state.json` (③) and
+    ///    `.pack-version` (④) stay as they were.
+    /// Returns (lane path, the end state of the complete real apply of step 1). Preconditions checked:
+    /// the real apply wrote exactly these bytes and their `.pristine/` mirror (the plain write path).
+    fn m15da_crash_in_step_2(
+        root: &Path,
+        name: &str,
+        lane: (&str, &[(&str, &str)], &[(&str, &str)], Option<PackState>),
+        items: &[(&str, &str)],
+        target: &str,
+        new_state: &PackState,
+        k: usize,
+    ) -> (PathBuf, M15daState) {
+        let (version, files, extra, state) = lane;
+        let pd = m15da_lane(root, name, version, files, extra, state.clone());
+        let _e = EnvGuard::set(ENV_PACK_DIR, &pd);
+        let journal = pack_journal_dir();
+        let captured = root.join("captured-journal");
+        let _ = std::fs::remove_dir_all(&captured);
+        apply_pack_transactional(items, target, new_state, None, || {
+            copy_dir_all(&journal, &captured).map_err(|e| e.to_string())
+        })
+        .expect("precondition: the real transaction must succeed");
+        let complete = m15da_state(&pd);
+        assert!(
+            captured.join("index.json").is_file(),
+            "precondition: the real journal was not captured"
+        );
+        std::fs::remove_dir_all(&pd).unwrap();
+        assert_eq!(m15da_lane(root, name, version, files, extra, state), pd);
+        let before = m15da_state(&pd);
+        copy_dir_all(&captured, &journal).unwrap();
+        let _ = std::fs::remove_dir_all(&captured);
+        let changed: Vec<(&str, &str)> = items
+            .iter()
+            .copied()
+            .filter(|(rel, c)| before.get(*rel).map(|v| v.0.as_str()) != Some(*c))
+            .take(k)
+            .collect();
+        assert_eq!(
+            changed.len(),
+            k,
+            "precondition: fewer than {k} changed items"
+        );
+        for (rel, content) in &changed {
+            let mirror = format!("{PRISTINE_DIR}/{rel}");
+            assert!(
+                complete.get(*rel).map(|v| v.0.as_str()) == Some(*content)
+                    && complete.get(mirror.as_str()).map(|v| v.0.as_str()) == Some(*content),
+                "precondition: the real apply did not write {rel} (+ {mirror}) as the crash model does"
+            );
+            let path = pd.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_atomic(&path, content.as_bytes()).unwrap();
+            ensure_pristine(&pd, rel, content);
+        }
+        (pd, complete)
+    }
+
+    /// M15-다, crash variant: the base's pack-update 0.15.0 → 0.15.1 dies in step ② (power loss, the
+    /// app killed with its sidecar). The orphan journal stays until a daemon boots. A department daemon
+    /// (at 0.15.0) boots FIRST, then the base daemon. Correct: the department pack is untouched and the
+    /// base pack is rolled back to its exact pre-state.
+    /// Control arm (must pass on the tip): the same crash state with ONLY the base daemon booting is
+    /// rolled back exactly — so any difference in the main arm is caused by the department's boot.
+    #[test]
+    #[ignore = "M15-다 reproduction (T9 stage 1 · design §2-11 다, crash variant): FAILS on the tip by design — a department daemon booting first consumes the base's orphan journal (rollback into the department pack + delete) and the base stays half-applied; un-ignore with the fix (T9 stage 2)"]
+    fn m15_da_dept_boot_recovery_takes_base_crash_journal_and_base_stays_half_applied() {
+        // A failing (ignored-by-design) test must not poison the lock for the next one.
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let items = m15da_v2_items(M15DA_BASE);
+        let st = test_free_state("0.15.1");
+
+        // Control arm: base only.
+        let croot = m15da_root("crash-ctl");
+        let _cenv = set_pack_env(croot.join("pack"), croot.join("cfg"));
+        let lane = ("0.15.0", M15DA_BASE, &[][..], None);
+        let (cbase, _) =
+            m15da_crash_in_step_2(&croot, "pack", lane.clone(), &items, "0.15.1", &st, 1);
+        let ccrash = m15da_state(&cbase);
+        let cpre = {
+            let pre_root = croot.join("pre");
+            m15da_state(&m15da_lane(
+                &pre_root,
+                "pack",
+                "0.15.0",
+                M15DA_BASE,
+                &[],
+                None,
+            ))
+        };
+        let crec = recover_pack_journal();
+        let cdiff = m15da_diff(&cpre, &m15da_state(&cbase));
+        drop(_cenv);
+        let _ = std::fs::remove_dir_all(&croot);
+        assert!(
+            !m15da_diff(&cpre, &ccrash).is_empty(),
+            "precondition: the crash model changed nothing"
+        );
+        assert!(
+            cdiff.is_empty() && crec == Ok(true),
+            "precondition (control arm): the base's own recovery must restore its pre-state on the tip; \
+             recover={crec:?} diff={cdiff:?}"
+        );
+
+        // Main arm: the department daemon boots first.
+        let root = m15da_root("crash-dept-first");
+        let dept = m15da_lane(
+            &root,
+            "pack-dept-d1",
+            "0.15.0",
+            M15DA_DEPT,
+            M15DA_SIDECARS,
+            None,
+        );
+        let _env = set_pack_env(root.join("pack"), root.join("cfg"));
+        let base_pre = m15da_state(&m15da_lane(
+            &root.join("pre"),
+            "pack",
+            "0.15.0",
+            M15DA_BASE,
+            &[],
+            None,
+        ));
+        let dept_pre = m15da_state(&dept);
+        let (base, _) = m15da_crash_in_step_2(&root, "pack", lane, &items, "0.15.1", &st, 1);
+        let base_crash = m15da_state(&base);
+        let dept_rec = {
+            let _e = EnvGuard::set(ENV_PACK_DIR, &dept);
+            recover_pack_journal()
+        };
+        let journal_after_dept = pack_journal_dir().join("index.json").is_file();
+        let base_rec = recover_pack_journal();
+        let base_end = m15da_state(&base);
+        let dept_end = m15da_state(&dept);
+        let base_current = pack_current_in(&base, "0.15.0");
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let dept_diff = m15da_diff(&dept_pre, &dept_end);
+        let base_diff = m15da_diff(&base_pre, &base_end);
+        let evidence = format!(
+            "base after the crash (vs pre-state):\n  {}\n\
+             department boot recovery returned {dept_rec:?}; journal still there after it: {journal_after_dept}\n\
+             base boot recovery returned {base_rec:?}\n\
+             department pack, {} file(s) changed by the base's journal:\n  {}\n\
+             base pack vs its pre-state after both boots, {} difference(s):\n  {}\n\
+             pack_current_in(base, \"0.15.0\") = {base_current} (true = no reinstall at the next boot)",
+            m15da_diff(&base_pre, &base_crash).join("\n  "),
+            dept_diff.len(),
+            dept_diff.join("\n  "),
+            base_diff.len(),
+            base_diff.join("\n  ")
+        );
+        assert!(
+            dept_diff.is_empty() && base_diff.is_empty(),
+            "M15-다 (crash variant): wrong end state\n{evidence}"
+        );
+    }
+
+    /// M15-다, the department is already at the base's TARGET version (e.g. its daemon was restarted
+    /// on the newer binary and installed that version) — its boot recovery judges the base's orphan
+    /// journal "committed" by ITS OWN `.pack-version` and deletes it without rolling anything back.
+    /// Correct: the base pack is rolled back to its pre-state at the base's boot.
+    #[test]
+    #[ignore = "M15-다 reproduction (T9 stage 1 · design §2-11 다, delete variant): FAILS on the tip by design — a department at the base's target version deletes the base's orphan journal as 'committed' and the base stays half-applied; un-ignore with the fix (T9 stage 2)"]
+    fn m15_da_dept_at_target_version_deletes_base_crash_journal() {
+        // A failing (ignored-by-design) test must not poison the lock for the next one.
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let items = m15da_v2_items(M15DA_BASE);
+        let st = test_free_state("0.15.1");
+        let root = m15da_root("crash-dept-at-target");
+        let dept = m15da_lane(
+            &root,
+            "pack-dept-d1",
+            "0.15.1",
+            M15DA_DEPT,
+            M15DA_SIDECARS,
+            None,
+        );
+        let _env = set_pack_env(root.join("pack"), root.join("cfg"));
+        let base_pre = m15da_state(&m15da_lane(
+            &root.join("pre"),
+            "pack",
+            "0.15.0",
+            M15DA_BASE,
+            &[],
+            None,
+        ));
+        let dept_pre = m15da_state(&dept);
+        let lane = ("0.15.0", M15DA_BASE, &[][..], None);
+        let (base, _) = m15da_crash_in_step_2(&root, "pack", lane, &items, "0.15.1", &st, 1);
+        let dept_rec = {
+            let _e = EnvGuard::set(ENV_PACK_DIR, &dept);
+            recover_pack_journal()
+        };
+        let journal_after_dept = pack_journal_dir().join("index.json").is_file();
+        let base_rec = recover_pack_journal();
+        let base_end = m15da_state(&base);
+        let dept_end = m15da_state(&dept);
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let dept_diff = m15da_diff(&dept_pre, &dept_end);
+        let base_diff = m15da_diff(&base_pre, &base_end);
+        let evidence = format!(
+            "department (.pack-version 0.15.1 = the base's target) boot recovery returned {dept_rec:?}; \
+             journal still there after it: {journal_after_dept}\n\
+             base boot recovery returned {base_rec:?}\n\
+             department pack, {} file(s) changed:\n  {}\n\
+             base pack vs its pre-state after both boots, {} difference(s):\n  {}",
+            dept_diff.len(),
+            dept_diff.join("\n  "),
+            base_diff.len(),
+            base_diff.join("\n  ")
+        );
+        assert!(
+            dept_diff.is_empty() && base_diff.is_empty(),
+            "M15-다 (delete variant): wrong end state\n{evidence}"
+        );
+    }
+
+    /// M15-다-2: a pro-revision update inside the SAME base version — (0.15.0, pro 1) → (0.15.0, pro 2),
+    /// allowed by the version gate (`cys.rs` test `version_gates_pro_revision_tuple_transitions`) —
+    /// dies in step ②. `.pack-version` is "0.15.0" before and after, and `apply_pack_transactional` is
+    /// called with target "0.15.0". Single lane, no department involved. Correct: the next boot's
+    /// recovery rolls the uncommitted apply back to the exact pre-state.
+    /// Also MEASURED (printed, not asserted): whether the next run of the same update heals the result.
+    #[test]
+    #[ignore = "M15-다-2 reproduction (T9 stage 1 · design §2-11 다-2): FAILS on the tip by design — recovery judges an uncommitted same-base pro-revision apply 'committed' by the unchanged .pack-version, deletes its journal and leaves a half-applied pack; un-ignore with the fix (T9 stage 2)"]
+    fn m15_da2_same_base_revision_crash_in_step_2_is_not_rolled_back() {
+        // A failing (ignored-by-design) test must not poison the lock for the next one.
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pro = |rev: u32| PackState {
+            channel: "pro".to_string(),
+            base_version: "0.15.0".to_string(),
+            pro_revision: rev,
+        };
+        let items = m15da_v2_items(M15DA_BASE);
+        let root = m15da_root("da2");
+        let _env = set_pack_env(root.join("pack"), root.join("cfg"));
+        let pre = m15da_state(&m15da_lane(
+            &root.join("pre"),
+            "pack",
+            "0.15.0",
+            M15DA_BASE,
+            &[],
+            Some(pro(1)),
+        ));
+        let lane = ("0.15.0", M15DA_BASE, &[][..], Some(pro(1)));
+        let (base, clean) =
+            m15da_crash_in_step_2(&root, "pack", lane, &items, "0.15.0", &pro(2), 1);
+        let crash = m15da_state(&base);
+        let target_in_journal = std::fs::read_to_string(pack_journal_dir().join("index.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<JournalIndex>(&s).ok())
+            .map(|i| i.target_version);
+        let rec = recover_pack_journal();
+        let journal_after = pack_journal_dir().join("index.json").is_file();
+        let after_boot = m15da_state(&base);
+        let state_after_boot = match read_pack_state(&base) {
+            PackStateRead::Valid(s) => {
+                format!("{}/{}/pro {}", s.channel, s.base_version, s.pro_revision)
+            }
+            other => format!("{other:?}"),
+        };
+        // Measurement: the user runs the same update again (the gate allows it: disk tuple is still
+        // (0.15.0, 1) < (0.15.0, 2)). Compared with the twin's clean, complete apply.
+        let rerun = apply_pack_transactional(&items, "0.15.0", &pro(2), None, || Ok(()));
+        let after_rerun = m15da_state(&base);
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let boot_diff = m15da_diff(&pre, &after_boot);
+        let rerun_vs_clean = m15da_diff(&clean, &after_rerun);
+        let evidence = format!(
+            "journal target_version = {target_in_journal:?}; .pack-version before = {:?}\n\
+             after the crash (vs pre-state):\n  {}\n\
+             boot recovery returned {rec:?}; journal still there after it: {journal_after}\n\
+             .pack-state.json after the boot: {state_after_boot}\n\
+             pack vs its pre-state after the boot recovery, {} difference(s):\n  {}\n\
+             MEASURED follow-up — the same update run again returned {:?}; its end state vs a clean \
+             complete apply, {} difference(s):\n  {}",
+            pre.get(".pack-version").map(|v| v.0.as_str()),
+            m15da_diff(&pre, &crash).join("\n  "),
+            boot_diff.len(),
+            boot_diff.join("\n  "),
+            rerun.as_ref().map(|(w, k, ok)| (w, k, ok)),
+            rerun_vs_clean.len(),
+            rerun_vs_clean.join("\n  ")
+        );
+        assert!(
+            boot_diff.is_empty(),
+            "M15-다-2: the boot recovery did not roll the uncommitted apply back\n{evidence}"
+        );
+    }
+
     /// ★핵심(R2CODE2 HIGH #1): pack-update 트랜잭션에서 .install-manifest.json write_atomic 실패
     /// (경로를 디렉터리로 만들어 rename 실패 유발)는 fail-closed로 Err가 되어 apply_pack_transactional이
     /// rollback을 타야 한다. 트리 pre-state 복원(README.md=OLD·new.txt 제거)·.pack-version 불변(미커밋)을
