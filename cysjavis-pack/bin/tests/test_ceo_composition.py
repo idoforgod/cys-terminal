@@ -944,6 +944,26 @@ class KeptFolder(Rig):
         self.assertFalse(os.path.exists(os.path.join(self.home, ".cys", "state", "preflight-c03-kept-warned")),
                          "'알렸다' 표지 폴더가 생겼다")
 
+    def test_a_header_only_change_is_not_reported_as_in_the_live_directive(self):
+        """★FY5(codex R5) — 머리말만 바뀐 조립 사본: 본문은 살아 있는 지침에 있지만 머리말은 이 사본에만 있다. 종전에는 본문만 비교해
+        '살아 있는 지침에도 있다'고 말했다. 이제 머리말과 본문을 따로 재고, 머리말이 다르면 그대로 말하며 WARN 이다. 머리말까지
+        같으면(내용 전체가 살아 있다) PASS."""
+        self.seed(md=HEADER + SEP + USER)
+        kd = os.path.join(self.dirs, ".ceo-kept")
+        os.makedirs(kd)
+        k = os.path.join(kd, "20260101T000000Z-1-1.before-compose")
+        _write(k, "# 사용자가 고친 머리말 줄\n" + HEADER + SEP + USER)          # 보관 뒤 머리말만 바뀌었다
+        _write(k + ".kept", json.dumps({"schema": 2, "kind": "regular", "sha256": sha(HEADER + SEP + USER)}))
+        row = self.c03()["C03.ceo-kept"]
+        self.assertEqual(row["status"], pf.WARN, "머리말만 바뀐 사본을 '살아 있는 지침에 있다'로 넘겼다(codex R5): %r" % row)
+        self.assertIn("머리말이 살아 있는 지침의 머리말과 다르다", row["detail"])
+        self.assertNotIn("그 내용은 살아 있는 지침에도 있다", row["detail"])
+        _write(k, HEADER + SEP + USER + "옮겨 적은 줄\n")                      # 머리말 같음 · 본문의 새 줄도 살아 있게 옮긴다
+        _write(self.p("MASTER_DIRECTIVE.md"), HEADER + SEP + USER + "옮겨 적은 줄\n")
+        row = self.c03()["C03.ceo-kept"]
+        self.assertEqual(row["status"], pf.PASS, row)
+        self.assertIn("머리말과 본문", row["detail"])
+
     def test_every_unusable_sidecar_is_unresolved(self):
         """★FY2b·c — 기준을 세울 수 없는 곁 파일은 모두 '미확인'(WARN): {} · {"sha256": null} · 종류 없음 · 일반 파일인데 해시 없음 ·
         읽지 못했다(unread) · 객체가 아님 · 해시 형식이 틀림 · 일반 파일이 아니라는데 지금은 일반 파일. 폴더로 보관된 것은

@@ -2381,14 +2381,27 @@ class Preflight:
         return side, None
 
     def _c03_kept_in_live(self, b, live):
-        """보관 사본의 지금 바이트가 살아 있는 지침에 들어 있는가 — (True | False | None(비교 못 함), 그 문장). 조립된 판이면
-        본문을 본다(★FL6 — 비교했을 때만 '없다'고 말한다)."""
+        """보관 사본의 지금 바이트가 살아 있는 지침에 들어 있는가 — (True | False | None(비교 못 함), 그 문장). ★FL6: 비교했을 때만
+        '없다'고 말한다. ★FY5: 조립된 사본은 머리말과 본문을 **따로** 잰다 — 본문이 살아 있는 지침(조립된 지침이면 그 본문)에 들어
+        있고 머리말이 살아 있는 조립의 머리말과 같을 때만 '살아 있는 지침에 있다'(True). 본문은 있는데 머리말이 다르면 그대로 말하고
+        False 다(WARN) — 머리말은 조립마다 제품이 다시 만들어, 거기 고친 것은 이 사본에만 있다."""
         if live is None:
             return None, "살아 있는 지침을 읽지 못해 비교하지 못했다"
-        c = self._c03_ceo_split(b)
-        if (c[2] if c is not None else b) in live:
-            return True, "그 내용은 살아 있는 지침에도 있다"
-        return False, "살아 있는 지침에는 없다"
+        kc = self._c03_ceo_split(b)
+        if kc is None:
+            if b in live:
+                return True, "그 내용은 살아 있는 지침에도 있다"
+            return False, "살아 있는 지침에는 없다"
+        lc = self._c03_ceo_split(live)
+        body_in = kc[2] in (lc[2] if lc is not None else live)
+        head_same = lc is not None and kc[0] == lc[0]
+        if body_in and head_same:
+            return True, "그 내용(머리말과 본문)은 살아 있는 지침에도 있다"
+        if body_in:
+            return False, ("본문은 살아 있는 지침에 있으나 머리말이 살아 있는 지침의 머리말과 다르다(%s — 머리말은 조립마다 제품이 "
+                           "다시 만들어, 거기 고친 것은 이 사본에만 있다)"
+                           % ("살아 있는 지침은 조립되어 있지 않다" if lc is None else "머리말 바이트가 다르다"))
+        return False, "본문이 살아 있는 지침에는 없다(머리말은 %s)" % ("같다" if head_same else "따로 쟀고 그것도 다르다")
 
     def _c03_ceo_intent_row(self):
         """[교체 축] C03.ceo-intent — ★RULINGS EY2. cys-dept 는 본부 지침의 살아 있는 이름을 바꾸기 전에 의도 기록
