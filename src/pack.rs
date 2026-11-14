@@ -8483,25 +8483,48 @@ mod tests {
     /// ★H-08 호출부 census(T9): 설계가 열거한 **8개 대상 쓰기**가 전부 새 헬퍼를 타고, 사이드카
     /// (`<rel>.user`·`.vendor-base`)와 `.pristine` 은 종전 writer 를 그대로 쓴다. 새 대상 쓰기를
     /// `write_atomic` 으로 추가하면 이 검체가 적색이 된다.
+    /// ★T2i(RULINGS EC4 의 결과): 팩 동사의 대상 쓰기 8곳은 경로로 여는 [`write_pack_file`] 대신 닻 내린
+    /// [`write_pack_file_beneath`] 를 탄다 — 권한 규칙은 같다(H-08 `pack_target_mode` · 정확 적용). `<rel>.user` 는
+    /// (RULINGS EC2) [`park_copy`] 의 덮지 않는 놓기로만 생기고, 그 쓰기도 실행비트를 주지 않는다(권한 없음 = 데이터).
+    /// 그래서 셈은 두 헬퍼의 합이 8 이고, 사이드카 검사는 지금의 writer 이름을 본다.
     #[test]
     fn h08_target_write_site_census() {
         let src = include_str!("bin/cys.rs");
-        // 대상 쓰기 = write_pack_file 호출. 설계의 8개 사이트와 수가 일치해야 한다.
-        let target_writes = src.matches("cys::pack::write_pack_file(").count();
+        // 대상 쓰기 = H-08 헬퍼 호출(경로형 + 닻 내린 형). 설계의 8개 사이트와 수가 일치해야 한다.
+        // 호출만 센다 — 주석 줄과 문자열 안의 언급(EC4 쓰기 자리 조사가 금지 목록으로 이 이름을 적는다)은 호출이 아니다.
+        let calls = |pat: &str| -> usize {
+            src.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .map(|l| l.match_indices(pat).filter(|(i, _)| !l[..*i].ends_with('"')).count())
+                .sum()
+        };
+        let path_writes = calls("cys::pack::write_pack_file(");
+        let anchored_writes = calls("cys::pack::write_pack_file_beneath(");
         assert_eq!(
-            target_writes, 8,
-            "설계가 열거한 대상 쓰기 8곳이 전부 write_pack_file 을 타야 한다 — 실측 {target_writes}"
+            path_writes + anchored_writes,
+            8,
+            "설계가 열거한 대상 쓰기 8곳이 전부 H-08 헬퍼를 타야 한다 — 실측 경로형 {path_writes} + 닻 내린 형 {anchored_writes}"
         );
-        // 사이드카·메타데이터 쓰기는 종전 writer 유지(실행비트를 주지 않는다).
-        for needle in [
-            "write_atomic(&dir.join(format!(\"{rel}.user\"))",
-            ".vendor-base",
-        ] {
+        // 닻 내린 헬퍼도 같은 권한 규칙(pack_target_mode · 정확 적용)을 쓴다.
+        let pack_src = include_str!("pack.rs");
+        let body_at = pack_src.find("pub fn write_pack_file_beneath(").expect("닻 내린 대상 쓰기 헬퍼");
+        let body = &pack_src[body_at..body_at + pack_src[body_at..].find("\n}\n").expect("헬퍼 끝")];
+        assert!(
+            body.contains("let mode = pack_target_mode(prior, bytes, system_manifest_entry);")
+                && body.contains("beneath_write(root, rel_path, bytes, mode, true, place, false)"),
+            "닻 내린 대상 쓰기가 H-08 권한 규칙을 정확 적용하지 않는다"
+        );
+        // 사이드카·메타데이터 쓰기는 실행비트를 주지 않는 writer(`<rel>.user` = park_copy · `.vendor-base` = write_atomic).
+        for needle in ["cys::pack::park_copy(", ".vendor-base"] {
             assert!(
                 src.contains(needle),
                 "사이드카 경로가 사라졌다(설계는 무변경을 요구한다): {needle}"
             );
         }
+        assert!(
+            pack_src.contains("beneath_write(dir, &user_rel, bytes, None, false, Place::NoReplace, durable)"),
+            "`<rel>.user` 의 놓기가 권한 없는(실행비트 없는) 쓰기가 아니다"
+        );
     }
 
     /// ★(0.14.42 · perf R3-6) 임베드 팩 해시 **메모 핀**. PACK_ALL 은 컴파일 타임 상수라 값이 프로세스 수명
