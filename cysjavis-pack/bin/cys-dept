@@ -1857,7 +1857,9 @@ class NoSafeMove(OSError):
 
 
 def move_noreplace(src, dst):
-    """★RULINGS EY3 — src 를 dst 로 옮긴다, dst 가 있으면 **덮지 않고** FileExistsError. 바이트를 다시 쓰지 않는다(같은 파일 그대로).
+    """★RULINGS EY3 — **우리 임시 파일**(다 쓴 .pre-ceo·곁 파일)을 새 이름으로 옮긴다, dst 가 있으면 **덮지 않고** FileExistsError.
+    바이트를 다시 쓰지 않는다(같은 파일 그대로). ★FL3: 살아 있는 지침 이름에는 쓰지 않는다 — 그 이름은 rename_into(보관)와
+    place_noreplace(놓기)만 바꾼다(링크 뒤 지우기는 그 사이에 이름을 바꿔 놓은 저장을 지운다).
     POSIX = 하드 링크 + 원래 이름 지우기(링크는 기존 이름을 덮지 않는다) → 하드 링크가 안 되면 덮지 않는 이름 바꾸기(맥 renamex_np
     RENAME_EXCL · 리눅스 renameat2 RENAME_NOREPLACE) → 그것도 없으면 NoSafeMove(호출부가 보류 — 확인 뒤 이름 바꾸기는 쓰지 않는다).
     윈도우 = os.rename(대상이 있으면 FileExistsError · 공유 위반은 짧게 재시도)."""
@@ -1885,6 +1887,48 @@ def move_noreplace(src, dst):
     return dst
 
 
+def rename_into(src, dst):
+    """★RULINGS FL3 — src 를 dst 로 **한 번의 원자 이름 바꾸기**로 옮긴다. 링크 + 지우기는 쓰지 않는다: 두 호출 사이에 편집기의
+    원자 저장이 원래 이름을 바꿔 놓으면 둘째 호출이 그 저장을 지운다(codex B2). 한 번의 이름 바꾸기는 그 순간 그 이름에 있는
+    것을 옮긴다. dst 는 잠금 안에서 만든 유일한 보관 이름이라 덮을 것이 없다 — 그래도 덮지 않는 호출(맥 RENAME_EXCL · 리눅스
+    RENAME_NOREPLACE · 윈도우 os.rename)을 먼저 쓰고, 그 호출이 없는 POSIX 파일 시스템에서만 이름이 비었는지 확인한 뒤 os.rename
+    한다(그 이름은 이 잠금 아래의 우리만 만든다)."""
+    if os.name != "posix":
+        retry_sharing(os.rename, src, dst)
+        return dst
+    nr = noreplace_fn()
+    if nr is not None:
+        try:
+            nr(src, dst)
+            return dst
+        except OSError as e:
+            if e.errno not in _NO_EXCHANGE:
+                raise
+    if os.path.lexists(dst):
+        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), dst)
+    os.rename(src, dst)
+    return dst
+
+
+def place_noreplace(src, dst):
+    """★RULINGS FL3·EY3 — 다 쓴 후보를 비어 있는 살아 있는 이름에 놓는다: 한 번의 **덮지 않는** 이름 바꾸기(맥 RENAME_EXCL · 리눅스
+    RENAME_NOREPLACE · 윈도우 os.rename). 살아 있는 이름은 사용자도 만들므로 '확인 뒤 이름 바꾸기'도 링크도 쓰지 않는다 — 그
+    호출이 없으면 NoSafeMove(보류). 그 사이 누가 만들었으면 FileExistsError(그것이 이긴다)."""
+    if os.name != "posix":
+        retry_sharing(os.rename, src, dst)
+        return dst
+    nr = noreplace_fn()
+    if nr is None:
+        raise NoSafeMove(errno.ENOTSUP, "덮지 않는 이름 바꾸기가 없는 파일 시스템", dst)
+    try:
+        nr(src, dst)
+    except OSError as e:
+        if e.errno in _NO_EXCHANGE:
+            raise NoSafeMove(e.errno, "덮지 않는 이름 바꾸기가 없는 파일 시스템", dst)
+        raise
+    return dst
+
+
 def keep_file(src, md, reason, name=None):
     """★RULINGS EY1 — 살아 있던 지침 파일(교체로 밀려난 것 · 되돌린 후보 · 강등 뒤의 .pre-ceo)을 보관 폴더 directives/.ceo-kept/
     로 **옮긴다**(지우지 않는다 · 다시 쓰지 않는다 · 덮지 않는 이름 <UTC>-<pid>-<n>.<reason>). 옮긴 뒤 그 순간의 바이트 해시를
@@ -1895,7 +1939,7 @@ def keep_file(src, md, reason, name=None):
     os.makedirs(kd, exist_ok=True)
     if name is not None:                # 의도 기록이 미리 정한 이름(EY2) — 있으면 덮지 않고 실패
         kept = os.path.join(kd, name)
-        move_noreplace(src, kept)
+        rename_into(src, kept)          # ★FL3 — 한 번의 이름 바꾸기
     else:
         base = "%s-%d" % (stamp(), os.getpid())
         for n in range(1, 1000):
@@ -1903,7 +1947,7 @@ def keep_file(src, md, reason, name=None):
             if os.path.lexists(kept) or os.path.lexists(kept + ".kept"):
                 continue
             try:
-                move_noreplace(src, kept)
+                rename_into(src, kept)
             except FileExistsError:
                 continue
             break
@@ -2104,7 +2148,7 @@ def swap_mode(md):
                 pass
         if mode is None:
             try:
-                move_noreplace(pa, pc)
+                place_noreplace(pa, pc)         # ★FL3 — 맡기고 먼저는 덮지 않는 이름 바꾸기가 있어야 한다
                 mode = "deposit"
             except OSError:
                 pass
@@ -2214,8 +2258,8 @@ def prim_exchange(cand_p, md):
 
 
 def place_candidate(cand_p, md):
-    """다 쓴 후보를 비어 있는 살아 있는 이름에 덮지 않는 방식으로 놓는다(맡기고 먼저 형식의 둘째 걸음)."""
-    move_noreplace(cand_p, md)
+    """다 쓴 후보를 비어 있는 살아 있는 이름에 덮지 않는 방식으로 놓는다(맡기고 먼저 형식의 둘째 걸음 · ★FL3 한 번의 이름 바꾸기)."""
+    place_noreplace(cand_p, md)
     fsync_dir(os.path.dirname(os.path.abspath(md)))
 
 

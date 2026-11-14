@@ -1098,6 +1098,58 @@ class SafePrimitives(Rig):
         self.assertTrue(os.path.exists(os.path.join(kd, "X.compose")), "보관된 판을 지웠다")
 
 
+class OneRename(Rig):
+    """★RULINGS FL3 — 살아 있는 이름은 한 번의 원자 이름 바꾸기로 유일한 보관 이름에 옮겨진다(codex B2: 링크 뒤 지우기는, 두 호출
+    사이에 편집기의 원자 저장이 이름을 바꿔 놓으면 둘째 호출이 그 저장을 지웠다). 저장은 옮기는 바로 그 호출 뒤에 끼워 넣는다."""
+    SAVE = "USERSAVE-FL3 살아 있는 이름이 옮겨지는 순간의 원자 저장\n"
+
+    def test_an_atomic_save_while_the_live_name_is_moved_away_survives(self):
+        self.seed()
+        ns = ceo_py_module()
+        ns["exchange_fn"] = lambda: None              # 맡기고 먼저(윈도우 등) — 살아 있는 이름이 옮겨지는 형식
+        md = os.path.abspath(self.p("MASTER_DIRECTIVE.md"))
+        fired, linked = [], []
+
+        def save():
+            if not fired:
+                fired.append(1)
+                tmp = md + ".editor-tmp"
+                _write(tmp, USER + self.SAVE)
+                os.replace(tmp, md)
+
+        class _Os:
+            def __getattr__(self, name):
+                return getattr(os, name)
+
+            def link(self, a, b):
+                os.link(a, b)
+                if os.path.abspath(a) == md:
+                    linked.append(b)
+                    save()
+
+            def rename(self, a, b):
+                os.rename(a, b)
+                if os.path.abspath(a) == md:
+                    save()
+        ns["os"] = _Os()
+        nr0 = ns["noreplace_fn"]()
+        if nr0 is not None:
+            def nr(a, b):
+                nr0(a, b)
+                if os.path.abspath(a) == md:
+                    save()
+            ns["noreplace_fn"] = lambda: nr
+        rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), md, sha(TEMPLATE), ""])
+        self.assertEqual(fired, [1], "끼어들기가 일어나지 않았다(시험 무효)")
+        everywhere = [self.read("MASTER_DIRECTIVE.md") or ""] + [_slurp(k, encoding="utf-8") for k in self.kept()]
+        self.assertTrue(any(self.SAVE in v for v in everywhere),
+                        "살아 있는 이름이 옮겨지는 순간의 원자 저장이 지워졌다(링크 뒤 지우기 — codex B2)")
+        self.assertEqual(linked, [], "살아 있는 이름을 링크로 옮겼다(한 번의 이름 바꾸기가 아니다)")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER + self.SAVE, "이긴 저장으로 조립하지 않았다")
+        self.assertIn(USER, [_slurp(k, encoding="utf-8") for k in self.kept()], "옮겨진 판이 보관 폴더에 없다")
+
+
 class FlushFailure(Rig):
     """★RULINGS FL5 — 실패한 flush 는 실패다(codex B4: fsync_dir 가 폴더 flush 실패를 삼켜, 디스크에 확정되지 않은 의도 기록 아래서
     살아 있는 이름을 바꿨다). 후보나 교체 기록의 폴더 flush 가 실패하면 살아 있는 이름을 건드리기 전에 보류하고(rc 6 · 알림 1건),
