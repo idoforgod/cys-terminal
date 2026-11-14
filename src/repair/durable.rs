@@ -147,6 +147,61 @@ pub fn write_durable(path: &Path, bytes: &[u8]) -> Result<(), RepairError> {
     result
 }
 
+/// RULINGS GK5 — the size cap of one engine record (a record, a lane row, an intent, an operation
+/// record): larger is never read, it is unreadable.
+pub const RECORD_READ_CAP: u64 = 16 * 1024 * 1024;
+
+/// What [`read_record_bytes`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordRead {
+    Bytes(Vec<u8>),
+    /// The path does not exist (the caller decides what positive evidence of absence it needs).
+    NotFound,
+    Unreadable(String),
+}
+
+/// RULINGS GK5 — THE bounded reader of the engine's own records: a non-blocking open that follows
+/// no link (unix: `O_NONBLOCK | O_NOFOLLOW`; Windows: the reparse point itself), a REGULAR file only,
+/// at most [`RECORD_READ_CAP`] bytes, read whole — a special file (a FIFO never blocks: it is
+/// refused before any read), a link, an oversized file or a size that changed during the read is
+/// unreadable. It never waits and never retries.
+pub fn read_record_bytes(p: &Path) -> RecordRead {
+    use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT: a link is opened as itself
+    }
+    let f = match opts.open(p) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RecordRead::NotFound,
+        Err(e) => return RecordRead::Unreadable(format!("{}: 열 수 없음(링크이거나 읽을 수 없음) — {e}", p.display())),
+    };
+    let m = match f.metadata() {
+        Ok(m) => m,
+        Err(e) => return RecordRead::Unreadable(format!("{}: {e}", p.display())),
+    };
+    if !m.file_type().is_file() {
+        return RecordRead::Unreadable(format!("{}: 일반 파일이 아님", p.display()));
+    }
+    if m.len() > RECORD_READ_CAP {
+        return RecordRead::Unreadable(format!("{}: 크기 {}바이트가 한도 {}바이트를 넘음", p.display(), m.len(), RECORD_READ_CAP));
+    }
+    let mut buf = Vec::with_capacity(m.len() as usize);
+    match (&f).take(RECORD_READ_CAP + 1).read_to_end(&mut buf) {
+        Ok(_) if buf.len() as u64 == m.len() => RecordRead::Bytes(buf),
+        Ok(_) => RecordRead::Unreadable(format!("{}: 읽는 동안 크기가 바뀜({} → {})", p.display(), m.len(), buf.len())),
+        Err(e) => RecordRead::Unreadable(format!("{}: {e}", p.display())),
+    }
+}
+
 /// [`write_durable`] of a JSON value — the SAME bytes `crate::atomic_write_json` writes (one-space
 /// pretty printer, trailing LF), made durable.
 pub fn write_json_durable<T: serde::Serialize>(path: &Path, v: &T) -> Result<(), RepairError> {
@@ -230,6 +285,30 @@ mod tests {
         INJECT_FLUSH_ERRNO.with(|c| c.set((libc::EINTR, 1)));
         assert!(write_durable(&p, b"intr").is_ok(), "EINTR is retried");
         INJECT_FLUSH_ERRNO.with(|c| c.set((0, 0)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// GK5: THE bounded reader — a regular file is read whole; a missing one is NotFound; a FIFO
+    /// (no writer), a link and a file over the cap are unreadable, each at once.
+    #[cfg(unix)]
+    #[test]
+    fn the_record_reader_is_bounded() {
+        let d = tmp("gk5");
+        let ok = d.join("r.json");
+        std::fs::write(&ok, b"{}").unwrap();
+        assert_eq!(read_record_bytes(&ok), RecordRead::Bytes(b"{}".to_vec()));
+        assert_eq!(read_record_bytes(&d.join("none.json")), RecordRead::NotFound);
+        let fifo = d.join("fifo.json");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        assert!(matches!(read_record_bytes(&fifo), RecordRead::Unreadable(_)), "a FIFO is never read");
+        let link = d.join("link.json");
+        std::os::unix::fs::symlink(&ok, &link).unwrap();
+        assert!(matches!(read_record_bytes(&link), RecordRead::Unreadable(_)), "a link is not followed");
+        let big = d.join("big.json");
+        std::fs::File::create(&big).unwrap().set_len(RECORD_READ_CAP + 1).unwrap();
+        assert!(matches!(read_record_bytes(&big), RecordRead::Unreadable(_)), "over the cap");
         let _ = std::fs::remove_dir_all(&d);
     }
 

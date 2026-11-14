@@ -538,10 +538,11 @@ fn corrupt(p: &Path, why: impl std::fmt::Display) -> RepairError {
 /// Reads a ledger JSON file: `Ok(None)` if absent; `Err(Corrupt)` if unreadable, malformed or of a
 /// higher `schema` than this build knows (O-C1-6 / O-C1-7).
 fn read_json<T: serde::de::DeserializeOwned>(p: &Path) -> Result<Option<T>, RepairError> {
-    let bytes = match std::fs::read(p) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(corrupt(p, e)),
+    // T6 · RULINGS GK5 (the seam's reads made bounded): through THE bounded record reader
+    let bytes = match super::durable::read_record_bytes(p) {
+        super::durable::RecordRead::Bytes(b) => b,
+        super::durable::RecordRead::NotFound => return Ok(None),
+        super::durable::RecordRead::Unreadable(why) => return Err(corrupt(p, why)),
     };
     let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| corrupt(p, e))?;
     let schema = v.get("schema").and_then(|s| s.as_u64()).unwrap_or(u64::MAX);

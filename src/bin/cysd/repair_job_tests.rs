@@ -251,6 +251,49 @@ fn the_consumed_seam_answers_inside_the_repair_lock_and_the_table_lock() {
     let _ = std::fs::remove_dir_all(root.parent().unwrap());
 }
 
+/// RULINGS GK5 through the seam: a FIFO (no writer) and a file over the cap, at a repair's
+/// `record.json` and at the lane's intent, read by `approval_consumed_in` called inside the daemon's
+/// real per-repair lock and a held stand-in for T5b's table lock — the answer is Unknown and the call
+/// returns (a blocking read of the FIFO would never return here). Without GK5 the read of the FIFO
+/// blocked for ever.
+#[cfg(unix)]
+#[test]
+fn the_seam_never_blocks_on_a_fifo_or_an_oversized_record() {
+    let (daemon, root, _pack) = rig("t6-gk5");
+    let lane = LaneKey::of_socket(&daemon.socket_path);
+    let id = RepairId::parse("R-1").unwrap();
+    let rdir = root.join("R-1");
+    let intents = rdir.join("intents");
+    std::fs::create_dir_all(&intents).unwrap();
+    let record = rdir.join("record.json");
+    let intent = intents.join(format!("{}.json", lane.0));
+    let mkfifo = |p: &Path| {
+        let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    };
+    let table = std::sync::Mutex::new(());
+    let ask = || {
+        let mut answer = None;
+        repair_lock(&daemon)(&id, &mut || {
+            let _table = table.lock().unwrap();
+            answer = Some(cys::repair::consumed::approval_consumed_in(&root, &lane, "rqr-gk5"));
+            Ok(())
+        })
+        .unwrap();
+        answer.unwrap()
+    };
+    for at in [&record, &intent] {
+        mkfifo(at);
+        assert!(matches!(ask(), cys::repair::consumed::ApprovalUse::Unknown(_)), "a FIFO at {}", at.display());
+        std::fs::remove_file(at).unwrap();
+        std::fs::File::create(at).unwrap().set_len(cys::repair::durable::RECORD_READ_CAP + 1).unwrap();
+        assert!(matches!(ask(), cys::repair::consumed::ApprovalUse::Unknown(_)), "an oversized file at {}", at.display());
+        std::fs::remove_file(at).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
 /// O-C7-3 / F8 source pin: the readiness flag and its time are set FIRST in `post_listen_boot` (the
 /// one function both accept loops call), before anything it spawns.
 #[test]
