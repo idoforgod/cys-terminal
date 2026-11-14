@@ -1997,6 +1997,48 @@ fn gate_registered(settings: &Path, pack: &Path) -> Option<bool> {
     }))
 }
 
+/// RULINGS EL2 — the execution signature of the gate's registration in a settings document: for every
+/// `PreToolUse` entry holding a hook whose command names `gate`, the entry's own keys other than
+/// `hooks` (the matcher …) and that hook object WHOLE (type, command, timeout, async, any other key).
+fn gate_entries(v: &serde_json::Value, gate: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for e in v
+        .pointer("/hooks/PreToolUse")
+        .and_then(|e| e.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(eo) = e.as_object() else {
+            continue;
+        };
+        let mut base = eo.clone();
+        base.remove("hooks");
+        for h in eo.get("hooks").and_then(|h| h.as_array()).into_iter().flatten() {
+            if h.get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c.contains(gate))
+            {
+                let mut sig = base.clone();
+                sig.insert("hook".into(), h.clone());
+                out.push(serde_json::Value::Object(sig));
+            }
+        }
+    }
+    out
+}
+
+/// RULINGS EL2 — is the gate's registration in `settings` THE ENTRY THE RELEASED REGISTRAR WRITES
+/// (`expected`, from the released template), compared as a whole — every execution attribute equal
+/// and no other registration of the gate beside it? `None` = unreadable.
+fn gate_entry_as_released(settings: &Path, gate: &str, expected: &serde_json::Value) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_slice(&replay::read_bounded(settings).ok()?).ok()?;
+    if v.get("disableAllHooks").and_then(|d| d.as_bool()) == Some(true) {
+        return Some(false);
+    }
+    let got = gate_entries(&v, gate);
+    Some(!got.is_empty() && got.iter().all(|g| g == expected))
+}
+
 /// RULINGS DF2: the binding probe a registered command is executed with — a gate class the released
 /// gate denies in the baseline set-up (a reviewer editing a repository file) and the released guard
 /// does not, so a DENY is the gate's.
@@ -2202,6 +2244,13 @@ fn run_i3(
                 _ => template.to_string(),
             }
             .replace(PACK_PLACEHOLDER, &pack.to_string_lossy());
+            // RULINGS EL2: the entry the RELEASED registrar writes for the gate, in this layout
+            let gate_path = pack.join("hooks").join(CAPGATE_SCRIPT).to_string_lossy().into_owned();
+            let expected: Option<serde_json::Value> = serde_json::from_str::<serde_json::Value>(
+                &template.replace(PACK_PLACEHOLDER, &pack.to_string_lossy()),
+            )
+            .ok()
+            .and_then(|v| gate_entries(&v, &gate_path).into_iter().next());
             let mut targets: Vec<(String, PathBuf)> = Vec::new();
             for p in profiles {
                 let d = home.join(p);
@@ -2299,13 +2348,28 @@ fn run_i3(
                     pack: &pack,
                 };
                 for (label, t) in &targets {
-                    // RULINGS DF2: behaviour decides; CZ1's closed grammar is reported beside it
-                    let st = if completed {
-                        gate_executes(r, t, &x, ("worker", scenario != Scenario::S2))
+                    // RULINGS EL2 / CZ1 / DF2: registered = the entry the released registrar writes
+                    // (compared whole) AND the closed grammar AND the command really denies
+                    let (st, detail) = if completed {
+                        let whole = match &expected {
+                            Some(e) => gate_entry_as_released(t, &gate_path, e),
+                            None => None,
+                        };
+                        let grammar = gate_registered(t, &pack);
+                        let st = match (whole, grammar) {
+                            (Some(true), Some(true)) => {
+                                gate_executes(r, t, &x, ("worker", scenario != Scenario::S2))
+                            }
+                            (Some(_), Some(_)) => Some(false),
+                            _ => None,
+                        };
+                        (
+                            st,
+                            format!("{why}; entry as released {whole:?}, grammar {grammar:?}"),
+                        )
                     } else {
-                        None
+                        (None, why.clone())
                     };
-                    let detail = format!("{why}; grammar pre-check {:?}", gate_registered(t, &pack));
                     out.push((k, label.clone(), st, detail));
                 }
             }
