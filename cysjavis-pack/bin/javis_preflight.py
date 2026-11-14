@@ -2437,7 +2437,8 @@ class Preflight:
         else:
             where = "없음(진행 중인 교체 없음 — 동작을 지금 판으로 다시 할 차례)"
         self.add(cid, WARN, "끝나지 않은 CEO 지침 교체(%s · 단계 %s · %s 시작) — 다음 승격 확인(부서 켜기·`cys-dept promote-ceo`)이나 "
-                            "base 데몬의 10분 승격 대기 틱이 그 단계에서 이어 가 동작을 끝낸다(또는 보류하고 알린다). 살아 있는 "
+                            "base 데몬의 10분 승격 대기 틱이 그 단계에서 이어 가 동작을 끝낸다(또는 보류하고 알린다 — 알림은 영속 "
+                            "알림함 ~/.cys/state/ceo-notices 에 놓인다: 거기에 넣지 못한 알림이 있으면 기록은 남는다). 살아 있는 "
                             "이름: %s · 교체 전 판 또는 후보: %s"
                  % (rec.get("op", "?"), step, rec.get("created_at", "?"),
                     "있음" if os.path.lexists(live) else "없음(C02 FAIL — 그 바이트는 오른쪽 파일에 있다)", where))

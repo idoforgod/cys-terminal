@@ -148,6 +148,7 @@ class Rig(unittest.TestCase):
         self.dirs = os.path.join(self.home, ".cys", "pack", "directives")
         self.log = os.path.join(self.tmp, "calls.log")
         self.feedlist = os.path.join(self.tmp, "feed-list.txt")
+        self.pushfail = os.path.join(self.tmp, "feed-push-fails")      # 있으면 스텁의 feed push 가 실패한다(데몬 없음 등)
         os.makedirs(self.bindir)
         os.makedirs(self.dirs)
         # 스텁 cys: 전 호출 기록 · ping=소켓 파일 실존 · status 실패(재주입 skip 경로) · feed list = 파일 내용.
@@ -157,8 +158,9 @@ class Rig(unittest.TestCase):
                'case "$1" in\n'
                '  ping) [ -e "$CYS_SOCKET" ] && exit 0 || exit 1 ;;\n'
                '  status|identify) exit 1 ;;\n'
-               '  feed) if [ "$2" = "list" ]; then [ -f "%(fl)s" ] && cat "%(fl)s"; exit 0; fi; exit 0 ;;\n'
-               'esac\nexit 0\n' % {"log": self.log, "fl": self.feedlist}, 0o755)
+               '  feed) if [ "$2" = "list" ]; then [ -f "%(fl)s" ] && cat "%(fl)s"; exit 0; fi\n'
+               '        if [ "$2" = "push" ] && [ -f "%(pf)s" ]; then exit 1; fi; exit 0 ;;\n'
+               'esac\nexit 0\n' % {"log": self.log, "fl": self.feedlist, "pf": self.pushfail}, 0o755)
         _write(os.path.join(self.bindir, "cysd"),
                '#!/bin/sh\nmkdir -p "$(dirname "$CYS_SOCKET")"\ntouch "$CYS_SOCKET"\nexit 0\n', 0o755)
         self.env = dict(os.environ)
@@ -174,7 +176,20 @@ class Rig(unittest.TestCase):
     def p(self, name):
         return os.path.join(self.dirs, name)
 
+    def outbox(self):
+        """★RULINGS FY3 — 영속 알림함(승격 대기 표지와 같은 상태 폴더)."""
+        return os.path.join(self.home, ".cys", "state", "ceo-notices")
+
+    def outbox_files(self, sent=False):
+        d = os.path.join(self.outbox(), "sent") if sent else self.outbox()
+        return sorted(os.path.join(d, f) for f in (os.listdir(d) if os.path.isdir(d) else []) if f.endswith(".notice"))
+
+    def notices_text(self):
+        """영속 알림함의 알림 — 아직 배달되지 않은 것과 sent/ 의 것 — 의 제목·본문(시험이 '알림이 있다'를 재는 곳)."""
+        return "".join(_slurp(f, encoding="utf-8") for f in self.outbox_files() + self.outbox_files(sent=True))
+
     def seed(self, md=USER, tmpl=TEMPLATE, marker=True, ndepts=1):
+        shutil.rmtree(self.outbox(), ignore_errors=True)
         _write(self.p("MASTER_DIRECTIVE.md"), md)
         _write(self.p("CEO_TEMPLATE.md"), tmpl)
         if marker:
@@ -650,32 +665,43 @@ class Composition(Rig):
         caps = self.captures("before-compose")
         self.assertEqual(len(caps), 2)
         self.assertEqual(sorted(t.rsplit(" — ", 1)[1] for t in titles), sorted(os.path.basename(c) for c in caps))
-        # 같은 사본의 알림을 다시 올리지는 않는다(제목 완전일치 dedupe 는 그대로).
-        nf = os.path.join(self.tmp, "nf.txt")
-        _write(nf, "NOTICE\t%s\t본문\n" % titles[0])
+        # 같은 사본의 알림을 다시 올리지는 않는다(제목 완전일치 dedupe 는 그대로 — ★FY3: 알림함 배달이 그것을 지난다).
+        stray = os.path.join(self.outbox(), "0" * 32 + ".notice")
+        _write(stray, "%s\n본문\n" % titles[0])
         funcs = "".join(extract_shell_function(_slurp(DEPT, encoding="utf-8"), f)
-                        for f in ("ceo_notice_once", "ceo_notices_from"))
-        r = subprocess.run(["bash", "-c", 'CYS=cys\n' + funcs + 'ceo_notices_from "$1"\n', DEPT, nf],
-                           capture_output=True, text=True, encoding="utf-8", env=self.env, timeout=60)
+                        for f in ("ceo_notice_once", "ceo_outbox_deliver"))
+        r = subprocess.run(["bash", "-c", 'CYS=cys\nCEO_OUTBOX="$1"\n_CEO_DELIVERED=0\n' + funcs + 'ceo_outbox_deliver\n', DEPT,
+                            self.outbox()], capture_output=True, text=True, encoding="utf-8", env=self.env, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(len(self.pushes_prefix("CEO 지침 사본 보관(머리말) — ")), 2, "같은 사본 알림을 또 올렸다")
+        self.assertTrue(os.path.exists(os.path.join(self.outbox(), "sent", os.path.basename(stray))),
+                        "이미 대기 중인 제목인데 sent/ 로 옮기지 않았다(피드가 받은 것)")
 
     def test_failed_notice_write_keeps_the_replacement_result(self):
-        """★CG2: 교체가 끝난 뒤 알림 기록이 실패해도(알림 파일 = 폴더) 결과(rc)는 교체의 결과다 — 다시 조립 12 · 강등 0."""
+        """★CG2: 교체가 끝난 뒤 알림 기록이 실패해도(★FY3: 영속 알림함을 쓸 수 없다 — 그 경로가 파일) 결과(rc)는 교체의 결과다 —
+        다시 조립 12 · 강등 0. 그 동작의 기록은 알림이 알림함에 들어갈 때까지 남고(FY3 i), 알림함이 고쳐지면 다음 입구가 마무리한다."""
         self.seed()
         self.assertEqual(self.run_dept("promote-ceo")[0], 0)
         live = HEADER + "USER-HEADER-EDIT\n" + SEP + USER          # 영수증이 증명 못 하는 머리말 → 사본 + 알림
         _write(self.p("MASTER_DIRECTIVE.md"), live)
-        bad_nf = os.path.join(self.tmp, "notice-dir")
-        os.mkdir(bad_nf)
+        bad_box = os.path.join(self.tmp, "outbox-is-a-file")
+        _write(bad_box, "not a folder\n")
+        self.env["CYS_CEO_OUTBOX"] = bad_box
         rc, out, err = self.run_ceo_py("compose", self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"),
-                                       sha(TEMPLATE), bad_nf)
+                                       sha(TEMPLATE), os.path.join(self.tmp, "kept-lines"))
         self.assertEqual(rc, 12, "알림 실패가 다시 조립의 결과를 바꿨다\n" + err)
         self.assertIn("알림 기록 실패", err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER)
         self.assert_receipt_for(HEADER, USER, HEADER + SEP + USER)
+        self.assertIsNotNone(self.read(".ceo-intent.json"), "알림이 알림함에 없는데 기록을 지웠다(★FY3 i)")
+        del self.env["CYS_CEO_OUTBOX"]
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)        # 알림함이 고쳐졌다 — 다음 입구가 넣고 기록을 지운다
+        self.assertIsNone(self.read(".ceo-intent.json"))
+        self.assertTrue(self.pushes_prefix("CEO 지침 사본 보관(머리말) — "), "알림함이 고쳐진 뒤에도 사본 알림이 없다")
         _write(self.p("MASTER_DIRECTIVE.md"), live)
-        rc, out, err = self.run_ceo_py("demote", self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), bad_nf)
+        self.env["CYS_CEO_OUTBOX"] = bad_box
+        rc, out, err = self.run_ceo_py("demote", self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"),
+                                       os.path.join(self.tmp, "kept-lines"))
         self.assertEqual(rc, 0, "알림 실패가 강등의 결과를 바꿨다\n" + err)
         self.assertIn("알림 기록 실패", err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER)
@@ -1119,7 +1145,7 @@ class IntentRecovery(Rig):
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), second, "되돌리기가 두 번째 저장을 살아 있는 이름에서 밀어냈다")
         self.assertIn(USER + self.SAVE, [_slurp(k, encoding="utf-8") for k in self.kept()], "앞의 저장이 보관되지 않았다")
         self.assertEqual(rc, 6, "두 저장이 겹쳤는데 보류가 아니다")
-        self.assertIn("두 저장이 겹침", _slurp(nf, encoding="utf-8"))
+        self.assertIn("두 저장이 겹침", self.notices_text())
 
     # ── 멈춤 지점 표(보고서 Round 2 (2)) ──
     def test_crash_points_of_a_promotion(self):
@@ -1463,6 +1489,7 @@ class CrashProperty(Rig):
 
     def fresh(self, op, mode):
         shutil.rmtree(self.dirs, ignore_errors=True)
+        shutil.rmtree(self.outbox(), ignore_errors=True)
         os.makedirs(self.dirs)
         _write(self.md, USER)
         _write(self.tmpl, TEMPLATE)
@@ -1506,9 +1533,9 @@ class CrashProperty(Rig):
             if res == "crash":
                 continue
             live = self.md_bytes()
-            notes = _slurp(nf, encoding="utf-8") if os.path.exists(nf) else ""
+            notes = self.notices_text()
             if res in (6, 9):
-                self.assertIn("NOTICE\t", notes, "I3: 보류(rc %s)에 알림이 없다 — %s" % (res, where))
+                self.assertTrue(notes, "I3: 보류(rc %s)에 알림이 없다 — %s" % (res, where))
                 self.assertIsNotNone(live, "I2: 보류 뒤 살아 있는 이름이 없다 — %s" % where)
                 continue
             if kind == "op" or had:
@@ -1655,7 +1682,7 @@ class ReadUnknown(Rig):
                     rc = self.compose(ns, nf)
                     self.assertEqual(rc, 6, "후보를 읽지 못했는데 보류하지 않았다(codex R1)")
                     self.assertEqual(self.snapshot(), before, "읽지 못했는데 무언가를 옮기거나 바꿨다")
-                    self.assertIn(self.TITLE, _slurp(nf, encoding="utf-8"))
+                    self.assertIn(self.TITLE, self.notices_text())
                 rc, out, err = self.run_dept("promote-ceo")
                 self.assertEqual(rc, 0, out + err)
                 self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER + self.SAVE,
@@ -1700,7 +1727,7 @@ class ReadUnknown(Rig):
                 rc = self.compose(ns, nf)
                 self.assertEqual(rc, 6, "%s 를 읽지 못했는데 보류하지 않았다" % label)
                 self.assertEqual(self.snapshot(), before, "%s 를 읽지 못했는데 무언가를 바꿨다" % label)
-                self.assertIn(self.TITLE, _slurp(nf, encoding="utf-8"))
+                self.assertIn(self.TITLE, self.notices_text())
                 rc, out, err = self.run_dept("promote-ceo")
                 self.assertEqual(rc, 0, out + err)
                 self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER)
@@ -1763,7 +1790,7 @@ class SafePrimitives(Rig):
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "살아 있는 지침이 바뀌었다")
         self.assertIsNone(self.read(".ceo-intent.json"))
         self.assertEqual([f for f in os.listdir(self.dirs) if f.endswith(".candidate")], [])
-        self.assertIn("CEO 지침 교체 보류(이 디스크에서는 안전하게 바꿀 수 없음)", _slurp(nf, encoding="utf-8"))
+        self.assertIn("CEO 지침 교체 보류(이 디스크에서는 안전하게 바꿀 수 없음)", self.notices_text())
         self.assertEqual(proxy.opened_live, [], "살아 있는 이름을 쓰기로 열었다")
 
     def test_the_live_name_is_never_written_in_place(self):
@@ -1847,6 +1874,84 @@ class OneRename(Rig):
         self.assertIn(USER, [_slurp(k, encoding="utf-8") for k in self.kept()], "옮겨진 판이 보관 폴더에 없다")
 
 
+class DurableOutbox(Rig):
+    """★RULINGS FY3 — 이 부분의 알림은 영속 알림함(~/.cys/state/ceo-notices)에 통째 파일로, 그것이 다루는 상태가 사라질 수 있기
+    **전에** 놓인다(동작 기록은 그 알림이 알림함에 들어간 뒤에만 지워진다). 셸이 조립 경로의 모든 입구에서 배달하고, 피드가 받은
+    것만 sent/ 로 옮긴다 — sent/<키> 가 '이미 알렸다'의 유일한 기억이다(.held 없음). 배달은 관문이 아니다."""
+
+    def barrier(self):
+        """읽을 수 없는(형식이 틀린) 기록 — 오래가는 보류."""
+        self.seed()
+        _write(self.p(".ceo-intent.json"), "{ 반쪽 기록")
+
+    def tick(self):
+        rc, out, err = self.run_dept("promote-if-pending")
+        self.assertEqual(rc, 0, out + err)
+        return out + err
+
+    def test_a_notice_survives_the_shell_dying_before_delivery(self):
+        """codex R3 — 종전: 보류 알림을 임시 파일에 덧붙인 뒤 .held 표지를 적어, 셸이 그 파일을 배달하기 전에 죽으면 알림은 영영
+        나가지 않았다(다음 틱은 표지를 보고 다시 쓰지 않았다). 이제 알림은 영속 알림함에 있고 다음 입구가 배달한다."""
+        self.barrier()
+        ns = ceo_py_module()
+        nf = os.path.join(self.tmp, "nf-dies.txt")
+        self.assertEqual(ns["do_recover"]([self.p("MASTER_DIRECTIVE.md"), nf]), 0)
+        # 셸이 여기서 죽었다 — ceo_notices_from 도 배달도 돌지 않았다(nf 는 버려진다).
+        self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), 0, "시험 전제: 아직 아무것도 올라가지 않았다")
+        self.tick()
+        self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), 1, "셸이 죽은 뒤의 보류 알림이 사라졌다(codex R3)")
+        self.assertEqual(self.outbox_files(), [])
+        self.assertEqual(len(self.outbox_files(sent=True)), 1)
+        self.assertFalse(os.path.exists(self.p(".ceo-intent.json.held")), ".held 표지가 생겼다")
+
+    def test_a_failed_push_stays_in_the_outbox_for_the_next_entry(self):
+        """피드가 받지 못한 알림(데몬 없음 · 올리기 실패)은 알림함에 남고 다음 입구가 다시 올린다 — 받은 뒤에야 sent/ 로. 그동안
+        조립 경로는 막히지 않는다(배달은 관문이 아니다)."""
+        self.barrier()
+        _write(self.pushfail, "1\n")
+        self.tick()
+        self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), 1, "올리기를 시도하지 않았거나 한 실행에 두 번 시도했다")
+        self.assertEqual(len(self.outbox_files()), 1, "피드가 받지 못한 알림이 알림함에 남지 않았다")
+        self.assertEqual(self.outbox_files(sent=True), [], "피드가 받지 못했는데 '보냈다'로 옮겼다")
+        os.unlink(self.pushfail)
+        self.tick()
+        self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), 2, "다음 입구가 다시 올리지 않았다")
+        self.assertEqual(self.outbox_files(), [])
+        self.assertEqual(len(self.outbox_files(sent=True)), 1)
+
+    def test_a_lasting_hold_gives_exactly_one_notice_and_a_dismissed_one_does_not_return(self):
+        self.barrier()
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), 1, "오래가는 보류가 알림을 여러 번 냈다")
+        _write(self.feedlist, "")                                       # 오너가 그 알림을 닫았다(대기 중 아님)
+        self.tick()
+        rc, out, err = self.run_dept("promote-ceo")
+        self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), 1, "닫은 알림이 같은 기록에 다시 나왔다")
+
+    def test_the_record_is_removed_only_after_its_notices_are_in_the_outbox(self):
+        """기록이 담은 알림(보관 사본 알림 — 그 동작의 정체가 키)이 알림함에 들어가지 못하면 기록은 지워지지 않는다(★FY3 i ·
+        종전: 알림은 임시 파일에만 있었고 기록은 먼저 지워졌다). 알림함이 고쳐지면 다음 입구가 넣고 지운다."""
+        self.seed()
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        _write(self.p("MASTER_DIRECTIVE.md"), HEADER + "USER-HEADER-EDIT\n" + SEP + USER)
+        ns = ceo_py_module()
+        bad_box = os.path.join(self.tmp, "outbox-is-a-file")
+        _write(bad_box, "x\n")
+        os.environ["CYS_CEO_OUTBOX"] = bad_box
+        try:
+            rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), ""])
+        finally:
+            del os.environ["CYS_CEO_OUTBOX"]
+        self.assertEqual(rc, 12)
+        rec = json.loads(self.read(".ceo-intent.json") or "null")
+        self.assertIsNotNone(rec, "알림이 알림함에 없는데 기록을 지웠다")
+        self.assertTrue(any("머리말" in t for t, _b in rec["notices"]), "기록이 알림을 담고 있지 않다")
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        self.assertIsNone(self.read(".ceo-intent.json"))
+        self.assertEqual(len(self.pushes_prefix("CEO 지침 사본 보관(머리말) — ")), 1)
+
+
 class FlushFailure(Rig):
     """★RULINGS FL5 — 실패한 flush 는 실패다(codex B4: fsync_dir 가 폴더 flush 실패를 삼켜, 디스크에 확정되지 않은 의도 기록 아래서
     살아 있는 이름을 바꿨다). 후보나 교체 기록의 폴더 flush 가 실패하면 살아 있는 이름을 건드리기 전에 보류하고(rc 6 · 알림 1건),
@@ -1878,7 +1983,7 @@ class FlushFailure(Rig):
         if os.path.exists(nf):
             os.unlink(nf)
         rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), nf])
-        return rc, proxy, (_slurp(nf, encoding="utf-8") if os.path.exists(nf) else "")
+        return rc, proxy, self.notices_text()
 
     def modes(self):
         return (["exchange"] if ceo_py_module()["exchange_fn"]() is not None else []) + ["deposit"]
@@ -2086,7 +2191,7 @@ class SaveDuringSwap(Rig):
         self.assertLessEqual(len(n), 3, "재시도 상한이 없다")
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER + "CHANGE %d\n" % len(n), "마지막 저장이 살아 있지 않다")
         self.assertIsNone(self.read(".ceo-receipt.json"))
-        self.assertIn("CEO 승격 보류(본부 지침이 조립 중에 계속 바뀜)", _slurp(nf, encoding="utf-8"))
+        self.assertIn("CEO 승격 보류(본부 지침이 조립 중에 계속 바뀜)", self.notices_text())
 
 
 class StaleLegacyReceipt(Rig):
@@ -2255,10 +2360,12 @@ class LockIsReal(Rig):
             self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "잠금을 못 잡았는데 지침을 바꿨다(무잠금 진행)")
             self.assertIsNone(self.read("MASTER_DIRECTIVE.md.pre-ceo"))
             self.register()
-        self.assertEqual(self.pushes(title), 2, "보류 알림이 없다(데몬이 보관 중이 아니면 매번 1건)")
+        # ★FY3: 같은 상태(같은 지침 바이트)의 오래가는 보류 = 알림 정확히 1건 — 영속 알림함의 키(sent/)가 기억한다(종전: 데몬이
+        #   보관 중이 아니면 입구마다 1건).
+        self.assertEqual(self.pushes(title), 1, "보류 알림이 없거나 같은 보류를 입구마다 다시 알렸다")
         _write(self.feedlist, "rid-l\t[pending]\tceo-notice\t%s\tdecision=-\n" % title)
         self.assertEqual(self.run_dept("launch", "d0")[0], 0)
-        self.assertEqual(self.pushes(title), 2, "보관 중인 보류 알림을 또 올렸다(폭주)")
+        self.assertEqual(self.pushes(title), 1, "보관 중인 보류 알림을 또 올렸다(폭주)")
         fcntl.flock(fd, fcntl.LOCK_UN)
         rc, out, err = self.run_dept("promote-ceo")
         self.assertEqual(rc, 0, out + err)
@@ -2308,7 +2415,7 @@ class LockIsReal(Rig):
         rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), nf])
         self.assertEqual(rc, 8)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER)
-        self.assertIn("CEO 승격 보류(다른 승격·강등이 진행 중)", _slurp(nf, encoding="utf-8"))
+        self.assertIn("CEO 승격 보류(다른 승격·강등이 진행 중)", self.notices_text())
         rc = ns["do_demote"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), nf])
         self.assertEqual(rc, 8)
 
