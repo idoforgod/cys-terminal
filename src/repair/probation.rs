@@ -1009,6 +1009,31 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
         if apply::approved_copy_of_current_generation_in(root, pack, lane, rel).unwrap_or(false) {
             continue;
         }
+        // CU2: the owner-approved copy of this generation stays the source of the right bytes (also
+        // after its probation closed superseded); the approved bytes live → nothing to do; a copy that
+        // cannot be verified → NOTHING is put back for this file, a finding for the worker
+        let approved = apply::approved_copy_resolution_in(root, pack, lane, rel);
+        if let apply::ApprovedCopy::Found(_, holder) = &approved {
+            if std::fs::read(holder).ok().as_deref() == Some(bytes.as_slice()) {
+                continue;
+            }
+        }
+        if let apply::ApprovedCopy::Unverifiable(by) = &approved {
+            if !already("approved-copy-unverifiable") {
+                new_findings.push(Finding {
+                    rel: rel.to_string(),
+                    sha256: sha.clone(),
+                    kind: "approved-copy-unverifiable".into(),
+                    at: env.op.now,
+                    notice: true,
+                    notified: false,
+                    slot: None,
+                    kept_copy: None,
+                    note: format!("주인이 승인한 {} 의 승인본을 확인할 수 없어 이 파일은 아무것도 되돌리지 않았습니다(워커 검토)", by.as_str()),
+                });
+            }
+            continue;
+        }
         let lf_only = false;
         let deadline = check_deadline(rel);
         let verdict = match (env.check)(rel, pack, deadline) {
@@ -1086,10 +1111,10 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
             })
             .unwrap_or(0o644);
         // the put-back content: the approved copy of the current generation, else our original of it
-        let target: Option<(Vec<u8>, u32)> = match apply::approved_copy_source_in(root, pack, lane, rel) {
-            Some((TargetState::File { mode, .. }, holder)) => std::fs::read(&holder).ok().map(|b| (b, mode)),
-            Some(_) => None,
-            None => original.clone().map(|o| (o, live_mode)),
+        let target: Option<(Vec<u8>, u32)> = match &approved {
+            apply::ApprovedCopy::Found(TargetState::File { mode, .. }, holder) => std::fs::read(holder).ok().map(|b| (b, *mode)),
+            apply::ApprovedCopy::Found(..) | apply::ApprovedCopy::Unverifiable(_) => None,
+            apply::ApprovedCopy::None => original.clone().map(|o| (o, live_mode)),
         };
         let Some((orig, mode)) = target else {
             if !already("no-original") {
@@ -1140,10 +1165,10 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
             if TargetState::read(&live)? != sampled_live {
                 return Ok(None);
             }
-            let source_now: Option<String> = match apply::approved_copy_source_in(root, pack, lane, rel) {
-                Some((TargetState::File { .. }, holder)) => std::fs::read(&holder).ok().map(|b| sha_hex(&b)),
-                Some(_) => None,
-                None => (env.original)(rel).map(|o| sha_hex(&o)),
+            let source_now: Option<String> = match apply::approved_copy_resolution_in(root, pack, lane, rel) {
+                apply::ApprovedCopy::Found(TargetState::File { .. }, holder) => std::fs::read(&holder).ok().map(|b| sha_hex(&b)),
+                apply::ApprovedCopy::Found(..) | apply::ApprovedCopy::Unverifiable(_) => None,
+                apply::ApprovedCopy::None => (env.original)(rel).map(|o| sha_hex(&o)),
             };
             if source_now.as_deref() != Some(source_sha.as_str()) {
                 return Ok(None);

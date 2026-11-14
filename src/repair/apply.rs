@@ -1741,25 +1741,31 @@ pub fn approved_copy_of_current_generation_in(
     Ok(false)
 }
 
-/// The bytes of the approved copy of the CURRENT generation for `rel` in this lane, when one
-/// exists (§6-10 (2) "마지막 승인본 저장소"): the newest in-force approved repair (boot-critical or
-/// protection-related, current generation) whose applied apply operation kept a copy slot — that
-/// slot's verified payload. M10 puts this back before it would fall back to the vendor original.
-pub fn approved_copy_source_in(
-    root: &Path,
-    pack: &Path,
-    lane: &LaneKey,
-    rel: &str,
-) -> Option<(TargetState, PathBuf)> {
+/// What the hourly scan knows about the owner-approved copy of `rel` for the CURRENT generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovedCopy {
+    /// No approved repair of this generation applied `rel` in this lane.
+    None,
+    /// The verified payload of the last approved copy slot.
+    Found(TargetState, PathBuf),
+    /// An approved repair of this generation applied `rel` here, but its copy cannot be verified —
+    /// the scan then puts NOTHING back for the file (CU2).
+    Unverifiable(RepairId),
+}
+
+/// CU2 — the approved copy of the CURRENT generation for `rel` in this lane (§6-10 (2) "마지막
+/// 승인본 저장소"): the NEWEST approved boot-critical / protection-related repair whose row is bound
+/// to the current generation and applied `rel` here — in force, OR whose probation was closed as
+/// superseded by a later change of the live file (the owner's approval of this generation still
+/// stands); a repair that was reverted or failed no longer counts. Its applied operation's copy slot
+/// must verify (identity + state); otherwise `Unverifiable`.
+pub fn approved_copy_resolution_in(root: &Path, pack: &Path, lane: &LaneKey, rel: &str) -> ApprovedCopy {
     let gen = pack_generation(pack);
     for id in ledger::list_ids_in(root).into_iter().rev() {
         let Ok(Some(rec)) = ledger::read_record_in(root, &id) else {
             continue;
         };
-        if !is_approval_class(rec.classification)
-            || !rec.approval.as_ref().is_some_and(|a| a.approved)
-            || !matches!(rec.state, RepairState::Probation | RepairState::InUse)
-        {
+        if !is_approval_class(rec.classification) || !rec.approval.as_ref().is_some_and(|a| a.approved) {
             continue;
         }
         let Ok(Some(row)) = ledger::read_lane_in(root, &id, lane) else {
@@ -1771,21 +1777,41 @@ pub fn approved_copy_source_in(
         if p.pack_generation != gen.version || p.pro_revision != gen.pro_revision {
             continue;
         }
-        let Some(op) = applied_op_for(root, &id, lane, rel) else {
+        let stands = match p.closed.as_deref() {
+            None => matches!(rec.state, RepairState::Probation | RepairState::InUse),
+            Some(c) => c.starts_with("사용 중") || c.starts_with("대체됨"),
+        };
+        if !stands || !row.applied.iter().any(|(r, _)| r == rel) {
             continue;
+        }
+        let Some(op) = applied_op_for(root, &id, lane, rel) else {
+            return ApprovedCopy::Unverifiable(id);
         };
         let (Some(dir), Some(want)) = (op.incoming_copy.as_ref(), op.incoming_copy_identity.as_ref()) else {
-            continue;
+            return ApprovedCopy::Unverifiable(id);
         };
         let slot = Slot::at(dir, rel);
-        let Ok(st) = TargetState::read(&slot.payload()) else {
-            continue;
-        };
-        if identity_of(&slot.payload()).ok().as_ref() == Some(want) && parse_canon(&op.incoming) == Some(st.clone()) {
-            return Some((st, slot.payload()));
+        match TargetState::read(&slot.payload()) {
+            Ok(st) if identity_of(&slot.payload()).ok().as_ref() == Some(want) && parse_canon(&op.incoming) == Some(st.clone()) => {
+                return ApprovedCopy::Found(st, slot.payload());
+            }
+            _ => return ApprovedCopy::Unverifiable(id),
         }
     }
-    None
+    ApprovedCopy::None
+}
+
+/// [`approved_copy_resolution_in`] as the verified copy only.
+pub fn approved_copy_source_in(
+    root: &Path,
+    pack: &Path,
+    lane: &LaneKey,
+    rel: &str,
+) -> Option<(TargetState, PathBuf)> {
+    match approved_copy_resolution_in(root, pack, lane, rel) {
+        ApprovedCopy::Found(st, p) => Some((st, p)),
+        _ => None,
+    }
 }
 
 /// F9's triple check (boot-critical OR protection-related — RULINGS U1); M10's.

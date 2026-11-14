@@ -849,3 +849,51 @@ fn a_revert_that_errors_every_time_ends_failed() {
     assert!(!rep.ended.contains(&a), "never 사용 중");
     assert_ne!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::InUse);
 }
+
+// ───────────────────────────── RULINGS CU2 — never less than what the owner approved ─────────────────────────────
+
+/// CU2: an approved repair of this generation whose probation was closed SUPERSEDED (a later change
+/// of the live file) still defines the right bytes: when the file is then broken, the scan puts back
+/// the owner-APPROVED copy, never the vendor original; and when the approved copy cannot be verified
+/// NOTHING is put back for the file and a finding is recorded for the worker. Without CU2 the scan
+/// ignored the superseded repair and restored the vendor original (re-introducing the fixed bug).
+#[cfg(target_os = "macos")]
+#[test]
+fn the_scan_never_puts_back_less_than_the_approved_copy() {
+    let Some(rel) = listed() else {
+        return;
+    };
+    for tamper in [false, true] {
+        let r = rig("cu2approved");
+        let id = rid("R-21");
+        crate::repair::apply::tests::approved_and_applied(&r, &id, rel, b"#!/bin/bash\necho vendor\n", b"#!/bin/bash\necho approved\n");
+        // the probation was closed superseded by a later change of the live file
+        let mut row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+        row.probation.as_mut().unwrap().closed = Some("대체됨 — 살아 있는 파일이 바뀜".into());
+        ledger::write_lane_in(&r.root, &row).unwrap();
+        let mut rec = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
+        rec.state = RepairState::Superseded;
+        ledger::write_record_in(&r.root, &rec).unwrap();
+        if tamper {
+            let (ops, _) = crate::repair::wal::list_in(&r.root, &id);
+            let op = ops.iter().find(|o| o.incoming_copy.is_some()).unwrap();
+            let p = crate::repair::vault::Slot::at(op.incoming_copy.as_ref().unwrap(), rel).payload();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::write(&p, b"TAMPERED").unwrap();
+        }
+        r.put(rel, b"#!/bin/bash\nbroken(\n", 0o755);
+        let fails = |x: &str, _: &Path, _: Duration| if x == rel { outcome(CheckResult::Fail("bad".into()), 5) } else { outcome(CheckResult::Pass, 5) };
+        let orig_of = |_: &str| Some(b"#!/bin/bash\necho vendor\n".to_vec());
+        let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
+        let lock = r.base.join(".pack-apply.lock");
+        let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+        let live = std::fs::read(r.pack.join(rel)).unwrap();
+        if tamper {
+            assert_eq!(live, b"#!/bin/bash\nbroken(\n", "nothing put back when the approved copy cannot be verified");
+            assert!(f.iter().any(|x| x.kind == "approved-copy-unverifiable"), "{f:?}");
+        } else {
+            assert_eq!(live, b"#!/bin/bash\necho approved\n", "the APPROVED copy, never the vendor original");
+        }
+    }
+}
