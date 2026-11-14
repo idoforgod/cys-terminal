@@ -1594,6 +1594,11 @@ pub(crate) fn guarded(what: &str, f: impl FnOnce()) -> bool {
 /// RULINGS DF4: a named thread for this channel; a thread that cannot be created is an error that is
 /// handled (logged, `false` — the caller takes its fallback), never a panic.
 pub(crate) fn spawn_thread(name: &str, f: impl FnOnce() + Send + 'static) -> bool {
+    #[cfg(test)]
+    if FAIL_SPAWN_FOR_TEST.with(|x| x.get()) {
+        drop(f);
+        return false;
+    }
     match std::thread::Builder::new()
         .name(format!("repair-{name}"))
         .spawn(move || {
@@ -1605,6 +1610,12 @@ pub(crate) fn spawn_thread(name: &str, f: impl FnOnce() + Send + 'static) -> boo
             false
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam of RULINGS DF4 / EL4: no thread can be made on this thread.
+    pub(crate) static FAIL_SPAWN_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// One enqueue attempt without waiting (the fallback when no delivery thread could be made).
@@ -1847,16 +1858,23 @@ pub(crate) fn handle_start(
     let waiter = move |rid: String, nonce: String, child: std::process::Child| {
         let pid = child.id();
         let (d1, rid1, nonce1) = (d.clone(), rid.clone(), nonce.clone());
-        let started = spawn_thread("helper-wait", move || {
-            let verified = wait_helper(child);
-            let eff = DaemonEffects { daemon: d1.clone() };
-            crate::repair::with_daemon_ctx(&d1, |ctx| {
-                let _ = finish_verification(ctx, &d1.repair_approvals, &eff, &rid1, &nonce1, verified);
-            });
-        });
-        if !started {
-            // no waiter: the helper is killed + reaped here and the click is not an approval
-            kill_and_reap(pid);
+        let started = start_waiter_or_reap(
+            move || {
+                let verified = wait_helper(child);
+                let eff = DaemonEffects { daemon: d1.clone() };
+                crate::repair::with_daemon_ctx(&d1, |ctx| {
+                    let _ =
+                        finish_verification(ctx, &d1.repair_approvals, &eff, &rid1, &nonce1, verified);
+                });
+            },
+            pid,
+            true,
+        );
+        if let Err(unreaped) = started {
+            // no waiter: the helper was killed + reaped (bounded) and the click is not an approval
+            if let Some(p) = unreaped {
+                eprintln!("cysd: 「스스로 해결」 본인 확인 도우미(pid {p})를 거두지 못했습니다 — 기록만 남깁니다");
+            }
             let eff = DaemonEffects { daemon: d.clone() };
             crate::repair::with_daemon_ctx(&d, |ctx| {
                 let _ = finish_verification(ctx, &d.repair_approvals, &eff, &rid, &nonce, false);
@@ -1866,20 +1884,48 @@ pub(crate) fn handle_start(
     approval_start(ctx, p, &daemon.repair_approvals, &eff, &waiter)
 }
 
-/// Kills and reaps a helper whose `Child` handle is gone (its waiter thread could not be made).
-fn kill_and_reap(pid: u32) {
+/// RULINGS EL4: kills (unless `kill` is false — the test seam standing for a helper slow to die) and
+/// reaps a helper whose `Child` handle is gone, NEVER blocking: `waitpid(…, WNOHANG)` polled for a
+/// fixed grace. Returns the pid it could not reap.
+fn kill_and_reap(pid: u32, kill: bool) -> Option<u32> {
     #[cfg(unix)]
     {
-        let pid = pid as libc::pid_t;
-        // SAFETY: kill(2) / waitpid(2) on our own child, not reaped yet (its pid cannot be reused).
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        let p = pid as libc::pid_t;
+        if kill {
+            // SAFETY: kill(2) on our own child, not reaped yet (its pid cannot be reused).
+            unsafe {
+                libc::kill(p, libc::SIGKILL);
+            }
         }
+        let grace = std::time::Instant::now();
+        while grace.elapsed() < Duration::from_millis(500) {
+            // SAFETY: waitpid(2) WNOHANG on our own child — returns at once.
+            let r = unsafe { libc::waitpid(p, std::ptr::null_mut(), libc::WNOHANG) };
+            if r == p || r < 0 {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Some(pid)
     }
     #[cfg(not(unix))]
     {
-        let _ = pid;
+        let _ = kill;
+        Some(pid)
+    }
+}
+
+/// RULINGS DF4 / EL4: starts the helper's waiter on its own thread; when no thread can be made the
+/// helper is killed and reaped HERE, bounded (`Err` carries the pid it could not reap, if any).
+fn start_waiter_or_reap(
+    start: impl FnOnce() + Send + 'static,
+    pid: u32,
+    kill: bool,
+) -> Result<(), Option<u32>> {
+    if spawn_thread("helper-wait", start) {
+        Ok(())
+    } else {
+        Err(kill_and_reap(pid, kill))
     }
 }
 
