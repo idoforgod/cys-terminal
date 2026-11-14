@@ -652,6 +652,55 @@ pub fn list_ids_in(root: &Path) -> Vec<RepairId> {
     ids
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only (T6 · FG1): the next enumerations of the repairs root fail (an unlistable root).
+    pub(crate) static FAIL_LIST_IDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// T6 · RULINGS FG1 (a granted seam beside `list_ids_in`, whose callers keep its behaviour): the
+/// repairs root's ids with three answers — `Ok(ids)`; `Ok(empty)` only on positive evidence (the root
+/// does not exist AND its parent could be read); `Err` for everything else (an unlistable root, an
+/// entry whose name or type cannot be read).
+pub fn list_ids_checked_in(root: &Path) -> Result<Vec<RepairId>, RepairError> {
+    #[cfg(test)]
+    if FAIL_LIST_IDS.with(|c| c.get()) {
+        return Err(RepairError::Io(format!("{}: 목록을 읽을 수 없습니다(시험 주입)", root.display())));
+    }
+    let rd = match std::fs::read_dir(root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return match root.parent().map(std::fs::read_dir) {
+                Some(Ok(_)) => Ok(Vec::new()),
+                _ => Err(RepairError::Io(format!("{}: 없음, 그러나 그 상위 폴더도 읽을 수 없습니다", root.display()))),
+            };
+        }
+        Err(e) => return Err(RepairError::Io(format!("{}: 목록을 읽을 수 없습니다 — {e}", root.display()))),
+    };
+    let mut ids = Vec::new();
+    for entry in rd {
+        let entry = entry.map_err(|e| RepairError::Io(format!("{}: 항목을 읽을 수 없습니다 — {e}", root.display())))?;
+        let ft = entry.file_type().map_err(|e| RepairError::Io(format!("{}: 항목 종류를 읽을 수 없습니다 — {e}", entry.path().display())))?;
+        if !ft.is_dir() {
+            continue;
+        }
+        if let Some(id) = entry.file_name().to_str().and_then(|n| RepairId::parse(n).ok()) {
+            ids.push(id);
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+/// T6 · RULINGS FG4 (a granted seam beside `write_lane_in`): the lane row written through the durable
+/// writer (file flushed, placed, directory flushed); a failure is returned — the event is not final.
+pub fn write_lane_durable_in(root: &Path, row: &LaneRecord) -> Result<(), RepairError> {
+    let p = lane_path_in(root, &row.repair, &row.lane);
+    let mut r = row.clone();
+    r.schema = super::REPAIR_SCHEMA;
+    super::durable::write_json_durable(&p, &r)
+}
+
 /// Allocates the next `R-<n>` by an exclusive directory create (O-C1-2: n = highest + 1; on
 /// `AlreadyExists` — another daemon won that number — the next one is tried). Unique across lanes
 /// because the create is atomic on the shared filesystem.

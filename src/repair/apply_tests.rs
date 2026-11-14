@@ -2435,3 +2435,47 @@ fn the_revert_recovery_sentence_follows_the_outcome() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("대체됨") && !lines[0].contains("마저 했습니다"), "{lines:?}");
 }
+
+// ───────────────────────────── RULINGS FG1 — no read collapses "could not read" into a value ─────────────────────────────
+
+/// FG1 (codex r4 B1): an apply bound to the free generation V is interrupted; the pack's state file
+/// then becomes CORRUPT (a pro pack of the same base, unreadable) — the generation "now" is Unknown,
+/// so the recovery puts NOTHING back. Without FG1 a corrupt state read as "free pack" and the free
+/// generation's pre-image went into the pro pack.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_corrupt_pack_state_is_an_unknown_generation_for_recovery() {
+    let r = rig("fg1state");
+    let id = rid("R-55");
+    let files = two_target_candidate(&r, &id);
+    let stop = StopOn { rel: "hooks/a2.sh", point: Point::AfterRecord, fired: Cell::new(false) };
+    assert!(apply_candidate_in(&r.env(&stop, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
+    std::fs::write(r.pack.join(crate::pack::PACK_STATE_FILE), b"{ corrupt").unwrap();
+    assert_eq!(Bound::now(&r.pack), Bound::Unknown);
+    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    resume_interrupted_in(&calm).unwrap();
+    recover_apply_intents_in(&calm, &no_repair_lock);
+    assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"NEW-1\n", "nothing put back into an unknown generation");
+    assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "superseded");
+}
+
+/// FG1 (codex r4 B2): the repairs root cannot be listed (injected) while known paths stay readable —
+/// the ledger is NOT complete: the resolution answers LedgerUnreadable (never NO APPROVAL) and the
+/// seam answers Unknown (never NotConsumed). A row that claims the file without its probation is an
+/// inconsistent member → Unknown.
+#[test]
+fn an_unlistable_root_and_a_row_without_probation_are_never_no_approval() {
+    let r = rig("fg1root");
+    let id = rid("R-56");
+    approved_and_applied(&r, &id, "hooks/u.sh", b"VENDOR\n", b"APPROVED\n");
+    crate::repair::ledger::FAIL_LIST_IDS.with(|c| c.set(true));
+    let answer = resolve_approved_copy_in(&r.root, &r.pack, &r.lane, "hooks/other.sh");
+    let consumed = crate::repair::consumed::approval_consumed_in(&r.root, &r.lane, "rqr-none");
+    crate::repair::ledger::FAIL_LIST_IDS.with(|c| c.set(false));
+    assert!(matches!(answer, ApprovedCopy::LedgerUnreadable { .. }), "{answer:?}");
+    assert!(matches!(consumed, crate::repair::consumed::ApprovalUse::Unknown(_)), "{consumed:?}");
+    let mut row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+    row.probation = None;
+    ledger::write_lane_in(&r.root, &row).unwrap();
+    assert!(matches!(resolve_approved_copy_in(&r.root, &r.pack, &r.lane, "hooks/u.sh"), ApprovedCopy::Unknown(_)));
+}

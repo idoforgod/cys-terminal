@@ -1252,3 +1252,24 @@ fn a_deferred_failed_recheck_is_never_closed_in_use() {
     assert!(!rep.ended.contains(&a), "never 사용 중");
     assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::Reverted);
 }
+
+/// FG1 (codex r4 B1) through M10: with the pack's state file corrupt the generation is Unknown — the
+/// scan puts nothing back (its binding at sampling is Unknown) and the binary's embedded originals
+/// are not offered as this generation's.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_corrupt_pack_state_suspends_the_put_back() {
+    let Some(rel) = listed() else {
+        return;
+    };
+    let r = rig("fg1m10");
+    r.put(rel, b"#!/bin/bash\nbroken(\n", 0o755);
+    std::fs::write(r.pack.join(crate::pack::PACK_STATE_FILE), b"{ corrupt").unwrap();
+    assert!(embedded_original_for(&r.pack, rel).is_none(), "no embedded original for an unknown generation");
+    let fails = |x: &str, _: &Path, _: Duration| if x == rel { outcome(CheckResult::Fail("bad".into()), 5) } else { outcome(CheckResult::Pass, 5) };
+    let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    let _ = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"#!/bin/bash\nbroken(\n", "nothing put back");
+}

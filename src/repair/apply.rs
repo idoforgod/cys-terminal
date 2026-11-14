@@ -161,6 +161,33 @@ fn stop(p: Point) -> RepairError {
 
 /// The pack generation of a lane's pack (C1 1.6, RULINGS O4): `.pack-version` + the pro revision
 /// (only for the pro channel — a pro revision under the same version is another generation).
+/// RULINGS FG1 — the pack generation with three answers: `Ok` (a readable `.pack-version`; the pro
+/// revision when the state says pro; a state file ABSENT = the free pack — the named legacy case);
+/// `Err` for everything else (no / unreadable / empty version, a CORRUPT state, a state whose
+/// `base_version` disagrees with `.pack-version`). Decisions read it through `Bound::now`.
+pub fn pack_generation_checked(pack: &Path) -> Result<PackGeneration, String> {
+    let version = std::fs::read_to_string(pack.join(".pack-version"))
+        .map_err(|e| format!(".pack-version: {e}"))?
+        .trim()
+        .to_string();
+    if version.is_empty() {
+        return Err(".pack-version: 비어 있음".into());
+    }
+    let pro_revision = match crate::pack::read_pack_state(pack) {
+        crate::pack::PackStateRead::Absent => None,
+        crate::pack::PackStateRead::Valid(st) => {
+            if !st.base_version.is_empty() && st.base_version != version {
+                return Err(format!("팩 상태의 기준 판({})이 .pack-version({version})과 다름", st.base_version));
+            }
+            (st.channel == "pro").then_some(st.pro_revision)
+        }
+        crate::pack::PackStateRead::Corrupt(m) => return Err(format!("팩 상태 손상: {m}")),
+    };
+    Ok(PackGeneration { version, pro_revision })
+}
+
+/// The pack generation for DISPLAY and records only ("unknown" when it cannot be read — never a
+/// decision: decisions use [`Bound::now`]).
 pub fn pack_generation(pack: &Path) -> PackGeneration {
     let version = std::fs::read_to_string(pack.join(".pack-version"))
         .map(|s| s.trim().to_string())
@@ -199,9 +226,12 @@ impl Bound {
     pub fn from_row(p: &ledger::Probation) -> Bound {
         Bound::of(Some(PackGeneration { version: p.pack_generation.clone(), pro_revision: p.pro_revision }))
     }
-    /// The pack's generation read at this moment.
+    /// The pack's generation read at this moment (FG1: unreadable / inconsistent metadata → Unknown).
     pub fn now(pack: &Path) -> Bound {
-        Bound::of(Some(pack_generation(pack)))
+        match pack_generation_checked(pack) {
+            Ok(g) => Bound::of(Some(g)),
+            Err(_) => Bound::Unknown,
+        }
     }
     /// Known AND equal to the pack's generation read now (Unknown equals nothing).
     pub fn equals_now(&self, pack: &Path) -> bool {
@@ -1280,12 +1310,18 @@ pub fn resume_interrupted_report_in(env: &OpEnv<'_>) -> Result<(u32, Vec<(Repair
     let mut errors = Vec::new();
     let mut n = 0u32;
     // EJ4: per repair — its guard TRIED first (held → left alone this tick), its records read only
-    // AFTER the guard is held (never a list snapshotted before)
-    for id in ledger::list_ids_in(env.root) {
+    // AFTER the guard is held (never a list snapshotted before). FG1: a failed listing is an error.
+    for id in ledger::list_ids_checked_in(env.root)? {
         let Some(_guard) = super::guard::RepairGuard::try_take(env.root, &id) else {
             continue;
         };
-        let (ops, _) = wal::list_in(env.root, &id);
+        let ops = match wal::list_checked_in(env.root, &id) {
+            Ok(ops) => ops,
+            Err(e) => {
+                errors.push((id.clone(), format!("동작 기록을 읽을 수 없습니다({e})")));
+                continue;
+            }
+        };
         for rec in ops.into_iter().filter(|r| r.lane_key == *env.lane && !r.finished && r.form != "hook") {
         let (repair, op_id) = (rec.repair.clone(), rec.op.clone());
         match resume_op(env, rec) {
@@ -1536,6 +1572,11 @@ pub fn revert_intent_path_in(root: &Path, id: &RepairId, lane: &LaneKey) -> Path
     ledger::repair_dir_in(root, id).join("intents").join(format!("{}.revert.json", lane.0))
 }
 
+/// FG1: the revert intent with three answers (as [`read_intent_checked_in`]).
+pub fn read_revert_intent_checked_in(root: &Path, id: &RepairId, lane: &LaneKey) -> Result<Option<RevertIntent>, String> {
+    read_checked(&revert_intent_path_in(root, id, lane), &ledger::repair_dir_in(root, id))
+}
+
 pub fn read_revert_intent_in(root: &Path, id: &RepairId, lane: &LaneKey) -> Option<RevertIntent> {
     serde_json::from_slice(&std::fs::read(revert_intent_path_in(root, id, lane)).ok()?).ok()
 }
@@ -1549,13 +1590,22 @@ fn write_revert_intent(root: &Path, ri: &RevertIntent) -> Result<(), RepairError
 /// bound to its generation (a different generation → nothing put back, closed superseded).
 pub fn recover_revert_intents_in(env: &OpEnv<'_>, hooks: &HookStepFn<'_>, locked: &RepairLock<'_>) -> Vec<String> {
     let mut lines = Vec::new();
-    for id in ledger::list_ids_in(env.root) {
+    let ids = match ledger::list_ids_checked_in(env.root) {
+        Ok(ids) => ids,
+        Err(e) => return vec![format!("수리 장부 목록을 읽을 수 없어 끊긴 되돌리기를 찾지 못했습니다 — 다음 차례에 다시({e:?})")],
+    };
+    for id in ids {
         // EJ4: a revert running now holds the repair's guard; its intent is read AFTER holding it
         let Some(_guard) = super::guard::RepairGuard::try_take(env.root, &id) else {
             continue;
         };
-        let Some(mut ri) = read_revert_intent_in(env.root, &id, env.lane) else {
-            continue;
+        let mut ri = match read_revert_intent_checked_in(env.root, &id, env.lane) {
+            Ok(Some(ri)) => ri,
+            Ok(None) => continue,
+            Err(e) => {
+                lines.push(format!("{}: 되돌리기 의도를 읽을 수 없습니다 — 다음 차례에 다시({e})", id.as_str()));
+                continue;
+            }
         };
         if ri.state != "reverting" {
             continue;
@@ -1684,7 +1734,9 @@ pub fn revert_in(
     let has_hooks = ledger::hook_lines(&rec).next().is_some();
     // DR7: an interrupted revert of this repair in this lane is completed first (never re-planned
     // against a row an already-restored file no longer matches)
-    if let Some(mut ri) = read_revert_intent_in(env.root, id, env.lane) {
+    let pending = read_revert_intent_checked_in(env.root, id, env.lane)
+        .map_err(|e| RepairError::Corrupt(format!("{}: 되돌리기 의도를 읽을 수 없어 되돌리지 않습니다 — {e}", id.as_str())))?;
+    if let Some(mut ri) = pending {
         if ri.state == "reverting" {
             return recover_one_revert(env, &rec, &mut ri, hooks, locked);
         }
@@ -2005,7 +2057,12 @@ pub enum ApprovedCopy {
 /// to the repairs root), if any.
 pub fn unreadable_ledger_member(root: &Path, lane: &LaneKey) -> Option<String> {
     let rel_of = |p: PathBuf| p.strip_prefix(root).map(|r| r.display().to_string()).unwrap_or_else(|_| p.display().to_string());
-    for id in ledger::list_ids_in(root) {
+    // FG1: an enumeration that FAILED is not "no repairs"
+    let ids = match ledger::list_ids_checked_in(root) {
+        Ok(ids) => ids,
+        Err(e) => return Some(format!("수리 장부 목록({e:?})")),
+    };
+    for id in ids {
         if ledger::read_record_in(root, &id).is_err() {
             return Some(rel_of(ledger::record_path_in(root, &id)));
         }
@@ -2022,7 +2079,11 @@ pub fn resolve_approved_copy_in(root: &Path, pack: &Path, lane: &LaneKey, rel: &
     if let Some(cause) = unreadable_ledger_member(root, lane) {
         return ApprovedCopy::LedgerUnreadable { cause };
     }
-    for id in ledger::list_ids_in(root).into_iter().rev() {
+    let ids = match ledger::list_ids_checked_in(root) {
+        Ok(ids) => ids,
+        Err(e) => return ApprovedCopy::LedgerUnreadable { cause: format!("수리 장부 목록({e:?})") },
+    };
+    for id in ids.into_iter().rev() {
         let (Ok(row), Ok(rec)) = (ledger::read_lane_in(root, &id, lane), ledger::read_record_in(root, &id)) else {
             return ApprovedCopy::LedgerUnreadable { cause: id.as_str().to_string() };
         };
@@ -2040,12 +2101,13 @@ pub fn resolve_approved_copy_in(root: &Path, pack: &Path, lane: &LaneKey, rel: &
             }
             continue;
         };
-        let Some(p) = row.probation.as_ref() else {
-            continue;
-        };
         if !row.applied.iter().any(|(r, _)| r == rel) {
             continue;
         }
+        // FG1: a row that claims the file without its probation is an inconsistent member
+        let Some(p) = row.probation.as_ref() else {
+            return ApprovedCopy::Unknown(format!("{}: 이 파일을 말하는 행에 시험 기간 기록이 없습니다", id.as_str()));
+        };
         match Bound::from_row(p) {
             Bound::Unknown => {
                 return ApprovedCopy::Unknown(format!("{}: 이 파일을 말하는 행의 팩 세대를 알 수 없습니다(재구성된 행)", id.as_str()))
@@ -2388,6 +2450,23 @@ pub fn intent_path_in(root: &Path, id: &RepairId, lane: &LaneKey) -> PathBuf {
     ledger::repair_dir_in(root, id).join("intents").join(format!("{}.json", lane.0))
 }
 
+/// FG1: the apply intent with three answers — `Ok(Some)`, `Ok(None)` only when the file does not exist
+/// AND the repair's folder could be read, `Err` for everything else.
+pub fn read_intent_checked_in(root: &Path, id: &RepairId, lane: &LaneKey) -> Result<Option<ApplyIntent>, String> {
+    read_checked(&intent_path_in(root, id, lane), &ledger::repair_dir_in(root, id))
+}
+
+fn read_checked<T: serde::de::DeserializeOwned>(path: &Path, owner_dir: &Path) -> Result<Option<T>, String> {
+    match std::fs::read(path) {
+        Ok(b) => serde_json::from_slice(&b).map(Some).map_err(|e| format!("{}: 읽을 수 없음 — {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match std::fs::read_dir(owner_dir) {
+            Ok(_) => Ok(None),
+            Err(e2) => Err(format!("{}: 없음, 그러나 {} 도 읽을 수 없음 — {e2}", path.display(), owner_dir.display())),
+        },
+        Err(e) => Err(format!("{}: 읽을 수 없음 — {e}", path.display())),
+    }
+}
+
 pub fn read_intent_in(root: &Path, id: &RepairId, lane: &LaneKey) -> Option<ApplyIntent> {
     let b = std::fs::read(intent_path_in(root, id, lane)).ok()?;
     serde_json::from_slice(&b).ok()
@@ -2413,13 +2492,22 @@ fn set_intent_state(root: &Path, intent: &mut ApplyIntent, state: &str, note: &s
 /// (`incomplete`). Per repair fault-isolated (CU1): one repair's failure is a line, not an abort.
 pub fn recover_apply_intents_in(env: &OpEnv<'_>, locked: &RepairLock<'_>) -> Vec<String> {
     let mut lines = Vec::new();
-    for id in ledger::list_ids_in(env.root) {
+    let ids = match ledger::list_ids_checked_in(env.root) {
+        Ok(ids) => ids,
+        Err(e) => return vec![format!("수리 장부 목록을 읽을 수 없어 끊긴 적용을 찾지 못했습니다 — 다음 차례에 다시({e:?})")],
+    };
+    for id in ids {
         // EJ4: an apply running now holds the repair's guard; the intent is read AFTER holding it
         let Some(_guard) = super::guard::RepairGuard::try_take(env.root, &id) else {
             continue;
         };
-        let Some(mut intent) = read_intent_in(env.root, &id, env.lane) else {
-            continue;
+        let mut intent = match read_intent_checked_in(env.root, &id, env.lane) {
+            Ok(Some(i)) => i,
+            Ok(None) => continue,
+            Err(e) => {
+                lines.push(format!("{}: 적용 의도를 읽을 수 없습니다 — 다음 차례에 다시({e})", id.as_str()));
+                continue;
+            }
         };
         if intent.state != "applying" {
             continue;
@@ -4059,11 +4147,21 @@ pub fn resume_hook_steps_report_in(
     let mut n = 0;
     // EJ4: a hook step running now holds its repair's guard (from before its dry run — the commit
     // takes it at its top); recovery tries the guard and reads the hook records AFTER holding it
-    for id in ledger::list_ids_in(root) {
+    let ids = match ledger::list_ids_checked_in(root) {
+        Ok(ids) => ids,
+        Err(e) => return (0, vec![(RepairId::parse("R-1").unwrap_or_else(|_| unreachable!()), format!("수리 장부 목록을 읽을 수 없습니다({e:?})"))]),
+    };
+    for id in ids {
         let Some(_guard) = super::guard::RepairGuard::try_take(root, &id) else {
             continue;
         };
-        let (ops, _) = wal::list_in(root, &id);
+        let ops = match wal::list_checked_in(root, &id) {
+            Ok(ops) => ops,
+            Err(e) => {
+                errors.push((id.clone(), format!("훅 동작 기록을 읽을 수 없습니다({e})")));
+                continue;
+            }
+        };
         for mut op in ops.into_iter().filter(|r| r.lane_key == *lane && !r.finished && r.form == "hook") {
         let Ok(Some(rec)) = ledger::read_record_in(root, &op.repair) else {
             continue;

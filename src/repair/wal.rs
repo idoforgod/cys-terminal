@@ -79,6 +79,36 @@ pub fn ops_dir_in(root: &Path, id: &RepairId) -> PathBuf {
     super::ledger::repair_dir_in(root, id).join("ops")
 }
 
+/// RULINGS FG1 — a repair's operation records with three answers: `Ok(records)`; `Ok(empty)` only when
+/// `ops/` does not exist AND the repair's folder could be read; `Err` for an unlistable folder or ANY
+/// record that cannot be read (a decision is never made on a partial log).
+pub fn list_checked_in(root: &Path, id: &RepairId) -> Result<Vec<OpRecord>, String> {
+    let dir = ops_dir_in(root, id);
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::read_dir(super::ledger::repair_dir_in(root, id)) {
+                Ok(_) => Ok(Vec::new()),
+                Err(e2) => Err(format!("{}: 없음, 그러나 수리 폴더도 읽을 수 없음 — {e2}", dir.display())),
+            };
+        }
+        Err(e) => return Err(format!("{}: 목록을 읽을 수 없음 — {e}", dir.display())),
+    };
+    let mut out = Vec::new();
+    for entry in rd {
+        let entry = entry.map_err(|e| format!("{}: 항목을 읽을 수 없음 — {e}", dir.display()))?;
+        let p = entry.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let b = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let r: OpRecord = serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", p.display()))?;
+        out.push(r);
+    }
+    out.sort_by(|a, b| a.created_at.partial_cmp(&b.created_at).unwrap_or(std::cmp::Ordering::Equal).then(a.op.cmp(&b.op)));
+    Ok(out)
+}
+
 /// `<root>/R-<n>/ops/<op>.json` (the layout of `paths::op_path`).
 pub fn op_path_in(root: &Path, id: &RepairId, op: &str) -> PathBuf {
     ops_dir_in(root, id).join(format!("{op}.json"))

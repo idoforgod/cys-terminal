@@ -20,14 +20,16 @@ pub fn approval_consumed_in(root: &Path, lane: &LaneKey, approval_ref: &str) -> 
     if let Some(cause) = super::apply::unreadable_ledger_member(root, lane) {
         return ApprovalUse::Unknown(format!("장부의 {cause} 을(를) 읽을 수 없습니다"));
     }
-    for id in super::ledger::list_ids_in(root) {
-        let intent_path = super::apply::intent_path_in(root, &id, lane);
-        if intent_path.exists() {
-            match super::apply::read_intent_in(root, &id, lane) {
-                Some(intent) if intent.approval_ref.as_deref() == Some(approval_ref) => return ApprovalUse::Consumed,
-                Some(_) => {}
-                None => return ApprovalUse::Unknown(format!("{}: 적용 의도를 읽을 수 없습니다", id.as_str())),
-            }
+    // FG1: a failed enumeration or an unreadable intent is never "not consumed"
+    let ids = match super::ledger::list_ids_checked_in(root) {
+        Ok(ids) => ids,
+        Err(e) => return ApprovalUse::Unknown(format!("수리 장부 목록을 읽을 수 없습니다({e:?})")),
+    };
+    for id in ids {
+        match super::apply::read_intent_checked_in(root, &id, lane) {
+            Ok(Some(intent)) if intent.approval_ref.as_deref() == Some(approval_ref) => return ApprovalUse::Consumed,
+            Ok(_) => {}
+            Err(e) => return ApprovalUse::Unknown(format!("{}: 적용 의도를 읽을 수 없습니다({e})", id.as_str())),
         }
         if let Ok(Some(row)) = super::ledger::read_lane_in(root, &id, lane) {
             if row.approval_ref.as_deref() == Some(approval_ref) {
