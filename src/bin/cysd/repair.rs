@@ -181,12 +181,36 @@ pub(crate) fn bind_role_family(
     Some(fam)
 }
 
-/// Drops a closed seat's binding.
+/// Drops a closed seat's binding (and its DG1 departure mark).
 pub(crate) fn forget_role_family(lane: &str, incarnation: &str, sid: u64) {
+    let key = (lane.to_string(), incarnation.to_string(), sid);
     role_bindings()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(&(lane.to_string(), incarnation.to_string(), sid));
+        .remove(&key);
+    family_departures()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+}
+
+/// RULINGS DG1 (T4b) — the seats that LEFT a role family in this daemon incarnation (lane,
+/// incarnation, seat): a claim whose family differs from the seat's earlier role's family or from
+/// its AD1 binding. A permanent mark for the seat's life in this incarnation (memory only — a
+/// daemon restart releases every lock anyway, so nothing it authorised survives); dropped with the
+/// seat. A leaf lock like the binding map.
+fn family_departures() -> &'static Mutex<std::collections::HashSet<(String, String, u64)>> {
+    static D: std::sync::OnceLock<Mutex<std::collections::HashSet<(String, String, u64)>>> =
+        std::sync::OnceLock::new();
+    D.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Whether the seat left a role family in this daemon incarnation (DG1).
+pub(crate) fn left_role_family(lane: &str, incarnation: &str, sid: u64) -> bool {
+    family_departures()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&(lane.to_string(), incarnation.to_string(), sid))
 }
 
 /// RULINGS AD1 — the ONE recording call where a role is claimed (`handlers.rs`, `system.claim_role`,
@@ -206,8 +230,21 @@ pub(crate) fn record_role_claim(
     previous: Option<&str>,
     claimed: &str,
 ) -> Option<RoleFamily> {
-    bind_role_family(lane, incarnation, sid, previous)
-        .or_else(|| bind_role_family(lane, incarnation, sid, Some(claimed)))
+    let bound = bind_role_family(lane, incarnation, sid, previous)
+        .or_else(|| bind_role_family(lane, incarnation, sid, Some(claimed)));
+    // RULINGS DG1 (T4b): an incompatible family transition is remembered for the seat's life — a
+    // seat that left the worker family never gets its repair's write authority back
+    let claimed_family = role_family(claimed);
+    let previous_family = previous.and_then(role_family);
+    if (previous_family.is_some() && previous_family != claimed_family)
+        || (bound.is_some() && bound != claimed_family)
+    {
+        family_departures()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((lane.to_string(), incarnation.to_string(), sid));
+    }
+    bound
 }
 
 impl Caller {
@@ -3826,6 +3863,8 @@ mod grant_verbs {
         let family_now = caller.role.as_deref().and_then(super::role_family);
         if family_now != Some(super::RoleFamily::Worker)
             || caller.bound_family != Some(super::RoleFamily::Worker)
+            // DG1: a seat that ever left its family (worker → master → worker) stays refused
+            || super::left_role_family(&ctx.lane.0, &ctx.incarnation, sid)
         {
             return no(RULE_DOC_WORKER_ONLY_KO);
         }

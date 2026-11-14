@@ -1674,7 +1674,59 @@ fn cv2_the_real_claim_role_line_takes_the_write_away() {
     let v = ask();
     assert_eq!(v["allowed"], false);
     assert_eq!(v["reason"], rule_doc_allowed_worker_only_ko(), "{v}");
+    // RULINGS DG1: back to worker through the same real line — still refused (the seat left its
+    // family once; its write authority never comes back)
+    let req = cys::Request {
+        id: json!(3),
+        method: "system.claim_role".into(),
+        params: json!({"role": "worker", "surface_id": sid}),
+    };
+    let Reply::Single(c) = dispatch(&d, req, Some(pid)) else {
+        panic!("one reply")
+    };
+    assert_eq!(c["ok"], json!(true), "claim_role worker: {c}");
+    let v = ask();
+    assert_eq!(v["allowed"], false);
+    assert_eq!(v["reason"], rule_doc_allowed_worker_only_ko(), "worker → master → worker: {v}");
     let _ = std::fs::remove_dir_all(production_root(&d));
+}
+
+/// RULINGS DG1: a seat that left the worker family never gets its repair's write authority back —
+/// a worker begins a token-backed rule-document repair (allowed), is re-declared master, then
+/// worker again: still "not allowed"; the repair is continued by ANOTHER worker seat through a
+/// normal pick-up (after the first seat's lease) and that seat is allowed.
+#[test]
+fn dg1_worker_master_worker_stays_refused_and_another_worker_picks_up() {
+    let mut r = rig("dg1");
+    r.lane = LaneKey(format!("dg1-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+    r.inc = "dg1-inc".into();
+    let (lane, inc) = (r.lane.0.clone(), r.inc.clone());
+    let t = now0();
+    let token = token_for(&r, "soul.md", t);
+    let first = 81u64;
+    let w1 = seat_caller(&lane, &inc, first, Some("worker".into()));
+    let v = r
+        .call(t + 2.0, &w1, "begin", json!({"trigger": "owner_order", "files": ["soul.md"], "owner_token": token}))
+        .unwrap();
+    assert_eq!(v["owner_token_bound"], true);
+    let ask = |who: &Caller, at: f64| r.call(at, who, "rule_doc_allowed", json!({"path": "soul.md"})).unwrap();
+    assert_eq!(ask(&w1, t + 3.0)["allowed"], true);
+    record_role_claim(&lane, &inc, first, Some("worker"), "master");
+    record_role_claim(&lane, &inc, first, Some("master"), "worker");
+    let back = seat_caller(&lane, &inc, first, Some("worker".into()));
+    assert_eq!((back.bound_family, back.role.as_deref()), (Some(RoleFamily::Worker), Some("worker")));
+    let v = ask(&back, t + 4.0);
+    assert_eq!(v["allowed"], false, "worker → master → worker: {v}");
+    assert_eq!(v["reason"], rule_doc_allowed_worker_only_ko());
+    // another worker seat picks the repair up once the first seat's lease is over
+    let later = t + 4.0 + 7_200.0 + 61.0;
+    let w2 = seat_caller(&lane, &inc, 82, Some("worker".into()));
+    let p = r
+        .call(later, &w2, "begin", json!({"trigger": "owner_order", "files": ["soul.md"], "owner_token": token}))
+        .unwrap();
+    assert_eq!(p["begin"], "picked-up", "{p}");
+    assert_eq!(ask(&w2, later + 1.0)["allowed"], true, "the second worker may write");
+    assert_eq!(ask(&back, later + 1.0)["allowed"], false, "the first seat still may not");
 }
 
 // ───────────────────────────── RULINGS CV3 (T4b) ─────────────────────────────
