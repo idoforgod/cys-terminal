@@ -835,7 +835,7 @@ fn production_classify(
             Ok(())
         } else {
             Err(RepairError::Precondition(format!(
-                "{rel}: 목록의 표기는 `{row}` 입니다 — 대소문자까지 그 표기로 다시 시작하세요(검사 종류와 시한은 정확한 표기로 찾습니다)"
+                "{rel}: 목록의 표기는 `{row}` 입니다 — 같은 파일의 다른 표기(대소문자 · 링크 · `..`)로는 시작하지 않습니다. 목록의 표기 그대로 다시 시작하세요(검사 종류와 시한은 정확한 표기로 찾습니다)"
             )))
         }
     };
@@ -859,8 +859,10 @@ fn production_classify(
             "{rel}: 보호장치 · 기동 필수 여부를 가릴 수 없어 시작하지 않습니다"
         )));
     }
+    // RULINGS CY1: the classification names the row through ANY identity of the path (a link, `..`
+    // after a link, a hard link); the REQUESTED spelling must be the row's own
     if let Some(e) = a.protection {
-        exact(a.rel.as_deref().unwrap_or(rel), e.rel)?;
+        exact(rel, e.rel)?;
         return Ok(Classification::ProtectionRelated);
     }
     if let Some(e) = boot_critical_entry(rel) {
@@ -869,7 +871,7 @@ fn production_classify(
     }
     match (a.decision, a.entry) {
         (Decision::Yes, Some(e)) => {
-            exact(a.rel.as_deref().unwrap_or(rel), e.rel)?;
+            exact(rel, e.rel)?;
             Ok(Classification::BootCritical)
         }
         (Decision::Yes, None) => Err(RepairError::Precondition(format!(

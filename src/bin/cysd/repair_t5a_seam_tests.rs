@@ -378,3 +378,42 @@ fn a_capital_sharp_s_spelling_of_an_absent_row_is_refused_naming_the_row() {
         Some("boss_directive.md")
     );
 }
+
+/// RULINGS CY1 — the daemon's caller: a path that names a listed row through ANY identity (an alias
+/// directory inside the pack, `..` after a link, an alias of the file) is refused naming the row; an
+/// alias pointing out of the pack is General.
+#[cfg(unix)]
+#[test]
+fn an_in_pack_alias_of_a_listed_file_is_refused_naming_the_row() {
+    let pack = scratch("cy1-pack");
+    let out = scratch("cy1-out");
+    for d in ["hooks/sub", "notes"] {
+        std::fs::create_dir_all(pack.join(d)).unwrap();
+    }
+    std::fs::write(pack.join("hooks/session-start.sh"), "#!/bin/sh\n").unwrap();
+    std::os::unix::fs::symlink(pack.join("hooks"), pack.join("hooks-alias")).unwrap();
+    std::os::unix::fs::symlink(pack.join("hooks/sub"), pack.join("notes/sub-link")).unwrap();
+    std::os::unix::fs::symlink(
+        pack.join("hooks/session-start.sh"),
+        pack.join("notes/ss.sh"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&out, pack.join("out-alias")).unwrap();
+    for spelled in [
+        "hooks-alias/session-start.sh",
+        "notes/sub-link/../session-start.sh",
+        "notes/ss.sh",
+    ] {
+        let e = production_classify(spelled, &pack).unwrap_err();
+        assert!(
+            format!("{e:?}").contains("`hooks/session-start.sh`"),
+            "{spelled}: {e:?}"
+        );
+    }
+    assert_eq!(
+        production_classify("out-alias/session-start.sh", &pack).unwrap(),
+        Classification::General
+    );
+    let _ = std::fs::remove_dir_all(&pack);
+    let _ = std::fs::remove_dir_all(&out);
+}

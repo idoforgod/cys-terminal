@@ -376,6 +376,84 @@ fn canonical_form(abs: &str, windows: bool) -> Option<String> {
     ))
 }
 
+/// RULINGS CY1 — the PHYSICAL form of a path: walked component by component the way the OS
+/// resolves it — every existing prefix canonicalised (links followed, also a chain), a `..` taken
+/// from that canonical prefix (so `link/..` is the parent of the link's TARGET, not of the link),
+/// the part that does not exist yet appended (a `..` there collapsed — the OS cannot follow what
+/// is not there; the conservative reading names the file such a path would reach). `None` = a
+/// component cannot be resolved (a link loop, an unreadable component).
+fn physical_form(p: &Path, windows: bool) -> Option<String> {
+    use std::path::Component;
+    let mut cur = PathBuf::new();
+    let mut rest: Vec<String> = Vec::new();
+    for c in p.components() {
+        if !rest.is_empty() {
+            match c {
+                Component::Normal(n) => rest.push(n.to_str()?.to_string()),
+                Component::ParentDir => {
+                    rest.pop();
+                }
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            Component::Prefix(_) | Component::RootDir => cur.push(c.as_os_str()),
+            Component::CurDir => {}
+            // `cur` is canonical (every link in it already followed): its parent is the physical one
+            Component::ParentDir => {
+                cur.pop();
+            }
+            Component::Normal(name) => {
+                let next = cur.join(name);
+                match std::fs::symlink_metadata(&next) {
+                    Ok(_) => cur = std::fs::canonicalize(&next).ok()?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        rest.push(name.to_str()?.to_string())
+                    }
+                    Err(_) => return None,
+                }
+            }
+        }
+    }
+    let mut out = cur.to_str()?.to_string();
+    for r in &rest {
+        out.push('/');
+        out.push_str(r);
+    }
+    Some(normalize_lexical(&out, windows))
+}
+
+/// The longest lane root that is a whole-component prefix of one identity of a path (components
+/// compared after the full case fold — RULINGS BN1; the rel keeps the identity's own spelling).
+fn root_of<'r>(
+    c: &str,
+    root_forms: &[(String, &'r PathBuf)],
+) -> Option<(usize, String, &'r PathBuf)> {
+    let c_parts: Vec<&str> = c.split('/').collect();
+    let mut best: Option<(usize, String, &PathBuf)> = None;
+    for (rf, r) in root_forms {
+        let rt = rf.trim_end_matches('/');
+        if rt.is_empty() {
+            continue;
+        }
+        let r_parts: Vec<&str> = rt.split('/').collect();
+        if c_parts.len() <= r_parts.len()
+            || !r_parts
+                .iter()
+                .zip(&c_parts)
+                .all(|(a, b)| fold_name(a) == fold_name(b))
+        {
+            continue;
+        }
+        let rel = c_parts[r_parts.len()..].join("/");
+        if !rel.is_empty() && best.as_ref().is_none_or(|(n, _, _)| r_parts.len() > *n) {
+            best = Some((r_parts.len(), rel, *r));
+        }
+    }
+    best
+}
+
 /// A component that looks like an 8.3 short name (`PROGRA~1`).
 fn has_short_name_component(s: &str) -> bool {
     s.split('/').any(|c| {
@@ -409,9 +487,25 @@ pub fn classify_with(
         };
         normalize_lexical(&format!("{c}/{raw}"), windows)
     };
+    // RULINGS CY1 — every identity of the path: the lexical spelling, the OS-canonical form of it,
+    // and the PHYSICAL form of the raw spelling (`..` taken after the link it follows)
+    // (an MSYS drive spelling `/c/…` is no native path: its lexical / canonical identities cover it)
+    let raw_abs: Option<PathBuf> = if Path::new(raw).is_absolute() {
+        Some(PathBuf::from(raw))
+    } else if is_absolute_form(&normalize_lexical(raw, windows), windows) {
+        None
+    } else {
+        cwd.map(|c| c.join(raw))
+    };
     let mut cands = vec![abs.clone()];
-    if let Some(c) = canonical_form(&abs, windows) {
-        if c != abs {
+    for c in [
+        canonical_form(&abs, windows),
+        raw_abs.and_then(|r| physical_form(&r, windows)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !cands.contains(&c) {
             cands.push(c);
         }
     }
@@ -424,34 +518,13 @@ pub fn classify_with(
         }
         root_forms.push((l, r));
     }
-    // the longest root that is a whole-component prefix of a candidate — components compared
-    // after the full case fold (RULINGS BN1: a fold may change a component's byte length, so the
-    // match is per component); the rel keeps the candidate's own spelling
-    let mut best: Option<(usize, String, &PathBuf)> = None;
-    for c in &cands {
-        let c_parts: Vec<&str> = c.split('/').collect();
-        for (rf, r) in &root_forms {
-            let rt = rf.trim_end_matches('/');
-            if rt.is_empty() {
-                continue;
-            }
-            let r_parts: Vec<&str> = rt.split('/').collect();
-            if c_parts.len() <= r_parts.len()
-                || !r_parts
-                    .iter()
-                    .zip(&c_parts)
-                    .all(|(a, b)| fold_name(a) == fold_name(b))
-            {
-                continue;
-            }
-            let rel = c_parts[r_parts.len()..].join("/");
-            if !rel.is_empty() && best.as_ref().is_none_or(|(n, _, _)| r_parts.len() > *n) {
-                best = Some((r_parts.len(), rel, r));
-            }
-        }
-    }
+    // each identity on its own (no tie-break between identities can drop one): its longest root
+    let matched: Vec<(String, &PathBuf)> = cands
+        .iter()
+        .filter_map(|c| root_of(c, &root_forms).map(|(_, rel, r)| (rel, r)))
+        .collect();
     let short_name = windows && cands.iter().any(|c| has_short_name_component(c));
-    let Some((_, rel, root)) = best else {
+    if matched.is_empty() {
         if short_name {
             return undecidable("an 8.3 short-name component could not be resolved");
         }
@@ -463,15 +536,54 @@ pub fn classify_with(
             protection: None,
             reason: "not inside a lane pack".to_string(),
         };
+    }
+    // listed if ANY identity names a row; the live file's own identity (a hard link — RULINGS
+    // AW3 (d), the same function the daemon uses) counts as one more
+    let hit_bc = matched
+        .iter()
+        .find_map(|(rel, r)| boot_critical_entry(rel).map(|e| (e, rel.clone(), *r)));
+    let hit_pr = matched
+        .iter()
+        .find_map(|(rel, r)| protection_entry(rel).map(|e| (e, rel.clone(), *r)));
+    let hit_id = matched
+        .iter()
+        .find_map(|(rel, r)| identity_alias(r, rel).map(|e| (e, rel.clone(), *r)));
+    let entry = hit_bc.as_ref().map(|(e, _, _)| *e).or_else(|| {
+        hit_id
+            .as_ref()
+            .and_then(|(e, _, _)| boot_critical_entry(e.rel))
+    });
+    let protection = hit_pr.as_ref().map(|(e, _, _)| *e).or_else(|| {
+        hit_id
+            .as_ref()
+            .and_then(|(e, _, _)| protection_entry(e.rel))
+    });
+    // the reported identity: the one that named a row (its own spelling — for a hard link the row's),
+    // else the lexical one
+    let (rel, root, via) = if let Some((_, rel, r)) = &hit_bc {
+        (rel.clone(), *r, None)
+    } else if let Some((_, rel, r)) = &hit_pr {
+        (rel.clone(), *r, None)
+    } else if let Some((e, _, r)) = &hit_id {
+        (
+            e.rel.to_string(),
+            *r,
+            Some("the same file through a hard link"),
+        )
+    } else {
+        (matched[0].0.clone(), matched[0].1, None)
     };
-    let entry = boot_critical_entry(&rel);
-    let protection = protection_entry(&rel);
+    let via = via.or_else(|| {
+        (matched.first().map(|(l, _)| l != &rel).unwrap_or(false))
+            .then_some("through a link or `..` (its physical path)")
+    });
     let (decision, reason) = match entry {
         Some(e) => (
             Decision::Yes,
             format!(
-                "on the compiled boot-critical list ({})",
-                category_wire(e.category)
+                "on the compiled boot-critical list ({}){}",
+                category_wire(e.category),
+                via.map(|v| format!(" — {v}")).unwrap_or_default()
             ),
         ),
         None if short_name && has_short_name_component(&rel) => {
@@ -1921,6 +2033,88 @@ mod tests {
         assert_eq!(identity_alias(&t, "hooks/guard.sh"), None);
         let e = refuse_identity_alias(&t, ["x/copy.sh", "x/link.sh"]).unwrap_err();
         assert!(e.contains("`hooks/guard.sh`"), "{e}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// RULINGS CY1 — a path is listed if ANY of its identities is listed: the lexical spelling, the
+    /// OS-canonical path (links resolved, also a chain of links) and the PHYSICAL path (`..` taken
+    /// after the link it follows, as the OS does), plus the live file's own identity (a hard link).
+    /// The J3 counterexample: an alias directory INSIDE the pack (`hooks-alias → hooks`) gave an
+    /// equal-root-length tie that the lexical candidate won, so `hooks-alias/session-start.sh` was
+    /// "not on the list" while the shell writes the live boot hook.
+    #[cfg(unix)]
+    #[test]
+    fn every_identity_of_a_path_is_checked() {
+        // a root WITHOUT a linked component (as `~/.cys/pack` is): the lexical and the canonical root
+        // are the same length — the tie J3 describes (macOS's `/var` → `/private/var` temp dir would
+        // give the canonical root one more component and hide it)
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let t = base.join(format!("t5c-ident-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&t);
+        let pack = t.join("home/.cys/pack");
+        let elsewhere = t.join("elsewhere");
+        for d in [
+            pack.join("hooks/sub"),
+            pack.join("notes"),
+            elsewhere.clone(),
+        ] {
+            std::fs::create_dir_all(&d).unwrap();
+        }
+        for f in ["hooks/session-start.sh", "hooks/guard.sh"] {
+            std::fs::write(pack.join(f), "x\n").unwrap();
+        }
+        std::fs::write(elsewhere.join("session-start.sh"), "x\n").unwrap();
+        let link = |from: &str, to: &Path| std::os::unix::fs::symlink(to, pack.join(from)).unwrap();
+        link("hooks-alias", &pack.join("hooks")); // an alias directory inside the pack
+        link("a1", &pack.join("a2")); // a chain of two links: a1 → a2 → hooks
+        link("a2", &pack.join("hooks"));
+        link("notes/start-copy.sh", &pack.join("hooks/session-start.sh")); // an alias of a file
+        link("notes/sub-link", &pack.join("hooks/sub")); // `notes/sub-link/..` is `hooks` physically
+        link("out-alias", &elsewhere); // an alias that points OUT of the pack
+        std::fs::hard_link(pack.join("hooks/guard.sh"), pack.join("notes/g.sh")).unwrap();
+        let roots = vec![pack.clone()];
+        let cls = |p: PathBuf| classify_with(&p, None, &roots, false);
+        for (p, row) in [
+            (
+                pack.join("hooks-alias/session-start.sh"),
+                "hooks/session-start.sh",
+            ),
+            (pack.join("a1/session-start.sh"), "hooks/session-start.sh"),
+            (pack.join("notes/start-copy.sh"), "hooks/session-start.sh"),
+            (
+                pack.join("notes/sub-link/../session-start.sh"),
+                "hooks/session-start.sh",
+            ),
+            // a leaf that does not exist yet under an alias still names the row it would create
+            (
+                pack.join("hooks-alias/inject-context.sh"),
+                "hooks/inject-context.sh",
+            ),
+        ] {
+            let a = cls(p.clone());
+            assert_eq!(a.decision, Decision::Yes, "{}: {a:?}", p.display());
+            assert_eq!(a.entry.map(|e| e.rel), Some(row), "{}", p.display());
+            assert_eq!(a.lane_pack.as_ref(), Some(&pack));
+        }
+        // a protection row through a parent alias and through a hard link
+        let a = cls(pack.join("hooks-alias/guard.sh"));
+        assert_eq!(a.protection.map(|e| e.rel), Some("hooks/guard.sh"), "{a:?}");
+        let a = cls(pack.join("notes/g.sh"));
+        assert_eq!(
+            a.protection.map(|e| e.rel),
+            Some("hooks/guard.sh"),
+            "hard link: {a:?}"
+        );
+        // an alias pointing OUT of the pack names no row of this lane
+        let a = cls(pack.join("out-alias/session-start.sh"));
+        assert_eq!(a.decision, Decision::No, "{a:?}");
+        assert!(a.entry.is_none() && a.protection.is_none());
+        // controls: an unlisted file inside the pack, also behind the alias
+        assert_eq!(cls(pack.join("notes/readme.md")).decision, Decision::No);
+        assert_eq!(
+            cls(pack.join("hooks-alias/README.md")).decision,
+            Decision::No
+        );
         let _ = std::fs::remove_dir_all(&t);
     }
 

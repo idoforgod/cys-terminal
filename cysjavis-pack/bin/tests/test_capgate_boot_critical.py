@@ -112,7 +112,7 @@ class _Env(unittest.TestCase):
     def calls_seen(self):
         return self.calls.read_text(encoding="utf-8").splitlines() if self.calls.exists() else []
 
-    def run_hook(self, tool, tool_input, cwd=None, **envkw):
+    def run_hook(self, tool, tool_input, cwd=None, hook=None, **envkw):
         env = dict(self.env)
         for k, v in envkw.items():
             if v is None:
@@ -124,7 +124,7 @@ class _Env(unittest.TestCase):
         if cwd is not None:
             payload["cwd"] = str(cwd)
         t0 = time.time()
-        r = subprocess.run([SH, str(HOOK)], input=json.dumps(payload), env=env,
+        r = subprocess.run([SH, str(hook or HOOK)], input=json.dumps(payload), env=env,
                            cwd=str(cwd) if cwd else str(self.root),
                            capture_output=True, text=True, timeout=60)
         return r, time.time() - t0
@@ -424,6 +424,37 @@ class GateWithBuiltBinary(_Env):
                     self.assertEqual(dec, "deny", "%s %s (cwd=%s) 가 거부되지 않았다: %r %r"
                                      % (tool, spelled, cwd, r.stdout, r.stderr[-300:]))
                     self.assertIn("cys repair submit", reason)
+
+    def test_in_pack_aliases_are_denied(self):
+        """RULINGS CY1 — the J3 counterexample end to end through the gate and the built binary: a
+        shell redirection (and a Write) to a listed file through an alias INSIDE the pack — an alias
+        directory, a chain of two links, an alias of the file, `..` after a link — is denied for a
+        worker and a master, and the live file is untouched; an alias pointing OUT of the pack names
+        no row of this lane."""
+        p = self.pack
+        (p / "hooks" / "sub").mkdir(exist_ok=True)
+        (p / "notes").mkdir(exist_ok=True)
+        os.symlink(str(p / "hooks"), str(p / "hooks-alias"))
+        os.symlink(str(p / "a2"), str(p / "a1"))
+        os.symlink(str(p / "hooks"), str(p / "a2"))
+        os.symlink(str(p / REL), str(p / "notes" / "ic-copy.sh"))
+        os.symlink(str(p / "hooks" / "sub"), str(p / "notes" / "sub-link"))
+        os.symlink(str(self.outside), str(p / "out-alias"))
+        before = (p / REL).read_text(encoding="utf-8")
+        leaf = REL.rsplit("/", 1)[1]
+        for spelled in ("hooks-alias/" + leaf, "a1/" + leaf, "notes/ic-copy.sh", "notes/sub-link/../" + leaf):
+            target = "%s/%s" % (p, spelled)
+            for role in ("worker", "master"):
+                for tool, ti in (("Bash", {"command": "printf x > %s" % target}),
+                                 ("Write", {"file_path": target, "content": "x"})):
+                    r, _ = self.run_hook(tool, ti, CYS_ROLE=role)
+                    dec, reason = self.decision(r)
+                    self.assertEqual(dec, "deny", "%s %s %s 가 거부되지 않았다: %r %r"
+                                     % (role, tool, spelled, r.stdout, r.stderr[-300:]))
+                    self.assertIn(REL, reason)
+        self.assertEqual((p / REL).read_text(encoding="utf-8"), before, "살아 있는 파일이 바뀌었다")
+        r, _ = self.run_hook("Bash", {"command": "printf x > %s/out-alias/%s" % (p, leaf)})
+        self.assertNotEqual(self.decision(r)[0], "deny", "팩 밖을 가리키는 별칭은 이 레인의 행이 아니다")
 
     def test_control_variants_allowed(self):
         rel = "hooks/README.md"
