@@ -14,6 +14,7 @@ pub mod boot_critical;
 pub mod durable;
 pub mod exchange;
 pub mod grant;
+pub mod guard;
 pub mod intake;
 pub mod ledger;
 pub mod lock;

@@ -478,3 +478,68 @@ fn revert_latest_takes_a_failed_repair_and_says_nothing_honestly() {
     let e = empty.call(T0, &human(), "revert", json!({"latest": true})).unwrap_err();
     assert!(e.message.contains("되돌릴 수리가 없습니다"), "{}", e.message);
 }
+
+/// EJ4 / EN6 through the real entry points: a COMMIT holds its repair's guard from its top through
+/// its hook phase — while it is in its hook dry run, the job's first-ready start pass leaves the
+/// repair alone (no second hook operation). Without the guard at commit's top the start pass saw a
+/// committed repair whose unregistration was never attempted and ran its own hook step.
+#[test]
+fn a_commit_in_its_hook_phase_excludes_the_start_pass() {
+    let r = rig("ej4commit");
+    let w = seat(3, "worker");
+    let id = r.call(T0, &w, "begin", json!({"trigger": "owner_order", "files": ["bin/a.py"]})).unwrap()["repair"].as_str().unwrap().to_string();
+    let rid = RepairId::parse(&id).unwrap();
+    let mut rec = r.record_of(&id);
+    rec.files.push(cys::repair::ledger::FileChange {
+        rel: "settings:Stop:x.sh".into(),
+        kind: cys::repair::ledger::ChangeKind::HookUnregister { event: "Stop".into(), script: "x.sh".into() },
+        pre: cys::repair::ledger::PreImage::Absent,
+        post: cys::repair::types::TargetState::Absent,
+        diff: None,
+    });
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "n"})).unwrap();
+    r.call(T0 + 2.0, &seat(7, "reviewer-codex"), "attest_verify", json!({"repair": id, "verdict": "pass", "note": "ok"})).unwrap();
+    let (in_tx, in_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let rr = &r;
+    let wr = &w;
+    let idr = &id;
+    std::thread::scope(|sc| {
+        let commit = sc.spawn(move || {
+            let hook = move |_: &RepairId, _: &cys::repair::types::LaneKey, _: cys::repair::apply::HookStep| -> Result<cys::repair::apply::ReconcileReport, RepairError> {
+                in_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                Ok(cys::repair::apply::ReconcileReport { hooks: Vec::new() })
+            };
+            let ctx = Ctx { hook_step: &hook, ..rr.ctx(T0 + 3.0) };
+            handle_with(&ctx, wr, "commit", &json!({"repair": idr}))
+        });
+        in_rx.recv().unwrap();
+        // the job's first-ready start pass, meanwhile
+        let calls = std::cell::Cell::new(0);
+        let hooks = |_: &RepairId, _: &cys::repair::types::LaneKey, _: cys::repair::apply::HookStep| -> Result<cys::repair::apply::ReconcileReport, RepairError> {
+            calls.set(calls.get() + 1);
+            Ok(cys::repair::apply::ReconcileReport { hooks: Vec::new() })
+        };
+        let lock = r.root.join(".pack-apply.lock");
+        let env = cys::repair::probation::JobEnv {
+            op: cys::repair::apply::OpEnv { root: &r.root, pack: &r.pack, lane: &r.lane, now: T0 + 4.0, form: cys::repair::platform::ApplyForm::Exchange, faults: &cys::repair::apply::NoFaults, own_check: &|_, _| None },
+            incarnation: "inc-x",
+            check: &|_, _, _| Err(RepairError::Io("no checks here".into())),
+            reference: &|_, _| Err(RepairError::Io("no checks here".into())),
+            hooks: &hooks,
+            registrar: &|_, _| Ok("{\"hooks\": []}".into()),
+            locked: &cys::repair::apply::no_repair_lock,
+            excluded: &|_| false,
+            original: &|_| None,
+            intake: &|_, _| true,
+            apply_lock: &lock,
+        };
+        let _ = cys::repair::probation::start_time_pass(&env);
+        assert_eq!(calls.get(), 0, "the start pass left the committing repair alone");
+        assert!(cys::repair::guard::is_held(&r.root, &rid), "the commit holds the guard in its hook phase");
+        go_tx.send(()).unwrap();
+        commit.join().unwrap().unwrap();
+    });
+}

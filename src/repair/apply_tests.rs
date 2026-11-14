@@ -2040,7 +2040,9 @@ fn recovery_never_touches_a_live_operation() {
     };
     wal::write_in(&r.root, &op).unwrap();
     let ok = |_: &Path, _: bool| -> Result<String, RepairError> { Ok(report_json(&[("Stop", "l.sh", "unregistered", &[])])) };
-    let owner = wal::LiveOp::enter(&op.op);
+    // EJ4 (REWRITTEN — old: the owner held `wal::LiveOp::enter(&op.op)`, the per-operation live set
+    // that EJ4 folds into the per-repair guard): the owner holds the repair's guard
+    let owner = crate::repair::guard::RepairGuard::try_take(&r.root, &id).unwrap();
     assert_eq!(resume_hook_steps_in(&r.root, &r.pack, &r.lane, &ok, &no_repair_lock, 3.0), 0, "a live hook step is not resumed");
     assert_eq!(wal::unfinished_for_lane(&r.root, &r.lane).len(), 1);
     drop(owner);
@@ -2052,7 +2054,7 @@ fn recovery_never_touches_a_live_operation() {
     let stop = StopOn { rel: "hooks/l2.sh", point: Point::AfterRecord, fired: Cell::new(false) };
     assert!(run_op(&r.env(&stop, ApplyForm::Exchange), &spec).is_err());
     let rec = wal::unfinished_for_lane(&r.root, &r.lane).into_iter().next().unwrap();
-    let owner = wal::LiveOp::enter(&rec.op);
+    let owner = crate::repair::guard::RepairGuard::try_take(&r.root, &rec.repair).unwrap();
     assert_eq!(resume_interrupted_in(&r.env(&NoFaults, ApplyForm::Exchange)).unwrap(), 0);
     drop(owner);
     assert_eq!(resume_interrupted_in(&r.env(&NoFaults, ApplyForm::Exchange)).unwrap(), 1);
@@ -2320,4 +2322,58 @@ fn a_failed_non_blocking_setup_does_not_run_the_child() {
     assert!(t.elapsed() < Duration::from_secs(5), "killed at once, not run to its deadline");
     let msg = format!("{res:?}");
     assert!(msg.contains("비차단") && msg.contains("멈췄습니다"), "{msg}");
+}
+
+// ───────────────────────────── RULINGS EJ4 — one ownership per repair ─────────────────────────────
+
+/// EJ4 through the real entry points: a revert (the owner) paused in its hook phase holds the
+/// repair's guard — the job's recovery of interrupted reverts, run meanwhile, leaves the repair alone;
+/// when the owner has finished, the recovery reads the intent AFTER taking the guard and finds it
+/// finished (nothing re-done from a stale listing).
+#[cfg(target_os = "macos")]
+#[test]
+fn recovery_leaves_a_repair_alone_while_its_owner_runs() {
+    let r = rig("ej4owner");
+    let id = rid("R-52");
+    let mut rec = committed_general(&r, &id, "hooks/o.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    rec.files.push(FileChange {
+        rel: "settings:Stop:o.sh".into(),
+        kind: ChangeKind::HookUnregister { event: "Stop".into(), script: "o.sh".into() },
+        pre: PreImage::Absent,
+        post: TargetState::Absent,
+        diff: None,
+    });
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let (in_tx, in_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let rr = &r;
+    let idr = &id;
+    std::thread::scope(|sc| {
+        let owner = sc.spawn(move || {
+            let hooks = move |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> {
+                in_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                Ok(ReconcileReport { hooks: Vec::new() })
+            };
+            let env = OpEnv { root: &rr.root, pack: &rr.pack, lane: &rr.lane, now: 1_800_000_000.0, form: ApplyForm::Exchange, faults: &NoFaults, own_check: &|_, _| None };
+            revert_in(&env, idr, RevertCaller::Human, &hooks, &no_repair_lock).map(|x| x.outcome)
+        });
+        in_rx.recv().unwrap();
+        // the owner is inside its hook phase: the revert intent says "reverting", the file restored
+        assert_eq!(read_revert_intent_in(&r.root, &id, &r.lane).unwrap().state, "reverting");
+        let calm = r.env(&NoFaults, ApplyForm::Exchange);
+        let called = Cell::new(0);
+        let other_hooks = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> {
+            called.set(called.get() + 1);
+            Ok(ReconcileReport { hooks: Vec::new() })
+        };
+        assert!(recover_revert_intents_in(&calm, &other_hooks, &no_repair_lock).is_empty(), "left alone while owned");
+        assert_eq!(called.get(), 0);
+        assert!(revert_in(&calm, &id, RevertCaller::Human, &other_hooks, &no_repair_lock).is_err(), "a second revert is busy, never waits");
+        go_tx.send(()).unwrap();
+        assert_eq!(owner.join().unwrap().unwrap(), ApplyOutcome::Applied);
+        // the owner finished: the recovery reads the intent after taking the guard — nothing to do
+        assert!(recover_revert_intents_in(&calm, &other_hooks, &no_repair_lock).is_empty());
+        assert_eq!(called.get(), 0);
+    });
 }

@@ -147,6 +147,7 @@ pub(crate) fn repair_lock<'a>(
             )
         };
         let _g = m.lock().unwrap_or_else(|e| e.into_inner());
+        let _mutex_scope = cys::repair::guard::MutexScope::enter(); // EN5
         f()
     }
 }

@@ -514,7 +514,6 @@ fn run_op_depth(env: &OpEnv<'_>, spec: &OpSpec, depth: u8) -> Result<OpDone, Rep
         return Ok(done(ApplyOutcome::Applied, None));
     }
     let op = wal::new_op_id(env.now, &spec.kind);
-    let _live = wal::LiveOp::enter(&op); // DR9: recovery never touches an operation that is running
     match (&spec.expected, &spec.incoming, env.form) {
         (TargetState::Absent, _, _) => op_place(env, spec, &op, &live, &gen),
         (_, TargetState::Absent, _) => op_move_in(env, spec, &op, &live, &gen, depth),
@@ -1280,20 +1279,21 @@ pub fn resume_interrupted_in(env: &OpEnv<'_>) -> Result<u32, RepairError> {
 pub fn resume_interrupted_report_in(env: &OpEnv<'_>) -> Result<(u32, Vec<(RepairId, String)>), RepairError> {
     let mut errors = Vec::new();
     let mut n = 0u32;
-    for rec in wal::unfinished_for_lane(env.root, env.lane) {
-        if rec.form == "hook" {
-            continue; // hook records are finished by the hook step's own resume
-        }
-        // DR9: an operation a live thread of this process is executing is not "interrupted"
-        let Some(_owned) = wal::LiveOp::try_enter(&rec.op) else {
+    // EJ4: per repair — its guard TRIED first (held → left alone this tick), its records read only
+    // AFTER the guard is held (never a list snapshotted before)
+    for id in ledger::list_ids_in(env.root) {
+        let Some(_guard) = super::guard::RepairGuard::try_take(env.root, &id) else {
             continue;
         };
+        let (ops, _) = wal::list_in(env.root, &id);
+        for rec in ops.into_iter().filter(|r| r.lane_key == *env.lane && !r.finished && r.form != "hook") {
         let (repair, op_id) = (rec.repair.clone(), rec.op.clone());
         match resume_op(env, rec) {
             Ok(_) => n += 1,
             Err(e) if format!("{e:?}").contains(INJECTED_STOP) => return Err(e),
             // left for the next run (nothing is forced) — and reported
             Err(e) => errors.push((repair, format!("끊긴 동작 {op_id} 을 마저 하지 못했습니다({e:?})"))),
+        }
         }
     }
     Ok((n, errors))
@@ -1541,15 +1541,16 @@ fn write_revert_intent(root: &Path, ri: &RevertIntent) -> Result<(), RepairError
 pub fn recover_revert_intents_in(env: &OpEnv<'_>, hooks: &HookStepFn<'_>, locked: &RepairLock<'_>) -> Vec<String> {
     let mut lines = Vec::new();
     for id in ledger::list_ids_in(env.root) {
+        // EJ4: a revert running now holds the repair's guard; its intent is read AFTER holding it
+        let Some(_guard) = super::guard::RepairGuard::try_take(env.root, &id) else {
+            continue;
+        };
         let Some(mut ri) = read_revert_intent_in(env.root, &id, env.lane) else {
             continue;
         };
         if ri.state != "reverting" {
             continue;
         }
-        let Some(_owned) = wal::LiveOp::try_enter(&format!("revert:{}", ri.op_tag)) else {
-            continue;
-        };
         let rec = match ledger::read_record_in(env.root, &id) {
             Ok(Some(r)) => r,
             Ok(None) => continue,
@@ -1646,6 +1647,10 @@ pub fn revert_in(
     hooks: &HookStepFn<'_>,
     locked: &RepairLock<'_>,
 ) -> Result<RevertReport, RepairError> {
+    // EJ4: the repair's ONE guard for the whole revert (tried; held → busy, never waited for)
+    let Some(_guard) = super::guard::RepairGuard::try_take(env.root, id) else {
+        return Err(RepairError::Locked(format!("{}: {}", id.as_str(), super::guard::BUSY)));
+    };
     let rec = ledger::read_record_in(env.root, id)?
         .ok_or_else(|| RepairError::Precondition(format!("{}: 그런 수리가 없습니다", id.as_str())))?;
     let windows_form = env.form == ApplyForm::DepositFirst;
@@ -1667,10 +1672,7 @@ pub fn revert_in(
     // against a row an already-restored file no longer matches)
     if let Some(mut ri) = read_revert_intent_in(env.root, id, env.lane) {
         if ri.state == "reverting" {
-            if let Some(_owned) = wal::LiveOp::try_enter(&format!("revert:{}", ri.op_tag)) {
-                return recover_one_revert(env, &rec, &mut ri, hooks, locked);
-            }
-            return Err(RepairError::Locked(format!("{}: 이 수리의 되돌리기가 지금 진행 중입니다", id.as_str())));
+            return recover_one_revert(env, &rec, &mut ri, hooks, locked);
         }
     }
     // DX1 / CT7: ONE definition of "revertible here" (the app's picker asks the same predicate)
@@ -1725,7 +1727,6 @@ pub fn revert_in(
     };
     // DR7: the repair-level intent is durable BEFORE the first restoring exchange
     let op_tag = wal::new_op_id(env.now, "revert");
-    let _live = wal::LiveOp::enter(&format!("revert:{op_tag}"));
     let mut ri = RevertIntent {
         schema: super::REPAIR_SCHEMA,
         repair: id.clone(),
@@ -1824,6 +1825,7 @@ fn finish_revert(
     let root = env.root.to_path_buf();
     let idc = id.clone();
     locked(id, &mut || {
+        let _mutex_scope = super::guard::MutexScope::enter();
         if let Some(mut r) = ledger::read_record_in(&root, &idc)? {
             if r.origin_lane == lane {
                 let method: String = format!("{label} — {by_label}{}", if note.is_empty() { String::new() } else { format!(" · {note}") }).chars().take(300).collect();
@@ -1883,6 +1885,7 @@ fn close_superseded(
     let id = rec.id.clone();
     let now = env.now;
     locked(&rec.id, &mut || {
+        let _mutex_scope = super::guard::MutexScope::enter();
         if let Some(mut row) = ledger::read_lane_in(&root, &id, &lane)? {
             if let Some(p) = row.probation.as_mut() {
                 if p.closed.is_none() {
@@ -2393,16 +2396,16 @@ fn set_intent_state(root: &Path, intent: &mut ApplyIntent, state: &str, note: &s
 pub fn recover_apply_intents_in(env: &OpEnv<'_>, locked: &RepairLock<'_>) -> Vec<String> {
     let mut lines = Vec::new();
     for id in ledger::list_ids_in(env.root) {
+        // EJ4: an apply running now holds the repair's guard; the intent is read AFTER holding it
+        let Some(_guard) = super::guard::RepairGuard::try_take(env.root, &id) else {
+            continue;
+        };
         let Some(mut intent) = read_intent_in(env.root, &id, env.lane) else {
             continue;
         };
         if intent.state != "applying" {
             continue;
         }
-        // DR9: an apply running now owns its intent
-        let Some(_owned) = wal::LiveOp::try_enter(&format!("intent:{}", intent.op_tag)) else {
-            continue;
-        };
         match recover_one_intent(env, &mut intent, locked) {
             Ok(line) => lines.push(line),
             Err(e) => lines.push(format!("{}: 끊긴 적용을 정리하지 못했습니다 — 다음 차례에 다시({e:?})", id.as_str())),
@@ -2428,6 +2431,7 @@ fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &Repair
         let request = rec.approval.as_ref().map(|a| a.request_id.clone());
         let now = env.now;
         locked(&id, &mut || {
+        let _mutex_scope = super::guard::MutexScope::enter();
             if ledger::read_lane_in(&root, &idc, &lane)?.is_none() {
                 ledger::write_lane_in(
                     &root,
@@ -2529,6 +2533,10 @@ pub fn apply_candidate_in(
     reference: &ReferenceFn<'_>,
     locked: &RepairLock<'_>,
 ) -> Result<ApplyReport, RepairError> {
+    // EJ4: the repair's ONE guard for the whole apply (tried; held → busy, never waited for)
+    let Some(_guard) = super::guard::RepairGuard::try_take(env.root, id) else {
+        return Err(RepairError::Locked(format!("{}: {}", id.as_str(), super::guard::BUSY)));
+    };
     let rec = ledger::read_record_in(env.root, id)?
         .ok_or_else(|| RepairError::Precondition(format!("{}: 그런 수리가 없습니다", id.as_str())))?;
     let decline = |why: String| -> Result<ApplyReport, RepairError> {
@@ -2755,7 +2763,6 @@ pub fn apply_candidate_in(
         created_at: env.now,
         updated_at: env.now,
     };
-    let _live_intent = wal::LiveOp::enter(&format!("intent:{}", op_tag)); // DR9
     if let Err(e) = write_intent(env.root, &intent) {
         return decline(format!("{}: 적용 의도를 기록할 수 없어 아무것도 바꾸지 않았습니다 — {e:?}", id.as_str()));
     }
@@ -2894,6 +2901,7 @@ pub fn apply_candidate_in(
     let request_id = approval.request_id.clone();
     let first_live = env.pack.join(slots.first().map(|(r, _)| r.as_str()).unwrap_or(""));
     locked(id, &mut || {
+        let _mutex_scope = super::guard::MutexScope::enter();
         let Some(mut r) = ledger::read_record_in(&root, &idc)? else {
             return Ok(());
         };
@@ -3013,7 +3021,6 @@ fn exchange_prepared(
         }
     };
     let op = wal::new_op_id(env.now, &spec.kind);
-    let _live = wal::LiveOp::enter(&op); // DR9
     let mut rec = new_record(env, spec, &op, "exchange", &gen);
     rec.slot = Some(slot.dir.clone());
     rec.slot_identity = Some(slot_identity);
@@ -3115,6 +3122,7 @@ fn mark_incomplete_apply(
     let request = rec.approval.as_ref().map(|a| a.request_id.clone());
     let why = why.to_string();
     locked(id, &mut || {
+        let _mutex_scope = super::guard::MutexScope::enter();
         let previous = ledger::read_lane_in(&root, &idc, &lane)?;
         let row = ledger::LaneRecord {
             schema: super::REPAIR_SCHEMA,
@@ -3163,6 +3171,7 @@ fn void_approval(
     let root = env.root.to_path_buf();
     let idc = id.clone();
     locked(id, &mut || {
+        let _mutex_scope = super::guard::MutexScope::enter();
         if let Some(mut r) = ledger::read_record_in(&root, &idc)? {
             if !matches!(r.state, RepairState::Probation | RepairState::InUse) {
                 r.approval = None;
@@ -3185,6 +3194,7 @@ fn mark_reverted_after_apply_check(
     let root = env.root.to_path_buf();
     let idc = id.clone();
     locked(id, &mut || {
+        let _mutex_scope = super::guard::MutexScope::enter();
         if let Some(mut r) = ledger::read_record_in(&root, &idc)? {
             r.state = RepairState::Reverted;
             // DX2: an undone apply never keeps its approval
@@ -3217,6 +3227,7 @@ fn supersede_older_in(
         let targets = targets.clone();
         let mut changed = false;
         locked(&oid, &mut || {
+        let _mutex_scope = super::guard::MutexScope::enter();
             let Some(mut r) = ledger::read_record_in(&root, &oid)? else {
                 return Ok(());
             };
@@ -3954,7 +3965,6 @@ pub fn hook_lines_step_in(
         updated_at: now,
         notice: None,
     };
-    let _live = wal::LiveOp::enter(&op.op); // DR9: owned until the step returns
     wal::write_in(root, &op)?;
     finish_hook_op(root, pack, &rec, &mut op, registrar, now)
 }
@@ -4026,11 +4036,14 @@ pub fn resume_hook_steps_report_in(
 ) -> (u32, Vec<(RepairId, String)>) {
     let mut errors = Vec::new();
     let mut n = 0;
-    for mut op in wal::unfinished_for_lane(root, lane).into_iter().filter(|r| r.form == "hook") {
-        // DR9: a hook step running now (it holds no pack-apply lock by design) is never resumed
-        let Some(_owned) = wal::LiveOp::try_enter(&op.op) else {
+    // EJ4: a hook step running now holds its repair's guard (from before its dry run — the commit
+    // takes it at its top); recovery tries the guard and reads the hook records AFTER holding it
+    for id in ledger::list_ids_in(root) {
+        let Some(_guard) = super::guard::RepairGuard::try_take(root, &id) else {
             continue;
         };
+        let (ops, _) = wal::list_in(root, &id);
+        for mut op in ops.into_iter().filter(|r| r.lane_key == *lane && !r.finished && r.form == "hook") {
         let Ok(Some(rec)) = ledger::read_record_in(root, &op.repair) else {
             continue;
         };
@@ -4043,6 +4056,7 @@ pub fn resume_hook_steps_report_in(
                 n += u32::from(op.finished);
             }
         }
+        }
     }
     (n, errors)
 }
@@ -4053,6 +4067,7 @@ pub fn mark_lane_conflict(root: &Path, id: &RepairId, lane: &LaneKey, now: f64, 
     let idc = id.clone();
     let lanec = lane.clone();
     let _ = locked(id, &mut || {
+        let _mutex_scope = super::guard::MutexScope::enter();
         if let Some(mut row) = ledger::read_lane_in(&rootb, &idc, &lanec)? {
             row.state = LaneState::Conflict;
             row.updated_at = now;

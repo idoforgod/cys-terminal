@@ -2902,6 +2902,10 @@ mod ledger_verbs {
     /// lane's File tombstones (AD3) → this lane's own row (K1; 검증됨, or 충돌 on a step error — Y2(c)).
     pub(crate) fn commit(ctx: &Ctx<'_>, caller: &Caller, p: &Value) -> Result<Value, VerbError> {
         let id = repair_id(p)?;
+        // T6 · RULINGS EJ4 / EN6: the repair's ONE guard for the whole commit, its hook phase included
+        let Some(_guard) = cys::repair::guard::RepairGuard::try_take(&ctx.root, &id) else {
+            return Err(VerbError::new(cys::repair::types::ERR_LOCKED, format!("{}: {}", id.as_str(), cys::repair::guard::BUSY)));
+        };
         // (1) preconditions under the per-repair mutex
         let (snapshot, states) = ctx.locked(id.as_str(), || -> Result<(RepairRecord, Vec<(String, TargetState)>), VerbError> {
             let mut rec = load(ctx, &id)?;

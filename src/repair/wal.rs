@@ -79,45 +79,6 @@ pub fn ops_dir_in(root: &Path, id: &RepairId) -> PathBuf {
     super::ledger::repair_dir_in(root, id).join("ops")
 }
 
-// ───────────────────────────── RULINGS DR9 — what a live operation owns ─────────────────────────────
-
-fn live_set() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static LIVE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
-    LIVE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-}
-
-/// RULINGS DR9 — this process is EXECUTING the operation (or apply / revert intent) `id` while the
-/// guard lives. Recovery never resumes or abandons an id in this set; an unfinished record of this
-/// lane NOT in the set belongs to a dead incarnation and is recovered.
-pub struct LiveOp(String);
-
-impl LiveOp {
-    pub fn enter(id: &str) -> LiveOp {
-        live_set().lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string());
-        LiveOp(id.to_string())
-    }
-    /// Claims `id` for a recovery: `None` when a live operation already owns it.
-    pub fn try_enter(id: &str) -> Option<LiveOp> {
-        let mut set = live_set().lock().unwrap_or_else(|e| e.into_inner());
-        if set.contains(id) {
-            return None;
-        }
-        set.insert(id.to_string());
-        Some(LiveOp(id.to_string()))
-    }
-}
-
-impl Drop for LiveOp {
-    fn drop(&mut self) {
-        live_set().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
-    }
-}
-
-/// Whether a live operation of this process owns `id`.
-pub fn is_live(id: &str) -> bool {
-    live_set().lock().unwrap_or_else(|e| e.into_inner()).contains(id)
-}
-
 /// `<root>/R-<n>/ops/<op>.json` (the layout of `paths::op_path`).
 pub fn op_path_in(root: &Path, id: &RepairId, op: &str) -> PathBuf {
     ops_dir_in(root, id).join(format!("{op}.json"))

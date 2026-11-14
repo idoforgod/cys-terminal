@@ -333,7 +333,15 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
         .filter_map(|id| ledger::read_record_in(root, &id).ok().flatten())
         .collect();
     recs.sort_by(|a, b| b.id.cmp(&a.id)); // newest first (AK4 supersedes the older ones)
-    for rec in &recs {
+    for listed in &recs {
+        // EJ4: the guard first (held → this repair is left alone), then the record re-read
+        let Some(_guard) = super::guard::RepairGuard::try_take(root, &listed.id) else {
+            continue;
+        };
+        let Ok(Some(fresh)) = ledger::read_record_in(root, &listed.id) else {
+            continue;
+        };
+        let rec = &fresh;
         if !in_force(rec) {
             continue;
         }
@@ -403,6 +411,7 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
             let idc = rec.id.clone();
             let lanec = lane.clone();
             if let Err(e) = (env.locked)(&rec.id, &mut || {
+        let _mutex_scope = super::guard::MutexScope::enter();
                 if ledger::read_lane_in(&rootb, &idc, &lanec)?.is_none() {
                     ledger::write_lane_in(&rootb, &new_row)?;
                 }
@@ -457,6 +466,7 @@ fn supersede_older(
         let mut changed = false;
         let rootb = root.to_path_buf();
         let _ = locked(&oid, &mut || {
+        let _mutex_scope = super::guard::MutexScope::enter();
             // CU1: an unreadable older record is skipped (never stops the pass)
             let Ok(Some(mut r)) = ledger::read_record_in(&rootb, &oid) else {
                 return Ok(());
@@ -603,6 +613,7 @@ fn close_row(env: &JobEnv<'_>, id: &RepairId, closed: &str, timeouts: &[(String,
     let idc = id.clone();
     let closed = closed.to_string();
     (env.locked)(id, &mut || {
+        let _mutex_scope = super::guard::MutexScope::enter();
         if let Some(mut row) = ledger::read_lane_in(&root, &idc, &lane)? {
             if let Some(p) = row.probation.as_mut() {
                 if p.closed.is_none() {
@@ -634,6 +645,7 @@ fn note_timeouts(env: &JobEnv<'_>, id: &RepairId, timeouts: &[(String, f64)]) ->
     let lane = env.op.lane.clone();
     let idc = id.clone();
     (env.locked)(id, &mut || {
+        let _mutex_scope = super::guard::MutexScope::enter();
         if let Some(mut row) = ledger::read_lane_in(&root, &idc, &lane)? {
             if let Some(p) = row.probation.as_mut() {
                 for t in timeouts {
@@ -698,6 +710,7 @@ fn close_failed(env: &JobEnv<'_>, id: &RepairId, why: &str) -> Result<(), Repair
     let idc = id.clone();
     let why = why.to_string();
     (env.locked)(id, &mut || {
+        let _mutex_scope = super::guard::MutexScope::enter();
         if let Some(mut row) = ledger::read_lane_in(&root, &idc, &lane)? {
             row.state = super::types::LaneState::Conflict;
             if let Some(p) = row.probation.as_mut() {
@@ -720,9 +733,23 @@ fn close_failed(env: &JobEnv<'_>, id: &RepairId, why: &str) -> Result<(), Repair
 
 /// The probation re-check of ONE repair in this lane.
 pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, report: &mut TickReport) -> Result<(), RepairError> {
+    // EJ4: the repair's guard (tried) for the re-check, and every decision on state read AFTER it is
+    // held; it is released before the pack-apply lock is tried for a return (EN5's order: lock →
+    // guard → mutex) — `revert_in` takes the guard again and re-reads
+    let Some(guard) = super::guard::RepairGuard::try_take(env.op.root, &rec.id) else {
+        report.lines.push(format!("{}: {} — 이번 차례에는 다시 검사하지 않습니다", rec.id.as_str(), super::guard::BUSY));
+        return Ok(());
+    };
+    let (Some(rec), Some(row)) = (ledger::read_record_in(env.op.root, &rec.id)?, ledger::read_lane_in(env.op.root, &rec.id, env.op.lane)?) else {
+        return Ok(());
+    };
+    let (rec, row) = (&rec, &row);
     let Some(p) = row.probation.as_ref() else {
         return Ok(());
     };
+    if p.closed.is_some() {
+        return Ok(());
+    }
     let id = &rec.id;
     // the binding: this lane, the pack generation, the expected live states
     if !apply::Bound::from_row(p).equals_now(env.op.pack) {
@@ -792,6 +819,7 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, repor
     }
     if let Some(why) = failure {
         let first_rel = ledger::file_targets(rec).map(|f| f.rel.as_str()).next().unwrap_or("");
+        drop(guard);
         if env.op.form == ApplyForm::Exchange {
             // DX3: the job NEVER waits for the pack-apply lock — held → no return this tick, retried
             let r = match crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || {
@@ -1311,7 +1339,13 @@ fn m10_sweep_full(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
             source: Some(src_file.clone()),
             bound: bound.clone(),
         };
+        let busy = std::cell::Cell::new(false);
         let r = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || -> Result<Option<apply::OpDone>, RepairError> {
+            // EJ4: the sub-ledger's guard under the lock (EN5's order); held → this put-back waits
+            let Some(_guard) = super::guard::RepairGuard::try_take(&sub, &m10_bucket()) else {
+                busy.set(true);
+                return Ok(None);
+            };
             // CT5: THE binding, revalidated under the lock — generation, live state, source of the bytes
             if !bound.equals_now(pack) {
                 return Ok(None);
@@ -1336,6 +1370,10 @@ fn m10_sweep_full(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
             report_deferred_sweep.set(true);
             continue;
         };
+        if busy.get() {
+            report_deferred_sweep.set(true);
+            continue;
+        }
         let Some(r) = r? else {
             new_findings.push(Finding {
                 rel: rel.to_string(),
