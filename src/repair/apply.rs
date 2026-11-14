@@ -735,10 +735,17 @@ fn after_seal_move_in(
 }
 
 /// CT3 for a placement (place form, the Windows second move): what is NOW live must be the state
-/// the placement was to put there; otherwise that entry is moved into a fresh slot by a CHECKED
-/// operation (expected = what is actually live) and the place is empty again, as before. `None` =
-/// the measured state is the incoming one.
-fn verify_placed(env: &OpEnv<'_>, rec: &OpRecord, live: &Path, depth: u8) -> Result<Option<String>, RepairError> {
+/// the placement was to put there; otherwise that entry goes into a fresh slot by a CHECKED
+/// operation (expected = what is actually live) and the PREVIOUS state returns — absent for the
+/// place form, the deposited bytes (`previous`) for the deposit-first form. `None` = the measured
+/// state is the incoming one.
+fn verify_placed(
+    env: &OpEnv<'_>,
+    rec: &OpRecord,
+    live: &Path,
+    previous: (TargetState, Option<PathBuf>),
+    depth: u8,
+) -> Result<Option<String>, RepairError> {
     let incoming = parse_canon(&rec.incoming).unwrap_or(TargetState::Absent);
     let live_now = TargetState::read(live)?;
     if live_now == incoming {
@@ -750,19 +757,19 @@ fn verify_placed(env: &OpEnv<'_>, rec: &OpRecord, live: &Path, depth: u8) -> Res
         live_now.canon(),
         incoming.canon()
     );
-    if depth == 0 && live_now != TargetState::Absent {
+    if depth == 0 && live_now != previous.0 {
         let back = OpSpec {
             id: rec.repair.clone(),
             rel: rec.rel.clone(),
             kind: "undo-mismatch".into(),
             expected: live_now,
-            incoming: TargetState::Absent,
-            source: None,
+            incoming: previous.0,
+            source: previous.1,
             generation: None,
         };
         let r = run_op_depth(env, &back, depth + 1)?;
         if r.outcome == ApplyOutcome::Applied {
-            note.push_str(" — 그것을 새 보관 칸으로 옮겨 그 자리를 이전처럼 비웠습니다");
+            note.push_str(" — 그것을 새 보관 칸에 두고 그 자리를 이전 상태로 되돌렸습니다");
         } else {
             note.push_str(&format!(" — 그 자리를 되돌리지 못했습니다(충돌 · {:?})", r.outcome));
         }
@@ -831,7 +838,7 @@ fn op_place(
     if env.faults.at(Point::BeforeDone, live, None) {
         return Err(stop(Point::BeforeDone));
     }
-    if let Some(note) = verify_placed(env, &rec, live, 0)? {
+    if let Some(note) = verify_placed(env, &rec, live, (TargetState::Absent, None), 0)? {
         wal::finish(env.root, &mut rec, "declined", &note, env.now)?;
         return Ok(done(ApplyOutcome::Declined(note), Some(&rec)));
     }
@@ -932,7 +939,8 @@ fn second_move(
                 if env.faults.at(Point::BeforeDone, live, Some(slot)) {
                     return Err(stop(Point::BeforeDone));
                 }
-                if let Some(note) = verify_placed(env, rec, live, 0)? {
+                let previous = vault::deposit_of(slot).map(|(st, h)| (st, Some(h))).unwrap_or((TargetState::Absent, None));
+                if let Some(note) = verify_placed(env, rec, live, previous, 0)? {
                     wal::finish(env.root, rec, "declined", &note, env.now)?;
                     return Ok(done(ApplyOutcome::Declined(note), Some(rec)));
                 }
@@ -1123,7 +1131,11 @@ pub fn resume_op(env: &OpEnv<'_>, mut rec: OpRecord) -> Result<OpDone, RepairErr
         ("place", "staged") | ("deposit-first", "placed") | ("place", "placed") => {
             let want = rec.incoming_copy_identity.clone();
             if want.as_ref().is_some_and(|w| live_entry.as_ref().is_some_and(|e| same_entry(w, e))) {
-                if let Some(note) = verify_placed(env, &rec, &live, 0)? {
+                let previous = match (&rec.form[..], &slot) {
+                    ("deposit-first", Some(sl)) => vault::deposit_of(sl).map(|(st, h)| (st, Some(h))).unwrap_or((TargetState::Absent, None)),
+                    _ => (TargetState::Absent, None),
+                };
+                if let Some(note) = verify_placed(env, &rec, &live, previous, 0)? {
                     wal::finish(env.root, &mut rec, "declined", &note, env.now)?;
                     return Ok(done(ApplyOutcome::Declined(note), Some(&rec)));
                 }
@@ -2507,6 +2519,9 @@ fn undo_applied(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord) -> Resu
 fn undo_applied_with(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord, only_ours: bool) -> Result<Vec<(String, String)>, RepairError> {
     let mut left = Vec::new();
     for spec in applied.iter().rev() {
+        if TargetState::read(&env.pack.join(&spec.rel))? == spec.expected {
+            continue; // nothing of this target was changed (its pre-image is live)
+        }
         let (pre, holder) = match pre_image_for(env.root, rec, env.lane, &spec.rel) {
             Ok(x) => x,
             Err(e) => {
