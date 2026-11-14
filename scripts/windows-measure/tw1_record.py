@@ -60,6 +60,8 @@ REQUIRED_ROWS = tuple("G%02d" % i for i in range(1, 17)) + (
     "T5C-COMPGEN", "T2G-COPY",
     # measurement push 3 (RULINGS HB5, HD2)
     "T9-JOURNAL-TAKE", "T5C-HANGUL",
+    # the release-blocking Windows rows (RULINGS HK2 (2), HL1)
+    "I-CLEAR-CHAIN",
 )
 
 # environment variables whose VALUE may appear in the record (RULINGS EQ6); every other name is listed without its value

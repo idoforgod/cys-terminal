@@ -86,6 +86,7 @@ if IS_WIN:
                     ("nFileIndexLow", wt.DWORD)]
 
     _k32.GetFileInformationByHandle.argtypes = [wt.HANDLE, ctypes.POINTER(_BHFI)]
+    _k32.IsProcessInJob.argtypes = [wt.HANDLE, wt.HANDLE, ctypes.POINTER(wt.BOOL)]
 
 
 # ───────────────────────────── small helpers ─────────────────────────────
@@ -203,9 +204,40 @@ def surface_roles(cys_exe):
     return roles, r
 
 
-def _b64(b):
-    import base64
-    return None if b is None else base64.b64encode(b).decode("ascii")
+TW1_MARKERS = ("# tw1", "<!-- tw1", "REM tw1")
+
+
+def file_digest(b):
+    """RULINGS HC3 + the coordinator's evidence rule (the record is public): what the record may carry about a pack
+    file - its SHA-256, its size and its line-ending counts. Never its body."""
+    if b is None:
+        return None
+    crlf = b.count(b"\r\n")
+    return {"sha256": sha256_bytes(b), "size": len(b), "crlf": crlf, "lf": b.count(b"\n") - crlf,
+            "cr": b.count(b"\r") - crlf}
+
+
+def lines_evidence(lines, live):
+    """The lines a check needs, as evidence: each line's SHA-256 and whether it is a whole line of `live`; the plain
+    text only of the TW1 marker the driver itself wrote (a conflicting edit's original text is never copied)."""
+    if lines is None:
+        return None
+    have = set(R.text_lines(live)) if live is not None else set()
+    out = []
+    for ln in lines:
+        at = min((ln.find(m) for m in TW1_MARKERS if m in ln), default=-1)
+        out.append({"sha256": sha256_bytes(ln.encode("utf-8")), "in_live": ln in have,
+                    "tw1_marker": ln[at:] if at >= 0 else None})
+    return out
+
+
+def edited_evidence(rel, live, new_b, user_b, base_b, vendor_b):
+    """The evidence of one edited pack file: digests of live / .new / the user's copy / the base / the vendor's, and the
+    lines the structural checks read (the user's added lines, the vendor's changed lines)."""
+    return {"rel": rel, "live": file_digest(live), "new": file_digest(new_b), "user": file_digest(user_b),
+            "base": file_digest(base_b), "vendor": file_digest(vendor_b),
+            "user_added": lines_evidence(R.added_lines(base_b, user_b), live),
+            "vendor_added": lines_evidence(R.added_lines(base_b, vendor_b), live)}
 
 
 def edited_outcome(live, user_b, base_b, vendor_b, new_b):
@@ -1193,6 +1225,12 @@ def probe_s1_base(pr):
                            "rt_edit_sha": f["rt_edit_sha"], "selection": sel,
                            "ejob_detected_missing": f.get("ejob_detected_missing"),
                            "ehook_detected_missing": f.get("ehook_detected_missing")})
+    # RULINGS HL1: the clear's verification chain on the BASE first (after the edits and the lifeline snapshot, so that
+    # its registrar does not change them) - the candidate must be no weaker (s3_clear_chain)
+    try:
+        f.update({"cc_base_" + k: v for k, v in _clear_chain(pr, "base").items()})
+    except Exception as e:  # noqa: BLE001 - the reference's failure is recorded; it must not cost the base stage
+        f["cc_base_error"] = "%s: %s" % (type(e).__name__, e)
     pr.restored = True
 
 
@@ -1616,8 +1654,7 @@ def probe_s3_files(pr):
         f[key + "_capture_is_user"] = e["user_sha"] in (s2_caps.get(key) or [])
         f[key + "_snapshot_is_user"] = (s2_snap.get(key) == e["user_sha"]) if s2_snap.get(key) else None
         f[key + "_conflict_line"] = s1_conflicts.get(key)
-        live_ev[key] = {"rel": rel, "live_b64": _b64(live), "new_b64": _b64(read_bytes(p + ".new")),
-                        "user_b64": _b64(ub), "base_b64": _b64(bb)}
+        live_ev[key] = edited_evidence(rel, live, read_bytes(p + ".new"), ub, bb, vb)
     s1 = os.path.join(pr.work, "obs", "s1_base.json")
     try:
         f["ENC1_user_invalid_utf8"] = json.loads(read_text(s1))["facts"].get("ENC1_user_invalid_utf8")
@@ -1632,7 +1669,7 @@ def probe_s3_files(pr):
         f["pre_update_%s_sha" % key] = s2f.get("pre_update_%s_sha" % key)
     f["manifest_present_before_install"] = s2f.get("manifest_present_before_install")
     pr.ev("pending.json", pending)
-    pr.ev("edited-files-bytes.json", live_ev)  # RULINGS HC3: the live bytes of every edited file, kept as evidence
+    pr.ev("edited-files.json", live_ev)  # digests + the lines the checks read - never a file body (public record)
     pr.restored = True
 
 
@@ -2028,6 +2065,24 @@ def probe_s7_primitives(pr):
     if not f["prim_runtime_found"]:
         return
     log = {}
+    # ── G04: the runtime folder's SHA-256 walk timed (twice: first and repeated), Defender's real-time state from S0 ──
+    s0f = ((_load(os.path.join(pr.work, "obs", "s0_env.json")) or {}).get("facts") or {})
+    f["g04_rtp_on"] = s0f.get("rtp_after")
+    rt = os.path.join(pr.install_dir, "runtime")
+    for k in ("first", "repeat"):
+        t0, n, size = time.monotonic(), 0, 0
+        for dp, _dns, fns in os.walk(rt):
+            for fn in fns:
+                q = os.path.join(dp, fn)
+                try:
+                    size += os.path.getsize(q)
+                except OSError:
+                    continue
+                sha256_file(q)
+                n += 1
+        f["g04_%s_ms" % k] = round((time.monotonic() - t0) * 1000)
+        f["g04_%s_files" % k] = n
+        f["g04_%s_bytes" % k] = size
     # ── G06: a running Git Bash script / an imported Python module, renamed, rewritten in place, replaced ──
     d = os.path.join(root, "g06")
     os.makedirs(d, exist_ok=True)
@@ -2523,8 +2578,8 @@ def probe_s6_variants(pr):
                 os.path.join(cys_dir, "pack-captures"), shm)
             f[tag + "_SHM_snapshot_is_user"] = f[tag + "_SHM_user_sha"] in _rel_shas_under(
                 os.path.join(ctx["paths"]["local_dir"], "update-snapshots"), shm)
-            pr.ev(tag + "/merged-shell-bytes.json", {"rel": shm, "live_b64": _b64(live), "user_b64": _b64(shm_user),
-                                                    "base_b64": _b64(shm_base), "entry": sent})
+            pr.ev(tag + "/merged-shell.json", {"entry": sent, "evidence": edited_evidence(
+                shm, live, read_bytes(sp + ".new"), shm_user, shm_base, vb)})
         ids = (f[tag + "_pack_dir_id_pre"], f[tag + "_pack_dir_id_after_driver"], dir_identity(pr.pack_dir))
         f[tag + "_pack_dir_same"] = None if None in ids else len(set(ids)) == 1
         f[tag + "_pack_prev_after"] = os.path.lexists(os.path.join(os.path.dirname(pr.pack_dir), "pack.prev"))
@@ -3089,6 +3144,639 @@ def probe_s3_eg2(pr):
     pr.restored = True
 
 
+# ───────────────────────────── the clear's verification chain (RULINGS HL1 - I-CLEAR-CHAIN) ─────────────────────────────
+
+def _statusline_input(transcript, session_id, pct):
+    """The agent CLI's documented statusline input - only the fields the product reads (cys.rs statusline_to_report_params)."""
+    return {"hook_event_name": "Status", "session_id": session_id, "transcript_path": transcript,
+            "cwd": os.path.dirname(transcript), "model": {"id": "claude-tw1", "display_name": "TW1 model"},
+            "workspace": {"current_dir": os.path.dirname(transcript), "project_dir": os.path.dirname(transcript)},
+            "version": "tw1", "output_style": {"name": "default"},
+            "context_window": {"used_percentage": pct, "context_window_size": 200000,
+                               "current_usage": {"input_tokens": 1000 * pct, "cache_creation_input_tokens": 0,
+                                                 "cache_read_input_tokens": 0}},
+            "rate_limits": {"five_hour": {"used_percentage": 10.0}, "seven_day": {"used_percentage": 5.0}}}
+
+
+def _find_surface(doc, num):
+    """The surface row with surface_id == num anywhere in a status document."""
+    if isinstance(doc, dict):
+        if doc.get("surface_id") == num:
+            return doc
+        for v in doc.values():
+            hit = _find_surface(v, num)
+            if hit is not None:
+                return hit
+    elif isinstance(doc, list):
+        for v in doc:
+            hit = _find_surface(v, num)
+            if hit is not None:
+                return hit
+    return None
+
+
+def _surface_usage(cys_exe, sid):
+    """The daemon's per-surface usage row (the clear verifier's input) through `cys status --json`."""
+    r = run([cys_exe, "status", "--json"], 30, env=clean_env({"CYS_NO_AUTOSTART": "1"}))
+    try:
+        doc = json.loads(r["out"])
+    except ValueError:
+        return None, False
+    try:
+        num = int(str(sid).split(":")[-1])
+    except ValueError:
+        return None, False
+    row = _find_surface(doc, num)
+    return (row or {}).get("usage"), row is not None
+
+
+def _same_path(a, b):
+    return bool(a and b) and norm_path(a) == norm_path(b)
+
+
+def _clear_chain(pr, tag):
+    """RULINGS HL1: registration (the version's own registrar C32) -> the registered command run under Git Bash with
+    CYS_SURFACE_ID and the documented statusline input -> the daemon's usage row it produces (what the clear verifier
+    `clear_effect_verdict` reads). Cases: missing, good (T1 then T2), stale (T2 again), failing (cys not on PATH).
+    The verifier itself runs only inside `cys cycle-agent` stage 6 after an idle agent screen - not driven here."""
+    out = {}
+    settings = settings_candidates(os.environ.get("USERPROFILE", ""))
+
+    def registered_cmd():
+        for sf in settings_candidates(os.environ.get("USERPROFILE", "")):
+            try:
+                doc = json.loads(read_text(sf) or "")
+            except ValueError:
+                continue
+            sl = doc.get("statusLine") if isinstance(doc, dict) else None
+            if isinstance(sl, dict) and "cys-statusline.sh" in str(sl.get("command", "")):
+                return str(sl["command"]), sf
+        return None, None
+
+    out["settings_files"] = len(settings)
+    cmd0, _sf = registered_cmd()
+    out["registered_before_registrar"] = cmd0 is not None
+    reg = run([pr.bundled_python(), "-B", os.path.join(pr.pack_dir, "bin", "javis_preflight.py"), "--fix", "--only",
+               "C32"], 240, env=seat_env(pr))
+    pr.ev("clear-chain/%s-registrar.json" % tag, reg)
+    out["registrar_exit"] = reg["code"]
+    cmdline, sf = registered_cmd()
+    out["registered"] = cmdline is not None
+    out["registered_in_claude_settings"] = bool(sf) and os.path.basename(os.path.dirname(sf)).lower() == ".claude"
+    if not cmdline:
+        return out
+    ns = pr.cys(["new-surface", "--role", "worker"], timeout=60)
+    pr.ev("clear-chain/%s-new-surface.json" % tag, ns)
+    sid = ns["out"].strip().splitlines()[-1].strip() if ns["code"] == 0 and ns["out"].strip() else None
+    out["surface"] = sid
+    if not sid:
+        return out
+    d = os.path.join(pr.work, "clear-chain", tag)
+    tr = {}
+    for k in ("T1", "T2", "T3"):
+        sid_k = "00000000-0000-4000-8000-%012d" % (abs(hash((tag, k))) % 10 ** 12)
+        tr[k] = (os.path.join(d, "projects", "tw1", sid_k + ".jsonl"), sid_k)
+        write_bytes(tr[k][0], b'{"type":"tw1"}\n')
+
+    def observe(step):
+        u, found = _surface_usage(pr.exe("cys.exe"), sid)
+        sfile = (u or {}).get("session_file")
+        which = next((k for k, (p, _s) in tr.items() if _same_path(sfile, p)), None)
+        out[step + "_row_found"] = found
+        out[step + "_source"] = (u or {}).get("source")
+        out[step + "_session_is"] = which if which else (None if not sfile else "other")
+        out[step + "_updated_at"] = (u or {}).get("updated_at")
+
+    def feed(step, key, path_env):
+        pf = os.path.join(d, step + "-input.json")
+        write_bytes(pf, json.dumps(_statusline_input(tr[key][0], tr[key][1], 41 if key == "T1" else 7)).encode("utf-8"))
+        env = seat_env(pr, {"CYS_SURFACE_ID": sid})
+        if path_env is not None:
+            env["PATH"] = path_env
+        r = run([pr.bundled_hook_bash(), "-c", cmdline], 60, env=env, stdin_path=pf)
+        pr.ev("clear-chain/%s-%s-hook.json" % (tag, step), r)
+        out[step + "_hook_exit"] = r["code"]
+        out[step + "_hook_line"] = r["out"].strip()[:120]
+        time.sleep(1.5)
+        observe(step)
+
+    observe("missing")                    # a fresh surface whose hook never ran
+    feed("good1", "T1", None)             # the session before the clear
+    feed("good2", "T2", None)             # a new session after the clear: the verifier's 'swap'
+    feed("stale", "T2", None)             # the same session again: no swap
+    git = os.path.join(pr.install_dir, "runtime", "git")
+    no_cys = os.pathsep.join([os.path.join(git, "usr", "bin"), os.path.join(git, "bin"),
+                              os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")])
+    feed("failing", "T3", no_cys)         # the hook cannot reach cys: it must still exit 0 and push nothing
+    out["cases"] = {k: (out.get(k + "_session_is"), out.get(k + "_source") == "statusline")
+                    for k in ("missing", "good1", "good2", "stale", "failing")}
+    return out
+
+
+def probe_s3_clear_chain(pr):
+    f = pr.facts
+    cc = _clear_chain(pr, "candidate")
+    f.update({"cc_cand_" + k: v for k, v in cc.items()})
+    base = ((_load(os.path.join(pr.work, "obs", "s1_base.json")) or {}).get("facts") or {})
+    bcc = {k[len("cc_base_"):]: v for k, v in base.items() if k.startswith("cc_base_")}
+    f.update({"cc_base_" + k: v for k, v in bcc.items()})
+    bc, cc_ = bcc.get("cases") or {}, cc.get("cases") or {}
+    for k in ("missing", "good1", "good2", "stale", "failing"):
+        f["cc_same_as_base_" + k] = (None if k not in bc or k not in cc_ else list(bc[k]) == list(cc_[k]))
+    pr.restored = True
+
+
+# ───────────────────────────── WIN-14: the changed Python tools in a code-page-949 console (RULINGS HK2 (2)) ─────────────────────────────
+
+# Runs (with the bundled runtime) inside the new console: the tool's output goes to the CONSOLE itself; its exit code
+# and the console code page are printed after it; then it waits so that the reader can attach.
+_CP949_WRAPPER = r'''import ctypes, subprocess, sys, time
+k = ctypes.WinDLL("kernel32")
+print("TW1-CP=%d" % k.GetConsoleOutputCP(), flush=True)
+rc = subprocess.call(sys.argv[1:])
+print("TW1-RC=%d" % rc, flush=True)
+print("TW1-END", flush=True)
+time.sleep(120)
+'''
+
+# Runs DETACHED (no console of its own): attaches to the target's console and reads its screen buffer as text.
+_CONSOLE_READER = r'''import ctypes, ctypes.wintypes as wt, sys, time
+pid, out, limit = int(sys.argv[1]), sys.argv[2], float(sys.argv[3])
+k = ctypes.WinDLL("kernel32", use_last_error=True)
+class COORD(ctypes.Structure):
+    _fields_ = [("X", wt.SHORT), ("Y", wt.SHORT)]
+class SMALL_RECT(ctypes.Structure):
+    _fields_ = [("Left", wt.SHORT), ("Top", wt.SHORT), ("Right", wt.SHORT), ("Bottom", wt.SHORT)]
+class CSBI(ctypes.Structure):
+    _fields_ = [("dwSize", COORD), ("dwCursorPosition", COORD), ("wAttributes", wt.WORD),
+                ("srWindow", SMALL_RECT), ("dwMaximumWindowSize", COORD)]
+k.CreateFileW.restype = wt.HANDLE
+k.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p, wt.DWORD, wt.DWORD, wt.HANDLE]
+k.ReadConsoleOutputCharacterW.argtypes = [wt.HANDLE, wt.LPWSTR, wt.DWORD, COORD, ctypes.POINTER(wt.DWORD)]
+k.GetConsoleScreenBufferInfo.argtypes = [wt.HANDLE, ctypes.POINTER(CSBI)]
+status, text = "not-attached", ""
+t0 = time.time()
+while time.time() - t0 < limit:
+    k.FreeConsole()
+    if k.AttachConsole(pid):
+        h = k.CreateFileW("CONOUT$", 0xC0000000, 3, None, 3, 0, None)
+        info = CSBI()
+        if h and h != wt.HANDLE(-1).value and k.GetConsoleScreenBufferInfo(h, ctypes.byref(info)):
+            w, rows = info.dwSize.X, info.dwCursorPosition.Y + 1
+            buf = ctypes.create_unicode_buffer(w * rows + 1)
+            got = wt.DWORD(0)
+            if k.ReadConsoleOutputCharacterW(h, buf, w * rows, COORD(0, 0), ctypes.byref(got)):
+                raw = buf.value[:got.value]
+                text = "\n".join(raw[i:i + w].rstrip() for i in range(0, len(raw), w))
+                status = "read"
+        if h and h != wt.HANDLE(-1).value:
+            k.CloseHandle(h)
+        k.FreeConsole()
+        if "TW1-END" in text:
+            status = "complete"
+            break
+    time.sleep(0.5)
+with open(out, "w", encoding="utf-8") as fh:
+    fh.write(status + "\n" + text)
+'''
+
+CREATE_NEW_CONSOLE = 0x00000010
+DETACHED_PROCESS = 0x00000008
+MOJIBAKE_CHARS = "êëìí�"   # what UTF-8 Hangul turns into when read as ANSI, and U+FFFD
+
+
+def _console_run(pr, argv, tag, env, limit=90):
+    """Run `argv` (the bundled Python running the wrapper) in a NEW console set to code page 949, its output on that
+    console; read the console back. -> dict(status, text, rc, cp)."""
+    d = os.path.join(pr.work, "cp949-console")
+    wrapper = os.path.join(d, "wrapper.py")
+    reader = os.path.join(d, "reader.py")
+    write_bytes(wrapper, _CP949_WRAPPER.encode("utf-8"))
+    write_bytes(reader, _CONSOLE_READER.encode("utf-8"))
+    outp = os.path.join(d, tag + ".txt")
+    if os.path.exists(outp):
+        os.remove(outp)
+    line = "chcp 949 >nul & " + subprocess.list2cmdline([pr.bundled_python(), "-B", wrapper] + argv)
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0  # SW_HIDE
+    # a STRING command line: cmd strips the first and the last quote of `/c "…"` and keeps the inner quoting of the
+    # arguments (a list would make subprocess escape those inner quotes with backslashes, which cmd does not read)
+    con = subprocess.Popen('cmd.exe /d /c "' + line + '"', env=env, creationflags=CREATE_NEW_CONSOLE, startupinfo=si,
+                           stdin=None, stdout=None, stderr=None)
+    pr.register_pid(con.pid, "cp949 console " + tag)
+    rd = subprocess.Popen([sys.executable, "-I", "-B", reader, str(con.pid), outp, str(limit)],
+                          creationflags=DETACHED_PROCESS, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL)
+    try:
+        rd.wait(timeout=limit + 30)
+    except subprocess.TimeoutExpired:
+        rd.kill()
+    kill_tree(con.pid)
+    pr.unregister_pid(con.pid)
+    raw = read_text(outp) or ""
+    status, _nl, text = raw.partition("\n")
+    m_rc = re.search(r"TW1-RC=(-?\d+)", text)
+    m_cp = re.search(r"TW1-CP=(\d+)", text)
+    res = {"status": status or "no-output", "text": text, "rc": int(m_rc.group(1)) if m_rc else None,
+           "cp": int(m_cp.group(1)) if m_cp else None}
+    pr.ev("cp949-console/%s.json" % tag, {"argv": argv, "status": res["status"], "rc": res["rc"], "cp": res["cp"],
+                                          "text": text[-6000:]})
+    return res
+
+
+def probe_s3_cp949_tools(pr):
+    """WIN-14 (RULINGS HK2 (2)): every pack Python tool 0.15.0 changed, under the bundled runtime in a console set to
+    code page 949, WITHOUT a UTF-8 mode variable (no PYTHONUTF8, no -X utf8) - its output on the console itself."""
+    f = pr.facts
+    if not IS_WIN:
+        return
+    env = clean_env()            # drops every PYTHON* variable (no UTF-8 mode, no IO encoding)
+    env.pop("LC_CTYPE", None)
+    f["utf8_variables_absent"] = not any(k.upper() in ("PYTHONUTF8", "PYTHONIOENCODING") for k in env)
+    ctl = _console_run(pr, [pr.bundled_python(), "-B", "-c", "print('제어 한글 출력 TW1')"], "control", env)
+    f["console_status_control"] = ctl["status"]
+    f["console_cp"] = ctl["cp"]
+    f["console_control_hangul_ok"] = "제어 한글 출력 TW1" in ctl["text"]
+    scratch = os.path.join(pr.work, "cp949-console", "한글 일정")
+    for spec in matrix()["scenario"]["cp949_tools"]:
+        rel, name = spec["rel"], spec["name"]
+        tool = os.path.join(pr.pack_dir, *rel.split("/"))
+        f["t14_%s_present" % name] = os.path.isfile(tool)
+        if not f["t14_%s_present" % name]:
+            continue
+        for case, args, _rc, echo in spec["cases"]:
+            args = [a.replace("{hangul_dir}", scratch) for a in args]
+            r = _console_run(pr, [pr.bundled_python(), "-B", tool] + args, "%s-%s" % (name, case), env)
+            key = "t14_%s_%s" % (name, case)
+            f[key + "_status"] = r["status"]
+            f[key + "_rc"] = r["rc"]
+            f[key + "_traceback"] = "Traceback (most recent call last)" in r["text"]
+            f[key + "_mojibake"] = sum(r["text"].count(c) for c in MOJIBAKE_CHARS)
+            f[key + "_hangul_chars"] = sum(1 for ch in r["text"] if "가" <= ch <= "힣")
+            f[key + "_echo_ok"] = (echo in r["text"]) if echo else None
+        if spec.get("writes_hangul_path"):
+            target = os.path.join(scratch, "schedule.json")
+            f["t14_%s_hangul_file_written" % name] = os.path.isfile(target)
+    shutil.rmtree(os.path.join(pr.work, "cp949-console", "한글 일정"), ignore_errors=True)
+    pr.restored = True
+
+
+# ───────────────────────────── S5 — the upgrade checklist's steps P4-P7, P9-P11 (WIN-02) and G08 ─────────────────────────────
+
+P4_KILL_AFTER_S = 10   # the checklist's P4-b: the installer killed while it runs (extraction takes ~45 s on the runner)
+
+_HOLD_SHARE_READ = r'''import ctypes, ctypes.wintypes as wt, sys, time
+k = ctypes.WinDLL("kernel32", use_last_error=True)
+k.CreateFileW.restype = wt.HANDLE
+k.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p, wt.DWORD, wt.DWORD, wt.HANDLE]
+h = k.CreateFileW(sys.argv[1], 0x80000000, 1, None, 3, 0, None)   # GENERIC_READ, FILE_SHARE_READ only
+print("held" if h not in (None, wt.HANDLE(-1).value) else "failed %d" % ctypes.get_last_error(), flush=True)
+time.sleep(900)
+'''
+
+
+def _cys_version(pr):
+    r = run([pr.exe("cys.exe"), "--version"], 30, env=clean_env({"CYS_NO_AUTOSTART": "1"}))
+    return r["code"], r["out"].strip()[:80]
+
+
+def _failure_file(pr):
+    """The installer's failure record: its first line and the four token lines (NSIS-CONTRACT 3)."""
+    t = read_text(pr.exe("cys-install-failure.txt"))
+    if t is None:
+        return None
+    lines = t.splitlines()
+    tok = {}
+    for k in ("unrecoverable", "rolled-back-to-previous", "not-updated", "placement-refused"):
+        ln = next((x for x in lines if x.startswith(k + ":")), None)
+        tok[k] = None if ln is None else ln[len(k) + 1:].strip()
+    return {"first": lines[0][:200] if lines else "", "tokens": tok}
+
+
+def _exes(pr, pattern):
+    return sorted(os.path.basename(x) for x in glob.glob(os.path.join(pr.install_dir, pattern)))
+
+
+def _base_install(pr):
+    """A fresh base (0.14.56) installation, nothing else (no pack, no daemon)."""
+    rs = _reset_installation(pr)
+    r = run([pr.ctx["installers"]["base"], "/S"], 900)
+    time.sleep(2)
+    _kill_product(pr.install_dir)
+    ok = (rs["clean"] and r["code"] == 0 and (read_text(pr.exe("cys-installed-version.txt")) or "").strip()
+          == matrix()["base"]["version"])
+    return ok and runtime_ok(pr.install_dir)[0]
+
+
+def _job_objects(pr):
+    """G08: job-object membership of the daemon and of the pane processes; then the daemon is stopped (not drained)
+    and the panes that survive are recorded."""
+    out = {}
+    lst = pr.cys(["list"], timeout=30, extra={"CYS_NO_AUTOSTART": "1"})
+    panes = sorted({int(x) for x in re.findall(r"\bpid=(\d+)", lst["out"])})
+    daemons = [p["pid"] for p in processes() if (p.get("name") or "").lower() == "cysd.exe"]
+
+    def in_job(pid):
+        h = _k32.OpenProcess(0x1000, False, pid)
+        if not h:
+            return None
+        try:
+            res = wt.BOOL(0)
+            return bool(res.value) if _k32.IsProcessInJob(h, None, ctypes.byref(res)) else None
+        finally:
+            _k32.CloseHandle(h)
+
+    out["g08_driver_in_job"] = in_job(os.getpid())
+    out["g08_daemon_in_job"] = {str(d): in_job(d) for d in daemons}
+    out["g08_panes_in_job"] = {str(p): in_job(p) for p in panes}
+    out["g08_pane_count"] = len(panes)
+    for d in daemons:
+        terminate(d)
+    time.sleep(3)
+    out["g08_panes_alive_after_daemon_kill"] = {str(p): alive(p) for p in panes}
+    out["g08_panes_survived"] = sum(1 for p in panes if alive(p))
+    return out
+
+
+def probe_s5_checklist(pr):
+    """WIN-02 (RULINGS HK2 (2)): the checklist's steps on the runner, each as the checklist demands; G08 first."""
+    f = pr.facts
+    if not IS_WIN:
+        return
+    m = matrix()
+    want4 = (pr.ctx["versions"]["candidate"] or "") + ".0"
+    base4 = m["base"]["version"] + ".0"
+    cand = pr.ctx["installers"]["candidate"]
+    cys_exe = pr.exe("cys.exe")
+    f.update(_job_objects(pr))
+    # P7 - the hook bash path
+    f["p7_bin_bash"] = os.path.isfile(os.path.join(pr.install_dir, "runtime", "git", "bin", "bash.exe"))
+    f["p7_usr_bash"] = os.path.isfile(os.path.join(pr.install_dir, "runtime", "git", "usr", "bin", "bash.exe"))
+    r = run([pr.bundled_hook_bash(), "-c", "echo hook-bash-ok"], 30, env=clean_env())
+    f["p7_echo_ok"] = r["code"] == 0 and r["out"].strip() == "hook-bash-ok"
+    # P10-a - the same version again: a quiet success, no swap
+    prev0 = _exes(pr, "*.prev*.exe")
+    r = pr.ev_cmd("p10a-install.json", run([cand, "/S"], 900))
+    time.sleep(2)
+    f["p10a_exit"] = r["code"]
+    f["p10a_failure_file"] = os.path.isfile(pr.exe("cys-install-failure.txt"))
+    f["p10a_prev_new"] = sorted(set(_exes(pr, "*.prev*.exe")) - set(prev0))
+    f["p10a_version_ok"] = file_version(cys_exe) == want4
+    # P10-b - an old file in place (no lock): it must really be replaced
+    _kill_product(pr.install_dir)
+    shutil.copyfile(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe"), cys_exe)
+    f["p10b_standin"] = file_version(cys_exe) != want4
+    r = pr.ev_cmd("p10b-install.json", run([cand, "/S"], 900))
+    time.sleep(2)
+    f["p10b_exit"] = r["code"]
+    f["p10b_version_ok"] = file_version(cys_exe) == want4
+    f["p10b_failure_file"] = os.path.isfile(pr.exe("cys-install-failure.txt"))
+    # P11 - the disk state of a power cut between the two renames; the next daemon start repairs the place
+    for variant in ("new", "prev"):
+        _kill_product(pr.install_dir)
+        for leftover in glob.glob(os.path.join(pr.install_dir, "cys.prev*.exe")) + [pr.exe("cys.new.exe")]:
+            if os.path.isfile(leftover):
+                os.remove(leftover)
+        if variant == "new":
+            shutil.copyfile(cys_exe, pr.exe("cys.new.exe"))
+        os.replace(cys_exe, pr.exe("cys.prev.exe"))
+        f["p11_%s_absent_before" % variant] = not os.path.exists(cys_exe)
+        dp = start_detached([pr.exe("cysd.exe")], env=clean_env(), stdout_path=os.path.join(pr.ev_dir, "p11-%s-cysd.out" % variant))
+        pr.register_pid(dp, "p11 daemon " + variant)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 30 and not os.path.isfile(cys_exe):
+            time.sleep(0.5)
+        time.sleep(2)
+        f["p11_%s_restored" % variant] = os.path.isfile(cys_exe)
+        f["p11_%s_version_rc" % variant] = _cys_version(pr)[0] if os.path.isfile(cys_exe) else None
+        f["p11_%s_is_new" % variant] = file_version(cys_exe) == want4 if os.path.isfile(cys_exe) else None
+        _kill_product(pr.install_dir)
+        pr.unregister_pid(dp)
+    # P9 - uninstall leaves none of the installer's own leftovers
+    _kill_product(pr.install_dir)
+    un = os.path.join(pr.install_dir, "uninstall.exe")
+    r = pr.ev_cmd("p9-uninstall.json", run([un, "/S", "_?=" + pr.install_dir], 300)) if os.path.isfile(un) else None
+    t0 = time.monotonic()
+    while _uninstaller_processes(pr.install_dir) and time.monotonic() - t0 < UNINSTALL_WAIT_S:
+        time.sleep(1)
+    f["p9_uninstall_exit"] = None if r is None else r["code"]
+    f["p9_runtime_left"] = os.path.exists(os.path.join(pr.install_dir, "runtime"))
+    f["p9_prev_left"] = _exes(pr, "*.prev*")
+    f["p9_new_exe_left"] = _exes(pr, "*.new.exe")
+    f["p9_failure_file_left"] = os.path.isfile(pr.exe("cys-install-failure.txt"))
+    f["p9_marker_left"] = os.path.isfile(pr.exe("cys-installed-version.txt"))
+    # P6-a - a handle lock (read-share only) on the old cys.exe: exit 4, the old build intact; released -> success
+    f["p6a_base_ok"] = _base_install(pr)
+    hold = os.path.join(pr.work, "s5", "hold.py")
+    write_bytes(hold, _HOLD_SHARE_READ.encode("utf-8"))
+    hp = start_detached([sys.executable, "-I", "-B", hold, cys_exe], env=clean_env(),
+                        stdout_path=os.path.join(pr.ev_dir, "p6a-holder.out"))
+    pr.register_pid(hp, "p6a holder")
+    time.sleep(3)
+    f["p6a_held"] = (read_text(os.path.join(pr.ev_dir, "p6a-holder.out")) or "").startswith("held")
+    r = pr.ev_cmd("p6a-install.json", run([cand, "/S"], 900))
+    time.sleep(2)
+    f["p6a_exit"] = r["code"]
+    ff = _failure_file(pr)
+    pr.ev("p6a-failure-record.json", ff)
+    f["p6a_placement_refused"] = (ff or {}).get("tokens", {}).get("placement-refused")
+    f["p6a_names_vacate_locked"] = "cys.exe(vacate-locked)" in (f["p6a_placement_refused"] or "")
+    f["p6a_old_works"] = _cys_version(pr)[0] == 0
+    f["p6a_old_kept"] = file_version(cys_exe) == base4
+    kill_tree(hp)
+    pr.unregister_pid(hp)
+    time.sleep(1)
+    r = pr.ev_cmd("p6a-rerun.json", run([cand, "/S"], 900))
+    time.sleep(2)
+    f["p6a_rerun_exit"] = r["code"]
+    f["p6a_rerun_version_ok"] = file_version(cys_exe) == want4
+    # P6-b - an image lock (a running old cys): success, the new version, the process alive
+    f["p6b_base_ok"] = _base_install(pr)
+    ep = start_detached([cys_exe, "events", "--reconnect"], env=clean_env(), stdout_path=os.path.join(pr.ev_dir, "p6b-events.out"))
+    pr.register_pid(ep, "p6b events")
+    time.sleep(3)
+    f["p6b_events_started"] = alive(ep)
+    r = pr.ev_cmd("p6b-install.json", run([cand, "/S"], 900))
+    time.sleep(2)
+    f["p6b_exit"] = r["code"]
+    f["p6b_version_ok"] = file_version(cys_exe) == want4
+    f["p6b_failure_file"] = os.path.isfile(pr.exe("cys-install-failure.txt"))
+    f["p6b_events_alive"] = alive(ep)
+    kill_tree(ep)
+    pr.unregister_pid(ep)
+    # P5 - the gate's negative test: a 0-byte read-only cys.exe -> a loud failure (exit 3 + the record); restored -> ok
+    f["p5_base_ok"] = _base_install(pr)
+    os.remove(cys_exe)
+    write_bytes(cys_exe, b"")
+    acl = run(["icacls", cys_exe, "/inheritance:r", "/grant:r", "%s:(R)" % os.environ.get("USERNAME", "")], 60)
+    f["p5_acl_set"] = acl["code"] == 0
+    r = pr.ev_cmd("p5-install.json", run([cand, "/S"], 900))
+    time.sleep(2)
+    f["p5_exit"] = r["code"]
+    ff = _failure_file(pr)
+    pr.ev("p5-failure-record.json", ff)
+    tok = (ff or {}).get("tokens") or {}
+    f["p5_first_line_ok"] = (ff or {}).get("first", "").startswith("cys installer: critical executable verification FAILED")
+    f["p5_four_tokens"] = bool(tok) and all(v is not None for v in tok.values())
+    f["p5_unrecoverable_names_cys"] = "cys.exe" in (tok.get("unrecoverable") or "")
+    f["p5_refused_names_cys"] = "cys.exe" in (tok.get("placement-refused") or "")
+    run(["icacls", cys_exe, "/reset"], 60)
+    for x in (cys_exe, pr.exe("cys-install-failure.txt")):
+        try:
+            os.remove(x)
+        except OSError:
+            pass
+    r = pr.ev_cmd("p5-recovery.json", run([cand, "/S"], 900))
+    time.sleep(2)
+    f["p5_recovery_exit"] = r["code"]
+    f["p5_recovery_version_ok"] = file_version(cys_exe) == want4
+    # P4 - the installer killed while it runs: a working CLI stays; a rerun completes
+    f["p4_base_ok"] = _base_install(pr)
+    kw = {"creationflags": CREATE_NO_WINDOW}
+    proc = subprocess.Popen([cand, "/S"], stdin=subprocess.DEVNULL, **kw)
+    pr.register_pid(proc.pid, "p4 installer")
+    time.sleep(P4_KILL_AFTER_S)
+    f["p4_kill_after_s"] = P4_KILL_AFTER_S
+    f["p4_alive_at_kill"] = proc.poll() is None
+    kill_tree(proc.pid)
+    pr.unregister_pid(proc.pid)
+    time.sleep(3)
+    f["p4_cys_exists"] = os.path.isfile(cys_exe)
+    f["p4_cysd_exists"] = os.path.isfile(pr.exe("cysd.exe"))
+    f["p4_version_rc"] = _cys_version(pr)[0] if f["p4_cys_exists"] else None
+    r = pr.ev_cmd("p4-rerun.json", run([cand, "/S"], 900))
+    time.sleep(2)
+    f["p4_rerun_exit"] = r["code"]
+    f["p4_rerun_version_ok"] = file_version(cys_exe) == want4
+    _kill_product(pr.install_dir)
+    pr.restored = False
+
+
+# ───────────────────────────── WIN-13: the product's stores under a Hangul, maximum-length user folder (RULINGS HK2 (2)) ─────────────────────────────
+
+WIN13_USER = "가나다라마바사 아자차카타파하 가나다라"   # 20 characters (the Windows user-name maximum): Hangul and spaces
+
+
+def _files_under(root):
+    out = []
+    for dp, _dns, fns in os.walk(root):
+        for fn in fns:
+            out.append(os.path.join(dp, fn))
+    return out
+
+
+def probe_s6_hangul(pr):
+    """One update leg (base init-pack + daemon + the user's edits -> candidate /S + init-pack + daemon + repair intake)
+    with CYS_PACK_DIR / CYS_STATE_DIR under %RUNNER_TEMP%\\tw1-users\\<WIN13_USER>\\.cys - the overrides the product
+    honours (the profile itself comes from the OS, not from USERPROFILE - row G05)."""
+    f = pr.facts
+    ctx = pr.ctx
+    m = matrix()
+    sel = ctx.get("selection") or {}
+    l1, g1 = sel.get("L1"), sel.get("G1")
+    want = ctx["versions"]["candidate"]
+    f["candidate_version"] = want
+    root = os.path.join(os.environ.get("RUNNER_TEMP") or pr.work, "tw1-users", WIN13_USER)
+    cys_dir = os.path.join(root, ".cys")
+    hp = os.path.join(cys_dir, "pack")
+    f["user_name_chars"] = len(WIN13_USER)
+    f["root_path_chars"] = len(root)
+    try:
+        shutil.rmtree(os.path.join(os.environ.get("RUNNER_TEMP") or pr.work, "tw1-users"), ignore_errors=True)
+        os.makedirs(cys_dir)
+        f["folder_ok"] = os.path.isdir(cys_dir)
+    except OSError as e:
+        f["folder_ok"] = False
+        pr.ev("win13-folder-error.txt", "%s: %s" % (type(e).__name__, e))
+    if not (f["folder_ok"] and l1 and g1):
+        return
+    env_h = clean_env({"CYS_PACK_DIR": hp, "CYS_STATE_DIR": os.path.join(cys_dir, "state")})
+    rs = _reset_installation(pr)
+    f["reset_clean"] = rs["clean"]
+    r = run([ctx["installers"]["base"], "/S"], 900)
+    time.sleep(2)
+    _kill_product(pr.install_dir)
+    f["base_ok"] = (r["code"] == 0 and (read_text(pr.exe("cys-installed-version.txt")) or "").strip() == m["base"]["version"])
+    f["runtime_ok"] = runtime_ok(pr.install_dir)[0]
+    ip = pr.ev_cmd("win13/base-init-pack.json", run([pr.exe("cys.exe"), "init-pack"], 600, env=env_h))
+    f["base_init_exit"] = ip["code"]
+    man = pack_manifest(hp)
+    f["base_pack_files"] = None if man is None else len(man)
+    f["base_pack_version"] = (read_text(os.path.join(hp, ".pack-version")) or "").strip() or None
+    d1 = start_detached([pr.exe("cysd.exe")], env=env_h, stdout_path=os.path.join(pr.ev_dir, "win13-base-cysd.out"))
+    pr.register_pid(d1, "win13 base daemon")
+    f["base_daemon_ready"] = wait_ready(pr.exe("cys.exe"), 90)[0]
+    # the user's edits: a listed file (-> vendor-first, its copy at .user and in the snapshot) and a general file the
+    # vendor changed (-> merged, its pre-image in the capture)
+    user = {}
+    for key, rel in (("L1", l1), ("G1", g1)):
+        p = os.path.join(hp, *rel.split("/"))
+        b = read_bytes(p)
+        if b is None:
+            continue
+        nb = b + (b"" if b.endswith(b"\n") else b"\n") + ("# tw1 user edit %s (win13)\n" % key).encode("ascii")
+        write_bytes(p, nb)
+        user[key] = sha256_bytes(nb)
+    f["edits_ok"] = len(user) == 2
+    _kill_product(pr.install_dir)
+    pr.unregister_pid(d1)
+    r = run([ctx["installers"]["candidate"], "/S"], 900)
+    time.sleep(2)
+    _kill_product(pr.install_dir)
+    f["cand_ok"] = r["code"] == 0 and (read_text(pr.exe("cys-installed-version.txt")) or "").strip() == want
+    ip = pr.ev_cmd("win13/cand-init-pack.json", run([pr.exe("cys.exe"), "init-pack", "--no-install-hook"], 600, env=env_h))
+    f["cand_init_exit"] = ip["code"]
+    f["cand_pack_version"] = (read_text(os.path.join(hp, ".pack-version")) or "").strip() or None
+    pend = _load(os.path.join(hp, ".merge-pending.json")) or {}
+    f["L1_kind"] = (pend.get(l1) or {}).get("kind") if isinstance(pend, dict) else None
+    f["G1_kind"] = (pend.get(g1) or {}).get("kind") if isinstance(pend, dict) else None
+    f["L1_park_is_user"] = sha256_file(os.path.join(hp, *l1.split("/")) + ".user") == user.get("L1")
+    snaps = sorted(glob.glob(os.path.join(cys_dir, "local", "update-snapshots", "*", "*")))
+    f["snapshot_under_folder"] = bool(snaps)
+    meta_ok = False
+    if snaps:
+        try:
+            json.loads(read_text(os.path.join(snaps[-1], "meta.json")))
+            meta_ok = True
+        except (TypeError, ValueError):
+            meta_ok = False
+    f["snapshot_meta_read_back"] = meta_ok
+    f["snapshot_L1_is_user"] = user.get("L1") in _rel_shas_under(os.path.join(cys_dir, "local", "update-snapshots"), l1)
+    f["capture_G1_is_user"] = user.get("G1") in _rel_shas_under(os.path.join(cys_dir, "pack-captures"), g1)
+    d2 = start_detached([pr.exe("cysd.exe")], env=env_h, stdout_path=os.path.join(pr.ev_dir, "win13-cand-cysd.out"))
+    pr.register_pid(d2, "win13 candidate daemon")
+    f["cand_daemon_ready"] = wait_ready(pr.exe("cys.exe"), 90)[0]
+    reps = []
+    for i in (1, 2):
+        rr = pr.ev_cmd("win13/report-%d.json" % i, run([pr.exe("cys.exe"), "repair", "report", "--file", g1, "--error",
+                                                        "tw1 win13 한글 경로"], 60, env=env_h))
+        reps.append(rr)
+    f["report_exits"] = [x["code"] for x in reps]
+    f["report_read_back"] = "2건째" in (reps[1]["out"] + reps[1]["err"])
+    repairs = os.path.join(cys_dir, "local", "repairs")
+    f["repairs_ledger_under_folder"] = os.path.isdir(repairs) and bool(_files_under(repairs))
+    state = os.path.join(cys_dir, "state")
+    sfiles = _files_under(state) if os.path.isdir(state) else []
+    f["state_records"] = len(sfiles)
+    bad = []
+    for q in sfiles:
+        if q.endswith(".json"):
+            try:
+                json.loads(read_text(q) or "")
+            except ValueError:
+                bad.append(os.path.basename(q))
+    f["state_json_unreadable"] = bad
+    allf = _files_under(cys_dir)
+    f["longest_path_chars"] = max((len(x) for x in allf), default=0)
+    f["files_written"] = len(allf)
+    real_cys = os.path.join(os.environ.get("USERPROFILE", ""), ".cys")
+    f["real_profile_cys_entries"] = sorted(os.listdir(real_cys)) if os.path.isdir(real_cys) else []
+    _kill_product(pr.install_dir)
+    pr.unregister_pid(d2)
+    pr.restored = False
+
+
 PROBES = {
     "s0_env": probe_s0_env,
     "s1_base": probe_s1_base,
@@ -3105,7 +3793,11 @@ PROBES = {
     "s3_siblings": probe_s3_siblings,
     "s3_judges": probe_s3_judges,
     "s3_eg2": probe_s3_eg2,
+    "s3_clear_chain": probe_s3_clear_chain,
+    "s3_cp949_tools": probe_s3_cp949_tools,
     "s7_primitives": probe_s7_primitives,
+    "s5_checklist": probe_s5_checklist,
     "s6_variants": probe_s6_variants,
     "s6_inplace": probe_s6_inplace,
+    "s6_hangul": probe_s6_hangul,
 }

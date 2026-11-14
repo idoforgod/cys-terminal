@@ -60,7 +60,7 @@ C = lambda cid, role, fact, op, **kw: dict({"id": cid, "role": role, "fact": fac
 class MatrixTests(unittest.TestCase):
     def test_real_matrix_is_valid(self):
         m = R.load_matrix(MATRIX)
-        self.assertEqual(len(m["rows"]), 76)
+        self.assertEqual(len(m["rows"]), 77)
 
     def test_class_counts_match_the_approved_plan(self):
         m = load()
@@ -70,7 +70,8 @@ class MatrixTests(unittest.TestCase):
         # push 2 (RULINGS GS2, GL4, GB5): +7 YES rows (IN-PLACE-HELD, MANIFEST-HELD, PACK-PREV, APP-RESTORE,
         # T5C-JUDGES, T5C-DANGLING, T5C-COMPGEN), +2 PARTLY (T5C-CP949, T2G-COPY), R-T3D-IDENT WAIT -> YES
         # push 3 (RULINGS HB5, HD2): +1 YES (T5C-HANGUL), +1 WAIT (T9-JOURNAL-TAKE)
-        self.assertEqual(counts, {"YES": 32, "PARTLY": 25, "NO": 8, "WAIT": 11})
+        # RULINGS HK2 (2) / HL1: +1 PARTLY (I-CLEAR-CHAIN)
+        self.assertEqual(counts, {"YES": 32, "PARTLY": 26, "NO": 8, "WAIT": 11})
 
     def test_every_required_row_exists_once(self):
         ids = [r["id"] for r, _ in R.iter_rows(load())]
@@ -148,7 +149,7 @@ class MatrixTests(unittest.TestCase):
         self.assertTrue(any("needs the assumption" in x for x in e), e)
 
     def test_top_row_count_is_pinned(self):
-        e = self._errors_after(lambda m: m.__setitem__("expected_top_rows", 75))
+        e = self._errors_after(lambda m: m.__setitem__("expected_top_rows", 76))
         self.assertTrue(any("expected_top_rows" in x for x in e), e)
 
     def test_bad_probe_table_is_refused(self):
@@ -819,6 +820,109 @@ class Run2CorrectionTests(unittest.TestCase):
         self.assertEqual(v["verdict"], R.NMH)
         self.assertIn("Hangul", v["reason"])
         self.assertEqual(load()["unit_markers"]["T7b"], ["repair", "gate", "--lane", "pack"])
+
+
+class ReleaseBlockingRowTests(unittest.TestCase):
+    """The evidence rule for pack files and the rows RULINGS HK2 (2) / HL1 make blocking (WIN-13, WIN-14, WIN-02,
+    I-CLEAR-CHAIN, G04 / G08)."""
+
+    def _row(self, rid):
+        return {r["id"]: r for r, _ in R.iter_rows(load())}[rid]
+
+    def _verdict(self, rid, facts):
+        return R.compute_verdict(self._row(rid), {"status": "ran", "facts": facts})
+
+    def test_pack_file_evidence_carries_no_body(self):
+        import tw1_probes as P
+        base = b"a\nACCOUNT-LINE secret-name\nc\n"
+        vendor = b"a\nACCOUNT-LINE acct-a\nc\n"
+        user = R.conflicting_edit(base, vendor, "  # tw1 conflicting user edit")[0].replace(b"\n", b"\r\n")
+        ev = P.edited_evidence("bin/x.sh", user, vendor, user, base, vendor)
+        text = json.dumps(ev, ensure_ascii=False)
+        self.assertNotIn("secret-name", text)                 # the original line is never copied
+        self.assertNotIn("acct-a", text)                      # nor the vendor's line
+        self.assertIn("# tw1 conflicting user edit", text)    # only the driver's own marker
+        self.assertEqual(ev["live"]["crlf"], 3)
+        self.assertEqual(ev["user_added"][0]["in_live"], True)
+        self.assertEqual(set(ev["live"]), {"sha256", "size", "crlf", "lf", "cr"})
+        src = open(os.path.join(HERE, "..", "windows-measure", "tw1_probes.py"), encoding="utf-8").read()
+        self.assertNotIn("b64encode", src)                    # no file body in any encoding
+
+    def test_statusline_input_has_what_the_product_reads(self):
+        import tw1_probes as P
+        d = P._statusline_input("X:/p/tw1/s.jsonl", "sid", 41)
+        for k in ("transcript_path", "context_window", "rate_limits", "model"):
+            self.assertIn(k, d)
+        self.assertEqual(d["context_window"]["used_percentage"], 41)
+        doc = {"departments": [{"surfaces": [{"surface_id": 7, "usage": {"source": "statusline"}}]}]}
+        self.assertEqual(P._find_surface(doc, 7)["usage"]["source"], "statusline")
+        self.assertIsNone(P._find_surface(doc, 8))
+
+    def test_failure_record_parsing(self):
+        import tempfile
+        import tw1_probes as P
+
+        class Fake:
+            def __init__(self, d):
+                self.d = d
+
+            def exe(self, n):
+                return os.path.join(self.d, n)
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "cys-install-failure.txt"), "w", encoding="utf-8") as fh:
+                fh.write("cys installer: critical executable verification FAILED (exit 3)\nunrecoverable: cys.exe\n"
+                         "rolled-back-to-previous:\nnot-updated:\nplacement-refused: cys.exe(vacate-locked)\n")
+            ff = P._failure_file(Fake(d))
+            self.assertTrue(ff["first"].startswith("cys installer: critical executable verification FAILED"))
+            self.assertEqual(ff["tokens"]["placement-refused"], "cys.exe(vacate-locked)")
+            self.assertEqual(ff["tokens"]["not-updated"], "")
+            self.assertIsNone(P._failure_file(Fake(os.path.join(d, "none"))))
+
+    def test_win14_covers_the_fourteen_changed_tools(self):
+        sc = load()["scenario"]["cp949_tools"]
+        self.assertEqual(len(sc), 14)
+        names = {t["name"] for t in sc}
+        g14 = {s["id"] for s in self._row("G14")["subrows"]}
+        self.assertEqual(g14, {"G14." + n for n in names})
+        doc = {t["name"]: {c[0]: c[2] for c in t["cases"]} for t in sc}
+        self.assertEqual(doc["javis_preflight"], {"help": 0, "hangul-arg": 2})
+        self.assertEqual(doc["javis_mission"], {"help": 64, "hangul-arg": 64})
+        self.assertEqual(doc["javis_dept_schedule"], {"help": 2, "hangul-path": 0})
+        self.assertNotIn([], [t["cases"] for t in sc])
+
+    def test_clear_chain_candidate_must_be_no_weaker(self):
+        cases = {"missing": [None, False], "good1": ["T1", True], "good2": ["T2", True], "stale": ["T2", True],
+                 "failing": ["T2", True]}
+        f = {"cc_base_registered": True, "cc_base_surface": "surface:4", "cc_cand_registered": True,
+             "cc_cand_surface": "surface:9", "cc_cand_registered_before_registrar": True,
+             "cc_cand_missing_session_is": None, "cc_cand_good1_session_is": "T1", "cc_cand_good2_session_is": "T2",
+             "cc_cand_good2_source": "statusline", "cc_cand_stale_session_is": "T2", "cc_cand_failing_hook_exit": 0,
+             "cc_cand_failing_session_is": "T2"}
+        f.update({"cc_same_as_base_" + k: True for k in cases})
+        self.assertEqual(self._verdict("I-CLEAR-CHAIN.payload", f)["verdict"], R.PASS)
+        weaker = dict(f, cc_cand_failing_session_is="T3", cc_same_as_base_failing=False)
+        self.assertEqual(self._verdict("I-CLEAR-CHAIN.payload", weaker)["verdict"], R.FAIL)
+        dec = R.decide_row(self._row("I-CLEAR-CHAIN.verifier"), load()["probes"], "updated", 1, {})
+        self.assertEqual(dec[1], R.NMH)
+        self.assertIn("agent CLI", dec[2])
+
+    def test_checklist_steps_are_built_and_p8_stated(self):
+        g02 = {s["id"]: s for s in self._row("G02")["subrows"]}
+        for p in ("P4", "P5", "P6a", "P6b", "P7", "P9", "P10a", "P10b", "P11"):
+            self.assertEqual(g02["G02." + p]["probe"], "s5_checklist", p)
+        self.assertEqual(g02["G02.P8"]["class"], "NO")
+        self.assertEqual(self._row("G08")["probe"], "s5_checklist")
+        self.assertEqual(self._row("G04")["probe"], "s7_primitives")
+        self.assertIsNone(self._row("G12")["probe"])
+        self.assertIn("HQ", self._row("G12")["why"])
+
+    def test_win13_row_and_its_folder(self):
+        import tw1_probes as P
+        self.assertEqual(len(P.WIN13_USER), 20)
+        self.assertTrue(any("\uac00" <= ch <= "\ud7a3" for ch in P.WIN13_USER) and " " in P.WIN13_USER)
+        v = self._verdict("G13", {"folder_ok": False})
+        self.assertEqual(v["verdict"], R.NMH)
+        self.assertEqual(self._row("G13")["probe"], "s6_hangul")
 
 
 class WorkflowTests(unittest.TestCase):
