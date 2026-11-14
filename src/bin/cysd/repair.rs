@@ -31,6 +31,11 @@ mod grant_tests;
 #[path = "repair_apply_tests.rs"]
 mod t6_tests;
 
+// Track T5b — the CM3 pin of `production_check` (a rel with a folder).
+#[cfg(test)]
+#[path = "repair_t5b_check_tests.rs"]
+mod t5b_check_tests;
+
 use crate::handlers::Reply;
 use crate::state::Daemon;
 use cys::repair::roles::{reviewer_slot_of, verb_class, CallerKind, ReviewerSlot, VerbClass};
@@ -488,10 +493,55 @@ pub(crate) fn handle(
         prompts: &daemon.repair_prompt_origin,
         product_pause: &product_pause,
     };
-    Reply::Single(match handle_with(&ctx, &caller, sub, params) {
+    // Track T5b: `submit` and the three approval verbs need the daemon (threads, the table, the
+    // helper); `status` gains the approval part (TRACKS T5b "submit/status/approval_*").
+    let result = match crate::repair_approval::route(daemon, &ctx, &caller, sub, params) {
+        Some(r) => r,
+        None => handle_with(&ctx, &caller, sub, params)
+            .map(|v| crate::repair_approval::augment_status(daemon, sub, params, v)),
+    };
+    Reply::Single(match result {
         Ok(v) => ok_response(id, v),
         Err(e) => err_response(id, &e.code, &e.message),
     })
+}
+
+/// Track T5b — a production [`Ctx`] for work the daemon does on its own threads (step 3, the
+/// helper's result, the watchdog's expiry sweep), built exactly as [`handle`] builds it.
+pub(crate) fn with_daemon_ctx<T>(daemon: &Arc<Daemon>, f: impl FnOnce(&Ctx<'_>) -> T) -> T {
+    let classify = |rel: &str| production_classify(rel, &cys::pack::pack_dir());
+    let check = production_check;
+    let ctx = Ctx {
+        root: production_root(daemon),
+        lane: LaneKey::of_socket(&daemon.socket_path),
+        incarnation: daemon.incarnation.clone(),
+        pack_dir: cys::pack::pack_dir(),
+        now: cys::repair::ledger::now_epoch(),
+        windows: cfg!(windows),
+        registry: cys::lane::registry_path(),
+        mutexes: &daemon.repair_mutexes,
+        seats: Vec::new(),
+        classify: &classify,
+        check: &check,
+        hook_step: &cys::repair::apply::hook_lines_step,
+        claim: &cys::repair::grant::try_claim_autonomous_start,
+        prompts: &daemon.repair_prompt_origin,
+    };
+    f(&ctx)
+}
+
+/// Track T5b — one intake row filed by the daemon itself (a lane finding of the protection screen,
+/// C4 AY1: "one intake row naming the protection"), through the `report` verb's own body.
+pub(crate) fn file_intake(daemon: &Arc<Daemon>, file: &str, error: &str) {
+    let caller = Caller {
+        kind: CallerKind::Detached,
+        role: None,
+        app_token: false,
+        bound_family: None,
+    };
+    with_daemon_ctx(daemon, |ctx| {
+        let _ = handle_with(ctx, &caller, "report", &serde_json::json!({"file": file, "error": error}));
+    });
 }
 
 /// The verb dispatcher behind [`handle`]: role table first, then the body.
@@ -978,9 +1028,15 @@ fn production_check(
     use cys::repair::rehearsal::{run_check, run_reference_check, CheckRequest, CheckResult};
     let kind = check_kind_for(rel);
     let started = std::time::Instant::now();
+    // RULINGS CM3: the scratch root is the PACK root (`live` = `<pack>/<rel>`), so that
+    // `<scratch_root>/<entry_rel>` is the live file also for a rel with a folder (`hooks/x.sh`)
+    let mut pack_root = live.to_path_buf();
+    for _ in Path::new(rel).components() {
+        pack_root.pop();
+    }
     let r = run_check(&CheckRequest {
         entry_rel: rel.to_string(),
-        scratch_root: live.parent().map(Path::to_path_buf).unwrap_or_default(),
+        scratch_root: pack_root,
         recorded_input: None,
         deadline,
     })?;
@@ -4637,9 +4693,8 @@ pub(crate) fn strict_origin(norm: &str, reply: &Value) -> &'static str {
     }
 }
 
-/// The pending final-approval requests (C5; memory only — void after a restart). T5b fills it.
-#[derive(Default)]
-pub(crate) struct ApprovalTable {}
+/// The pending final-approval requests (C5; memory only — void after a restart) — T5b's table.
+pub(crate) use crate::repair_approval::ApprovalTable;
 
 /// The per-seat owner-prompt record (T3 writes, T4 reads). `named_docs` = rule-document base names,
 /// lower-cased, found in the seat's latest owner-typed prompt (RULINGS U4(a)); no prompt text kept.
@@ -5283,9 +5338,18 @@ mod tests {
                     }));
                     let (code, msg) = result.unwrap_or_else(|_| panic!("repair.{sub} panicked"));
                     // T6 (rewrite: `revert` / `reapply` / `tick` / `sweep` left the stub set — the old
-                    // expectation for them was `repair_not_implemented` after the role table)
-                    if T3_VERBS.contains(sub) || T4_VERBS.contains(sub) || T6_VERBS.contains(sub) {
-                        // T3's / T4's / T6's bodies answer a success or a structured error — never the stub
+                    // expectation for them was `repair_not_implemented` after the role table); T5b
+                    // rewrite (was: `submit` and the three approval verbs among the stubs): their bodies
+                    // are in now — like T3's / T4's they answer a success or a structured error, never
+                    // the stub (none of these calls can spawn the real helper: in a unit test the spawn
+                    // refuses)
+                    if T3_VERBS.contains(sub)
+                        || T4_VERBS.contains(sub)
+                        || T6_VERBS.contains(sub)
+                        || crate::repair_approval::T5B_VERBS.contains(sub)
+                    {
+                        // T3's / T4's / T6's / T5b's bodies answer a success or a structured error —
+                        // never the stub
                         assert_ne!(code, "repair_not_implemented", "repair.{sub}: {msg}");
                         assert_ne!(code, "method_not_found", "repair.{sub}");
                         continue;

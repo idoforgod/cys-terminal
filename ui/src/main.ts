@@ -232,6 +232,7 @@ import {
   winGateInputs,
 } from "./wheelgate";
 import { ceoPaletteEntries } from "./selfdiag";
+import { buildRepairCard, REPAIR_TOAST_TITLE, REPAIR_TOAST_BODY, type RepairCard } from "./repaircard"; // 「스스로 해결」 T5b 수리 최종 승인 카드(순수 그리기)
 import {
   isMacUserAgent,
   installResultToast,
@@ -7287,6 +7288,17 @@ interface FeedSection {
 // 세대 가드(리뷰 1 의 4번) — 늦게 끝난 낡은 응답이 마지막 그림이 되지 않게 한다. 부서 묶음의 '더 보기' 펼침 상태(소켓 키)도 여기 둔다.
 let feedRefreshGen = 0;
 const feedDeptExpanded = new Set<string>();
+/** 「스스로 해결」(T5b): 카드의 결정 — `approve` 는 데몬이 도우미(운영체제 본인 확인)를 **시작만** 하고 곧바로 돌아온다(결과는 사건으로 온다 · 기다리지 않는다). */
+async function decideRepair(requestId: string, decision: "approve" | "reject"): Promise<void> {
+  try {
+    await invoke("repair_approval_decide", { requestId, decision, socket: current()?.socket ?? null });
+    if (decision === "approve") daemonToast("feed", "본인 확인 창을 띄웠습니다", "운영체제 창에서 Touch ID 또는 로그인 암호로 확인하세요.");
+  } catch (e) {
+    daemonToast("feed", "수리 승인 요청을 처리하지 못했습니다", String(e));
+  }
+  refreshFeed();
+}
+
 async function refreshFeed() {
   const myGen = ++feedRefreshGen;
   // 패널이 닫혀 있으면 조회하지 않는다 — 배지·알림 숫자는 refreshSidebarStatus(전체 소켓 집계)가 단독 소유라 이 조회 결과는 닫힌 동안 쓰이지 않는다.
@@ -7313,6 +7325,13 @@ async function refreshFeed() {
     : ((await invoke("feed_list", { status: null }).catch(() => null)) as { items: FeedItem[] } | null);
   if (!r) return;
   if (myGen !== feedRefreshGen) return; // 기다리는 사이 더 새 갱신이 시작됐다 — 이 응답은 버린다
+  // 「스스로 해결」(T5b · C5): 지금 연 작업 공간(부서)의 수리 최종 승인 요청 — 그 부서의 카드는 그 부서를 열었을 때 보인다(부서 모아 보기 없음).
+  //   새 주기 타이머를 더하지 않는다(핀 deptprogresswiring 307 — 이 갱신은 feed·repair 사건과 기존 주기가 부른다).
+  const repairList = (await invoke("repair_approval_list", { socket: current()?.socket ?? null }).catch(() => null)) as
+    | { requests?: RepairCard[] }
+    | null;
+  if (myGen !== feedRefreshGen) return;
+  const repairCards: RepairCard[] = Array.isArray(repairList?.requests) ? repairList!.requests! : [];
   const items = r.items.slice().reverse();
   const deptSections = sections ? sections.slice(1) : [];
 
@@ -7321,7 +7340,8 @@ async function refreshFeed() {
   if (!(ccOpen && ccTab === "feed")) return;
   const box = document.getElementById("cc-feed-items")!;
   box.innerHTML = "";
-  if (items.length === 0 && !(deptSections.some((d) => d.items.length > 0 || !d.ok))) {
+  for (const c of repairCards) box.appendChild(buildRepairCard(document, c, Date.now(), (rid, d) => void decideRepair(rid, d)));
+  if (items.length === 0 && repairCards.length === 0 && !(deptSections.some((d) => d.items.length > 0 || !d.ok))) {
     // ★'비어 있음'만 적으면 거짓말이 될 수 있다 — 이 목록은 기본 데몬 1개만 보므로 부서 데몬에
     //  대기가 남아 있어도 비기 때문이다. 그 경우 사유를 함께 적는다.
     //  ※ 수치는 **타 소켓 직접 합**(pendingBySocket 소켓별 값)이다 — 전 소켓 합산(pendingApprovals)을
@@ -10024,6 +10044,10 @@ function onDaemonEvent(event: Record<string, unknown>) {
         ? `중복 서버 ${payload.count}개: ${String(payload.cmdline ?? "").slice(0, 80)}`
         : JSON.stringify(payload).slice(0, 120);
     daemonToast("watchdog", `🐕 ${name}`, detail);
+  } else if (category === "repair") {
+    // 「스스로 해결」(T5b · C5 5.8): 수리 최종 승인 카드는 알리기만 한다 — 확인 창·패널을 저절로 열지 않는다(팀 만들기 제안과 같은 규칙).
+    if (name === "repair.approval.created") daemonToast("feed", REPAIR_TOAST_TITLE, REPAIR_TOAST_BODY);
+    if (name === "repair.approval.created" || name === "repair.approval.resolved") refreshFeed();
   } else if (category === "feed") {
     if (name === "feed.item.created") {
       // ★U16: 팀 만들기 제안은 확인 창을 자동으로 띄우지 않는다(포커스 탈취·취소 사고 · 반박 M6) — 안내만.
