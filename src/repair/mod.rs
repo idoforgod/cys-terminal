@@ -24,6 +24,8 @@ pub mod paths;
 pub mod platform;
 /// T6 — the appended job's work: probation re-check, M10, the start-time pass.
 pub mod probation;
+/// T7b — department propagation: each lane's own rows, the pack-instance pass, the gate's reader.
+pub mod propagate;
 pub mod reapply_claim;
 pub mod rehearsal;
 /// Track T5b — the replay rules shared by the rehearsal runner and the screen (C4 BH2, BK1, BL1).
