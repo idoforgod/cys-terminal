@@ -4251,8 +4251,14 @@ pub(crate) fn identity_refusal(pack: &Path, rel: &str) -> Option<String> {
     let key = fold_name(&rel.replace('\\', "/"));
     for name in protected_names(pack) {
         if fold_name(&name) != key && file_identity(&pack.join(&name)) == Some(id) {
+            // DJ3: the way that exists for the protected file — the key file has none but pack-heal
+            if let Some(locked) = cys::repair::types::system_locked_entry(&name) {
+                return Some(format!(
+                    "{rel}: 서명 키 파일 `{locked}` 과 같은 파일입니다(하드 링크 등 같은 파일의 다른 이름) — 서명 키 파일은 어떤 이름으로도 수리 대상이 아닙니다. 사본이 손상됐다면 `cys pack-heal {locked}` 로 내장본을 되살립니다(RULINGS AU4 · DA1)"
+                ));
+            }
             return Some(format!(
-                "{rel}: `{name}` 과 같은 파일입니다(하드 링크 등 같은 파일의 다른 이름) — 규칙 문서·서명 키 파일은 그 이름으로만, 주인 지시 표가 있을 때만 고칩니다(RULINGS DA1)"
+                "{rel}: 규칙 문서 `{name}` 과 같은 파일입니다(하드 링크 등 같은 파일의 다른 이름) — 규칙 문서는 그 이름 `{name}` 으로, 주인 지시 표가 있을 때만 고칩니다(RULINGS DA1)"
             ));
         }
     }

@@ -4393,3 +4393,37 @@ fn dj2_failed_write_returns_its_reservation() {
         .unwrap();
     assert_eq!(v["over_quota"], true, "{v}");
 }
+
+/// RULINGS DJ3: a second name of the key file is refused naming the canonical file and its only
+/// way (`cys pack-heal`), never the owner-token route of the rule documents.
+#[test]
+fn dj3_key_file_alias_names_the_canonical_file_and_pack_heal() {
+    let r = rig("dj3");
+    std::fs::write(r.pack.join("trusted-keys.json"), b"{}\n").unwrap();
+    std::fs::create_dir_all(r.pack.join("notes")).unwrap();
+    std::fs::hard_link(
+        r.pack.join("trusted-keys.json"),
+        r.pack.join("notes/k.json"),
+    )
+    .unwrap();
+    let e = r
+        .call(
+            T0,
+            &seat(3, "worker"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["notes/k.json"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    assert!(
+        e.message.contains("`trusted-keys.json`")
+            && e.message.contains("cys pack-heal trusted-keys.json"),
+        "{}",
+        e.message
+    );
+    assert!(
+        !e.message.contains("주인 지시 표"),
+        "the owner-token route was offered: {}",
+        e.message
+    );
+}
