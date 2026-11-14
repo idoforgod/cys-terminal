@@ -443,9 +443,12 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
         }
         // (b2) older in-force repairs on the same targets
         match supersede_older(root, lane, rec, env.locked) {
-            Ok(ids) => {
+            Ok((ids, deferred)) => {
                 for oid in ids {
                     lines.push(format!("{}: 같은 파일의 더 새 수리 {} 로 대체됨", oid.as_str(), rec.id.as_str()));
+                }
+                for oid in deferred {
+                    lines.push(format!("{}: {} — 더 새 수리 {} 로의 대체는 다음에 다시", oid.as_str(), super::guard::BUSY, rec.id.as_str()));
                 }
             }
             Err(e) => lines.push(format!("{}: 더 오래된 수리를 정리하지 못했습니다({e:?})", rec.id.as_str())),
@@ -454,15 +457,23 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
     Ok(lines)
 }
 
+/// The older in-force repairs of this lane on `newer`'s targets → superseded. FG5: each older repair
+/// is written only under ITS guard, TRIED — held (a re-check, a return, a recovery owns it right now)
+/// → deferred (returned second), never written under the mutex alone.
 fn supersede_older(
     root: &Path,
     lane: &LaneKey,
     newer: &RepairRecord,
     locked: &RepairLock<'_>,
-) -> Result<Vec<RepairId>, RepairError> {
+) -> Result<(Vec<RepairId>, Vec<RepairId>), RepairError> {
     let targets: Vec<String> = ledger::file_targets(newer).map(|f| f.rel.clone()).collect();
     let mut out = Vec::new();
-    for oid in ledger::list_ids_in(root).into_iter().filter(|o| *o < newer.id).rev() {
+    let mut deferred = Vec::new();
+    for oid in ledger::list_ids_checked_in(root)?.into_iter().filter(|o| *o < newer.id).rev() {
+        let Some(_older_guard) = super::guard::RepairGuard::try_take(root, &oid) else {
+            deferred.push(oid);
+            continue;
+        };
         let mut changed = false;
         let rootb = root.to_path_buf();
         let _ = locked(&oid, &mut || {
@@ -482,7 +493,7 @@ fn supersede_older(
             out.push(oid);
         }
     }
-    Ok(out)
+    Ok((out, deferred))
 }
 
 // ───────────────────────────── the 24-hour re-check ─────────────────────────────
@@ -706,6 +717,13 @@ fn probation_pass(env: &JobEnv<'_>, report: &mut TickReport) {
 /// automatically) ends in a truthful FAILED state the ledger shows — the lane row 충돌 with its
 /// probation closed `실패 — …` (never closed 사용 중 later); the record keeps its state with a line.
 fn close_failed(env: &JobEnv<'_>, id: &RepairId, why: &str) -> Result<(), RepairError> {
+    close_failed_as(env, id, why, true, false)
+}
+
+/// [`close_failed`]: `conflict` — the row → 충돌 (a final failure; not for a return still owed);
+/// `replace_owed` — an existing closure that still OWES the return (EK2) is replaced (FG5: the owed
+/// return ended otherwise); any other closure is never replaced.
+fn close_failed_as(env: &JobEnv<'_>, id: &RepairId, why: &str, conflict: bool, replace_owed: bool) -> Result<(), RepairError> {
     let root = env.op.root.to_path_buf();
     let lane = env.op.lane.clone();
     let now = env.op.now;
@@ -714,9 +732,12 @@ fn close_failed(env: &JobEnv<'_>, id: &RepairId, why: &str) -> Result<(), Repair
     (env.locked)(id, &mut || {
         let _mutex_scope = super::guard::MutexScope::enter();
         if let Some(mut row) = ledger::read_lane_in(&root, &idc, &lane)? {
-            row.state = super::types::LaneState::Conflict;
+            if conflict {
+                row.state = super::types::LaneState::Conflict;
+            }
             if let Some(p) = row.probation.as_mut() {
-                if p.closed.is_none() {
+                let replaceable = replace_owed && p.closed.as_deref().is_some_and(apply::closure_owes_return);
+                if p.closed.is_none() || replaceable {
                     p.closed = Some(format!("{} — {why}", apply::CLOSED_FAILED).chars().take(400).collect());
                 }
             }
@@ -731,6 +752,50 @@ fn close_failed(env: &JobEnv<'_>, id: &RepairId, why: &str) -> Result<(), Repair
         }
         Ok(())
     })
+}
+
+/// FG5 — an owed return (EK2) that `revert_in` refused or could not do: after the change of lock
+/// scope the repair's guard is taken AGAIN (tried) and the state re-read; only a closure that still
+/// owes the return is replaced — by `대체됨` when the repair is no longer in force (a newer repair took
+/// its place meanwhile), else by a final FAILED closure. Guard held → left owed (retried next tick).
+fn settle_owed_return(env: &JobEnv<'_>, id: &RepairId, detail: &str, report: &mut TickReport) -> Result<(), RepairError> {
+    let Some(_guard) = super::guard::RepairGuard::try_take(env.op.root, id) else {
+        report.lines.push(format!("{}: {} — 되돌리기는 남은 채로 다음 차례에 다시", id.as_str(), super::guard::BUSY));
+        return Ok(());
+    };
+    let (Some(rec), Some(row)) = (ledger::read_record_in(env.op.root, id)?, ledger::read_lane_in(env.op.root, id, env.op.lane)?) else {
+        return Ok(());
+    };
+    if !row.probation.as_ref().and_then(|p| p.closed.as_deref()).is_some_and(apply::closure_owes_return) {
+        return Ok(()); // settled meanwhile
+    }
+    if rec.origin_lane == *env.op.lane && !in_force(&rec) {
+        let root = env.op.root.to_path_buf();
+        let lane = env.op.lane.clone();
+        let now = env.op.now;
+        let idc = id.clone();
+        let text: String = format!("대체됨 — 재검사 실패 뒤 이 수리가 더 새 수리로 대체되어 되돌리지 않았습니다 · {detail}").chars().take(400).collect();
+        (env.locked)(id, &mut || {
+            let _mutex_scope = super::guard::MutexScope::enter();
+            if let Some(mut row) = ledger::read_lane_in(&root, &idc, &lane)? {
+                if let Some(p) = row.probation.as_mut() {
+                    if p.closed.as_deref().is_some_and(apply::closure_owes_return) {
+                        p.closed = Some(text.clone());
+                    }
+                }
+                row.updated_at = now;
+                ledger::write_lane_durable_in(&root, &row)?;
+            }
+            Ok(())
+        })?;
+        report.superseded.push(id.clone());
+        report.lines.push(format!("{}: 재검사 실패 뒤 더 새 수리로 대체됨 — 되돌리지 않음 · {detail}", id.as_str()));
+        return Ok(());
+    }
+    close_failed_as(env, id, &format!("재검사 실패, 되돌리지 못했습니다({detail}) — 워커 검토"), true, true)?;
+    report.reported_only.push((id.clone(), detail.to_string()));
+    report.lines.push(format!("{}: 재검사 실패 — 되돌리지 못해 실패로 기록했습니다({detail})", id.as_str()));
+    Ok(())
 }
 
 /// The probation re-check of ONE repair in this lane.
@@ -762,7 +827,10 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, repor
                 report.reverted.push(rec.id.clone());
                 report.lines.push(format!("{}: 미뤄 둔 되돌리기를 했습니다(시험 기간 재검사 실패)", rec.id.as_str()));
             }
-            Ok(Some(r)) => report.lines.push(format!("{}: 미뤄 둔 되돌리기를 하지 못했습니다 — 다음 차례에 다시({r:?})", rec.id.as_str())),
+            // the return ran to its end (충돌 / 대체됨 — `finish_revert` wrote the closure)
+            Ok(Some(Ok(r))) => report.lines.push(format!("{}: 미뤄 둔 되돌리기를 마치지 못했습니다({:?})", rec.id.as_str(), r.outcome)),
+            // refused or failed before its end: FG5 — settled under the guard taken again
+            Ok(Some(Err(e))) => settle_owed_return(env, &rec.id, &format!("{e:?}"), report)?,
             Ok(None) => {
                 report.deferred_probation = true;
                 report.lines.push(format!("{}: 미뤄 둔 되돌리기 — 팩이 아직 쓰이는 중(다음 차례에 다시)", rec.id.as_str()));
@@ -840,23 +908,28 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, repor
     }
     if let Some(why) = failure {
         let first_rel = ledger::file_targets(rec).map(|f| f.rel.as_str()).next().unwrap_or("");
-        drop(guard);
         if env.op.form == ApplyForm::Exchange {
+            // FG5: the measured failure is made durable WHILE the guard is held (the closure; the
+            // return still owed — EK2); only then is the guard released for the lock
+            close_failed_as(env, id, &format!("{} · 재검사 실패 · {why}", apply::RETURN_OWED), false, false)?;
+            drop(guard);
+            if env.op.faults.at(apply::Point::RecheckHandOver, &env.op.pack.join(first_rel), None) {
+                return Err(apply::stop(apply::Point::RecheckHandOver));
+            }
             // DX3: the job NEVER waits for the pack-apply lock — held → no return this tick, retried
             let r = match crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || {
                 revert_in(&env.op, id, RevertCaller::DaemonAuto, env.hooks, env.locked)
             }) {
                 Ok(Some(r)) => r,
                 Ok(None) => {
-                    // EK2: the failure is made durable NOW (the closure; the return still owed)
-                    if !row.probation.as_ref().and_then(|p| p.closed.as_deref()).is_some_and(apply::closure_owes_return) {
-                        close_failed(env, id, &format!("{} · 재검사 실패, 다른 적용이나 업데이트가 팩을 바꾸는 중이라 되돌리기를 미룸 · {why}", apply::RETURN_OWED))?;
-                    }
                     report.deferred_probation = true;
                     report.lines.push(format!("{}: 재검사 실패 — 다른 적용이나 업데이트가 팩을 바꾸는 중이라 이번 차례에는 되돌리지 않았습니다(실패로 기록 · 다음 차례에 다시)", id.as_str()));
                     return Ok(());
                 }
-                Err(e) => Err(RepairError::Io(e)),
+                Err(e) => {
+                    report.lines.push(format!("{}: 재검사 실패 — 잠금을 확인할 수 없어 되돌리기는 남은 채로 다음 차례에 다시({e})", id.as_str()));
+                    return Ok(());
+                }
             };
             // DR8: the intake description is derived from the MEASURED outcome of the revert
             let outcome_text = match &r {
@@ -878,25 +951,28 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, repor
                     report.superseded.push(id.clone());
                     report.lines.push(format!("{}: 재검사 실패, 되돌리기는 대체됨 — {:?}", id.as_str(), r.outcome));
                 }
-                other => {
-                    // CU1: a failure that could not be reverted is never closed 사용 중 — failed state
-                    let detail = match &other {
-                        Ok(r) => format!("{:?}", r.outcome),
-                        Err(e) => format!("{e:?}"),
-                    };
-                    close_failed(env, id, &format!("재검사 실패, 되돌리지 못했습니다({detail}) · {why} — 워커 검토"))?;
+                Ok(r) => {
+                    // the return ran to its end but not completely: `finish_revert` closed the row
+                    // 충돌 (it owes its report — FG3)
                     report.reported_only.push((id.clone(), why.clone()));
-                    report.lines.push(format!("{}: 재검사 실패 — 되돌리지 못해 실패로 기록했습니다({detail}) · {why}", id.as_str()));
+                    report.lines.push(format!("{}: 재검사 실패 — 되돌리기를 마치지 못했습니다({:?}) · {why}", id.as_str(), r.outcome));
+                }
+                Err(e) => {
+                    // CU1 / FG5: refused or failed before its end — settled under the guard taken
+                    // again (never closed 사용 중)
+                    settle_owed_return(env, id, &format!("{e:?} · {why}"), report)?;
                 }
             }
         } else {
             // Windows 0.15.0: automatic return is off — ONE intake row and a FAILED end of this
-            // probation (CU4: never 사용 중 later; the row closed, so it is not re-filed every check)
+            // probation (CU4: never 사용 중 later; the row closed, so it is not re-filed every check);
+            // FG5: written while the guard is held
             note_timeouts(env, id, &timeouts)?;
             let _ = first_rel;
             close_failed(env, id, &format!("재검사 실패(이 운영체제에서는 자동으로 되돌리지 않음 — 기록·알림) · {why} — 워커 검토"))?;
             report.reported_only.push((id.clone(), why.clone()));
             report.lines.push(format!("{}: 재검사 실패 — 이 운영체제에서는 자동으로 되돌리지 않고 실패로 기록·알림만 합니다 · {why}", id.as_str()));
+            drop(guard);
         }
         return Ok(());
     }

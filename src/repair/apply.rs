@@ -84,6 +84,9 @@ pub enum Point {
     AfterValidation,
     /// DX2 — the approved apply's record is committed (시험 기간), its lane row not yet written.
     AfterRecordCommit,
+    /// FG5 — the probation re-check measured a failure and made it durable; its guard is released,
+    /// the pack-apply lock not yet tried for the return (the check-to-return hand-over).
+    RecheckHandOver,
 }
 
 /// Fault injection (tests). `at` returns `true` to make the operation stop right there as if the
@@ -155,7 +158,7 @@ fn done(outcome: ApplyOutcome, op: Option<&OpRecord>) -> OpDone {
     }
 }
 
-fn stop(p: Point) -> RepairError {
+pub(crate) fn stop(p: Point) -> RepairError {
     RepairError::Io(format!("{INJECTED_STOP} at {p:?}"))
 }
 
@@ -3327,10 +3330,16 @@ fn supersede_older_in(
 ) -> Result<Vec<RepairId>, RepairError> {
     let targets: Vec<String> = ledger::file_targets(newer).map(|f| f.rel.clone()).collect();
     let mut done_ids = Vec::new();
-    let mut older: Vec<RepairId> = ledger::list_ids_in(root).into_iter().filter(|o| *o < newer.id).collect();
+    let mut older: Vec<RepairId> = ledger::list_ids_checked_in(root)?.into_iter().filter(|o| *o < newer.id).collect();
     older.sort();
     older.reverse();
     for oid in older {
+        // FG5: an older repair is written only under ITS guard (tried): held — a re-check, a return or
+        // a recovery owns it right now — it is left for later (its own re-check sees the live file
+        // changed, the start pass supersedes it); never written under the mutex alone
+        let Some(_older_guard) = super::guard::RepairGuard::try_take(root, &oid) else {
+            continue;
+        };
         let root = root.to_path_buf();
         let lane = lane.clone();
         let targets = targets.clone();

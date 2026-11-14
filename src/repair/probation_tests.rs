@@ -1311,6 +1311,73 @@ fn a_closure_whose_flush_fails_is_not_final() {
     assert!(closed.starts_with(crate::repair::apply::CLOSED_FAILED), "the next tick made it final: {closed}");
 }
 
+// ───────────────────────────── RULINGS FG5 — the guard is held wherever the repair is written ─────────────────────────────
+
+/// FG5 (codex r4 M6) — the check-to-return hand-over: the re-check's measured failure is durable
+/// BEFORE its guard is released for the pack-apply lock — the process stopping right at the hand-over
+/// leaves the closure `실패 — 되돌리기 남음 …`; the next tick makes the owed return. Without FG5 the
+/// guard was dropped first and nothing was written until after the lock: a stop there lost the
+/// measured failure.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_stop_at_the_hand_over_keeps_the_measured_failure() {
+    struct AtHandOver;
+    impl crate::repair::apply::Faults for AtHandOver {
+        fn at(&self, p: crate::repair::apply::Point, _: &Path, _: Option<&crate::repair::vault::Slot>) -> bool {
+            p == crate::repair::apply::Point::RecheckHandOver
+        }
+    }
+    let r = rig("fg5handover");
+    let a = rid("R-1");
+    let rec = committed_general(&r, &a, "hooks/h.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let fails = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Fail("bad".into()), 5);
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    let stop = AtHandOver;
+    let mut env = job(&r, &d, ApplyForm::Exchange, NOW, &lock);
+    env.op.faults = &stop;
+    let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
+    let res = recheck_one(&env, &rec, &row, &mut TickReport::default());
+    assert!(format!("{res:?}").contains(crate::repair::apply::INJECTED_STOP), "{res:?}");
+    let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed;
+    assert!(closed.as_deref().is_some_and(crate::repair::apply::closure_owes_return), "durable before the hand-over: {closed:?}");
+    assert_eq!(std::fs::read(r.pack.join("hooks/h.sh")).unwrap(), b"POST\n", "nothing put back yet");
+    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 700.0, &lock), false).unwrap();
+    assert!(rep.reverted.contains(&a), "the owed return was made: {:?}", rep.lines);
+    assert_eq!(std::fs::read(r.pack.join("hooks/h.sh")).unwrap(), b"PRE\n");
+}
+
+/// FG5 (codex r4 M6) — a REAL re-check against a supersession: while the re-check runs its check (it
+/// holds the repair's guard), a newer repair's supersession of it is attempted — it TRIES the guard,
+/// finds it held and defers; the re-check's failure is then persisted and its return made under the
+/// guard (Reverted). Once the guard is free the supersession acts. Without FG5 the supersession wrote
+/// the record `Superseded` under the mutex alone in the middle of the re-check.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_supersession_during_a_recheck_defers() {
+    let r = rig("fg5supersede");
+    let a = rid("R-1");
+    let rec = committed_general(&r, &a, "hooks/s.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let mut newer = rec.clone();
+    newer.id = rid("R-9");
+    let seen = RefCell::new(None);
+    let check = |_: &str, _: &Path, _: Duration| {
+        let res = supersede_older(&r.root, &r.lane, &newer, &no_repair_lock).unwrap();
+        *seen.borrow_mut() = Some(res);
+        outcome(CheckResult::Fail("bad".into()), 5)
+    };
+    let d = Doubles { check: &check, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
+    let mut report = TickReport::default();
+    recheck_one(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), &rec, &row, &mut report).unwrap();
+    let (done, deferred) = seen.borrow().clone().unwrap();
+    assert!(done.is_empty() && deferred == vec![a.clone()], "the supersession deferred: {done:?} {deferred:?}");
+    assert!(report.reverted.contains(&a), "{:?}", report.lines);
+    assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::Reverted);
+    assert_eq!(std::fs::read(r.pack.join("hooks/s.sh")).unwrap(), b"PRE\n");
+}
+
 // ───────────────────────────── RULINGS EK2 — a failed re-check is a fact from the moment it is measured ─────────────────────────────
 
 /// EK2: a re-check fails while another apply / update holds the pack-apply lock — the failure is made

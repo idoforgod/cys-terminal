@@ -3199,6 +3199,12 @@ mod ledger_verbs {
             if !candidate {
                 continue;
             }
+            // T6 · RULINGS FG5 (the EN6 seam): an older repair is written only under ITS guard, tried
+            // — held (a re-check / return / recovery owns it) → left for later (its own re-check sees
+            // the live file changed; the job's start pass supersedes it)
+            let Some(_older_guard) = cys::repair::guard::RepairGuard::try_take(&ctx.root, &oid) else {
+                continue;
+            };
             let changed = ctx.locked(oid.as_str(), || -> Result<bool, VerbError> {
                 let Some(mut r) = ledger::read_record_in(&ctx.root, &oid)? else {
                     return Ok(false);

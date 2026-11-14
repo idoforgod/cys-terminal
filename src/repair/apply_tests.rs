@@ -2372,6 +2372,26 @@ fn a_failed_setup_reaps_on_the_shared_deadline() {
     assert!(msg.contains("비차단") && msg.contains("따로 거두게"), "{msg}");
 }
 
+/// FG5 (codex r4 M6): the apply's supersession of older repairs TRIES each older repair's guard — an
+/// older repair whose guard is held (a re-check, a return, a recovery owns it) is not written; once
+/// the guard is free it is superseded. Without FG5 it was written under the mutex alone.
+#[test]
+fn the_apply_supersession_defers_a_guarded_older_repair() {
+    let r = rig("fg5apply");
+    let a = rid("R-1");
+    let rec = committed_general(&r, &a, "hooks/q.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let mut newer = rec.clone();
+    newer.id = rid("R-9");
+    let held = crate::repair::guard::RepairGuard::try_take(&r.root, &a).unwrap();
+    let done = supersede_older_in(&r.root, &r.lane, &newer, &no_repair_lock).unwrap();
+    assert!(done.is_empty(), "not written while its guard is held: {done:?}");
+    assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::Probation);
+    drop(held);
+    let done = supersede_older_in(&r.root, &r.lane, &newer, &no_repair_lock).unwrap();
+    assert_eq!(done, vec![a.clone()]);
+    assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::Superseded);
+}
+
 // ───────────────────────────── RULINGS EJ4 — one ownership per repair ─────────────────────────────
 
 /// EJ4 through the real entry points: a revert (the owner) paused in its hook phase holds the
