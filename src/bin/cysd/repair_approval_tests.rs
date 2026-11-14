@@ -868,6 +868,27 @@ fn three_resubmissions_then_the_fourth_is_refused_line_once() {
     assert!(r.staged(&id).exists());
 }
 
+/// RULINGS DF4: a panic inside the watchdog's sweep (or a worker thread of this channel) is caught and
+/// the caller goes on; no thread of this module is created by a call that panics when it cannot be.
+#[test]
+fn watchdog_sweep_and_threads_survive_panics() {
+    assert!(!guarded("test", || panic!("boom")), "a panic is caught and reported");
+    assert!(guarded("test", || {}));
+    let src = include_str!("repair_approval.rs");
+    assert!(
+        !src.contains(concat!("std::thread::", "spawn(")),
+        "every thread goes through spawn_thread (Builder::spawn, a handled error)"
+    );
+    let sweep_fn = src
+        .split("pub(crate) fn watchdog_sweep(")
+        .nth(1)
+        .and_then(|t| t.split("\n}\n").next())
+        .unwrap_or("");
+    assert!(sweep_fn.contains("guarded("), "the watchdog's sweep is panic-isolated");
+    let gov = include_str!("governance.rs");
+    assert!(gov.contains("crate::repair_approval::watchdog_sweep(&daemon);"));
+}
+
 /// RULINGS DF3: the report gate's set is the repairs the owner HAS A CARD for — not a request still
 /// in step 3, not one whose step 3 refused (a fix-and-resubmit cycle), not an expired one.
 #[test]
