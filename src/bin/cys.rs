@@ -28384,6 +28384,9 @@ fn unrecorded_parked_copies_capped(
             //   않는다.
             let shown = d.strip_prefix(dir).map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
             let shown = if shown.is_empty() { ".".to_string() } else { shown };
+            // ★T2i(RULINGS GT1): 시험 주입은 항목 자체를 오류로 바꾼다 — 시험과 제품이 아래의 같은 오류 갈래를 지난다.
+            #[cfg(test)]
+            let entry = scan_seam(ScanStep::Item, entry);
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
@@ -28396,16 +28399,12 @@ fn unrecorded_parked_copies_capped(
                 scan.incomplete = Some(format!("방문 상한 {cap}개에 닿음"));
                 break 'walk;
             }
+            let ft = entry.file_type();
+            // ★T2i(RULINGS GT1): 시험 주입은 종류 확인의 답 자체를 오류로 바꾼다(같은 오류 갈래).
             #[cfg(test)]
-            let fault = SCAN_ENTRY_FAULT.with(|f| f.get() == Some(seen));
-            #[cfg(not(test))]
-            let fault = false;
-            let ft = match entry.file_type() {
-                Ok(t) if !fault => t,
-                Ok(_) => {
-                    scan.incomplete.get_or_insert(format!("폴더 '{shown}' 의 항목 종류를 알 수 없음(시험 주입)"));
-                    continue;
-                }
+            let ft = scan_seam(ScanStep::Type, ft);
+            let ft = match ft {
+                Ok(t) => t,
                 Err(e) => {
                     scan.incomplete.get_or_insert(format!("폴더 '{shown}' 의 항목 종류를 알 수 없음({e})"));
                     continue;
@@ -28437,10 +28436,34 @@ fn unrecorded_parked_copies_capped(
     scan
 }
 
+/// ★T2i(RULINGS GB3 · GT1) 시험 주입의 단계: 폴더 항목 읽기 · 항목 종류 확인.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanStep {
+    Item,
+    Type,
+}
+
 #[cfg(test)]
 thread_local! {
-    /// ★T2i(RULINGS GB3) 시험 주입: 조사의 n 번째 항목(1부터)에서 종류 확인이 실패한 것으로 한다.
-    static SCAN_ENTRY_FAULT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// ★T2i(RULINGS GB3 · GT1) 시험 주입: 조사에서 그 단계의 n 번째 답(1부터)이 **오류**다 — 주입은 결과를 바꿀 뿐이고, 처리는
+    /// 제품의 오류 갈래가 한다. 한 번 쏘면 비워진다(쏘였는지 시험이 확인한다).
+    static SCAN_FAULT: std::cell::Cell<Option<(ScanStep, usize)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn scan_seam<T>(step: ScanStep, r: std::io::Result<T>) -> std::io::Result<T> {
+    SCAN_FAULT.with(|f| match f.get() {
+        Some((s, 1)) if s == step => {
+            f.set(None);
+            Err(std::io::Error::other("시험 주입"))
+        }
+        Some((s, n)) if s == step => {
+            f.set(Some((s, n - 1)));
+            r
+        }
+        _ => r,
+    })
 }
 
 /// ★T2i(RULINGS FH4): `cys pack-merge` 목록이 '정합 상태'라고 말해도 되는가 — 대기 0 · 기록 없는 사본 0 · 조사를 끝냈음.
@@ -43282,8 +43305,10 @@ mod tests {
         assert!(bad.is_empty(), "pack-verb write sites that open an existing path: {bad:?}");
     }
 
-    /// ★T2i(RULINGS GB3): 보관 사본 조사 안의 오류(항목의 종류를 알 수 없음)는 '조사 미완'이다 — 첫 항목에서든 가운데 항목에서든.
-    /// 그때 목록은 '정합'을 말하지 않는다. 오류가 없으면 다 읽었다.
+    /// ★T2i(RULINGS GB3): 보관 사본 조사 안의 오류(항목을 읽지 못함 · 항목의 종류를 알 수 없음)는 '조사 미완'이다 — 첫 항목에서든
+    /// 가운데 항목에서든. 그때 목록은 '정합'을 말하지 않는다. 오류가 없으면 다 읽었다.
+    /// ★T2i(RULINGS GT1): 주입은 항목 · 종류 확인의 **답을 오류로** 바꾸고, '미완'은 제품의 오류 갈래가 적는다 — 그 갈래를
+    /// '건너뛰기'로 되돌리면 이 시험이 적색이다.
     #[test]
     fn gb3_an_error_inside_the_scan_makes_it_incomplete() {
         let td = std::env::temp_dir().join(format!("cys-gb3-{}", std::process::id()));
@@ -43296,21 +43321,24 @@ mod tests {
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
-                SCAN_ENTRY_FAULT.with(|f| f.set(None));
+                SCAN_FAULT.with(|f| f.set(None));
             }
         }
         let _reset = Reset;
-        for at in [1usize, 2] {
-            SCAN_ENTRY_FAULT.with(|f| f.set(Some(at)));
-            let scan = unrecorded_parked_copies(&td, &none);
-            assert!(scan.copies.is_empty());
-            assert!(
-                scan.incomplete.as_deref().is_some_and(|w| w.starts_with("폴더 '.' 의 항목 종류를 알 수 없음")),
-                "fault at entry {at}: {scan:?}"
-            );
-            assert!(!merge_list_says_consistent(&none, &scan), "fault at entry {at}: 정합이라 말하지 않는다");
+        for (step, says) in [
+            (ScanStep::Item, "폴더 '.' 의 항목을 읽지 못함(시험 주입)"),
+            (ScanStep::Type, "폴더 '.' 의 항목 종류를 알 수 없음(시험 주입)"),
+        ] {
+            for at in [1usize, 2] {
+                SCAN_FAULT.with(|f| f.set(Some((step, at))));
+                let scan = unrecorded_parked_copies(&td, &none);
+                assert_eq!(SCAN_FAULT.with(|f| f.get()), None, "{step:?} at {at}: 주입이 쏘이지 않았다(측정 무효)");
+                assert!(scan.copies.is_empty());
+                assert_eq!(scan.incomplete.as_deref(), Some(says), "{step:?} at entry {at}: {scan:?}");
+                assert!(!merge_list_says_consistent(&none, &scan), "{step:?} at entry {at}: 정합이라 말하지 않는다");
+            }
         }
-        SCAN_ENTRY_FAULT.with(|f| f.set(None));
+        SCAN_FAULT.with(|f| f.set(None));
         let scan = unrecorded_parked_copies(&td, &none);
         assert!(merge_list_says_consistent(&none, &scan), "{scan:?}");
         let _ = std::fs::remove_dir_all(&td);
