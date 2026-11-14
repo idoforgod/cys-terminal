@@ -836,12 +836,19 @@ pub fn acquire_settings_lock(settings: &Path) -> Option<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
         let lock_path = PathBuf::from(format!("{}.cys-lock", settings.display()));
+        // ★T2i(RULINGS EC5): 막히지 않게 연다 — 그 자리가 FIFO(읽는 쪽 없음)면 열기가 영원히 멈췄다. 일반 파일만 잠근다(그
+        //   밖 = 잠금 없음 · 종전 열기 실패와 같은 갈래).
         let f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .custom_flags(libc::O_NONBLOCK)
             .open(&lock_path)
             .ok()?;
+        if !f.metadata().map(|m| m.is_file()).unwrap_or(false) {
+            return None;
+        }
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return None;
         }
@@ -867,6 +874,26 @@ pub fn acquire_settings_lock(settings: &Path) -> Option<std::fs::File> {
 ///  · 쓰기는 `write_atomic`(tmp+rename+fsync) — 반쪽 파일이 굳으면 훅 등록부 전체가 사라진다.
 ///
 /// 반환: 실제로 추가한 항목의 사람용 라벨(`"SessionStart←session-start.sh"`). 빈 벡터 = 이미 충족.
+/// ★T2i(RULINGS EC5): 설정 파일(`settings.json`)의 시작 경로 판독 — 막히지 않게 열고 일반 파일 · 상한 이하만(링크는 일반
+/// 파일을 가리킬 때만 따른다 — 지금 동작). 부재 = `Ok(None)`(빈 설정으로 시작하는 호출부 규칙 그대로), 판독 불가 · UTF-8
+/// 아님 = `Err`(종전 `read_to_string` 의 그 밖의 오류와 같은 갈래 — 덮어쓰지 않는다).
+fn settings_read_bounded(settings_path: &Path) -> Result<Option<String>, String> {
+    match read_start_live(settings_path) {
+        StartRead::Missing => Ok(None),
+        StartRead::Unreadable(e) => Err(format!("settings read error: {e}")),
+        StartRead::Bytes(b) => {
+            String::from_utf8(b).map(Some).map_err(|e| format!("settings read error: not UTF-8 ({e})"))
+        }
+    }
+}
+
+/// ★T2i(RULINGS EC5): `<settings>.bak-cys` 를 **이미 읽은 바이트**로 쓴다(종전 `std::fs::copy` 는 원본을 다시 열었다 — 그
+/// 사이에 FIFO 로 바뀌면 막혔다). 원본의 권한 비트를 그대로(복사가 하던 일).
+fn settings_backup_from(settings_path: &Path, body: &str) -> Result<(), String> {
+    let backup = PathBuf::from(format!("{}.bak-cys", settings_path.display()));
+    write_atomic_mode(&backup, body.as_bytes(), existing_file_mode(settings_path)).map_err(|e| e.to_string())
+}
+
 pub fn merge_desired_hooks(
     settings_path: &Path,
     pack_dir: &Path,
@@ -887,13 +914,14 @@ pub fn merge_desired_hooks(
     //   바인딩 이름을 `_lock` 으로 두는 것이 계약이다(`_` 하나면 즉시 drop = 락 미성립).
     let _lock = acquire_settings_lock(settings_path);
     let existed = settings_path.exists();
-    let mut root: serde_json::Value = match std::fs::read_to_string(settings_path) {
-        Ok(s) if s.trim().is_empty() => serde_json::json!({}),
-        Ok(s) => serde_json::from_str(&s).map_err(|e| format!("settings parse error: {e}"))?,
+    // ★T2i(RULINGS EC5): 시작 경로의 단일 판독기(막히지 않음 · 일반 파일 · 상한) — 백업도 이 바이트로 쓴다(다시 열지 않는다).
+    let raw = settings_read_bounded(settings_path)?;
+    let mut root: serde_json::Value = match raw.as_deref() {
+        Some(s) if s.trim().is_empty() => serde_json::json!({}),
+        Some(s) => serde_json::from_str(s).map_err(|e| format!("settings parse error: {e}"))?,
         // 파일 없음일 때만 빈 설정으로 시작 — 권한 등 다른 읽기 에러를 무시하면
         // 기존 settings.json이 hooks만 남은 JSON으로 대체될 수 있다.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(format!("settings read error: {e}")),
+        None => serde_json::json!({}),
     };
     if !root.is_object() {
         return Err("settings root is not an object".into());
@@ -940,9 +968,8 @@ pub fn merge_desired_hooks(
         return Ok(added);
     }
     // backup — 실제 write가 발생할 때만(멱등 재실행이 정상 백업을 클로버하지 않게).
-    if existed {
-        let backup = format!("{}.bak-cys", settings_path.display());
-        std::fs::copy(settings_path, &backup).map_err(|e| e.to_string())?;
+    if let (true, Some(body)) = (existed, raw.as_deref()) {
+        settings_backup_from(settings_path, body)?;
     }
     let body = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
     write_atomic(settings_path, body.as_bytes()).map_err(|e| e.to_string())?;
@@ -1012,12 +1039,13 @@ pub fn retune_registered_hook_timeouts(
     //   존재 검사 뒤에 잡는다: 파일이 없으면 만질 것도 없고, 그때 락 파일을 만들면 '없으면
     //   만들지 않는다' 경계(위 한 줄)를 잔재로 뚫는다.
     let _lock = acquire_settings_lock(settings_path);
-    let mut root: serde_json::Value = match std::fs::read_to_string(settings_path) {
+    // ★T2i(RULINGS EC5): 시작 경로의 단일 판독기 — 백업도 이 바이트로 쓴다.
+    let raw = settings_read_bounded(settings_path)?;
+    let mut root: serde_json::Value = match raw.as_deref() {
         // 빈 파일 = 등록 0 — 만질 것이 없다(빈 객체로 덮어쓰지 않는다).
-        Ok(s) if s.trim().is_empty() => return Ok(vec![]),
-        Ok(s) => serde_json::from_str(&s).map_err(|e| format!("settings parse error: {e}"))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) => return Err(format!("settings read error: {e}")),
+        Some(s) if s.trim().is_empty() => return Ok(vec![]),
+        Some(s) => serde_json::from_str(s).map_err(|e| format!("settings parse error: {e}"))?,
+        None => return Ok(vec![]),
     };
     if !root.is_object() {
         return Err("settings root is not an object".into());
@@ -1036,8 +1064,7 @@ pub fn retune_registered_hook_timeouts(
     if raised.is_empty() {
         return Ok(raised);
     }
-    let backup = format!("{}.bak-cys", settings_path.display());
-    std::fs::copy(settings_path, &backup).map_err(|e| e.to_string())?;
+    settings_backup_from(settings_path, raw.as_deref().unwrap_or_default())?;
     let body = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
     write_atomic(settings_path, body.as_bytes()).map_err(|e| e.to_string())?;
     Ok(raised)
@@ -1053,8 +1080,9 @@ pub fn verify_desired_hooks_registered(
     pack_dir: &Path,
     hooks: &[DesiredHook],
 ) -> Vec<String> {
-    let root: serde_json::Value = std::fs::read_to_string(settings_path)
-        .ok()
+    // ★T2i(RULINGS EC5): 시작 경로의 단일 판독기(판독 불가 = 빈 설정 = 전부 미등록으로 보고 — 지금과 같은 방향).
+    let root: serde_json::Value = read_start_live(settings_path)
+        .text()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     hooks
@@ -1853,15 +1881,28 @@ pub fn seed_first_run_gates_at(
 ) -> SeedOutcome {
     let path = cfg.join(CLAUDE_CONFIG_FILE);
     let existed = path.exists();
+    // ★T2i(RULINGS EC5): 시작 경로의 단일 판독기(막히지 않음 · 일반 파일 · 상한) — 백업은 이 바이트로 쓴다(다시 열지 않는다).
+    let mut original: Vec<u8> = Vec::new();
     let existing = if existed {
-        match std::fs::read_to_string(&path) {
-            Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
-                Ok(v) => v,
-                Err(e) => {
-                    return SeedOutcome::Refused(format!("{} 파싱 불가 — 보존: {e}", path.display()))
+        match read_start_live(&path) {
+            StartRead::Bytes(b) => {
+                let parsed = std::str::from_utf8(&b)
+                    .map_err(|e| e.to_string())
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).map_err(|e| e.to_string()));
+                match parsed {
+                    Ok(v) => {
+                        original = b;
+                        v
+                    }
+                    Err(e) => {
+                        return SeedOutcome::Refused(format!("{} 파싱 불가 — 보존: {e}", path.display()))
+                    }
                 }
-            },
-            Err(e) => {
+            }
+            StartRead::Missing => {
+                return SeedOutcome::Refused(format!("{} 읽기 불가 — 보존: 사라짐", path.display()))
+            }
+            StartRead::Unreadable(e) => {
                 return SeedOutcome::Refused(format!("{} 읽기 불가 — 보존: {e}", path.display()))
             }
         }
@@ -1882,7 +1923,8 @@ pub fn seed_first_run_gates_at(
     //   (claude 가 다음 기동에 종전과 같은 신규 프로필을 다시 만든다). 백업 부재는 곧
     //   "시드 이전에는 이 파일이 존재하지 않았다" 의 기록이므로 정보가 사라지지 않는다.
     if existed {
-        if let Err(e) = std::fs::copy(&path, cfg.join(FIRST_RUN_SEED_BACKUP)) {
+        let mode = existing_file_mode(&path).or(Some(0o600));
+        if let Err(e) = write_atomic_mode(&cfg.join(FIRST_RUN_SEED_BACKUP), &original, mode) {
             return SeedOutcome::Refused(format!("백업 실패 — 시드 보류: {e}"));
         }
     }
@@ -1900,8 +1942,8 @@ pub fn seed_first_run_gates_at(
 
     // 사후 검증 — '썼다'는 주장이 아니라 **되읽기**로 확인한다. 같은 순수 계획기를 다시 돌려
     // "이제 추가할 것이 없다" 를 오라클로 쓴다(판정 사본 0).
-    let verified = std::fs::read_to_string(&path)
-        .ok()
+    let verified = read_start_live(&path)
+        .text()
         .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
         .map(|v| {
             let re = plan_first_run_seed(&v, workspaces, premise);
@@ -1969,10 +2011,14 @@ pub enum PackStateRead {
 
 pub fn read_pack_state(dir: &Path) -> PackStateRead {
     let path = dir.join(PACK_STATE_FILE);
-    let s = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PackStateRead::Absent,
-        Err(e) => return PackStateRead::Corrupt(format!("읽기 실패: {e}")),
+    // ★T2h(RULINGS CW3): 시작 경로 판독 — 링크 비추종 · 막히지 않음 · 일반 파일 · 상한.
+    let s = match read_start_meta(&path) {
+        StartRead::Bytes(b) => match String::from_utf8(b) {
+            Ok(s) => s,
+            Err(e) => return PackStateRead::Corrupt(format!("읽기 실패: {e}")),
+        },
+        StartRead::Missing => return PackStateRead::Absent,
+        StartRead::Unreadable(e) => return PackStateRead::Corrupt(format!("읽기 실패: {e}")),
     };
     match serde_json::from_str::<PackState>(&s) {
         Ok(st) if st.channel == "free" || st.channel == "pro" => PackStateRead::Valid(st),
@@ -2000,7 +2046,7 @@ pub fn remote_is_newer_tuple(remote: (&str, u32), disk: (&str, u32)) -> bool {
 /// 임베드 트리(PACK_ALL)에 없는 것이 있으면 pro overlay 실재로 본다. (판독 실패 = 증거 없음 —
 /// ①축 accepted.channel이 1차 권위라 이 축은 보조 휴리스틱이다.)
 pub fn pro_file_evidence(dir: &Path) -> bool {
-    let Ok(s) = std::fs::read_to_string(dir.join(INSTALL_MANIFEST)) else {
+    let Some(s) = read_start_meta(&dir.join(INSTALL_MANIFEST)).text() else {
         return false;
     };
     let Ok(m) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&s) else {
@@ -2026,10 +2072,14 @@ fn channel_guard_and_heal(dir: &Path) -> Option<String> {
         ),
         PackStateRead::Valid(st) => {
             // channel=free — 정합 검사(state.base ↔ .pack-version).
-            let disk_v = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-            if st.base_version == disk_v {
+            // ★T2i(RULINGS EC5): 시작 경로의 단일 판독기(막히지 않음 · 일반 파일 · 상한). 판독 불가(FIFO · 장치 · 폴더 · 상한
+            //   초과)면 아래 증거 검사는 그대로 하되 자가치유(상태 쓰기)는 하지 않는다 — 모르는 값으로 기록을 고치지 않는다.
+            let (disk_v, unreadable) = match read_start_meta(&dir.join(PACK_VERSION_FILE)) {
+                StartRead::Missing => (String::new(), None),
+                StartRead::Bytes(b) => (String::from_utf8(b).map(|s| s.trim().to_string()).unwrap_or_default(), None),
+                StartRead::Unreadable(e) => (String::new(), Some(e)),
+            };
+            if unreadable.is_none() && st.base_version == disk_v {
                 return None;
             }
             // 불일치 — 음성 pro 증거 검사(v6·R5 codex 결착: "정상 JSON이지만 거짓 free" 차단).
@@ -2062,6 +2112,10 @@ fn channel_guard_and_heal(dir: &Path) -> Option<String> {
                      → 보존·내장 팩 미반영. 복구: cys pack-repair-channel"
                         .to_string(),
                 );
+            }
+            if let Some(e) = unreadable {
+                eprintln!("[init-pack] ⚠ {PACK_VERSION_FILE} 판독 불가({e}) — state 자가치유 생략(다음 기동 재시도)");
+                return None;
             }
             // 증거 없음 → 제한적 자가치유: base_version만 동기화(loud) 후 진행.
             let mut healed = st;
@@ -2245,6 +2299,98 @@ pub fn read_pack_text_bounded(p: &Path) -> std::io::Result<String> {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "크기 상한 초과"));
     }
     read_capped_utf8(f, HOOKS_READ_CAP)
+}
+
+/// ★T2h(RULINGS CW3 · 검토자 B3): 데몬 시작 경로(설치·업데이트 판정 — 바인드 전)가 읽는 파일 하나의 판독 결과. 부재 ·
+/// 판독 불가(사유) · 바이트. 판독 불가는 호출부의 **보수적 기본값**이 된다(시작을 막지 않는다).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartRead {
+    Missing,
+    Unreadable(String),
+    Bytes(Vec<u8>),
+}
+
+impl StartRead {
+    /// 바이트(부재·판독 불가 = None).
+    pub fn bytes(self) -> Option<Vec<u8>> {
+        match self {
+            StartRead::Bytes(b) => Some(b),
+            _ => None,
+        }
+    }
+    /// UTF-8 텍스트(부재·판독 불가·UTF-8 아님 = None).
+    pub fn text(self) -> Option<String> {
+        self.bytes().and_then(|b| String::from_utf8(b).ok())
+    }
+}
+
+/// ★T2h(RULINGS CW3): 장부·메타 파일(`.merge-audit.jsonl` · `.merge-pending.json` · 설치 기록 · `.pack-version` ·
+/// `.pack-state.json` · `.pristine/<rel>` · `<rel>.user` · `<rel>.new` · `<rel>.base` · 스냅샷 `meta.json`) 하나의 상한.
+pub const START_META_CAP: u64 = 64 * 1024 * 1024;
+/// ★T2h(RULINGS CW3): 살아 있는 팩 파일 하나의 상한(내장 팩의 가장 큰 파일은 약 1.3MB).
+pub const START_LIVE_CAP: u64 = 64 * 1024 * 1024;
+
+/// ★T2h(RULINGS CW3): 장부·메타 판독 — 마지막 성분의 링크를 **따르지 않고**(unix `O_NOFOLLOW` · windows 재해석 지점을 그대로
+/// 연다) **막히지 않게** 열어(unix `O_NONBLOCK` — 쓰는 쪽 없는 FIFO 도 즉시 열린다) 연 핸들이 일반 파일이고 상한 이하일 때만
+/// 읽는다(상한 + 1 바이트까지 읽어 넘치면 거부 — 읽는 동안 자라도 성공이 아니다). FIFO · 소켓 · 장치 · 폴더 · 링크 · 상한 초과
+/// = 판독 불가. 시작 경로가 이 파일들로 무기한 멈추지 않는다.
+pub fn read_start_meta(p: &Path) -> StartRead {
+    start_read(p, START_META_CAP, false)
+}
+
+/// ★T2h(RULINGS CW3): 살아 있는 팩 파일 판독 — 사용자가 둔 링크는 **일반 파일을 가리킬 때만** 따른다(지금 동작). 막히지 않게
+/// 열고 일반 파일 · 상한 이하만 읽는다 — FIFO · 장치 · 상한 초과 = 판독 불가(그 파일은 '판독 불가' 경로를 탄다).
+pub fn read_start_live(p: &Path) -> StartRead {
+    start_read(p, START_LIVE_CAP, true)
+}
+
+fn start_read(p: &Path, cap: u64, follow: bool) -> StartRead {
+    use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK | if follow { 0 } else { libc::O_NOFOLLOW });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        if !follow {
+            opts.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+    }
+    let f = match opts.open(p) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StartRead::Missing,
+        Err(e) => return StartRead::Unreadable(format!("열기 실패: {e}")),
+    };
+    let m = match f.metadata() {
+        Ok(m) => m,
+        Err(e) => return StartRead::Unreadable(format!("상태 확인 실패: {e}")),
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if !follow && m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return StartRead::Unreadable("재해석 지점(링크)은 따르지 않는다".into());
+        }
+    }
+    if !m.is_file() {
+        return StartRead::Unreadable("일반 파일이 아니다(FIFO·소켓·장치·폴더·링크)".into());
+    }
+    if m.len() > cap {
+        return StartRead::Unreadable(format!("크기 상한({cap}바이트) 초과"));
+    }
+    let mut bytes = Vec::new();
+    if let Err(e) = f.take(cap + 1).read_to_end(&mut bytes) {
+        return StartRead::Unreadable(format!("읽기 실패: {e}"));
+    }
+    if bytes.len() as u64 > cap {
+        return StartRead::Unreadable("크기 상한 초과(읽는 동안 커졌다)".into());
+    }
+    StartRead::Bytes(bytes)
 }
 
 /// ★F10 R2-m3: 상한 + 1 바이트까지 읽어 넘치면 거부한다 — stat 뒤에 파일이 자라도 앞부분(상한까지)만 해시한 '성공'이 나오지 않는다.
@@ -2744,7 +2890,8 @@ pub const MASTER_DIRECTIVE_REL: &str = "directives/MASTER_DIRECTIVE.md";
 /// (시험 `ceo_promoted_in_matches_the_shared_fixture`).
 pub fn ceo_promoted_in(dir: &Path) -> bool {
     ceo_pre_ceo_present_in(dir)
-        || std::fs::read(dir.join(MASTER_DIRECTIVE_REL))
+        || read_start_live(&dir.join(MASTER_DIRECTIVE_REL))
+            .bytes()
             .map(|b| has_ceo_separator(&b))
             .unwrap_or(false)
 }
@@ -2768,10 +2915,14 @@ fn has_ceo_separator(b: &[u8]) -> bool {
 /// 바 가드 2 — `.merge-audit.jsonl` 에서 사용자가 일부러 옛 버전을 유지한 기록이 있는 파일 집합.
 /// 행동 `keep-mine`(pack-merge)·`rollback`(pack-rollback)만 센다. 거부 기록(flags 에 `refused`)은
 /// 사용자의 선택이 아니라 게이트의 거부이므로 세지 않는다. 판독 실패 행은 건너뛴다(파일 부재 = 빈 집합).
-pub fn merge_audit_keep_rels(dir: &Path) -> std::collections::BTreeSet<String> {
+/// ★T2h(RULINGS CW3): `None` = 감사 원장을 읽을 수 없다(FIFO · 폴더 · 링크 · 상한 초과 · 읽기 오류) — 호출부는 **모든** user 소유
+/// 파일을 '내 것 유지'로 본다(보수적 기본값: 자동 갱신하지 않는다). 부재 = 빈 집합(지금 동작).
+pub fn merge_audit_keep_rels(dir: &Path) -> Option<std::collections::BTreeSet<String>> {
     let mut out = std::collections::BTreeSet::new();
-    let Ok(text) = std::fs::read_to_string(dir.join(MERGE_AUDIT_FILE)) else {
-        return out;
+    let text = match read_start_meta(&dir.join(MERGE_AUDIT_FILE)) {
+        StartRead::Missing => return Some(out),
+        StartRead::Unreadable(_) => return None,
+        StartRead::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
     };
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
@@ -2790,7 +2941,7 @@ pub fn merge_audit_keep_rels(dir: &Path) -> std::collections::BTreeSet<String> {
             out.insert(file.to_string());
         }
     }
-    out
+    Some(out)
 }
 
 /// 생명줄 훅 파일인가 — `hooks/<여섯 이름>`(CONTRACTS 8.7 · `repair::boot_critical::LIFELINE_HOOKS`).
@@ -2800,10 +2951,13 @@ pub fn is_lifeline_rel(rel: &str) -> bool {
         .is_some_and(|name| crate::repair::boot_critical::LIFELINE_HOOKS.contains(&name))
 }
 
-/// 셸 스크립트인가 — 라(CR 금지)의 대상. 확장자 `.sh`, `hooks/` 아래 파일, 또는 첫 줄이 셸
-/// 인터프리터(`#!…sh`)인 파일. 판정은 vendor 본(임베드) 기준이다(사용자본의 첫 줄은 깨져 있을 수 있다).
+/// 셸 스크립트인가 — 라(CR 금지)의 대상. 확장자 `.sh`, 또는 첫 줄이 셸 인터프리터(`#!…sh`)인 파일(★FT1: 폴더는 따지지 않는다).
+/// 판정은 vendor 본(임베드) 기준이다(사용자본의 첫 줄은 깨져 있을 수 있다).
 pub fn is_shell_script(rel: &str, vendor: &str) -> bool {
-    if rel.ends_with(".sh") || rel.starts_with("hooks/") {
+    // ★T2i(RULINGS FT1): '셸 스크립트'는 셸 스크립트다 — 이름이 `.sh` 로 끝나거나 vendor 첫 줄이 sh / bash / zsh shebang 일 때만.
+    //   폴더(`hooks/`)는 셸 스크립트를 만들지 않는다(종전: `hooks/` 아래 모든 파일 — README.md · inject_gate.py · Windows 배치
+    //   cys-agy-statusline.cmd 의 CR 이 지워졌고 원본은 어디에도 남지 않았다 · TW1 CW7-ENC).
+    if rel.ends_with(".sh") {
         return true;
     }
     let first = vendor.lines().next().unwrap_or("");
@@ -2850,7 +3004,18 @@ pub fn listed_file_refusal(rel: &str, verb: &str) -> String {
     format!(
         "⛔ 거부: '{rel}' 은 기동 필수·보호 목록에 있는 파일입니다 — `{verb}` 는 이 파일에 출시본이 아닌 바이트를 넣지 \
          않습니다(아무것도 쓰지 않았습니다). 이 파일을 바꾸는 길은 수리 흐름뿐입니다: 워커가 `cys repair begin --files {rel} \
-         --trigger …` → 예행·검사 → 주인 승인(업데이트가 보관한 내 사본이면 `cys repair reapply <수리번호>`)."
+         --trigger …` → 예행·검사 → 주인 승인(업데이트가 보관한 내 사본 {rel}.user 을 다시 입히려면: {}).",
+        parked_copy_routes(rel)
+    )
+}
+
+/// ★T2g(RULINGS CN1 · CN2): 업데이트가 vendor 우선으로 보관한 사본(`<rel>.user` · 원장 vendor-first)을 다시 입히는 두 길 —
+/// `cys repair reapply` 는 **수리**가 만든 수정만 받는다(수리 번호가 있어야 한다). 사용자가 손으로 고친 것은 수리 번호가 없으므로
+/// 업데이트 계기의 보통 수리다. 팩 동사는 수리 장부를 읽지 않으므로(읽지 않아야 한다) 어느 쪽인지 모른다 — 조건과 함께 둘 다
+/// 이름 댄다. `reapply` 혼자는 쓰지 않는다. `rel` 은 파일 이름(또는 `<파일>` 같은 자리 표시).
+pub fn parked_copy_routes(rel: &str) -> String {
+    format!(
+        "수리로 고친 파일이면 `cys repair reapply <수리번호>`, 직접 고친 파일이면 `cys repair begin --files {rel} --trigger update`"
     )
 }
 
@@ -3057,15 +3222,14 @@ pub fn lane_for_install(pack: &Path) -> Option<crate::repair::types::LaneKey> {
 
 /// 매니페스트 로드 + 깨짐 여부(파일이 있는데 JSON 으로 읽히지 않음). 깨지면 빈 표(지금 동작)와 true.
 pub fn load_manifest_state(dir: &Path) -> (std::collections::BTreeMap<String, String>, bool) {
-    match std::fs::read_to_string(dir.join(INSTALL_MANIFEST)) {
-        Ok(s) => match serde_json::from_str(&s) {
+    // ★T2h(RULINGS CW3): 시작 경로 판독 — 판독 불가(FIFO · 폴더 · 링크 · 상한 초과)는 '깨짐'과 같다(보수 경로).
+    match read_start_meta(&dir.join(INSTALL_MANIFEST)) {
+        StartRead::Bytes(b) => match serde_json::from_slice(&b) {
             Ok(m) => (m, false),
             Err(_) => (std::collections::BTreeMap::new(), true),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (std::collections::BTreeMap::new(), false)
-        }
-        Err(_) => (std::collections::BTreeMap::new(), true),
+        StartRead::Missing => (std::collections::BTreeMap::new(), false),
+        StartRead::Unreadable(_) => (std::collections::BTreeMap::new(), true),
     }
 }
 
@@ -3077,7 +3241,7 @@ pub struct UpdateContext<'s> {
     sources: &'s UpdateSources,
     manifest_corrupt: bool,
     ceo_promoted: bool,
-    audit_keep: std::cell::OnceCell<std::collections::BTreeSet<String>>,
+    audit_keep: std::cell::OnceCell<Option<std::collections::BTreeSet<String>>>,
 }
 
 impl<'s> UpdateContext<'s> {
@@ -3124,7 +3288,8 @@ impl<'s> UpdateContext<'s> {
                 f.audit_keep = self
                     .audit_keep
                     .get_or_init(|| merge_audit_keep_rels(&self.dir))
-                    .contains(rel);
+                    .as_ref()
+                    .is_none_or(|kept| kept.contains(rel));
                 f.ceo_promoted = rel == MASTER_DIRECTIVE_REL && self.ceo_promoted;
                 let unedited = manifest_hash == Some(dh.as_str()) || f.prev_vendor_match;
                 if unedited && is_constitution_file(rel) {
@@ -3138,8 +3303,8 @@ impl<'s> UpdateContext<'s> {
                 let parked = e.and_then(|e| e.get("kind")).and_then(|k| k.as_str()) == Some("user-kept")
                     && e.and_then(|e| e.get("reason")).and_then(|r| r.as_str()) != Some("capture-failed");
                 if parked {
-                    f.parked_same_vendor = std::fs::read_to_string(self.dir.join(format!("{rel}.new")))
-                        .ok()
+                    f.parked_same_vendor = read_start_meta(&self.dir.join(format!("{rel}.new")))
+                        .text()
                         .as_deref()
                         == Some(embed);
                 }
@@ -3320,18 +3485,27 @@ pub fn decide_file_action_with(
 
 /// 병합 대기 원장 로드(부재·손상 = 빈 원장, 기동 차단 0).
 pub fn load_merge_pending(dir: &Path) -> serde_json::Map<String, serde_json::Value> {
-    std::fs::read_to_string(dir.join(MERGE_PENDING_FILE))
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    // ★T2h(RULINGS CW3): 시작 경로 판독 — 판독 불가(FIFO · 폴더 · 링크 · 상한 초과)는 빈 원장(지금의 파싱 실패와 같다).
+    read_start_meta(&dir.join(MERGE_PENDING_FILE))
+        .bytes()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default()
 }
 
-/// 병합 대기 원장 저장(best-effort — 자문 메타데이터라 실패가 설치를 막지 않는다).
-pub fn save_merge_pending(dir: &Path, pending: &serde_json::Map<String, serde_json::Value>) {
-    if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(pending.clone())) {
-        let _ = write_atomic(&dir.join(MERGE_PENDING_FILE), json.as_bytes());
-    }
+/// 병합 대기 원장 저장. ★T2h(RULINGS CW5): 실패를 돌려준다 — vendor 우선 기록의 선저장(RULINGS AC7)은 이 결과를 보고,
+/// 기록이 디스크에 남지 않으면 살아 있는 기동 필수 파일을 바꾸지 않는다(보관 실패와 같은 격리). 그 밖의 호출부는 자문
+/// 메타데이터라 종전대로 실패가 설치를 막지 않는다(호출부가 `let _ =` 로 명시한다).
+pub fn save_merge_pending(
+    dir: &Path,
+    pending: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(&serde_json::Value::Object(pending.clone()))
+        .map_err(|e| format!("병합 대기 원장 직렬화 실패: {e}"))?;
+    let p = dir.join(MERGE_PENDING_FILE);
+    // ★T2i(RULINGS EC7): 영속이 증명된 쓰기(본문 · 교체 · 폴더 fsync — 실패는 돌려준다). vendor 우선은 이 결과를 보고서만
+    //   살아 있는 파일을 바꾼다.
+    write_atomic_durable(&p, json.as_bytes()).map_err(|e| format!("병합 대기 원장 기록 실패 {}: {e}", p.display()))
 }
 
 /// ★G3-축3 감사 원장 1줄 append. 다중 프로세스 appender 전제라 O_APPEND + **라인당 단일
@@ -3345,11 +3519,57 @@ pub fn append_merge_audit(dir: &Path, entry: &serde_json::Value) -> Result<(), S
         serde_json::to_string(entry).map_err(|e| format!("감사 엔트리 직렬화 실패: {e}"))?;
     line.push('\n');
     let path = dir.join(MERGE_AUDIT_FILE);
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| format!("감사 원장 열기 실패 {}: {e}", path.display()))?;
+    // ★T2h(RULINGS CW3 · CW1): 링크를 따르지 않고(살아 있는 파일의 별칭에 덧붙이지 않는다) 막히지 않게 연다(읽는 쪽 없는
+    // FIFO 는 즉시 실패 — 설치가 멈추지 않는다) · 연 핸들이 일반 파일일 때만 쓴다.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut f = opts.open(&path).map_err(|e| format!("감사 원장 열기 실패 {}: {e}", path.display()))?;
+    let m = f.metadata().map_err(|e| format!("감사 원장 상태 확인 실패 {}: {e}", path.display()))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if m.file_attributes() & 0x400 != 0 {
+            return Err(format!("감사 원장 {} 이 재해석 지점(링크)입니다 — 쓰지 않습니다", path.display()));
+        }
+    }
+    if !m.is_file() {
+        return Err(format!("감사 원장 {} 이 일반 파일이 아닙니다 — 쓰지 않습니다", path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if m.nlink() > 1 {
+            return Err(format!("감사 원장 {} 이 다른 파일의 별칭(하드 링크)입니다 — 쓰지 않습니다", path.display()));
+        }
+    }
+    // ★T2i(RULINGS EC4 (3)): 윈도우에서도 링크 수는 **연 핸들**의 사실이다(`GetFileInformationByHandle` 의 `nNumberOfLinks`) —
+    //   하나가 아니면(보호 파일의 하드 링크) 쓰지 않는다. 그 질의가 실패해도 쓰지 않는다.
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) } == 0 {
+            return Err(format!(
+                "감사 원장 {} 의 링크 수를 핸들에서 확인할 수 없습니다({}) — 쓰지 않습니다",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        if info.nNumberOfLinks != 1 {
+            return Err(format!("감사 원장 {} 이 다른 파일의 별칭(하드 링크)입니다 — 쓰지 않습니다", path.display()));
+        }
+    }
     f.write_all(line.as_bytes())
         .map_err(|e| format!("감사 원장 쓰기 실패 {}: {e}", path.display()))
 }
@@ -3398,6 +3618,10 @@ pub const LEDGER_KINDS: [&str; 9] = [
 /// - kept-drift 인입 + 기존 kind∈LINEAGE → kind 불변, `state:"at-rest"` 만 갱신(멱등 — 이미
 ///   at-rest 면 no-op·dirty 미발생). 정적 재스윕이 merged/conflicted 계보·캡처 포인터를 지우지
 ///   않는다(v2 §4 KeepDrift arm 쓰기 0 규칙 · merged_kind_not_clobbered 핀).
+/// - ★T2g(RULINGS CQ1 · CR2): kept-drift 인입 + 기존 kind = `vendor-first` → **항목 그대로**(no-op · dirty 미발생). 그 기록은
+///   "업데이트가 내 사본을 `<rel>.user` 에 보관했고 아직 다시 입히지 않았다"는 계보다 — 살아 있는 파일이 같은 버전에서
+///   달라졌다고(손으로 고침) 사라지면 `cys repair reapply` 가 그 사본을 찾지 못한다. 장부만의 규칙이다: 팩 파일 쓰기 ·
+///   스윕 순서 · 살아 있는 파일의 판정은 그대로다.
 /// - 그 외 kind 인입 = kind 전환 허용하되 **capture·base_side 는 신 항목에 승계**(신 항목이 자체
 ///   값을 갖지 않는 필드만 — 소실 금지. 크래시 창 재스윕 healed 가 영속된 merged 항목의 캡처
 ///   포인터를 지우는 창의 봉인 · v2 §4). 승계는 old kind 무관 — 한 번 실린 증거 포인터는 어떤
@@ -3423,6 +3647,10 @@ pub fn upsert_pending_v2(
         "미등재 원장 kind 쓰기: {new_kind:?} — src/pack.rs LEDGER_KINDS 에 등재 후 사용(계상 SOT)"
     );
     if let Some(ok) = old_kind {
+        // ★T2g(RULINGS CQ1 · CR2): 보관된 사본의 기록은 같은 버전의 드리프트가 바꾸지 않는다(항목 그대로 — rewrite 0).
+        if ok == "vendor-first" && new_kind == "kept-drift" {
+            return;
+        }
         if LINEAGE_KINDS.contains(&ok) && new_kind == "kept-drift" {
             // kind 불변 — state:"at-rest" 만(멱등 · no-op 시 dirty 미발생 = 원장 rewrite 0).
             let mut e = old.unwrap();
@@ -3580,8 +3808,8 @@ fn plan_install_core(
     let mut plan = InstallPlan::default();
     // 다운그레이드 차단 미러(install_into 와 동일 판정).
     if !force {
-        if let Some(dv) = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
-            .ok()
+        if let Some(dv) = read_start_meta(&dir.join(PACK_VERSION_FILE))
+            .text()
             .map(|s| s.trim().to_string())
         {
             if version_gt(&dv, target_version) {
@@ -3599,7 +3827,7 @@ fn plan_install_core(
     for (rel, content) in items.iter().copied() {
         let path = dir.join(rel);
         let exists = path.exists();
-        let disk = if exists { std::fs::read_to_string(&path).ok() } else { None };
+        let disk = if exists { read_start_live(&path).text() } else { None };
         let mh_raw = manifest.get(rel).map(String::as_str);
         // ★C-07(0.14.55 · P3): 분류 **직전** 낡은 항목 판정. decide_file_action 의 arm 은 무변경.
         let stale =
@@ -3672,7 +3900,7 @@ fn plan_install_core(
             {
                 continue;
             }
-            match std::fs::read_to_string(dir.join(rel)) {
+            match read_start_live(&dir.join(rel)).text().ok_or(()) {
                 Ok(existing) if mh.as_str() == content_hash(&existing).as_str() => {
                     plan.prune_delete.push(rel.clone());
                 }
@@ -3730,7 +3958,7 @@ pub fn pack_current_in(dir: &Path, binary_version: &str) -> bool {
     if !dir.join(INSTALL_MANIFEST).exists() {
         return false;
     }
-    let Ok(disk) = std::fs::read_to_string(dir.join(PACK_VERSION_FILE)) else {
+    let Some(disk) = read_start_meta(&dir.join(PACK_VERSION_FILE)).text() else {
         return false;
     };
     match (parse_semver(disk.trim()), parse_semver(binary_version)) {
@@ -3749,6 +3977,637 @@ pub fn pack_current_for(binary_version: &str) -> bool {
 /// 원자적 파일 쓰기(§7-⑤): 같은 디렉터리 temp 파일에 쓰고 fsync → rename으로 원자 교체 →
 /// 디렉터리 fsync(best-effort). 쓰는 도중 crash 시 부분 파일이 최종 경로에 남지 않는다
 /// (std::fs::write는 비원자라 부분 쓰기 노출). cysd governance의 write_json_atomic과 동형.
+/// ★T2h(RULINGS CW1): 링크 · 재해석 지점인가(no-follow 메타데이터).
+fn meta_is_link_like(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return true;
+        }
+    }
+    meta.file_type().is_symlink()
+}
+
+/// ★T2h(RULINGS CW1 · 검토자 B1): 팩 동사의 **쓰기 자리 하나**의 경로 규칙 — `root` 아래 `rel_path` 의 이미 있는 구성 요소를
+/// 루트에서부터 링크를 따르지 않고 본다: 어느 구성 요소든 링크(윈도우는 모든 재해석 지점)면 거부, 부모가 폴더가 아니면 거부,
+/// 마지막 성분이 폴더면 거부. 없는 구성 요소에서 멈춘다(그 아래는 아무것도 없다 — 쓰기가 새로 만든다). 부수 자리(`.pristine/…` ·
+/// `<rel>.user` · `<rel>.new` · `<rel>.base` · 장부)가 살아 있는 트리의 별칭이 되어 '살아 있는 바이트를 쓰지 않는' 예외가
+/// 등재 파일의 쓰기로 바뀌는 길을 막는다.
+pub fn sidecar_path_gate(root: &Path, rel_path: &str) -> Result<(), String> {
+    let parts: Vec<&str> = rel_path.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".").collect();
+    if parts.is_empty() || parts.contains(&"..") {
+        return Err(format!("쓰기 자리 {rel_path} 가 정규형이 아닙니다"));
+    }
+    let mut at = root.to_path_buf();
+    for (i, part) in parts.iter().enumerate() {
+        at.push(part);
+        let meta = match std::fs::symlink_metadata(&at) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("쓰기 자리 {} 를 확인할 수 없습니다({e})", parts[..=i].join("/"))),
+        };
+        if meta_is_link_like(&meta) {
+            return Err(format!(
+                "쓰기 자리 {} 가 링크(또는 연결 지점 · 재해석 지점)입니다 — 팩 동사는 링크를 거친 자리에 쓰지 않습니다",
+                parts[..=i].join("/")
+            ));
+        }
+        if i + 1 < parts.len() && !meta.is_dir() {
+            return Err(format!("쓰기 자리 {} 의 상위 {} 가 폴더가 아닙니다", rel_path, parts[..=i].join("/")));
+        }
+        if i + 1 == parts.len() && meta.is_dir() {
+            return Err(format!("쓰기 자리 {rel_path} 가 폴더입니다"));
+        }
+    }
+    Ok(())
+}
+
+/// ★T2h(RULINGS CW1): `root` 아래 `rel_path` 에 **닻을 내린** 원자 쓰기(교체). 본문은 [`beneath_write`] 하나다(RULINGS EC4).
+pub fn write_beneath(root: &Path, rel_path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    beneath_write(root, rel_path, bytes, None, false, Place::Replace, false)
+}
+
+/// ★T2i(RULINGS EC2 · EC4): 닻을 내린 쓰기가 마지막 이름에 놓는 방식 — `Replace` = 원자 교체(마지막 성분이 링크면 링크
+/// 자체가 바뀐다), `NoReplace` = 그 이름이 비어 있을 때만(차 있으면 `AlreadyExists` · 아무것도 바뀌지 않음).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    Replace,
+    NoReplace,
+}
+
+fn rel_parts(rel_path: &str) -> std::io::Result<Vec<&str>> {
+    let parts: Vec<&str> = rel_path.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".").collect();
+    if parts.is_empty() || parts.contains(&"..") {
+        return Err(std::io::Error::other(format!("쓰기 자리 {rel_path} 가 정규형이 아닙니다")));
+    }
+    Ok(parts)
+}
+
+#[cfg(unix)]
+struct DirFd(libc::c_int);
+
+#[cfg(unix)]
+impl Drop for DirFd {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+
+#[cfg(unix)]
+fn c_name(s: &str) -> std::io::Result<std::ffi::CString> {
+    std::ffi::CString::new(s.as_bytes()).map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// ★T2i(RULINGS EC4 (4)): unix — `root` 를 연 기술자에서 구성 요소마다 `openat(O_DIRECTORY | O_NOFOLLOW)` 로 내려간다(`mkdirs` 면
+/// 없는 폴더를 `mkdirat`). 사실(링크 아님 · 폴더임)은 연 기술자에서 나온다 — 검사와 쓰기 사이에 구성 요소가 링크로 바뀌면 실패.
+/// 없는 구성 요소(`mkdirs` 아님) = `NotFound`.
+#[cfg(unix)]
+fn anchor_dir(root: &Path, comps: &[&str], mkdirs: bool, rel_path: &str) -> std::io::Result<DirFd> {
+    use std::os::unix::ffi::OsStrExt;
+    let root_c = std::ffi::CString::new(root.as_os_str().as_bytes()).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let fd = unsafe { libc::open(root_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut d = DirFd(fd);
+    for comp in comps {
+        let c = c_name(comp)?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let mut nfd = unsafe { libc::openat(d.0, c.as_ptr(), flags) };
+        let mut err = std::io::Error::last_os_error();
+        if nfd < 0 && mkdirs && err.raw_os_error() == Some(libc::ENOENT) {
+            let made = unsafe { libc::mkdirat(d.0, c.as_ptr(), 0o755 as libc::mode_t) };
+            if made != 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(e);
+                }
+            }
+            nfd = unsafe { libc::openat(d.0, c.as_ptr(), flags) };
+            err = std::io::Error::last_os_error();
+        }
+        if nfd < 0 {
+            if err.raw_os_error() == Some(libc::ENOENT) {
+                return Err(err);
+            }
+            return Err(std::io::Error::other(format!(
+                "쓰기 자리 {rel_path} 의 구성 요소 {comp} 가 링크이거나 폴더가 아닙니다({err})"
+            )));
+        }
+        d = DirFd(nfd);
+    }
+    Ok(d)
+}
+
+/// ★T2i(RULINGS EC2): 같은 폴더 기술자 안의 **덮지 않는** 이름 바꾸기 — macOS `renameatx_np(RENAME_EXCL)`, 리눅스(glibc)·안드로이드
+/// `renameat2(RENAME_NOREPLACE)`. 대상 이름이 차 있으면 `AlreadyExists`(아무것도 바뀌지 않음). 파일 시스템·운영체제가 지원하지
+/// 않으면(`EINVAL` · `ENOTSUP` · `ENOSYS`) `Unsupported` — 호출부는 놓지 않는다(보관 불가 갈래).
+#[cfg(unix)]
+fn no_replace_renameat(fd: libc::c_int, from: &std::ffi::CStr, to: &std::ffi::CStr) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        if FAIL_NO_REPLACE_RENAME.with(|f| f.get()) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "injected: no-replace rename unsupported"));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    let r = unsafe { libc::renameatx_np(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_EXCL) };
+    #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "android"))]
+    let r = unsafe { libc::renameat2(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_NOREPLACE) };
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"), target_os = "android")))]
+    let r: libc::c_int = {
+        let _ = (fd, from, to);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "이 운영체제에서는 덮지 않는 이름 바꾸기를 쓸 수 없습니다",
+        ));
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    let c = e.raw_os_error();
+    if c == Some(libc::EINVAL) || c == Some(libc::ENOTSUP) || c == Some(libc::EOPNOTSUPP) || c == Some(libc::ENOSYS) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("이 파일 시스템은 덮지 않는 이름 바꾸기를 지원하지 않습니다({e})"),
+        ));
+    }
+    Err(e)
+}
+
+/// ★T2i(RULINGS FP1): 덮지 않는 놓기의 대체 길 — 닻 내린 폴더 기술자 안에서 마지막 이름을 배타 생성(O_CREAT | O_EXCL |
+/// O_NOFOLLOW)해 쓰고 내린다. 이미 있으면 AlreadyExists(아무것도 바뀌지 않음). 쓰기 · 내림이 실패하면 그 반쪽 파일은 남는다 —
+/// 자리의 사본으로 다음 보관이 옮긴다(지우지 않는다: 지우는 사이에 다른 쓰는 쪽이 같은 이름을 만들었을 수 있다).
+#[cfg(unix)]
+fn exclusive_create_at(d: &DirFd, leaf_c: &std::ffi::CStr, bytes: &[u8], mode: Option<u32>, exact: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::io::FromRawFd;
+    #[cfg(test)]
+    {
+        if FAIL_EXCLUSIVE_FALLBACK.with(|f| f.get()) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "injected: exclusive creation refused"));
+        }
+    }
+    let fd = unsafe {
+        libc::openat(
+            d.0,
+            leaf_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            mode.unwrap_or(0o644) as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    f.write_all(bytes)?;
+    if exact {
+        if let Some(m) = mode {
+            apply_mode_exact(&f, m)?;
+        }
+    }
+    sync_file_checked(&f, &leaf_c.to_string_lossy())
+}
+
+/// ★T2i(RULINGS GB2): 자리에 이미 있는 같은 바이트의 사본을 '보관된 사본'으로 다시 쓸 때 — 그 **파일**을 내린다(닻 내린 판독
+/// 기술자 · 링크 비추종 · 일반 파일만). 실패는 실패(내렸다고 가정하지 않는다). 윈도우: 내림(`FlushFileBuffers`)은 쓰기 권한
+/// 핸들이 필요해 쓰기 권한으로 연다(바이트는 쓰지 않는다 · 재해석 지점 비추종 · 일반 파일만).
+fn beneath_sync_file(root: &Path, rel_path: &str) -> std::io::Result<()> {
+    let parts = rel_parts(rel_path)?;
+    let leaf = parts[parts.len() - 1];
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::FromRawFd;
+        let d = anchor_dir(root, &parts[..parts.len() - 1], false, rel_path)?;
+        let c = c_name(leaf)?;
+        let fd = unsafe { libc::openat(d.0, c.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let f = unsafe { std::fs::File::from_raw_fd(fd) };
+        if !f.metadata()?.is_file() {
+            return Err(std::io::Error::other(format!("{rel_path} 가 일반 파일이 아닙니다")));
+        }
+        sync_file_checked(&f, leaf)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        sidecar_path_gate(root, rel_path).map_err(std::io::Error::other)?;
+        let path = parts.iter().fold(root.to_path_buf(), |p, c| p.join(c));
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)?;
+        if !f.metadata()?.is_file() {
+            return Err(std::io::Error::other(format!("{rel_path} 가 일반 파일이 아닙니다")));
+        }
+        sync_file_checked(&f, leaf)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, leaf);
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "파일 내림을 이 운영체제에서 쓸 수 없습니다"))
+    }
+}
+
+/// ★T2i(RULINGS EC7 · EC2): 닻 내린 폴더 기술자의 fsync — 시험 주입(`FAIL_DIR_SYNC_FOR`, 마지막 이름 단위) · '지원하지 않음'만 Ok.
+#[cfg(unix)]
+fn sync_dir_fd(d: &DirFd, leaf: &str) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        if FAIL_DIR_SYNC_FOR.with(|f| f.borrow().as_deref() == Some(leaf)) {
+            return Err(std::io::Error::other("injected directory flush failure"));
+        }
+    }
+    let _ = leaf;
+    if unsafe { libc::fsync(d.0) } == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if dir_sync_unsupported(&e) {
+        Ok(())
+    } else {
+        Err(e)
+    }
+}
+
+/// ★T2i(RULINGS EC4 (4) · 윈도우): 배타적으로 만든 파일의 **핸들**이 뜻한 자리에 있는가 — `GetFinalPathNameByHandleW` 의 답이
+/// `canonicalize(root)` + 구성 요소 + 이름과 같아야 한다(대소문자 무시). 중간 구성 요소가 연결 지점·재해석 지점이면 답이 달라져
+/// 거부된다(루트 자체의 연결은 canonicalize 가 풀므로 허용). `NtCreateFile` 의 핸들 상대 생성은 쓰지 않는다(RULINGS EF).
+#[cfg(windows)]
+fn windows_handle_sits_at(f: &std::fs::File, root: &Path, comps: &[&str], name: &str) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let mut buf = vec![0u16; 1024];
+    loop {
+        let n = unsafe { GetFinalPathNameByHandleW(f.as_raw_handle() as _, buf.as_mut_ptr(), buf.len() as u32, 0) } as usize;
+        if n == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n < buf.len() {
+            buf.truncate(n);
+            break;
+        }
+        buf.resize(n + 1, 0);
+    }
+    let got = String::from_utf16_lossy(&buf);
+    let mut want = std::fs::canonicalize(root)?;
+    for c in comps {
+        want.push(c);
+    }
+    want.push(name);
+    let norm = |s: &str| s.trim_start_matches(r"\\?\").replace('/', "\\").to_lowercase();
+    if norm(&got) != norm(&want.to_string_lossy()) {
+        return Err(std::io::Error::other(format!(
+            "만든 임시 파일이 뜻한 자리에 있지 않습니다({got}) — 연결 지점·재해석 지점을 거친 자리에는 쓰지 않습니다"
+        )));
+    }
+    Ok(())
+}
+
+/// ★T2i(RULINGS FP5 m6): 절대 경로를 verbatim(`\\?\` · UNC 는 `\\?\UNC\`) 넓은 문자열로 — 이미 붙었거나 상대 경로면 그대로 ·
+/// `/` 는 `\` 로(verbatim 경로는 정규화되지 않는다 · 구성 요소는 `rel_parts` 가 이미 정규형으로 만들었다).
+#[cfg(windows)]
+fn windows_verbatim(p: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut w: Vec<u16> = p.as_os_str().encode_wide().map(|c| if c == u16::from(b'/') { u16::from(b'\\') } else { c }).collect();
+    let bs = u16::from(b'\\');
+    let starts = |w: &[u16], s: &str| w.len() >= s.len() && w.iter().zip(s.encode_utf16()).all(|(a, b)| *a == b);
+    if !starts(&w, r"\\?\") && p.is_absolute() {
+        if starts(&w, r"\\") {
+            let rest: Vec<u16> = w[2..].to_vec();
+            w = r"\\?\UNC\".encode_utf16().chain(rest).collect();
+        } else {
+            w = r"\\?\".encode_utf16().chain(w).collect();
+        }
+    }
+    let _ = bs;
+    w.push(0);
+    w
+}
+
+/// ★T2i(RULINGS EC2 · 윈도우): `MoveFileExW` 덮지 않는 이동(`MOVEFILE_REPLACE_EXISTING` 없음 · `MOVEFILE_WRITE_THROUGH`) — 차 있으면
+/// `AlreadyExists`(ERROR_FILE_EXISTS 80 · ERROR_ALREADY_EXISTS 183).
+#[cfg(windows)]
+fn windows_move_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+    // ★T2i(RULINGS FP5 m6): 긴 경로 — std 의 이름 바꾸기처럼 절대 경로에 `\\?\` (UNC 는 `\\?\UNC\`) 를 붙인다.
+    let (a, b) = (windows_verbatim(from), windows_verbatim(to));
+    let ok = unsafe { MoveFileExW(a.as_ptr(), b.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if ok != 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    // ★T2i(RULINGS FP5 m6): 대상 이름에 무엇이든(파일 · 폴더 · 재해석 지점) 있으면 '차 있음'(다음 세대 자리로).
+    if matches!(e.raw_os_error(), Some(80) | Some(183)) || std::fs::symlink_metadata(to).is_ok() {
+        return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+    }
+    // ★T2i(RULINGS FP1): ERROR_INVALID_FUNCTION(1) · ERROR_NOT_SUPPORTED(50) · ERROR_INVALID_PARAMETER(87) = 이 볼륨은 지원하지 않음.
+    if matches!(e.raw_os_error(), Some(1) | Some(50) | Some(87)) {
+        return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, e));
+    }
+    Err(e)
+}
+
+/// ★T2i(RULINGS EC4 · EC2): **팩 동사의 쓰기 하나** — (1) 새 바이트는 이 쓰는 쪽이 **배타적으로 만든**(create-new · 링크 비추종)
+/// 임시 파일에만 쓰고 마지막 이름에는 놓기로만 닿는다, (2) 이미 있는 임시 이름은 열지 않는다(다음 이름 · 고갈 = 거부), (4) 사실은
+/// 연 핸들에서: unix = 닻 내린 폴더 기술자([`anchor_dir`]) 안의 `openat(O_CREAT | O_EXCL | O_NOFOLLOW)` · `renameat` /
+/// [`no_replace_renameat`]; 윈도우 = 경로 규칙([`sidecar_path_gate`]) 뒤 배타 생성 → 핸들 증명([`windows_handle_sits_at`]) →
+/// 놓기(`Replace` = std 이름 바꾸기 · `NoReplace` = [`windows_move_no_replace`]). `mode` = 만들 때의 권한(`exact` 면 `fchmod` + 되읽기
+/// 검증 — H-08), `durable` = 놓은 뒤 부모 폴더 fsync 실패를 돌려준다(EC7). 실패하면 임시 파일을 지우고 아무것도 바꾸지 않는다.
+pub fn beneath_write(
+    root: &Path,
+    rel_path: &str,
+    bytes: &[u8],
+    mode: Option<u32>,
+    exact: bool,
+    place: Place,
+    durable: bool,
+) -> std::io::Result<()> {
+    let parts = rel_parts(rel_path)?;
+    let leaf = parts[parts.len() - 1];
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::io::FromRawFd;
+        let d = anchor_dir(root, &parts[..parts.len() - 1], true, rel_path)?;
+        let leaf_c = c_name(leaf)?;
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut made: Option<(libc::c_int, std::ffi::CString)> = None;
+        for _ in 0..crate::TMP_NAME_TRIES {
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp_c = c_name(&format!(".{leaf}.tmp-{}-{n}", std::process::id()))?;
+            let tfd = unsafe {
+                libc::openat(
+                    d.0,
+                    tmp_c.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    mode.unwrap_or(0o644) as libc::c_uint,
+                )
+            };
+            if tfd >= 0 {
+                made = Some((tfd, tmp_c));
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(e);
+            }
+        }
+        let Some((tfd, tmp_c)) = made else {
+            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "임시 이름 고갈 — 아무것도 쓰지 않았습니다"));
+        };
+        let mut f = unsafe { std::fs::File::from_raw_fd(tfd) };
+        let res = (|| -> std::io::Result<()> {
+            f.write_all(bytes)?;
+            if exact {
+                if let Some(m) = mode {
+                    apply_mode_exact(&f, m)?;
+                }
+            }
+            f.sync_all()?;
+            match place {
+                Place::Replace => {
+                    if unsafe { libc::renameat(d.0, tmp_c.as_ptr(), d.0, leaf_c.as_ptr()) } != 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                }
+                Place::NoReplace => no_replace_renameat(d.0, &tmp_c, &leaf_c),
+            }
+        })();
+        drop(f);
+        match res {
+            Ok(()) => {}
+            // ★T2i(RULINGS FP1): 덮지 않는 이름 바꾸기를 이 파일 시스템이 지원하지 않으면 — 다른 길의 덮지 않는 생성: 마지막
+            //   이름을 **배타적으로 만들고**(O_CREAT | O_EXCL | O_NOFOLLOW · 차 있으면 AlreadyExists) 그 자리에 쓰고 내린다. 쓰다 멈춘
+            //   사본은 자리의 사본(occupant)이 되어 다음 보관이 세대 자리로 옮긴다(살아 있는 파일은 보관이 끝난 뒤에만 바뀐다).
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported && place == Place::NoReplace => {
+                unsafe { libc::unlinkat(d.0, tmp_c.as_ptr(), 0) };
+                exclusive_create_at(&d, &leaf_c, bytes, mode, exact)?;
+            }
+            Err(e) => {
+                unsafe { libc::unlinkat(d.0, tmp_c.as_ptr(), 0) };
+                return Err(e);
+            }
+        }
+        if durable {
+            sync_dir_fd(&d, leaf)?;
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        sidecar_path_gate(root, rel_path).map_err(std::io::Error::other)?;
+        let dest = parts.iter().fold(root.to_path_buf(), |p, c| p.join(c));
+        let parent = dest.parent().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf());
+        std::fs::create_dir_all(&parent)?;
+        let mut made: Option<(PathBuf, std::fs::File)> = None;
+        for _ in 0..crate::TMP_NAME_TRIES {
+            let cand = crate::tmp_path_for(&parent, leaf);
+            match create_tmp_with_mode(&cand, None) {
+                Ok(f) => {
+                    made = Some((cand, f));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        let Some((tmp, mut f)) = made else {
+            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "임시 이름 고갈 — 아무것도 쓰지 않았습니다"));
+        };
+        let tmp_name = tmp.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let res = (|| -> std::io::Result<()> {
+            windows_handle_sits_at(&f, root, &parts[..parts.len() - 1], &tmp_name)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        drop(f);
+        let res = res.and_then(|_| match place {
+            Place::Replace => std::fs::rename(&tmp, &dest),
+            Place::NoReplace => windows_move_no_replace(&tmp, &dest),
+        });
+        match res {
+            Ok(()) => {}
+            // ★T2i(RULINGS FP1): 덮지 않는 이동을 지원하지 않는 볼륨 — 마지막 이름을 배타 생성(CREATE_NEW)해 쓰고 내린다(핸들 증명 포함).
+            Err(e) if place == Place::NoReplace && e.kind() == std::io::ErrorKind::Unsupported => {
+                let _ = std::fs::remove_file(&tmp);
+                let mut g = create_tmp_with_mode(&dest, None)?;
+                windows_handle_sits_at(&g, root, &parts[..parts.len() - 1], leaf)?;
+                g.write_all(bytes)?;
+                g.sync_all()?;
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        }
+        let _ = (mode, exact, durable);
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, bytes, mode, exact, place, durable, leaf);
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "닻 내린 쓰기를 이 운영체제에서 쓸 수 없습니다"))
+    }
+}
+
+/// ★T2i(RULINGS EC4 (4)): 팩 **대상** 파일의 닻 내린 쓰기 — [`write_pack_file`] 의 권한 규칙(H-08 `pack_target_mode` · 정확 적용)
+/// 그대로, 쓰기는 [`beneath_write`](`place` — 동사가 고른다: 교체 · `--missing-only` 는 덮지 않음).
+pub fn write_pack_file_beneath(
+    root: &Path,
+    rel_path: &str,
+    bytes: &[u8],
+    prior: Option<u32>,
+    system_manifest_entry: bool,
+    place: Place,
+) -> std::io::Result<()> {
+    let mode = pack_target_mode(prior, bytes, system_manifest_entry);
+    beneath_write(root, rel_path, bytes, mode, true, place, false)
+}
+
+/// ★T2i(RULINGS EC2): 같은 폴더 안의 **덮지 않는** 이동(보관본을 세대 자리로) — unix 는 닻 내린 기술자 안의
+/// [`no_replace_renameat`], 윈도우는 경로 규칙 뒤 [`windows_move_no_replace`]. 원본 없음 = `NotFound`, 대상 있음 = `AlreadyExists`.
+pub fn beneath_move_no_replace(root: &Path, from_rel: &str, to_rel: &str) -> std::io::Result<()> {
+    let fp = rel_parts(from_rel)?;
+    let tp = rel_parts(to_rel)?;
+    if fp[..fp.len() - 1] != tp[..tp.len() - 1] {
+        return Err(std::io::Error::other(format!("{from_rel} → {to_rel}: 같은 폴더 안에서만 옮깁니다")));
+    }
+    #[cfg(unix)]
+    {
+        let d = anchor_dir(root, &fp[..fp.len() - 1], false, from_rel)?;
+        no_replace_renameat(d.0, &c_name(fp[fp.len() - 1])?, &c_name(tp[tp.len() - 1])?)
+    }
+    #[cfg(windows)]
+    {
+        // 경로 규칙은 **이름 전체**에(부모 폴더만 재면 그 폴더 자체가 '폴더입니다'로 거부되고, 팩 루트의 파일은 빈 경로로 거부된다).
+        sidecar_path_gate(root, from_rel).map_err(std::io::Error::other)?;
+        sidecar_path_gate(root, to_rel).map_err(std::io::Error::other)?;
+        let base = fp[..fp.len() - 1].iter().fold(root.to_path_buf(), |p, c| p.join(c));
+        windows_move_no_replace(&base.join(fp[fp.len() - 1]), &base.join(tp[tp.len() - 1]))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, fp, tp);
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "덮지 않는 이동을 이 운영체제에서 쓸 수 없습니다"))
+    }
+}
+
+/// ★T2i(RULINGS FP5 m7): 보관본(`<rel>.user` · `<rel>.new`)의 정체 — 링크를 따르지 않는 메타데이터의 (장치 · 아이노드 · 크기 ·
+/// 수정 시각 · 바뀐 시각). 윈도우는 (크기 · 마지막 쓰기 · 만든 시각 · 속성). 지울 때 읽거나 확인한 그 사본인지 대조한다.
+pub fn side_identity(path: &Path) -> Option<(u64, u64, u64, i64, i64)> {
+    let m = std::fs::symlink_metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((m.dev(), m.ino(), m.size(), m.mtime() * 1_000_000_000 + m.mtime_nsec(), m.ctime() * 1_000_000_000 + m.ctime_nsec()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Some((u64::from(m.file_attributes()), 0, m.file_size(), m.last_write_time() as i64, m.creation_time() as i64))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Some((0, 0, m.len(), 0, 0))
+    }
+}
+
+/// ★T2i(RULINGS EC2): 보관 자리(`<rel>.user`)에 지금 있는 것 — 닻 내린 판독(링크 비추종 · 막히지 않음 · 일반 파일 · 상한).
+#[derive(Debug)]
+enum Occupant {
+    Missing,
+    /// 일반 파일 — 바이트(상한 초과 · 판독 실패 = None: 비교할 수 없으니 '다른 사본'으로 다룬다).
+    File(Option<Vec<u8>>),
+    /// 파일이 아닌 것(폴더 · 링크 · FIFO …) 또는 자리를 확인할 수 없음 — 세대가 아니라 장애물.
+    Obstacle(String),
+}
+
+fn beneath_occupant(root: &Path, rel_path: &str) -> Occupant {
+    let parts = match rel_parts(rel_path) {
+        Ok(p) => p,
+        Err(e) => return Occupant::Obstacle(e.to_string()),
+    };
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::io::FromRawFd;
+        let d = match anchor_dir(root, &parts[..parts.len() - 1], false, rel_path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Occupant::Missing,
+            Err(e) => return Occupant::Obstacle(e.to_string()),
+        };
+        let leaf_c = match c_name(parts[parts.len() - 1]) {
+            Ok(c) => c,
+            Err(e) => return Occupant::Obstacle(e.to_string()),
+        };
+        let fd = unsafe {
+            libc::openat(d.0, leaf_c.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ENOENT) {
+                return Occupant::Missing;
+            }
+            // ★T2i(RULINGS FP5 m8): 열지 못한 이유를 닻 내린 lstat 으로 가른다 — 읽을 수 없는 **일반 파일**은 '파일이 아님'이 아니라
+            //   '판독 불가 사본'(비교할 수 없으니 다른 사본으로 다뤄 세대 자리로 옮긴다 · 옮기기는 읽기 권한이 필요 없다).
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstatat(d.0, leaf_c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } == 0 {
+                return match st.st_mode & libc::S_IFMT {
+                    libc::S_IFREG => Occupant::File(None),
+                    libc::S_IFLNK => Occupant::Obstacle("링크".into()),
+                    libc::S_IFDIR => Occupant::Obstacle("폴더".into()),
+                    _ => Occupant::Obstacle(format!("특수 파일({e})")),
+                };
+            }
+            return Occupant::Obstacle(e.to_string());
+        }
+        let f = unsafe { std::fs::File::from_raw_fd(fd) };
+        let Ok(m) = f.metadata() else { return Occupant::Obstacle("상태 확인 실패".into()) };
+        if m.is_dir() {
+            return Occupant::Obstacle("폴더".into());
+        }
+        if !m.is_file() {
+            return Occupant::Obstacle("특수 파일(FIFO · 장치 · 소켓)".into());
+        }
+        if m.len() > START_META_CAP {
+            return Occupant::File(None);
+        }
+        let mut b = Vec::new();
+        match f.take(START_META_CAP + 1).read_to_end(&mut b) {
+            Ok(_) => Occupant::File(Some(b)),
+            Err(_) => Occupant::File(None),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // 경로 규칙은 이름 전체에(링크 · 폴더인 자리는 장애물 · 없으면 통과).
+        if let Err(e) = sidecar_path_gate(root, rel_path) {
+            return Occupant::Obstacle(e);
+        }
+        let p = parts.iter().fold(root.to_path_buf(), |p, c| p.join(c));
+        match std::fs::symlink_metadata(&p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Occupant::Missing,
+            Err(e) => Occupant::Obstacle(e.to_string()),
+            Ok(m) if meta_is_link_like(&m) || !m.is_file() => Occupant::Obstacle("일반 파일이 아님".into()),
+            Ok(_) => match read_start_meta(&p) {
+                StartRead::Bytes(b) => Occupant::File(Some(b)),
+                StartRead::Missing => Occupant::Missing,
+                StartRead::Unreadable(_) => Occupant::File(None),
+            },
+        }
+    }
+}
+
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_atomic_mode(path, bytes, None)
 }
@@ -3761,7 +4620,86 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// 방식은 넓은 창이 잠깐 열리므로, **처음부터** 목표 mode 로 만든다.
 pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
     // 거동 불변: enforce=false 는 종전과 **바이트 동일**하다(mode 는 open(2) 인자로만 간다).
-    write_atomic_mode_inner(path, bytes, mode, false, apply_mode_exact)
+    write_atomic_mode_inner(path, bytes, mode, false, apply_mode_exact, false)
+}
+
+/// ★T2i(RULINGS EC7): **영속이 증명된** 원자 쓰기 — 본문 fsync → 원자 교체 → 부모 폴더 fsync, 그리고 그 셋의 실패를 **모두**
+/// 돌려준다(종전 [`write_atomic`] 은 폴더 fsync 실패를 버렸다). 너그럽게 넘기는 것은 '폴더 fsync 를 지원하지 않음' 하나다
+/// ([`dir_sync_unsupported`] — `Unsupported` · `EINVAL` · `ENOTSUP`/`EOPNOTSUPP`). vendor 우선의 선저장(보관본 `<rel>.user` 와
+/// 원장)이 이것을 쓴다 — 살아 있는 기동 필수 파일은 이 둘이 디스크에 남았음이 증명된 뒤에만 바뀐다.
+/// 윈도우: 본문은 `FlushFileBuffers`(`sync_all`)로 내리고, 폴더는 std 로 열어 내릴 수 없다(`FILE_FLAG_BACKUP_SEMANTICS` 필요) —
+/// '지원하지 않음'으로 다룬다(교체의 영속은 NTFS 메타데이터 기록에 기댄다 — 추정).
+pub fn write_atomic_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_mode_inner(path, bytes, None, false, apply_mode_exact, true)
+}
+
+/// ★T2i(RULINGS EC7): 폴더 fsync 가 '지원하지 않음'으로 실패했는가(그때만 너그럽게 넘긴다).
+fn dir_sync_unsupported(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        let c = e.raw_os_error();
+        c == Some(libc::EINVAL) || c == Some(libc::ENOTSUP) || c == Some(libc::EOPNOTSUPP)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// ★T2i(RULINGS EC7) 시험 주입: 이 파일 이름의 영속 쓰기에서 부모 폴더 fsync 가 실패한 것으로 한다(스레드 단위 — 다른 시험과
+    /// 섞이지 않는다).
+    static FAIL_DIR_SYNC_FOR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// ★T2i(RULINGS FP1) 시험 주입: 덮지 않는 이름 바꾸기가 '지원하지 않음'(EINVAL 같은 파일 시스템)인 것으로 한다.
+    static FAIL_NO_REPLACE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// ★T2i(RULINGS FP1) 시험 주입: 그 대체 길(마지막 이름의 배타 생성)도 실패한 것으로 한다.
+    static FAIL_EXCLUSIVE_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// ★T2i(RULINGS GB2) 시험 주입: 이 이름의 파일 내림(fsync)이 실패한 것으로 한다(배타 생성의 대체 길 · 자리의 같은 사본 다시 내림).
+    static FAIL_FILE_SYNC_FOR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// ★T2i(RULINGS GB2): 파일 하나의 내림 — 시험 주입 · '지원하지 않음'만 Ok(EC7 의 규칙 그대로), 그 밖의 실패는 실패.
+fn sync_file_checked(f: &std::fs::File, leaf: &str) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        if FAIL_FILE_SYNC_FOR.with(|x| x.borrow().as_deref() == Some(leaf)) {
+            return Err(std::io::Error::other("injected file flush failure"));
+        }
+    }
+    let _ = leaf;
+    match f.sync_all() {
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+        other => other,
+    }
+}
+
+/// ★T2i(RULINGS EC7): 영속 쓰기의 부모 폴더 fsync — 실패를 돌려준다('지원하지 않음'만 Ok).
+fn sync_parent_dir(path: &Path, parent: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        if FAIL_DIR_SYNC_FOR.with(|f| f.borrow().is_some() && *f.borrow() == name) {
+            return Err(std::io::Error::other("injected directory flush failure"));
+        }
+    }
+    let _ = path;
+    #[cfg(unix)]
+    {
+        let d = std::fs::File::open(parent)?;
+        match d.sync_all() {
+            Err(e) if dir_sync_unsupported(&e) => Ok(()),
+            other => other,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Ok(())
+    }
 }
 
 /// [`write_atomic_mode`] 의 **정확 적용판**(H-08).
@@ -3774,7 +4712,7 @@ pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::i
 /// (chmod(2) 는 umask 무관 — `install_into` 의 실행비트 루프가 이미 `set_permissions` 를 쓰는 이유다)
 /// **rename 전에 fstat 으로 검증**한다. 검증 실패·적용 실패는 **대상을 교체하지 않고** 그대로 올린다.
 pub fn write_atomic_mode_exact(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
-    write_atomic_mode_inner(path, bytes, mode, true, apply_mode_exact)
+    write_atomic_mode_inner(path, bytes, mode, true, apply_mode_exact, false)
 }
 
 fn write_atomic_mode_inner(
@@ -3786,6 +4724,8 @@ fn write_atomic_mode_inner(
     //   이유는 H-CONC-3 핀이 소유자를 `fn <이름>(` 문자열로 해소하기 때문이다 — 제네릭을 붙이면
     //   정의가 `fn write_atomic_mode_inner<A>(` 가 되어 핀이 소유자를 놓친다(실측된 사각).
     apply: fn(&std::fs::File, u32) -> std::io::Result<()>,
+    // ★T2i(RULINGS EC7): true = 부모 폴더 fsync 실패를 돌려준다([`write_atomic_durable`]) · false = 종전(최선 노력).
+    durable: bool,
 ) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().ok_or_else(|| {
@@ -3845,6 +4785,7 @@ fn write_atomic_mode_inner(
         Ok(())
     })();
     match res {
+        Ok(()) if durable => sync_parent_dir(path, parent),
         Ok(()) => {
             // 디렉터리 엔트리 영속화 — best-effort(실패 무시).
             if let Ok(d) = std::fs::File::open(parent) {
@@ -4033,8 +4974,8 @@ pub fn classify_stale_entry(
     //   같으면 그 항목은 낡은 것이 아니라 **정상적인 드리프트/병합 상태의 기준선**이다.
     //   이 가드를 빼면 합법적인 로컬 수정(항목==조상 해시 · 건강한 3-way 경로)이 "출처 불명"으로
     //   오분류돼 3-way 병합이 사라진다(실측: lib 스위트 52건 적색).
-    let pristine_hash = std::fs::read_to_string(dir.join(PRISTINE_DIR).join(rel))
-        .ok()
+    let pristine_hash = read_start_meta(&dir.join(PRISTINE_DIR).join(rel))
+        .text()
         .map(|p| content_hash(&p));
     classify_stale_entry_with(
         rel,
@@ -4121,7 +5062,7 @@ pub fn is_system_manifest_entry(dir: &Path, rel: &str) -> bool {
     if ownership_name_scoped(rel, dir) != "system" {
         return false;
     }
-    let Ok(s) = std::fs::read_to_string(dir.join(INSTALL_MANIFEST)) else {
+    let Some(s) = read_start_meta(&dir.join(INSTALL_MANIFEST)).text() else {
         return false;
     };
     let Ok(m) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&s) else {
@@ -4155,7 +5096,7 @@ fn ensure_pristine(dir: &Path, rel: &str, content: &str) {
 /// healed 폴백으로 강등한다(손실 0 · v2 §4).
 fn ensure_pristine_checked(dir: &Path, rel: &str, content: &str) -> Result<(), String> {
     let p = dir.join(PRISTINE_DIR).join(rel);
-    if std::fs::read_to_string(&p).ok().as_deref() == Some(content) {
+    if read_start_meta(&p).text().as_deref() == Some(content) {
         return Ok(());
     }
     if let Some(parent) = p.parent() {
@@ -4216,17 +5157,17 @@ fn create_capture_segment(
 /// 가드는 비UTF-8 .user 에서 항상 불일치 판정이라 재사용 불가 — 바이트 경로는 무조건 복사한다
 /// (치유 성공 후 L1 재도달 없음 — 재복사는 재손상 시에만).
 /// ★T4 CLI 동사 소비(pack-heal 판독 불가 파일 바이트 백업) — 재구현 금지.
-pub fn byte_backup_user(dir: &Path, rel: &str, src: &Path) -> Result<(), String> {
-    let dst = dir.join(format!("{rel}.user"));
-    let tmp = dir.join(format!("{rel}.user.tmp-{}", std::process::id()));
-    std::fs::copy(src, &tmp).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("바이트 백업 복사 실패 {}: {e}", tmp.display())
-    })?;
-    std::fs::rename(&tmp, &dst).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("바이트 백업 rename 실패 {}: {e}", dst.display())
-    })
+pub fn byte_backup_user(dir: &Path, rel: &str, src: &Path) -> Result<ParkOutcome, String> {
+    // ★T2h(RULINGS CW3): 시작 경로에서 FIFO · 장치 · 상한 초과 파일을 읽지 않는다 — 막히지 않게 연 핸들이 일반 파일일 때만
+    // 그 바이트를 백업한다(아니면 백업 실패 = 호출부의 격리 · 보안 자산은 종전 '무결성 우선' 예외 그대로).
+    let bytes = match read_start_live(src) {
+        StartRead::Bytes(b) => b,
+        StartRead::Missing => return Err(format!("바이트 백업 원본 없음 {}", src.display())),
+        StartRead::Unreadable(why) => return Err(format!("바이트 백업 원본 판독 불가 {}: {why}", src.display())),
+    };
+    // ★T2i(RULINGS EC4 (2) · EC2): 고정 임시 이름(`<rel>.user.tmp-<pid>` — 이미 있으면 따라가 자르고 썼다)을 쓰지 않는다 — 보관은
+    //   [`park_copy`](배타 임시 파일 · 덮지 않는 놓기 · 차 있으면 세대 자리로).
+    park_copy(dir, rel, &bytes, false)
 }
 
 /// ★T3(D9 · v2 §2 원칙 3): 검증 base lazy 로드 — `.pristine/<rel>` 을 읽어
@@ -4234,7 +5175,7 @@ pub fn byte_backup_user(dir: &Path, rel: &str, src: &Path) -> Result<(), String>
 /// 미시도(decide L4 종전 거동 낙하) — 크래시·원장 손상·연쇄 릴리스 스큐가 전부 이 게이트에서
 /// "틀린 base 병합" 대신 손실 0 폴백으로 강등된다.
 fn load_verified_base(dir: &Path, rel: &str, manifest_hash: &str) -> Option<String> {
-    let pristine = std::fs::read_to_string(dir.join(PRISTINE_DIR).join(rel)).ok()?;
+    let pristine = read_start_meta(&dir.join(PRISTINE_DIR).join(rel)).text()?;
     if content_hash(&pristine) == manifest_hash {
         Some(pristine)
     } else {
@@ -4253,51 +5194,192 @@ pub fn preserve_prior_user_generation(
     rel: &str,
     incoming: Option<&[u8]>,
 ) -> Result<Option<PathBuf>, String> {
-    let prior = dir.join(format!("{rel}.user"));
-    if !prior.exists() {
-        return Ok(None);
-    }
-    if let Some(inc) = incoming {
-        if std::fs::read(&prior).ok().as_deref() == Some(inc) {
-            return Ok(None);
-        }
-    }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut dest = dir.join(format!("{rel}.user.prev-{ts}"));
-    let mut n = 1u32;
-    while dest.exists() {
-        n += 1;
-        dest = dir.join(format!("{rel}.user.prev-{ts}-{n}"));
-    }
-    std::fs::rename(&prior, &dest).map_err(|e| format!("기존 {rel}.user 세대 보존 실패({e})"))?;
-    Ok(Some(dest))
+    preserve_prior_user_generation_at(dir, rel, incoming, ts, &mut |_| {})
 }
 
-/// 설치 실행부 전용 세대 보존: `{rel}.user` 가 **일반 파일**일 때만 이전 세대로 비켜 세운다. 그 자리에 파일이
-/// 아닌 것(디렉터리 등)이 있으면 세대가 아니라 장애물이다 — 옮기지 않고 Err(백업 불가 → 호출자는 덮지 않는다,
-/// 부록 A-2 #4). 부재 = Ok(할 일 없음).
-fn preserve_prior_user_file(dir: &Path, rel: &str, incoming: Option<&[u8]>) -> Result<(), String> {
-    match std::fs::symlink_metadata(dir.join(format!("{rel}.user"))) {
-        Err(_) => Ok(()),
-        Ok(m) if m.file_type().is_file() => {
-            preserve_prior_user_generation(dir, rel, incoming).map(|_| ())
+/// ★T2h(RULINGS CW2 · 검토자 B2) → ★T2i(RULINGS EC2): 세대 자리는 **덮지 않는 이동**으로만 채운다 — `<rel>.user` 를 후보 이름으로
+/// [`beneath_move_no_replace`](차 있으면 `AlreadyExists` → 다음 이름). 교체되는 세대 자리는 없다. 다른 쓰는 쪽이 이미 `.user` 를
+/// 옮겼으면 보존할 것이 없다(Ok(None)). `before_reserve` = 시험의 끼어들기 지점(제품은 빈 함수).
+fn preserve_prior_user_generation_at(
+    dir: &Path,
+    rel: &str,
+    incoming: Option<&[u8]>,
+    ts: u64,
+    before_reserve: &mut dyn FnMut(&Path),
+) -> Result<Option<PathBuf>, String> {
+    match beneath_occupant(dir, &format!("{rel}.user")) {
+        Occupant::Missing => return Ok(None),
+        Occupant::File(Some(b)) if incoming == Some(b.as_slice()) => return Ok(None),
+        _ => {}
+    }
+    Ok(move_occupant_to_slot(dir, rel, ts, before_reserve)?.map(|s| dir.join(s)))
+}
+
+/// ★T2i(RULINGS EC2): `<rel>.user` 에 있는 것을 새 세대 자리 `<rel>.user.prev-<ts>[-n]` 로 **덮지 않고** 옮긴다(팩 상대 경로 반환 ·
+/// 옮길 것이 이미 없으면 None).
+fn move_occupant_to_slot(
+    dir: &Path,
+    rel: &str,
+    ts: u64,
+    before_reserve: &mut dyn FnMut(&Path),
+) -> Result<Option<String>, String> {
+    let user_rel = format!("{rel}.user");
+    for n in 1u32..=10_000 {
+        let slot = if n == 1 { format!("{rel}.user.prev-{ts}") } else { format!("{rel}.user.prev-{ts}-{n}") };
+        before_reserve(&dir.join(&slot));
+        match beneath_move_no_replace(dir, &user_rel, &slot) {
+            Ok(()) => return Ok(Some(slot)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                return Err(format!("기존 {rel}.user 를 덮지 않고 옮기는 것을 이 파일 시스템이 지원하지 않습니다({e})"))
+            }
+            Err(e) => return Err(format!("기존 {rel}.user 세대 보존 실패({e})")),
         }
-        Ok(_) => Err(format!("{rel}.user 자리에 파일이 아닌 항목이 있어 세대 보존·백업을 할 수 없습니다")),
+    }
+    Err(format!("기존 {rel}.user 세대 자리를 찾지 못했습니다"))
+}
+
+/// ★T2i(RULINGS EC2): 보관 한 번의 결과.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkOutcome {
+    /// 이 쓰는 쪽의 사본이 있는 곳(팩 상대) — `<rel>.user`, 또는 자리가 끝내 비지 않았을 때 자기 세대 자리.
+    pub at: String,
+    /// 자리에 있던 다른 사본을 옮긴 세대 자리들(팩 상대).
+    pub moved: Vec<String>,
+    /// 자리가 끝내 비지 않아 자기 세대 자리에 놓았다(겹침).
+    pub overlap: bool,
+    /// ★T2i(RULINGS FH5): 겹침을 감사 원장에 적지 못한 사유 — 사본의 안전(위 `at`)과 겹침의 기록은 서로 다른 결과다. 겹침이
+    /// 없거나 적었으면 None.
+    pub overlap_record_error: Option<String>,
+}
+
+/// ★T2i(RULINGS EC2): 보관의 끼어들기 지점(시험 전용 — 제품은 빈 함수).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkStep {
+    /// n 번째 놓기 직전.
+    BeforePlace(u32),
+    /// n 번째 놓기가 '차 있음'을 본 뒤, 그 자리의 사본을 세대 자리로 옮기기 직전.
+    BeforeMove(u32),
+}
+
+/// ★T2i(RULINGS EC2): 덮지 않는 놓기를 다시 시도하는 횟수(그 뒤엔 자기 세대 자리 + 감사 원장의 겹침 기록).
+pub const PARK_PLACE_TRIES: u32 = 3;
+
+/// ★T2i(RULINGS EC2 — 규칙 하나를 보관본에): `<rel>.user` 에는 **아무것도 덮어쓰지 않는다**. 사본은 덮지 않는 놓기로만 그 이름에
+/// 생기고([`beneath_write`] `NoReplace`), 그 이름에 있던 것은 덮지 않는 이동으로만 세대 자리로 간다. 놓을 때 자리가 차 있으면:
+/// 같은 바이트면 끝 · 다르면 그 사본을 새 세대 자리로 옮기고 다시 놓는다(최대 [`PARK_PLACE_TRIES`]번). 그래도 차 있으면 자기
+/// 사본을 자기 세대 자리에 두고 겹침을 감사 원장에 적는다(`park-overlap`). 그래서 두 쓰는 쪽이 어떻게 엇갈려도 모든 사본이 이름이나
+/// 세대 자리에 남는다 — '막기가 아니라 알아채고 보관'. 덮지 않는 놓기를 지원하지 않는 파일 시스템 = Err(호출부의 보관 불가 갈래).
+/// `durable` = vendor 우선의 선저장(EC7 — 놓은 뒤 폴더 fsync 실패를 돌려준다).
+pub fn park_copy(dir: &Path, rel: &str, bytes: &[u8], durable: bool) -> Result<ParkOutcome, String> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    park_copy_at(dir, rel, bytes, durable, ts, &mut |_| {})
+}
+
+fn park_copy_at(
+    dir: &Path,
+    rel: &str,
+    bytes: &[u8],
+    durable: bool,
+    ts: u64,
+    hook: &mut dyn FnMut(ParkStep),
+) -> Result<ParkOutcome, String> {
+    let user_rel = format!("{rel}.user");
+    let mut moved: Vec<String> = Vec::new();
+    for attempt in 0..PARK_PLACE_TRIES {
+        hook(ParkStep::BeforePlace(attempt));
+        match beneath_write(dir, &user_rel, bytes, None, false, Place::NoReplace, durable) {
+            Ok(()) => return Ok(ParkOutcome { at: user_rel, moved, overlap: false, overlap_record_error: None }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                return Err(format!("{user_rel}: {e} — 덮지 않고 놓을 수 없어 보관하지 않았습니다"))
+            }
+            Err(e) => return Err(format!("{user_rel} 기록 실패: {e}")),
+        }
+        match beneath_occupant(dir, &user_rel) {
+            Occupant::Missing => continue,
+            Occupant::File(Some(b)) if b == bytes => {
+                // ★T2i(RULINGS GB2): 자리에 이미 있는 같은 사본은 내려졌다고 가정하지 않는다 — 새로 쓴 사본과 같이 그 **파일**을 먼저
+                //   내리고(언제나), 영속 증명이 필요하면 폴더도. 실패는 실패 — 호출부는 살아 있는 파일을 바꾸지 않는다.
+                beneath_sync_file(dir, &user_rel).map_err(|e| format!("{user_rel} 기록 실패: {e}"))?;
+                if durable {
+                    beneath_sync_parent(dir, &user_rel).map_err(|e| format!("{user_rel} 기록 실패: {e}"))?;
+                }
+                return Ok(ParkOutcome { at: user_rel, moved, overlap: false, overlap_record_error: None });
+            }
+            Occupant::File(_) => {}
+            Occupant::Obstacle(why) => {
+                return Err(format!("{user_rel} 자리에 일반 파일이 아닌 항목({why})이 있어 세대 보존·백업을 할 수 없습니다"))
+            }
+        }
+        // 마지막 시도에서도 차 있으면 그 사본은 이름에 두고(옮기지 않는다) 자기 사본을 세대 자리로.
+        if attempt + 1 == PARK_PLACE_TRIES {
+            break;
+        }
+        hook(ParkStep::BeforeMove(attempt));
+        match move_occupant_to_slot(dir, rel, ts, &mut |_| {}) {
+            Ok(Some(slot)) => moved.push(slot),
+            Ok(None) => {}
+            // ★T2i(RULINGS FP1): 덮지 않는 이동을 지원하지 않으면 자리의 사본은 그대로 두고, 이 사본을 자기 세대 자리에(배타 생성).
+            Err(e) if e.contains("지원하지 않") => break,
+            Err(e) => return Err(e),
+        }
+    }
+    // 자리가 끝내 비지 않았다 — 자기 사본은 자기 세대 자리로, 겹침은 감사 원장에.
+    let mut own: Option<String> = None;
+    for n in 1u32..=10_000 {
+        let slot = if n == 1 { format!("{rel}.user.prev-{ts}") } else { format!("{rel}.user.prev-{ts}-{n}") };
+        match beneath_write(dir, &slot, bytes, None, false, Place::NoReplace, durable) {
+            Ok(()) => {
+                own = Some(slot);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{rel}: 보관 자리 겹침 — 자기 세대 자리 기록 실패({e})")),
+        }
+    }
+    let Some(slot) = own else { return Err(format!("{rel}: 보관 자리 겹침 — 세대 자리를 찾지 못했습니다")) };
+    let entry = serde_json::json!({
+        "ts": ts, "file": rel, "action": "park-overlap", "slot": slot, "moved": moved, "flags": [],
+    });
+    let overlap_record_error = match append_merge_audit(dir, &entry) {
+        Ok(()) => None,
+        Err(e) => {
+            eprintln!("[pack] ⚠ {rel}: 보관 자리 겹침을 감사 원장에 적지 못했습니다({e}) — 사본은 {slot} 에 있습니다");
+            Some(e)
+        }
+    };
+    Ok(ParkOutcome { at: slot, moved, overlap: true, overlap_record_error })
+}
+
+/// ★T2i(RULINGS EC7): `rel_path` 의 부모 폴더 fsync(닻 내린 기술자 — 윈도우는 '지원하지 않음').
+fn beneath_sync_parent(root: &Path, rel_path: &str) -> std::io::Result<()> {
+    let parts = rel_parts(rel_path)?;
+    #[cfg(unix)]
+    {
+        let d = anchor_dir(root, &parts[..parts.len() - 1], false, rel_path)?;
+        sync_dir_fd(&d, parts[parts.len() - 1])
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, parts);
+        Ok(())
     }
 }
 
 /// ★M11 나: 사용자 수정본을 `{rel}.user` 로 보관(이전 세대 보존 선행). 이미 같은 내용이면 무조치.
 /// Err = 보관 불가(호출자는 덮지 않고 격리한다 — 부록 A-2 #4).
-fn park_user_copy(dir: &Path, rel: &str, bytes: &[u8]) -> Result<(), String> {
-    let user_path = dir.join(format!("{rel}.user"));
-    if std::fs::read(&user_path).ok().as_deref() == Some(bytes) {
-        return Ok(());
-    }
-    preserve_prior_user_file(dir, rel, Some(bytes))?;
-    write_atomic(&user_path, bytes).map_err(|e| format!("{rel}.user 기록 실패: {e}"))
+/// ★T2i(RULINGS EC2 · EC7): [`park_copy`] 하나로(덮지 않는 놓기 · 영속 증명) — 사본이 있는 곳을 돌려준다(원장 side).
+fn park_user_copy(dir: &Path, rel: &str, bytes: &[u8]) -> Result<ParkOutcome, String> {
+    park_copy(dir, rel, bytes, true)
 }
 
 /// ★M11 가: 사용자 파일 유지 + vendor 신버전 `<rel>.new` 보관 + 원장 `user-kept`. 셸 스크립트는 살아 있는
@@ -4318,7 +5400,7 @@ fn park_user_kept(
     ts: u64,
 ) {
     let new_path = dir.join(format!("{rel}.new"));
-    if std::fs::read_to_string(&new_path).ok().as_deref() != Some(vendor) {
+    if read_start_meta(&new_path).text().as_deref() != Some(vendor) {
         if let Err(e) = write_atomic(&new_path, vendor.as_bytes()) {
             eprintln!("[init-pack] ⚠ {rel}: vendor 신버전 보관({rel}.new) 기록 실패({e}) — 사용자 파일은 그대로");
         }
@@ -4479,6 +5561,13 @@ pub fn create_update_snapshot(
     caps: (u64, u64),
 ) -> Result<SnapshotOutcome, String> {
     let lane_dir = root.join(path_safe(lane_key));
+    // ★T2h(RULINGS CW1): 스냅샷 보관소와 레인 폴더는 링크 · 재해석 지점이 아니다 — 링크를 거치면 사본 쓰기와 오래된 세대
+    // 정리(폴더째 지우기)가 그 링크가 가리키는 곳(살아 있는 팩일 수도 있다)에서 일어난다.
+    for p in [root, lane_dir.as_path()] {
+        if std::fs::symlink_metadata(p).is_ok_and(|m| meta_is_link_like(&m)) {
+            return Err(format!("스냅샷 자리 {} 가 링크(또는 재해석 지점)입니다 — 스냅샷을 만들지 않습니다", p.display()));
+        }
+    }
     std::fs::create_dir_all(&lane_dir)
         .map_err(|e| format!("스냅샷 레인 생성 실패 {}: {e}", lane_dir.display()))?;
     let now = chrono::Utc::now();
@@ -4538,8 +5627,14 @@ pub fn create_update_snapshot(
             if !meta.is_file() {
                 continue;
             }
-            let data = std::fs::read(&src)
-                .map_err(|e| format!("스냅샷 원본 판독 실패 {}: {e}", src.display()))?;
+            // ★T2h(RULINGS CW3): 막히지 않는 판독 — lstat 뒤에 FIFO 로 바뀐 파일이 시작을 멈추지 못한다.
+            let data = match read_start_live(&src) {
+                StartRead::Bytes(b) => b,
+                StartRead::Missing => continue,
+                StartRead::Unreadable(why) => {
+                    return Err(format!("스냅샷 원본 판독 실패 {}: {why}", src.display()))
+                }
+            };
             std::fs::write(&dst, &data)
                 .map_err(|e| format!("스냅샷 사본 기록 실패 {}: {e}", dst.display()))?;
             bytes_total += data.len() as u64;
@@ -4607,7 +5702,8 @@ pub fn list_update_snapshots(lane_dir: &Path) -> Vec<(String, PathBuf)> {
     for e in entries.flatten() {
         let p = e.path();
         let name = e.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || !p.is_dir() {
+        // ★T2h(RULINGS CW1): 링크는 스냅샷이 아니다(목록 · 정리 대상에서 뺀다 — 정리가 링크 너머를 지우지 않는다).
+        if name.starts_with('.') || !std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir() && !meta_is_link_like(&m)) {
             continue;
         }
         let created = read_update_snapshot_meta(&p)
@@ -4653,8 +5749,12 @@ pub fn newest_update_snapshot(root: &Path, lane_key: &str) -> Option<PathBuf> {
 
 /// 스냅샷 메타 판독(스키마가 더 높으면 Err — 읽을 수 없음).
 pub fn read_update_snapshot_meta(snap: &Path) -> Result<SnapshotMeta, String> {
-    let s = std::fs::read_to_string(snap.join(UPDATE_SNAPSHOT_META))
-        .map_err(|e| format!("스냅샷 메타 판독 실패 {}: {e}", snap.display()))?;
+    let s = match read_start_meta(&snap.join(UPDATE_SNAPSHOT_META)) {
+        StartRead::Bytes(b) => String::from_utf8(b)
+            .map_err(|e| format!("스냅샷 메타 판독 실패 {}: {e}", snap.display()))?,
+        StartRead::Missing => return Err(format!("스냅샷 메타 판독 실패 {}: 없음", snap.display())),
+        StartRead::Unreadable(why) => return Err(format!("스냅샷 메타 판독 실패 {}: {why}", snap.display())),
+    };
     let m: SnapshotMeta =
         serde_json::from_str(&s).map_err(|e| format!("스냅샷 메타 파싱 실패: {e}"))?;
     if m.schema > UPDATE_SNAPSHOT_SCHEMA {
@@ -5134,7 +6234,7 @@ fn seed_dept_soul_content(dir: &Path, rel: &str, embed: &str) -> String {
     let base_soul = dir.parent().map(|p| p.join("pack").join("soul.md"));
     let inherited = base_soul
         .as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_start_live(p).text())
         .filter(|s| !s.trim().is_empty());
     // (a) 부서명 — 등재소 `dept_scope_of` 재사용(사본 드리프트 금지). 미판정도 시드는 진행한다.
     let dept = dept_name_for_seed(dir);
@@ -5313,8 +6413,8 @@ fn take_update_snapshot(
 ) -> Option<Result<SnapshotOutcome, String>> {
     let root = sources.snapshot_root.as_ref()?;
     let lane = sources.lane.as_ref()?;
-    let dv = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
-        .ok()
+    let dv = read_start_meta(&dir.join(PACK_VERSION_FILE))
+        .text()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())?;
     if dv == target_version || manifest.is_empty() {
@@ -5348,7 +6448,7 @@ fn take_update_snapshot(
         // 바이트가 그대로인 재기록(force · 디스크 = 새 바이트)은 되돌릴 것이 없다.
         let same = !is_link(r)
             && embed.get(r.as_str()).is_some_and(|c| {
-                std::fs::read(dir.join(r)).is_ok_and(|b| b == c.as_bytes())
+                read_start_live(&dir.join(r)).bytes().is_some_and(|b| b == c.as_bytes())
             });
         if !same && !rels.contains(r) {
             rels.push(r.clone());
@@ -5418,8 +6518,8 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     // 비강제 install이 비수정 파일·prune으로 신기능을 구 내용으로 후퇴시키는 사일런트 회귀를 막는다.
     // force(수동 init-pack --force)면 우회 — 의도적 재설치는 허용.
     if !force {
-        if let Some(dv) = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
-            .ok()
+        if let Some(dv) = read_start_meta(&dir.join(PACK_VERSION_FILE))
+            .text()
             .map(|s| s.trim().to_string())
         {
             if version_gt(&dv, target_version) {
@@ -5506,7 +6606,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     for (rel, content) in items.iter().copied() {
         let path = dir.join(rel);
         let exists = path.exists();
-        let disk = if exists { std::fs::read_to_string(&path).ok() } else { None };
+        let disk = if exists { read_start_live(&path).text() } else { None };
         // 판정 입력과 동일한 사실(존재하나 읽기 실패) — 소유권 술어를 다시 쓰지 않는다(SOT 분산 금지).
         let unreadable = exists && disk.is_none();
         let mhash_raw: Option<String> = manifest.get(rel).cloned();
@@ -5601,9 +6701,9 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             FileAction::VendorFirst { reason } => {
                 // ★M11 나(기동 필수 충돌): 사용자 수정본을 먼저 보관(이전 세대는 .user.prev-<시각>) —
                 // 보관이 안 되면 덮지 않는다(격리 · 부록 A-2 #4). 보관되면 아래 공용 경로가 vendor 본을 쓴다.
-                let user_bytes: Option<Vec<u8>> = std::fs::read(&path).ok();
+                let user_bytes: Option<Vec<u8>> = read_start_live(&path).bytes();
                 match user_bytes.as_deref().map(|b| park_user_copy(&dir, rel, b)) {
-                    Some(Ok(())) => {
+                    Some(Ok(parked)) => {
                         // 앞서 user-kept·new-pending 으로 보관하던 `.new` 는 이제 살아 있는 vendor 본과 같아진다 — 치운다.
                         if matches!(
                             pending.get(rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str()),
@@ -5611,16 +6711,37 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         ) {
                             let _ = std::fs::remove_file(dir.join(format!("{rel}.new")));
                         }
-                        if let serde_json::Value::Object(entry) = serde_json::json!({
+                        if let serde_json::Value::Object(mut entry) = serde_json::json!({
                             "kind": "vendor-first", "side": format!("{rel}.user"),
                             "reason": reason, "parked_at": now_ts,
                             "version": target_version, "ts": now_ts,
                         }) {
+                            // ★T2i(RULINGS EC2): 자리가 끝내 비지 않아 이 사본이 세대 자리에 있으면 그 자리를 함께 적는다
+                            //   (겹침은 감사 원장에도).
+                            if parked.overlap {
+                                entry.insert("overlap_slot".into(), serde_json::json!(parked.at));
+                                // ★FH5: 감사 원장에 겹침을 적지 못했으면 그 사실도(사본은 위 자리에 안전하다).
+                                if let Some(e) = parked.overlap_record_error.as_deref() {
+                                    entry.insert("overlap_audit_error".into(), serde_json::json!(e));
+                                }
+                            }
                             upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
                         }
                         // ★RULINGS AC7: 원장을 vendor 바이트보다 **먼저** 저장한다 — 그 사이에 멈춰도 `.user` 가 기록
                         // 없는 고아가 되지 않는다(다음 스윕은 같은 판정으로 수렴한다).
-                        save_merge_pending(&dir, &pending);
+                        // ★T2h(RULINGS CW5): 저장이 **실패하면** 살아 있는 파일을 바꾸지 않는다 — 기록 없이 바뀐 기동 필수
+                        // 파일은 남기지 않는다(보관 실패와 같은 격리 · 기록 가능 회복 후 재스윕이 같은 판정으로 수렴한다).
+                        if let Err(e) = save_merge_pending(&dir, &pending) {
+                            eprintln!("[init-pack] ⚠ 격리(quarantined): {rel} — 기동 필수 파일의 vendor 우선 기록을 남기지 못했습니다({e}). 파일 무접촉 보존 — 기록 가능 회복 후 재스윕 시 vendor 본 우선 적용.");
+                            if let serde_json::Value::Object(entry) = serde_json::json!({
+                                "kind": "quarantined", "reason": "ledger-write-failed", "side": rel,
+                                "version": target_version, "ts": now_ts,
+                            }) {
+                                upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                            }
+                            kept += 1;
+                            continue;
+                        }
                     }
                     other => {
                         let why = match other {
@@ -5671,7 +6792,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 if new_pending {
                     // user-owned 보존 + 임베드 신버전 병치(idempotent) — '영구 동결'을 '보이는 병합 대기'로.
                     let new_path = dir.join(format!("{rel}.new"));
-                    if std::fs::read_to_string(&new_path).ok().as_deref() != Some(content) {
+                    if read_start_meta(&new_path).text().as_deref() != Some(content) {
                         let _ = write_atomic(&new_path, content.as_bytes());
                     }
                     upsert_pending(&mut pending, &mut pending_dirty, rel, "new-pending", format!("{rel}.new"));
@@ -5892,14 +7013,13 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 let user_src: Option<String> = fallback_user_src.or_else(|| disk.clone());
                 if let Some(d) = user_src.as_deref() {
                     let user_path = dir.join(format!("{rel}.user"));
-                    if std::fs::read_to_string(&user_path).ok().as_deref() != Some(d) {
-                        let backup = preserve_prior_user_file(&dir, rel, Some(d.as_bytes()))
-                            .and_then(|_| {
-                                write_atomic(&user_path, d.as_bytes()).map_err(|e| e.to_string())
-                            });
+                    if read_start_meta(&user_path).text().as_deref() != Some(d) {
+                        // ★T2i(RULINGS EC2 · FP5 m9 · FP1): 덮지 않는 보관 · vendor 우선이므로 영속 증명(EC7) · 보관이 안 되면
+                        //   캡처가 있든 없든 덮지 않는다(기록은 사본이 있을 때만 그 사본을 이름 댄다).
+                        let backup = park_copy(&dir, rel, d.as_bytes(), true).map(|_| ());
                         match backup {
                             Ok(()) => {}
-                            Err(e) if fallback_reason == "capture-failed" => {
+                            Err(e) => {
                                 // ★성찰 차단 수리 2R-5(v2 §2 원칙 4 — 백업 불가면 덮지 않는다):
                                 // capture-failed 레인은 ①캡처가 없어 .user 가 유일 보존본인데 그
                                 // 쓰기 실패가 best-effort 로 침묵 통과되면 아래 공용 레인의 vendor
@@ -5918,20 +7038,13 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                                 kept += 1;
                                 continue;
                             }
-                            Err(e) => {
-                                // 캡처 실재 레인(충돌·게이트·pristine 실패): 사용자 바이트는 ①캡처가
-                                // 이미 보존하므로 .user 는 이차 사본 — 종전 best-effort 유지하되
-                                // 침묵은 금지(v2 §2 원칙 5 · loud 경고 — 원장 side 는 기록되므로
-                                // doctor·사용자가 .user 부재를 관측·추적 가능).
-                                eprintln!("[init-pack] ⚠ {rel}: .user 백업 기록 실패({e}) — 사용자본은 병합 캡처에 보존(원장 capture 경로 참조)");
-                            }
                         }
                     }
                     // 충돌 조상 사이드카 <rel>.base — base 전문 기록(사후 3-way 재료 영구 보존 ·
                     // 이식 ① C안 요소 · backup_set side_paths 등재로 rollback 원자성 편입).
                     if let Some(b) = verified_base.as_deref() {
                         let base_path = dir.join(format!("{rel}.base"));
-                        if std::fs::read_to_string(&base_path).ok().as_deref() != Some(b) {
+                        if read_start_meta(&base_path).text().as_deref() != Some(b) {
                             let _ = write_atomic(&base_path, b.as_bytes());
                         }
                     }
@@ -5944,7 +7057,18 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
                     }
                     // ★RULINGS AC7: 원장을 vendor 바이트보다 먼저 저장(위 vendor 우선 가지와 같은 이유).
-                    save_merge_pending(&dir, &pending);
+                    // ★T2h(RULINGS CW5): 저장 실패 = 살아 있는 파일 무접촉(위 가지와 같은 격리).
+                    if let Err(e) = save_merge_pending(&dir, &pending) {
+                        eprintln!("[init-pack] ⚠ 격리(quarantined): {rel} — 기동 필수 파일의 vendor 우선 기록을 남기지 못했습니다({e}). 파일 무접촉 보존 — 기록 가능 회복 후 재스윕 시 vendor 본 우선 적용.");
+                        if let serde_json::Value::Object(entry) = serde_json::json!({
+                            "kind": "quarantined", "reason": "ledger-write-failed", "side": rel,
+                            "version": target_version, "ts": now_ts,
+                        }) {
+                            upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                        }
+                        kept += 1;
+                        continue;
+                    }
                 }
             }
             FileAction::Write { heal_user_copy } => {
@@ -5954,17 +7078,46 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     // best-effort 그대로이되, 이전 세대를 덮지 않는다(사 — `.user.prev-<시각>`).
                     if let Some(d) = disk.as_deref() {
                         let user_path = dir.join(format!("{rel}.user"));
-                        if std::fs::read_to_string(&user_path).ok().as_deref() != Some(d) {
-                            let _ = preserve_prior_user_file(&dir, rel, Some(d.as_bytes()));
-                            let _ = write_atomic(&user_path, d.as_bytes());
-                        }
-                        // ★T3(D7): healed upsert 는 계보 인지 헬퍼 경유 — 크래시 창 재스윕 healed 가
-                        // 영속된 merged 항목의 capture 포인터를 지우는 창의 봉인(v2 §4 공통 적용 규칙).
-                        if let serde_json::Value::Object(entry) = serde_json::json!({
-                            "kind": "healed", "side": format!("{rel}.user"),
-                            "version": target_version, "ts": now_ts,
-                        }) {
-                            upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                        // ★T2i(RULINGS EC2): 덮지 않는 보관(이전 세대는 덮지 않는다) · 사본이 있는 곳을 안다.
+                        let side: Result<String, String> = if read_start_meta(&user_path).text().as_deref() == Some(d) {
+                            Ok(format!("{rel}.user"))
+                        } else {
+                            park_copy(&dir, rel, d.as_bytes(), false).map(|p| p.at)
+                        };
+                        match side {
+                            // ★T3(D7): healed upsert 는 계보 인지 헬퍼 경유 — 크래시 창 재스윕 healed 가
+                            // 영속된 merged 항목의 capture 포인터를 지우는 창의 봉인(v2 §4 공통 적용 규칙).
+                            Ok(side) => {
+                                if let serde_json::Value::Object(entry) = serde_json::json!({
+                                    "kind": "healed", "side": side,
+                                    "version": target_version, "ts": now_ts,
+                                }) {
+                                    upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                                }
+                            }
+                            // ★T2i(RULINGS GD1): 잠금 보안 자산(L0)은 무결성 우선 — 사본을 보관하지 못해도 치유는 간다(설계 §7 5행 ·
+                            //   주인 결정 12 · 출시본 그대로). 기록은 참이다: 사본이 없으니 사본을 이름 대지 않고, 보관 실패와 그 사유를 적는다.
+                            Err(e) if system_locked(rel) => {
+                                eprintln!("[init-pack] ⚠ 보안 자산 {rel}: 사용자 수정본 보관 실패({e}) — 무결성 우선으로 치유 강행(v2 §2 원칙 4 예외)");
+                                if let serde_json::Value::Object(entry) = serde_json::json!({
+                                    "kind": "healed", "backup": "failed", "backup_error": e,
+                                    "version": target_version, "ts": now_ts,
+                                }) {
+                                    upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                                }
+                            }
+                            // ★T2i(RULINGS FP1): 그 밖의 파일은 보관 없이는 덮지 않는다(이번 기동은 격리).
+                            Err(e) => {
+                                eprintln!("[init-pack] ⚠ 격리(quarantined): {rel} — 사용자 수정본을 보관하지 못했습니다({e}). 파일 무접촉 보존 — 보관 가능 회복 후 재스윕 시 정상 치유 대상.");
+                                if let serde_json::Value::Object(entry) = serde_json::json!({
+                                    "kind": "quarantined", "reason": "backup-failed", "side": rel,
+                                    "version": target_version, "ts": now_ts,
+                                }) {
+                                    upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                                }
+                                kept += 1;
+                                continue;
+                            }
                         }
                     } else if exists {
                         // ★T3 L0/L1 실행부(v2 §3 · §2 원칙 4 · D4·D11): 판독 불가(disk=None) —
@@ -5972,29 +7125,24 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         // (tmp+copy+rename 원자화)으로 봉인한다.
                         // ★0.15.0 사: 이전 세대 보존을 먼저 — 두 번 밀려나도 첫 백업이 덮이지 않는다(CP949
                         // 파일 A·B). 세대 보존 실패는 백업 실패와 같다(fail-closed → 아래 격리).
-                        let backup = preserve_prior_user_file(
-                            &dir,
-                            rel,
-                            std::fs::read(&path).ok().as_deref(),
-                        )
-                        .and_then(|_| byte_backup_user(&dir, rel, &path));
+                        // ★T2i(RULINGS EC2): 세대 보존과 백업이 하나다(`byte_backup_user` → `park_copy`).
+                        let backup = byte_backup_user(&dir, rel, &path);
                         match backup {
-                            Ok(()) => {
+                            Ok(parked) => {
                                 if let serde_json::Value::Object(entry) = serde_json::json!({
-                                    "kind": "healed", "side": format!("{rel}.user"),
+                                    "kind": "healed", "side": parked.at,
                                     "version": target_version, "ts": now_ts,
                                 }) {
                                     upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
                                 }
                             }
+                            // ★L0(v2 §3) · ★T2i(RULINGS GD1 — FP1 의 이 갈래를 거둠): 보안 자산은 백업 실패에도 치유 강행(무결성>보존 —
+                            //   §2 원칙 4 의 명시 예외 · 주인 결정 12). 원장 side 는 실백업 성공 시에만 — 실패는 side 없이
+                            //   backup:"failed" 와 그 사유(존재하지 않는 .user 를 '보존됨'으로 오보하지 않는다 · D11).
                             Err(e) if system_locked(rel) => {
-                                // ★L0(v2 §3): 보안 자산은 백업 실패에도 치유 강행(무결성>보존 —
-                                // §2 원칙 4 의 명시 예외). 원장 side 는 **실백업 성공 시에만**
-                                // "{rel}.user" — 실패는 side 없이 backup:"failed" 기록(존재하지
-                                // 않는 .user 를 '보존됨'으로 오보하지 않는다 · D11).
                                 eprintln!("[init-pack] ⚠ 보안 자산 {rel}: 바이트 백업 실패({e}) — 무결성 우선으로 치유 강행(v2 §2 원칙 4 예외)");
                                 if let serde_json::Value::Object(entry) = serde_json::json!({
-                                    "kind": "healed", "backup": "failed",
+                                    "kind": "healed", "backup": "failed", "backup_error": e,
                                     "version": target_version, "ts": now_ts,
                                 }) {
                                     upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
@@ -6043,7 +7191,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         written += 1;
     }
     if pending_dirty {
-        save_merge_pending(&dir, &pending);
+        let _ = save_merge_pending(&dir, &pending);
     }
     // ★M11 가: 사용자 우선 폴백으로 불필요해진 이번 스윕의 병합 전 사본 정리(파일 → 빈 상위 디렉터리만).
     if !capture_cleanup.is_empty() {
@@ -6137,7 +7285,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     continue; // ★B2: user 소유·seed-once 상태는 영구 보존 — prune 대상 제외(스코프 인지)
                 }
                 let path = dir.join(&rel);
-                match std::fs::read_to_string(&path) {
+                match read_start_live(&path).text().ok_or(()) {
                     // 비수정(설치-당시 해시 == 디스크 해시) → 제거 + 매니페스트에서 삭제.
                     Ok(existing)
                         if manifest.get(&rel).map(String::as_str)
@@ -6722,8 +7870,9 @@ fn restore_journaled_file(
 pub fn rollback_journal() -> Result<(), String> {
     let jdir = pack_journal_dir();
     let index_path = jdir.join("index.json");
-    let s = std::fs::read_to_string(&index_path)
-        .map_err(|e| format!("journal 인덱스 읽기 실패 {}: {e}", index_path.display()))?;
+    // ★T2i(RULINGS FP2): 데몬이 듣기 전의 판독 — 시작 경로의 판독기(막히지 않음 · 일반 파일 · 상한). 판독 불가 = 종전 읽기 오류와
+    //   같은 갈래(Err — 복구를 하지 않고 그대로 둔다). 복구의 순서 · 잠금 · 판정은 바꾸지 않는다(설계 §4).
+    let s = journal_text(&index_path, "journal 인덱스 읽기 실패")?;
     let index: JournalIndex =
         serde_json::from_str(&s).map_err(|e| format!("journal 인덱스 파싱 실패: {e}"))?;
     let dir = pack_dir();
@@ -6732,8 +7881,13 @@ pub fn rollback_journal() -> Result<(), String> {
         let target = dir.join(&entry.rel);
         if entry.existed {
             let backup = files_dir.join(&entry.rel);
-            let bytes = std::fs::read(&backup)
-                .map_err(|e| format!("journal 백업 복원 읽기 실패 {}: {e}", backup.display()))?;
+            let bytes = match read_start_meta(&backup) {
+                StartRead::Bytes(b) => b,
+                StartRead::Missing => return Err(format!("journal 백업 복원 읽기 실패 {}: 없음", backup.display())),
+                StartRead::Unreadable(e) => {
+                    return Err(format!("journal 백업 복원 읽기 실패 {}: {e}", backup.display()))
+                }
+            };
             if let Some(parent) = target.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -6761,6 +7915,15 @@ pub fn rollback_journal() -> Result<(), String> {
     Ok(())
 }
 
+/// ★T2i(RULINGS FP2): 저널 메타 파일의 텍스트 — 시작 경로의 판독기로(없음 · 판독 불가 · UTF-8 아님 = Err, 종전 읽기 오류와 같은 갈래).
+fn journal_text(path: &Path, what: &str) -> Result<String, String> {
+    match read_start_meta(path) {
+        StartRead::Bytes(b) => String::from_utf8(b).map_err(|e| format!("{what} {}: UTF-8 아님({e})", path.display())),
+        StartRead::Missing => Err(format!("{what} {}: 없음", path.display())),
+        StartRead::Unreadable(e) => Err(format!("{what} {}: {e}", path.display())),
+    }
+}
+
 /// crash recovery(§7-⑤): orphan 저널을 발견하면 `.pack-version`(= hard commit marker)을 저널의
 /// 목표 버전과 대조한다. 같으면 커밋은 성공했고 저널 정리 중 crash였으므로 저널만 삭제(롤백 금지).
 /// 다르면 미커밋(부분적용)이므로 rollback으로 pre-state 자가치유. 인덱스 부재(백업 도중 crash)는
@@ -6777,11 +7940,13 @@ pub fn recover_pack_journal() -> Result<bool, String> {
         }
         return Ok(false);
     }
-    let s = std::fs::read_to_string(&index_path)
-        .map_err(|e| format!("journal 인덱스 읽기 실패 {}: {e}", index_path.display()))?;
+    // ★T2i(RULINGS FP2): 시작 경로의 판독기 — 판독 불가 = 종전 읽기 오류 갈래(인덱스: Err = 복구 건너뜀 · `.pack-version`: 빈 값 =
+    //   종전 읽기 실패와 같은 '미커밋' 판정).
+    let s = journal_text(&index_path, "journal 인덱스 읽기 실패")?;
     let index: JournalIndex =
         serde_json::from_str(&s).map_err(|e| format!("journal 인덱스 파싱 실패(손상): {e}"))?;
-    let disk_version = std::fs::read_to_string(pack_dir().join(PACK_VERSION_FILE))
+    let disk_version = read_start_meta(&pack_dir().join(PACK_VERSION_FILE))
+        .text()
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     if !disk_version.is_empty() && disk_version == index.target_version {
@@ -7265,6 +8430,7 @@ mod tests {
             Some(0o755),
             true,
             chmod_wrong_then_verify,
+            false,
         )
         .expect_err("mode 적용이 무시됐는데 성공을 돌려주면 조용한 실패다");
         assert!(
@@ -7296,6 +8462,7 @@ mod tests {
             Some(0o755),
             true,
             apply_mode_exact,
+            false,
         )
         .expect("진짜 fchmod 경로는 성공해야 한다");
         assert_eq!(
@@ -7444,25 +8611,48 @@ mod tests {
     /// ★H-08 호출부 census(T9): 설계가 열거한 **8개 대상 쓰기**가 전부 새 헬퍼를 타고, 사이드카
     /// (`<rel>.user`·`.vendor-base`)와 `.pristine` 은 종전 writer 를 그대로 쓴다. 새 대상 쓰기를
     /// `write_atomic` 으로 추가하면 이 검체가 적색이 된다.
+    /// ★T2i(RULINGS EC4 의 결과): 팩 동사의 대상 쓰기 8곳은 경로로 여는 [`write_pack_file`] 대신 닻 내린
+    /// [`write_pack_file_beneath`] 를 탄다 — 권한 규칙은 같다(H-08 `pack_target_mode` · 정확 적용). `<rel>.user` 는
+    /// (RULINGS EC2) [`park_copy`] 의 덮지 않는 놓기로만 생기고, 그 쓰기도 실행비트를 주지 않는다(권한 없음 = 데이터).
+    /// 그래서 셈은 두 헬퍼의 합이 8 이고, 사이드카 검사는 지금의 writer 이름을 본다.
     #[test]
     fn h08_target_write_site_census() {
         let src = include_str!("bin/cys.rs");
-        // 대상 쓰기 = write_pack_file 호출. 설계의 8개 사이트와 수가 일치해야 한다.
-        let target_writes = src.matches("cys::pack::write_pack_file(").count();
+        // 대상 쓰기 = H-08 헬퍼 호출(경로형 + 닻 내린 형). 설계의 8개 사이트와 수가 일치해야 한다.
+        // 호출만 센다 — 주석 줄과 문자열 안의 언급(EC4 쓰기 자리 조사가 금지 목록으로 이 이름을 적는다)은 호출이 아니다.
+        let calls = |pat: &str| -> usize {
+            src.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .map(|l| l.match_indices(pat).filter(|(i, _)| !l[..*i].ends_with('"')).count())
+                .sum()
+        };
+        let path_writes = calls("cys::pack::write_pack_file(");
+        let anchored_writes = calls("cys::pack::write_pack_file_beneath(");
         assert_eq!(
-            target_writes, 8,
-            "설계가 열거한 대상 쓰기 8곳이 전부 write_pack_file 을 타야 한다 — 실측 {target_writes}"
+            path_writes + anchored_writes,
+            8,
+            "설계가 열거한 대상 쓰기 8곳이 전부 H-08 헬퍼를 타야 한다 — 실측 경로형 {path_writes} + 닻 내린 형 {anchored_writes}"
         );
-        // 사이드카·메타데이터 쓰기는 종전 writer 유지(실행비트를 주지 않는다).
-        for needle in [
-            "write_atomic(&dir.join(format!(\"{rel}.user\"))",
-            ".vendor-base",
-        ] {
+        // 닻 내린 헬퍼도 같은 권한 규칙(pack_target_mode · 정확 적용)을 쓴다.
+        let pack_src = include_str!("pack.rs");
+        let body_at = pack_src.find("pub fn write_pack_file_beneath(").expect("닻 내린 대상 쓰기 헬퍼");
+        let body = &pack_src[body_at..body_at + pack_src[body_at..].find("\n}\n").expect("헬퍼 끝")];
+        assert!(
+            body.contains("let mode = pack_target_mode(prior, bytes, system_manifest_entry);")
+                && body.contains("beneath_write(root, rel_path, bytes, mode, true, place, false)"),
+            "닻 내린 대상 쓰기가 H-08 권한 규칙을 정확 적용하지 않는다"
+        );
+        // 사이드카·메타데이터 쓰기는 실행비트를 주지 않는 writer(`<rel>.user` = park_copy · `.vendor-base` = write_atomic).
+        for needle in ["cys::pack::park_copy(", ".vendor-base"] {
             assert!(
                 src.contains(needle),
                 "사이드카 경로가 사라졌다(설계는 무변경을 요구한다): {needle}"
             );
         }
+        assert!(
+            pack_src.contains("beneath_write(dir, &user_rel, bytes, None, false, Place::NoReplace, durable)"),
+            "`<rel>.user` 의 놓기가 권한 없는(실행비트 없는) 쓰기가 아니다"
+        );
     }
 
     /// ★(0.14.42 · perf R3-6) 임베드 팩 해시 **메모 핀**. PACK_ALL 은 컴파일 타임 상수라 값이 프로세스 수명
@@ -9314,7 +10504,7 @@ mod tests {
         std::fs::write(pd.join(PRISTINE_DIR).join(rel), e_old).unwrap();
         std::fs::write(pd.join(INSTALL_MANIFEST),
             serde_json::json!({ rel: content_hash(e_old) }).to_string()).unwrap();
-        save_merge_pending(&pd, &serde_json::Map::new());
+        let _ = save_merge_pending(&pd, &serde_json::Map::new());
         let _ = std::fs::remove_dir_all(base.join("pack-captures")); // 가 회복 스윕이 만든 캡처 디렉터리
         std::fs::write(base.join("pack-captures"), "OCCUPIED").unwrap();
         std::fs::create_dir_all(pd.join(format!("{rel}.user"))).unwrap();
@@ -9743,9 +10933,8 @@ mod tests {
     }
 
     /// ★T3(v2 §3 L0 · D11): 잠금 보안 자산(trusted-keys.json) — 백업 선행 시도하되, 백업 실패
-    /// 시에도 치유를 강행한다(무결성>보존 — §2 원칙 4 의 유일 예외). 원장 side 는 **실백업 성공
-    /// 시에만** 기록(실패 시 side 부재 + backup:"failed" — 존재하지 않는 .user 를 '보존됨'으로
-    /// 오보하지 않는다).
+    /// 시에도 치유를 강행한다(무결성>보존 — §2 원칙 4 의 유일 예외 · ★T2i RULINGS GD1 로 되살림). 원장 side 는 **실백업 성공
+    /// 시에만** 기록(실패 시 side 부재 + backup:"failed" + 그 사유 — 존재하지 않는 .user 를 '보존됨'으로 오보하지 않는다).
     #[test]
     fn unreadable_locked_byte_backup() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
@@ -9788,6 +10977,8 @@ mod tests {
             assert!(p2.get(rel).and_then(|e| e.get("side")).is_none(),
                     "②side 부재 — 실패한 백업을 '보존됨'으로 오보 금지");
             assert_eq!(p2.get(rel).and_then(|e| e["backup"].as_str()), Some("failed"));
+            // ★T2i(RULINGS GD1): 보관 실패의 사유도 적는다.
+            assert!(p2.get(rel).and_then(|e| e["backup_error"].as_str()).is_some_and(|s| !s.is_empty()), "② 사유");
         }
         let _ = std::fs::remove_dir_all(&base1);
         let _ = std::fs::remove_dir_all(&base2);
@@ -14922,6 +16113,1162 @@ mod m11_tests {
         assert_eq!(std::fs::read_to_string(prev[0].path()).unwrap(), "#!/bin/bash\necho USER-A\n", "A 가 B 로 덮이지 않았다");
     }
 
+    /// ★T2g(RULINGS CQ1 · CR2): vendor-first 기록은 같은 버전의 스윕이 **손으로 고친** 살아 있는 파일을 kept-drift 로 볼 때도
+    /// 그대로 남는다(종전: kept-drift 가 그 기록을 바꿔 써서 `cys repair reapply` 가 보관본을 찾지 못했다). 그 상태에서 진짜
+    /// 다음 업데이트는 **새로 고친 사본**을 `.user` 에 보관하고 앞서 보관한 사본을 `.user.prev-*` 로 옮긴다(오늘과 같다) — 세대마다
+    /// 바이트와 기록의 모양(`kind: vendor-first` · `side` = 실재하는 `<rel>.user` — T6 의 `reapply` 가 읽는 모양)을 잰다.
+    #[test]
+    fn t2g_cq1_vendor_first_record_survives_a_same_version_sweep_after_a_hand_edit() {
+        let rig = Rig::new("cq1");
+        let rel = "hooks/inject.sh";
+        let src = || UpdateSources::none().with_boot_critical(bc_only(&["hooks/inject.sh"]));
+        let v1 = "#!/bin/bash\necho V1\n";
+        let edit_a = "#!/bin/bash\necho USER-A\n";
+        let edit_b = "#!/bin/bash\necho USER-B — a hand edit after the update\n";
+        let v2 = "#!/bin/bash\necho V2\n";
+        let shape = |want_user: &str| {
+            let e = rig.entry(rel).expect("기록");
+            assert_eq!(e["kind"], "vendor-first", "{e}");
+            let side = e["side"].as_str().expect("side");
+            assert_eq!(side, format!("{rel}.user"));
+            assert!(rig.pack.join(side).is_file(), "side 는 실재하는 파일");
+            assert_eq!(rig.read(side).as_deref(), Some(want_user), "side 의 바이트 = 내 사본");
+        };
+        // 업데이트 1: 내 수정 A → vendor 우선(살아 있는 파일 = V1, A 는 .user).
+        rig.write(rel, edit_a.as_bytes());
+        rig.install(&[(rel, v1)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(v1));
+        shape(edit_a);
+        // 손으로 고침 B → 같은 버전의 스윕(V1 그대로): KeepDrift — 살아 있는 파일 무접촉, 기록 그대로(rewrite 0).
+        rig.write(rel, edit_b.as_bytes());
+        let before = std::fs::read_to_string(rig.pack.join(MERGE_PENDING_FILE)).unwrap();
+        assert_eq!(rig.plan(&[(rel, v1)], false, &src()).kept_drift, vec![rel.to_string()], "판정은 그대로 kept-drift");
+        rig.install(&[(rel, v1)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(edit_b), "살아 있는 파일 무접촉");
+        assert_eq!(std::fs::read_to_string(rig.pack.join(MERGE_PENDING_FILE)).unwrap(), before, "기록 그대로 — rewrite 0");
+        shape(edit_a);
+        assert!(load_merge_pending(&rig.pack).contains_key(rel), "병합 대기 목록이 이 파일을 보인다");
+        // 진짜 다음 업데이트(V2): 새로 고친 B 를 .user 에, 앞서 보관한 A 는 .user.prev-* 로(오늘과 같다).
+        rig.install(&[(rel, v2)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(v2), "기동 필수 = vendor 먼저");
+        shape(edit_b);
+        let prev: Vec<_> = std::fs::read_dir(rig.pack.join("hooks"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("inject.sh.user.prev-"))
+            .collect();
+        assert_eq!(prev.len(), 1, "앞선 세대 1개");
+        assert_eq!(std::fs::read_to_string(prev[0].path()).unwrap(), edit_a, "A 는 한 세대 뒤에 그대로");
+        // 대조: 같은 버전의 kept-drift 가 merged 계보에는 state 만 붙이고(종전 규칙 그대로), 기록 없는 파일에는 kept-drift 를 쓴다.
+        let mut p = serde_json::Map::new();
+        let mut dirty = false;
+        let kd = |r: &str| match serde_json::json!({"kind": "kept-drift", "side": r, "version": "x", "ts": 1}) {
+            serde_json::Value::Object(o) => o,
+            _ => unreachable!(),
+        };
+        p.insert("a".into(), serde_json::json!({"kind": "vendor-first", "side": "a.user", "version": "x", "ts": 0}));
+        upsert_pending_v2(&mut p, &mut dirty, "a", kd("a"));
+        assert!(!dirty, "vendor-first: no-op");
+        assert_eq!(p["a"], serde_json::json!({"kind": "vendor-first", "side": "a.user", "version": "x", "ts": 0}), "항목 그대로");
+        p.insert("m".into(), serde_json::json!({"kind": "merged", "capture": "c", "version": "x", "ts": 0}));
+        upsert_pending_v2(&mut p, &mut dirty, "m", kd("m"));
+        assert_eq!((p["m"]["kind"].as_str(), p["m"]["state"].as_str()), (Some("merged"), Some("at-rest")));
+        upsert_pending_v2(&mut p, &mut dirty, "n", kd("n"));
+        assert_eq!(p["n"]["kind"], "kept-drift");
+    }
+
+    /// ★T2h(RULINGS CW5 · 검토자 M1): vendor 우선의 '원장 선저장'은 저장이 **디스크에 남았을 때만** 살아 있는 파일을 바꾼다 —
+    /// `.merge-pending.json` 이 폴더(쓸 수 없는 원장)면 기동 필수 파일은 사용자 사본 그대로 남고(격리), 원장을 쓸 수 있게 되면
+    /// 다음 스윕이 같은 판정으로 수렴한다(vendor 본 · `.user` · 기록). 종전: 저장 실패를 버리고 vendor 본을 써 기록 없는
+    /// 보관본을 남겼다.
+    #[test]
+    fn t2h_cw5_vendor_first_never_replaces_the_live_file_without_its_record() {
+        let rig = Rig::new("cw5");
+        let rel = "hooks/inject.sh";
+        let src = || UpdateSources::none().with_boot_critical(bc_only(&["hooks/inject.sh"]));
+        let mine = "#!/bin/bash\necho USER-A\n";
+        let v1 = "#!/bin/bash\necho V1\n";
+        rig.write(rel, mine.as_bytes());
+        std::fs::create_dir_all(rig.pack.join(MERGE_PENDING_FILE)).unwrap();
+        assert!(save_merge_pending(&rig.pack, &serde_json::Map::new()).is_err(), "폴더인 원장 — 저장은 실패를 돌려준다");
+        rig.install(&[(rel, v1)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(mine), "기록이 남지 않으면 살아 있는 파일을 바꾸지 않는다");
+        assert!(rig.pack.join(MERGE_PENDING_FILE).is_dir(), "원장 자리는 그대로");
+        // 원장을 쓸 수 있게 되면 다음 스윕이 수렴한다.
+        std::fs::remove_dir_all(rig.pack.join(MERGE_PENDING_FILE)).unwrap();
+        rig.install(&[(rel, v1)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(v1), "기동 필수 = vendor 먼저");
+        assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some(mine), "내 사본 보관");
+        assert_eq!(rig.kind(rel).as_deref(), Some("vendor-first"), "기록과 함께");
+    }
+
+    /// ★T2i(RULINGS EC2): 두 쓰는 쪽이 각 경계에서 엇갈려도 **모든 사본이 남는다**(이름 또는 세대 자리) — U(먼저 보관돼 있던 사본) ·
+    /// V(쓰는 쪽 B) · W(쓰는 쪽 A). 경계 = A 의 첫 놓기 직전 · A 가 '차 있음'을 보고 옮기기 직전 · A 의 다시 놓기 직전 — 그
+    /// 지점에서 B 가 끝까지 돈다(끼어들기 지점으로 순서를 정한다 · 잠 없음). 자리가 끝내 비지 않으면(놓기마다 다른 쓰는 쪽의
+    /// 사본이 먼저 생김) A 의 사본은 자기 세대 자리에, 겹침은 감사 원장에 남는다.
+    #[test]
+    fn ec2_two_writers_every_parked_copy_survives_at_each_boundary() {
+        let rig = Rig::new("ec2");
+        let rel = "hooks/x.sh";
+        let copies = |rig: &Rig| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(rig.pack.join("hooks"))
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n == "x.sh.user" || n.starts_with("x.sh.user.prev-")
+                })
+                .map(|e| std::fs::read_to_string(e.path()).unwrap())
+                .collect();
+            v.sort();
+            v
+        };
+        let reset = |rig: &Rig| {
+            let _ = std::fs::remove_dir_all(rig.pack.join("hooks"));
+            let _ = std::fs::remove_file(rig.pack.join(MERGE_AUDIT_FILE));
+            rig.write(&format!("{rel}.user"), b"U\n");
+        };
+        for (case, at) in [
+            ("before the first placement", ParkStep::BeforePlace(0)),
+            ("before moving the occupant", ParkStep::BeforeMove(0)),
+            ("before the retry", ParkStep::BeforePlace(1)),
+        ] {
+            reset(&rig);
+            let pack = rig.pack.clone();
+            let mut fired = false;
+            let out = park_copy_at(&rig.pack, rel, b"W\n", false, 100, &mut |s| {
+                if s == at && !fired {
+                    fired = true;
+                    park_copy_at(&pack, rel, b"V\n", false, 100, &mut |_| {}).unwrap();
+                }
+            })
+            .unwrap();
+            assert!(fired, "{case}: the interleaving happened");
+            assert_eq!(copies(&rig), vec!["U\n", "V\n", "W\n"], "{case}: every copy exists");
+            assert!(!out.overlap, "{case}");
+            assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some("W\n"), "{case}: A's copy holds the name");
+        }
+        // 같은 바이트가 이미 그 자리에 있으면 끝(사본이 늘지 않는다).
+        reset(&rig);
+        let out = park_copy_at(&rig.pack, rel, b"U\n", false, 100, &mut |_| {}).unwrap();
+        assert_eq!((out.moved.len(), out.overlap), (0, false));
+        assert_eq!(copies(&rig), vec!["U\n"]);
+        // 자리가 끝내 비지 않음 → 자기 세대 자리 + 감사 원장의 겹침.
+        reset(&rig);
+        let pack = rig.pack.clone();
+        let mut k = 0;
+        let out = park_copy_at(&rig.pack, rel, b"W\n", false, 100, &mut |s| {
+            if let ParkStep::BeforePlace(_) = s {
+                k += 1;
+                park_copy_at(&pack, rel, format!("X{k}\n").as_bytes(), false, 200, &mut |_| {}).unwrap();
+            }
+        })
+        .unwrap();
+        assert!(out.overlap, "{out:?}");
+        assert_eq!(copies(&rig), vec!["U\n", "W\n", "X1\n", "X2\n", "X3\n"], "every copy exists");
+        assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some("X3\n"), "the last other copy stays at the name");
+        assert_eq!(std::fs::read_to_string(rig.pack.join(&out.at)).unwrap(), "W\n");
+        let audit = std::fs::read_to_string(rig.pack.join(MERGE_AUDIT_FILE)).unwrap();
+        let e: serde_json::Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+        assert_eq!((e["action"].as_str(), e["file"].as_str(), e["slot"].as_str()), (Some("park-overlap"), Some(rel), Some(out.at.as_str())));
+        assert_eq!(out.overlap_record_error, None, "겹침을 적었다");
+        // ★T2i(RULINGS FH5): 감사 원장을 쓸 수 없으면(폴더) 사본은 자기 세대 자리에 안전하지만 '기록 실패'가 따로 돌아온다.
+        reset(&rig);
+        std::fs::create_dir_all(rig.pack.join(MERGE_AUDIT_FILE)).unwrap();
+        let pack = rig.pack.clone();
+        let mut k = 0;
+        let out = park_copy_at(&rig.pack, rel, b"W\n", false, 100, &mut |s| {
+            if let ParkStep::BeforePlace(_) = s {
+                k += 1;
+                park_copy_at(&pack, rel, format!("Y{k}\n").as_bytes(), false, 300, &mut |_| {}).unwrap();
+            }
+        })
+        .unwrap();
+        assert!(out.overlap);
+        assert!(out.overlap_record_error.as_deref().is_some_and(|e| e.contains("감사 원장")), "{out:?}");
+        assert_eq!(std::fs::read_to_string(rig.pack.join(&out.at)).unwrap(), "W\n", "사본은 안전하다");
+        std::fs::remove_dir_all(rig.pack.join(MERGE_AUDIT_FILE)).unwrap();
+        // ★T2i(RULINGS FP5 m8): 읽을 수 없는 일반 파일인 사본 = '판독 불가 사본' — 장애물이 아니라 세대 자리로 옮기고 새 사본을 놓는다.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            reset(&rig);
+            let up = rig.pack.join(format!("{rel}.user"));
+            std::fs::set_permissions(&up, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let out = park_copy_at(&rig.pack, rel, b"W\n", false, 400, &mut |_| {}).unwrap();
+            assert_eq!((out.at.as_str(), out.overlap, out.moved.len()), ("hooks/x.sh.user", false, 1), "{out:?}");
+            let slot = rig.pack.join(&out.moved[0]);
+            std::fs::set_permissions(&slot, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(std::fs::read_to_string(&slot).unwrap(), "U\n", "판독 불가였던 사본은 세대 자리에 그대로");
+            assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some("W\n"));
+        }
+        // 파일이 아닌 자리(폴더) = 장애물 → 보관하지 않는다(호출부의 격리 갈래).
+        reset(&rig);
+        std::fs::remove_file(rig.pack.join(format!("{rel}.user"))).unwrap();
+        std::fs::create_dir_all(rig.pack.join(format!("{rel}.user"))).unwrap();
+        let e = park_copy_at(&rig.pack, rel, b"W\n", false, 100, &mut |_| {}).unwrap_err();
+        assert!(e.contains("일반 파일이 아닌 항목(폴더)"), "{e}");
+    }
+
+    /// ★T2i(RULINGS EC4): 팩 동사는 이미 있는 경로를 쓰려고 열지 않는다 — 검토자의 두 순서: (a) 미리 심은 `<rel>.user.tmp-<pid>`
+    /// (보호 훅을 가리키는 링크 · 그 훅의 하드 링크) → 바이트 백업은 그 이름을 쓰지 않고(새 배타 임시 파일) 보호 훅은 그대로,
+    /// (b) 감사 원장이 보호 파일의 하드 링크 → 덧붙이지 않는다. (4) 구성 요소가 링크로 바뀐 자리: 닻 내린 쓰기 · 보관 · 덮지 않는
+    /// 이동은 거부하고 링크 너머에 아무것도 만들지 않는다. 윈도우: 같은 규칙을 핸들의 사실로(링크 수 = `GetFileInformationByHandle`,
+    /// 자리 = `GetFinalPathNameByHandleW`) — 이 기계에서는 잴 수 없다(TW1).
+    #[cfg(unix)]
+    #[test]
+    fn ec4_a_planted_temp_or_a_linked_audit_never_writes_a_protected_file() {
+        let rig = Rig::new("ec4");
+        let guard = "hooks/guard.sh";
+        let guard_bytes = "#!/bin/sh\n# PROTECTED\n";
+        rig.write(guard, guard_bytes.as_bytes());
+        let rel = "hooks/x.sh";
+        let src: &[u8] = b"\xc7\xd1\xb1\xdb CP949\n";
+        rig.write(rel, src);
+        for form in ["symlink", "hardlink"] {
+            let planted = rig.pack.join(format!("{rel}.user.tmp-{}", std::process::id()));
+            let _ = std::fs::remove_file(&planted);
+            let _ = std::fs::remove_file(rig.pack.join(format!("{rel}.user")));
+            if form == "symlink" {
+                std::os::unix::fs::symlink(rig.pack.join(guard), &planted).unwrap();
+            } else {
+                std::fs::hard_link(rig.pack.join(guard), &planted).unwrap();
+            }
+            byte_backup_user(&rig.pack, rel, &rig.pack.join(rel)).unwrap();
+            assert_eq!(rig.read(guard).as_deref(), Some(guard_bytes), "{form}: the protected hook is untouched");
+            assert_eq!(std::fs::read(rig.pack.join(format!("{rel}.user"))).unwrap(), src, "{form}: the backup holds the source bytes");
+            assert!(std::fs::symlink_metadata(&planted).is_ok(), "{form}: the planted name is left alone, not reused");
+        }
+        let _ = std::fs::remove_file(rig.pack.join(MERGE_AUDIT_FILE));
+        std::fs::hard_link(rig.pack.join(guard), rig.pack.join(MERGE_AUDIT_FILE)).unwrap();
+        assert!(append_merge_audit(&rig.pack, &serde_json::json!({"action": "x", "file": rel})).is_err(), "hard-linked audit refused");
+        assert_eq!(rig.read(guard).as_deref(), Some(guard_bytes), "the protected file is untouched by the audit");
+        std::fs::remove_file(rig.pack.join(MERGE_AUDIT_FILE)).unwrap();
+        // (4) 구성 요소가 링크: `skills` → 팩 밖 폴더.
+        let elsewhere = rig.base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, rig.pack.join("skills")).unwrap();
+        assert!(write_pack_file_beneath(&rig.pack, "skills/a.md", b"A", None, false, Place::Replace).is_err());
+        assert!(park_copy(&rig.pack, "skills/a.md", b"A", false).is_err());
+        std::fs::write(elsewhere.join("b.md.user"), "B").unwrap();
+        assert!(beneath_move_no_replace(&rig.pack, "skills/b.md.user", "skills/b.md.user.prev-1").is_err());
+        let left: Vec<String> = std::fs::read_dir(&elsewhere).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left, vec!["b.md.user".to_string()], "nothing created or moved behind the link");
+        // 덮지 않는 놓기: 차 있으면 AlreadyExists · 무변경.
+        rig.write("hooks/n.sh", b"OLD");
+        let e = beneath_write(&rig.pack, "hooks/n.sh", b"NEW", None, false, Place::NoReplace, false).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(rig.read("hooks/n.sh").as_deref(), Some("OLD"));
+    }
+
+    /// ★T2i(RULINGS FP1 · GD1 · GB5): 덮지 않는 이름 바꾸기를 파일 시스템이 지원하지 않아도(시험 주입) 사본은 다른 길로 보관된다 —
+    /// 마지막 이름의 배타 생성. 자리에 다른 사본이 있으면 그것은 그대로 두고 이 사본은 자기 세대 자리에(겹침 기록). 그 다른 길마저
+    /// 막히면: vendor 우선은 덮지 않는다(격리). 잠금 보안 자산(L0)은 무결성 우선 — 두 갈래(판독 가능 · 판독 불가) 모두 치유는 가고,
+    /// 기록은 없는 사본을 이름 대지 않는다(backup: failed + 사유). `--missing-only` 의 쓰기(`write_pack_file_beneath` · 덮지 않음)도 그
+    /// 길로 만든다.
+    /// ★T2i(RULINGS GB5): unix 만 — 주입(`FAIL_NO_REPLACE_RENAME` · `FAIL_EXCLUSIVE_FALLBACK`)은 unix 의 `no_replace_renameat` ·
+    /// `exclusive_create_at` 에만 걸린다. 윈도우의 같은 경우(덮지 않는 이동이 '지원하지 않음' → CREATE_NEW 로 만들기 · 그것도 막히면
+    /// 살아 있는 파일 그대로 · 자리에 있는 사본 보존)는 Windows 측정(TW1)의 행이다 — 어느 Windows 작업도 이 시험을 돌리지 않는다
+    /// (`.github/workflows`: 전체 `cargo test --lib` 는 macOS 레그만, Windows 는 필터 `factory_reset::` · `merge3::` 등).
+    #[cfg(unix)]
+    #[test]
+    fn fp1_without_the_no_replace_rename_the_copy_is_still_parked_and_nothing_live_is_overwritten_without_it() {
+        struct Inject;
+        impl Drop for Inject {
+            fn drop(&mut self) {
+                FAIL_NO_REPLACE_RENAME.with(|f| f.set(false));
+                FAIL_EXCLUSIVE_FALLBACK.with(|f| f.set(false));
+            }
+        }
+        let _reset = Inject;
+        let rig = Rig::new("fp1");
+        let rel = "hooks/x.sh";
+        // ① 이름 바꾸기 지원 없음 → 배타 생성으로 보관.
+        FAIL_NO_REPLACE_RENAME.with(|f| f.set(true));
+        let out = park_copy(&rig.pack, rel, b"W\n", false).unwrap();
+        assert_eq!((out.at.as_str(), out.overlap), ("hooks/x.sh.user", false));
+        assert_eq!(rig.read("hooks/x.sh.user").as_deref(), Some("W\n"));
+        // 자리에 다른 사본(U) → U 는 그대로, W2 는 자기 세대 자리에 + 겹침 기록.
+        let out = park_copy(&rig.pack, rel, b"W2\n", false).unwrap();
+        assert!(out.overlap, "{out:?}");
+        assert_eq!(rig.read("hooks/x.sh.user").as_deref(), Some("W\n"), "자리의 사본은 그대로");
+        assert_eq!(std::fs::read_to_string(rig.pack.join(&out.at)).unwrap(), "W2\n");
+        // `--missing-only` 의 쓰기: 없던 파일은 만들고, 있으면 차 있음(무변경).
+        write_pack_file_beneath(&rig.pack, "bin/fresh.py", b"print(1)\n", None, true, Place::NoReplace).unwrap();
+        assert_eq!(rig.read("bin/fresh.py").as_deref(), Some("print(1)\n"));
+        let e = write_pack_file_beneath(&rig.pack, "bin/fresh.py", b"X", None, true, Place::NoReplace).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(rig.read("bin/fresh.py").as_deref(), Some("print(1)\n"));
+        // ② 다른 길도 막힘 → 보관 실패.
+        FAIL_EXCLUSIVE_FALLBACK.with(|f| f.set(true));
+        assert!(park_copy(&rig.pack, "hooks/y.sh", b"Y\n", false).is_err());
+        assert!(!rig.pack.join("hooks/y.sh.user").exists());
+        // vendor 우선: 살아 있는 파일 무변경 · 격리 · 사본 없음.
+        let vf = "hooks/inject.sh";
+        rig.write(vf, b"#!/bin/bash\necho MINE\n");
+        rig.install(&[(vf, "#!/bin/bash\necho V1\n")], false, &UpdateSources::none().with_boot_critical(bc_only(&["hooks/inject.sh"])));
+        assert_eq!(rig.read(vf).as_deref(), Some("#!/bin/bash\necho MINE\n"), "vendor 우선: 보관 없이는 덮지 않는다");
+        assert_eq!(rig.kind(vf).as_deref(), Some("quarantined"));
+        assert!(!rig.pack.join(format!("{vf}.user")).exists(), "사본 없음");
+        // ★T2i(RULINGS GD1): 잠금 파일(판독 가능) — 보관 실패여도 무결성 우선으로 치유하고, 기록은 없는 사본을 이름 대지 않는다.
+        let locked = "trusted-keys.json";
+        rig.write(locked, b"{\"keys\": [\"MINE\"]}\n");
+        rig.manifest(&[(locked, "{\"keys\": []}\n")]);
+        // 기준선이 맞아야(설치 기록 = .pristine) C-07 의 제자리 보존이 아니라 L0 치유 갈래에 닿는다.
+        rig.pristine(locked, "{\"keys\": []}\n");
+        rig.install(&[(locked, "{\"keys\": [\"VENDOR\"]}\n")], false, &UpdateSources::none());
+        assert_eq!(rig.read(locked).as_deref(), Some("{\"keys\": [\"VENDOR\"]}\n"), "L0: 무결성 우선 — 치유는 간다");
+        let e = rig.entry(locked).unwrap();
+        assert_eq!((e["kind"].as_str(), e["backup"].as_str()), (Some("healed"), Some("failed")), "{e}");
+        assert!(e.get("side").is_none(), "없는 사본을 이름 대지 않는다: {e}");
+        assert!(!rig.pack.join(format!("{locked}.user")).exists());
+        // 잠금 파일(판독 불가 — UTF-8 아님): 같은 규칙.
+        rig.write(locked, b"\xff\xfe\x00keys\n");
+        rig.install(&[(locked, "{\"keys\": [\"VENDOR\"]}\n")], false, &UpdateSources::none());
+        assert_eq!(rig.read(locked).as_deref(), Some("{\"keys\": [\"VENDOR\"]}\n"), "판독 불가 L0 도 치유는 간다");
+        let e = rig.entry(locked).unwrap();
+        assert_eq!((e["kind"].as_str(), e["backup"].as_str()), (Some("healed"), Some("failed")), "{e}");
+        assert!(e.get("side").is_none(), "{e}");
+        rig.write(locked, b"\xff\xfe\x00keys\n");
+        // 주입을 풀면 같은 스윕이 보관하고 치유한다(기록은 그 사본을 이름 댄다).
+        FAIL_NO_REPLACE_RENAME.with(|f| f.set(false));
+        FAIL_EXCLUSIVE_FALLBACK.with(|f| f.set(false));
+        rig.install(&[(locked, "{\"keys\": [\"VENDOR\"]}\n")], false, &UpdateSources::none());
+        assert_eq!(rig.read(locked).as_deref(), Some("{\"keys\": [\"VENDOR\"]}\n"));
+        assert_eq!(std::fs::read(rig.pack.join(format!("{locked}.user"))).unwrap(), b"\xff\xfe\x00keys\n", "사본을 보관했다");
+        let e = rig.entry(locked).unwrap();
+        assert_eq!((e["kind"].as_str(), e["side"].as_str()), (Some("healed"), Some("trusted-keys.json.user")), "기록은 있는 사본을 이름 댄다");
+        assert!(e.get("backup").is_none(), "{e}");
+    }
+
+    /// ★T2i(RULINGS GB2): 자리에 이미 있는 같은 사본은 다시 내린다 — 대체 길(배타 생성)의 파일 내림이 실패해 사본이 내려지지
+    /// 않은 채 남으면, 다음 스윕의 같은 사본 재사용도 그 파일을 내려야 하고, 그 내림이 다시 실패하면 살아 있는 파일은 그대로다.
+    /// 내림이 되면 그때 진행한다. (unix 만 — 주입은 unix 함수에 걸린다 · 윈도우 경우는 TW1 의 행, RULINGS GB5.)
+    #[cfg(unix)]
+    #[test]
+    fn gb2_a_copy_found_in_place_is_flushed_again_before_live_changes() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FAIL_NO_REPLACE_RENAME.with(|f| f.set(false));
+                FAIL_FILE_SYNC_FOR.with(|f| *f.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+        let rig = Rig::new("gb2");
+        let rel = "hooks/inject.sh";
+        let src = || UpdateSources::none().with_boot_critical(bc_only(&["hooks/inject.sh"]));
+        let mine = "#!/bin/bash\necho MINE\n";
+        let v1 = "#!/bin/bash\necho V1\n";
+        rig.write(rel, mine.as_bytes());
+        FAIL_NO_REPLACE_RENAME.with(|f| f.set(true));
+        FAIL_FILE_SYNC_FOR.with(|f| *f.borrow_mut() = Some("inject.sh.user".into()));
+        // ① 대체 길이 사본을 쓰지만 그 파일 내림이 실패 → 보관 실패 → 살아 있는 파일 그대로(사본은 내려지지 않은 채 남음).
+        rig.install(&[(rel, v1)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(mine), "① 내림 실패 → 덮지 않음");
+        assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some(mine), "① 내려지지 않은 사본이 자리에 남음");
+        // ② 다음 스윕: 같은 사본을 다시 쓰려면 그 파일을 내려야 한다 — 다시 실패 → 그대로.
+        rig.install(&[(rel, v1)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(mine), "② 다시 내림 실패 → 덮지 않음");
+        assert_eq!(rig.kind(rel).as_deref(), Some("quarantined"));
+        // ③ 내림이 되면 진행.
+        FAIL_FILE_SYNC_FOR.with(|f| *f.borrow_mut() = None);
+        rig.install(&[(rel, v1)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(v1), "③ 내렸으면 vendor 우선");
+        assert_eq!(rig.kind(rel).as_deref(), Some("vendor-first"));
+        assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some(mine));
+    }
+
+    /// ★T2i(RULINGS EC7): vendor 우선의 선저장은 **영속이 증명돼야** 한다 — 원장 쓰기의 부모 폴더 fsync 가 실패하면(시험 주입)
+    /// 살아 있는 기동 필수 파일은 사용자 사본 그대로다(격리 · ledger-write-failed). 보관본 `<rel>.user` 쓰기의 폴더 fsync 가
+    /// 실패해도 같다(user-backup-failed). 주입이 없으면 같은 스윕이 vendor 본 · `.user` · 기록으로 수렴한다. 영속 쓰기 자체는
+    /// 폴더 fsync 실패를 돌려주고, '지원하지 않음'(EINVAL · ENOTSUP)만 너그럽게 넘긴다.
+    #[test]
+    fn ec7_vendor_first_needs_a_durable_record_before_the_live_file_changes() {
+        let rig = Rig::new("ec7");
+        let rel = "hooks/inject.sh";
+        let src = || UpdateSources::none().with_boot_critical(bc_only(&["hooks/inject.sh"]));
+        let mine = "#!/bin/bash\necho USER-A\n";
+        let v1 = "#!/bin/bash\necho V1\n";
+        let inject = |name: Option<&str>| FAIL_DIR_SYNC_FOR.with(|f| *f.borrow_mut() = name.map(str::to_string));
+        // 영속 쓰기: 주입 → Err · 파일은 자리에 있다(교체는 됐으나 증명 안 됨) · 주입 해제 → Ok.
+        let probe = rig.base.join("probe.json");
+        inject(Some("probe.json"));
+        assert!(write_atomic_durable(&probe, b"{}").is_err(), "폴더 fsync 실패를 돌려준다");
+        inject(None);
+        assert!(write_atomic_durable(&probe, b"{}").is_ok());
+        #[cfg(unix)]
+        {
+            assert!(dir_sync_unsupported(&std::io::Error::from_raw_os_error(libc::EINVAL)));
+            assert!(dir_sync_unsupported(&std::io::Error::from_raw_os_error(libc::ENOTSUP)));
+            assert!(!dir_sync_unsupported(&std::io::Error::from_raw_os_error(libc::EIO)), "EIO 는 실패");
+        }
+        // ① 원장 쓰기의 폴더 fsync 실패 → 살아 있는 파일 무변경.
+        rig.write(rel, mine.as_bytes());
+        inject(Some(MERGE_PENDING_FILE));
+        rig.install(&[(rel, v1)], false, &src());
+        inject(None);
+        assert_eq!(rig.read(rel).as_deref(), Some(mine), "원장이 영속하지 않으면 바꾸지 않는다");
+        assert_eq!(rig.kind(rel).as_deref(), Some("quarantined"));
+        assert_eq!(rig.entry(rel).unwrap()["reason"], "ledger-write-failed");
+        // ② 보관본 쓰기의 폴더 fsync 실패 → 무변경. ★T2i(RULINGS FP5 m5): unix 만 — 윈도우에서는 폴더 내림이 '지원하지 않음'이라
+        //   보관본 쓰기의 주입 지점에 닿지 않는다(TW1 에서 잴 것: 윈도우의 본문 내림 · NTFS 의 이름 영속).
+        let _ = std::fs::remove_file(rig.pack.join(MERGE_PENDING_FILE));
+        let _ = std::fs::remove_file(rig.pack.join(format!("{rel}.user")));
+        #[cfg(unix)]
+        {
+            inject(Some("inject.sh.user"));
+            rig.install(&[(rel, v1)], false, &src());
+            inject(None);
+            assert_eq!(rig.read(rel).as_deref(), Some(mine), "보관본이 영속하지 않으면 바꾸지 않는다");
+            assert_eq!(rig.entry(rel).unwrap()["reason"], "user-backup-failed");
+        }
+        // ③ 주입 없음 → 수렴.
+        rig.install(&[(rel, v1)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(v1), "기동 필수 = vendor 먼저");
+        assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some(mine), "내 사본 보관");
+        assert_eq!(rig.kind(rel).as_deref(), Some("vendor-first"), "기록과 함께");
+    }
+
+    /// ★T2i(RULINGS EC5): 시작 경로의 남은 판독 — **정상 free 상태**(`.pack-state.json` = free · 기록 불일치라 자가치유 경로까지
+    /// 간다)에서 `.pack-version` · 상위의 `.pack-accepted.json` · 설치 기록 · 상태 파일 자리에 FIFO · 폴더 · 상한 초과 · FIFO 를
+    /// 가리키는 링크 · 장치(`/dev/zero`)를 가리키는 링크를 두어도 설치는 각자의 시한 안에 끝나고, 읽을 수 없는 `.pack-version` 으로
+    /// 상태를 고치지 않는다(종전: 빈 값으로 자가치유). 설정 파일 판독기(`settings.json` 병합 · 재조정 · 검증, 첫기동 관문 시드의
+    /// `.claude.json`, 잠금 파일 `<settings>.cys-lock`)도 같은 자리에서 시한 안에 끝나고 아무것도 덮지 않는다.
+    #[test]
+    fn ec5_start_path_free_state_and_settings_readers_never_block() {
+        let rig = Rig::new("ec5");
+        let old = "{\"agents\": 1}\n";
+        let new = "{\"agents\": 2}\n";
+        let items: Vec<(String, String)> = vec![("agents.json".into(), new.into())];
+        let setup = |root: &Path| -> PathBuf {
+            let pack = root.join("pack");
+            std::fs::create_dir_all(&pack).unwrap();
+            std::fs::write(pack.join("agents.json"), old).unwrap();
+            std::fs::write(pack.join(PACK_VERSION_FILE), "1.0.0\n").unwrap();
+            let st = PackState { channel: "free".into(), base_version: "0.9.0".into(), pro_revision: 0 };
+            write_pack_state(&pack, &st).unwrap();
+            let m: std::collections::BTreeMap<String, String> =
+                [("agents.json".to_string(), content_hash(old))].into_iter().collect();
+            std::fs::write(pack.join(INSTALL_MANIFEST), serde_json::to_string(&m).unwrap()).unwrap();
+            pack
+        };
+        fn deadline<T: Send + 'static>(case: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(f());
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("{case}: did not finish within its deadline (blocked on a start-path read)"))
+        }
+        let run = |case: &str, pack: PathBuf| -> bool {
+            let it = items.clone();
+            deadline(case, move || {
+                install_into_with(
+                    pack,
+                    it.iter().map(|(a, b)| (a.as_str(), b.as_str())),
+                    false,
+                    "9.9.9",
+                    false,
+                    false,
+                    PackScope::Base,
+                    None,
+                    None,
+                    &UpdateSources::none(),
+                )
+                .is_ok()
+            })
+        };
+        let base_of = |pack: &Path| match read_pack_state(pack) {
+            PackStateRead::Valid(st) => Some(st.base_version),
+            _ => None,
+        };
+        // 대조: 정상 free 상태 · 기록 불일치 → 자가치유 → 설치 → 기록 = 설치한 판.
+        let ctl = setup(&rig.base.join("control"));
+        assert!(run("control", ctl.clone()), "control install");
+        assert_eq!(std::fs::read_to_string(ctl.join("agents.json")).unwrap(), new, "control: 갱신");
+        assert_eq!(base_of(&ctl).as_deref(), Some("9.9.9"), "control: 기록 수렴");
+        let mut forms: Vec<&str> = vec!["dir", "oversized"];
+        #[cfg(unix)]
+        forms.extend(["fifo", "link-to-fifo", "link-to-device"]);
+        let targets = [PACK_VERSION_FILE, "../.pack-accepted.json", INSTALL_MANIFEST, PACK_STATE_FILE];
+        let mut cases = 0usize;
+        for (ti, target) in targets.iter().enumerate() {
+            for form in &forms {
+                let case = format!("{target} as {form}");
+                let root = rig.base.join(format!("e{ti}-{form}"));
+                let pack = setup(&root);
+                let p = match target.strip_prefix("../") {
+                    Some(name) => root.join(name),
+                    None => pack.join(target),
+                };
+                plant_special(&p, form, &root, &case);
+                let _ = run(&case, pack.clone());
+                if *target == PACK_VERSION_FILE {
+                    assert_ne!(base_of(&pack).as_deref(), Some(""), "{case}: 읽을 수 없는 판 값으로 기록을 고치지 않는다");
+                }
+                cases += 1;
+                let _ = std::fs::remove_dir_all(&root);
+            }
+        }
+        assert_eq!(cases, targets.len() * forms.len());
+        // 설정 파일 판독기 — 같은 형태를 `settings.json` · `.claude.json` · 잠금 파일 자리에.
+        for form in &forms {
+            let root = rig.base.join(format!("s-{form}"));
+            let cfg = root.join("cfg");
+            std::fs::create_dir_all(&cfg).unwrap();
+            let settings = cfg.join("settings.json");
+            plant_special(&settings, form, &root, &format!("settings.json as {form}"));
+            let pk = root.join("pack");
+            for which in ["merge", "retune", "verify"] {
+                let (s, pk2) = (settings.clone(), pk.clone());
+                let case = format!("{which}: settings.json as {form}");
+                let r = deadline(&case, move || match which {
+                    "merge" => merge_desired_hooks(&s, &pk2, &AWAKENING_HOOKS).map(|_| ()),
+                    "retune" => retune_registered_hook_timeouts(&s, &pk2, &AWAKENING_HOOKS).map(|_| ()),
+                    _ => {
+                        let missing = verify_desired_hooks_registered(&s, &pk2, &AWAKENING_HOOKS);
+                        if missing.len() == AWAKENING_HOOKS.len() { Err("all missing".into()) } else { Ok(()) }
+                    }
+                });
+                // 읽을 수 없는 설정은 덮지 않는다(병합 · 재조정 = 오류, 검증 = 전부 미등록) — 폴더는 재조정의 '없으면 만들지 않는다'가
+                // 아니라 판독 불가 갈래다.
+                assert!(r.is_err(), "{case}: {r:?}");
+                assert!(!cfg.join("settings.json.bak-cys").exists(), "{case}: 백업도 쓰지 않는다");
+            }
+            let claude = cfg.join(CLAUDE_CONFIG_FILE);
+            plant_special(&claude, form, &root, &format!(".claude.json as {form}"));
+            let c2 = cfg.clone();
+            let out = deadline(&format!("seed: .claude.json as {form}"), move || {
+                seed_first_run_gates_at(&c2, &["/w".to_string()], AuthPremise::Unproven)
+            });
+            assert!(matches!(out, SeedOutcome::Refused(_)), ".claude.json as {form}: {out:?}");
+            assert!(!cfg.join(FIRST_RUN_SEED_BACKUP).exists(), ".claude.json as {form}: 백업 없음");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // ★T2i(RULINGS FP2): 데몬이 듣기 전의 저널 복구 — 정상 저널(인덱스 + 백업)에서 인덱스 · 백업 · `.pack-version` 자리에 같은
+        //   형태를 두어도 복구는 시한 안에 돌아온다(복구의 순서 · 판정은 그대로 — 판독 불가 = 종전 읽기 오류 갈래).
+        for (ti, target) in ["index.json", "files/a.txt", "../pack/.pack-version"].iter().enumerate() {
+            for form in &forms {
+                let root = rig.base.join(format!("j{ti}-{form}"));
+                let pack = root.join("pack");
+                std::fs::create_dir_all(&pack).unwrap();
+                std::fs::write(pack.join("a.txt"), "new").unwrap();
+                std::fs::write(pack.join(PACK_VERSION_FILE), "1.0.0
+").unwrap();
+                let jdir = root.join(".pack-journal");
+                std::fs::create_dir_all(jdir.join("files")).unwrap();
+                std::fs::write(
+                    jdir.join("index.json"),
+                    r#"{"target_version":"2.0.0","entries":[{"rel":"a.txt","existed":true,"mode":null}]}"#,
+                )
+                .unwrap();
+                std::fs::write(jdir.join("files").join("a.txt"), "old").unwrap();
+                let p = jdir.join(target);
+                plant_special(&p, form, &root, &format!("journal {target} as {form}"));
+                let _env = EnvGuard::set("CYS_PACK_DIR", &pack);
+                let _ = deadline(&format!("journal {target} as {form}"), recover_pack_journal);
+                let _ = std::fs::remove_dir_all(&root);
+            }
+        }
+        // 잠금 파일 자리의 FIFO → 잠금 없이 진행(종전 열기 실패와 같은 갈래) · 병합은 끝난다.
+        #[cfg(unix)]
+        {
+            let root = rig.base.join("lock-fifo");
+            let cfg = root.join("cfg");
+            std::fs::create_dir_all(&cfg).unwrap();
+            let settings = cfg.join("settings.json");
+            std::fs::write(&settings, "{}").unwrap();
+            plant_special(&cfg.join("settings.json.cys-lock"), &"fifo", &root, "lock as fifo");
+            let (s, pk) = (settings.clone(), root.join("pack"));
+            let r = deadline("merge: lock as fifo", move || merge_desired_hooks(&s, &pk, &AWAKENING_HOOKS));
+            assert!(r.is_ok(), "{r:?}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// ★T2i(RULINGS FH2): 시작 경로의 판독기는 막히지 않고 상한 없이 읽지 않는다 — **최종 대상이 상한 이하의 일반 파일인 링크는
+    /// 따른다**(출시본이 따르던 곳: `read_start_live` 를 쓰는 곳 — 설정 파일 판독 `settings_read_bounded` · `verify_desired_hooks_registered`
+    /// · 첫기동 관문 시드의 `.claude.json`, 살아 있는 팩 파일의 계획 · 설치 · 스냅샷 · vendor 우선 판독, `ceo_promoted_in`, 부서 soul
+    /// 시드, `byte_backup_user` 의 원본). 그 밖을 가리키는 링크(FIFO · 장치 · 폴더 · 상한 초과)는 '판독 불가' — 그 판독의 기존 안전값
+    /// (설정 = 덮지 않음 · 검증 = 전부 미등록으로 보고 · 시드 = 거부). 끊긴 링크는 출시본과 같이 '없음'(그 판독의 기존 '없음' 갈래).
+    /// `merge_desired_hooks` 는 출시본처럼 링크인 설정 파일을 쓰지 않는다(거부).
+    #[cfg(unix)]
+    #[test]
+    fn fh2_a_link_to_a_regular_file_is_followed_and_a_link_to_anything_else_is_unreadable() {
+        let rig = Rig::new("fh2");
+        let root = rig.base.join("fh2");
+        std::fs::create_dir_all(&root).unwrap();
+        let pk = root.join("pack");
+        // 판독기 자체.
+        std::fs::write(root.join("real.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(root.join("real.json"), root.join("l-real")).unwrap();
+        assert_eq!(read_start_live(&root.join("l-real")), StartRead::Bytes(b"{}".to_vec()), "일반 파일 링크는 따른다");
+        assert!(matches!(read_start_meta(&root.join("l-real")), StartRead::Unreadable(_)), "메타 판독기는 링크를 따르지 않는다");
+        let fifo = root.join("f.fifo");
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        }
+        std::fs::create_dir_all(root.join("adir")).unwrap();
+        std::fs::File::create(root.join("big")).unwrap().set_len(START_LIVE_CAP + 1).unwrap();
+        let others: [(&str, PathBuf); 4] = [
+            ("fifo", fifo.clone()),
+            ("device", PathBuf::from("/dev/zero")),
+            ("dir", root.join("adir")),
+            ("oversized", root.join("big")),
+        ];
+        for (what, target) in &others {
+            let l = root.join(format!("l-{what}"));
+            std::os::unix::fs::symlink(target, &l).unwrap();
+            let l2 = l.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(read_start_live(&l2));
+            });
+            let got = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("link to {what}: the read did not return within its deadline"));
+            assert!(matches!(got, StartRead::Unreadable(_)), "link to {what}: {got:?}");
+        }
+        std::os::unix::fs::symlink(root.join("nowhere"), root.join("l-dangling")).unwrap();
+        assert_eq!(read_start_live(&root.join("l-dangling")), StartRead::Missing, "끊긴 링크 = 출시본과 같은 '없음'");
+        // 설정 파일: 등록이 다 된 일반 파일을 가리키는 링크 → 검증은 그 내용을 읽는다(따름).
+        let cfg = root.join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let full = root.join("full-settings.json");
+        merge_desired_hooks(&full, &pk, &AWAKENING_HOOKS).unwrap();
+        let settings = cfg.join("settings.json");
+        std::os::unix::fs::symlink(&full, &settings).unwrap();
+        assert!(verify_desired_hooks_registered(&settings, &pk, &AWAKENING_HOOKS).is_empty(), "링크를 따라 등록을 읽었다");
+        assert!(merge_desired_hooks(&settings, &pk, &AWAKENING_HOOKS).is_err(), "링크인 설정 파일은 쓰지 않는다(출시본 그대로)");
+        // 그 밖을 가리키는 링크 → 판독 불가의 안전값(검증 = 전부 미등록 · 재조정 = 오류 · 덮지 않음).
+        for (what, target) in &others {
+            std::fs::remove_file(&settings).unwrap();
+            std::os::unix::fs::symlink(target, &settings).unwrap();
+            let (s, pk2) = (settings.clone(), pk.clone());
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let v = verify_desired_hooks_registered(&s, &pk2, &AWAKENING_HOOKS).len();
+                let r = retune_registered_hook_timeouts(&s, &pk2, &AWAKENING_HOOKS).is_err();
+                let _ = tx.send((v, r));
+            });
+            let (missing, retune_err) = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("settings link to {what}: did not return within its deadline"));
+            assert_eq!(missing, AWAKENING_HOOKS.len(), "settings link to {what}: 전부 미등록으로 보고");
+            assert!(retune_err, "settings link to {what}: 재조정은 오류(덮지 않음)");
+        }
+        // 첫기동 관문 시드의 `.claude.json`: 일반 파일 링크는 읽고(판독 거부가 아님), FIFO 링크는 거부.
+        let claude = cfg.join(CLAUDE_CONFIG_FILE);
+        std::fs::write(root.join("claude-real.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(root.join("claude-real.json"), &claude).unwrap();
+        let out = seed_first_run_gates_at(&cfg, &["/w".to_string()], AuthPremise::Unproven);
+        assert!(!matches!(&out, SeedOutcome::Refused(why) if why.contains("읽기 불가")), "일반 파일 링크는 읽는다: {out:?}");
+        let _ = std::fs::remove_file(&claude);
+        let _ = std::fs::remove_file(cfg.join(FIRST_RUN_SEED_BACKUP));
+        std::os::unix::fs::symlink(&fifo, &claude).unwrap();
+        let c2 = cfg.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(seed_first_run_gates_at(&c2, &["/w".to_string()], AuthPremise::Unproven));
+        });
+        let out = rx.recv_timeout(std::time::Duration::from_secs(20)).expect(".claude.json link to fifo: deadline");
+        assert!(matches!(&out, SeedOutcome::Refused(why) if why.contains("읽기 불가")), "{out:?}");
+    }
+
+    /// EC5 시험의 형태 심기 — 폴더 · 상한 초과(성긴 파일) · FIFO · FIFO 를 가리키는 링크 · 장치(`/dev/zero`)를 가리키는 링크.
+    fn plant_special(p: &Path, form: &str, root: &Path, case: &str) {
+        let _ = std::fs::remove_file(p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        match form {
+            "dir" => std::fs::create_dir_all(p).unwrap(),
+            "oversized" => std::fs::File::create(p).unwrap().set_len(START_LIVE_CAP.max(START_META_CAP) + 1).unwrap(),
+            #[cfg(unix)]
+            "fifo" | "link-to-fifo" => {
+                use std::os::unix::ffi::OsStrExt;
+                let fifo = if form == "fifo" { p.to_path_buf() } else { root.join(format!("elsewhere-{}.fifo", p.file_name().unwrap().to_string_lossy())) };
+                let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "{case}: mkfifo");
+                if form == "link-to-fifo" {
+                    std::os::unix::fs::symlink(&fifo, p).unwrap();
+                }
+            }
+            #[cfg(unix)]
+            "link-to-device" => std::os::unix::fs::symlink("/dev/zero", p).unwrap(),
+            _ => unreachable!("{form}"),
+        }
+    }
+
+    /// ★T2i(RULINGS EC5 · FP2): 시작 경로 판독 조사(census) — 데몬이 듣기 **전**에 도는 팩 코드의 실제 뿌리(`cysd` main 의
+    /// `recover_pack_journal` · `pack_current_for` · `install`)에서 **호출 그래프를 따라** 닿는 함수(이 파일과 `packsig.rs` 의
+    /// 시험 밖 함수, 이름으로 해소 — 넘치게 잡는 쪽) 가운데 날것의 경로 판독(`std::fs::read(` · `std::fs::read_to_string(` ·
+    /// `fs::read_to_string(` · `std::fs::copy(` · `File::open(`)이 있는 곳은 없어야 한다. 예외 둘: `write_atomic_mode_inner` 와
+    /// `sync_parent_dir` 의 `File::open(parent)` = 폴더를 내리려고 여는 것(내용 판독 아님). 새 판독 함수 · 새 호출이 생기면 이 조사가
+    /// 저절로 잡는다(이 Mac 에서 닿는 함수 165개 — 파이썬 이식으로 같은 규칙을 미리 잰 값, `impl/runs/T2-scratch/census_port.py`).
+    #[test]
+    fn ec5_start_path_read_census() {
+        let pack_src = include_str!("pack.rs");
+        let sig_src = include_str!("packsig.rs");
+        // 문자열 · 문자 · 주석을 지운 사본(괄호 짝 맞추기용 — 길이 보존).
+        fn blank(src: &str) -> String {
+            let b = src.as_bytes();
+            let mut out = b.to_vec();
+            let mut i = 0;
+            while i < b.len() {
+                match b[i] {
+                    b'/' if b.get(i + 1) == Some(&b'/') => {
+                        while i < b.len() && b[i] != b'\n' {
+                            out[i] = b' ';
+                            i += 1;
+                        }
+                    }
+                    b'/' if b.get(i + 1) == Some(&b'*') => {
+                        while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                            if b[i] != b'\n' {
+                                out[i] = b' ';
+                            }
+                            i += 1;
+                        }
+                        out[i] = b' ';
+                        if i + 1 < b.len() {
+                            out[i + 1] = b' ';
+                        }
+                        i += 2;
+                    }
+                    b'r' if (b.get(i + 1) == Some(&b'"') || b.get(i + 1) == Some(&b'#'))
+                        && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) =>
+                    {
+                        let mut j = i + 1;
+                        let mut hashes = 0;
+                        while b.get(j) == Some(&b'#') {
+                            hashes += 1;
+                            j += 1;
+                        }
+                        if b.get(j) != Some(&b'"') {
+                            i += 1;
+                            continue;
+                        }
+                        j += 1;
+                        loop {
+                            if j >= b.len() {
+                                break;
+                            }
+                            if b[j] == b'"' && (0..hashes).all(|h| b.get(j + 1 + h) == Some(&b'#')) {
+                                j += 1 + hashes;
+                                break;
+                            }
+                            j += 1;
+                        }
+                        for o in out.iter_mut().take(j).skip(i) {
+                            if *o != b'\n' {
+                                *o = b' ';
+                            }
+                        }
+                        i = j;
+                    }
+                    b'"' => {
+                        out[i] = b' ';
+                        i += 1;
+                        while i < b.len() && b[i] != b'"' {
+                            if b[i] == b'\\' {
+                                out[i] = b' ';
+                                i += 1;
+                            }
+                            if i < b.len() && b[i] != b'\n' {
+                                out[i] = b' ';
+                            }
+                            i += 1;
+                        }
+                        if i < b.len() {
+                            out[i] = b' ';
+                        }
+                        i += 1;
+                    }
+                    b'\'' => {
+                        // 문자 리터럴('x' · '\n' · '\u{..}')만 지운다 — 수명('a)은 그대로.
+                        let end = if b.get(i + 1) == Some(&b'\\') {
+                            (i + 2..b.len().min(i + 12)).find(|&k| b[k] == b'\'')
+                        } else if b.get(i + 2) == Some(&b'\'') {
+                            Some(i + 2)
+                        } else {
+                            std::str::from_utf8(&b[i + 1..b.len().min(i + 6)])
+                                .ok()
+                                .or_else(|| std::str::from_utf8(&b[i + 1..b.len().min(i + 5)]).ok())
+                                .and_then(|s| s.chars().next())
+                                .map(|c| i + 1 + c.len_utf8())
+                                .filter(|&k| b.get(k) == Some(&b'\''))
+                        };
+                        match end {
+                            Some(e) => {
+                                for o in out.iter_mut().take(e + 1).skip(i) {
+                                    *o = b' ';
+                                }
+                                i = e + 1;
+                            }
+                            None => i += 1,
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        }
+        // 시험 모듈(`#[cfg(test)] mod … { … }`)의 바이트 구간.
+        fn test_regions(code: &str) -> Vec<(usize, usize)> {
+            let mut out = Vec::new();
+            let mut from = 0;
+            while let Some(k) = code[from..].find("#[cfg(test)]") {
+                let at = from + k;
+                let rest = &code[at..];
+                let Some(m) = rest.find("mod ") else { break };
+                if rest[..m].contains(';') || rest[..m].contains("fn ") {
+                    from = at + 12;
+                    continue;
+                }
+                let Some(open) = rest.find('{') else { break };
+                let mut depth = 0i32;
+                let mut end = rest.len();
+                for (i, ch) in rest[open..].char_indices() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = open + i + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                out.push((at, at + end));
+                from = at + end;
+            }
+            out
+        }
+        // 이름 → 몸통(원문) 목록.
+        fn functions(src: &str) -> Vec<(String, String)> {
+            let code = blank(src);
+            let tests = test_regions(&code);
+            let mut out = Vec::new();
+            let bytes = code.as_bytes();
+            let mut pos = 0;
+            while let Some(k) = code[pos..].find("fn ") {
+                let at = pos + k;
+                pos = at + 3;
+                if at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') {
+                    continue;
+                }
+                if tests.iter().any(|&(s, e)| at >= s && at < e) {
+                    continue;
+                }
+                let name: String = code[at + 3..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                if name.is_empty() {
+                    continue;
+                }
+                let rest = &code[at..];
+                let (Some(open), semi) = (rest.find('{'), rest.find(';')) else { continue };
+                if semi.is_some_and(|s| s < open) {
+                    continue;
+                }
+                let mut depth = 0i32;
+                let mut end = None;
+                for (i, ch) in rest[open..].char_indices() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(open + i + 1);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(end) = end else { continue };
+                out.push((name, src[at..at + end].to_string()));
+            }
+            out
+        }
+        let mut fns: Vec<(String, String, &str)> = Vec::new();
+        for (n, b) in functions(pack_src) {
+            fns.push((n, b, "pack.rs"));
+        }
+        for (n, b) in functions(sig_src) {
+            fns.push((n, b, "packsig.rs"));
+        }
+        let names: std::collections::BTreeSet<String> = fns.iter().map(|(n, _, _)| n.clone()).collect();
+        let calls_of = |body: &str| -> Vec<String> {
+            let code = blank(body);
+            let mut out = Vec::new();
+            let b = code.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+                    let s = i;
+                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                        i += 1;
+                    }
+                    let mut j = i;
+                    while j < b.len() && b[j] == b' ' {
+                        j += 1;
+                    }
+                    if b.get(j) == Some(&b'(') {
+                        out.push(code[s..i].to_string());
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            out
+        };
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut stack: Vec<String> = ["recover_pack_journal", "pack_current_for", "install"].iter().map(|s| s.to_string()).collect();
+        for r in &stack {
+            assert!(names.contains(r), "census root {r} not found");
+        }
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n.clone()) {
+                continue;
+            }
+            for (fname, body, _) in fns.iter().filter(|(f, _, _)| *f == n) {
+                let _ = fname;
+                for c in calls_of(body) {
+                    if names.contains(&c) && !seen.contains(&c) {
+                        stack.push(c);
+                    }
+                }
+            }
+        }
+        for must in ["install_into_with", "channel_guard_and_heal", "read_accepted", "rollback_journal", "merge_desired_hooks", "park_copy_at"] {
+            assert!(seen.contains(must), "census must reach {must} (reached {})", seen.len());
+        }
+        let raw = ["std::fs::read(", "std::fs::read_to_string(", "fs::read_to_string(", "std::fs::copy(", "File::open("];
+        let mut bad = Vec::new();
+        for (n, body, file) in fns.iter().filter(|(n, _, _)| seen.contains(n)) {
+            let code = blank(body);
+            for r in raw {
+                let dir_open = r == "File::open(" && (n == "write_atomic_mode_inner" || n == "sync_parent_dir");
+                if code.contains(r) && !dir_open {
+                    bad.push(format!("{file}::{n} {r}"));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "unbounded reads reachable before the daemon listens ({} functions): {bad:?}", seen.len());
+    }
+
+    /// ★T2h(RULINGS CW3 · 검토자 B3): 시작 경로(데몬의 기동 설치 — 바인드 전)는 장부·메타 파일 하나로 멈추지 않는다 — 감사 원장 ·
+    /// 병합 대기 원장 · 설치 기록 · `.pack-version` · `.pack-state.json` · `.pristine/<rel>` · `<rel>.user` · `<rel>.new` 자리에
+    /// FIFO(쓰는 쪽 없음) · 폴더 · FIFO 를 가리키는 링크 · 상한 초과 파일(성긴 파일)을 두어도 설치는 **각자의 시한 안에** 끝난다
+    /// (시한을 넘기면 실패 — 회귀가 스위트를 멈추지 않는다). 감사 원장을 읽을 수 없으면 보수적 기본값: user 소유 파일을 자동
+    /// 갱신하지 않는다(대조: 감사 원장이 없으면 갱신한다).
+    #[test]
+    fn t2h_cw3_start_path_never_blocks_on_a_special_or_oversized_ledger() {
+        let rig = Rig::new("cw3");
+        let agents_old = "{\"agents\": 1}\n";
+        let agents_new = "{\"agents\": 2}\n";
+        let items: Vec<(String, String)> = vec![
+            ("agents.json".into(), agents_new.into()),
+            ("hooks/inject.sh".into(), "#!/bin/bash\necho V1\n".into()),
+            ("bin/drift.py".into(), "VENDOR-NEW\n".into()),
+            ("bin/kept.py".into(), "line1\nVENDOR\nline3\n".into()),
+        ];
+        let setup = |pack: &Path| {
+            let w = |rel: &str, c: &str| {
+                let p = pack.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, c).unwrap();
+            };
+            w("agents.json", agents_old);
+            w("hooks/inject.sh", "#!/bin/bash\necho USER\n");
+            w("bin/drift.py", "DRIFT\n");
+            w(".pristine/bin/drift.py", "BASE\n");
+            w("bin/kept.py", "line1\nMINE\nline3\n");
+            w("bin/kept.py.new", "line1\nVENDOR\nline3\n");
+            w(".pack-version", "1.0.0\n");
+            let m: std::collections::BTreeMap<String, String> = [
+                ("agents.json", content_hash(agents_old)),
+                ("bin/drift.py", content_hash("BASE\n")),
+                ("bin/kept.py", content_hash("line1\nline2\nline3\n")),
+            ]
+            .into_iter()
+            .map(|(r, h)| (r.to_string(), h))
+            .collect();
+            std::fs::write(pack.join(INSTALL_MANIFEST), serde_json::to_string(&m).unwrap()).unwrap();
+        };
+        let run = |case: &str, pack: PathBuf| -> bool {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let it = items.clone();
+            std::thread::spawn(move || {
+                let src = UpdateSources::none().with_boot_critical(bc_only(&["hooks/inject.sh"]));
+                let r = install_into_with(
+                    pack,
+                    it.iter().map(|(a, b)| (a.as_str(), b.as_str())),
+                    false,
+                    "9.9.9",
+                    false,
+                    false,
+                    PackScope::Base,
+                    None,
+                    None,
+                    &src,
+                );
+                let _ = tx.send(r.is_ok());
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("{case}: the install did not finish within its deadline (blocked on a start-path read)"))
+        };
+        // 대조: 감사 원장이 없으면 user 소유 비수정 파일은 갱신된다.
+        let ctl = rig.base.join("control");
+        setup(&ctl);
+        assert!(run("control", ctl.clone()), "control install");
+        assert_eq!(std::fs::read_to_string(ctl.join("agents.json")).unwrap(), agents_new, "control: 갱신");
+        let targets = [
+            MERGE_AUDIT_FILE,
+            MERGE_PENDING_FILE,
+            INSTALL_MANIFEST,
+            PACK_VERSION_FILE,
+            PACK_STATE_FILE,
+            ".pristine/bin/drift.py",
+            "hooks/inject.sh.user",
+            "bin/kept.py.new",
+        ];
+        let mut forms: Vec<&str> = vec!["dir", "oversized"];
+        #[cfg(unix)]
+        forms.extend(["fifo", "link-to-fifo"]);
+        let mut cases = 0usize;
+        for (ti, target) in targets.iter().enumerate() {
+            for form in &forms {
+                let case = format!("{target} as {form}");
+                let pack = rig.base.join(format!("c{ti}-{form}"));
+                setup(&pack);
+                let p = pack.join(target);
+                let _ = std::fs::remove_file(&p);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                match *form {
+                    "dir" => std::fs::create_dir_all(&p).unwrap(),
+                    "oversized" => std::fs::File::create(&p).unwrap().set_len(START_META_CAP + 1).unwrap(),
+                    #[cfg(unix)]
+                    "fifo" | "link-to-fifo" => {
+                        use std::os::unix::ffi::OsStrExt;
+                        let fifo = if *form == "fifo" { p.clone() } else { pack.join("elsewhere.fifo") };
+                        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+                        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "{case}: mkfifo");
+                        if *form == "link-to-fifo" {
+                            std::os::unix::fs::symlink(&fifo, &p).unwrap();
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                let _finished_ok = run(&case, pack.clone());
+                if *target == MERGE_AUDIT_FILE {
+                    assert_eq!(
+                        std::fs::read_to_string(pack.join("agents.json")).unwrap(),
+                        agents_old,
+                        "{case}: 감사 원장을 읽을 수 없으면 user 소유 파일을 자동 갱신하지 않는다"
+                    );
+                }
+                cases += 1;
+                let _ = std::fs::remove_dir_all(&pack);
+            }
+        }
+        assert_eq!(cases, targets.len() * forms.len());
+        // 판독기 자체: 일반 파일만 · 링크 비추종(메타) · 링크 추종(살아 있는 파일) · 부재.
+        let dir = rig.base.join("reader");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f"), "x").unwrap();
+        assert_eq!(read_start_meta(&dir.join("f")), StartRead::Bytes(b"x".to_vec()));
+        assert_eq!(read_start_meta(&dir.join("absent")), StartRead::Missing);
+        assert!(matches!(read_start_meta(&dir), StartRead::Unreadable(_)), "폴더");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("f"), dir.join("l")).unwrap();
+            assert!(matches!(read_start_meta(&dir.join("l")), StartRead::Unreadable(_)), "메타: 링크 비추종");
+            assert_eq!(read_start_live(&dir.join("l")), StartRead::Bytes(b"x".to_vec()), "살아 있는 파일: 일반 파일 링크 추종");
+        }
+    }
+
+    /// ★T2h(RULINGS CW2 · 검토자 B2): 보관된 세대는 결코 덮이지 않는다 — 두 쓰는 쪽을 결정적으로 끼워 넣는다: A 가 `.user`(U)를
+    /// `prev-100` 에 보존하고 V 를 쓴 뒤, 같은 초의 B 가 고른 후보 자리를 **예약 직전에** 세 번째 쓰는 쪽(X)이 차지한다(종전 코드는
+    /// 존재 확인 뒤 `rename` 으로 그 자리를 덮었다). B 는 다음 자리로 넘어가고 U · V · X 가 모두 남는다. 다른 쓰는 쪽이 이미 `.user`
+    /// 를 옮겼으면 보존할 것이 없다.
+    #[test]
+    fn t2h_cw2_an_archived_generation_is_never_replaced() {
+        let rig = Rig::new("cw2");
+        let rel = "hooks/x.sh";
+        let user = |c: &[u8]| rig.write(&format!("{rel}.user"), c);
+        user(b"U\n");
+        let a = preserve_prior_user_generation_at(&rig.pack, rel, Some(b"V\n"), 100, &mut |_| {}).unwrap().unwrap();
+        assert_eq!(a, rig.pack.join(format!("{rel}.user.prev-100")));
+        user(b"V\n");
+        let mut taken: Vec<PathBuf> = Vec::new();
+        let b = preserve_prior_user_generation_at(&rig.pack, rel, Some(b"W\n"), 100, &mut |cand| {
+            if taken.is_empty() && !cand.exists() {
+                std::fs::write(cand, "X\n").unwrap();
+                taken.push(cand.to_path_buf());
+            }
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(taken.len(), 1, "끼어든 쓰는 쪽이 B 의 첫 후보를 차지했다");
+        assert_ne!(b, taken[0], "B 는 차지된 자리를 쓰지 않는다");
+        let read = |p: &Path| std::fs::read_to_string(p).unwrap();
+        assert_eq!(read(&a), "U\n", "A 의 세대(U) 그대로");
+        assert_eq!(read(&taken[0]), "X\n", "끼어든 세대(X) 그대로");
+        assert_eq!(read(&b), "V\n", "B 의 세대(V)");
+        let gens: Vec<String> = std::fs::read_dir(rig.pack.join("hooks"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("x.sh.user.prev-"))
+            .map(|e| read(&e.path()))
+            .collect();
+        assert_eq!(gens.len(), 3, "{gens:?}");
+        // 다른 쓰는 쪽이 이미 옮겼다 → 보존할 것 없음.
+        assert_eq!(preserve_prior_user_generation_at(&rig.pack, rel, None, 100, &mut |_| {}).unwrap(), None);
+    }
+
+    /// ★T2h(RULINGS CW1): 닻 내린 쓰기와 경로 규칙 — 구성 요소가 링크면 쓰지 않는다(가리키는 곳에 아무것도 생기지 않는다),
+    /// 마지막 성분이 링크면 그 링크만 교체된다(가리키는 파일 무접촉), 없는 구성 요소는 만든다. 스냅샷 레인이 링크면 스냅샷을
+    /// 만들지 않는다(링크 너머의 정리 · 쓰기 없음).
+    #[cfg(unix)]
+    #[test]
+    fn t2h_cw1_anchored_writes_never_follow_a_link() {
+        let rig = Rig::new("cw1");
+        let live = rig.pack.join("hooks");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("guard.sh"), "LIVE\n").unwrap();
+        std::fs::create_dir_all(rig.pack.join(PRISTINE_DIR)).unwrap();
+        std::os::unix::fs::symlink(&live, rig.pack.join(PRISTINE_DIR).join("hooks")).unwrap();
+        assert!(sidecar_path_gate(&rig.pack, ".pristine/hooks/guard.sh").is_err(), "부모 링크 → 거부");
+        assert!(write_beneath(&rig.pack, ".pristine/hooks/guard.sh", b"X\n").is_err(), "닻 내린 쓰기 → 실패");
+        assert_eq!(std::fs::read_to_string(live.join("guard.sh")).unwrap(), "LIVE\n", "링크 너머 무접촉");
+        assert_eq!(std::fs::read_dir(&live).unwrap().count(), 1, "링크 너머에 임시 파일도 없다");
+        // 마지막 성분이 링크 → 그 링크만 교체.
+        std::fs::remove_file(rig.pack.join(PRISTINE_DIR).join("hooks")).unwrap();
+        std::fs::create_dir_all(rig.pack.join(PRISTINE_DIR).join("hooks")).unwrap();
+        std::os::unix::fs::symlink(live.join("guard.sh"), rig.pack.join(PRISTINE_DIR).join("hooks/guard.sh")).unwrap();
+        assert!(sidecar_path_gate(&rig.pack, ".pristine/hooks/guard.sh").is_err(), "마지막 성분 링크 → 관문 거부");
+        write_beneath(&rig.pack, ".pristine/hooks/guard.sh", b"BASE\n").unwrap();
+        assert_eq!(std::fs::read_to_string(live.join("guard.sh")).unwrap(), "LIVE\n", "가리키던 파일 무접촉");
+        assert_eq!(std::fs::read_to_string(rig.pack.join(".pristine/hooks/guard.sh")).unwrap(), "BASE\n");
+        // 없는 구성 요소는 만든다.
+        write_beneath(&rig.pack, ".pristine/bin/new/x.py", b"Y\n").unwrap();
+        assert_eq!(std::fs::read_to_string(rig.pack.join(".pristine/bin/new/x.py")).unwrap(), "Y\n");
+        // 스냅샷 레인이 링크 → 만들지 않는다.
+        let root = rig.base.join("snaps");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&live, root.join("base")).unwrap();
+        std::fs::write(rig.pack.join("hooks/guard.sh"), "LIVE\n").unwrap();
+        let none = |_: &str| Vec::<String>::new();
+        let r = create_update_snapshot(&rig.pack, &root, "base", "1.0.0", &std::collections::BTreeMap::new(),
+            &["hooks/guard.sh".to_string()], PackScope::Base, &none, (UPDATE_SNAPSHOT_FILE_CAP, UPDATE_SNAPSHOT_TOTAL_CAP));
+        assert!(r.is_err(), "레인 링크 → 스냅샷 거부");
+        assert_eq!(std::fs::read_dir(&live).unwrap().count(), 1, "링크 너머(살아 있는 hooks)에 아무것도 생기지 않았다");
+    }
+
     /// 부록 A-2 #4(백업이 없으면 덮지 않는다): 기동 필수 파일의 사용자본을 보관할 수 없으면 vendor 본을 쓰지 않고 격리.
     #[cfg(unix)]
     #[test]
@@ -15299,6 +17646,42 @@ mod m11_tests {
         assert_eq!(rig.kind("hooks/clash.sh").as_deref(), Some("user-kept"), "같은 줄 충돌 → 사용자 우선");
         assert_eq!(rig.read("hooks/clash.sh").as_deref(), Some("#!/bin/bash\necho MINE\n"), "셸 보존 결과에도 CR 없음");
         assert!(!std::fs::read(rig.pack.join("hooks/clash.sh")).unwrap().contains(&b'\r'));
+    }
+
+    /// ★T2i(RULINGS FT1): 보존된 파일의 CR 제거는 진짜 셸 스크립트에만 — `hooks/` 아래의 `.md` · `.py` · `.cmd` 는 사용자의 바이트
+    /// 그대로(CRLF 유지)이고 원장에 "eol" 이 없다. `.sh` 와 shebang 파일(확장자 없음)은 종전대로 LF + "eol": "lf".
+    #[test]
+    fn ft1_only_a_real_shell_script_loses_its_cr_when_kept() {
+        let rig = Rig::new("ft1");
+        let cases: [(&str, &str, &[u8], bool); 5] = [
+            ("hooks/zz_note.md", "# note\nvendor\n", b"# note\r\nmine\r\n", false),
+            ("hooks/zz_gate.py", "#!/usr/bin/env python3\nprint('v')\n", b"#!/usr/bin/env python3\r\nprint('mine')\r\n", false),
+            ("hooks/zz_tool.cmd", "@echo off\r\necho vendor\r\n", b"@echo off\r\necho mine\r\n", false),
+            ("hooks/zz_run.sh", "#!/bin/bash\necho vendor\n", b"#!/bin/bash\r\necho mine\r\n", true),
+            ("bin/zz_tool", "#!/bin/bash\necho vendor\n", b"#!/bin/bash\r\necho mine\r\n", true),
+        ];
+        for (rel, _v, mine, _s) in cases.iter() {
+            rig.write(rel, mine);
+        }
+        let items: Vec<(&str, &str)> = cases.iter().map(|(r, v, _, _)| (*r, *v)).collect();
+        rig.install(&items, false, &UpdateSources::none());
+        for (rel, _v, mine, shell) in cases.iter() {
+            let live = std::fs::read(rig.pack.join(rel)).unwrap();
+            let e = rig.entry(rel);
+            if *shell {
+                let lf: Vec<u8> = mine.iter().copied().filter(|b| *b != b'\r').collect();
+                assert_eq!(live, lf, "{rel}: 셸 스크립트 = LF");
+                assert_eq!(e.as_ref().map(|e| e["eol"].clone()), Some(serde_json::json!("lf")), "{rel}: {e:?}");
+            } else {
+                assert_eq!(&live, mine, "{rel}: 사용자의 바이트 그대로(CR 포함)");
+                assert!(e.as_ref().is_none_or(|e| e.get("eol").is_none()), "{rel}: eol 없음 {e:?}");
+            }
+        }
+        assert!(!is_shell_script("hooks/README.md", "# x\n"));
+        assert!(!is_shell_script("hooks/cys-agy-statusline.cmd", "@echo off\r\n"));
+        assert!(!is_shell_script("hooks/inject_gate.py", "#!/usr/bin/env python3\n"));
+        assert!(is_shell_script("hooks/session-start.sh", ""));
+        assert!(is_shell_script("bin/cys-dept", "#!/usr/bin/env bash\n"));
     }
 
     /// 부록 A-2 #6(손상 의심 검사): 의심 병합은 받아들이지 않고 사용자 파일을 살린다 — 표시는 덮는 이유가 아니라

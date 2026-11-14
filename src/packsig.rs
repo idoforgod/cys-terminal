@@ -302,10 +302,15 @@ pub fn verify_no_extra_files(manifest: &PackManifest, root: &Path) -> Result<(),
 /// 실패 = Err(손상 = fail-closed 거부). '부재'와 '손상'을 구분해 손상본이 신규 머신으로 강등돼
 /// replay 단조 게이트를 우회하는 것을 차단한다.
 fn read_accepted(path: &Path) -> Result<Option<AcceptedPack>, String> {
-    let s = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("accepted 기록 읽기 실패 {}: {e}", path.display())),
+    // ★T2i(RULINGS EC5): 데몬 시작 경로(`channel_guard_and_heal`)도 이 함수를 부른다 — 시작 경로의 단일 판독기(막히지 않음 ·
+    //   일반 파일 · 상한 · 마지막 링크 비추종). 판독 불가 = Err(종전 그 밖의 읽기 오류와 같은 갈래 — 보존 방향).
+    let s = match crate::pack::read_start_meta(path) {
+        crate::pack::StartRead::Missing => return Ok(None),
+        crate::pack::StartRead::Unreadable(e) => {
+            return Err(format!("accepted 기록 읽기 실패 {}: {e}", path.display()))
+        }
+        crate::pack::StartRead::Bytes(b) => String::from_utf8(b)
+            .map_err(|e| format!("accepted 기록 읽기 실패 {}: UTF-8 아님({e})", path.display()))?,
     };
     serde_json::from_str(&s)
         .map(Some)

@@ -394,6 +394,83 @@ CSO_DIRECTIVE_REV_MARKER = "<!-- cso-directive-rev: 2026-09-06-alert-inbox -->"
 CSO_DIRECTIVE_MARKER_MAX_LINE = 20      # 표지는 파일 첫 20행 안에 있어야 한다(P3 와 공유하는 계약)
 
 
+# ── ★T2i(RULINGS EF1 · EF2 · EF3 · FH4) — 기록 없는 보관 사본 ─────────────────────────────────────────
+# '보관 중'은 디스크의 사실이다: 되돌리기(`cys pack-rollback`)는 기동 필수·보호 목록 파일의 `<rel>.user` 가 있으면 원장
+# 기록이 있든 없든 그 파일을 건너뛴다. 원장 기록은 다른 쓰는 쪽의 원장 통째 저장으로 지워질 수 있고(`--take-new` 는 vendor
+# 본 유지를 확정하며 기록을 지우되 사본을 남긴다) — 그때 원장만 보는 목록은 그 사본을 숨긴다. 그래서 C62 는 원장이
+# 그 사본을 이름 대지 않는(`vendor-first`·`healed`·`conflicted` 가 아닌) `<rel>.user` 를 디스크에서 찾아 보인다.
+# ★FH4: 원본 `<rel>` 이 없는 사본도 보인다('원본 없음' — 지워졌거나 업데이트에서 빠진 파일). 링크는 따라가지 않는다 · 건너뛰는
+# 폴더는 팩 루트의 `.pristine`(출시본 기준선) 하나 · 방문 상한 `UNRECORDED_SCAN_CAP` 에 닿거나 폴더를 읽지 못하면 '조사 미완' —
+# 그때 C62 는 '0건'이라고 말하지 않는다(WARN). `cys pack-merge` 목록(`src/bin/cys.rs` `unrecorded_parked_copies`)과 같은 규칙.
+UNRECORDED_SCAN_CAP = 100000
+_USER_SIDE_KINDS = ("vendor-first", "healed", "conflicted")
+
+
+def _unrecorded_parked_copies(root, pending, cap=None):
+    """→ (copies, incomplete) — copies = 정렬된 [(rel, 원본 없음, 그 사본을 이름 대지 않는 원장 기록의 종류 또는 None)] ·
+    incomplete = 조사를 끝내지 못한 사유(끝냈으면 None)."""
+    cap = UNRECORDED_SCAN_CAP if cap is None else cap
+    out = []
+    problems = []
+
+    def onerror(e):
+        where = os.path.relpath(getattr(e, "filename", None) or root, root).replace(os.sep, "/")
+        problems.append("폴더 '%s' 를 읽지 못함(%s)" % (where, getattr(e, "strerror", None) or e))
+
+    seen = 0
+    for cur, dirs, files in os.walk(root, followlinks=False, onerror=onerror):
+        if cur == root:
+            dirs[:] = sorted(d for d in dirs if d != ".pristine")
+        else:
+            dirs.sort()
+        for name in sorted(files):
+            seen += 1
+            if seen > cap:
+                return sorted(out), "방문 상한 %d개에 닿음" % cap
+            if not name.endswith(".user") or name == ".user":
+                continue
+            base = os.path.join(cur, name[:-len(".user")])
+            rel = os.path.relpath(base, root).replace(os.sep, "/")
+            v = pending.get(rel) if isinstance(pending, dict) else None
+            if isinstance(v, dict) and v.get("kind") in _USER_SIDE_KINDS:
+                continue
+            kind = v.get("kind") if isinstance(v, dict) and isinstance(v.get("kind"), str) else None
+            out.append((rel, not os.path.lexists(base), kind))
+    return sorted(out), (problems[0] if problems else None)
+
+
+def _unrecorded_copies_part(unrecorded, incomplete=None):
+    """★T2i(RULINGS FH4 · FP4): 기록 없는 사본과 원장 기록이 다른 종류인 사본을 나눠 말한다 — 다른 종류면 그 종류를 이름 대고
+    '기록 없이'라고 하지 않는다. 다시 입히는 길은 vendor 우선 기록이 없으므로 `cys repair begin` 하나(`reapply` 는 거부된다)."""
+    def shown(items):
+        out = []
+        for r, orphan, kind in items[:8]:
+            tags = []
+            if kind:
+                tags.append("원장 기록 '%s'" % kind)
+            if orphan:
+                tags.append("원본 없음")
+            out.append("%s(%s)" % (r, " · ".join(tags)) if tags else r)
+        return ", ".join(out) + (" 외 %d건" % (len(items) - 8) if len(items) > 8 else "")
+    route = ("다시 입히기 = 워커가 승인 절차로 `cys repair begin --files <파일> --trigger update` · 다시 입히지 않으려면 그 사본을 "
+             "다른 이름으로 옮긴다(지우지 않는다)")
+    none = [c for c in unrecorded if not c[2]]
+    other = [c for c in unrecorded if c[2]]
+    parts = []
+    if none:
+        parts.append("★기록 없는 보관 사본 %d건 — 병합 대기 기록 없이 디스크에 남은 내 수정본 <파일>.user(`--take-new` 로 vendor 본 "
+                     "유지를 확정했거나 기록이 지워짐 · '원본 없음' = 그 파일이 지워졌거나 업데이트에서 빠짐 · 기동 필수·보호 목록 "
+                     "파일이면 사본이 있는 동안 되돌리기가 그 파일을 건너뜀 · %s): %s" % (len(none), route, shown(none)))
+    if other:
+        parts.append("★원장 기록이 이름 대지 않는 보관 사본 %d건 — 원장에는 이 파일들이 괄호 안의 종류로 적혀 있으나 그 기록은 이 "
+                     "사본(<파일>.user)을 이름 대지 않음(기동 필수·보호 목록 파일이면 사본이 있는 동안 되돌리기가 그 파일을 건너뜀 · "
+                     "%s): %s" % (len(other), route, shown(other)))
+    if incomplete:
+        parts.append("★보관 사본 조사 미완(%s) — 기록 없는 보관 사본이 더 있을 수 있음(이 점검은 '0건'이라고 말하지 않는다)"
+                     % incomplete)
+    return "; ".join(parts)
+
+
 # ── ★0.15.0 M11 마 — 묘비(장부에 기록된 파일 삭제 · 생명줄이 아닌 훅 해제)의 읽기 창구 ──────────────
 # 정본은 수리 장부의 레인별 묘비 파일(`~/.cys/local/repairs/tombstones/<lane_key>.json`, 그 레인의 데몬만
 # 쓴다 — RULINGS B1)이고, 파이썬은 장부 파일을 직접 파싱하지 않는다: `cys repair tombstones --json`(CLI 의
@@ -2506,8 +2583,10 @@ class Preflight:
     #   등록을 조정하고, 출력(Y2(a))을 파싱해 자기가 지목한 훅만 판정한다. 등록 논리는 두 벌이 아니다 —
     #   아래는 평소 점검이 쓰는 같은 등록기·같은 존재 술어를 부를 뿐이다. 훅 목록은 제품이 등록하는 목록
     #   그대로다(새로 더하거나 빼지 않는다 — P1): C08·C32·C33·C28(능력 게이트 포함)·C27·C55.
-    #   능력 게이트는 생명줄이고 그 등록 조건(데몬 경보 ∧ 지침 표지 · 대상표 deny)은 C28 이 소유하므로
-    #   여기서는 **보고만** 한다(기대 상태 = 그 조건의 판정) — 묘비는 생명줄에 적용되지 않으니 조정할 일이 없다.
+    #   능력 게이트는 생명줄이고 그 등록 조건(데몬 경보 ∧ 지침 표지 · 대상표 deny)은 C28 이 소유한다 — ★T2h(RULINGS CW6):
+    #   그 조건이 **충족**이면 좁은 모드도 같은 등록기로 올린다(빠진 항목 · 선언 timeout 미달 · matcher 로 좁혀진 항목을 C28 ⓒ
+    #   와 같은 방법으로 교정 · 대상표 deny 프로필 제외 · 생명줄이라 묘비 무관 · --dry-run 은 쓰지 않는다). 조건 거짓 · 판정 불능은
+    #   지금처럼 보고만 한다(해제는 C28 이 한다).
     def _reconcile_hook_table(self):
         """(event, script, structural_lifeline, kind, matcher, timeout) — 제품 등록 목록(기존 상수에서 유도)."""
         rows = [("SessionStart", "session-start.sh", True, "c08", None, None),
@@ -2545,6 +2624,7 @@ class Preflight:
         life = lane_lifeline_scripts()
         raw_hook_tombs = lane_tombstones()[1]
         cap_state = None
+        cap_deny = set()
         rows, missing, errors = [], set(), []
         for event, script, structural, kind, matcher, timeout in self._reconcile_hook_table():
             lifeline = bool(structural or (life is not None and script in life))
@@ -2554,6 +2634,10 @@ class Preflight:
             if kind == "capgate":
                 if cap_state is None:
                     cap_state = self._capgate_gate()[0]
+                    # ★T2h(RULINGS CW6): C28 과 같은 대상표 — 판독 실패는 판정 불능(등록 보류 · C28 과 같다).
+                    cap_deny, cap_tbl_err = capgate_table_denied_basenames(pack_dir())
+                    if cap_tbl_err:
+                        cap_state = CAPGATE_UNKNOWN
                 desired = {CAPGATE_ON: "registered", CAPGATE_OFF: "unregistered"}.get(cap_state,
                                                                                       "unknown")
             elif lifeline:
@@ -2567,7 +2651,10 @@ class Preflight:
             tstates = []
             for t in targets:
                 state = self._reg_state(t, event, script, kind)
-                if (not dry_run and not state.startswith("refused:") and kind != "capgate"
+                cap_ok = (kind != "capgate"
+                          or (desired == "registered"
+                              and os.path.basename(os.path.dirname(os.path.abspath(t))) not in cap_deny))
+                if (not dry_run and not state.startswith("refused:") and cap_ok
                         and desired in ("registered", "unregistered")):
                     err = None
                     if desired == "registered" and script_ok:
@@ -2577,11 +2664,18 @@ class Preflight:
                             err = self._register_statusline(t)
                         elif kind == "appbuild" and not self._appbuild_hook_registered(t):
                             err = self._register_appbuild_hook(t, respect_tombstone=not lifeline)
-                        elif kind == "event" and not self._event_hook_registered(t, event, script,
-                                                                                  timeout):
-                            err = self._register_event_hook(t, event, script, matcher,
-                                                            timeout=timeout,
-                                                            respect_tombstone=not lifeline)
+                        elif kind in ("event", "capgate"):
+                            # ★T2h(RULINGS CW6): matcher 로 좁혀진 능력 게이트 등록은 '부분 집행' — C28 ⓒ 와 같이 우리 항목만 빼고
+                            #   다시 넣는다(남의 훅은 `_hook_entry_is_ours` 가 보존한다).
+                            narrowed = (kind == "capgate"
+                                        and not self._event_hook_scope_ok(t, event, script, matcher))
+                            if narrowed:
+                                err = self._unregister_event_hook(t, event, script)
+                            if not err and (narrowed
+                                            or not self._event_hook_registered(t, event, script, timeout)):
+                                err = self._register_event_hook(t, event, script, matcher,
+                                                                timeout=timeout,
+                                                                respect_tombstone=not lifeline)
                     elif desired == "unregistered" and state == "registered":
                         # Y2(d): 항목이 **있을 때만** 해제 · 잠금 안에서 묘비 재확인.
                         err = self._unregister_event_hook(t, event, script, require_tombstone=True)
@@ -6364,6 +6458,11 @@ class Preflight:
             return
         ledger = os.path.join(pack_dir(), ".merge-pending.json")
         if not os.path.isfile(ledger):
+            # ★T2i(RULINGS EF2 · EF3): 원장이 없어도 디스크의 보관 사본은 보인다('보관 중'은 디스크의 사실 — EF1).
+            unrecorded, incomplete = _unrecorded_parked_copies(pack_dir(), {})
+            if unrecorded or incomplete:
+                self.add(cid, WARN, _unrecorded_copies_part(unrecorded, incomplete))
+                return
             self.add(cid, PASS, "병합 대기 0건 (원장 없음)")
             return
         try:
@@ -6394,9 +6493,11 @@ class Preflight:
                            if isinstance(v, dict) and v.get("kind") == "user-kept")
         vendor_first = sorted(r for r, v in pending.items()
                               if isinstance(v, dict) and v.get("kind") == "vendor-first")
+        # ★T2i(RULINGS EF2 · EF3): 기록 없는 보관 사본(디스크의 사실) — 판정 집합(WARN)이다.
+        unrecorded, incomplete = _unrecorded_parked_copies(pack_dir(), pending)
         self._parked_merge_wakes(pending)
         if (not healed and not newp and not conflicted and not quarantined
-                and not user_kept and not vendor_first):
+                and not user_kept and not vendor_first and not unrecorded and not incomplete):
             self.add(cid, PASS, "병합 대기 0건")
             return
         parts = []
@@ -6406,10 +6507,15 @@ class Preflight:
                          % (len(user_kept), ", ".join(user_kept[:8]),
                             " 외 %d건" % (len(user_kept) - 8) if len(user_kept) > 8 else ""))
         if vendor_first:
+            # ★T2g(RULINGS CN2 · CR3): 다시 입히는 두 길과 그 조건 — `reapply` 는 수리가 만든 수정만 받는다.
             parts.append("★기동 필수 vendor 우선(vendor-first) %d건 — vendor 본을 먼저 살리고 내 수정본은 "
-                         "<파일>.user 에 보관(다시 입히기 = 워커가 승인 절차로 · cys repair reapply): %s%s"
+                         "<파일>.user 에 보관(다시 입히기 = 워커가 승인 절차로: 수리로 고친 파일이면 "
+                         "`cys repair reapply <수리번호>`, 직접 고친 파일이면 "
+                         "`cys repair begin --files <파일> --trigger update`): %s%s"
                          % (len(vendor_first), ", ".join(vendor_first[:8]),
                             " 외 %d건" % (len(vendor_first) - 8) if len(vendor_first) > 8 else ""))
+        if unrecorded or incomplete:
+            parts.append(_unrecorded_copies_part(unrecorded, incomplete))
         if healed:
             parts.append("★원복(healed) %d건 — 라이브 수정이 배포 원본으로 되돌려짐(수정본은 <파일>.user 보존): %s%s"
                          % (len(healed), ", ".join(healed[:8]),
@@ -6465,7 +6571,8 @@ class Preflight:
             jobs.append(("parked-merge",
                          "업데이트가 보관한 수정 %d건(%s) — 워커 1명에게 부서당 과제 하나로 배정하라: "
                          "user-kept 는 합치기(cys pack-merge), vendor-first 는 승인 절차로 다시 입히기"
-                         "(cys repair reapply · 주인 승인). master 직접 병합 금지"
+                         "(수리로 고친 파일이면 cys repair reapply <수리번호>, 직접 고친 파일이면 "
+                         "cys repair begin --files <파일> --trigger update · 주인 승인). master 직접 병합 금지"
                          % (len(parked), lane),
                          "parked-merge-%s-%s" % (lane, fp)))
         if legacy:
@@ -6481,36 +6588,13 @@ class Preflight:
         #   대기 중일 때만 묶으므로, 지문 기록 없이는 배달 뒤 다음 점검이 같은 목록을 다시 적재한다. 집합이 바뀌면 새로
         #   보이고, 집합이 비면 기록을 지운다(같은 수정이 나중에 다시 보관되면 다시 보인다). 적재가 실패하면 기록하지
         #   않는다(다음 점검이 다시 시도).
-        state_p = os.path.join(pack_dir(), "state", "merge-notice-delivered.json")
-        try:
-            with open(state_p, encoding="utf-8") as f:
-                delivered = json.load(f)
-            if not isinstance(delivered, dict):
-                delivered = {}
-        except Exception:
-            delivered = {}
-        before = dict(delivered)
-        for task in list(delivered):
-            if task not in fps:
-                del delivered[task]
+        # ★T2i(RULINGS EC6 · FH3): 적재마다 자기 표지(배타 생성 · 다시 적재는 번호로 묶음)를 먼저 남긴다(`_notice_once`) — 공유
+        #   파일을 읽고 고쳐 쓰지 않고, 다른 지문의 표지를 지우지 않는다(표지는 나이로만 치운다 · 같은 집합이 '보냄' 뒤
+        #   `NOTICE_MARK_MAX_AGE_S` 안에 다시 오면 다시 알리지 않는다 — C62 WARN 은 매 부트 보인다).
         for task, reason, key in jobs:
-            if delivered.get(task) == fps[task]:
-                continue
-            try:
-                r = subprocess.run(
-                    [sys.executable, wakeup, "enqueue", "--to", "master", "--task", task,
-                     "--reason", reason, "--idempotency-key", key],
-                    capture_output=True, text=True, timeout=10, env=_utf8_env())
-                if r.returncode == 0:
-                    delivered[task] = fps[task]
-            except Exception:
-                pass   # 관측 채널 — 실패가 점검을 막지 않는다(C62 WARN 은 그대로 남는다)
-        if delivered != before:
-            try:
-                os.makedirs(os.path.dirname(state_p), exist_ok=True)
-                _write_json_lf_atomic(state_p, delivered, prefix=".merge-notice.")
-            except Exception:
-                pass
+            _notice_once(task, fps[task],
+                         lambda reason=reason, key=key, task=task: _wakeup_enqueue(
+                             wakeup, task, reason, key))
 
     # ── C68 병합 원장 체류 기한 게이트 (★W-D1 커스텀 생존 2026-07-17) ──
     # 고지 채널은 실측으로 반증됐다(원장 항목 9주 체류 — C62 WARN·init-pack 보고 줄이 있었는데도).
@@ -6581,17 +6665,14 @@ class Preflight:
         if self.fix and not root_ok:
             enq = "큐 적재 보류(워크스페이스 루트 미확정: %s — JAVIS_ROOT 미설정·cwd 에 _round 부재)" % wk_root
         if self.fix and root_ok and os.path.isfile(wakeup):
-            try:
-                r = subprocess.run(
-                    [sys.executable, wakeup, "enqueue", "--to", "master",
-                     "--task", "merge-review",
-                     "--reason", "병합 원장 기한 초과 %d건(최장 %.0f일) — 워커에 pack-merge 검토 위임 필요"
-                                 % (len(stale), oldest),
-                     "--idempotency-key", "merge-review-" + fingerprint],
-                    capture_output=True, text=True, timeout=10, env=_utf8_env())
-                enq = "wakeup enqueue %s" % ("OK" if r.returncode == 0 else "실패(%d)" % r.returncode)
-            except Exception as e:
-                enq = "wakeup enqueue 예외(%s)" % e
+            # ★T2h(RULINGS CW4 · 검토자 B4): 같은 잔존 상태(지문)는 **한 번만** 알린다 — 큐의 멱등키는 대기 중일 때만 묶어
+            #   배달 뒤에는 같은 과제가 다시 왔다. 배달 기록은 적재 전에 남기고, 남길 수 없으면 데몬 기동당 한 번만.
+            reason = ("병합 원장 기한 초과 %d건(최장 %.0f일) — 워커에 pack-merge 검토 위임 필요"
+                      % (len(stale), oldest))
+            outcome = _notice_once("merge-review", fingerprint,
+                                   lambda: _wakeup_enqueue(wakeup, "merge-review", reason,
+                                                           "merge-review-" + fingerprint))
+            enq = NOTICE_RESULT_SENTENCES[outcome]
         shown = ", ".join("%s(%.0f일)" % (rel, d) for rel, d in stale[:6])
         self.add(cid, WARN,
                  "병합 대기 기한(%.0f일) 초과 %d건: %s%s — master: 워커에 `cys pack-merge` 검토 위임(직접 병합 금지) · %s"
@@ -8701,6 +8782,163 @@ def claude_procs_for_config(config_dir, runner=None, os_name=None, platform=None
 def _open_nofollow(path, flags, mode=0o600):
     """심링크 무추종 open(가능한 플랫폼에서) — Windows 는 O_NOFOLLOW 부재 → 호출자의 _is_link_like 검사가 방벽."""
     return os.open(path, flags | getattr(os, "O_NOFOLLOW", 0), mode)
+
+
+# ── ★T2i(RULINGS EC6 · FH3) — 알림의 영속 표지: 적재마다 자기 표지 하나, 다시 적재는 번호를 매겨 횟수를 묶는다 ──────────
+# 알림 하나(과제 + 지문)의 **모든 적재 앞에는 그 적재만의 표지**가 배타 생성(O_EXCL · 링크 비추종)으로 먼저 생긴다 — 첫 적재는
+# `<과제>.<지문>.pending`, 오래된 'pending'(멈춘 점검)의 다시 적재는 번호를 매긴 `<과제>.<지문>.retry-<k>`(k = 1 … N,
+# `NOTICE_RETRY_MAX`). 표지를 만들지 못하면 적재하지 않는다. 그래서 한 지문의 배달은 저장소가 그 뒤에 어떻든 **N + 1 번 이하**이고,
+# 동시에 다시 적재하려는 두 점검은 같은 번호의 표지를 둘 다 만들 수 없어 함께 적재하지 못한다. 큐가 받은 뒤의 `<과제>.<지문>.sent`
+# 는 **그 지문을 담은 일반 파일**일 때만 '보냄'이다(폴더 · 끊긴 링크 · 다른 지문 = 보냄 아님). 점검은 다른 지문의 표지를 지우지
+# 않는다 — 표지는 나이로만 치운다(그 지문의 '보냄'이 `NOTICE_MARK_MAX_AGE_S` 보다 오래됐을 때 그 지문의 표지 전부; '보냄'이 없는
+# 지문의 표지는 남겨 위 상한을 지킨다). 방금 만든 표지(`NOTICE_PENDING_STALE_S` 안)는 다른 점검이 지금 보내는 중이다.
+NOTICE_PENDING_STALE_S = 120
+NOTICE_RETRY_MAX = 2
+NOTICE_MARK_MAX_AGE_S = 30 * 86400
+_notice_now = time.time   # 시험이 바꾸는 시계(EA2 — 실제 잠 없음)
+
+NOTICE_RESULT_SENTENCES = {
+    "sent": "wakeup 적재함(이번 점검이 보냄)",
+    "already": "wakeup 생략(같은 상태를 이미 보냈거나 다른 점검이 지금 보내는 중)",
+    "unrecorded": "wakeup 적재하지 않음(알림 기록을 남길 수 없음 — 기록 없이 보내면 매 점검 되풀이된다)",
+    "exhausted": "wakeup 적재하지 않음(같은 알림을 이미 정해진 횟수만큼 적재했으나 '보냄' 기록이 남지 않음 — 더 보내지 않는다)",
+    "failed": "wakeup 적재 도구가 실패를 알림(큐가 받았는지는 알 수 없음 — 이 시도는 정해진 횟수에 센다)",
+}
+
+
+def _notice_marks_dir():
+    return os.path.join(pack_dir(), "state", "notice-marks")
+
+
+def _notice_mark(task, fp, state):
+    return os.path.join(_notice_marks_dir(), "%s.%s.%s" % (task, fp, state))
+
+
+def _notice_create_mark(path, fp=None):
+    """배타 생성 — 그 표지가 이미 있으면 FileExistsError, 만들 수 없으면 그 밖의 OSError(호출부가 가른다). 표지 폴더 자리가
+    폴더가 아니면(파일 · 링크) FileExistsError 가 아니라 NotADirectoryError 다 — '이미 있음'으로 읽히면 기록 없이 매 점검 다시
+    적재하게 된다. 본문 = {pid, at, fp} · 파일과 폴더를 내린다(폴더 내림 실패는 표지를 무르지 않는다 — 잃으면 번호가 묶은 한도 안의
+    다시 적재가 된다)."""
+    d = os.path.dirname(path)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except FileExistsError as e:
+        raise NotADirectoryError(errno.ENOTDIR, "알림 기록 자리가 폴더가 아니다", d) from e
+    if os.path.islink(d) or not os.path.isdir(d):
+        raise NotADirectoryError(errno.ENOTDIR, "알림 기록 자리가 폴더가 아니다", d)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    try:
+        os.write(fd, json.dumps({"pid": os.getpid(), "at": _notice_now(), "fp": fp}).encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        dfd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def _notice_mark_info(path):
+    """일반 파일인 표지의 본문(dict) — 일반 파일이 아니거나(폴더 · 링크) 읽을 수 없으면 None."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    info = _read_json_tolerant(path)
+    return info if isinstance(info, dict) else {}
+
+
+def _notice_is_sent(task, fp):
+    info = _notice_mark_info(_notice_mark(task, fp, "sent"))
+    return isinstance(info, dict) and info.get("fp") == fp
+
+
+def _notice_fresh(info):
+    at = info.get("at") if isinstance(info, dict) else None
+    return isinstance(at, (int, float)) and 0 <= _notice_now() - at < NOTICE_PENDING_STALE_S
+
+
+def _notice_gc():
+    """나이로만 치운다 — '보냄'(그 지문을 담은 일반 파일)이 `NOTICE_MARK_MAX_AGE_S` 보다 오래된 지문의 표지 전부. 다른 경우는
+    지우지 않는다(지금 다른 점검이 쓰는 표지 · '보냄' 없는 지문의 상한 표지)."""
+    d = _notice_marks_dir()
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    old = set()
+    for n in names:
+        if not n.endswith(".sent"):
+            continue
+        task, fp, _s = n.rsplit(".", 2) if n.count(".") >= 2 else (None, None, None)
+        if task is None:
+            continue
+        info = _notice_mark_info(os.path.join(d, n))
+        at = info.get("at") if isinstance(info, dict) else None
+        if isinstance(info, dict) and info.get("fp") == fp and isinstance(at, (int, float)) \
+                and _notice_now() - at > NOTICE_MARK_MAX_AGE_S:
+            old.add("%s.%s." % (task, fp))
+    for n in names:
+        if any(n.startswith(pfx) for pfx in old):
+            try:
+                os.remove(os.path.join(d, n))
+            except OSError:
+                pass
+
+
+def _wakeup_enqueue(wakeup, task, reason, key):
+    """master 큐 적재 1회 — 적재됐으면 True(실패 · 예외 = False · 점검을 막지 않는다)."""
+    try:
+        r = subprocess.run(
+            [sys.executable, wakeup, "enqueue", "--to", "master", "--task", task,
+             "--reason", reason, "--idempotency-key", key],
+            capture_output=True, text=True, timeout=10, env=_utf8_env())
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _notice_once(task, fp, enqueue):
+    """★T2i(RULINGS EC6 · FH3): 알림 하나 — 'sent'(이번에 보냄) | 'already'(이미 보냈거나 다른 점검이 보내는 중) |
+    'unrecorded'(이 적재의 표지를 남길 수 없어 적재하지 않음) | 'exhausted'(첫 적재 + 다시 적재 N 번을 이미 함) |
+    'failed'(큐가 받지 않음 — 다음 점검이 다시). 문장은 `NOTICE_RESULT_SENTENCES`."""
+    _notice_gc()
+    if _notice_is_sent(task, fp):
+        return "already"
+    mark = None
+    for state in ["pending"] + ["retry-%d" % k for k in range(1, NOTICE_RETRY_MAX + 1)]:
+        path = _notice_mark(task, fp, state)
+        try:
+            _notice_create_mark(path, fp)
+        except FileExistsError:
+            if _notice_fresh(_notice_mark_info(path)):
+                return "already"     # 다른 점검이 지금 이 표지로 보내는 중
+            continue                 # 멈춘 점검의 표지 — 다음 번호로 다시
+        except OSError as e:
+            print("[preflight] 알림 '%s' 적재하지 않음 — 알림 기록(%s)을 남길 수 없다(%s) · 기록 없이 보내면 매 점검 되풀이된다"
+                  % (task, path, e), file=sys.stderr)
+            return "unrecorded"
+        mark = path
+        break
+    if mark is None:
+        return "exhausted"
+    if not enqueue():
+        # ★T2i(RULINGS GB1): 표지는 거둬들이지 않는다 — '적재 도구가 실패를 알림'은 '큐가 받지 않음'이 아니다(큐는 대기 항목을 먼저
+        #   저장하고 그 뒤에 감사 원장에 쓴다 — 원장을 쓸 수 없거나 그 사이에 멈추면 항목은 배달된다). 이 시도는 번호를 소비하고,
+        #   한 지문의 적재는 저장소 · 원장 · 프로세스가 어떻든 N + 1 번 이하다(그 뒤 'exhausted'). 표지를 지우는 길은 나이 규칙뿐.
+        return "failed"
+    try:
+        _notice_create_mark(_notice_mark(task, fp, "sent"), fp)
+    except OSError as e:
+        print("[preflight] 알림 '%s' 적재함 — '보냄' 기록을 남기지 못했다(%s) · 다시 적재는 번호를 매긴 표지로 최대 %d 번"
+              % (task, e, NOTICE_RETRY_MAX), file=sys.stderr)
+    return "sent"
 
 
 def _open_unblocking_ro(path, nofollow=False):
