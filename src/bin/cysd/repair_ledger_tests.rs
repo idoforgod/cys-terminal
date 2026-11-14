@@ -4125,3 +4125,112 @@ fn da4_same_target_follows_identity_then_name() {
         "notes/absent2.txt"
     ));
 }
+
+/// A deletion repair committed, reopened by the audit, picked up, recorded and verified again —
+/// ready for its re-commit (the target is Absent: no check child runs).
+fn reopened_deletion(tag: &str) -> (Rig, String) {
+    let r = rig(tag);
+    let w = seat(3, "worker");
+    let id = r
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::remove_file(r.pack.join("bin/a.py")).unwrap();
+    r.call(
+        T0 + 1.0,
+        &w,
+        "record",
+        json!({"repair": id, "note": "delete"}),
+    )
+    .unwrap();
+    r.call(
+        T0 + 2.0,
+        &seat(7, "reviewer-codex"),
+        "attest_verify",
+        json!({"repair": id, "verdict": "pass", "note": "ok"}),
+    )
+    .unwrap();
+    r.call(T0 + 3.0, &w, "commit", json!({"repair": id}))
+        .unwrap();
+    r.call(
+        T0 + 4.0,
+        &seat(8, "reviewer-gemini"),
+        "attest_audit",
+        json!({"repair": id, "verdict": "finding", "note": "again"}),
+    )
+    .unwrap();
+    assert_eq!(
+        r.call(
+            T0 + 5.0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]})
+        )
+        .unwrap()["begin"],
+        "picked-up"
+    );
+    r.call(
+        T0 + 6.0,
+        &w,
+        "record",
+        json!({"repair": id, "note": "delete again"}),
+    )
+    .unwrap();
+    r.call(
+        T0 + 7.0,
+        &seat(7, "reviewer-codex"),
+        "attest_verify",
+        json!({"repair": id, "verdict": "pass", "note": "ok"}),
+    )
+    .unwrap();
+    (r, id)
+}
+
+/// RULINGS DA5: a re-commit meets this lane's row corrupt, or of a newer schema: the commit is
+/// refused saying why, the row's bytes stay as they were, and the record does not change state.
+#[test]
+fn da5_unreadable_lane_row_never_overwritten() {
+    for (tag, newer) in [("da5-corrupt", false), ("da5-future", true)] {
+        let (r, id) = reopened_deletion(tag);
+        let rid = RepairId::parse(&id).unwrap();
+        let path = ledger::lane_path_in(&r.root, &rid, &r.lane);
+        let bytes: Vec<u8> = if newer {
+            let mut v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            v["schema"] = json!(999);
+            serde_json::to_vec(&v).unwrap()
+        } else {
+            b"{ not json".to_vec()
+        };
+        std::fs::write(&path, &bytes).unwrap();
+        let before = r.record_of(&id);
+        let e = r
+            .call(
+                T0 + 8.0,
+                &seat(3, "worker"),
+                "commit",
+                json!({"repair": id}),
+            )
+            .unwrap_err();
+        assert_eq!(e.code, "repair_corrupt", "{tag}: {}", e.message);
+        assert!(e.message.contains("lanes"), "{tag}: {}", e.message);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "{tag}: the lane row was overwritten"
+        );
+        let after = r.record_of(&id);
+        assert_eq!(
+            after.state,
+            RepairState::InProgress,
+            "{tag}: the record moved"
+        );
+        assert_eq!(after.committed, before.committed, "{tag}");
+    }
+}

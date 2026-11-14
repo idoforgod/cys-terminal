@@ -2147,6 +2147,23 @@ mod ledger_verbs {
             .collect()
     }
 
+    /// RULINGS DA5 (O-C1-6 / O-C1-7): `commit` writes this lane's row; a row that exists but is
+    /// corrupt or of a newer schema is never overwritten — refused with the reason, bytes kept.
+    fn lane_row_readable(ctx: &Ctx<'_>, id: &RepairId) -> Result<(), VerbError> {
+        match ledger::read_lane_in(&ctx.root, id, &ctx.lane) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(VerbError::new(
+                cys::repair::types::ERR_CORRUPT,
+                format!(
+                    "{}: 이 부서의 수리 행({})을 읽을 수 없습니다(손상되었거나 더 새 형식) — 원본을 그대로 두고 확정하지 않습니다: {}",
+                    id.as_str(),
+                    ledger::lane_path_in(&ctx.root, id, &ctx.lane).display(),
+                    VerbError::from(e).message
+                ),
+            )),
+        }
+    }
+
     /// RULINGS AW3 (b) / (c) over a repair's file targets: no link / junction in a target's parent
     /// chain inside the lane's pack (the leaf may be a link — U2); with `states`, a `Link` state is
     /// refused when it points to a directory or into any lane's pack.
@@ -2760,6 +2777,9 @@ mod ledger_verbs {
                     format!("{}: 검증 서명이 고친 좌석의 것입니다 — 다른 좌석의 리뷰어1 서명이 필요합니다", id.as_str()),
                 ));
             }
+            // DA5: this lane's row must be absent or readable — a corrupt or newer-schema row is never
+            // overwritten (O-C1-6 / O-C1-7): refused BEFORE any state transition.
+            lane_row_readable(ctx, &id)?;
             path_rules(ctx, &rec, None)?;
             let states = current_states(ctx, &rec)?;
             path_rules(ctx, &rec, Some(states.as_slice()))?;
@@ -2785,6 +2805,7 @@ mod ledger_verbs {
             }
             path_rules(ctx, &rec, Some(states.as_slice()))?;
             cys::repair::boot_critical::refuse_identity_alias(&ctx.pack_dir, file_targets(&rec).map(|f| f.rel.as_str())).map_err(|why| VerbError::new(cys::repair::types::ERR_PRECONDITION, why))?; // RULINGS AW3 (d)
+            lane_row_readable(ctx, &id)?; // DA5
             if current_states(ctx, &rec)? != states {
                 return Err(VerbError::new(
                     "target_changed",
@@ -2905,7 +2926,24 @@ mod ledger_verbs {
                 }
             }
             let (version, pro) = pack_generation(&ctx.pack_dir);
-            let previous = ledger::read_lane_in(&ctx.root, &id, &ctx.lane).ok().flatten();
+            // DA5: read again — a row that became unreadable since step (3a) is left as it is
+            let previous = match ledger::read_lane_in(&ctx.root, &id, &ctx.lane) {
+                Ok(p) => p,
+                Err(e) => {
+                    warnings.push(format!(
+                        "이 부서의 수리 행을 읽을 수 없게 되어 그대로 두었습니다(덮어쓰지 않음) — {}",
+                        VerbError::from(e).message
+                    ));
+                    return Ok(reply(ctx, &rec, json!({
+                        "committed": committed,
+                        "audit_due_at": rec.audit_due_at,
+                        "hook_step": if !has_hooks { json!(null) } else if let Some(e) = &step_error { json!({"error": e}) } else { json!("ok") },
+                        "superseded": superseded.iter().map(|r| r.as_str().to_string()).collect::<Vec<_>>(),
+                        "warnings": warnings,
+                        "lane_row": "unreadable",
+                    })));
+                }
+            };
             let mut applied_history = previous.as_ref().map(|r| r.applied_history.clone()).unwrap_or_default();
             if let Some(prev) = &previous {
                 if !prev.applied.is_empty() && prev.applied != committed {
