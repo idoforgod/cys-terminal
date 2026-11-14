@@ -926,97 +926,27 @@ pub fn i4_region<'a>(text: &'a str, first: &str, last: &str) -> Option<String> {
 
 // ───────────────────────────── census (iii) — deny rules and branches ─────────────────────────────
 
-/// The text an anchor of [`CENSUS_PINS`] is compared with: the line without quote, bracket and
-/// backslash characters, white space collapsed to single spaces and trimmed — so the pin table holds
-/// plain strings (no escape, no bracket inside the block — RULINGS CO1 / CS1).
-pub fn anchor_text(line: &str) -> String {
-    let kept: String = line
-        .chars()
-        .filter(|c| !matches!(c, '"' | '\'' | '[' | ']' | '\\'))
-        .collect();
-    kept.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// RULINGS CZ7 — one census region of a device text: from the ONE line whose [`anchor_text`] is
-/// `start` up to, not including, the ONE line whose anchor text is `end` (`""` = to the end of the
-/// text). Each anchor must occur exactly once in the whole text, the end after the start. Returns
-/// (line count, sha256 hex of the region's lines joined by LF) — the region pinned WHOLE.
-pub fn census_region(text: &str, start: &str, end: &str) -> Result<(usize, String), String> {
+/// RULINGS GA7 — census (iii) pins each released device WHOLE: (line count, sha256 hex of the lines
+/// joined by LF — the file's text itself). No anchor, no free region: a region between two anchors
+/// accepted any top-level statement placed in it (EL6's form left that hole).
+pub fn census_pinned(text: &str) -> (usize, String) {
     use sha2::{Digest, Sha256};
-    let lines: Vec<&str> = text.split('\n').collect();
-    let at = |a: &str| -> Result<usize, String> {
-        let hits: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| anchor_text(l) == a)
-            .map(|(i, _)| i)
-            .collect();
-        match hits.as_slice() {
-            [i] => Ok(*i),
-            [] => Err(format!("anchor not found: {a:?}")),
-            _ => Err(format!("anchor occurs {} times: {a:?}", hits.len())),
-        }
-    };
-    let s = at(start)?;
-    let e = if end.is_empty() { lines.len() } else { at(end)? };
-    if e <= s {
-        return Err(format!("anchor {end:?} does not follow {start:?}"));
-    }
-    let region = lines[s..e].join("\n");
-    let h = Sha256::digest(region.as_bytes());
-    Ok((e - s, h.iter().map(|b| format!("{b:02x}")).collect()))
+    let h = Sha256::digest(text.as_bytes());
+    (
+        text.split('\n').count(),
+        h.iter().map(|b| format!("{b:02x}")).collect(),
+    )
 }
 
-/// RULINGS EL6 — census (iii) pins the WHOLE released device except DECLARED free regions (CZ7
-/// inverted: pinning named regions had left the dispatch outside every pin). The digest is the sha256
-/// of the device's lines, LF-joined, with the lines of every free region of that device removed (a free
-/// region runs from the ONE line whose anchor text is its start up to, not including, the ONE line
-/// whose anchor text is its end — [`census_region`]'s anchors). Returns (pinned line count, digest).
-pub fn census_pinned(text: &str, frees: &[(&str, &str)]) -> Result<(usize, String), String> {
-    use sha2::{Digest, Sha256};
-    let lines: Vec<&str> = text.split('\n').collect();
-    let at = |a: &str| -> Result<usize, String> {
-        let hits: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| anchor_text(l) == a)
-            .map(|(i, _)| i)
-            .collect();
-        match hits.as_slice() {
-            [i] => Ok(*i),
-            [] => Err(format!("anchor not found: {a:?}")),
-            _ => Err(format!("anchor occurs {} times: {a:?}", hits.len())),
-        }
-    };
-    let mut free = vec![false; lines.len()];
-    for (start, end) in frees {
-        let (s, e) = (at(start)?, at(end)?);
-        if e <= s {
-            return Err(format!("anchor {end:?} does not follow {start:?}"));
-        }
-        for f in free.iter_mut().take(e).skip(s) {
-            *f = true;
-        }
-    }
-    let kept: Vec<&str> = lines
-        .iter()
-        .zip(free.iter())
-        .filter(|(_, f)| !**f)
-        .map(|(l, _)| *l)
-        .collect();
-    let h = Sha256::digest(kept.join("\n").as_bytes());
-    Ok((kept.len(), h.iter().map(|b| format!("{b:02x}")).collect()))
-}
-
-/// RULINGS EL6 / CZ7 — census (iii): per released device ONE `pin` row (device, `pin`, "", "", pinned
-/// line count, sha256 — [`census_pinned`]) and its `free` rows (device, `free`, start anchor, end
-/// anchor, 0, the reason the region is free). DEFAULT = PINNED: guard.sh and `_lib.sh` are pinned
-/// whole (their `_lib.sh` prelude sourcing, its `CYS_PACK_DIR` fallback and the `exit 0` when the
-/// library is missing included — EO3); the gate is pinned whole except its self-tests (the dispatch
-/// `if CAPGATE_SELF_TEST … else main()` after them is pinned). Any edit outside a free region — a
-/// comment included — fails `screen::tests::census_iii_deny_rules_and_branches_pinned` until the
-/// corpora and cells are reviewed against the device and this table is updated (CM4: a lib-suite
-/// test); a pack-only release that edits a protection file is held by it.
+/// RULINGS GA7 / CO1 / CS1 — census (iii): per released device ONE `pin` row (device, `pin`, "", "",
+/// line count, sha256 — [`census_pinned`] over the WHOLE file). guard.sh, the capability gate (its
+/// self-tests included) and `_lib.sh` are pinned whole. Any edit — a comment included — fails
+/// `screen::tests::census_iii_deny_rules_and_branches_pinned` until the corpora and cells are reviewed
+/// against the device and this table is updated (CM4: a lib-suite test). Consequence (GA7): in release
+/// 1 `hooks/guard.sh` and `hooks/role-capability-gate.sh` — the gate's self-tests included — change
+/// only through a vendor update; a pack-only release that edits either is held by the pack-release
+/// gate (CO1: the pins at the binary's tag). The two empty columns keep the row shape the gate's
+/// compared block was built for.
 pub const CENSUS_PINS: &[(&str, &str, &str, &str, usize, &str)] = &[
     (
         "hooks/guard.sh",
@@ -1031,16 +961,8 @@ pub const CENSUS_PINS: &[(&str, &str, &str, &str, usize, &str)] = &[
         "pin",
         "",
         "",
-        3464,
-        "f145731c70b6da7d6394780766747ee047b90cabf7fb6a60e97b7eae93873da3",
-    ),
-    (
-        "hooks/role-capability-gate.sh",
-        "free",
-        "def self_test():",
-        "if os.environ.get(CAPGATE_SELF_TEST):",
-        0,
-        "the self-tests run only under CAPGATE_SELF_TEST which no harness and no screen sets",
+        5197,
+        "7113d4327b41aae171527b55c81fb0ac6a997c458b7d0001b21907d6cd50d812",
     ),
     (
         "hooks/_lib.sh",
