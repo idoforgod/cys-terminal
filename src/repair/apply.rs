@@ -1898,6 +1898,116 @@ pub fn production_screen_step(
 /// Wall-time bound of the apply-time screen (the screen's whole run; exceeded → decline).
 pub const SCREEN_DEADLINE: Duration = Duration::from_secs(300);
 
+// ───────────────────────────── CT4 — one apply = one recoverable unit ─────────────────────────────
+
+/// One target of an apply intent: its pre-image and the approved state (canon strings).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IntentTarget {
+    pub rel: String,
+    pub pre: String,
+    pub incoming: String,
+}
+
+/// RULINGS CT4 — the repair-level intent of one approved apply in one lane, durable BEFORE the first
+/// exchange (`<root>/R-<n>/intents/<lane>.json`): `applying` → `applied` | `undone` | `incomplete`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ApplyIntent {
+    pub schema: u32,
+    pub repair: RepairId,
+    pub lane_key: LaneKey,
+    pub op_tag: String,
+    pub state: String,
+    pub targets: Vec<IntentTarget>,
+    #[serde(default)]
+    pub note: String,
+    pub created_at: f64,
+    pub updated_at: f64,
+}
+
+pub fn intent_path_in(root: &Path, id: &RepairId, lane: &LaneKey) -> PathBuf {
+    ledger::repair_dir_in(root, id).join("intents").join(format!("{}.json", lane.0))
+}
+
+pub fn read_intent_in(root: &Path, id: &RepairId, lane: &LaneKey) -> Option<ApplyIntent> {
+    let b = std::fs::read(intent_path_in(root, id, lane)).ok()?;
+    serde_json::from_slice(&b).ok()
+}
+
+fn write_intent(root: &Path, intent: &ApplyIntent) -> Result<(), RepairError> {
+    super::durable::write_json_durable(&intent_path_in(root, &intent.repair, &intent.lane_key), intent)
+}
+
+fn set_intent_state(root: &Path, intent: &mut ApplyIntent, state: &str, note: &str, now: f64) -> Result<(), RepairError> {
+    intent.state = state.to_string();
+    intent.note = note.chars().take(400).collect();
+    intent.updated_at = now;
+    write_intent(root, intent)
+}
+
+/// CT4 recovery (the next ready tick, under the pack-apply lock — CT5): every `applying` intent of
+/// THIS lane is completed or undone AS A WHOLE. Its record already in 시험 기간 with this lane's row
+/// → the apply had finished (only the intent's last write was lost): `applied`. Otherwise every
+/// target whose live state is the approved one is put back to its pre-image by a checked operation
+/// — operations that had individually finished included — and the approval is void (`undone`);
+/// what cannot be put back leaves the lane row 충돌 with exactly those targets, revertible
+/// (`incomplete`). Per repair fault-isolated (CU1): one repair's failure is a line, not an abort.
+pub fn recover_apply_intents_in(env: &OpEnv<'_>, locked: &RepairLock<'_>) -> Vec<String> {
+    let mut lines = Vec::new();
+    for id in ledger::list_ids_in(env.root) {
+        let Some(mut intent) = read_intent_in(env.root, &id, env.lane) else {
+            continue;
+        };
+        if intent.state != "applying" {
+            continue;
+        }
+        match recover_one_intent(env, &mut intent, locked) {
+            Ok(line) => lines.push(line),
+            Err(e) => lines.push(format!("{}: 끊긴 적용을 정리하지 못했습니다 — 다음 차례에 다시({e:?})", id.as_str())),
+        }
+    }
+    lines
+}
+
+fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &RepairLock<'_>) -> Result<String, RepairError> {
+    let id = intent.repair.clone();
+    let rec = ledger::read_record_in(env.root, &id)?
+        .ok_or_else(|| RepairError::Corrupt(format!("{}: 적용 의도는 있는데 수리 기록이 없습니다", id.as_str())))?;
+    let row = ledger::read_lane_in(env.root, &id, env.lane)?;
+    if matches!(rec.state, RepairState::Probation | RepairState::InUse)
+        && row.as_ref().is_some_and(|r| r.probation.is_some() && r.state != LaneState::Conflict)
+    {
+        set_intent_state(env.root, intent, "applied", "기록과 부서 행이 이미 확정되어 있었습니다", env.now)?;
+        return Ok(format!("{}: 끊긴 적용은 이미 끝나 있었습니다(의도 기록만 마저 씀)", id.as_str()));
+    }
+    let mut specs = Vec::new();
+    for t in &intent.targets {
+        let pre = parse_canon(&t.pre).ok_or_else(|| RepairError::Corrupt(format!("{}: 의도의 상태를 읽을 수 없습니다", t.rel)))?;
+        let incoming = parse_canon(&t.incoming).ok_or_else(|| RepairError::Corrupt(format!("{}: 의도의 상태를 읽을 수 없습니다", t.rel)))?;
+        specs.push(OpSpec {
+            id: id.clone(),
+            rel: t.rel.clone(),
+            kind: "apply".into(),
+            expected: pre,
+            incoming,
+            source: None,
+            generation: None,
+        });
+    }
+    let left = undo_applied_with(env, &specs, &rec, true)?;
+    if left.is_empty() {
+        let why = "적용 중에 끊겨 바꾼 것을 모두 되돌렸습니다 — 다시 승인이 필요합니다";
+        void_approval(env, &id, why, locked)?;
+        set_intent_state(env.root, intent, "undone", why, env.now)?;
+        return Ok(format!("{}: {why}", id.as_str()));
+    }
+    let detail = left.iter().map(|(r, w)| format!("{r}: {w}")).collect::<Vec<_>>().join(" · ");
+    let why = format!("적용 중에 끊겼고 바꾼 것을 다 되돌리지 못했습니다(충돌 — cys repair revert {} 로 되돌릴 수 있습니다) · {detail}", id.as_str());
+    mark_incomplete_apply(env, &id, &rec, &specs, &why, locked)?;
+    set_intent_state(env.root, intent, "incomplete", &why, env.now)?;
+    Ok(format!("{}: {why}", id.as_str()))
+}
+
+
 /// What the approved apply did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyReport {
@@ -2100,6 +2210,24 @@ pub fn apply_candidate_in(
             slot.clone(),
         ));
     }
+    // CT4: the repair-level intent is durable BEFORE the first exchange
+    let mut intent = ApplyIntent {
+        schema: super::REPAIR_SCHEMA,
+        repair: id.clone(),
+        lane_key: env.lane.clone(),
+        op_tag: op_tag.clone(),
+        state: "applying".into(),
+        targets: plan
+            .iter()
+            .map(|(sp, _)| IntentTarget { rel: sp.rel.clone(), pre: sp.expected.canon(), incoming: sp.incoming.canon() })
+            .collect(),
+        note: String::new(),
+        created_at: env.now,
+        updated_at: env.now,
+    };
+    if let Err(e) = write_intent(env.root, &intent) {
+        return decline(format!("{}: 적용 의도를 기록할 수 없어 아무것도 바꾸지 않았습니다 — {e:?}", id.as_str()));
+    }
     // rule one per target — the exchange uses the very slot that was fingerprinted
     let mut results: Vec<(String, ApplyOutcome)> = Vec::new();
     let mut applied: Vec<OpSpec> = Vec::new();
@@ -2156,16 +2284,23 @@ pub fn apply_candidate_in(
             id = id.as_str()
         );
         mark_incomplete_apply(env, id, &rec, &attempted, &msg, locked)?;
+        let mut i2 = intent.clone();
+        set_intent_state(env.root, &mut i2, "incomplete", &msg, env.now)?;
         Ok(Some(ApplyReport {
             outcome: ApplyOutcome::Declined(msg),
             files,
         }))
+    };
+    let mark_undone = |why: &str| -> Result<(), RepairError> {
+        let mut i2 = intent.clone();
+        set_intent_state(env.root, &mut i2, "undone", why, env.now)
     };
     if let Some(why) = failed {
         // put back what this apply already changed (rule one), then decline
         if let Some(r) = undo_then(&why, results.clone())? {
             return Ok(r);
         }
+        mark_undone(&why)?;
         return decline(format!("{}: 적용이 끝까지 가지 못해 바꾼 것을 되돌렸습니다 — {why}", id.as_str()));
     }
     // Q3: the live states reproduce the approved fingerprint
@@ -2177,6 +2312,7 @@ pub fn apply_candidate_in(
         if let Some(r) = undo_then("적용 뒤 살아 있는 파일이 승인된 지문과 다릅니다", results.clone())? {
             return Ok(r);
         }
+        mark_undone("적용 뒤 살아 있는 파일이 승인된 지문과 다릅니다")?;
         return decline(format!(
             "{}: 적용 뒤 살아 있는 파일이 승인된 지문과 다릅니다 — 되돌렸습니다",
             id.as_str()
@@ -2206,6 +2342,7 @@ pub fn apply_candidate_in(
                 if let Some(r) = undo_then(&format!("{rel}: 적용 직후 검사 실패 — {why}"), results.clone())? {
                     return Ok(r);
                 }
+                mark_undone(&format!("{rel}: 적용 직후 검사 실패 — {why}"))?;
                 mark_reverted_after_apply_check(env, id, &format!("{rel}: {why}"), locked)?;
                 return Ok(ApplyReport {
                     outcome: ApplyOutcome::Declined(format!(
@@ -2278,6 +2415,7 @@ pub fn apply_candidate_in(
             );
         }
     }
+    set_intent_state(env.root, &mut intent, "applied", "", env.now)?;
     supersede_older_in(env.root, env.lane, &rec, locked)?;
     Ok(ApplyReport {
         outcome: ApplyOutcome::Applied,
@@ -2361,6 +2499,12 @@ fn exchange_prepared(
 /// whose expected state is what is actually live now (CT3). Returns the targets that could NOT be
 /// put back (rel, why) — empty = every change undone.
 fn undo_applied(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord) -> Result<Vec<(String, String)>, RepairError> {
+    undo_applied_with(env, applied, rec, false)
+}
+
+/// [`undo_applied`]; `only_ours` (CT4 recovery): a target whose live state is neither the pre-image
+/// nor the apply's state is left alone and reported (someone else wrote it after the crash).
+fn undo_applied_with(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord, only_ours: bool) -> Result<Vec<(String, String)>, RepairError> {
     let mut left = Vec::new();
     for spec in applied.iter().rev() {
         let (pre, holder) = match pre_image_for(env.root, rec, env.lane, &spec.rel) {
@@ -2373,6 +2517,10 @@ fn undo_applied(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord) -> Resu
         let live_now = TargetState::read(&env.pack.join(&spec.rel))?;
         if live_now == pre {
             continue; // already the pre-image (e.g. undone by the operation's own CT3 check)
+        }
+        if only_ours && live_now != spec.incoming {
+            left.push((spec.rel.clone(), format!("살아 있는 것이 적용 전도 적용 결과도 아닙니다({}) — 그대로 둠", live_now.canon())));
+            continue;
         }
         let back = OpSpec {
             id: spec.id.clone(),

@@ -1526,3 +1526,105 @@ fn hook_step_declines_when_its_dry_run_cannot_be_measured() {
     assert!(ops.is_empty(), "nothing recorded");
     assert!(crate::repair::tombstones::load_in(&r.root, &r.lane).unwrap().is_empty(), "no tombstone");
 }
+
+// ───────────────────────────── RULINGS CT4 — one apply = one recoverable unit ─────────────────────────────
+
+/// Two-target approved candidate of `R` (boot-critical), returned with its candidate files.
+fn two_target_candidate(r: &Rig, id: &RepairId) -> Vec<CandidateFile> {
+    let mut files = Vec::new();
+    let mut changes = Vec::new();
+    let mut states = Vec::new();
+    for (rel, pre, post) in [("hooks/a1.sh", b"PRE-1\n", b"NEW-1\n"), ("hooks/a2.sh", b"PRE-2\n", b"NEW-2\n")] {
+        r.put(rel, pre, 0o755);
+        let pre_img = ledger::copy_preimage_in(&r.root, id, &r.lane, rel, &r.pack.join(rel), 1.0).unwrap();
+        let staging = ledger::staging_dir_in(&r.root, id).join(rel);
+        std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
+        std::fs::write(&staging, post).unwrap();
+        let st = TargetState::read(&staging).unwrap();
+        states.push((rel.to_string(), st.clone()));
+        changes.push(FileChange { rel: rel.into(), kind: ChangeKind::Edit, pre: pre_img, post: st, diff: None });
+        files.push(CandidateFile { rel: rel.into(), staged: staging, mode: 0o644 });
+    }
+    let fp = crate::repair::types::fingerprint(&states);
+    let mut rec = record(r, id, Classification::BootCritical, changes, RepairState::AwaitingApproval);
+    rec.approval = Some(approval(&fp));
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    files
+}
+
+/// Stops (a simulated crash) at `point` of the operation on `rel` only.
+struct StopOn {
+    rel: &'static str,
+    point: Point,
+    fired: Cell<bool>,
+}
+
+impl Faults for StopOn {
+    fn at(&self, point: Point, live: &Path, _slot: Option<&Slot>) -> bool {
+        if point == self.point && live.ends_with(self.rel) && !self.fired.get() {
+            self.fired.set(true);
+            return true;
+        }
+        false
+    }
+}
+
+/// CT4 (blocking 4): a crash BETWEEN the targets of one approved apply — the first target's
+/// operation already finished — is undone AS A WHOLE by the next run: both files back at their
+/// pre-images, the approval void, the intent `undone`; and a crash right after the second exchange
+/// the same. Without CT4 the first file kept the approved bytes with no record and no lane row.
+#[cfg(target_os = "macos")]
+#[test]
+fn crash_between_the_targets_of_one_apply_is_undone_as_a_whole() {
+    for point in [Point::AfterRecord, Point::AfterSeal, Point::BeforeDone] {
+        let r = rig("ct4crash");
+        let id = rid("R-40");
+        let files = two_target_candidate(&r, &id);
+        let faults = StopOn { rel: "hooks/a2.sh", point, fired: Cell::new(false) };
+        let env = r.env(&faults, ApplyForm::Exchange);
+        let res = apply_candidate_in(&env, &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock);
+        assert!(faults.fired.get(), "{point:?}: the stop fired");
+        assert!(res.is_err(), "{point:?}: the simulated crash");
+        assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"NEW-1\n", "{point:?}: the first target was applied before the crash");
+        assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "applying");
+        // the next ready tick: interrupted operations, then the intent
+        let calm = r.env(&NoFaults, ApplyForm::Exchange);
+        resume_interrupted_in(&calm).unwrap();
+        let lines = recover_apply_intents_in(&calm, &no_repair_lock);
+        assert_eq!(lines.len(), 1, "{point:?}: {lines:?}");
+        assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"PRE-1\n", "{point:?}: the finished first target is undone too");
+        assert_eq!(std::fs::read(r.pack.join("hooks/a2.sh")).unwrap(), b"PRE-2\n", "{point:?}");
+        assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "undone");
+        let after = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
+        assert_eq!(after.state, RepairState::InProgress, "{point:?}: back to 진행 중, approval void");
+        assert!(after.approval.is_none());
+        assert!(r.vault_bytes().contains(&b"NEW-1\n".to_vec()), "the approved bytes stay in the vault");
+        // idempotent: a second recovery does nothing
+        assert!(recover_apply_intents_in(&calm, &no_repair_lock).is_empty());
+    }
+}
+
+/// CT4: when the recovery cannot put a target back (someone else wrote it after the crash), the
+/// lane row says 충돌 with exactly the targets still at the apply's state — revertible — and the
+/// intent is `incomplete`; the foreign bytes are left alone.
+#[cfg(target_os = "macos")]
+#[test]
+fn unrecoverable_target_leaves_a_revertible_conflict_row() {
+    let r = rig("ct4conflict");
+    let id = rid("R-41");
+    let files = two_target_candidate(&r, &id);
+    let faults = StopOn { rel: "hooks/a2.sh", point: Point::BeforeDone, fired: Cell::new(false) };
+    assert!(apply_candidate_in(&r.env(&faults, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
+    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    resume_interrupted_in(&calm).unwrap();
+    // another writer changes the second file before the recovery runs
+    r.put("hooks/a2.sh", b"SOMEONE-ELSE\n", 0o755);
+    let lines = recover_apply_intents_in(&calm, &no_repair_lock);
+    assert!(lines[0].contains("충돌"), "{lines:?}");
+    assert_eq!(std::fs::read(r.pack.join("hooks/a2.sh")).unwrap(), b"SOMEONE-ELSE\n", "foreign bytes left alone");
+    assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"PRE-1\n", "our own target undone");
+    assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "incomplete");
+    let row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+    assert_eq!(row.state, LaneState::Conflict);
+    assert!(row.applied.is_empty(), "nothing of the apply is live any more: {:?}", row.applied);
+}
