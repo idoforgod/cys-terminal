@@ -6554,11 +6554,9 @@ class Preflight:
         #   대기 중일 때만 묶으므로, 지문 기록 없이는 배달 뒤 다음 점검이 같은 목록을 다시 적재한다. 집합이 바뀌면 새로
         #   보이고, 집합이 비면 기록을 지운다(같은 수정이 나중에 다시 보관되면 다시 보인다). 적재가 실패하면 기록하지
         #   않는다(다음 점검이 다시 시도).
-        # ★T2i(RULINGS EC6): 알림의 두 상태('보내는 중' · '보냄')를 지문마다 배타 생성 표지로 남긴다(`_notice_once`) — 공유
-        #   파일을 읽고 고쳐 쓰지 않는다. 집합이 비면 그 과제의 표지만 지운다(C68 의 `merge-review` 는 C68 이 관리한다).
-        for t in ("parked-merge", "legacy-user-list"):
-            if t not in fps:
-                _notice_clear(t)
+        # ★T2i(RULINGS EC6 · FH3): 적재마다 자기 표지(배타 생성 · 다시 적재는 번호로 묶음)를 먼저 남긴다(`_notice_once`) — 공유
+        #   파일을 읽고 고쳐 쓰지 않고, 다른 지문의 표지를 지우지 않는다(표지는 나이로만 치운다 · 같은 집합이 '보냄' 뒤
+        #   `NOTICE_MARK_MAX_AGE_S` 안에 다시 오면 다시 알리지 않는다 — C62 WARN 은 매 부트 보인다).
         for task, reason, key in jobs:
             _notice_once(task, fps[task],
                          lambda reason=reason, key=key, task=task: _wakeup_enqueue(
@@ -8752,20 +8750,24 @@ def _open_nofollow(path, flags, mode=0o600):
     return os.open(path, flags | getattr(os, "O_NOFOLLOW", 0), mode)
 
 
-# ── ★T2i(RULINGS EC6) — 알림의 두 영속 상태 ─────────────────────────────────────────────────────────────
-# 알림 하나(과제 + 지문)는 **'보내는 중'(pending)** 표지를 큐에 묻기 **전에**, **'보냄'(sent)** 표지를 큐가 받은 **뒤에** 남긴다 —
-# 둘 다 배타 생성(O_EXCL · 링크 비추종)으로 한 번씩, 지문마다 따로(`<팩>/state/notice-marks/<과제>.<지문>.<상태>`). 두 점검이
-# 서로의 표지를 지우지 않고, '보내는 중'을 만든 쪽이 적재한다. '보내는 중'을 남길 수 없으면 적재하지 않는다(쓸 수 없는 저장소에서
-# 매 점검 반복 없음 · stderr 한 줄). '보내는 중'만 있고 '보냄'이 없으면(적재와 '보냄' 사이에 멈춤 · 적재 전에 멈춤) 다음 점검이
-# 같은 키로 다시 적재한다 — 큐는 대기 중인 같은 키를 묶으므로 최악은 **한 번 더** 배달이고, 잃거나 되풀이하지 않는다. 방금 만든
-# '보내는 중'(`NOTICE_PENDING_STALE_S` 안)은 다른 점검이 지금 보내는 중이라 건드리지 않는다.
+# ── ★T2i(RULINGS EC6 · FH3) — 알림의 영속 표지: 적재마다 자기 표지 하나, 다시 적재는 번호를 매겨 횟수를 묶는다 ──────────
+# 알림 하나(과제 + 지문)의 **모든 적재 앞에는 그 적재만의 표지**가 배타 생성(O_EXCL · 링크 비추종)으로 먼저 생긴다 — 첫 적재는
+# `<과제>.<지문>.pending`, 오래된 'pending'(멈춘 점검)의 다시 적재는 번호를 매긴 `<과제>.<지문>.retry-<k>`(k = 1 … N,
+# `NOTICE_RETRY_MAX`). 표지를 만들지 못하면 적재하지 않는다. 그래서 한 지문의 배달은 저장소가 그 뒤에 어떻든 **N + 1 번 이하**이고,
+# 동시에 다시 적재하려는 두 점검은 같은 번호의 표지를 둘 다 만들 수 없어 함께 적재하지 못한다. 큐가 받은 뒤의 `<과제>.<지문>.sent`
+# 는 **그 지문을 담은 일반 파일**일 때만 '보냄'이다(폴더 · 끊긴 링크 · 다른 지문 = 보냄 아님). 점검은 다른 지문의 표지를 지우지
+# 않는다 — 표지는 나이로만 치운다(그 지문의 '보냄'이 `NOTICE_MARK_MAX_AGE_S` 보다 오래됐을 때 그 지문의 표지 전부; '보냄'이 없는
+# 지문의 표지는 남겨 위 상한을 지킨다). 방금 만든 표지(`NOTICE_PENDING_STALE_S` 안)는 다른 점검이 지금 보내는 중이다.
 NOTICE_PENDING_STALE_S = 120
+NOTICE_RETRY_MAX = 2
+NOTICE_MARK_MAX_AGE_S = 30 * 86400
 _notice_now = time.time   # 시험이 바꾸는 시계(EA2 — 실제 잠 없음)
 
 NOTICE_RESULT_SENTENCES = {
     "sent": "wakeup 적재함(이번 점검이 보냄)",
     "already": "wakeup 생략(같은 상태를 이미 보냈거나 다른 점검이 지금 보내는 중)",
     "unrecorded": "wakeup 적재하지 않음(알림 기록을 남길 수 없음 — 기록 없이 보내면 매 점검 되풀이된다)",
+    "exhausted": "wakeup 적재하지 않음(같은 알림을 이미 정해진 횟수만큼 적재했으나 '보냄' 기록이 남지 않음 — 더 보내지 않는다)",
     "failed": "wakeup 적재 실패(큐가 받지 않음 — 다음 점검이 다시 시도)",
 }
 
@@ -8778,10 +8780,11 @@ def _notice_mark(task, fp, state):
     return os.path.join(_notice_marks_dir(), "%s.%s.%s" % (task, fp, state))
 
 
-def _notice_create_mark(path):
+def _notice_create_mark(path, fp=None):
     """배타 생성 — 그 표지가 이미 있으면 FileExistsError, 만들 수 없으면 그 밖의 OSError(호출부가 가른다). 표지 폴더 자리가
     폴더가 아니면(파일 · 링크) FileExistsError 가 아니라 NotADirectoryError 다 — '이미 있음'으로 읽히면 기록 없이 매 점검 다시
-    적재하게 된다."""
+    적재하게 된다. 본문 = {pid, at, fp} · 파일과 폴더를 내린다(폴더 내림 실패는 표지를 무르지 않는다 — 잃으면 번호가 묶은 한도 안의
+    다시 적재가 된다)."""
     d = os.path.dirname(path)
     try:
         os.makedirs(d, exist_ok=True)
@@ -8791,22 +8794,64 @@ def _notice_create_mark(path):
         raise NotADirectoryError(errno.ENOTDIR, "알림 기록 자리가 폴더가 아니다", d)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
     try:
-        os.write(fd, json.dumps({"pid": os.getpid(), "at": _notice_now()}).encode("utf-8"))
+        os.write(fd, json.dumps({"pid": os.getpid(), "at": _notice_now(), "fp": fp}).encode("utf-8"))
         os.fsync(fd)
     finally:
         os.close(fd)
+    try:
+        dfd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
 
 
-def _notice_clear(task, keep_fp=None):
-    """그 과제의 표지를 지운다(`keep_fp` 의 표지는 남긴다) — 집합이 비었거나 바뀌었을 때(같은 집합이 나중에 다시 오면 다시 알린다)."""
+def _notice_mark_info(path):
+    """일반 파일인 표지의 본문(dict) — 일반 파일이 아니거나(폴더 · 링크) 읽을 수 없으면 None."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    info = _read_json_tolerant(path)
+    return info if isinstance(info, dict) else {}
+
+
+def _notice_is_sent(task, fp):
+    info = _notice_mark_info(_notice_mark(task, fp, "sent"))
+    return isinstance(info, dict) and info.get("fp") == fp
+
+
+def _notice_fresh(info):
+    at = info.get("at") if isinstance(info, dict) else None
+    return isinstance(at, (int, float)) and 0 <= _notice_now() - at < NOTICE_PENDING_STALE_S
+
+
+def _notice_gc():
+    """나이로만 치운다 — '보냄'(그 지문을 담은 일반 파일)이 `NOTICE_MARK_MAX_AGE_S` 보다 오래된 지문의 표지 전부. 다른 경우는
+    지우지 않는다(지금 다른 점검이 쓰는 표지 · '보냄' 없는 지문의 상한 표지)."""
     d = _notice_marks_dir()
     try:
         names = os.listdir(d)
     except OSError:
         return
-    keep = None if keep_fp is None else "%s.%s." % (task, keep_fp)
+    old = set()
     for n in names:
-        if n.startswith(task + ".") and not (keep and n.startswith(keep)):
+        if not n.endswith(".sent"):
+            continue
+        task, fp, _s = n.rsplit(".", 2) if n.count(".") >= 2 else (None, None, None)
+        if task is None:
+            continue
+        info = _notice_mark_info(os.path.join(d, n))
+        at = info.get("at") if isinstance(info, dict) else None
+        if isinstance(info, dict) and info.get("fp") == fp and isinstance(at, (int, float)) \
+                and _notice_now() - at > NOTICE_MARK_MAX_AGE_S:
+            old.add("%s.%s." % (task, fp))
+    for n in names:
+        if any(n.startswith(pfx) for pfx in old):
             try:
                 os.remove(os.path.join(d, n))
             except OSError:
@@ -8826,38 +8871,40 @@ def _wakeup_enqueue(wakeup, task, reason, key):
 
 
 def _notice_once(task, fp, enqueue):
-    """★T2i(RULINGS EC6): 알림 하나를 보낸다 — 'sent'(이번에 보냄) | 'already'(이미 보냈거나 다른 점검이 보내는 중) |
-    'unrecorded'(기록을 남길 수 없어 적재하지 않음) | 'failed'(큐가 받지 않음 — 다음 점검이 다시). 문장은 `NOTICE_RESULT_SENTENCES`."""
-    sent_p = _notice_mark(task, fp, "sent")
-    pend_p = _notice_mark(task, fp, "pending")
-    if os.path.lexists(sent_p):
+    """★T2i(RULINGS EC6 · FH3): 알림 하나 — 'sent'(이번에 보냄) | 'already'(이미 보냈거나 다른 점검이 보내는 중) |
+    'unrecorded'(이 적재의 표지를 남길 수 없어 적재하지 않음) | 'exhausted'(첫 적재 + 다시 적재 N 번을 이미 함) |
+    'failed'(큐가 받지 않음 — 다음 점검이 다시). 문장은 `NOTICE_RESULT_SENTENCES`."""
+    _notice_gc()
+    if _notice_is_sent(task, fp):
         return "already"
-    try:
-        _notice_create_mark(pend_p)
-    except FileExistsError:
-        info = _read_json_tolerant(pend_p)
-        at = info.get("at") if isinstance(info, dict) else None
-        if isinstance(at, (int, float)) and 0 <= _notice_now() - at < NOTICE_PENDING_STALE_S:
-            return "already"
-        # 예전 점검이 적재 전, 또는 적재와 '보냄' 사이에 멈췄다 — 같은 키로 다시(큐가 대기 중이면 묶는다).
-    except OSError as e:
-        print("[preflight] 알림 '%s' 적재하지 않음 — 알림 기록(%s)을 남길 수 없다(%s) · 기록 없이 보내면 매 점검 되풀이된다"
-              % (task, pend_p, e), file=sys.stderr)
-        return "unrecorded"
+    mark = None
+    for state in ["pending"] + ["retry-%d" % k for k in range(1, NOTICE_RETRY_MAX + 1)]:
+        path = _notice_mark(task, fp, state)
+        try:
+            _notice_create_mark(path, fp)
+        except FileExistsError:
+            if _notice_fresh(_notice_mark_info(path)):
+                return "already"     # 다른 점검이 지금 이 표지로 보내는 중
+            continue                 # 멈춘 점검의 표지 — 다음 번호로 다시
+        except OSError as e:
+            print("[preflight] 알림 '%s' 적재하지 않음 — 알림 기록(%s)을 남길 수 없다(%s) · 기록 없이 보내면 매 점검 되풀이된다"
+                  % (task, path, e), file=sys.stderr)
+            return "unrecorded"
+        mark = path
+        break
+    if mark is None:
+        return "exhausted"
     if not enqueue():
         try:
-            os.remove(pend_p)
+            os.remove(mark)
         except OSError:
             pass
         return "failed"
     try:
-        _notice_create_mark(sent_p)
-    except FileExistsError:
-        pass
+        _notice_create_mark(_notice_mark(task, fp, "sent"), fp)
     except OSError as e:
-        print("[preflight] 알림 '%s' 적재함 — '보냄' 기록(%s)을 남기지 못했다(%s) · 다음 점검이 같은 키로 한 번 더 적재할 수 있다"
-              % (task, sent_p, e), file=sys.stderr)
-    _notice_clear(task, keep_fp=fp)
+        print("[preflight] 알림 '%s' 적재함 — '보냄' 기록을 남기지 못했다(%s) · 다시 적재는 번호를 매긴 표지로 최대 %d 번"
+              % (task, e, NOTICE_RETRY_MAX), file=sys.stderr)
     return "sent"
 
 

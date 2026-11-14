@@ -251,13 +251,26 @@ class LedgerKinds(Rig):
         w = [x for x in self.wakes(log) if "parked-merge" in x]
         self.assertEqual(len(w), 2, "집합이 바뀌면 새 과제 한 번")
         self.assertNotEqual(k(w[-1]), k(w[0]))
-        # 집합이 비면 기록을 지운다 — 같은 수정이 나중에 다시 보관되면 다시 보인다.
+        # ★T2i(RULINGS FH3 — 기대가 바뀜): 집합이 비어도 표지를 지우지 않는다(다른 지문의 표지를 지우지 않고 나이로만 치운다) —
+        #   같은 집합이 '보냄' 뒤 `NOTICE_MARK_MAX_AGE_S` 안에 다시 오면 다시 알리지 않고(C62 WARN 은 매 부트 보인다), 그보다 오래되면
+        #   다시 알린다(종전 AC7: 집합이 비면 기록을 지워 곧바로 다시 보였다).
         self.ledger({})
         self.run_check("c62_pack_heal_ledger", "C62")
-        self.assertNotIn("parked-merge", self.delivered())
+        self.assertIn("parked-merge", self.delivered(), "표지는 남는다")
         self.ledger({"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "version": "0.15.0", "ts": 1}})
         self.run_check("c62_pack_heal_ledger", "C62")
-        self.assertEqual(len([x for x in self.wakes(log) if "parked-merge" in x]), 3)
+        self.assertEqual(len([x for x in self.wakes(log) if "parked-merge" in x]), 2, "나이 안에서는 다시 알리지 않는다")
+        d = os.path.join(self.pack, "state", "notice-marks")
+        for n in os.listdir(d):
+            if n.endswith(".sent"):
+                p = os.path.join(d, n)
+                with open(p, encoding="utf-8") as f:
+                    info = json.load(f)
+                info["at"] = info["at"] - pf.NOTICE_MARK_MAX_AGE_S - 1
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump(info, f)
+        self.run_check("c62_pack_heal_ledger", "C62")
+        self.assertEqual(len([x for x in self.wakes(log) if "parked-merge" in x]), 3, "나이가 지난 표지는 치워지고 다시 알린다")
 
     def test_failed_enqueue_is_retried_not_recorded(self):
         log = self._wake_rig()
@@ -471,13 +484,87 @@ class NoticeMarksRealQueue(Rig):
                 self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "unrecorded", form)
             self.assertEqual(self.queued(), [], form)
 
+    # ★T2i(RULINGS FH3): 적재마다 자기 표지 · 다시 적재는 번호로 묶음 — 한 지문의 배달은 저장소가 어떻든 N + 1 번 이하.
+    def test_fh3_sent_never_writable_is_bounded(self):
+        os.makedirs(self.mark("t", "f1", "sent"))   # '보냄' 자리가 폴더 — 만들 수 없고, '보냄'으로 세지도 않는다
+        delivered = 0
+        outcomes = []
+        with contextlib.redirect_stderr(io.StringIO()):
+            for _ in range(pf.NOTICE_RETRY_MAX + 4):
+                outcomes.append(pf._notice_once("t", "f1", self.enqueue("t", "f1")))
+                delivered += self.drain()
+                self.clock[0] += pf.NOTICE_PENDING_STALE_S
+        self.assertEqual(delivered, pf.NOTICE_RETRY_MAX + 1, outcomes)
+        self.assertEqual(outcomes[:pf.NOTICE_RETRY_MAX + 1], ["sent"] * (pf.NOTICE_RETRY_MAX + 1))
+        self.assertEqual(set(outcomes[pf.NOTICE_RETRY_MAX + 1:]), {"exhausted"}, "그 뒤로는 조용하다")
+
+    def test_fh3_folder_turns_read_only_after_the_first_enqueue(self):
+        d = os.path.join(self.pack, "state", "notice-marks")
+
+        def enqueue_then_lock():
+            ok = self.enqueue("t", "f1")()
+            os.chmod(d, 0o555)
+            return ok
+
+        self.addCleanup(lambda: os.path.isdir(d) and os.chmod(d, 0o755))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(pf._notice_once("t", "f1", enqueue_then_lock), "sent")
+            self.assertEqual(self.drain(), 1)
+            for _ in range(3):
+                self.clock[0] += pf.NOTICE_PENDING_STALE_S
+                self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "unrecorded")
+        self.assertEqual(self.drain(), 0, "다시 적재의 표지를 만들 수 없으면 적재하지 않는다")
+
+    def test_fh3_two_stale_retries_at_once_enqueue_once(self):
+        pf._notice_create_mark(self.mark("t", "f1", "pending"), "f1")
+        self.clock[0] += pf.NOTICE_PENDING_STALE_S
+        seen = []
+
+        def a_enqueue():
+            seen.append(pf._notice_once("t", "f1", self.enqueue("t", "f1")))
+            return self.enqueue("t", "f1")()
+
+        self.assertEqual(pf._notice_once("t", "f1", a_enqueue), "sent")
+        self.assertEqual(seen, ["already"], "B 는 A 의 retry-1 표지를 보고 적재하지 않는다")
+        self.assertTrue(os.path.exists(self.mark("t", "f1", "retry-1")))
+        self.assertEqual(self.drain(), 1)
+
+    def test_fh3_two_fingerprints_keep_each_others_marks(self):
+        self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "sent")
+        self.assertEqual(pf._notice_once("t", "f2", self.enqueue("t", "f2")), "sent")
+        for fp in ("f1", "f2"):
+            self.assertTrue(os.path.isfile(self.mark("t", fp, "pending")) and os.path.isfile(self.mark("t", fp, "sent")), fp)
+        self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "already")
+
+    def test_fh3_non_regular_sent_is_not_sent(self):
+        os.makedirs(os.path.join(self.pack, "state", "notice-marks"), exist_ok=True)
+        os.symlink(os.path.join(self.root, "nowhere"), self.mark("t", "f1", "sent"))   # 끊긴 링크
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "sent", "한 번도 받지 않은 알림은 보낸다")
+        self.assertEqual(len(self.queued()), 1)
+        with open(self.mark("t", "f2", "sent"), "w", encoding="utf-8") as f:
+            json.dump({"fp": "other"}, f)   # 다른 지문을 담은 '보냄' = 보냄 아님
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(pf._notice_once("t", "f2", lambda: True), "sent")
+
+    def test_fh3_marks_are_removed_by_age_only(self):
+        self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "sent")
+        pf._notice_create_mark(self.mark("t", "f9", "pending"), "f9")       # '보냄' 없는 지문
+        self.clock[0] += pf.NOTICE_MARK_MAX_AGE_S + 1
+        pf._notice_gc()
+        self.assertFalse(os.path.exists(self.mark("t", "f1", "sent")), "'보냄'이 오래된 지문의 표지는 치운다")
+        self.assertFalse(os.path.exists(self.mark("t", "f1", "pending")))
+        self.assertTrue(os.path.exists(self.mark("t", "f9", "pending")), "'보냄' 없는 지문의 표지는 남긴다(횟수 상한)")
+
     def test_failed_enqueue_leaves_no_mark(self):
         self.assertEqual(pf._notice_once("t", "f1", lambda: False), "failed")
         self.assertFalse(os.path.exists(self.mark("t", "f1", "pending")), "다음 점검이 곧바로 다시 시도한다")
         self.assertEqual(pf._notice_once("t", "f1", self.enqueue("t", "f1")), "sent")
 
     def test_result_sentences(self):
-        self.assertEqual(set(pf.NOTICE_RESULT_SENTENCES), {"sent", "already", "unrecorded", "failed"})
+        self.assertEqual(set(pf.NOTICE_RESULT_SENTENCES), {"sent", "already", "unrecorded", "exhausted", "failed"})
+        self.assertEqual(pf.NOTICE_RESULT_SENTENCES["exhausted"],
+                         "wakeup 적재하지 않음(같은 알림을 이미 정해진 횟수만큼 적재했으나 '보냄' 기록이 남지 않음 — 더 보내지 않는다)")
         self.assertEqual(pf.NOTICE_RESULT_SENTENCES["unrecorded"],
                          "wakeup 적재하지 않음(알림 기록을 남길 수 없음 — 기록 없이 보내면 매 점검 되풀이된다)")
 
