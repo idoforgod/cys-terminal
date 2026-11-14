@@ -459,6 +459,13 @@ if os.environ.get("GUARD_TEST_MODE", "0") == "1" and os.environ.get("GUARD_TEST_
         PROBE_CAP_S = GATE_BUDGET_S if GATE_BUDGET_S > 1.0 else min(PROBE_CAP_S, GATE_BUDGET_S)
     except Exception:
         pass
+# RULINGS FV1 (T4c): GUARD_TEST_REPORT_LIMITS=1 → ONE line on the error stream with the effective summed budget and
+#   per-query limit this run will use, so a test asserts the values instead of timing them. Independent of
+#   GUARD_TEST_MODE (test mode off → the defaults: the budget variable was ignored). No file, no decision changes;
+#   without the variable nothing is printed. The bash part below forwards exactly this line (the parser's other
+#   stderr stays discarded).
+if os.environ.get("GUARD_TEST_REPORT_LIMITS", "") == "1":
+    sys.stderr.write("GUARD-LIMITS budget_s=%.3f probe_cap_s=%.3f\n" % (GATE_BUDGET_S, PROBE_CAP_S))
 GATE_T0 = time.monotonic()
 
 def budget_left():
@@ -1085,6 +1092,13 @@ else
   [ -n "$GUARD_PYFILE" ] && rm -f "$GUARD_PYFILE" 2>/dev/null
   PYOUT="$(printf '%s' "$INPUT" | GUARD_PAUSED="$GUARD_PAUSED" GUARD_ACTIVE="$GUARD_ACTIVE" GUARD_CONST_AUTH="$GUARD_CONST_AUTH" GUARD_CONST_SCOPE="$GUARD_CONST_SCOPE" GUARD_PREFLIGHT="$PREFLIGHT" "$PYBIN" -c "$PYSRC" 2>/tmp/.guard_py_err.$$)"
   RC=$?
+fi
+# RULINGS FV1 (T4c): with GUARD_TEST_REPORT_LIMITS=1 forward the parser's ONE limits line to the hook's error stream
+# (its other stderr stays discarded); without the variable nothing here runs.
+if [ "${GUARD_TEST_REPORT_LIMITS:-}" = "1" ] && [ -f /tmp/.guard_py_err.$$ ]; then
+  while IFS= read -r _gl || [ -n "$_gl" ]; do
+    case "$_gl" in "GUARD-LIMITS "*) printf '%s\n' "$_gl" >&2; break;; esac
+  done < /tmp/.guard_py_err.$$
 fi
 rm -f /tmp/.guard_py_err.$$ 2>/dev/null
 if [ "$RC" -eq 0 ]; then
