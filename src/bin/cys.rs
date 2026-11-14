@@ -26451,11 +26451,11 @@ fn advance_vendor_baseline(dir: &std::path::Path, rel: &str, content: &str) {
     if let Ok(json) = serde_json::to_string_pretty(&m) {
         let _ = cys::pack::write_atomic(&mpath, json.as_bytes());
     }
-    let bp = dir.join(cys::pack::PRISTINE_DIR).join(rel);
-    if let Some(p) = bp.parent() {
-        let _ = std::fs::create_dir_all(p);
+    // ★T2h(RULINGS CW1 · 검토자 B1): `.pristine/<rel>` 은 닻 내린 쓰기 — 구성 요소가 링크면(검사 뒤에 바뀌었어도) 쓰지 않는다.
+    //   (종전: `create_dir_all` + `write_atomic` 이 `.pristine/hooks` → `hooks` 링크를 따라 살아 있는 파일을 바꿨다.)
+    if let Err(e) = cys::pack::write_beneath(dir, &format!("{}/{rel}", cys::pack::PRISTINE_DIR), content.as_bytes()) {
+        eprintln!("⚠ '{rel}' 기준선(.pristine) 기록 실패({e}) — 살아 있는 파일은 무접촉");
     }
-    let _ = cys::pack::write_atomic(&bp, content.as_bytes());
 }
 
 /// ③ 커스터마이즈 병합: 병합 대기 원장 목록·해소. 해소 경로 4종 —
@@ -26630,7 +26630,29 @@ fn pack_rel_gate(dir: &std::path::Path, rel: &str) -> Result<(), String> {
             other => format!("{other:?}"),
         };
         format!("⛔ 거부: {why} — 아무것도 쓰지 않았습니다")
-    })
+    })?;
+    pack_sidecar_gate(dir, rel)
+}
+
+/// ★T2h(RULINGS CW1 · 검토자 B1): 팩 동사가 이 rel 에 대해 쓰는 **모든 부수 자리** — `.pristine/<rel>` · `<rel>.user` ·
+/// `<rel>.new` · `<rel>.base`(세대 보관 `<rel>.user.prev-*` · `.user.adopted-*` 는 같은 부모) · 장부 셋 — 가 경로 규칙
+/// (`pack::sidecar_path_gate`: 링크 · 재해석 지점 없음, 마지막 성분이 링크 · 폴더 아님)을 지나야 한다. 어떤 쓰기보다 먼저 —
+/// 하나라도 걸리면 아무것도 쓰지 않는다. `.pristine/<rel>` 쓰기는 닻 내린 쓰기(`pack::write_beneath`)로 쓰기 시점에도 지킨다.
+fn pack_sidecar_gate(dir: &std::path::Path, rel: &str) -> Result<(), String> {
+    let sites = [
+        format!("{}/{rel}", cys::pack::PRISTINE_DIR),
+        format!("{rel}.user"),
+        format!("{rel}.new"),
+        format!("{rel}.base"),
+        cys::pack::INSTALL_MANIFEST.to_string(),
+        cys::pack::MERGE_PENDING_FILE.to_string(),
+        cys::pack::MERGE_AUDIT_FILE.to_string(),
+    ];
+    for site in &sites {
+        cys::pack::sidecar_path_gate(dir, site)
+            .map_err(|e| format!("⛔ 거부: '{rel}' — {e} — 아무것도 쓰지 않았습니다"))?;
+    }
+    Ok(())
 }
 
 /// ★T2f(RULINGS BO4): `pack-merge --ai` 의 순수 관문 — 기동 필수·보호 목록 파일이면 AI 를 부르기 **전에** 거부한다
@@ -26978,6 +27000,16 @@ fn run_pack_merge_with(
                 // 스킬 등 system 파일의 사용자본을 오버레이로 승격 — vendor 무결성(치유)과 공존.
                 let local_root = cys::pack::local_dir();
                 let dest = local_root.join(&rel);
+                // ★T2h(RULINGS CW1): 오버레이 자리는 링크를 거치지 않고, 팩 안(살아 있는 파일의 별칭)이 아니다.
+                if let Err(e) = cys::pack::sidecar_path_gate(&local_root, &rel) {
+                    eprintln!("⛔ 거부: '{rel}' 오버레이 — {e} — 아무것도 쓰지 않았습니다");
+                    return 1;
+                }
+                let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                if canon(&local_root).starts_with(canon(&dir)) {
+                    eprintln!("⛔ 거부: '{rel}' 오버레이 자리({})가 팩 안입니다 — 아무것도 쓰지 않았습니다", local_root.display());
+                    return 1;
+                }
                 if let Some(parent) = dest.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
@@ -27311,6 +27343,11 @@ fn preserve_prior_user_generation(
 /// 개명 선행 — conflicted(무캡처)의 유일 원본 침묵 클로버 봉인.
 fn run_pack_heal(rel: &str, yes: bool) -> i32 {
     let dir = cys::pack::pack_dir();
+    // ★T2h(RULINGS CW1 · 검토자 F3): 팩 동사의 rel 관문(정규형 · 상위 링크 · 모든 부수 자리)을 무엇보다 먼저.
+    if let Err(e) = pack_rel_gate(&dir, rel) {
+        eprintln!("{e}");
+        return 1;
+    }
     // ① embed 조회 — 부재 = 거부.
     let Some(embed) = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c)
     else {
@@ -27440,6 +27477,11 @@ fn run_pack_heal_missing_only(rel: &str) -> i32 {
 /// 만들지 않게. 생명줄 훅 파일은 묘비가 결코 적용되지 않으므로(입력원이 거른다) 언제나 되살린다.
 fn run_pack_heal_missing_only_with(rel: &str, sources: &cys::pack::UpdateSources) -> i32 {
     let dir = cys::pack::pack_dir();
+    // ★T2h(RULINGS CW1 · 검토자 F3): 팩 동사의 rel 관문(정규형 · 상위 링크 · 모든 부수 자리)을 무엇보다 먼저.
+    if let Err(e) = pack_rel_gate(&dir, rel) {
+        eprintln!("{e}");
+        return 1;
+    }
     let Some(embed) = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c)
     else {
         eprintln!("'{rel}' 은 임베드 팩에 없음(자작·폐기 파일) — pack-heal 대상 아님");
@@ -43203,6 +43245,60 @@ mod tests {
         for t in reapply_texts.iter().filter(|t| t.contains("cys repair reapply")) {
             assert!(t.contains("수리로 고친 파일이면 `cys repair reapply <수리번호>`") && t.contains("--trigger update`"), "{t}");
         }
+    }
+
+    /// ★T2h(RULINGS CW1 · 검토자 B1 — 그 순서 그대로): `pack/hooks` 는 진짜 폴더, `pack/.pristine/hooks` 는 `pack/hooks` 를 가리키는
+    /// 링크, `hooks/guard.sh`(실제 보호 목록의 행 · 이음새 없음)에 user-kept 기록과 출시본이 아닌 `.new`. `pack-merge --file
+    /// hooks/guard.sh --keep-mine` 은 **거부되고 아무것도 쓰지 않는다**(종전: 무변경 예외로 허용된 뒤 기준선 쓰기가
+    /// `.pristine/hooks/guard.sh` 를 거쳐 살아 있는 보호 훅에 `.new` 바이트를 썼다). `pack-heal` · `--missing-only` 도 같은
+    /// 관문에서 거부된다. 오버레이(`--to-local`) 자리가 링크이거나 팩 안이면 거부된다.
+    #[cfg(unix)]
+    #[test]
+    fn t2h_cw1_a_linked_sidecar_never_writes_a_listed_file() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, _sys, _embed, _env) = t4_system_fixture("t2hcw1");
+        let rel = "hooks/guard.sh";
+        let real = cys::pack::UpdateSources::none();
+        assert!(real.is_listed(rel), "실제 보호 목록의 행");
+        std::fs::create_dir_all(td.join("hooks")).unwrap();
+        let mine = "#!/bin/sh\n# MY LIVE GUARD\n";
+        let tampered = "#!/bin/sh\n# NOT A RELEASE\n";
+        std::fs::write(td.join(rel), mine).unwrap();
+        std::fs::write(td.join(format!("{rel}.new")), tampered).unwrap();
+        std::fs::create_dir_all(td.join(cys::pack::PRISTINE_DIR)).unwrap();
+        std::os::unix::fs::symlink(td.join("hooks"), td.join(cys::pack::PRISTINE_DIR).join("hooks")).unwrap();
+        t4_write_ledger(&td, rel, serde_json::json!({"kind": "user-kept", "side": format!("{rel}.new"), "version": "x", "ts": 0}));
+        let ledger_before = std::fs::read_to_string(td.join(cys::pack::MERGE_PENDING_FILE)).unwrap();
+        let untouched = |what: &str| {
+            assert_eq!(std::fs::read_to_string(td.join(rel)).unwrap(), mine, "{what}: 살아 있는 보호 훅 무접촉");
+            assert_eq!(std::fs::read_to_string(td.join(format!("{rel}.new"))).unwrap(), tampered, "{what}: .new 무접촉");
+            assert_eq!(std::fs::read_to_string(td.join(cys::pack::MERGE_PENDING_FILE)).unwrap(), ledger_before, "{what}: 원장 무접촉");
+            let names: std::collections::BTreeSet<String> = std::fs::read_dir(td.join("hooks"))
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            assert_eq!(names, ["guard.sh", "guard.sh.new"].iter().map(|s| s.to_string()).collect(), "{what}: 링크 너머에 아무것도 생기지 않았다");
+        };
+        let keep = MergeFlags { yes: true, keep_mine: true, ..MergeFlags::default() };
+        assert_eq!(run_pack_merge_with(Some(rel.to_string()), keep, None, &real), 1, "keep-mine → 거부");
+        untouched("keep-mine");
+        assert_eq!(run_pack_heal(rel, true), 1, "pack-heal → 거부");
+        untouched("pack-heal");
+        assert_eq!(run_pack_heal_missing_only_with(rel, &real), 1, "--missing-only → 거부");
+        untouched("--missing-only");
+        assert!(pack_sidecar_gate(&td, rel).unwrap_err().contains(".pristine/hooks"), "거부 문장이 걸린 자리를 이름 댄다");
+        // 링크가 없으면 같은 무변경 keep-mine 은 허용된다(T2f BH6 그대로) — 관문은 링크만 막는다.
+        std::fs::remove_file(td.join(cys::pack::PRISTINE_DIR).join("hooks")).unwrap();
+        std::fs::write(td.join(format!("{rel}.new")), tampered).unwrap();
+        assert!(pack_sidecar_gate(&td, rel).is_ok());
+        // 오버레이: 자리가 링크 → 거부(링크를 거치지 않는다).
+        let local = td.parent().unwrap().join("local");
+        let _l = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
+        std::fs::create_dir_all(&local).unwrap();
+        std::os::unix::fs::symlink(td.join("hooks"), local.join("hooks")).unwrap();
+        assert!(cys::pack::sidecar_path_gate(&local, rel).is_err(), "오버레이 자리 링크 → 거부");
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
     }
 
     /// RULINGS AB1: `cys pack-plan` 의 버킷 목록이 설치 계획의 **모든** 버킷을 보인다 — 신설 세 버킷(user-kept ·

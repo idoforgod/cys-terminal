@@ -3490,6 +3490,13 @@ pub fn append_merge_audit(dir: &Path, entry: &serde_json::Value) -> Result<(), S
     if !m.is_file() {
         return Err(format!("감사 원장 {} 이 일반 파일이 아닙니다 — 쓰지 않습니다", path.display()));
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if m.nlink() > 1 {
+            return Err(format!("감사 원장 {} 이 다른 파일의 별칭(하드 링크)입니다 — 쓰지 않습니다", path.display()));
+        }
+    }
     f.write_all(line.as_bytes())
         .map_err(|e| format!("감사 원장 쓰기 실패 {}: {e}", path.display()))
 }
@@ -3897,6 +3904,142 @@ pub fn pack_current_for(binary_version: &str) -> bool {
 /// 원자적 파일 쓰기(§7-⑤): 같은 디렉터리 temp 파일에 쓰고 fsync → rename으로 원자 교체 →
 /// 디렉터리 fsync(best-effort). 쓰는 도중 crash 시 부분 파일이 최종 경로에 남지 않는다
 /// (std::fs::write는 비원자라 부분 쓰기 노출). cysd governance의 write_json_atomic과 동형.
+/// ★T2h(RULINGS CW1): 링크 · 재해석 지점인가(no-follow 메타데이터).
+fn meta_is_link_like(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return true;
+        }
+    }
+    meta.file_type().is_symlink()
+}
+
+/// ★T2h(RULINGS CW1 · 검토자 B1): 팩 동사의 **쓰기 자리 하나**의 경로 규칙 — `root` 아래 `rel_path` 의 이미 있는 구성 요소를
+/// 루트에서부터 링크를 따르지 않고 본다: 어느 구성 요소든 링크(윈도우는 모든 재해석 지점)면 거부, 부모가 폴더가 아니면 거부,
+/// 마지막 성분이 폴더면 거부. 없는 구성 요소에서 멈춘다(그 아래는 아무것도 없다 — 쓰기가 새로 만든다). 부수 자리(`.pristine/…` ·
+/// `<rel>.user` · `<rel>.new` · `<rel>.base` · 장부)가 살아 있는 트리의 별칭이 되어 '살아 있는 바이트를 쓰지 않는' 예외가
+/// 등재 파일의 쓰기로 바뀌는 길을 막는다.
+pub fn sidecar_path_gate(root: &Path, rel_path: &str) -> Result<(), String> {
+    let parts: Vec<&str> = rel_path.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".").collect();
+    if parts.is_empty() || parts.contains(&"..") {
+        return Err(format!("쓰기 자리 {rel_path} 가 정규형이 아닙니다"));
+    }
+    let mut at = root.to_path_buf();
+    for (i, part) in parts.iter().enumerate() {
+        at.push(part);
+        let meta = match std::fs::symlink_metadata(&at) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("쓰기 자리 {} 를 확인할 수 없습니다({e})", parts[..=i].join("/"))),
+        };
+        if meta_is_link_like(&meta) {
+            return Err(format!(
+                "쓰기 자리 {} 가 링크(또는 연결 지점 · 재해석 지점)입니다 — 팩 동사는 링크를 거친 자리에 쓰지 않습니다",
+                parts[..=i].join("/")
+            ));
+        }
+        if i + 1 < parts.len() && !meta.is_dir() {
+            return Err(format!("쓰기 자리 {} 의 상위 {} 가 폴더가 아닙니다", rel_path, parts[..=i].join("/")));
+        }
+        if i + 1 == parts.len() && meta.is_dir() {
+            return Err(format!("쓰기 자리 {rel_path} 가 폴더입니다"));
+        }
+    }
+    Ok(())
+}
+
+/// ★T2h(RULINGS CW1): `root` 아래 `rel_path` 에 **닻을 내린** 원자 쓰기 — unix: 루트를 연 디렉터리 기술자에서 구성 요소마다
+/// `openat(O_DIRECTORY | O_NOFOLLOW)` 로 내려가고(없으면 `mkdirat`), 같은 기술자 안에서 임시 파일을 `O_CREAT | O_EXCL |
+/// O_NOFOLLOW` 로 만들어 쓰고 `fsync` 한 뒤 `renameat` 한다 — 검사와 쓰기 사이에 구성 요소가 링크로 바뀌어도 쓰기는 그 링크를
+/// 따라가지 않는다(바뀐 자리 = 실패). 마지막 성분이 링크면 그 링크 자체가 교체된다(가리키는 파일은 무접촉). windows: 같은 경로
+/// 규칙([`sidecar_path_gate`])을 쓰기 직전에 다시 재고 원자 쓰기 — 검사와 쓰기 사이의 창은 남는다(그 운영체제에 `openat` 이 없다).
+pub fn write_beneath(root: &Path, rel_path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let bad = |m: String| std::io::Error::other(m);
+    let parts: Vec<&str> = rel_path.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".").collect();
+    if parts.is_empty() || parts.contains(&"..") {
+        return Err(bad(format!("쓰기 자리 {rel_path} 가 정규형이 아닙니다")));
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::FromRawFd;
+        let cstr = |b: &[u8]| std::ffi::CString::new(b).map_err(|e| bad(e.to_string()));
+        let errno = || std::io::Error::last_os_error();
+        let root_c = cstr(root.as_os_str().as_bytes())?;
+        let mut dfd = unsafe { libc::open(root_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        if dfd < 0 {
+            return Err(errno());
+        }
+        for comp in &parts[..parts.len() - 1] {
+            let c = cstr(comp.as_bytes())?;
+            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            let mut nfd = unsafe { libc::openat(dfd, c.as_ptr(), flags) };
+            if nfd < 0 && errno().raw_os_error() == Some(libc::ENOENT) {
+                let made = unsafe { libc::mkdirat(dfd, c.as_ptr(), 0o755 as libc::mode_t) };
+                if made != 0 && errno().raw_os_error() != Some(libc::EEXIST) {
+                    let e = errno();
+                    unsafe { libc::close(dfd) };
+                    return Err(e);
+                }
+                nfd = unsafe { libc::openat(dfd, c.as_ptr(), flags) };
+            }
+            unsafe { libc::close(dfd) };
+            if nfd < 0 {
+                return Err(bad(format!(
+                    "쓰기 자리 {rel_path} 의 구성 요소 {comp} 가 링크이거나 폴더가 아닙니다({})",
+                    errno()
+                )));
+            }
+            dfd = nfd;
+        }
+        let leaf = parts[parts.len() - 1];
+        let leaf_c = cstr(leaf.as_bytes())?;
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_c = cstr(format!(".{leaf}.tmp-{}-{n}", std::process::id()).as_bytes())?;
+        let tfd = unsafe {
+            libc::openat(
+                dfd,
+                tmp_c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o644 as libc::c_uint,
+            )
+        };
+        if tfd < 0 {
+            let e = errno();
+            unsafe { libc::close(dfd) };
+            return Err(e);
+        }
+        let mut f = unsafe { std::fs::File::from_raw_fd(tfd) };
+        let wrote = f.write_all(bytes).and_then(|_| f.sync_all());
+        drop(f);
+        let res = wrote.and_then(|_| {
+            if unsafe { libc::renameat(dfd, tmp_c.as_ptr(), dfd, leaf_c.as_ptr()) } != 0 {
+                Err(errno())
+            } else {
+                Ok(())
+            }
+        });
+        if res.is_err() {
+            unsafe { libc::unlinkat(dfd, tmp_c.as_ptr(), 0) };
+        }
+        unsafe { libc::close(dfd) };
+        res
+    }
+    #[cfg(not(unix))]
+    {
+        sidecar_path_gate(root, rel_path).map_err(bad)?;
+        let dest = parts.iter().fold(root.to_path_buf(), |p, c| p.join(c));
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_atomic(&dest, bytes)
+    }
+}
+
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_atomic_mode(path, bytes, None)
 }
@@ -4716,6 +4859,13 @@ pub fn create_update_snapshot(
     caps: (u64, u64),
 ) -> Result<SnapshotOutcome, String> {
     let lane_dir = root.join(path_safe(lane_key));
+    // ★T2h(RULINGS CW1): 스냅샷 보관소와 레인 폴더는 링크 · 재해석 지점이 아니다 — 링크를 거치면 사본 쓰기와 오래된 세대
+    // 정리(폴더째 지우기)가 그 링크가 가리키는 곳(살아 있는 팩일 수도 있다)에서 일어난다.
+    for p in [root, lane_dir.as_path()] {
+        if std::fs::symlink_metadata(p).is_ok_and(|m| meta_is_link_like(&m)) {
+            return Err(format!("스냅샷 자리 {} 가 링크(또는 재해석 지점)입니다 — 스냅샷을 만들지 않습니다", p.display()));
+        }
+    }
     std::fs::create_dir_all(&lane_dir)
         .map_err(|e| format!("스냅샷 레인 생성 실패 {}: {e}", lane_dir.display()))?;
     let now = chrono::Utc::now();
@@ -4850,7 +5000,8 @@ pub fn list_update_snapshots(lane_dir: &Path) -> Vec<(String, PathBuf)> {
     for e in entries.flatten() {
         let p = e.path();
         let name = e.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || !p.is_dir() {
+        // ★T2h(RULINGS CW1): 링크는 스냅샷이 아니다(목록 · 정리 대상에서 뺀다 — 정리가 링크 너머를 지우지 않는다).
+        if name.starts_with('.') || !std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir() && !meta_is_link_like(&m)) {
             continue;
         }
         let created = read_update_snapshot_meta(&p)
@@ -14688,6 +14839,45 @@ mod m11_tests {
         };
         assert_eq!(run(5_000), vec!["A-in", "A-out", "B"], "쥔 쪽이 끝난 뒤에 돈다");
         assert_eq!(run(50), vec!["A-in", "B", "A-out"], "시한(50ms)을 넘기면 잠금 없이 진행한다");
+    }
+
+    /// ★T2h(RULINGS CW1): 닻 내린 쓰기와 경로 규칙 — 구성 요소가 링크면 쓰지 않는다(가리키는 곳에 아무것도 생기지 않는다),
+    /// 마지막 성분이 링크면 그 링크만 교체된다(가리키는 파일 무접촉), 없는 구성 요소는 만든다. 스냅샷 레인이 링크면 스냅샷을
+    /// 만들지 않는다(링크 너머의 정리 · 쓰기 없음).
+    #[cfg(unix)]
+    #[test]
+    fn t2h_cw1_anchored_writes_never_follow_a_link() {
+        let rig = Rig::new("cw1");
+        let live = rig.pack.join("hooks");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("guard.sh"), "LIVE\n").unwrap();
+        std::fs::create_dir_all(rig.pack.join(PRISTINE_DIR)).unwrap();
+        std::os::unix::fs::symlink(&live, rig.pack.join(PRISTINE_DIR).join("hooks")).unwrap();
+        assert!(sidecar_path_gate(&rig.pack, ".pristine/hooks/guard.sh").is_err(), "부모 링크 → 거부");
+        assert!(write_beneath(&rig.pack, ".pristine/hooks/guard.sh", b"X\n").is_err(), "닻 내린 쓰기 → 실패");
+        assert_eq!(std::fs::read_to_string(live.join("guard.sh")).unwrap(), "LIVE\n", "링크 너머 무접촉");
+        assert_eq!(std::fs::read_dir(&live).unwrap().count(), 1, "링크 너머에 임시 파일도 없다");
+        // 마지막 성분이 링크 → 그 링크만 교체.
+        std::fs::remove_file(rig.pack.join(PRISTINE_DIR).join("hooks")).unwrap();
+        std::fs::create_dir_all(rig.pack.join(PRISTINE_DIR).join("hooks")).unwrap();
+        std::os::unix::fs::symlink(live.join("guard.sh"), rig.pack.join(PRISTINE_DIR).join("hooks/guard.sh")).unwrap();
+        assert!(sidecar_path_gate(&rig.pack, ".pristine/hooks/guard.sh").is_err(), "마지막 성분 링크 → 관문 거부");
+        write_beneath(&rig.pack, ".pristine/hooks/guard.sh", b"BASE\n").unwrap();
+        assert_eq!(std::fs::read_to_string(live.join("guard.sh")).unwrap(), "LIVE\n", "가리키던 파일 무접촉");
+        assert_eq!(std::fs::read_to_string(rig.pack.join(".pristine/hooks/guard.sh")).unwrap(), "BASE\n");
+        // 없는 구성 요소는 만든다.
+        write_beneath(&rig.pack, ".pristine/bin/new/x.py", b"Y\n").unwrap();
+        assert_eq!(std::fs::read_to_string(rig.pack.join(".pristine/bin/new/x.py")).unwrap(), "Y\n");
+        // 스냅샷 레인이 링크 → 만들지 않는다.
+        let root = rig.base.join("snaps");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&live, root.join("base")).unwrap();
+        std::fs::write(rig.pack.join("hooks/guard.sh"), "LIVE\n").unwrap();
+        let none = |_: &str| Vec::<String>::new();
+        let r = create_update_snapshot(&rig.pack, &root, "base", "1.0.0", &std::collections::BTreeMap::new(),
+            &["hooks/guard.sh".to_string()], PackScope::Base, &none, (UPDATE_SNAPSHOT_FILE_CAP, UPDATE_SNAPSHOT_TOTAL_CAP));
+        assert!(r.is_err(), "레인 링크 → 스냅샷 거부");
+        assert_eq!(std::fs::read_dir(&live).unwrap().count(), 1, "링크 너머(살아 있는 hooks)에 아무것도 생기지 않았다");
     }
 
     /// 부록 A-2 #4(백업이 없으면 덮지 않는다): 기동 필수 파일의 사용자본을 보관할 수 없으면 vendor 본을 쓰지 않고 격리.
