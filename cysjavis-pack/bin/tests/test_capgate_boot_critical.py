@@ -59,12 +59,39 @@ def _built_cys():
     return None
 
 
+# The reviewer rule of the gate lets a reviewer write anywhere under these prefixes, anywhere under the temp
+# folder and anywhere with these path parts (role-capability-gate.sh ALLOW_PATH_PREFIXES · ALLOW_PATH_SUBSTRS ·
+# `tempfile.gettempdir()`). A fixture pack below one of them makes a FORBIDDEN reviewer write allowed, so a test of
+# the reviewer's refusal would pass or fail for the wrong reason. On Linux the system temp folder IS `/tmp/` (the
+# Ubuntu pack job, run 43632157608: every forbidden reviewer write "passed"); on macOS it resolves to
+# `/private/var/folders/…`, which nothing names. The fixtures therefore live in the first folder that none of those
+# rules covers: the temp folder where it qualifies (macOS — unchanged), else the home folder, else the working folder.
+_REVIEWER_ALLOWED_PREFIXES = ("/tmp/", "/private/tmp/", "/var/tmp/", "/var/folders/")
+_REVIEWER_ALLOWED_PARTS = ("/logs/", "/log/", "/_round/")
+
+
+def _reviewer_may_write_below(path):
+    p = os.path.realpath(path).replace("\\", "/").rstrip("/") + "/"
+    return p.startswith(_REVIEWER_ALLOWED_PREFIXES) or any(s in p for s in _REVIEWER_ALLOWED_PARTS)
+
+
+def _fixture_base():
+    for cand in (tempfile.gettempdir(), os.path.expanduser("~"), os.getcwd()):
+        if cand and os.path.isdir(cand) and os.access(cand, os.W_OK) and not _reviewer_may_write_below(cand):
+            return cand
+    return None
+
+
 @NEED_SH
 class _Env(unittest.TestCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory(prefix="t5a-gate-")
+        tmp = tempfile.TemporaryDirectory(prefix="t5a-gate-", dir=_fixture_base())
         self.addCleanup(tmp.cleanup)
         self.root = Path(os.path.realpath(tmp.name))
+        # the premise every reviewer-refusal test here stands on (no silent skip when it does not hold)
+        self.assertFalse(_reviewer_may_write_below(str(self.root)),
+                         "fixture root %s is inside the reviewer's temp allowance — a forbidden write would pass"
+                         % self.root)
         self.home = self.root / "home"
         self.pack = self.home / ".cys" / "pack"
         self.dept = self.home / ".cys" / "pack-dept-d1"
