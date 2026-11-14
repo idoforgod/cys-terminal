@@ -587,7 +587,8 @@ fn print_ok(out: &mut dyn Write, verb: &str, v: &Value, json_out: bool) {
             } else {
                 ""
             }
-        ),
+        )
+        .and_then(|_| status_notice_lines(out, v)),
         "cleanup" => writeln!(
             out,
             "{id}: 보관소 칸 정리 {}개 · 거부 {}개",
@@ -685,6 +686,27 @@ fn t6_request(cmd: &RepairCmd) -> Option<(&'static str, Value)> {
 }
 
 /// The printed result of a T6 verb (a refusal is the daemon's sentence on stderr — `fail`).
+/// T6 · RULINGS GK3 / GV3 (CCR-T6-2 — the status rendering only): the owner notices closed "not
+/// confirmed" (handed out three times without their receiver's confirmation) and a notice state the
+/// daemon could not read are printed in the ordinary output of `cys repair status`.
+fn status_notice_lines(out: &mut dyn Write, v: &Value) -> std::io::Result<()> {
+    match v.get("notices_not_confirmed") {
+        Some(Value::Array(keys)) if !keys.is_empty() => {
+            writeln!(out, "받았다는 확인이 없는 알림 {}건(세 번 건넸고 더는 건네지 않음):", keys.len())?;
+            for k in keys {
+                writeln!(out, "  {}", k.as_str().unwrap_or("?"))?;
+            }
+            Ok(())
+        }
+        Some(Value::Object(o)) if o.contains_key("unreadable") => writeln!(
+            out,
+            "알림 상태를 읽을 수 없습니다 — {}",
+            o.get("unreadable").and_then(|x| x.as_str()).unwrap_or("?")
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn t6_print(cmd: &RepairCmd, out: &mut dyn Write, v: &Value) -> i32 {
     let r = match cmd {
         RepairCmd::Sweep { json: true, .. } => writeln!(out, "{v}"),
@@ -1401,6 +1423,32 @@ mod tests {
         let (c, o, e) = run(&["rule-doc-allowed", "--path", "soul.md"], json!({"allowed": false, "path": "soul.md", "reason": "no"}));
         assert_eq!((c, o.as_str()), (95, ""));
         assert!(e.contains("허용하지 않음"));
+    }
+
+    /// RULINGS GV3 (codex r6 M3): the ordinary output of `cys repair status` prints the notices the
+    /// daemon closed "not confirmed" and an unreadable notice state — fed with the daemon's answers.
+    /// Without GV3 only the lane, the counts and the reviewer slots were printed.
+    #[test]
+    fn status_prints_the_unconfirmed_notices_and_an_unreadable_notice_state() {
+        let render = |answer: Value| {
+            let rpc = move |_m: &str, _p: Value| -> Result<Value, String> { Ok(answer.clone()) };
+            let cmd = parse(&["status"]).unwrap();
+            let mut out = Vec::new();
+            assert_eq!(run_with(&cmd, &mut out, &mut Vec::new(), &rpc), 0);
+            String::from_utf8(out).unwrap()
+        };
+        let base = json!({"lane": "base", "repairs": 0, "open_defects": 0, "reviewer_slots": {"waiting": false}});
+        let mut exhausted = base.clone();
+        exhausted["notices_not_confirmed"] = json!(["f:hooks/x.sh:ab:kept"]);
+        let text = render(exhausted);
+        assert!(text.contains("확인이 없는 알림 1건") && text.contains("f:hooks/x.sh:ab:kept"), "{text}");
+        let mut unreadable = base.clone();
+        unreadable["notices_not_confirmed"] = json!({"unreadable": "m10/base.notices-handed.json: 읽을 수 없음"});
+        let text = render(unreadable);
+        assert!(text.contains("알림 상태를 읽을 수 없습니다") && text.contains("notices-handed.json"), "{text}");
+        let mut none = base;
+        none["notices_not_confirmed"] = json!([]);
+        assert!(!render(none).contains("알림"), "nothing printed when there is none");
     }
 
     /// RULINGS DA6: `cys repair status <R>` names a corrupt record in its normal output (not only
