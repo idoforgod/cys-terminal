@@ -379,6 +379,25 @@ fn a_capital_sharp_s_spelling_of_an_absent_row_is_refused_naming_the_row() {
     );
 }
 
+/// RULINGS FR1 (a) — the daemon's caller: a DANGLING link inside the pack to an ABSENT listed file (a
+/// write through it would create the listed file) is followed by its text and refused naming the row.
+#[cfg(unix)]
+#[test]
+fn a_dangling_link_to_an_absent_listed_file_is_refused_naming_the_row() {
+    let pack = scratch("fr1-pack");
+    for d in ["hooks", "notes"] {
+        std::fs::create_dir_all(pack.join(d)).unwrap();
+    }
+    std::os::unix::fs::symlink("../hooks/session-start.sh", pack.join("notes/ss.sh")).unwrap();
+    assert!(!pack.join("hooks/session-start.sh").exists());
+    let e = production_classify("notes/ss.sh", &pack).unwrap_err();
+    assert!(
+        format!("{e:?}").contains("`hooks/session-start.sh`"),
+        "{e:?}"
+    );
+    let _ = std::fs::remove_dir_all(&pack);
+}
+
 /// RULINGS CY1 / DY2 — the daemon's caller, first on the case ONLY the comparison of the REQUESTED
 /// spelling with the row catches: the listed file is ABSENT (so the live-file identity check of
 /// AW3 (d) has nothing to compare) and a parent-directory alias inside the pack (an alias directory;

@@ -213,6 +213,21 @@ class GateWithStub(_Env):
             self.assertNotEqual(self.decision(r)[0], "deny", "%s %r" % (tool, ti))
         self.assertEqual(self.calls_seen(), [], "읽기·팩 밖 쓰기에 cys 를 띄웠다")
 
+    def test_an_outside_file_is_asked_only_when_it_has_two_names(self):
+        """RULINGS FR1 (b) cost — a write outside the pack to an ordinary file (one name) starts no `cys` (one
+        stat in the gate); the same write to a file with a second name asks the body once."""
+        stub = self.fake("no", "printf '%s'\n" % json.dumps({"decision": "no"}))
+        plain = self.root / "plain.txt"
+        plain.write_text("x", encoding="utf-8")
+        r, _ = self.run_hook("Bash", {"command": "echo x > %s" % plain}, CYS_BIN=stub)
+        self.assertNotEqual(self.decision(r)[0], "deny")
+        self.assertEqual(self.calls_seen(), [], "an ordinary outside file started cys")
+        twin = self.root / "twin.txt"
+        twin.write_text("x", encoding="utf-8")
+        os.link(str(twin), str(self.root / "twin-2.txt"))
+        r, _ = self.run_hook("Bash", {"command": "echo x > %s" % twin}, CYS_BIN=stub)
+        self.assertEqual(len(self.calls_seen()), 1, "a file with two names is asked once")
+
     def test_one_process_per_tool_call(self):
         cmd = "echo a > %s; echo b > %s; rm %s" % (self.pack / REL, self.dept / REL,
                                                     self.pack / "hooks" / "README.md")
@@ -478,6 +493,38 @@ class GateWithBuiltBinary(_Env):
         elif tool == "Write":
             Path(ti["file_path"]).write_text(ti["content"], encoding="utf-8")
         return True
+
+    def test_a_dangling_link_and_an_outside_hard_link_are_denied(self):
+        """RULINGS FR1 — (a) a dangling link inside the pack to an ABSENT listed file (a write through it would
+        create the listed file) and (b) a hard link OUTSIDE the pack to a listed file (a write through it changes
+        the live file) are denied as the listed file itself, as worker and master, by a Write and by a shell
+        redirection; after what the harness does with each answer (the tool runs unless denied) the listed file
+        is still absent / unchanged. Controls: an ordinary outside file and an outside hard link of an unlisted
+        pack file pass."""
+        p = self.pack
+        (p / "notes").mkdir(exist_ok=True)
+        absent = "hooks/session-start.sh"
+        self.assertFalse((p / absent).exists())
+        os.symlink("../" + absent, str(p / "notes" / "ss.sh"))
+        os.link(str(p / REL), str(self.outside / "h"))
+        os.link(str(p / "hooks" / "README.md"), str(self.outside / "readme"))
+        (self.outside / "plain").write_text("x\n", encoding="utf-8")
+        before = (p / REL).read_text(encoding="utf-8")
+        missed = []
+        for target, row in ((str(p / "notes" / "ss.sh"), absent), (str(self.outside / "h"), REL)):
+            for role in ("worker", "master"):
+                for tool, ti in (("Bash", {"command": "printf x > %s" % target}),
+                                 ("Write", {"file_path": target, "content": "x"})):
+                    r, _ = self.run_hook(tool, ti, CYS_ROLE=role)
+                    dec, reason = self.decision(r)
+                    if self.attempt(tool, ti, r) or row not in reason:
+                        missed.append("%s %s %s: %r %r" % (role, tool, target, r.stdout, r.stderr[-300:]))
+        self.assertEqual(missed, [], "not denied as the listed file")
+        self.assertFalse((p / absent).exists(), "a write through the dangling link created the listed file")
+        self.assertEqual((p / REL).read_text(encoding="utf-8"), before, "the live file changed through the hard link")
+        for name in ("plain", "readme"):
+            r, _ = self.run_hook("Bash", {"command": "printf x > %s" % (self.outside / name)})
+            self.assertNotEqual(self.decision(r)[0], "deny", "%s: %r" % (name, r.stdout))
 
     def test_control_variants_allowed(self):
         rel = "hooks/README.md"
@@ -757,9 +804,9 @@ class JudgeIsolation(_PlantedVectors, _Env):
 
 # RULINGS ES1 — the two interpreter starts of `_lib.sh` (the --owned runner and the deadline wrapper), as
 # they are now and as they were at 288de708 (rebuilt in a copy for the negative controls)
-LIB_NEW_OWNED = '    "$CYS_PY" -I -S -B -X utf8 -c \'import os,runpy,sys\nif sys.argv[1]:\n    os.environ["LC_CTYPE"]=sys.argv[1][1:]\nelse:\n    os.environ.pop("LC_CTYPE",None)\np=sys.argv[2]\nif os.name == "nt" and len(p)>3 and p[0]=="/" and p[2]=="/" and p[1].isalpha():\n    p=p[1]+":"+p[2:]\nsys.argv=[p]+sys.argv[3:]\nrunpy.run_path(p,run_name="__main__")\' "${LC_CTYPE+=$LC_CTYPE}" "$_cys_owned_leaf"'
+LIB_NEW_OWNED = '    "$CYS_PY" -I -S -B -X utf8 -c \'import os,runpy,sys\nif sys.argv[1] == "":\n    os.environ.pop("LC_CTYPE",None)\nelif sys.argv[1][0] == "=":\n    os.environ["LC_CTYPE"]=sys.argv[1][1:]\np=sys.argv[2]\nif os.name == "nt" and len(p)>3 and p[0]=="/" and p[2]=="/" and p[1].isalpha():\n    p=p[1]+":"+p[2:]\nsys.argv=[p]+sys.argv[3:]\nrunpy.run_path(p,run_name="__main__")\' "$_cys_lc" "$_cys_owned_leaf"'
 LIB_OLD_OWNED = '    "$CYS_PY" -B -c \'import sys\nsys.path[:]=[x for x in sys.path if x]\nimport os,runpy\np=sys.argv[1]\nif os.name == "nt" and len(p)>3 and p[0]=="/" and p[2]=="/" and p[1].isalpha():\n    p=p[1]+":"+p[2:]\nsys.argv=[p]+sys.argv[2:]\nrunpy.run_path(p,run_name="__main__")\' "$_cys_owned_leaf"'
-LIB_NEW_FALLBACK = '    "$CYS_PY" -I -S -B -X utf8 -c \'import os,sys\nif sys.argv[1]:\n    os.environ["LC_CTYPE"] = sys.argv[1][1:]\nelse:\n    os.environ.pop("LC_CTYPE", None)\nimport signal,subprocess\ntry:\n    p = subprocess.Popen(sys.argv[3:], start_new_session=True)\nexcept FileNotFoundError:\n    sys.exit(127)\nexcept Exception:\n    sys.exit(126)\ntry:\n    sys.exit(p.wait(timeout=float(sys.argv[2])))\nexcept subprocess.TimeoutExpired:\n    try:\n        os.killpg(os.getpgid(p.pid), signal.SIGKILL)\n    except Exception:\n        p.kill()\n    sys.exit(124)\' "${LC_CTYPE+=$LC_CTYPE}" "$_cys_to" "$@"\n    return $?\n'
+LIB_NEW_FALLBACK = '    "$CYS_PY" -I -S -B -X utf8 -c \'import os,sys\nif sys.argv[1] == "":\n    os.environ.pop("LC_CTYPE", None)\nelif sys.argv[1][0] == "=":\n    os.environ["LC_CTYPE"] = sys.argv[1][1:]\nimport signal,subprocess\ntry:\n    p = subprocess.Popen(sys.argv[3:], start_new_session=True)\nexcept FileNotFoundError:\n    sys.exit(127)\nexcept Exception:\n    sys.exit(126)\ntry:\n    sys.exit(p.wait(timeout=float(sys.argv[2])))\nexcept subprocess.TimeoutExpired:\n    try:\n        os.killpg(os.getpgid(p.pid), signal.SIGKILL)\n    except Exception:\n        p.kill()\n    sys.exit(124)\' "$_cys_lc" "$_cys_to" "$@"\n    return $?\n'
 LIB_OLD_FALLBACK = '    "$CYS_PY" -B -c \'import sys\nsys.path[:]=[x for x in sys.path if x]\nimport os,signal,subprocess\ntry:\n    p = subprocess.Popen(sys.argv[2:], start_new_session=True)\nexcept FileNotFoundError:\n    sys.exit(127)\nexcept Exception:\n    sys.exit(126)\ntry:\n    sys.exit(p.wait(timeout=float(sys.argv[1])))\nexcept subprocess.TimeoutExpired:\n    try:\n        os.killpg(os.getpgid(p.pid), signal.SIGKILL)\n    except Exception:\n        p.kill()\n    sys.exit(124)\' "$_cys_to" "$@"\n    return $?\n'
 LEAF = BIN / "_owned_process.py"
 
@@ -947,12 +994,14 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
         return sorted(x for x in raw.split(b"\0") if x)
 
     def test_the_wrapped_command_keeps_its_environment(self):
-        """ES1 — only the wrapper's interpreter is isolated: what the command it runs receives is exactly what
-        the shell would give it directly (apart from `_`, the shell's last-command, and what any Python launcher
-        adds — the same as under the old wrapper), on a UTF-8 locale and on the C locale, where CPython rewrites
-        LC_CTYPE for its children (PEP 538) and `-I` ignores a PYTHONCOERCECLOCALE=0 that stopped it: the
-        wrappers put LC_CTYPE back as the shell had it. The --owned runner is measured with a probe leaf that
-        starts the command the way `bin/_owned_process.py` does (`env=os.environ.copy()`)."""
+        """ES1 / FU2 — only the wrapper's interpreter is isolated: the command it runs receives exactly what the
+        shell would give it directly (apart from `_`, the shell's last-command, and what any Python launcher adds
+        — the same under the old wrapper). LC_CTYPE is handed back as the command would inherit it — on a C
+        locale CPython rewrites it for its children (PEP 538) and `-I` ignores a PYTHONCOERCECLOCALE=0 that
+        stopped it — keeping whether it was EXPORTED: unset, exported empty, exported value, and a shell
+        variable that was never exported (it must not be promoted; FU2's case: LC_CTYPE=C unexported with
+        LC_ALL=C exported). The --owned runner is measured with a probe leaf that starts the command the way
+        `bin/_owned_process.py` does (`env=os.environ.copy()`)."""
         env_cmd = ["/usr/bin/env", "-0"] if os.path.exists("/usr/bin/env") else ["env", "-0"]
         probe = self.root / "probe-leaf" / "env-leaf.py"
         probe.write_text("import os, subprocess, sys\nsys.exit(subprocess.call(%r, env=os.environ.copy()))\n" % env_cmd,
@@ -961,36 +1010,48 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
         base = {"PYTHONPATH": str(self.tmpdir / "pp-none"), "PYTHONSTARTUP": str(self.tmpdir / "none.py"),
                 "PYTHONUSERBASE": str(self.tmpdir / "ub-none"), "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
                 "ES1_PROBE": "kept"}
-        for tag, loc in (("UTF-8", {"LANG": "en_US.UTF-8", "LC_CTYPE": None}),
-                         ("C + PYTHONCOERCECLOCALE=0", {"LANG": "C", "LC_CTYPE": "C", "PYTHONCOERCECLOCALE": "0", "PYTHONUTF8": "0"}),
-                         ("LANG=C only", {"LANG": "C", "LC_CTYPE": None, "PYTHONUTF8": None})):
-            extra = dict(base, LC_ALL=None, **loc)
-            env = dict(self.env, _CYS_LIB_DEFINE_ONLY="1")
+        cases = (
+            ("UTF-8 locale", {"LANG": "en_US.UTF-8", "LC_CTYPE": None, "LC_ALL": None}, ""),
+            ("LANG=C, LC_CTYPE unset", {"LANG": "C", "LC_CTYPE": None, "LC_ALL": None, "PYTHONUTF8": None}, ""),
+            ("LC_CTYPE exported empty", {"LANG": "C", "LC_CTYPE": "", "LC_ALL": None, "PYTHONUTF8": None}, ""),
+            ("LC_CTYPE=C exported + PYTHONCOERCECLOCALE=0",
+             {"LANG": "C", "LC_CTYPE": "C", "PYTHONCOERCECLOCALE": "0", "LC_ALL": None, "PYTHONUTF8": "0"}, ""),
+            ("LC_CTYPE=C a shell variable, not exported; LC_ALL=C exported",
+             {"LANG": "C", "LC_ALL": "C", "LC_CTYPE": None, "PYTHONUTF8": None}, "LC_CTYPE=C; "),
+        )
+
+        def env_for(extra):
+            e = dict(self.env, _CYS_LIB_DEFINE_ONLY="1")
+            e.update(base)
             for k, v in extra.items():
                 if v is None:
-                    env.pop(k, None)
+                    e.pop(k, None)
                 else:
-                    env[k] = v
-            direct = set(self.env_lines(subprocess.run([SH, "-c", '"$@"', "x"] + env_cmd, env=env, cwd=str(self.root),
-                                                       capture_output=True, timeout=30).stdout))
+                    e[k] = v
+            return e
+
+        for tag, extra, prefix in cases:
+            env = env_for(extra)
+            direct = set(self.env_lines(subprocess.run([SH, "-c", prefix + '"$@"', "x"] + env_cmd, env=env,
+                                                       cwd=str(self.root), capture_output=True, timeout=30).stdout))
+            if prefix:
+                self.assertFalse(any(x.startswith(b"LC_CTYPE=") for x in direct), "fixture: %s" % tag)
             for kind, args in (("deadline wrapper", ["5"] + env_cmd),
                                ("--owned runner", ["--owned", "30", str(probe), "--records", "--", "/bin/true"])):
-                got, olds = [], []
-                for lib, sink in ((None, got), (old, olds)):
-                    e = dict(self.env, _CYS_LIB_DEFINE_ONLY="1")
-                    for k, v in extra.items():
-                        if v is None:
-                            e.pop(k, None)
-                        else:
-                            e[k] = v
-                    r = subprocess.run([SH, "-c", '. "$1"; shift; cys_timeout_run "$@"', "x", str(lib or LIB)] + args,
-                                       cwd=str(self.root), env=e, stdin=subprocess.DEVNULL, capture_output=True, timeout=90)
-                    sink.extend(self.env_lines(r.stdout))
-                new_set, old_set = set(got), set(olds)
+                sets = []
+                for lib in (LIB, old):
+                    r = subprocess.run([SH, "-c", prefix + '. "$1"; shift; cys_timeout_run "$@"', "x", str(lib)] + args,
+                                       cwd=str(self.root), env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                                       timeout=90)
+                    sets.append(set(self.env_lines(r.stdout)))
+                new_set, old_set = sets
                 missing = sorted(x for x in direct - new_set if not x.startswith(b"_="))
                 added = sorted(x for x in new_set - direct - old_set if not x.startswith(b"_="))
                 self.assertEqual(missing, [], "%s, %s: removed or changed for the command" % (kind, tag))
                 self.assertEqual(added, [], "%s, %s: added that the old wrapper did not add either" % (kind, tag))
+                lc_direct = sorted(x for x in direct if x.startswith(b"LC_CTYPE="))
+                lc_new = sorted(x for x in new_set if x.startswith(b"LC_CTYPE="))
+                self.assertEqual(lc_new, lc_direct, "%s, %s: LC_CTYPE is not what the command inherits" % (kind, tag))
                 self.assertIn(b"ES1_PROBE=kept", new_set, "%s, %s" % (kind, tag))
                 self.assertIn(b"PYTHONPATH=" + str(self.tmpdir / "pp-none").encode(), new_set, "%s, %s" % (kind, tag))
 
@@ -1001,9 +1062,9 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
         k = "\"$CYS_PY\" -I -S -B -X utf8 -c '"
         self.assertEqual(src.count(k), 2, "the two isolated starts of _lib.sh")
         i1 = src.index(k) + len(k)
-        j1 = src.index("' \"${LC_CTYPE+=$LC_CTYPE}\" \"$_cys_owned_leaf\"", i1)
+        j1 = src.index("' \"$_cys_lc\" \"$_cys_owned_leaf\"", i1)
         i2 = src.index(k, j1) + len(k)
-        j2 = src.index("' \"${LC_CTYPE+=$LC_CTYPE}\" \"$_cys_to\"", i2)
+        j2 = src.index("' \"$_cys_lc\" \"$_cys_to\"", i2)
         bodies = [src[i1:j1], src[i2:j2]]
         names = set()
         for b in bodies + [LEAF.read_text(encoding="utf-8")]:
@@ -1031,7 +1092,7 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
             old_rc, old_out, _ = self.lib_run(args, extra, self.root, lib=old)
             self.assertEqual((new_rc, new_out), (old_rc, old_out), "%r %r" % (args, extra))
         rc, out, _ = self.lib_run(["5", self.answer, 2], {}, self.root)
-        self.assertEqual((rc, out), (2, b"reviewer-codex\\n"), "a command's own 2 (a Stop hook's block) passes")
+        self.assertEqual((rc, out), (2, b"reviewer-codex\n"), "a command's own 2 (a Stop hook's block) passes")
         self.assertEqual(sorted(os.listdir(str(self.tmpdir))), before, "the wrapper created something under TMPDIR")
 
 

@@ -161,6 +161,78 @@ pub fn file_identity(path: &Path) -> Option<(u64, u64)> {
     }
 }
 
+/// RULINGS FR1 (b) — how many names the live file at `path` has (hard links). Unix: `st_nlink`;
+/// Windows: `nNumberOfLinks` of `GetFileInformationByHandle` (compile-checked only). `None` = absent
+/// or unreadable.
+pub fn link_count(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(std::fs::metadata(path).ok()?.nlink())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let f = std::fs::File::open(path).ok()?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) };
+        if ok == 0 {
+            return None;
+        }
+        Some(u64::from(info.nNumberOfLinks))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// RULINGS FR1 (b) — a file OUTSIDE every lane root that is the same file (volume + file id) as a
+/// listed row's live file in one of the lanes: a hard link made outside the pack. Only a file with
+/// more than one name is compared (an ordinary file costs one `stat`). Returns the row and its lane.
+fn outside_hard_link<'r>(
+    live: &Path,
+    roots: &'r [PathBuf],
+) -> Option<(&'static Entry, &'r PathBuf)> {
+    // one `stat` for an ordinary file: absent, not a regular file (a folder's link count is its
+    // sub-folders) or a single name → not compared
+    let m = std::fs::metadata(live).ok()?;
+    if !m.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    let names = {
+        use std::os::unix::fs::MetadataExt;
+        m.nlink()
+    };
+    #[cfg(not(unix))]
+    let names = link_count(live)?;
+    if names < 2 {
+        return None;
+    }
+    let id = file_identity(live)?;
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    for r in roots {
+        let key = std::fs::canonicalize(r).unwrap_or_else(|_| r.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        if let Some(e) = GENERATED
+            .iter()
+            .chain(GENERATED_PROTECTION.iter())
+            .find(|e| file_identity(&r.join(e.rel)) == Some(id))
+        {
+            return Some((e, r));
+        }
+    }
+    None
+}
+
 /// RULINGS AW3 (d) — the listed row (boot-critical or protection) whose live file in `pack_root`
 /// is the SAME file (volume + file id — a hard link, or a link followed to it) as the live file of
 /// `rel`, under a different rel (the fold of the spellings differs). `None` when `rel`'s file is
@@ -380,34 +452,74 @@ fn canonical_form(abs: &str, windows: bool) -> Option<String> {
 /// resolves it — every existing prefix canonicalised (links followed, also a chain), a `..` taken
 /// from that canonical prefix (so `link/..` is the parent of the link's TARGET, not of the link),
 /// the part that does not exist yet appended (a `..` there collapsed — the OS cannot follow what
-/// is not there; the conservative reading names the file such a path would reach). `None` = a
-/// component cannot be resolved (a link loop, an unreadable component).
+/// is not there; the conservative reading names the file such a path would reach). RULINGS FR1 (a):
+/// a link whose target does not exist is followed by its TEXT (`read_link`, at most
+/// `DANGLING_LINK_HOPS` links) — a write through it creates that spelling, so that spelling is the
+/// identity. `None` = a component cannot be resolved (a link loop, an unreadable component).
 fn physical_form(p: &Path, windows: bool) -> Option<String> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
     use std::path::Component;
+    enum Step {
+        Root(OsString),
+        Parent,
+        Name(OsString),
+    }
+    let steps = |q: &Path| -> Vec<Step> {
+        q.components()
+            .filter_map(|c| match c {
+                Component::Prefix(_) | Component::RootDir => {
+                    Some(Step::Root(c.as_os_str().to_os_string()))
+                }
+                Component::CurDir => None,
+                Component::ParentDir => Some(Step::Parent),
+                Component::Normal(n) => Some(Step::Name(n.to_os_string())),
+            })
+            .collect()
+    };
+    let mut queue: VecDeque<Step> = steps(p).into();
     let mut cur = PathBuf::new();
     let mut rest: Vec<String> = Vec::new();
-    for c in p.components() {
+    let mut hops = 0usize;
+    while let Some(step) = queue.pop_front() {
         if !rest.is_empty() {
-            match c {
-                Component::Normal(n) => rest.push(n.to_str()?.to_string()),
-                Component::ParentDir => {
+            match step {
+                Step::Name(n) => rest.push(n.to_str()?.to_string()),
+                Step::Parent => {
                     rest.pop();
                 }
-                _ => {}
+                Step::Root(_) => return None,
             }
             continue;
         }
-        match c {
-            Component::Prefix(_) | Component::RootDir => cur.push(c.as_os_str()),
-            Component::CurDir => {}
+        match step {
+            // an absolute component (the path's own, or a link target's) replaces what was walked
+            Step::Root(r) => cur.push(r),
             // `cur` is canonical (every link in it already followed): its parent is the physical one
-            Component::ParentDir => {
+            Step::Parent => {
                 cur.pop();
             }
-            Component::Normal(name) => {
-                let next = cur.join(name);
+            Step::Name(name) => {
+                let next = cur.join(&name);
                 match std::fs::symlink_metadata(&next) {
-                    Ok(_) => cur = std::fs::canonicalize(&next).ok()?,
+                    Ok(m) => match std::fs::canonicalize(&next) {
+                        Ok(c) => cur = c,
+                        Err(e)
+                            if m.file_type().is_symlink()
+                                && e.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            hops += 1;
+                            if hops > DANGLING_LINK_HOPS {
+                                return None;
+                            }
+                            // relative text resolves from the link's own (canonical) folder = `cur`
+                            let target = std::fs::read_link(&next).ok()?;
+                            for s in steps(&target).into_iter().rev() {
+                                queue.push_front(s);
+                            }
+                        }
+                        Err(_) => return None,
+                    },
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         rest.push(name.to_str()?.to_string())
                     }
@@ -423,6 +535,10 @@ fn physical_form(p: &Path, windows: bool) -> Option<String> {
     }
     Some(normalize_lexical(&out, windows))
 }
+
+/// RULINGS FR1 (a): how many dangling links one path may pass through (the OS's own symlink limit is
+/// of the same order: 32 on macOS, 40 on Linux).
+const DANGLING_LINK_HOPS: usize = 32;
 
 /// The longest lane root that is a whole-component prefix of one identity of a path (components
 /// compared after the full case fold — RULINGS BN1; the rel keeps the identity's own spelling).
@@ -497,6 +613,7 @@ pub fn classify_with(
     } else {
         cwd.map(|c| c.join(raw))
     };
+    let live: PathBuf = raw_abs.clone().unwrap_or_else(|| PathBuf::from(&abs));
     let mut cands = vec![abs.clone()];
     for c in [
         canonical_form(&abs, windows),
@@ -525,6 +642,31 @@ pub fn classify_with(
         .collect();
     let short_name = windows && cands.iter().any(|c| has_short_name_component(c));
     if matched.is_empty() {
+        // RULINGS FR1 (b): outside every lane root, a file with more than one name may be a hard link
+        // of a listed file — compared by file identity before it is called "not inside a lane pack"
+        if let Some((e, root)) = outside_hard_link(&live, roots) {
+            let entry = boot_critical_entry(e.rel);
+            let protection = protection_entry(e.rel);
+            let via = " — the same file through a hard link outside the pack";
+            let (decision, reason) = match entry {
+                Some(b) => (
+                    Decision::Yes,
+                    format!(
+                        "on the compiled boot-critical list ({}){via}",
+                        category_wire(b.category)
+                    ),
+                ),
+                None => (Decision::No, format!("a protection file{via}")),
+            };
+            return PathAnswer {
+                decision,
+                lane_pack: Some(root.clone()),
+                rel: Some(e.rel.to_string()),
+                entry,
+                protection,
+                reason,
+            };
+        }
         if short_name {
             return undecidable("an 8.3 short-name component could not be resolved");
         }
@@ -2043,6 +2185,113 @@ mod tests {
     /// equal-root-length tie that the lexical candidate won, so `hooks-alias/session-start.sh` was
     /// "not on the list" while the shell writes the live boot hook.
     #[cfg(unix)]
+
+    /// RULINGS FR1 (a) — a DANGLING link inside the pack to an ABSENT listed file (a write through it
+    /// creates the listed file) is followed by its text: relative, absolute, a chain of two dangling
+    /// links; a dangling link pointing out of the pack names no row; a link loop does not hang and
+    /// stays undecided by its physical form (the other identities still answer).
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_is_followed_by_its_text() {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let t = base.join(format!("t5c-dangling-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&t);
+        let pack = t.join("home/.cys/pack");
+        let elsewhere = t.join("elsewhere");
+        for d in [pack.join("hooks"), pack.join("notes"), elsewhere.clone()] {
+            std::fs::create_dir_all(&d).unwrap();
+        }
+        assert!(
+            !pack.join("hooks/session-start.sh").exists(),
+            "the listed file is absent"
+        );
+        let link = |from: &str, to: &str| std::os::unix::fs::symlink(to, pack.join(from)).unwrap();
+        link("notes/ss.sh", "../hooks/session-start.sh"); // relative text
+        link("notes/chain.sh", "ss.sh"); // a dangling link to a dangling link
+        let abs_text = pack.join("hooks/session-start.sh");
+        link("notes/abs.sh", abs_text.to_str().unwrap()); // absolute text
+        link(
+            "notes/out.sh",
+            elsewhere.join("session-start.sh").to_str().unwrap(),
+        );
+        link("notes/loop-a", "loop-b");
+        link("notes/loop-b", "loop-a");
+        let roots = vec![pack.clone()];
+        let cls = |p: &str| classify_with(&pack.join(p), None, &roots, false);
+        for p in ["notes/ss.sh", "notes/chain.sh", "notes/abs.sh"] {
+            let a = cls(p);
+            assert_eq!(
+                a.rel.as_deref(),
+                Some("hooks/session-start.sh"),
+                "{p}: {a:?}"
+            );
+            assert!(a.entry.is_some() || a.protection.is_some(), "{p}: {a:?}");
+            assert!(physical_form(&pack.join(p), false).is_some(), "{p}");
+        }
+        assert_eq!(cls("notes/out.sh").entry, None);
+        assert_eq!(cls("notes/out.sh").protection, None);
+        assert_eq!(
+            physical_form(&pack.join("notes/loop-a"), false),
+            None,
+            "a loop is not followed forever"
+        );
+        assert_eq!(cls("notes/loop-a").entry, None);
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// RULINGS FR1 (b) — a HARD LINK made OUTSIDE every lane root to a listed file is compared by file
+    /// identity before "not inside a lane pack": it is listed (the row and its lane named). An ordinary
+    /// outside file, a hard link of an UNLISTED pack file and two outside files linked to each other
+    /// stay "not inside a lane pack".
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_outside_every_lane_is_compared_by_identity() {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let t = base.join(format!("t5c-outlink-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&t);
+        let pack = t.join("home/.cys/pack");
+        let dept = t.join("home/.cys/pack-dept-d1");
+        let out = t.join("tmp");
+        for d in [pack.join("hooks"), dept.join("hooks"), out.clone()] {
+            std::fs::create_dir_all(&d).unwrap();
+        }
+        std::fs::write(pack.join("hooks/session-start.sh"), "x\n").unwrap();
+        std::fs::write(dept.join("hooks/guard.sh"), "x\n").unwrap();
+        std::fs::write(pack.join("hooks/README.md"), "x\n").unwrap();
+        std::fs::hard_link(pack.join("hooks/session-start.sh"), out.join("h")).unwrap();
+        std::fs::hard_link(dept.join("hooks/guard.sh"), out.join("g")).unwrap();
+        std::fs::hard_link(pack.join("hooks/README.md"), out.join("readme")).unwrap();
+        std::fs::write(out.join("plain"), "x\n").unwrap();
+        std::fs::write(out.join("pair-a"), "x\n").unwrap();
+        std::fs::hard_link(out.join("pair-a"), out.join("pair-b")).unwrap();
+        let roots = vec![pack.clone(), dept.clone()];
+        let cls = |n: &str| classify_with(&out.join(n), None, &roots, false);
+        let h = cls("h");
+        assert_eq!(
+            (h.decision, h.rel.as_deref()),
+            (Decision::Yes, Some("hooks/session-start.sh")),
+            "{h:?}"
+        );
+        assert_eq!(h.lane_pack.as_ref(), Some(&pack));
+        assert!(h.reason.contains("hard link outside the pack"), "{h:?}");
+        let g = cls("g");
+        assert_eq!(g.rel.as_deref(), Some("hooks/guard.sh"), "{g:?}");
+        assert!(g.protection.is_some(), "{g:?}");
+        assert_eq!(
+            g.lane_pack.as_ref(),
+            Some(&dept),
+            "the lane that holds it is named"
+        );
+        for n in ["readme", "plain", "pair-a"] {
+            let a = cls(n);
+            assert_eq!(
+                (a.decision, a.rel.clone(), a.reason.as_str()),
+                (Decision::No, None, "not inside a lane pack"),
+                "{n}: {a:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&t);
+    }
     #[test]
     fn every_identity_of_a_path_is_checked() {
         // a root WITHOUT a linked component (as `~/.cys/pack` is): the lexical and the canonical root

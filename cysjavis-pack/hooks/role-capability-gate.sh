@@ -372,7 +372,7 @@ fi
 #   좌석에 싣는 PYTHONUTF8=1) — 은 명령줄에서 **명시적으로** 돌려준다: `-X utf8`. 판정기 본문은 표준 라이브러리만
 #   import 한다(hashlib json os re shlex subprocess sys tempfile time posixpath shutil — 팩 모듈 0).
 #   ★고장 방식(불변 · RULINGS FO2): 플래그를 더하는 것 말고는 아무것도 바꾸지 않는다 — 네 플래그는 이 판정기가
-#   돌 수 있는 모든 Python 3 가 받는다(`-I` 는 3.4+). 시작하지 못하는 인터프리터는 종전과 같다: `exec` 가
+#   돌 수 있는 모든 Python 3 가 받는다(`-I` 는 3.4+ 가 판정기를 띄운다 · `-X utf8` 의 UTF-8 모드는 3.7+, 3.4–3.6 은 받고 무시). 시작하지 못하는 인터프리터는 종전과 같다: `exec` 가
 #   실패하면 셸이 한 줄을 남기고 126/127 로 끝난다(비차단 = 고장 난 게이트의 통과 · 전부 거부 아님).
 #   Windows 동봉 embeddable(`python312._pth`)에서의 동작은 미측정(보고서 T5c · TW1).
 exec "$CYS_PY" -I -S -B -X utf8 - <<'PYEOF'
@@ -3071,6 +3071,15 @@ def _bc_under_pack_root(path):
                 return True
             if os.name == "nt" and re.search(r"~[0-9]", ff):
                 return True            # 8.3 짧은 이름 — 본체가 푼다
+        # ★RULINGS FR1 (b)(0.15.0 · T5c): 팩 밖이어도 **이름이 둘 이상인 보통 파일**은 목록 파일의 하드 링크일 수
+        #   있다(`ln <팩>/hooks/session-start.sh /tmp/h` 뒤 `: > /tmp/h` 가 살아 있는 훅을 비운다) — 본체가 파일
+        #   신원으로 대조하게 묻는다. 보통 파일(이름 하나)은 stat 한 번이고 `cys` 를 띄우지 않는다.
+        try:
+            st = os.stat(path)
+            if st.st_nlink > 1 and (st.st_mode & 0o170000) == 0o100000:
+                return True
+        except (OSError, ValueError):
+            pass
     except Exception:
         return False
     return False
