@@ -13,15 +13,20 @@ large archive whose single streaming pass is MEASURED (compressed bytes read ≤
 gzip stream would read more; RULINGS CA1). T11b (RULINGS DB4): a universal file whose fat table disagrees with a
 slice's OWN header (CPU or subtype), a header / load commands that run past their slice, a load command past
 sizeofcmds, a table listed out of offset order inside a streamed archive; every load command checked, also after
-the version command and in a command area over 1 MiB (DI1). T11b (RULINGS DB5, DI2): a tar HARD-LINK member — the
-updater's extractor cannot create it (the archive cannot be extracted as packed), whether its target comes before
-or after it, through `./` names, in a chain, dangling or to a wrong-architecture file. DI3 / DI4: a chain of 20
-symbolic links resolves, a real loop (also a growing one) is a loop, `.` / `//` / a directory symbolic-link member in
-a target resolve, a target climbing above the root is refused as unsafe. A red case differs from its green control
-only in the planted fact.
+the version command and in a command area over 1 MiB (DI1); many small commands read with a bounded buffer, a bad last
+one still found, a command area over the 16 MiB cap not measurable (DL2). RULINGS DL1 (the closed form that replaces
+DB5, DI2–DI4): EVERY tar hard-link member fails — target before or after, `./` names, a chain, dangling, a
+wrong-architecture target; symbolic links resolved as the kernel does — 32 expansions resolve and 33 do not, a deep
+chain is "too many links" (no crash), a real loop, `marker/../python3.12` with `marker` a file or absent does not
+resolve, `.` / `//` / a directory link in a target resolve, member names with an inner `./` or `//` meet their link,
+absolute names and `..` in member / hard-link names are not measurable; the checker's own failure is exit 2. A red
+case differs from its green control only in the planted fact.
 
     python3 scripts/tests/test_check_macho_arch.py
 """
+import contextlib
+import importlib.util
+import io
 import os
 import re
 import shutil
@@ -44,6 +49,13 @@ LC_BUILD_VERSION, LC_VERSION_MIN_MACOSX = 0x32, 0x24
 RT = "Contents/Resources/runtime/"
 REQUIRE_APP = ["--require", RT + "python/bin/python3", "--require", RT + "node/bin/node",
                "--require", RT + "git/bin/git", "--require", RT + "uv/uv"]
+
+
+def load_gate():
+    spec = importlib.util.spec_from_file_location("check_macho_arch_under_test", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def ver(s):
@@ -462,10 +474,10 @@ class Gate(unittest.TestCase):
                     hard(t, rel, target)
         return arc
 
-    def test_a_hard_link_member_cannot_be_extracted_as_packed_wherever_its_target_is(self):
-        # RULINGS DI2: the updater (tauri-plugin-updater 2.10.1 updater.rs:1246) unpacks each member with the tar
-        # crate's Entry::unpack(file), which makes a hard link from the stored name relative to the process's working
-        # directory (tar 0.4.46 entry.rs:203–204, 528–548) — target before or after, it does not produce the file
+    def test_every_hard_link_member_fails_wherever_its_target_is(self):
+        # RULINGS DL1 (3): the updater (tauri-plugin-updater 2.10.1 updater.rs:1246) unpacks each member with the tar
+        # crate's Entry::unpack(file), which takes a hard link's stored name relative to the process's working
+        # directory (tar 0.4.46 entry.rs:203–204, 528–548) — the archive does not guarantee which file the link names
         py = "cys.app/Contents/Resources/runtime/python/bin/"
         for name, plan, prefix in (("after.tar.gz", [("after", "python3", "python3.12")], ""),
                                    ("before.tar.gz", [("before", "python3", "python3.12")], ""),
@@ -474,8 +486,9 @@ class Gate(unittest.TestCase):
             arc = self.hard_tar(name, plan, prefix=prefix)
             rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
             self.assertEqual(rc, 1, name + "\n" + out)
-            self.assertIn("FAIL %spython3: the archive cannot be extracted as packed — this member is a tar hard link "
-                          "(to %s%s" % (py, prefix + py, plan[0][2]), out)
+            self.assertIn("FAIL %spython3: a tar hard link (to %s%s) — the archive does not guarantee which file this "
+                          "link names" % (py, prefix + py, plan[0][2]), out)
+            self.assertNotIn("abandoned", out)
             self.assertNotIn("python3: missing", out)
             self.assertRegex(out, r"runtime/python/bin/python3\s+\(tar hard link\)")
             shutil.rmtree(os.path.join(self.tmp, "cys.app"))
@@ -484,15 +497,15 @@ class Gate(unittest.TestCase):
         arc = self.hard_tar("chain.tar.gz", [("after", "python3.1", "python3.12"), ("after", "python3", "python3.1")])
         rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
         self.assertEqual(rc, 1, out)
-        self.assertIn("python/bin/python3.1: the archive cannot be extracted as packed", out)
-        self.assertIn("python/bin/python3: the archive cannot be extracted as packed", out)
+        self.assertIn("python/bin/python3.1: a tar hard link", out)
+        self.assertIn("python/bin/python3: a tar hard link", out)
 
     def test_a_hard_link_to_a_wrong_architecture_file_fails_both_ways(self):
         arc = self.hard_tar("wrong.tar.gz", [("after", "python3", "python3.12")], python_cpu=ARM64)
         rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
         self.assertEqual(rc, 1, out)
         self.assertIn("FAIL cys.app/Contents/Resources/runtime/python/bin/python3.12: arm64 (no slice", out)
-        self.assertIn("python/bin/python3: the archive cannot be extracted as packed", out)
+        self.assertIn("python/bin/python3: a tar hard link", out)
 
     # -- T11b · RULINGS DI1: every load command --
     def test_a_load_command_after_the_version_command_is_checked(self):
@@ -552,7 +565,7 @@ class Gate(unittest.TestCase):
         app = self.py_links([("python/bin/python3", "lx/python3.12"), ("python/bin/lx", "lx/y")])   # lx → lx/y → …
         rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, self.make_tar("grow.tar.gz", app))
         self.assertEqual(rc, 1, out)
-        self.assertIn("python/bin/python3: link loop", out)
+        self.assertIn("python/bin/python3: too many links: more than 32 link expansions", out)   # the kernel: ELOOP
 
     def test_equivalent_spellings_and_a_directory_link_resolve(self):
         # `.` and `//` inside a target, and a target through a symbolic-link DIRECTORY member (runtime/py → python)
@@ -563,12 +576,134 @@ class Gate(unittest.TestCase):
             self.assertEqual(rc, 0, out)
             self.assertNotIn("dangling", out)
 
-    def test_a_target_climbing_above_the_root_is_refused_as_unsafe(self):
+    def test_a_target_climbing_above_the_root_fails_as_outside_the_archive(self):
         app = self.py_links([("python/bin/python3", "../../../../../../../outside/python3.12")])
         rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, self.make_tar("unsafe.tar.gz", app))
         self.assertEqual(rc, 1, out)
-        self.assertIn("python/bin/python3: unsafe link: it climbs above the root of the tree", out)
+        self.assertIn("python/bin/python3: outside the archive: `..` climbs above its root", out)
         self.assertNotIn("dangling", out)
+
+    # -- T11b · RULINGS DL1 (2): the kernel's resolution --
+    def chain_app(self, n):
+        """python3 → l<n-1> → … → l0 → python3.12: N + 1 link expansions."""
+        return self.py_links([("python/bin/l0", "python3.12")] + [("python/bin/l%d" % i, "l%d" % (i - 1)) for i in range(1, n)]
+                             + [("python/bin/python3", "l%d" % (n - 1))])
+
+    def test_thirty_two_link_expansions_resolve_and_thirty_three_do_not(self):
+        app = self.chain_app(31)                                                   # 32 expansions
+        rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, self.make_tar("l32.tar.gz", app))
+        self.assertEqual(rc, 0, out)
+        shutil.rmtree(app)
+        app = self.chain_app(32)                                                   # 33 expansions
+        rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, self.make_tar("l33.tar.gz", app))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("python/bin/python3: too many links: more than 32 link expansions (the platform's MAXSYMLINKS)", out)
+
+    def test_a_deep_chain_is_too_many_links_not_a_crash(self):
+        app = self.chain_app(1500)                                                 # far past any recursion limit
+        rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, app)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("too many links", out)
+        self.assertNotIn("Traceback", out)
+
+    def test_an_intermediate_component_must_be_a_directory_of_the_archive(self):
+        # `marker/../python3.12`: the kernel needs `marker` to be a directory — a file or nothing does not resolve
+        app = self.py_links([("python/bin/python3", "marker/../python3.12")])
+        self.put("cys.app/Contents/Resources/runtime/python/bin/marker", b"just a file\n", 0o644)
+        for arg in (app, self.make_tar("marker-file.tar.gz", app)):
+            rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arg)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("python/bin/python3: not a directory: cys.app/Contents/Resources/runtime/python/bin/marker is a file", out)
+        os.remove(os.path.join(app, "Contents/Resources/runtime/python/bin/marker"))
+        rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, self.make_tar("marker-none.tar.gz", app))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("python/bin/python3: missing component: cys.app/Contents/Resources/runtime/python/bin/marker", out)
+
+    def test_member_names_with_an_inner_dot_or_a_double_slash_meet_their_link(self):
+        # DL1 (1): ONE normal form for member names and link targets alike
+        for name in ("cys.app/Contents/Resources/runtime/python/bin/./python3.12",
+                     "cys.app/Contents/Resources/runtime//python/bin/python3.12"):
+            app = self.app()
+            os.remove(os.path.join(app, "Contents/Resources/runtime/python/bin/python3.12"))   # python3 still links to it
+            arc = os.path.join(self.tmp, "odd.tar.gz")
+            with tarfile.open(arc, "w:gz") as t:
+                t.add(app, arcname="cys.app")
+                data = thin(X86_64, minos="10.15")
+                ti = tarfile.TarInfo(name)
+                ti.size, ti.mode = len(data), 0o755
+                t.addfile(ti, io.BytesIO(data))
+            rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
+            self.assertEqual(rc, 0, name + "\n" + out)
+            self.assertRegex(out, r"runtime/python/bin/python3 -> python3\.12\s+x86_64\s+min 10\.15")
+            shutil.rmtree(app)
+
+    def test_absolute_names_and_dotdot_in_member_or_hard_link_names_are_not_measurable(self):
+        app = self.app()
+        for label, ti in (("member", tarfile.TarInfo("cys.app/../evil")),
+                          ("absolute member", tarfile.TarInfo("/abs/evil")),
+                          ("absolute link target", None),
+                          ("hard-link name", None)):
+            arc = os.path.join(self.tmp, "names.tar.gz")
+            with tarfile.open(arc, "w:gz") as t:
+                t.add(app, arcname="cys.app")
+                if ti is None:
+                    ti = tarfile.TarInfo("cys.app/Contents/Resources/extra")
+                    if label == "absolute link target":
+                        ti.type, ti.linkname = tarfile.SYMTYPE, "/usr/bin/python3"
+                    else:
+                        ti.type, ti.linkname = tarfile.LNKTYPE, "cys.app/../outside"
+                    t.addfile(ti)
+                else:
+                    ti.size = 4
+                    t.addfile(ti, io.BytesIO(b"text"))
+            rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
+            self.assertEqual(rc, 2, label + "\n" + out)
+            self.assertIn("not measurable", out)
+            self.assertNotIn("FAIL", out)
+
+    def test_the_checkers_own_failure_is_exit_2_never_1(self):
+        # DL1 (4): recursion, memory, any unexpected exception — "cannot judge", never "FAIL"
+        app = self.app()
+        for exc in (RecursionError, MemoryError, KeyError):
+            g = load_gate()
+            def boom(*a, **k):
+                raise exc("planted")
+            g.resolve = boom
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = g.main(["--target", "x86_64-apple-darwin", *REQUIRE_APP, app])
+            self.assertEqual(rc, 2, buf.getvalue())
+            self.assertIn("CANNOT JUDGE: the checker itself failed (%s" % exc.__name__, buf.getvalue())
+
+    # -- T11b · RULINGS DL2: bounded memory --
+    def many_small(self, n, last):
+        cmds = struct.pack("<IIIIII", LC_BUILD_VERSION, 24, 1, ver("10.15"), ver("15.0"), 0)
+        cmds += struct.pack("<II", 0x2, 8) * (n - 2) + struct.pack("<II", 0x2, last)
+        return struct.pack("<IIIIIIII", 0xFEEDFACF, X86_64, 3, 2, n, len(cmds), 0, 0) + cmds
+
+    def test_many_small_commands_keep_the_buffer_bounded_and_a_bad_last_one_is_found(self):
+        g = load_gate()
+        n = 120000                                                                  # ~940 KiB of 8-byte commands
+        for last, bad in ((8, False), (16, True)):
+            data = self.many_small(n, last)
+            reader = g.ForwardReader(io.BytesIO(data))
+            if bad:
+                with self.assertRaises(g.Unjudgeable) as cm:
+                    g.inspect(reader.read, len(data), "x86_64")
+                self.assertIn("load command %d (16 bytes) runs past sizeofcmds" % (n - 1), str(cm.exception))
+            else:
+                self.assertEqual(g.inspect(reader.read, len(data), "x86_64")["minos"], "10.15")
+            self.assertLessEqual(reader.peak, 2 * g.ForwardReader.CHUNK + 64, "the reader kept %d bytes" % reader.peak)
+        self.put("t/cys.app/Contents/MacOS/cys", self.many_small(n, 16))           # the same, streamed from an archive
+        rc, out = self.gate("--target", "x86_64-apple-darwin", self.make_tar("small.tar.gz", os.path.join(self.tmp, "t", "cys.app")))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("load command %d (16 bytes) runs past sizeofcmds" % (n - 1), out)
+
+    def test_a_command_area_over_the_cap_is_not_measurable(self):
+        hdr = struct.pack("<IIIIIIII", 0xFEEDFACF, X86_64, 3, 2, 1, (16 << 20) + 8, 0, 0)
+        rc, out = self.one(hdr + b"\0" * 64)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("exceeds the checker's resource cap of 16777216 bytes — not measurable", out)
 
     # -- cannot judge is never a pass --
     def test_cannot_judge_cases_exit_2(self):
