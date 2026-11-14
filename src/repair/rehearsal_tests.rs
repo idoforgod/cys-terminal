@@ -455,6 +455,41 @@ fn grandchild_of_an_escaped_child_is_followed() {
     replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
+/// RULINGS GA3 — THE completeness of a pass (one function, asked by the screen and the rehearsal):
+/// complete only when every planned execution was recorded observed whole; an execution whose output
+/// hit the cap or could not be read, a spawn failure, one never started — each leaves it incomplete.
+#[test]
+fn pass_plan_is_complete_only_when_every_planned_execution_was_observed_whole() {
+    let ok = replay::ChildOutcome {
+        code: Some(0),
+        stdout_state: replay::StreamState { eof: true, dropped: 0, read_error: false },
+        stderr_state: replay::StreamState { eof: true, dropped: 0, read_error: false },
+        ..Default::default()
+    };
+    assert!(replay::observed_whole(&ok));
+    let mut capped = ok.clone();
+    capped.stdout_state.dropped = 1;
+    let mut unread = ok.clone();
+    unread.stderr_state.read_error = true;
+    let spawn = replay::ChildOutcome { spawn_error: Some("x".into()), ..Default::default() };
+    let mut late = ok.clone();
+    late.timed_out = true;
+    for o in [&capped, &unread, &spawn, &late] {
+        assert!(!replay::observed_whole(o), "{o:?}");
+    }
+    let plan = replay::PassPlan::default();
+    plan.plan(2);
+    plan.record(true);
+    assert!(!plan.complete(), "one planned execution never ended");
+    plan.record(true);
+    assert!(plan.complete());
+    let plan = replay::PassPlan::default();
+    plan.plan(2);
+    plan.record(true);
+    plan.record(replay::observed_whole(&capped));
+    assert!(!plan.complete(), "an execution not observed whole");
+}
+
 /// RULINGS GA9: a pipe that answers "interrupted" for ever cannot keep the pump in its turn — every
 /// attempt counts against the turn's budget and the pump returns to the outer deadline check. (The
 /// old pump retried an interrupted read without counting it: this test never returned there.)

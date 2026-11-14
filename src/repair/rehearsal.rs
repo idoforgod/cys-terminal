@@ -74,6 +74,30 @@ fn rel_is_plain(rel: &str) -> bool {
     !rel.is_empty() && !p.is_absolute() && p.components().all(|c| matches!(c, Component::Normal(_)))
 }
 
+thread_local! {
+    /// RULINGS GA3: every execution of the check running on this thread was observed whole.
+    static OBSERVED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Records one execution of the current check (RULINGS GA3).
+fn note(o: &ChildOutcome) {
+    if !replay::observed_whole(o) {
+        OBSERVED.with(|c| c.set(false));
+    }
+}
+
+/// RULINGS GA3 — [`run_check`] and whether the check ran to a RESULT whose every execution was
+/// observed whole (a spawn failure turned into a failed check, an output that could not be read whole,
+/// a time-out, an error — none is). The plan of a rehearsal pass records this per target
+/// ([`replay::PassPlan`]); `run_check` keeps its T0 signature (CZ10).
+pub fn run_check_observed(req: &CheckRequest) -> (Result<CheckResult, RepairError>, bool) {
+    OBSERVED.with(|c| c.set(true));
+    let r = run_check(req);
+    let whole = OBSERVED.with(|c| c.get())
+        && matches!(r, Ok(CheckResult::Pass) | Ok(CheckResult::Fail(_)));
+    (r, whole)
+}
+
 /// Runs one check child (killed and reaped at the deadline).
 pub fn run_check(req: &CheckRequest) -> Result<CheckResult, RepairError> {
     if !rel_is_plain(&req.entry_rel) {
@@ -216,6 +240,7 @@ fn sh_syntax(file: &Path, rel: &str, deadline: Duration) -> CheckResult {
     ];
     let cwd = file.parent().unwrap_or_else(|| Path::new("/"));
     let o = replay::run_child(&argv, &plain_env(), cwd, b"", deadline);
+    note(&o);
     outcome_result(&o, rel, "셸 문법 검사")
 }
 
@@ -242,6 +267,7 @@ fn py_compile(file: &Path, rel: &str, deadline: Duration) -> Result<CheckResult,
     env.push(("PYTHONDONTWRITEBYTECODE".into(), "1".into()));
     let cwd = file.parent().unwrap_or_else(|| Path::new("/"));
     let o = replay::run_child(&argv, &env, cwd, b"", deadline);
+    note(&o);
     Ok(outcome_result(&o, rel, "파이썬 컴파일 검사"))
 }
 
@@ -426,6 +452,7 @@ fn run_in_copy(
         },
     };
     let o = replay::run_child(&argv, &env, &work, &input, deadline);
+    note(&o);
     drop(sock);
     // RULINGS CZ4: a scratch root that cannot be removed is returned (the check is not measured)
     scratch.close()?;

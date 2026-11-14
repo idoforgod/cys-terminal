@@ -654,12 +654,10 @@ struct Runner<'a> {
     nopy_usr_bin: PathBuf,
     /// Answers may come from (and go to) the process-wide cache (false on the BL1 repeat).
     use_cache: bool,
-    /// RULINGS EL1 — the PLAN of this pass and how much of it ran to a result: every planned
-    /// execution (`planned`), those that ran to an exit status within their time (`finished`), and
-    /// early returns of a probe / I3 run before or after its executions (`broken`).
-    planned: AtomicUsize,
-    finished: AtomicUsize,
-    broken: AtomicUsize,
+    /// RULINGS GA3 — the PLAN of this pass ([`replay::PassPlan`]): every job (a probe, a backstop
+    /// cell, an I3 run, the template) is declared before its pool starts and recorded observed whole
+    /// or not when it ends.
+    plan: replay::PassPlan,
     /// Test seam (EL1): the next execution of this pass fails to start.
     inject_spawn_failure: AtomicBool,
 }
@@ -693,13 +691,7 @@ impl<'a> Runner<'a> {
     /// RULINGS EL1: every planned execution of this pass ran to a result, nothing returned early,
     /// nothing ran out of time — computed from the plan, never from "time was left".
     fn complete(&self) -> bool {
-        self.planned.load(Ordering::SeqCst) == self.finished.load(Ordering::SeqCst)
-            && self.broken.load(Ordering::SeqCst) == 0
-            && !self.out_of_time.load(Ordering::SeqCst)
-    }
-
-    fn mark_broken(&self) {
-        self.broken.fetch_add(1, Ordering::SeqCst);
+        self.plan.complete() && !self.out_of_time.load(Ordering::SeqCst)
     }
 
     fn interp_key(&self) -> String {
@@ -727,9 +719,7 @@ impl<'a> Runner<'a> {
             py_dir,
             nopy_usr_bin: nopy,
             use_cache: true,
-            planned: AtomicUsize::new(0),
-            finished: AtomicUsize::new(0),
-            broken: AtomicUsize::new(0),
+            plan: replay::PassPlan::default(),
             inject_spawn_failure: AtomicBool::new(false),
         })
     }
@@ -762,7 +752,6 @@ impl<'a> Runner<'a> {
         cwd: &Path,
         stdin: &[u8],
     ) -> replay::ChildOutcome {
-        self.planned.fetch_add(1, Ordering::SeqCst);
         let Some(d) = self.child_deadline() else {
             return replay::ChildOutcome {
                 timed_out: true,
@@ -776,9 +765,6 @@ impl<'a> Runner<'a> {
             };
         }
         let o = replay::run_child(argv, env, cwd, stdin, d);
-        if !o.timed_out && o.spawn_error.is_none() && (o.code.is_some() || o.signal.is_some()) {
-            self.finished.fetch_add(1, Ordering::SeqCst);
-        }
         if !o.leftovers.is_empty() {
             if let Ok(mut l) = self.leftovers.lock() {
                 l.extend(o.leftovers.iter().copied());
@@ -963,9 +949,12 @@ fn run_hook_probe(
     setup: Setup,
 ) -> Vec<Judged> {
     match run_hook_probe_inner(r, files, released_files, class, probe, setup) {
-        Ok(j) => j,
+        Ok((j, whole)) => {
+            r.plan.record(whole);
+            j
+        }
         Err(e) => {
-            r.mark_broken();
+            r.plan.record(false);
             vec![Judged {
             suffix: "",
             answer: Answer::Error,
@@ -982,8 +971,10 @@ fn run_hook_probe_inner(
     class: &Class,
     probe: &Probe,
     setup: Setup,
-) -> Result<Vec<Judged>, RepairError> {
+) -> Result<(Vec<Judged>, bool), RepairError> {
     let run = r.fresh_dir()?;
+    // RULINGS GA3: every execution of this job observed whole?
+    let whole = std::cell::Cell::new(true);
     let res = (|| -> Result<Vec<Judged>, RepairError> {
         let home = run.join("h");
         let tmp = run.join("t");
@@ -1119,7 +1110,13 @@ fn run_hook_probe_inner(
                 .into_owned(),
         ];
         let input = probe_input(probe, &map, &work);
-        let call = |env: &[(String, String)]| r.run(&argv, env, &work, &input);
+        let call = |env: &[(String, String)]| {
+            let o = r.run(&argv, env, &work, &input);
+            if !replay::observed_whole(&o) {
+                whole.set(false);
+            }
+            o
+        };
         let judged = match setup {
             Setup::Warm => {
                 let _ = call(&env);
@@ -1189,7 +1186,7 @@ fn run_hook_probe_inner(
     })();
     // RULINGS CZ4: a cleanup error / a leftover scratch root makes the probe not measurable
     let cleaned = replay::remove_tree(&run);
-    res.and_then(|j| cleaned.map(|()| j))
+    res.and_then(|j| cleaned.map(|()| (j, whole.get())))
 }
 
 /// E-21 (BC3, BH1): the RELEASED guard.sh under its own no-Python switch with a variant's other
@@ -1275,6 +1272,7 @@ fn run_backstop_probe(
             ];
             let o = r.run(&argv, &env, &work, &probe_input(probe, &map, &work));
             drop(sock);
+            r.plan.record(replay::observed_whole(&o));
             let err = String::from_utf8_lossy(&o.stderr).into_owned();
             let marker_ok = active || err.lines().any(|l| l.trim_end() == BACKSTOP_MARKER);
             let reason_ok = err.lines().any(|l| l.trim_end() == reason);
@@ -1306,7 +1304,8 @@ fn run_backstop_probe(
         res.and_then(|j| cleaned.map(|()| j))
     };
     go().unwrap_or_else(|e| {
-        r.mark_broken();
+        // the job ended before / without its execution being recorded: not observed whole
+        r.plan.record(false);
         Judged {
             suffix: "",
             answer: Answer::Error,
@@ -1402,11 +1401,16 @@ fn screen_device(
                 .filter(|k| !have.contains_key(*k))
                 .copied()
                 .collect();
+            // RULINGS GA3: the planned executions are declared before the first one starts
+            r.plan.plan(todo.len());
             let got = run_pool(r.cfg.threads, &todo, |(cid, pi, setup)| {
                 let class = classes.iter().find(|c| c.id == *cid).copied();
                 match class.and_then(|c| c.probes.get(*pi).map(|p| (c, p))) {
                     Some((c, p)) => run_hook_probe(r, &f, &released_files, c, p, *setup),
-                    None => Vec::new(),
+                    None => {
+                        r.plan.record(false);
+                        Vec::new()
+                    }
                 }
             });
             for (k, j) in todo.iter().zip(got.iter()) {
@@ -1612,6 +1616,7 @@ fn screen_backstop(r: &Runner<'_>, v: &Variants, rels: &[String], results: &mut 
             Var::Candidate,
             Var::Attribution,
         ];
+        r.plan.plan(jobs.len());
         let got = run_pool(r.cfg.threads, &jobs, |var| {
             let f = sub(match var {
                 Var::Released => &v.released,
@@ -2323,10 +2328,8 @@ fn run_i3(
             ];
             for k in 1..=2 {
                 let o = r.run(&argv, &env, &work, b"");
-                let completed = !o.timed_out
-                    && o.spawn_error.is_none()
-                    && o.left_something().is_none()
-                    && matches!(o.code, Some(0) | Some(1));
+                // RULINGS GA3: the registrar's run counts only when observed whole
+                let completed = replay::observed_whole(&o) && matches!(o.code, Some(0) | Some(1));
                 let why = if completed {
                     format!("exit {:?}", o.code)
                 } else {
@@ -2389,7 +2392,6 @@ fn run_i3(
         res.and(cleaned)
     })();
     if let Err(e) = go {
-        r.mark_broken();
         for row in out.iter_mut() {
             row.2 = None;
             row.3 = format!("{} — run not clean: {e:?}", row.3);
@@ -2491,14 +2493,15 @@ fn screen_i3(r: &Runner<'_>, v: &Variants, rels: &[String], results: &mut Vec<Pr
         .collect();
     let touches = !touched.is_empty();
     let all_released_equal = touches && touched.iter().all(|(_, e)| *e);
+    r.plan.plan(1);
     let template = i3_template(r, &released_files);
+    r.plan.record(template.is_some());
     let profiles = profile_set(v);
     let combos: Vec<(Layout, Scenario)> = [Layout::L1, Layout::L2]
         .iter()
         .flat_map(|l| [Scenario::S1, Scenario::S2, Scenario::S3].map(move |s| (*l, s)))
         .collect();
     let Some(template) = template else {
-        r.mark_broken();
         for (l, s) in &combos {
             results.push(ProbeResult {
                 test: "I3".into(),
@@ -2566,14 +2569,19 @@ fn screen_i3(r: &Runner<'_>, v: &Variants, rels: &[String], results: &mut Vec<Pr
         )])),
         r.interp_key()
     );
+    // RULINGS GA3: the planned I3 runs are declared before the first one starts; each is recorded
+    // observed whole (every row measured) or not; a reused row is an observed fact
+    r.plan.plan(jobs.len());
     let got = run_pool(r.cfg.threads, &jobs, |(g, l, s)| {
         let ck = format!("{}|{l:?}|{s:?}|{ctx_key}", keys[*g].0);
         if r.use_cache {
             if let Some(rows) = i3_cache().lock().ok().and_then(|m| m.get(&ck).cloned()) {
+                r.plan.record(true);
                 return rows;
             }
         }
         let rows = run_i3(r, &keys[*g].1, &profiles, &template, *l, *s);
+        r.plan.record(!rows.is_empty() && rows.iter().all(|(_, _, st, _)| st.is_some()));
         // never kept from the BL1 repeat (which runs without the cache), never a not-measured row
         if r.use_cache && rows.iter().all(|(_, _, st, _)| st.is_some()) {
             if let Ok(mut m) = i3_cache().lock() {
