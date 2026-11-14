@@ -55,6 +55,9 @@ R_UNIT_UNKNOWN = "unit presence unknown"
 REQUIRED_ROWS = tuple("G%02d" % i for i in range(1, 17)) + (
     "CW7-UPD", "CW7-NEXT", "CW7-LISTED", "CW7-GENERAL", "CW7-HELD", "CW7-ENC", "CW7-WFAIL", "CW7-INTR",
     "R-T3D-IDENT", "EC2", "EC4", "EC5", "DY1", "DY3", "T7C",
+    # measurement push 2 (RULINGS GS2, GL4, GB5): the rows T9a, T5c and T2g owe
+    "IN-PLACE-HELD", "MANIFEST-HELD", "PACK-PREV", "APP-RESTORE", "T5C-JUDGES", "T5C-CP949", "T5C-DANGLING",
+    "T5C-COMPGEN", "T2G-COPY",
 )
 
 # environment variables whose VALUE may appear in the record (RULINGS EQ6); every other name is listed without its value

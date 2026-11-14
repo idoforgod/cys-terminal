@@ -60,14 +60,16 @@ C = lambda cid, role, fact, op, **kw: dict({"id": cid, "role": role, "fact": fac
 class MatrixTests(unittest.TestCase):
     def test_real_matrix_is_valid(self):
         m = R.load_matrix(MATRIX)
-        self.assertEqual(len(m["rows"]), 65)
+        self.assertEqual(len(m["rows"]), 74)
 
     def test_class_counts_match_the_approved_plan(self):
         m = load()
         counts = {}
         for r in m["rows"]:
             counts[r["class"]] = counts.get(r["class"], 0) + 1
-        self.assertEqual(counts, {"YES": 23, "PARTLY": 23, "NO": 8, "WAIT": 11})
+        # push 2 (RULINGS GS2, GL4, GB5): +7 YES rows (IN-PLACE-HELD, MANIFEST-HELD, PACK-PREV, APP-RESTORE,
+        # T5C-JUDGES, T5C-DANGLING, T5C-COMPGEN), +2 PARTLY (T5C-CP949, T2G-COPY), R-T3D-IDENT WAIT -> YES
+        self.assertEqual(counts, {"YES": 31, "PARTLY": 25, "NO": 8, "WAIT": 10})
 
     def test_every_required_row_exists_once(self):
         ids = [r["id"] for r, _ in R.iter_rows(load())]
@@ -144,7 +146,7 @@ class MatrixTests(unittest.TestCase):
         self.assertTrue(any("needs the assumption" in x for x in e), e)
 
     def test_top_row_count_is_pinned(self):
-        e = self._errors_after(lambda m: m.__setitem__("expected_top_rows", 64))
+        e = self._errors_after(lambda m: m.__setitem__("expected_top_rows", 73))
         self.assertTrue(any("expected_top_rows" in x for x in e), e)
 
     def test_bad_probe_table_is_refused(self):
@@ -658,6 +660,44 @@ class DriverShapeTests(unittest.TestCase):
         self.assertIn('name = "other"\nversion = "0.15.0"', lock2)
         self.assertEqual(T.append_marker(b"a\r\nb", "# m"), b"a\nb\n# m\n")
         self.assertIn("cmd", load()["scenario"]["next_version_marker"])
+
+
+class Push2HelperTests(unittest.TestCase):
+    """The pure helpers measurement push 2 added to the probes (the Windows calls themselves run only on the runner)."""
+
+    def test_vendor_rels_follow_build_rs(self):
+        import tw1_probes as P
+        rels = P.vendor_rels()
+        self.assertGreaterEqual(len(rels), 250)                     # build.rs refuses a pack under 250 entries
+        self.assertEqual(rels, sorted(rels))
+        self.assertFalse([r for r in rels if any(c.startswith(".") or c in ("tests", "__pycache__") for c in r.split("/"))])
+        self.assertIn("hooks/session-start.sh", rels)
+        self.assertIn("bin/javis_event.py", rels)
+
+    def test_deny_of_reads_the_last_json_line(self):
+        import tw1_probes as P
+        deny = '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"r"}}'
+        self.assertEqual(P._deny_of("Active code page: 949\n" + deny + "\n"), (True, "r"))
+        self.assertEqual(P._deny_of(""), (False, None))
+        self.assertEqual(P._deny_of('{"hookSpecificOutput":{"additionalContext":"x"}}'), (False, None))
+        self.assertEqual(P._deny_of("{not json"), (False, None))
+
+    def test_spellings(self):
+        import tw1_probes as P
+        self.assertEqual(P._msys("X:\\profiles\\x\\.cys\\pack"), "/x/profiles/x/.cys/pack")
+        self.assertEqual(P._fwd("D:\\a\\_temp"), "D:/a/_temp")
+
+    def test_staging_leftovers_and_held_relations(self):
+        import tempfile
+        import tw1_probes as P
+        with tempfile.TemporaryDirectory() as d:
+            for n in ("pack", "pack.prev", "pack-captures", ".pack-staging-init-12", "x.superseded-prev"):
+                os.makedirs(os.path.join(d, n))
+            self.assertEqual(P.staging_leftovers(d), [".pack-staging-init-12", "x.superseded-prev"])
+        self.assertIsNone(P.staging_leftovers(os.path.join(HERE, "no-such-folder")))
+        sc = load()["scenario"]
+        self.assertEqual({k: f(sc) for k, f in P._HELD_REL.items()},
+                         {"bash": "hooks/save-state.sh", "python": "bin/javis_event.py", "early": "agents.json"})
 
 
 class WorkflowTests(unittest.TestCase):
