@@ -2178,8 +2178,8 @@ pub(crate) fn route(
 
 /// RULINGS EO5 (a) / DE1 / GA8: what the scoped after-run comparison around the worker's `check`
 /// found has the same consequences as in step 3 — ONE intake row (a noted difference too), written
-/// FIRST and within this bounded step (no helper thread: the report verb's lock is `intake:<…>`, never
-/// a repair lock), and for a refusal whose row the ledger answered NEW the lane master's pointer —
+/// FIRST and within this bounded step (no helper thread: the report verb takes one of the intake shard
+/// locks — `repair::intake_lock_for`, RULINGS DA3 — never a repair lock), and for a refusal whose row the ledger answered NEW the lane master's pointer —
 /// once, one attempt. Nothing is remembered in memory: a restart asks the ledger again.
 pub(crate) fn comparison_consequence(
     daemon: &Arc<Daemon>,
