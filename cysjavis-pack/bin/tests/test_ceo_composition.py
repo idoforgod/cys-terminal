@@ -16,6 +16,7 @@
     python3 cysjavis-pack/bin/tests/test_ceo_composition.py
 """
 import ast
+import errno
 import glob
 import hashlib
 import importlib.util
@@ -23,6 +24,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1094,6 +1096,72 @@ class SafePrimitives(Rig):
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER, "빈 살아 있는 이름을 채우지 않았다")
         self.assertEqual(proxy2.opened_live, [], "복구의 채우기가 살아 있는 이름을 쓰기로 열었다(제자리 쓰기)")
         self.assertTrue(os.path.exists(os.path.join(kd, "X.compose")), "보관된 판을 지웠다")
+
+
+class FlushFailure(Rig):
+    """★RULINGS FL5 — 실패한 flush 는 실패다(codex B4: fsync_dir 가 폴더 flush 실패를 삼켜, 디스크에 확정되지 않은 의도 기록 아래서
+    살아 있는 이름을 바꿨다). 후보나 교체 기록의 폴더 flush 가 실패하면 살아 있는 이름을 건드리기 전에 보류하고(rc 6 · 알림 1건),
+    만든 것은 지우지 않는다. 용인은 '지원하지 않음'(EINVAL·ENOTSUP) 뿐 — 그때는 교체가 그대로 끝난다."""
+
+    class _Os:
+        """ceo_py 모듈 안의 `os` 만 바꾼다 — 폴더 fd 의 fsync 가 주어진 errno 로 실패한다(when(폴더) 가 참일 때만)."""
+        def __init__(self, real, code, when):
+            self._real, self._code, self._when, self.failed = real, code, when, 0
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def fsync(self, fd):
+            if stat.S_ISDIR(self._real.fstat(fd).st_mode) and self._when():
+                self.failed += 1
+                raise OSError(self._code, os.strerror(self._code))
+            return self._real.fsync(fd)
+
+    def run_with(self, mode, code, when):
+        shutil.rmtree(self.dirs, ignore_errors=True)
+        self.seed()
+        ns = ceo_py_module()
+        if mode == "deposit":
+            ns["exchange_fn"] = lambda: None
+        proxy = self._Os(os, code, when)
+        ns["os"] = proxy
+        nf = os.path.join(self.tmp, "nf-%s.txt" % mode)
+        if os.path.exists(nf):
+            os.unlink(nf)
+        rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), nf])
+        return rc, proxy, (_slurp(nf, encoding="utf-8") if os.path.exists(nf) else "")
+
+    def modes(self):
+        return (["exchange"] if ceo_py_module()["exchange_fn"]() is not None else []) + ["deposit"]
+
+    def test_a_failed_flush_holds_before_the_live_name_is_touched(self):
+        intent = lambda: os.path.lexists(self.p(".ceo-intent.json"))
+        for mode in self.modes():
+            for label, when in (("candidate", lambda: True), ("intent", intent)):
+                with self.subTest(mode=mode, failing=label):
+                    rc, proxy, notes = self.run_with(mode, errno.EIO, when)
+                    self.assertGreater(proxy.failed, 0, "폴더 flush 실패를 끼워 넣지 못했다(시험 무효)")
+                    self.assertEqual(rc, 6, "flush 가 실패했는데 보류하지 않았다(codex B4)")
+                    self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "확정되지 않은 기록 아래서 살아 있는 이름이 바뀌었다")
+                    self.assertIn("CEO 지침 교체 기록 확인 필요", notes, "보류 알림이 없다")
+                    self.assertIn("디스크에 확정하지", notes)
+                    self.assertTrue([f for f in os.listdir(self.dirs) if f.endswith(".candidate")],
+                                    "확실하지 않은데 후보를 치웠다(모든 산출물을 남긴다)")
+                    if label == "intent":
+                        self.assertTrue(intent(), "교체 기록을 치웠다")
+                    rc, out, err = self.run_dept("promote-ceo")
+                    self.assertEqual(rc, 0, out + err)
+                    self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER, "다음 입구가 이어 가지 않았다")
+                    self.assertIsNone(self.read(".ceo-intent.json"))
+
+    def test_an_unsupported_directory_flush_is_tolerated(self):
+        for mode in self.modes():
+            for code in (errno.EINVAL, errno.ENOTSUP):
+                with self.subTest(mode=mode, errno=errno.errorcode[code]):
+                    rc, proxy, notes = self.run_with(mode, code, lambda: True)
+                    self.assertGreater(proxy.failed, 0, "폴더 flush 를 부르지 않았다(시험 무효)")
+                    self.assertEqual(rc, 0, notes)
+                    self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER)
 
 
 class SaveDuringSwap(Rig):

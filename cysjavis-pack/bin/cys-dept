@@ -1741,17 +1741,23 @@ def stamp():
     return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
 
 
+_FLUSH_UNSUPPORTED = (errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP)
+
+
 def fsync_dir(d):
+    """★RULINGS FL5 — 폴더 안의 이름 바꾸기를 디스크에 확정한다. **실패는 실패다**(OSError — 부르는 쪽이 보류한다: 확정됐다고 믿을
+    수 없는 기록 아래에서는 살아 있는 이름을 건드리지 않는다). 용인하는 것은 '이 파일 시스템은 폴더 flush 를 지원하지 않는다'
+    뿐이다: 윈도우(파이썬은 폴더를 열어 fsync 할 수 없다 — NTFS 는 이름 바꾸기를 메타데이터 저널에 남긴다)와 fsync 가
+    EINVAL·ENOTSUP·EOPNOTSUPP 로 답하는 파일 시스템. 맥 APFS 와 리눅스 ext4 는 지원한다(맥은 실측 — 보고서 Round 3)."""
     if os.name != "posix":
         return
+    fd = os.open(d, os.O_RDONLY)
     try:
-        fd = os.open(d, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
+        try:
+            os.fsync(fd)
+        except OSError as e:
+            if e.errno not in _FLUSH_UNSUPPORTED:
+                raise
     finally:
         os.close(fd)
 
@@ -2213,6 +2219,16 @@ def place_candidate(cand_p, md):
     fsync_dir(os.path.dirname(os.path.abspath(md)))
 
 
+def hold_unflushed(md, nf, what, e):
+    """★RULINGS FL5 — 살아 있는 이름을 바꾸기 전에 쓴 것(후보·교체 기록)을 디스크에 확정하지 못했다: 보류(알림 1건 · 지침 무변경 ·
+    만든 파일은 그대로 — 확실하지 않으면 모든 산출물을 남긴다)."""
+    err("CEO 지침 교체 보류: %s 을(를) 디스크에 확정하지 못했다(%s) — 살아 있는 지침은 건드리지 않았다" % (what, e))
+    note(nf, T_INTENT_CHECK, "본부 지침을 바꾸기 전에 %s을(를) 디스크에 확정하지(flush) 못해(%s) CEO 지침을 바꾸지 않고 "
+                             "보류했습니다. 살아 있는 지침은 그대로이고, 만들어 둔 파일은 지우지 않았습니다 — 다음 승격 확인이 "
+                             "이어 갑니다. 같은 일이 되풀이되면 디스크 상태를 확인하십시오." % (what, e))
+    raise HoldSwap("unflushed: %s" % what)
+
+
 def swap_unit(md, data, expect_sha, op, reason, expect=None, nf=""):
     """★RULINGS EY2 — 하나의 복구할 수 있는 교체. ① 후보를 다 쓴다 ② 의도 기록(읽은 바이트의 해시 · 후보 · 미리 정한 보관
     이름)을 남긴다 ③ 살아 있는 이름을 바꾼다 — 맞바꾸기(맥·리눅스) 또는 맡기고 먼저(살아 있는 파일을 보관 폴더로 옮긴 뒤 다
@@ -2230,17 +2246,19 @@ def swap_unit(md, data, expect_sha, op, reason, expect=None, nf=""):
     iid = new_iid()
     cand_p = candidate_path(md, iid)
     kname = "%s.%s" % (iid, reason)
-    write_candidate(cand_p, data, md, expect)
+    try:
+        write_candidate(cand_p, data, md, expect)
+    except OSError as e:
+        hold_unflushed(md, nf, "새 지침 후보", e)
     rec = {"schema": 1, "id": iid, "op": op, "reason": reason, "mode": mode, "live": os.path.basename(md),
            "read_sha256": expect_sha, "candidate": os.path.basename(cand_p), "candidate_sha256": sha(data),
            "kept": kname, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    # 정리는 '그 걸음이 실패했다'가 확실할 때만(OSError) 한다 — 다른 예외·실제 멈춤 뒤의 상태는 다음 입구가 기록으로 이어 간다.
     try:
         write_intent(md, rec)
-    except OSError:
-        if not os.path.lexists(intent_path(md)) or read_intent(md) != rec:
-            silent_unlink(cand_p)
-        raise
+    except OSError as e:
+        # ★FL5: 기록(파일 또는 폴더)의 flush 가 실패했다 — 기록이 디스크에 있다고 믿을 수 없으니 살아 있는 이름을 건드리기 전에
+        #   보류한다. 확실하지 않으면 아무것도 치우지 않는다(후보·기록 그대로 — 다음 입구가 이어 간다).
+        hold_unflushed(md, nf, "교체 기록(%s)" % INTENT, e)
     if mode == "exchange":
         try:
             prim_exchange(cand_p, md)
@@ -2254,7 +2272,10 @@ def swap_unit(md, data, expect_sha, op, reason, expect=None, nf=""):
                 remove_intent(md)
                 raise
             mode = rec["mode"] = "deposit"          # 이 파일 시스템은 맞바꾸기를 못 한다 — 맡기고 먼저로
-            write_intent(md, rec)
+            try:
+                write_intent(md, rec)
+            except OSError as e:
+                hold_unflushed(md, nf, "교체 기록(%s)" % INTENT, e)     # ★FL5 — 아직 살아 있는 이름은 그대로다
             _MODE[os.path.dirname(os.path.abspath(md))] = "deposit"
     if mode == "exchange":
         kept, ksha = keep_file(cand_p, md, reason, name=kname)
