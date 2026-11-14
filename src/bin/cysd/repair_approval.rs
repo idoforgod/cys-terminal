@@ -755,7 +755,7 @@ pub(crate) fn production_step3(s3: &Step3Input) -> Result<Step3Ok, String> {
         .map_err(|e| format!("예행 사본을 만들지 못했습니다 — {e:?}"))?;
     for (rel, st) in &s3.states {
         let dst = layout.join(rel);
-        replay::remove_tree(&dst);
+        replay::remove_tree(&dst).map_err(|e| format!("{rel}: {e:?}"))?;
         let src = match st {
             TargetState::Absent => replay::LaidSource::Absent,
             TargetState::Link { target } => replay::LaidSource::Link(target.clone()),
@@ -797,7 +797,9 @@ pub(crate) fn production_step3(s3: &Step3Input) -> Result<Step3Ok, String> {
             CheckResult::Timeout => return Err(format!("{rel}: 예행 검사 시간 초과")),
         }
     }
-    drop(scratch);
+    scratch
+        .close()
+        .map_err(|e| format!("예행 사본을 지우지 못했습니다 — {e:?}"))?;
     // (b) the protection screen (C4 — every boot-critical and protection-related submit, AT2)
     let cand = ScreenCandidate {
         files: staging.clone(),
