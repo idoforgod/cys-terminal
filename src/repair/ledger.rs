@@ -290,10 +290,14 @@ pub fn held_by_seat_in(
     Ok(None)
 }
 
-/// The job-state reader (RULINGS H3 / I1). Stub in T0.
+/// The job-state reader (RULINGS H3 / I1) — T7b: `propagate::read_job_state_checked` (GK5's bounded
+/// reader; absent → `Precondition`, malformed or unreadable → `Corrupt`).
 pub fn load_job_state(lane: &LaneKey) -> Result<JobState, RepairError> {
-    let _ = lane;
-    Err(RepairError::NotImplemented("ledger::load_job_state"))
+    match super::propagate::read_job_state_checked(&super::paths::repairs_root(), lane) {
+        super::propagate::FileRead::Value(st) => Ok(st),
+        super::propagate::FileRead::Absent => Err(RepairError::Precondition(format!("{}: 이 부서의 수리 상태 파일이 아직 없습니다", lane.0))),
+        super::propagate::FileRead::Malformed(why) | super::propagate::FileRead::ReadError(why) => Err(RepairError::Corrupt(why)),
+    }
 }
 
 /// The registered lanes (RULINGS K1: base ∪ `depts.json` sockets; interpretation 27).
@@ -362,14 +366,28 @@ pub enum PackInstanceOutcome {
     Reset { demoted: u32 },
 }
 
-/// RULINGS I8 — `fresh_id` comes from the daemon's CSPRNG. Stub in T0 (body: T7b).
+/// RULINGS I8 — `fresh_id` comes from the daemon's CSPRNG. Body: T7b
+/// (`propagate::pack_instance_pass_in`): the same instance (also after a verify-only pass, L5 (a)) →
+/// `Same`; a full reset → `Reset`; a pass skipped for a transient read error (O5) → `Err`.
 pub fn pack_instance_pass(
     lane: &LaneKey,
     pack_dir: &Path,
     fresh_id: &str,
 ) -> Result<PackInstanceOutcome, RepairError> {
-    let _ = (lane, pack_dir, fresh_id);
-    Err(RepairError::NotImplemented("ledger::pack_instance_pass"))
+    let root = super::paths::repairs_root();
+    let env = super::propagate::PassEnv {
+        root: &root,
+        lane,
+        pack: pack_dir,
+        now: now_epoch(),
+        locked: &super::apply::no_repair_lock,
+        stop: &|_| false,
+    };
+    match super::propagate::pack_instance_pass_in(&env, fresh_id) {
+        super::propagate::PassOutcome::Equal | super::propagate::PassOutcome::VerifyOnly { .. } => Ok(PackInstanceOutcome::Same),
+        super::propagate::PassOutcome::Reset { demoted } => Ok(PackInstanceOutcome::Reset { demoted }),
+        super::propagate::PassOutcome::Skipped(why) => Err(RepairError::Io(why)),
+    }
 }
 
 /// The assignment gate's verdict for a lane (printed by `cys repair gate`).
@@ -379,10 +397,10 @@ pub enum GateVerdict {
     Held(HoldCause),
 }
 
-/// Local read of the gate (interpretation 24). Stub in T0 (body: T7b).
+/// Local read of the gate (interpretation 24). Body: T7b (`propagate::gate_verdict_in` — reads only;
+/// every doubt is HELD with its cause).
 pub fn gate_verdict(lane: &LaneKey) -> Result<GateVerdict, RepairError> {
-    let _ = lane;
-    Err(RepairError::NotImplemented("ledger::gate_verdict"))
+    Ok(super::propagate::gate_verdict_in(&super::paths::repairs_root(), lane))
 }
 
 /// THE candidate reader (RULINGS V2(a)), re-exported as `repair::candidate_states`: one line per
