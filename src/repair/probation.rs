@@ -741,7 +741,7 @@ fn probation_pass(env: &JobEnv<'_>, report: &mut TickReport) {
         let Some(p) = row.probation.clone() else {
             continue;
         };
-        if p.closed.as_deref().is_some_and(|c| !apply::closure_owes_return(c)) {
+        if p.closed.as_deref().is_some_and(|c| !apply::closure_owes_return(c) && !apply::closure_not_revertible(c)) {
             continue;
         }
         let rec = match ledger::read_record_in(root, &id) {
@@ -869,6 +869,16 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, _listed_row: &LaneRecor
         return Ok(());
     };
     if let Some(closed) = p.closed.as_deref() {
+        // FI1: not put back by the mechanism — nothing is re-checked for a return; at 24 hours the
+        // record is in use (the row keeps its sentence)
+        if apply::closure_not_revertible(closed) {
+            if env.op.now - p.applied_at >= ledger::PROBATION_SECS as f64 && rec.state == RepairState::Probation {
+                close_row(env, &rec.id, "사용 중 — 24시간 시험 기간을 마쳤습니다", &[], Some(RepairState::InUse))?;
+                report.ended.push(rec.id.clone());
+                report.lines.push(format!("{}: 시험 기간을 마치고 사용 중({})", rec.id.as_str(), apply::NOT_REVERTIBLE_SENTENCE));
+            }
+            return Ok(());
+        }
         if !apply::closure_owes_return(closed) || env.op.form != ApplyForm::Exchange {
             return Ok(());
         }

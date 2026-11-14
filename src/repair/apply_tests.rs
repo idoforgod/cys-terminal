@@ -2392,6 +2392,117 @@ fn the_apply_supersession_defers_a_guarded_older_repair() {
     assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::Superseded);
 }
 
+// ───────────────────────────── RULINGS FI1 — the binding of a put-back is its bytes' generation ─────────────────────────────
+
+/// The approved apply of `approved_and_applied` with `between` run after the begin (the pre-image
+/// copy) and before the apply, and `faults` during the apply.
+fn approved_with(r: &Rig, id: &RepairId, rel: &str, between: &dyn Fn(&Rig), faults: &dyn Faults) -> ApplyReport {
+    r.put(rel, b"PRE\n", 0o755);
+    let pre_img = ledger::copy_preimage_in(&r.root, id, &r.lane, rel, &r.pack.join(rel), 1.0).unwrap();
+    between(r);
+    let staging = ledger::staging_dir_in(&r.root, id);
+    std::fs::create_dir_all(staging.join(rel).parent().unwrap()).unwrap();
+    std::fs::write(staging.join(rel), b"POST\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(staging.join(rel), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let st = TargetState::read(&staging.join(rel)).unwrap();
+    let fp = crate::repair::types::fingerprint(&[(rel.to_string(), st.clone())]);
+    let mut rec = record(r, id, Classification::BootCritical, vec![FileChange { rel: rel.into(), kind: ChangeKind::Edit, pre: pre_img, post: st, diff: None }], RepairState::AwaitingApproval);
+    rec.approval = Some(approval(&fp));
+    rec.verify = Some(Attestation { seat: 2, role: "reviewer-codex".into(), verdict: "pass".into(), note: String::new(), at: 1.0, fingerprint_sha256: fp });
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let env = r.env(faults, ApplyForm::Exchange);
+    apply_candidate_in(&env, id, &[CandidateFile { rel: rel.into(), staged: staging.join(rel), mode: 0o755 }], &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).unwrap()
+}
+
+fn pre_image_dir(r: &Rig, id: &RepairId) -> PathBuf {
+    match &ledger::read_record_in(&r.root, id).unwrap().unwrap().files[0].pre {
+        PreImage::Slot { slot_dir, .. } => slot_dir.clone(),
+        PreImage::Absent => panic!("no pre-image slot"),
+    }
+}
+
+/// FI1 (codex r4 addendum): the pack is updated BETWEEN the begin (the pre-image copy, which records
+/// the generation its bytes were live in) and the commit — the commit still commits, but the repair
+/// is not put back by the mechanism and the row SAYS so; a revert is refused, nothing put back.
+/// Without FI1 the row carried the apply's generation and a revert put the old generation's bytes
+/// back.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_update_between_begin_and_commit_commits_a_repair_that_is_not_put_back() {
+    let r = rig("fi1begin");
+    let id = rid("R-11");
+    let rep = approved_with(&r, &id, "hooks/fi.sh", &|r| std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap(), &NoFaults);
+    assert_eq!(rep.outcome, ApplyOutcome::Applied, "{rep:?}");
+    assert_eq!(vault::slot_generation(&pre_image_dir(&r, &id)).unwrap().unwrap().version, "0.15.0", "the begin recorded its bytes' generation");
+    let row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+    let closed = row.probation.as_ref().unwrap().closed.clone().unwrap_or_default();
+    assert!(closed.contains(NOT_REVERTIBLE_SENTENCE), "the row says so: {closed}");
+    let rec = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
+    assert!(!revertible_here(&rec, &row, &r.lane));
+    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    assert!(revert_in(&env, &id, RevertCaller::Human, &no_hooks, &no_repair_lock).is_err(), "refused");
+    assert_eq!(std::fs::read(r.pack.join("hooks/fi.sh")).unwrap(), b"POST\n", "nothing put back");
+}
+
+/// FI1: the update lands INSIDE the commit's window — after the record is written, before the row:
+/// the row, written after it, compares the pre-images' generation with the generation NOW and says
+/// the repair is not put back. Without FI1 the row carried the generation of the apply's start.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_update_inside_the_commit_window_is_said_on_the_row() {
+    struct UpdateAtCommit;
+    impl Faults for UpdateAtCommit {
+        fn at(&self, p: Point, live: &Path, _: Option<&Slot>) -> bool {
+            if p == Point::AfterRecordCommit {
+                let pack = live.parent().unwrap().parent().unwrap();
+                std::fs::write(pack.join(".pack-version"), "0.15.2\n").unwrap();
+            }
+            false
+        }
+    }
+    let r = rig("fi1window");
+    let id = rid("R-12");
+    let rep = approved_with(&r, &id, "hooks/fw.sh", &|_| {}, &UpdateAtCommit);
+    assert_eq!(rep.outcome, ApplyOutcome::Applied, "{rep:?}");
+    let closed = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap_or_default();
+    assert!(closure_not_revertible(&closed), "{closed}");
+}
+
+/// FI1: a slot whose metadata records no generation is Unknown — its bytes are never put back (a
+/// revert closes 대체됨 and changes nothing); and the generation read when a slot is filled obeys
+/// FG1 — a corrupt pack state at the begin leaves the field absent.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_slot_without_its_generation_is_never_put_back() {
+    let r = rig("fi1unknown");
+    let id = rid("R-13");
+    committed_general(&r, &id, "hooks/fu.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let dir = pre_image_dir(&r, &id);
+    assert!(vault::slot_generation(&dir).unwrap().is_some(), "recorded at the begin");
+    // the field removed: an older slot
+    let p = dir.join("meta").join("pre.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+    v.as_object_mut().unwrap().remove("pack_generation");
+    std::fs::write(&p, serde_json::to_vec(&v).unwrap()).unwrap();
+    assert_eq!(vault::slot_generation(&dir).unwrap(), None);
+    assert_eq!(put_back_bound(Some(&dir), &Bound::now(&r.pack)), Bound::Unknown);
+    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let rep = revert_in(&env, &id, RevertCaller::Human, &no_hooks, &no_repair_lock).unwrap();
+    assert!(matches!(rep.outcome, ApplyOutcome::Superseded(_)), "{rep:?}");
+    assert_eq!(std::fs::read(r.pack.join("hooks/fu.sh")).unwrap(), b"POST\n", "nothing put back");
+    // FG1 at the fill: a corrupt pack state → no generation recorded
+    let id2 = rid("R-14");
+    std::fs::write(r.pack.join(crate::pack::PACK_STATE_FILE), b"{ corrupt").unwrap();
+    r.put("hooks/fc.sh", b"X\n", 0o755);
+    let pre = ledger::copy_preimage_in(&r.root, &id2, &r.lane, "hooks/fc.sh", &r.pack.join("hooks/fc.sh"), 2.0).unwrap();
+    let PreImage::Slot { slot_dir, .. } = pre else { panic!("slot") };
+    assert_eq!(vault::slot_generation(&slot_dir).unwrap(), None, "an unreadable generation is never recorded as one");
+}
+
 // ───────────────────────────── RULINGS EJ4 — one ownership per repair ─────────────────────────────
 
 /// EJ4 through the real entry points: a revert (the owner) paused in its hook phase holds the

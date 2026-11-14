@@ -578,6 +578,7 @@ fn op_exchange(
         &spec.expected,
         &staged,
         env.now,
+        Bound::now(env.pack).known().as_ref(),
     )?;
     if env.faults.at(Point::AfterSlot, live, Some(&slot)) {
         return Err(stop(Point::AfterSlot));
@@ -781,6 +782,7 @@ fn op_move_in(
         &spec.expected,
         &Staged::Empty,
         env.now,
+        Bound::now(env.pack).known().as_ref(),
     )?;
     if env.faults.at(Point::AfterSlot, live, Some(&slot)) {
         return Err(stop(Point::AfterSlot));
@@ -1012,6 +1014,7 @@ fn op_deposit_first(
         &spec.expected,
         &Staged::Empty,
         env.now,
+        Bound::now(env.pack).known().as_ref(),
     )?;
     if env.faults.at(Point::AfterSlot, live, Some(&slot)) {
         return Err(stop(Point::AfterSlot));
@@ -1468,10 +1471,21 @@ pub fn pre_image_for(
     lane: &LaneKey,
     rel: &str,
 ) -> Result<(TargetState, Option<PathBuf>), RepairError> {
+    pre_image_slot_for(root, rec, lane, rel).map(|(st, holder, _)| (st, holder))
+}
+
+/// RULINGS FI1 — [`pre_image_for`] that also names the slot whose bytes would be put back (`None` for
+/// an absent pre-image: nothing is put back, the entry is moved out).
+pub fn pre_image_slot_for(
+    root: &Path,
+    rec: &RepairRecord,
+    lane: &LaneKey,
+    rel: &str,
+) -> Result<(TargetState, Option<PathBuf>, Option<PathBuf>), RepairError> {
     if let Some(op) = applied_op_for(root, &rec.id, lane, rel) {
         let want = parse_canon(&op.expected).unwrap_or(TargetState::Absent);
         if want == TargetState::Absent {
-            return Ok((TargetState::Absent, None));
+            return Ok((TargetState::Absent, None, None));
         }
         let slot = Slot::at(op.slot.as_deref().unwrap_or(Path::new("")), rel);
         let (st, holder) = vault::deposit_of(&slot)?;
@@ -1480,7 +1494,7 @@ pub fn pre_image_for(
                 "{rel}: 보관된 적용 전 내용이 기록과 다릅니다"
             )));
         }
-        return Ok((st, Some(holder)));
+        return Ok((st, Some(holder), Some(slot.dir.clone())));
     }
     if rec.origin_lane != *lane {
         return Err(RepairError::Precondition(format!(
@@ -1491,7 +1505,7 @@ pub fn pre_image_for(
         .find(|f| f.rel == rel)
         .ok_or_else(|| RepairError::Precondition(format!("{rel}: 수리 기록에 없는 대상입니다")))?;
     match &f.pre {
-        PreImage::Absent => Ok((TargetState::Absent, None)),
+        PreImage::Absent => Ok((TargetState::Absent, None, None)),
         PreImage::Slot { slot_dir, .. } => {
             let slot = Slot::at(slot_dir, rel);
             let (st, holder) = vault::deposit_of(&slot)?;
@@ -1500,8 +1514,22 @@ pub fn pre_image_for(
                     "{rel}: 보관된 적용 전 내용이 기록과 다릅니다"
                 )));
             }
-            Ok((st, Some(holder)))
+            Ok((st, Some(holder), Some(slot_dir.clone())))
         }
+    }
+}
+
+/// RULINGS FI1 — the door's binding for putting back the bytes of `slot`: the generation the slot
+/// recorded when it was filled (absent or unreadable → Unknown; a row's or intent's generation never
+/// stands in). `None` (nothing put back — an entry moved out) → `removal`, the binding of the change
+/// being undone.
+pub fn put_back_bound(slot: Option<&Path>, removal: &Bound) -> Bound {
+    match slot {
+        None => removal.clone(),
+        Some(d) => match vault::slot_generation(d) {
+            Ok(g) => Bound::of(g),
+            Err(_) => Bound::Unknown,
+        },
     }
 }
 
@@ -1514,6 +1542,41 @@ pub const BY_DAEMON_AUTO: &str = "데몬(자동)";
 /// held) is closed `실패 — 되돌리기 남음 · …` IN THAT TICK: the failure is a fact of the row from the
 /// moment it is measured; the return stays owed and is retried at later ticks (never 사용 중).
 pub const RETURN_OWED: &str = "되돌리기 남음";
+
+/// RULINGS FI1 — a commit whose pre-images were taken in another pack generation than the one live
+/// at the commit (or in an unknown one) still commits, but its repair is not put back by the
+/// mechanism and its row says so: the probation is closed with this label and sentence.
+pub const NOT_REVERTIBLE: &str = "되돌릴 수 없음";
+pub const NOT_REVERTIBLE_SENTENCE: &str = "이 수리는 팩이 바뀌기 전에 시작되어 자동으로 되돌릴 수 없습니다";
+
+/// The closure FI1 writes on such a row.
+pub fn not_revertible_closure() -> String {
+    format!("{NOT_REVERTIBLE} — {NOT_REVERTIBLE_SENTENCE}")
+}
+
+/// Whether a closure is FI1's "not revertible by the mechanism".
+pub fn closure_not_revertible(closed: &str) -> bool {
+    closed.starts_with(&format!("{NOT_REVERTIBLE} — "))
+}
+
+/// RULINGS FI1 — whether `rec`'s pre-images were taken in a generation other than the pack's NOW:
+/// any pre-image slot whose recorded generation is absent (Unknown), unreadable, or different from
+/// the generation read now (itself Unknown → true). A record without a pre-image slot → false.
+pub fn begun_in_another_generation(rec: &RepairRecord, pack: &Path) -> bool {
+    let slots: Vec<&Path> = ledger::file_targets(rec)
+        .filter_map(|f| match &f.pre {
+            PreImage::Slot { slot_dir, .. } => Some(slot_dir.as_path()),
+            PreImage::Absent => None,
+        })
+        .collect();
+    if slots.is_empty() {
+        return false;
+    }
+    let Ok(now) = pack_generation_checked(pack) else {
+        return true;
+    };
+    slots.iter().any(|d| !matches!(vault::slot_generation(d), Ok(Some(g)) if g == now))
+}
 
 /// Whether a lane row's closure still owes the automatic return (EK2).
 pub fn closure_owes_return(closed: &str) -> bool {
@@ -1556,7 +1619,7 @@ pub fn closure_owes_intake(closed: &str) -> bool {
 pub fn revertible_here(rec: &RepairRecord, row: &ledger::LaneRecord, lane: &LaneKey) -> bool {
     let has_hooks = ledger::hook_lines(rec).next().is_some();
     let applies = !row.applied.is_empty() || has_hooks;
-    let closed_for_good = matches!(row.probation.as_ref().and_then(|p| p.closed.as_deref()), Some(c) if c.starts_with("되돌려짐") || c.starts_with("대체됨"));
+    let closed_for_good = matches!(row.probation.as_ref().and_then(|p| p.closed.as_deref()), Some(c) if c.starts_with("되돌려짐") || c.starts_with("대체됨") || closure_not_revertible(c));
     if !applies || closed_for_good {
         return false;
     }
@@ -1774,7 +1837,9 @@ pub fn revert_in(
             rec.state.label_ko()
         )));
     }
-    let bound = row.probation.as_ref().map(Bound::from_row).unwrap_or(Bound::Unknown);
+    // the binding of a removal (an entry the repair created is moved out): the row's generation of
+    // the change; a put-back's binding is its bytes' generation (FI1, below)
+    let row_bound = row.probation.as_ref().map(Bound::from_row).unwrap_or(Bound::Unknown);
     // step 0 for EVERY target before anything changes
     let mut plan: Vec<OpSpec> = Vec::new();
     for (rel, canon) in &row.applied {
@@ -1792,15 +1857,17 @@ pub fn revert_in(
                 locked,
             )?);
         }
+        let (pre, holder, slot) = pre_image_slot_for(env.root, &rec, env.lane, rel)?;
+        // FI1: the door's binding for a put-back is the generation of the bytes put back
+        let bound = put_back_bound(slot.as_deref(), &row_bound);
         if !bound.equals_now(env.pack) {
             return Ok(close_superseded(
                 env,
                 &rec,
-                "팩 세대가 적용 때와 다르거나 알 수 없습니다 — 옛 세대의 바이트는 되살리지 않습니다(아무것도 되돌리지 않았습니다)",
+                "되살릴 바이트의 팩 세대가 지금과 다르거나 알 수 없습니다 — 옛 세대의 바이트는 되살리지 않습니다(아무것도 되돌리지 않았습니다)",
                 locked,
             )?);
         }
-        let (pre, holder) = pre_image_for(env.root, &rec, env.lane, rel)?;
         plan.push(OpSpec {
             id: id.clone(),
             rel: rel.clone(),
@@ -1808,9 +1875,11 @@ pub fn revert_in(
             expected,
             incoming: pre,
             source: holder,
-            bound: bound.clone(),
+            bound,
         });
     }
+    // every target's binding equals the generation now (checked above): the intent records it
+    let bound = Bound::now(env.pack);
     let by_label = match by {
         RevertCaller::Human => "사람".to_string(),
         RevertCaller::TicketedWorker { seat } => format!("워커 좌석 {seat}"),
@@ -2561,6 +2630,8 @@ fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &Repair
         let committed = rec.committed.clone();
         let request = rec.approval.as_ref().map(|a| a.request_id.clone());
         let now = env.now;
+        // FI1: as at the commit — pre-images of another generation than the one live now
+        let not_revertible = begun_in_another_generation(&rec, env.pack);
         locked(&id, &mut || {
         let _mutex_scope = super::guard::MutexScope::enter();
             // EJ5: THIS repair's row fields are rebuilt from the committed record and the intent
@@ -2579,7 +2650,7 @@ fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &Repair
                         pro_revision: gen_pro,
                         applied_at,
                         expected: committed.clone(),
-                        closed: None,
+                        closed: not_revertible.then(not_revertible_closure),
                         check_timings: Vec::new(),
                         check_timeouts: Vec::new(),
                     }),
@@ -2773,6 +2844,7 @@ pub fn apply_candidate_in(
             &pre,
             &staged,
             env.now,
+            Bound::now(env.pack).known().as_ref(),
         )?;
         slot_states.push((f.rel.clone(), TargetState::read(&slot.payload())?));
         slots.push((f.rel.clone(), Some(slot)));
@@ -2924,6 +2996,7 @@ pub fn apply_candidate_in(
                         },
                     },
                     env.now,
+                    Bound::now(env.pack).known().as_ref(),
                 )
                 .ok()
                 .filter(|_| matches!(spec.incoming, TargetState::File { .. }));
@@ -3048,6 +3121,9 @@ pub fn apply_candidate_in(
             return Err(stop(Point::AfterRecordCommit));
         }
         let previous = ledger::read_lane_in(&root, &idc, &lane)?;
+        // FI1: pre-images of another generation than the one live NOW (read at this row's write) →
+        // committed, but not put back by the mechanism, and the row says so
+        let not_revertible = begun_in_another_generation(&r, env.pack);
         let row = ledger::LaneRecord {
             schema: super::REPAIR_SCHEMA,
             repair: idc.clone(),
@@ -3058,7 +3134,7 @@ pub fn apply_candidate_in(
                 pro_revision: gen_pro,
                 applied_at: now,
                 expected: committed.clone(),
-                closed: None,
+                closed: not_revertible.then(not_revertible_closure),
                 check_timings: timings.clone(),
                 check_timeouts: Vec::new(),
             }),
@@ -3196,7 +3272,7 @@ fn undo_applied_with(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord, on
         if TargetState::read(&env.pack.join(&spec.rel))? == spec.expected {
             continue; // nothing of this target was changed (its pre-image is live)
         }
-        let (pre, holder) = match pre_image_for(env.root, rec, env.lane, &spec.rel) {
+        let (pre, holder, slot) = match pre_image_slot_for(env.root, rec, env.lane, &spec.rel) {
             Ok(x) => x,
             Err(e) => {
                 left.push((spec.rel.clone(), format!("적용 전 내용을 확인할 수 없습니다({e:?})")));
@@ -3218,8 +3294,8 @@ fn undo_applied_with(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord, on
             expected: live_now,
             incoming: pre,
             source: holder,
-            // DR1: the apply's binding goes with its undo (a different generation → nothing back)
-            bound: spec.bound.clone(),
+            // FI1: the binding of the bytes put back (a removal: the apply's binding — DR1)
+            bound: put_back_bound(slot.as_deref(), &spec.bound),
         };
         let r = run_op(env, &back)?;
         if r.outcome != ApplyOutcome::Applied {

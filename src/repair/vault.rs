@@ -342,6 +342,21 @@ fn read_regular(p: &Path) -> Result<Vec<u8>, RepairError> {
     std::fs::read(p).map_err(|e| io(p, e))
 }
 
+/// RULINGS FI1 — the generation a slot's `meta/pre.json` records for its bytes: `Ok(Some(g))`;
+/// `Ok(None)` when the slot records none (Unknown — a slot filled without a readable generation, or
+/// written before FI1); `Err` when the metadata cannot be read (FG1: never taken as "none").
+pub fn slot_generation(slot_dir: &Path) -> Result<Option<super::ledger::PackGeneration>, RepairError> {
+    let p = slot_dir.join("meta").join("pre.json");
+    let b = std::fs::read(&p).map_err(|e| io(&p, e))?;
+    let v: serde_json::Value = serde_json::from_slice(&b).map_err(|e| RepairError::Corrupt(format!("{}: {e}", p.display())))?;
+    match v.get("pack_generation") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(g) => serde_json::from_value(g.clone())
+            .map(Some)
+            .map_err(|e| RepairError::Corrupt(format!("{}: pack_generation — {e}", p.display()))),
+    }
+}
+
 /// Builds one fresh slot for `rel` (O5: a temporary sibling, then a no-replace move under the
 /// `<시각>` name, `-<n>` appended while the name exists — O-C2-1). `expected` is the state the
 /// slot's deposit is expected to have (what `meta/pre.json` records); `staged` is placed in
@@ -357,6 +372,7 @@ pub fn build_slot(
     expected: &TargetState,
     staged: &Staged,
     now: f64,
+    generation: Option<&super::ledger::PackGeneration>,
 ) -> Result<Slot, RepairError> {
     let vault = vault_dir_in(root, id);
     if std::fs::symlink_metadata(&vault).is_err() {
@@ -405,7 +421,7 @@ pub fn build_slot(
             TargetState::Link { target } => (String::new(), 0, Some(target.clone())),
             TargetState::Absent => (String::new(), 0, None),
         };
-        let pre = serde_json::json!({
+        let mut pre = serde_json::json!({
             "schema": super::REPAIR_SCHEMA,
             "repair": id.as_str(),
             "lane_key": lane.0,
@@ -416,6 +432,11 @@ pub fn build_slot(
             "mode": mode,
             "link_target": link_target,
         });
+        // RULINGS FI1: the pack generation in which this slot's bytes are live, read when the slot is
+        // filled (absent = Unknown — the caller could not read it)
+        if let Some(g) = generation {
+            pre["pack_generation"] = serde_json::json!(g);
+        }
         let mut bytes =
             serde_json::to_vec_pretty(&pre).map_err(|e| RepairError::Io(e.to_string()))?;
         bytes.push(b'\n');
@@ -731,6 +752,7 @@ mod tests {
                     mode: 0o755,
                 },
                 1_800_000_000.0,
+                None,
             )
             .unwrap();
             assert!(super::super::ledger::is_slot_name(&s.name()), "{}", s.name());
@@ -781,6 +803,7 @@ mod tests {
                 mode: 0o755,
             },
             1.0,
+            None,
         )
         .unwrap();
         let m = std::fs::metadata(s.payload()).unwrap();
@@ -809,6 +832,7 @@ mod tests {
                 mode: 0o644,
             },
             2.0,
+            None,
         )
         .unwrap();
         let mut held = std::fs::OpenOptions::new()
