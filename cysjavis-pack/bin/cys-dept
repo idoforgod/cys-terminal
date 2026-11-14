@@ -1642,7 +1642,7 @@ CEO_PENDING="$HOME/.cys/state/ceo-pending"
 CEO_RECEIPT_NAME=".ceo-receipt.json"
 ceo_py(){  # $1 = superset | state | compose | demote | verify | promoted
   python3 - "$@" <<'PY'
-import hashlib, json, os, re, sys, tempfile, time
+import errno, hashlib, json, os, re, sys, tempfile, time
 
 # 구분선 — scripts/gen_ceo_template.py SEPARATOR 와 같은 바이트(O-C11-2 · test_ceo_composition 이 고정한다).
 SEP = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n".encode("utf-8")
@@ -1971,15 +1971,91 @@ def undo_swap(path, disp, data):
             err("우리 후보 자리에 다른 바이트가 있었다 — %s 에 남겼다" % rej)
 
 
+_EXCHANGE = []
+
+
+def exchange_fn():
+    """두 이름을 원자로 맞바꾸는 시스템 호출 — 맥 renamex_np(RENAME_SWAP) · 리눅스 renameat2(RENAME_EXCHANGE). 없으면 None
+    (윈도우 · 그 호출이 없는 libc). 한 번만 찾는다."""
+    if not _EXCHANGE:
+        fn = None
+        try:
+            import ctypes
+            libc = ctypes.CDLL(None, use_errno=True)
+
+            def raise_errno(a):
+                e = ctypes.get_errno()
+                raise OSError(e, os.strerror(e), a)
+            if sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+                f = libc.renamex_np
+                f.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+                f.restype = ctypes.c_int
+
+                def fn(a, b):
+                    if f(os.fsencode(a), os.fsencode(b), 0x2) != 0:     # RENAME_SWAP
+                        raise_errno(a)
+            elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+                f = libc.renameat2
+                f.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+                f.restype = ctypes.c_int
+
+                def fn(a, b):
+                    if f(-100, os.fsencode(a), -100, os.fsencode(b), 0x2) != 0:   # AT_FDCWD · RENAME_EXCHANGE
+                        raise_errno(a)
+        except Exception:
+            fn = None
+        _EXCHANGE.append(fn)
+    return _EXCHANGE[0]
+
+
+_NO_EXCHANGE = (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOSYS, errno.EXDEV)
+
+
 def swap_live(path, data, old, expect=None):
     """★RULINGS DC1 — 살아 있는 지침을 data 로 바꾸되, **바꾸는 순간의 파일**이 읽었던 old 와 같을 때만 남긴다.
-    ① 후보를 같은 폴더 임시 파일에 다 쓴다(fsync · expect 로 다시 읽어 확인) ② 살아 있는 파일을 그 순간 그대로 옆 이름
-    (<path>.displaced.<UTC>)으로 옮긴다 ③ 후보를 덮지 않는 방식으로 제자리에 놓는다 — 그 사이 편집기가 새 파일을 만들었으면
-    그것이 이긴다 ④ 옮긴 파일을 old 와 대조 — 다르면(읽은 뒤에 저장됨) 되돌린다. ③·④ 의 경우 SourceChanged(호출부가 다시
-    읽어 처음부터 · 상한 뒤 보류). 저장된 바이트는 언제나 살아 있는 파일이나 옆 이름의 파일에 있다 — 어느 쪽에도 없는 경우는
-    없다. ②와 ③ 사이(이름 바꾸기 두 번 — 그 사이 다른 일 없음) 아주 짧게 살아 있는 이름이 비어 있다.
-    돌려주는 값 = 옮겨 둔 파일(교체 순간의 그 파일, old 와 같은 바이트) — 호출부가 백업·사본으로 쓰거나 지운다."""
+    ① 후보를 같은 폴더 임시 파일에 다 쓴다(fsync · expect 로 다시 읽어 확인) ② 맞바꾸기가 있으면(맥·리눅스) 후보와 살아 있는
+    파일의 이름을 **원자로 맞바꾼다** — 살아 있는 이름은 한순간도 비지 않고, 임시 이름에 남은 것이 교체 순간의 그 파일이다.
+    없으면(윈도우 등) 살아 있는 파일을 그 순간 그대로 옆 이름으로 옮기고 후보를 덮지 않는 방식으로 제자리에 놓는다(그 사이
+    편집기가 새 파일을 만들면 그것이 이긴다 · 이름 바꾸기 두 번 사이 살아 있는 이름이 잠깐 빈다) ③ 옮겨진 파일을 old 와
+    대조 — 다르면(읽은 뒤에 저장됨) 되돌리고 SourceChanged(호출부가 다시 읽어 처음부터 · 상한 뒤 보류). 저장된 바이트는 언제나
+    살아 있는 파일이나 옆 이름의 파일에 있다 — 어느 쪽에도 없는 경우는 없다.
+    돌려주는 값 = 옮겨 둔 파일(<path>.displaced.<UTC> — 교체 순간의 그 파일, old 와 같은 바이트) — 호출부가 백업·사본으로
+    쓰거나 지운다."""
     tmp = write_temp(path, data, expect)
+    ex = exchange_fn()
+    if ex is not None:
+        try:
+            ex(tmp, path)
+        except FileNotFoundError:
+            silent_unlink(tmp)
+            raise SourceChanged("살아 있는 지침이 사라졌다")
+        except OSError as e:
+            if e.errno not in _NO_EXCHANGE:
+                silent_unlink(tmp)
+                raise
+            ex = None                       # 이 파일 시스템은 맞바꾸기를 못 한다 — 아래 이름 옮기기로
+        if ex is not None:
+            disp = side_name(path, "displaced")
+            os.rename(tmp, disp)            # 임시 이름(우리 것)에 남은 교체 순간의 파일 → 옆 이름
+            try:
+                same = read_bytes(disp) == old
+            except OSError:
+                same = False
+            if not same:
+                ex(disp, path)              # 되돌리기도 원자 — 살아 있는 이름 = 저장된 파일, disp = 방금 살아 있던 것
+                try:
+                    ours = read_bytes(disp) == data
+                except OSError:
+                    ours = False
+                if ours:
+                    os.unlink(disp)
+                else:                       # 그 사이 또 저장됐다 — 지우지 않고 남긴다
+                    kept = side_name(path, "changed")
+                    os.rename(disp, kept)
+                    err("되돌리는 사이 또 저장됐다 — 그 판은 %s 에 남겼다" % kept)
+                raise SourceChanged("읽은 뒤에 지침이 저장됐다")
+            fsync_dir(os.path.dirname(os.path.abspath(path)))
+            return disp
     disp = side_name(path, "displaced")
     try:
         rename_away(path, disp)

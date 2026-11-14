@@ -766,6 +766,20 @@ class SaveDuringSwap(Rig):
         ns[name] = wrapped
         return fired
 
+    @staticmethod
+    def modes(ns):
+        """교체의 두 방식 — 맞바꾸기(맥·리눅스, 이 플랫폼에 있을 때)와 이름 옮기기(윈도우 등의 대안 · 여기서 강제로 잰다)."""
+        out = []
+        if ns["exchange_fn"]() is not None:
+            out.append("exchange")
+        out.append("rename")
+        return out
+
+    @staticmethod
+    def force(ns, mode):
+        if mode == "rename":
+            ns["exchange_fn"] = lambda: None
+
     def save_in_place(self, text):
         with open(self.p("MASTER_DIRECTIVE.md"), "w", encoding="utf-8") as f:
             f.write(text)
@@ -776,11 +790,13 @@ class SaveDuringSwap(Rig):
         os.replace(tmp, self.p("MASTER_DIRECTIVE.md"))
 
     def test_save_between_read_and_promotion_write_is_never_lost(self):
-        for how in ("in-place", "rename"):
-            with self.subTest(save=how):
+        for mode in self.modes(ceo_py_module()):
+          for how in ("in-place", "rename"):
+            with self.subTest(swap=mode, save=how):
                 shutil.rmtree(self.dirs, ignore_errors=True)
                 self.seed()
                 ns = ceo_py_module()
+                self.force(ns, mode)
                 saver = self.save_in_place if how == "in-place" else self.save_by_rename
                 fired = self.hook_first_live_write(ns, lambda: saver(USER + self.EDIT))
                 rc = ns["do_compose"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), sha(TEMPLATE), ""])
@@ -798,9 +814,11 @@ class SaveDuringSwap(Rig):
                     self.assertEqual(live, USER + self.EDIT, "보류했는데 저장한 파일이 살아 있지 않다")
 
     def test_save_while_the_live_name_is_empty_wins(self):
-        """교체의 두 단계 사이(살아 있는 이름이 비어 있는 순간)에 편집기가 새 파일을 만들면 그 파일이 이긴다 — 덮지 않는다."""
+        """이름 옮기기 방식(맞바꾸기가 없는 플랫폼)의 두 단계 사이 — 살아 있는 이름이 비어 있는 순간 — 에 편집기가 새 파일을
+        만들면 그 파일이 이긴다(덮지 않는다)."""
         self.seed()
         ns = ceo_py_module()
+        self.force(ns, "rename")
         self.assertIn("place_new", ns, "교체가 '덮지 않는 자리 놓기'를 쓰지 않는다")
         orig = ns["place_new"]
         md = self.p("MASTER_DIRECTIVE.md")
@@ -820,18 +838,57 @@ class SaveDuringSwap(Rig):
         self.assertEqual([f for f in os.listdir(self.dirs) if ".displaced" in f], [], "옮겨 둔 옛 파일이 남았다")
 
     def test_save_between_read_and_demotion_write_is_never_lost(self):
-        self.seed()
-        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
-        composed = self.read("MASTER_DIRECTIVE.md")
+        for mode in self.modes(ceo_py_module()):
+            with self.subTest(swap=mode):
+                shutil.rmtree(self.dirs, ignore_errors=True)
+                self.seed()
+                self.register()
+                self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+                composed = self.read("MASTER_DIRECTIVE.md")
+                ns = ceo_py_module()
+                self.force(ns, mode)
+                fired = self.hook_first_live_write(ns, lambda: self.save_in_place(composed + self.EDIT))
+                rc = ns["do_demote"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), ""])
+                self.assertEqual(fired, [1])
+                held = [k for k, v in self.everywhere().items() if self.EDIT in v]
+                self.assertTrue(held, "강등 직전 저장이 살아 있는 파일에도 백업에도 없다: rc=%r %r" % (rc, self.everywhere()))
+                if rc == 0:
+                    self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER + self.EDIT,
+                                     "강등이 저장 전 본문을 돌려줬다(DC1)")
+
+    def test_live_name_never_absent_during_an_exchange_swap(self):
+        """맞바꾸기 방식에서는 교체 중에도 살아 있는 이름이 한순간도 비지 않는다 — 읽는 쪽(훅·배달)이 '파일 없음'을 볼 수 없다.
+        읽는 스레드가 200번의 교체 내내 여는 동안 FileNotFoundError 0."""
+        import threading
         ns = ceo_py_module()
-        fired = self.hook_first_live_write(ns, lambda: self.save_in_place(composed + self.EDIT))
-        rc = ns["do_demote"]([self.p("CEO_TEMPLATE.md"), self.p("MASTER_DIRECTIVE.md"), ""])
-        self.assertEqual(fired, [1])
-        held = [k for k, v in self.everywhere().items() if self.EDIT in v]
-        self.assertTrue(held, "강등 직전 저장이 살아 있는 파일에도 백업에도 없다: rc=%r %r" % (rc, self.everywhere()))
-        if rc == 0:
-            self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER + self.EDIT,
-                             "강등이 저장 전 본문을 돌려줬다(DC1)")
+        if ns["exchange_fn"]() is None:
+            self.skipTest("이 플랫폼에는 원자 맞바꾸기가 없다(이름 옮기기 방식 — 잠깐 빈다)")
+        self.seed()
+        md = self.p("MASTER_DIRECTIVE.md")
+        stop, misses, reads = threading.Event(), [], [0]
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    with open(md, "rb") as f:
+                        f.read(16)
+                    reads[0] += 1
+                except FileNotFoundError:
+                    misses.append(1)
+        t = threading.Thread(target=reader)
+        t.start()
+        try:
+            cur = USER.encode()
+            for i in range(200):
+                nxt = (USER + "v%d\n" % i).encode()
+                disp = ns["swap_live"](md, nxt, cur)
+                os.unlink(disp)
+                cur = nxt
+        finally:
+            stop.set()
+            t.join(60)
+        self.assertGreater(reads[0], 0, "읽는 스레드가 돌지 않았다(시험 무효)")
+        self.assertEqual(misses, [], "교체 중 살아 있는 이름이 비었다")
 
     def test_retries_are_bounded_and_end_in_a_hold(self):
         """원본이 매번 바뀌면 정해진 횟수만 다시 하고 보류한다(아무것도 쓰지 않음 · 알림 1건) — 끝없는 재시도 없음."""
