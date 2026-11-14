@@ -30,6 +30,10 @@ CENSUS_FILES = {
     "cysjavis-pack/bin/javis_dept_schedule.py", # 작성자 10(부서 심기 · mkstemp + os.replace · LF)
     "cysjavis-pack/bin/javis_report_gate.py",   # 읽기만
     "cysjavis-pack/bin/cys-dept",               # 작성자 10 호출
+    "scripts/windows-measure/tw1_probes.py",    # NOT a writer of the product (C7 table unchanged): the CI-only Windows
+                                                # measurement driver (0.15.0 TW1, RULINGS FC3) edits the schedule.json
+                                                # of the installation UNDER TEST on a CI runner - the scenario's "the
+                                                # user removed a built-in job" - and reads it back
 }
 
 
