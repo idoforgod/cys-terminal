@@ -930,6 +930,38 @@ fn comparison_refusal_files_one_intake_row_and_one_owner_line() {
     assert_eq!(eff.master.lock().unwrap().len(), 1);
 }
 
+/// RULINGS GA3: the rehearsal's pass is carried out WHOLE — a target that fails does not end it early.
+/// Target A passes the first time and fails in the repeat (a marker of its own); target B writes a
+/// live listed file on every run. The repeat still runs B, B writes again → REFUSED. (The old pass
+/// returned at A's failure in the repeat, B never ran, the repeat counted as complete → "noted".)
+#[test]
+fn a_failing_target_does_not_end_the_repeat_early() {
+    let r = rig("ga3");
+    let id = RepairId::parse("R-1").unwrap();
+    let live = r.pack.join("hooks/guard.sh");
+    std::fs::write(&live, b"#!/bin/sh\nexit 0\n").unwrap();
+    let marker = r.dir.join("a-ran-once");
+    let staging = ledger::staging_dir_in(&r.root, &id);
+    let a = "hooks/appbuild-gate.sh";
+    let b = "hooks/grill-arm.sh";
+    let mut states = Vec::new();
+    for (rel, body) in [
+        (a, format!("#!/bin/sh\nif [ -f '{0}' ]; then exit 1; fi\n: > '{0}'\nexit 0\n", marker.display())),
+        (b, format!("#!/bin/sh\nprintf 'x\\n' >> '{}'\nexit 0\n", live.display())),
+    ] {
+        let p = staging.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+        cys::repair::replay::set_mode(&p, 0o755);
+        states.push((rel.to_string(), TargetState::read(&p).unwrap()));
+    }
+    let s3 = Step3Input { root: r.root.clone(), repair: id, pack: r.pack.clone(), states, windows: false };
+    let home = r.dir.join("realhome");
+    std::fs::create_dir_all(&home).unwrap();
+    let e = production_step3_with(&s3, &home).unwrap_err();
+    assert!(e.why.contains("다시 썼습니다"), "{}", e.why);
+}
+
 /// RULINGS EO5 (b): the owner's line for an escape refusal is sent once per (repair, candidate
 /// fingerprint) — the same candidate refused again tells nobody again (the intake row is filed each
 /// time step 3 refuses).

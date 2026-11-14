@@ -1048,7 +1048,7 @@ pub(crate) fn production_check_with(
     deadline: std::time::Duration,
     compared: &dyn Fn(&cys::repair::rehearsal::Comparison),
 ) -> Result<CheckReport, RepairError> {
-    use cys::repair::rehearsal::{run_check, run_reference_check, CheckRequest, CheckResult};
+    use cys::repair::rehearsal::{run_reference_check, CheckRequest, CheckResult};
     let kind = check_kind_for(rel);
     let started = std::time::Instant::now();
     // RULINGS CM3: the scratch root is the PACK root (`live` = `<pack>/<rel>`), so that
@@ -1066,10 +1066,8 @@ pub(crate) fn production_check_with(
         deadline,
     };
     let (r, cmp) = cys::repair::rehearsal::compared_runs(&pack_root, &home, || {
-        let r = run_check(&req);
-        // RULINGS EL1: complete only when the check ran to a result (pass or fail)
-        let completed = matches!(r, Ok(CheckResult::Pass) | Ok(CheckResult::Fail(_)));
-        (r, completed)
+        // RULINGS GA3: complete only when the check ran to a result observed whole
+        cys::repair::rehearsal::run_check_observed(&req)
     });
     if cmp != cys::repair::rehearsal::Comparison::Clean {
         compared(&cmp);
