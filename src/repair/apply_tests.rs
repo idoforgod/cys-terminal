@@ -2909,7 +2909,7 @@ const WRITE_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("apply.rs", "op_place", "staging", 1, "our own non-slot incoming copy removed"),
     ("apply.rs", "resume_op", "staging", 3, "our own non-slot incoming copy removed"),
     ("apply.rs", "run_op_depth", "vault", 1, "the repair's vault folder"),
-    ("apply.rs", "second_move", "staging", 2, "our own non-slot incoming copy removed"),
+    ("apply.rs", "second_move", "staging", 3, "our own non-slot incoming copy removed"),
     ("apply.rs", "write_intent", "ledger", 1, "the apply intent (durable)"),
     ("apply.rs", "write_revert_intent", "ledger", 1, "the revert intent (durable)"),
     ("durable.rs", "write_durable", "ledger", 6, "the durable writer of ledger files: temporary sibling, flush, rename"),
@@ -3261,6 +3261,77 @@ fn another_writers_bytes_after_our_exchange_stay_live() {
     let closed = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
     assert!(closed.starts_with("충돌") && closure_owes_intake(&closed), "closed as conflict, its report owed: {closed}");
     assert!(r.vault_bytes().contains(&b"POST\n".to_vec()), "the vault keeps the repaired copy");
+}
+
+// ───────────────────────────── RULINGS GV1 — another writer's bytes are a conflict on every return path ─────────────────────────────
+
+/// GV1 (codex r6 M1): a user-requested revert whose file another writer changed — found by the
+/// pre-check, or written between the record and the door — closes as CONFLICT: the bytes stay, the
+/// row is 충돌 with a closure whose report is owed, the record stays in force (not "superseded").
+/// Without GV1 the pre-check closed it 대체됨 (record Superseded, no report) and the door's refusal
+/// was counted "nothing changed".
+#[cfg(target_os = "macos")]
+#[test]
+fn a_revert_meeting_another_writers_bytes_closes_as_conflict() {
+    struct WriteAtRecord;
+    impl Faults for WriteAtRecord {
+        fn at(&self, p: Point, live: &Path, _: Option<&Slot>) -> bool {
+            if p == Point::AfterRecord {
+                std::fs::write(live, b"FOREIGN AT THE DOOR\n").unwrap();
+            }
+            false
+        }
+    }
+    for (tag, at_door) in [("precheck", false), ("door", true)] {
+        let r = rig(&format!("gv1{tag}"));
+        let id = rid("R-91");
+        committed_general(&r, &id, "hooks/g.sh", Some(b"PRE\n"), Some(b"POST\n"));
+        if !at_door {
+            std::fs::write(r.pack.join("hooks/g.sh"), b"FOREIGN\n").unwrap();
+        }
+        let faults = WriteAtRecord;
+        let env = if at_door { r.env(&faults, ApplyForm::Exchange) } else { r.env(&NoFaults, ApplyForm::Exchange) };
+        let rep = revert_in(&env, &id, RevertCaller::Human, &no_hooks, &no_repair_lock).unwrap();
+        assert!(matches!(rep.outcome, ApplyOutcome::Declined(_)), "{tag}: {rep:?}");
+        let want: &[u8] = if at_door { b"FOREIGN AT THE DOOR\n" } else { b"FOREIGN\n" };
+        assert_eq!(std::fs::read(r.pack.join("hooks/g.sh")).unwrap(), want, "{tag}: the bytes stay");
+        let row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+        assert_eq!(row.state, LaneState::Conflict, "{tag}");
+        let closed = row.probation.unwrap().closed.unwrap();
+        assert_eq!(closure_report_class(&closed), Some("conflict"), "{tag}: its report is owed: {closed}");
+        assert_eq!(ledger::read_record_in(&r.root, &id).unwrap().unwrap().state, RepairState::Probation, "{tag}: still in force");
+    }
+}
+
+/// GV1: a PENDING revert that resumes after another writer changed the file (neither the recorded
+/// applied state nor the pre-image) closes as conflict with its report owed. Without GV1 it was
+/// counted "nothing changed" and closed 대체됨.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_pending_revert_meeting_another_writers_bytes_closes_as_conflict() {
+    let r = rig("gv1pending");
+    let id = rid("R-92");
+    let rec = committed_general(&r, &id, "hooks/q.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let ri = RevertIntent {
+        schema: 1,
+        repair: id.clone(),
+        lane_key: r.lane.clone(),
+        op_tag: "t".into(),
+        state: "reverting".into(),
+        targets: vec![RevertTarget { rel: "hooks/q.sh".into(), applied: r.live("hooks/q.sh").canon(), pre: rec.files[0].pre.state().canon() }],
+        has_hooks: false,
+        pack_generation: Bound::now(&r.pack).known(),
+        by: BY_DAEMON_AUTO.into(),
+        created_at: 1.0,
+        updated_at: 1.0,
+    };
+    write_revert_intent(&r.root, &ri).unwrap();
+    std::fs::write(r.pack.join("hooks/q.sh"), b"FOREIGN\n").unwrap();
+    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let _ = recover_revert_intents_in(&env, &no_hooks, &no_repair_lock);
+    assert_eq!(std::fs::read(r.pack.join("hooks/q.sh")).unwrap(), b"FOREIGN\n", "the bytes stay");
+    let closed = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
+    assert_eq!(closure_report_class(&closed), Some("conflict"), "its report is owed: {closed}");
 }
 
 // ───────────────────────────── RULINGS EJ4 — one ownership per repair ─────────────────────────────

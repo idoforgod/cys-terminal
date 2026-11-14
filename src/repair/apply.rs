@@ -476,11 +476,12 @@ impl DoorAct<'_> {
 /// only when the operation's bound generation is Known and equal; otherwise `Superseded`, nothing
 /// touched.
 fn door(env: &OpEnv<'_>, binding: &Binding, live: &Path, act: DoorAct<'_>) -> Result<(), RepairError> {
-    // GK2: the live path holds EXACTLY the recorded state at this moment, or nothing is touched
+    // GK2: the live path holds EXACTLY the recorded state at this moment, or nothing is touched —
+    // GV1: another writer's bytes are a CONFLICT (declined), never "superseded"
     if let Some(expected) = act.expected() {
         let now = TargetState::read(live)?;
         if now != *expected.state() {
-            return Err(RepairError::Superseded(format!(
+            return Err(RepairError::Declined(format!(
                 "{}: 살아 있는 것이 기록된 상태가 아닙니다(지금 {} · 기록 {}) — 다른 작성자의 바이트를 그대로 둡니다",
                 live.display(),
                 now.canon(),
@@ -733,8 +734,9 @@ fn run_op_depth(env: &OpEnv<'_>, spec: &OpSpec, depth: u8) -> Result<OpDone, Rep
     // step 0 — the live entry is the expected one, the pack generation the bound one
     let now_state = TargetState::read(&live)?;
     if now_state != spec.expected {
+        // GV1: the live file is not the recorded state — another writer's bytes: a CONFLICT
         return Ok(done(
-            ApplyOutcome::Superseded(format!(
+            ApplyOutcome::Declined(format!(
                 "{}: 살아 있는 파일이 기대한 상태가 아닙니다(기대 {} · 지금 {}) — 아무것도 바꾸지 않았습니다",
                 spec.rel,
                 spec.expected.canon(),
@@ -1285,6 +1287,13 @@ fn second_move(
                 wal::finish(env.root, rec, "superseded", &note, env.now)?;
                 return Ok(done(ApplyOutcome::Superseded(note), Some(rec)));
             }
+            Err(RepairError::Declined(m)) => {
+                // GV1: another writer's entry at the place — a conflict; nothing removed
+                let _ = std::fs::remove_file(&copy);
+                let note = format!("{rel}: 두 번째 옮기기 자리에 다른 작성자의 것이 있습니다 — 그대로 둠(충돌 · 아무것도 지우지 않음 · {m})");
+                wal::finish(env.root, rec, "declined", &note, env.now)?;
+                return Ok(done(ApplyOutcome::Declined(note), Some(rec)));
+            }
             Err(e) => {
                 // stays at `moved`: the next run resumes or abandons
                 return Ok(done(
@@ -1772,7 +1781,7 @@ pub fn closure_owes_return(closed: &str) -> bool {
 /// class is a separate duty (its own acknowledgement), so a later terminal outcome of the same repair
 /// — the owed return made, or ended 충돌 — is reported even after an earlier one was acknowledged:
 /// `failed-return-owed` (a failed re-check, the return still owed — EK2), `failed` (FAILED),
-/// `reverted-auto` (the daemon's automatic return complete), `conflict-auto` (the automatic return
+/// `reverted-auto` (the daemon's automatic return complete), `conflict` (a return of any caller
 /// could not finish — 충돌), `superseded-after-failure` (a failed re-check whose return found nothing to
 /// change, or whose repair was superseded before it).
 pub fn closure_report_class(closed: &str) -> Option<&'static str> {
@@ -1782,8 +1791,9 @@ pub fn closure_report_class(closed: &str) -> Option<&'static str> {
         Some("failed")
     } else if closed == format!("{CLOSED_REVERTED} — {BY_DAEMON_AUTO}") {
         Some("reverted-auto")
-    } else if closed.starts_with(&format!("충돌 — 되돌리기를 마치지 못했습니다({BY_DAEMON_AUTO})")) {
-        Some("conflict-auto")
+    } else if closed.starts_with("충돌 — 되돌리기를 마치지 못했습니다(") {
+        // GV1: a return of ANY caller that met another writer's bytes (or could not finish)
+        Some("conflict")
     } else if closed == format!("대체됨 — {BY_DAEMON_AUTO}") || closed.starts_with("대체됨 — 재검사 실패 뒤") {
         Some("superseded-after-failure")
     } else {
@@ -1945,7 +1955,8 @@ fn recover_one_revert(
             )?
             .outcome
         } else {
-            ApplyOutcome::Superseded(format!("{}: 살아 있는 것이 적용 결과도 적용 전도 아닙니다 — 그대로 둠", t.rel))
+            // GV1: another writer's bytes — a CONFLICT (the return closes 충돌, its report owed)
+            ApplyOutcome::Declined(format!("{}: 살아 있는 것이 적용 결과도 적용 전도 아닙니다 — 다른 작성자의 바이트를 그대로 둠(충돌)", t.rel))
         };
         files.push((t.rel.clone(), outcome));
     }
@@ -2027,31 +2038,38 @@ pub fn revert_in(
     // the binding of a removal (an entry the repair created is moved out): the row's generation of
     // the change; a put-back's binding is its bytes' generation (FI1, below)
     let row_bound = row.probation.as_ref().map(Bound::from_row).unwrap_or(Bound::Unknown);
+    let by_label = match &by {
+        RevertCaller::Human => "사람".to_string(),
+        RevertCaller::TicketedWorker { seat } => format!("워커 좌석 {seat}"),
+        RevertCaller::DaemonAuto => BY_DAEMON_AUTO.to_string(),
+    };
     // step 0 for EVERY target before anything changes
     let mut plan: Vec<OpSpec> = Vec::new();
     for (rel, canon) in &row.applied {
         let expected = parse_canon(canon).ok_or_else(|| {
             RepairError::Corrupt(format!("{rel}: 기록된 상태를 읽을 수 없습니다({canon})"))
         })?;
-        let live_now = TargetState::read(&env.pack.join(rel))?;
-        if live_now != expected {
-            return Ok(close_superseded(
-                env,
-                &rec,
-                &format!(
-                    "{rel}: 살아 있는 파일이 적용 결과와 다릅니다(업데이트나 다른 작성자) — 아무것도 되돌리지 않았습니다"
-                ),
-                locked,
-            )?);
-        }
         let (pre, holder, slot) = pre_image_slot_for(env.root, &rec, env.lane, rel)?;
-        // FI1: the door's binding for a put-back is the generation of the bytes put back
+        // FI1: the door's binding for a put-back is the generation of the bytes put back — GV1: a
+        // generation that moved on is judged FIRST and closes the revert "superseded"
         let bound = put_back_bound(slot.as_deref(), &row_bound);
         if !bound.equals_now(env.pack) {
             return Ok(close_superseded(
                 env,
                 &rec,
                 "되살릴 바이트의 팩 세대가 지금과 다르거나 알 수 없습니다 — 옛 세대의 바이트는 되살리지 않습니다(아무것도 되돌리지 않았습니다)",
+                locked,
+            )?);
+        }
+        // GV1: in the same generation, a live file that is not what the row records the apply left
+        // is ANOTHER writer's — a CONFLICT: the bytes stay, the row 충돌, its report owed (FG3)
+        let live_now = TargetState::read(&env.pack.join(rel))?;
+        if live_now != expected {
+            return Ok(close_conflict(
+                env,
+                &rec,
+                &format!("{rel}: 살아 있는 파일이 적용 결과가 아닙니다(다른 작성자) — 그 바이트를 그대로 두고 아무것도 되돌리지 않았습니다"),
+                &by_label,
                 locked,
             )?);
         }
@@ -2067,11 +2085,6 @@ pub fn revert_in(
     }
     // every target's binding equals the generation now (checked above): the intent records it
     let bound = Bound::now(env.pack);
-    let by_label = match by {
-        RevertCaller::Human => "사람".to_string(),
-        RevertCaller::TicketedWorker { seat } => format!("워커 좌석 {seat}"),
-        RevertCaller::DaemonAuto => BY_DAEMON_AUTO.to_string(),
-    };
     // DR7: the repair-level intent is durable BEFORE the first restoring exchange
     let op_tag = wal::new_op_id(env.now, "revert");
     let mut ri = RevertIntent {
@@ -2255,6 +2268,49 @@ fn close_superseded(
     })?;
     Ok(RevertReport {
         outcome: ApplyOutcome::Superseded(why.to_string()),
+        files: Vec::new(),
+        hook_step: None,
+    })
+}
+
+/// RULINGS GV1 — a revert that met ANOTHER writer's bytes before changing anything: the row → 충돌
+/// with the closure `충돌 — 되돌리기를 마치지 못했습니다(<by>) · <why>` (its report owed and
+/// re-derived — FG3), the bytes stay, the record keeps its state with a method line (it is still in
+/// force — a later revert may finish it).
+fn close_conflict(
+    env: &OpEnv<'_>,
+    rec: &RepairRecord,
+    why: &str,
+    by_label: &str,
+    locked: &RepairLock<'_>,
+) -> Result<RevertReport, RepairError> {
+    let lane = env.lane.clone();
+    let root = env.root.to_path_buf();
+    let id = rec.id.clone();
+    let now = env.now;
+    let closure: String = format!("충돌 — 되돌리기를 마치지 못했습니다({by_label}) · {why}").chars().take(400).collect();
+    locked(&rec.id, &mut || {
+        let _mutex_scope = super::guard::MutexScope::enter();
+        if let Some(mut row) = ledger::read_lane_in(&root, &id, &lane)? {
+            row.state = LaneState::Conflict;
+            if let Some(p) = row.probation.as_mut() {
+                if p.closed.as_deref().is_none_or(closure_owes_return) {
+                    p.closed = Some(closure.clone());
+                }
+            }
+            row.updated_at = now;
+            ledger::write_lane_durable_in(&root, &row)?;
+        }
+        if let Some(mut r) = ledger::read_record_in(&root, &id)? {
+            if r.origin_lane == lane {
+                r.methods.push(closure.chars().take(300).collect());
+                ledger::write_record_durable_in(&root, &r)?;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(RevertReport {
+        outcome: ApplyOutcome::Declined(why.to_string()),
         files: Vec::new(),
         hook_step: None,
     })
