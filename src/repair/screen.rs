@@ -2051,106 +2051,120 @@ fn gate_entry_as_released(settings: &Path, gate: &str, expected: &serde_json::Va
     Some(!got.is_empty() && got.iter().all(|g| g == expected))
 }
 
-/// RULINGS DF2: the binding probe a registered command is executed with — a gate class the released
-/// gate denies in the baseline set-up (a reviewer editing a repository file) and the released guard
-/// does not, so a DENY is the gate's.
-const I3_BINDING_CLASS: &str = "R-4";
-
-/// What executing a registered command needs: the run's scratch pieces (replay rules).
-struct ExecCtx<'p> {
-    home: &'p Path,
-    tmp: &'p Path,
-    work: &'p Path,
-    bin: &'p Path,
-    sock: &'p Path,
-    pack: &'p Path,
+/// RULINGS GA2 — one target settings file as the harness reads it after a registrar run: absent, a
+/// link, a JSON document, or bytes that are no JSON document. In a JSON document every string (keys
+/// included) has the run's own scratch root replaced by a placeholder — the only part two runs of the
+/// same registrar on the same bytes write differently (the pack path inside the commands).
+#[derive(Debug, Clone, PartialEq)]
+enum SettingsDoc {
+    Absent,
+    Link(String),
+    Json(serde_json::Value),
+    NotJson(Vec<u8>),
 }
 
-/// RULINGS DF2 — "registered" is judged by BEHAVIOUR: every `PreToolUse` command hook for all tools in
-/// this settings file whose command names the gate's path (the pre-check; CZ1's closed grammar is
-/// only reported) is EXECUTED the way the harness runs a hook — `/bin/sh -c <command>`, the binding
-/// probe on standard input — under the replay rules (the run's scratch HOME, pack, stub `cys` and
-/// socket, the fixed environment). Registered = one of them DENIES in DF1's reading. `None` = not
-/// measurable (the settings unreadable, no interpreter, a run that could not start, ran out of time
-/// or left something behind, and no deny elsewhere). The stub answers the probe's role during the
-/// probe and the registrar's again afterwards.
-fn gate_executes(r: &Runner<'_>, settings: &Path, x: &ExecCtx<'_>, registrar_stub: (&str, bool)) -> Option<bool> {
-    let text = replay::read_bounded(settings).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&text).ok()?;
-    if v.get("disableAllHooks").and_then(|d| d.as_bool()) == Some(true) {
-        return Some(false);
+const RUN_PLACEHOLDER: &str = "@@SCREEN_RUN@@";
+
+/// Reads `path` with the bounded no-follow reader; `None` = not readable (not measurable).
+fn settings_doc(path: &Path, run: &Path) -> Option<SettingsDoc> {
+    let bytes = match replay::read_stamped(path).ok()?.0 {
+        LaidSource::Absent => return Some(SettingsDoc::Absent),
+        LaidSource::Link(t) => return Some(SettingsDoc::Link(t)),
+        LaidSource::Bytes { bytes, .. } => bytes,
+    };
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Some(SettingsDoc::NotJson(bytes));
+    };
+    let mut roots = vec![run.to_string_lossy().into_owned()];
+    if let Ok(c) = run.canonicalize() {
+        roots.push(c.to_string_lossy().into_owned());
     }
-    let gate = x.pack.join("hooks").join(CAPGATE_SCRIPT);
-    let gate_s = gate.to_string_lossy().into_owned();
-    let commands: Vec<String> = v
-        .pointer("/hooks/PreToolUse")
-        .and_then(|e| e.as_array())
-        .map(|entries| {
-            entries
+    // the longer spelling first: `/private/var/x` holds `/var/x`
+    roots.sort_by_key(|r| std::cmp::Reverse(r.len()));
+    roots.dedup();
+    fn placeholder(v: &mut serde_json::Value, roots: &[String]) {
+        let fix = |t: &str| {
+            roots
                 .iter()
-                .filter(|e| e.get("matcher").map_or(true, |m| m.as_str() == Some("")))
-                .filter_map(|e| e.get("hooks").and_then(|h| h.as_array()))
-                .flatten()
-                .filter(|h| h.get("type").and_then(|t| t.as_str()) == Some("command"))
-                .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
-                .filter(|c| c.contains(&gate_s))
-                .take(4)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    if commands.is_empty() {
-        return Some(false);
-    }
-    let py = r.cfg.interpreter.as_ref()?;
-    let class = corpus::CORPUS_R.iter().find(|c| c.id == I3_BINDING_CLASS)?;
-    let probe = class.probes.first()?;
-    replay::write_stub_conf(x.bin, class.role, false).ok()?;
-    let map: Vec<(&str, String)> = vec![
-        ("{pack}", x.pack.to_string_lossy().into_owned()),
-        ("{w}", x.work.to_string_lossy().into_owned()),
-        ("{home}", x.home.to_string_lossy().into_owned()),
-        (
-            "{other}",
-            x.home
-                .join(".cys")
-                .join("pack-dept-zz")
-                .to_string_lossy()
-                .into_owned(),
-        ),
-    ];
-    let input = probe_input(probe, &map, x.work);
-    let mut path_dirs = vec![x.bin.to_path_buf()];
-    if let Some(p) = &r.py_dir {
-        path_dirs.push(p.clone());
-    }
-    let mut env = replay::base_env(x.home, x.tmp, &path_dirs);
-    env.push(("CYS_SURFACE_ID".into(), "7".into()));
-    env.push(("CYS_ROLE".into(), class.role.into()));
-    env.push(("CYS_SOCKET".into(), x.sock.to_string_lossy().into_owned()));
-    env.push(("CYS_PACK_DIR".into(), x.pack.to_string_lossy().into_owned()));
-    env.push(("CYS_PY".into(), py.to_string_lossy().into_owned()));
-    let mut measurable = true;
-    let mut denied = false;
-    for c in &commands {
-        let o = r.run(&["/bin/sh".to_string(), "-c".to_string(), c.clone()], &env, x.work, &input);
-        if o.timed_out || o.spawn_error.is_some() || o.left_something().is_some() {
-            measurable = false;
-            continue;
-        }
-        if o.code == Some(2) || (o.code == Some(0) && deny_payload(&o.stdout)) {
-            denied = true;
-            break;
+                .fold(t.to_string(), |acc, r| acc.replace(r.as_str(), RUN_PLACEHOLDER))
+        };
+        match v {
+            serde_json::Value::String(t) => *t = fix(t),
+            serde_json::Value::Array(a) => a.iter_mut().for_each(|x| placeholder(x, roots)),
+            serde_json::Value::Object(m) => {
+                let old = std::mem::take(m);
+                for (k, mut x) in old {
+                    placeholder(&mut x, roots);
+                    m.insert(fix(&k), x);
+                }
+            }
+            _ => {}
         }
     }
-    replay::write_stub_conf(x.bin, registrar_stub.0, registrar_stub.1).ok()?;
-    if denied {
-        Some(true)
-    } else if measurable {
-        Some(false)
-    } else {
-        None
+    placeholder(&mut v, &roots);
+    Some(SettingsDoc::Json(v))
+}
+
+/// RULINGS GA2 — where `got` first differs from the `reference` document, as a JSON pointer; `None`
+/// = the same document: every key, event, block and hook, array order and multiplicity.
+fn doc_difference(reference: &SettingsDoc, got: &SettingsDoc) -> Option<String> {
+    fn at(x: &serde_json::Value, y: &serde_json::Value, here: &str) -> Option<String> {
+        use serde_json::Value::{Array, Object};
+        match (x, y) {
+            (Object(p), Object(q)) => {
+                for k in p.keys().chain(q.keys().filter(|k| !p.contains_key(*k))) {
+                    let here = format!("{here}/{}", k.replace('~', "~0").replace('/', "~1"));
+                    match (p.get(k), q.get(k)) {
+                        (Some(u), Some(v)) => {
+                            if let Some(d) = at(u, v, &here) {
+                                return Some(d);
+                            }
+                        }
+                        _ => return Some(here),
+                    }
+                }
+                None
+            }
+            (Array(p), Array(q)) => {
+                for i in 0..p.len().max(q.len()) {
+                    let here = format!("{here}/{i}");
+                    match (p.get(i), q.get(i)) {
+                        (Some(u), Some(v)) => {
+                            if let Some(d) = at(u, v, &here) {
+                                return Some(d);
+                            }
+                        }
+                        _ => return Some(here),
+                    }
+                }
+                None
+            }
+            _ if x == y => None,
+            _ => Some(if here.is_empty() { "/".into() } else { here.to_string() }),
+        }
     }
+    match (reference, got) {
+        (SettingsDoc::Json(x), SettingsDoc::Json(y)) => at(x, y, ""),
+        _ if reference == got => None,
+        _ => Some("the whole file".into()),
+    }
+}
+
+/// RULINGS GA2: the marker of a variant row whose document differs from the released registrar's.
+const I3_DOC_DIFFERS: &str = "설정 문서가 출시본 등록기의 결과와 다름";
+
+/// RULINGS GA2 / decision 26: the sentence of an I3 refusal on a changed document.
+const I3_VENDOR_ONLY: &str = "등록기(javis_preflight.py C28)가 쓴 설정 문서가 출시본 등록기가 같은 자리에서 쓴 문서와 다릅니다 — 1차 출시에서 등록기가 쓰는 내용은 공급사 업데이트로만 바뀝니다(훅 등록 목록은 이 기능이 고치지 않습니다)";
+
+/// One I3 row: (run, target label) → registered as the released registrar writes it (`None` = not
+/// measured), what was observed, and the target's whole document after the run.
+#[derive(Debug, Clone)]
+struct I3Row {
+    run: usize,
+    label: String,
+    registered: Option<bool>,
+    detail: String,
+    doc: Option<SettingsDoc>,
 }
 
 /// The settings text with every hook command that runs the gate removed ("starts unregistered").
@@ -2222,7 +2236,8 @@ enum Scenario {
 }
 
 /// The I3 run of one variant in one (layout, scenario): two registrar runs, the second on the
-/// first's end state. `Some(ended registered)` per (run, target label); `None` = the run errored.
+/// first's end state. One row per (run, target label) with the target's whole document (GA2);
+/// `registered: None` = the run errored.
 fn run_i3(
     r: &Runner<'_>,
     files: &Files,
@@ -2230,7 +2245,7 @@ fn run_i3(
     template: &str,
     layout: Layout,
     scenario: Scenario,
-) -> Vec<(usize, String, Option<bool>, String)> {
+) -> Vec<I3Row> {
     let mut out = Vec::new();
     let go = (|| -> Result<(), RepairError> {
         let run = r.fresh_dir()?;
@@ -2310,7 +2325,13 @@ fn run_i3(
             let Some(py) = &r.cfg.interpreter else {
                 for k in 1..=2 {
                     for (label, _) in &targets {
-                        out.push((k, label.clone(), None, "no interpreter".into()));
+                        out.push(I3Row {
+                            run: k,
+                            label: label.clone(),
+                            registered: None,
+                            detail: "no interpreter".into(),
+                            doc: None,
+                        });
                     }
                 }
                 return Ok(());
@@ -2349,38 +2370,38 @@ fn run_i3(
                             .collect::<String>()
                     )
                 };
-                let x = ExecCtx {
-                    home: &home,
-                    tmp: &tmp,
-                    work: &work,
-                    bin: &bin,
-                    sock: sock.path(),
-                    pack: &pack,
-                };
                 for (label, t) in &targets {
-                    // RULINGS EL2 / CZ1 / DF2: registered = the entry the released registrar writes
-                    // (compared whole) AND the closed grammar AND the command really denies
-                    let (st, detail) = if completed {
+                    // RULINGS EL2 / CZ1: registered = the entry the released registrar writes AND the
+                    // closed grammar; RULINGS GA2: the whole document goes with the row — a variant
+                    // is compared with the released registrar's document in screen_i3 (no execution:
+                    // an equal document runs the same command, whose gate the R / C probes judge)
+                    let (st, detail, doc) = if completed {
                         let whole = match &expected {
                             Some(e) => gate_entry_as_released(t, &gate_path, e),
                             None => None,
                         };
                         let grammar = gate_registered(t, &pack);
                         let st = match (whole, grammar) {
-                            (Some(true), Some(true)) => {
-                                gate_executes(r, t, &x, ("worker", scenario != Scenario::S2))
-                            }
-                            (Some(_), Some(_)) => Some(false),
+                            (Some(a), Some(b)) => Some(a && b),
                             _ => None,
                         };
+                        let doc = settings_doc(t, &run);
+                        let st = if doc.is_none() { None } else { st };
                         (
                             st,
-                            format!("{why}; entry as released {whole:?}, grammar {grammar:?}"),
+                            format!("{why}; entry as released {whole:?}, grammar {grammar:?}, document read {}", doc.is_some()),
+                            doc,
                         )
                     } else {
-                        (None, why.clone())
+                        (None, why.clone(), None)
                     };
-                    out.push((k, label.clone(), st, detail));
+                    out.push(I3Row {
+                        run: k,
+                        label: label.clone(),
+                        registered: st,
+                        detail,
+                        doc,
+                    });
                 }
             }
             drop(sock);
@@ -2393,10 +2414,16 @@ fn run_i3(
     })();
     if let Err(e) = go {
         for row in out.iter_mut() {
-            row.2 = None;
-            row.3 = format!("{} — run not clean: {e:?}", row.3);
+            row.registered = None;
+            row.detail = format!("{} — run not clean: {e:?}", row.detail);
         }
-        out.push((1, "*".into(), None, format!("layout / cleanup: {e:?}")));
+        out.push(I3Row {
+            run: 1,
+            label: "*".into(),
+            registered: None,
+            detail: format!("layout / cleanup: {e:?}"),
+            doc: None,
+        });
     }
     out
 }
@@ -2449,16 +2476,9 @@ fn i3_template(r: &Runner<'_>, released: &Files) -> Option<String> {
             return None;
         }
         let settings = home.join(".claude").join("settings.json");
-        let x = ExecCtx {
-            home: &home,
-            tmp: &tmp,
-            work: &work,
-            bin: &bin,
-            sock: sock.path(),
-            pack: &pack,
-        };
-        // RULINGS DF2: the released registrar's registration must really deny the binding probe
-        if gate_executes(r, &settings, &x, ("worker", true)) != Some(true) {
+        // RULINGS CZ1: the released registrar's registration executes the gate (the closed grammar;
+        // GA2 — that the released gate denies is the R / C probes' released column)
+        if gate_registered(&settings, &pack) != Some(true) {
             return None;
         }
         drop(sock);
@@ -2470,7 +2490,7 @@ fn i3_template(r: &Runner<'_>, released: &Files) -> Option<String> {
     res
 }
 
-type I3Rows = Vec<(usize, String, Option<bool>, String)>;
+type I3Rows = Vec<I3Row>;
 
 fn i3_cache() -> &'static Mutex<HashMap<String, I3Rows>> {
     static C: std::sync::OnceLock<Mutex<HashMap<String, I3Rows>>> = std::sync::OnceLock::new();
@@ -2478,12 +2498,8 @@ fn i3_cache() -> &'static Mutex<HashMap<String, I3Rows>> {
 }
 
 fn screen_i3(r: &Runner<'_>, v: &Variants, rels: &[String], results: &mut Vec<ProbeResult>) {
-    // RULINGS DF2: the registered command is EXECUTED — the gate needs its prelude beside it
-    let mut laid: Vec<String> = rels.to_vec();
-    if !laid.iter().any(|x| x == "hooks/_lib.sh") {
-        laid.push("hooks/_lib.sh".into());
-    }
-    let sub = |f: &Files| subset(f, &laid);
+    // RULINGS GA2: nothing registered is executed any more — only the registrar's inputs are laid
+    let sub = |f: &Files| subset(f, rels);
     let released_files = sub(&v.released);
     let touched: Vec<(&String, bool)> = v
         .touched
@@ -2581,9 +2597,9 @@ fn screen_i3(r: &Runner<'_>, v: &Variants, rels: &[String], results: &mut Vec<Pr
             }
         }
         let rows = run_i3(r, &keys[*g].1, &profiles, &template, *l, *s);
-        r.plan.record(!rows.is_empty() && rows.iter().all(|(_, _, st, _)| st.is_some()));
+        r.plan.record(!rows.is_empty() && rows.iter().all(|x| x.registered.is_some()));
         // never kept from the BL1 repeat (which runs without the cache), never a not-measured row
-        if r.use_cache && rows.iter().all(|(_, _, st, _)| st.is_some()) {
+        if r.use_cache && rows.iter().all(|x| x.registered.is_some()) {
             if let Ok(mut m) = i3_cache().lock() {
                 if m.len() > 2_000 {
                     m.clear();
@@ -2593,8 +2609,7 @@ fn screen_i3(r: &Runner<'_>, v: &Variants, rels: &[String], results: &mut Vec<Pr
         }
         rows
     });
-    let mut table: HashMap<(String, Layout, Scenario), Vec<(usize, String, Option<bool>, String)>> =
-        HashMap::new();
+    let mut table: HashMap<(String, Layout, Scenario), I3Rows> = HashMap::new();
     for ((g, l, s), rows) in jobs.iter().zip(got) {
         table.insert((keys[*g].0.clone(), *l, *s), rows);
     }
@@ -2620,14 +2635,25 @@ fn screen_i3(r: &Runner<'_>, v: &Variants, rels: &[String], results: &mut Vec<Pr
                 .unwrap_or_default()
         };
         let rel_rows = rows_of(Var::Released);
-        for (k, label, st, why) in &rel_rows {
-            let pick = |var: Var| -> Option<Answer> {
-                rows_of(var)
-                    .iter()
-                    .find(|(k2, l2, _, _)| k2 == k && l2 == label)
-                    .map(|(_, _, b, _)| ans(*b))
+        for rel in &rel_rows {
+            let mut why = rel.detail.clone();
+            // RULINGS GA2: a variant is shown registered only when its WHOLE document equals the
+            // released registrar's in the same layout, scenario, run and target
+            let mut pick = |var: Var| -> Option<Answer> {
+                let rows = rows_of(var);
+                let x = rows.iter().find(|x| x.run == rel.run && x.label == rel.label)?;
+                Some(match (&rel.doc, &x.doc, x.registered) {
+                    (Some(a), Some(b), Some(reg)) => match doc_difference(a, b) {
+                        None => ans(Some(reg)),
+                        Some(place) => {
+                            why.push_str(&format!("; {var:?}: {I3_DOC_DIFFERS} ({place})"));
+                            Answer::Allow
+                        }
+                    },
+                    _ => Answer::Error,
+                })
             };
-            let released = ans(*st);
+            let released = ans(rel.registered);
             let (clean, lane, cand, attr) = if released == Answer::Deny {
                 (
                     pick(Var::Clean),
@@ -2649,8 +2675,8 @@ fn screen_i3(r: &Runner<'_>, v: &Variants, rels: &[String], results: &mut Vec<Pr
             );
             results.push(ProbeResult {
                 test: "I3".into(),
-                class: format!("I3:{label}"),
-                cell: format!("{l:?}/{s:?}/run{k}"),
+                class: format!("I3:{}", rel.label),
+                cell: format!("{l:?}/{s:?}/run{}", rel.run),
                 protection: protection_of("I3").to_string(),
                 released,
                 clean,
@@ -2658,7 +2684,7 @@ fn screen_i3(r: &Runner<'_>, v: &Variants, rels: &[String], results: &mut Vec<Pr
                 candidate: cand,
                 attribution: attr,
                 decision,
-                detail: why.clone(),
+                detail: why,
             });
         }
     }
@@ -2838,6 +2864,12 @@ fn summarize(probes: Vec<ProbeResult>, input_fingerprint: String, took: Duration
             tags.len(),
             tags.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
         ));
+    }
+    // RULINGS GA2: a refusal on a changed settings document says why it cannot pass in release 1
+    if probes.iter().any(|p| {
+        p.test == "I3" && p.decision == ProbeDecision::Refused && p.detail.contains(I3_DOC_DIFFERS)
+    }) {
+        refusals.push(I3_VENDOR_ONLY.to_string());
     }
     let n_findings: usize = findings.values().map(Vec::len).sum();
     if n_findings > 0 {
