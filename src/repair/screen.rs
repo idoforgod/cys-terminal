@@ -386,6 +386,23 @@ pub fn after_run_refusal(report: &ScreenReport) -> Option<String> {
     (only.verdict == ScreenVerdict::Refused).then(|| only.refusals.join(" / "))
 }
 
+/// RULINGS GA8: the line of an after-run difference that was NOT written again in the repeat (a note
+/// and one intake row — [`judge_after_run`]), judged without explanations; `None` when the
+/// comparison found nothing or refused.
+pub fn after_run_note(report: &ScreenReport) -> Option<String> {
+    if after_run_refusal(report).is_some() {
+        return None;
+    }
+    let mut only = report.clone();
+    only.verdict = ScreenVerdict::Accepted;
+    only.refusals.clear();
+    only.notes.clear();
+    only.lane_findings.clear();
+    only.not_measurable.clear();
+    judge_after_run(&mut only, &|_| false);
+    only.lane_findings.first().cloned()
+}
+
 // ═════════════════════════════════════════ the engine ═════════════════════════════════════════
 
 use super::replay::{self, LaidSource, ScratchRoot, ScratchSocket};

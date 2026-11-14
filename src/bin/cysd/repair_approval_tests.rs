@@ -203,6 +203,8 @@ struct Rec {
     events: Mutex<Vec<String>>,
     applied: Mutex<Vec<Vec<String>>>,
     intake: Mutex<Vec<(String, String)>>,
+    /// RULINGS GA8: the ledger's answer the double gives (None = a new row)
+    intake_answer: Mutex<Option<crate::repair::Filed>>,
     step3_fail: Mutex<Option<String>>,
     step3_err: Mutex<Option<Step3Err>>,
     helper_exit: Mutex<Option<i32>>,
@@ -219,6 +221,9 @@ impl Effects for Rec {
         self.delivered.lock().unwrap().push((seat, text));
     }
     fn tell_master(&self, text: String) {
+        self.master.lock().unwrap().push(text);
+    }
+    fn point_master(&self, text: String) {
         self.master.lock().unwrap().push(text);
     }
     fn publish(&self, name: &str, _payload: Value) {
@@ -282,11 +287,16 @@ impl Effects for Rec {
             }),
         }
     }
-    fn intake(&self, file: &str, error: &str) {
+    fn intake(&self, file: &str, error: &str) -> crate::repair::Filed {
         self.intake
             .lock()
             .unwrap()
             .push((file.into(), error.into()));
+        self.intake_answer
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(crate::repair::Filed::New)
     }
     fn approval_consumed(
         &self,
@@ -907,8 +917,9 @@ fn watchdog_sweep_and_threads_survive_panics() {
     assert!(gov.contains("crate::repair_approval::watchdog_sweep(&daemon);"));
 }
 
-/// RULINGS DE1: a refusal by the after-run comparison returns the candidate and files ONE intake row
-/// and the owner's one line — once, nothing per tick.
+/// RULINGS DE1 / GA8: a refusal by the after-run comparison returns the candidate; step 3 itself wrote
+/// its ONE intake row first (`intake` lists it) — `run_step3` files nothing again and sends the
+/// master's pointer once, nothing per tick.
 #[test]
 fn comparison_refusal_files_one_intake_row_and_one_owner_line() {
     let r = rig("de1");
@@ -922,11 +933,13 @@ fn comparison_refusal_files_one_intake_row_and_one_owner_line() {
     });
     let rid = pending(&r, &t, &eff, T0);
     assert_eq!(state_of(&t, &rid), ReqState::Voided);
-    assert_eq!(eff.intake.lock().unwrap().len(), 1, "one intake row");
+    // RULINGS GA8 (old expectation: `eff.intake.len() == 1` — run_step3 filed the carried rows after
+    // ending the request; the production step 3 writes them first, `step3_writes_the_row_first…`)
+    assert_eq!(eff.intake.lock().unwrap().len(), 0, "the caller never files the rows again");
     assert_eq!(eff.master.lock().unwrap().len(), 1, "one owner line");
     sweep(&r.ctx(T0 + 60.0), &t, &eff);
     sweep(&r.ctx(T0 + 2000.0), &t, &eff);
-    assert_eq!(eff.intake.lock().unwrap().len(), 1, "never again per tick");
+    assert_eq!(eff.intake.lock().unwrap().len(), 0, "never again per tick");
     assert_eq!(eff.master.lock().unwrap().len(), 1);
 }
 
@@ -958,28 +971,151 @@ fn a_failing_target_does_not_end_the_repeat_early() {
     let s3 = Step3Input { root: r.root.clone(), repair: id, pack: r.pack.clone(), states, windows: false };
     let home = r.dir.join("realhome");
     std::fs::create_dir_all(&home).unwrap();
-    let e = production_step3_with(&s3, &home).unwrap_err();
+    let e = production_step3_with(&s3, &home, &|_, _| crate::repair::Filed::New).unwrap_err();
     assert!(e.why.contains("다시 썼습니다"), "{}", e.why);
 }
 
-/// RULINGS EO5 (b): the owner's line for an escape refusal is sent once per (repair, candidate
-/// fingerprint) — the same candidate refused again tells nobody again (the intake row is filed each
-/// time step 3 refuses).
+/// RULINGS EO5 (b) → GA8 (2): the owner's line for an escape refusal follows the ledger's answer that
+/// the refusal's row is NEW — the same candidate refused again (a restart in between included: the
+/// test keeps NO memory between the runs, only the ledger on disk) tells nobody again, while the row
+/// is written each time. (Old form: an in-memory `escape_told` set, emptied by every restart; old
+/// expectation `master.len() == 1, intake.len() == 2` over a canned step 3 — the counts below are the
+/// same, now from the real ledger.)
 #[test]
 fn escape_line_once_per_candidate() {
     let r = rig("eo5b");
-    r.signed_repair();
-    let t = Mutex::new(ApprovalTable::default());
+    let s3 = escaping_candidate(&r);
+    let home = r.dir.join("realhome");
+    std::fs::create_dir_all(&home).unwrap();
+    let rows = Mutex::new(Vec::<crate::repair::Filed>::new());
+    let ledger = |f: &str, l: &str| {
+        let a = crate::repair::file_intake_in(&r.ctx(T0), f, l);
+        rows.lock().unwrap().push(a.clone());
+        a
+    };
+    let first = production_step3_with(&s3, &home, &ledger).unwrap_err();
+    let again = production_step3_with(&s3, &home, &ledger).unwrap_err();
+    assert!(first.owner_line.is_some(), "a new row: one pointer — {first:?}");
+    assert!(again.owner_line.is_none(), "the ledger says not new: no second line — {again:?}");
+    assert_eq!(
+        *rows.lock().unwrap(),
+        vec![crate::repair::Filed::New, crate::repair::Filed::NotNew],
+        "the row is written each time"
+    );
+}
+
+/// A candidate whose hook writes a LIVE listed file of the lane on every run (CZ3's sequence).
+fn escaping_candidate(r: &Rig) -> Step3Input {
+    let id = RepairId::parse("R-1").unwrap();
+    let live = r.pack.join("hooks/guard.sh");
+    std::fs::write(&live, b"#!/bin/sh\nexit 0\n").unwrap();
+    let rel = "hooks/appbuild-gate.sh";
+    let staged = ledger::staging_dir_in(&r.root, &id).join(rel);
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::write(&staged, format!("#!/bin/sh\nprintf 'x\\n' >> '{}'\nexit 0\n", live.display())).unwrap();
+    cys::repair::replay::set_mode(&staged, 0o755);
+    Step3Input {
+        root: r.root.clone(),
+        repair: id,
+        pack: r.pack.clone(),
+        states: vec![(rel.to_string(), TargetState::read(&staged).unwrap())],
+        windows: false,
+    }
+}
+
+/// RULINGS GA8 (1) / (2): step 3 writes what its comparison found FIRST — before it returns, whatever
+/// follows — and a write that fails marks nothing: no pointer then, and the next identical step 3
+/// writes the row (new) and points once.
+#[test]
+fn step3_writes_the_row_first_and_a_failed_write_marks_nothing() {
+    let r = rig("ga8-s3");
+    let s3 = escaping_candidate(&r);
+    let home = r.dir.join("realhome");
+    std::fs::create_dir_all(&home).unwrap();
+    let failed = production_step3_with(&s3, &home, &|_, _| {
+        crate::repair::Filed::Failed("the ledger could not be written".into())
+    })
+    .unwrap_err();
+    assert!(failed.owner_line.is_none(), "{failed:?}");
+    assert_eq!(failed.intake.len(), 1, "the found list is carried: {failed:?}");
+    let ledger = |f: &str, l: &str| crate::repair::file_intake_in(&r.ctx(T0), f, l);
+    let next = production_step3_with(&s3, &home, &ledger).unwrap_err();
+    assert!(next.owner_line.is_some(), "nothing was marked by the failure: {next:?}");
+}
+
+/// RULINGS GA8 — the worker's `check`: the comparison's row is written within the call (no helper
+/// thread), the pointer follows only a NEW row and is sent once; a failed write sends nothing and
+/// marks nothing; a noted difference is a row and never a pointer.
+#[test]
+fn check_comparison_writes_the_row_and_points_once() {
+    use cys::repair::rehearsal::Comparison;
+    let r = rig("ga8-check");
+    let rel = "hooks/appbuild-gate.sh";
+    let pointed = Mutex::new(Vec::<String>::new());
+    let point = |t: String| pointed.lock().unwrap().push(t);
+    let ledger = |f: &str, l: &str| crate::repair::file_intake_in(&r.ctx(T0), f, l);
+    let refused = Comparison::Refused("예행이 실제 환경의 항목을 다시 썼습니다(hooks/guard.sh)".into());
+    let fail = |_: &str, _: &str| crate::repair::Filed::Failed("injected".into());
+    assert_eq!(
+        check_consequence(rel, &refused, &fail, &point),
+        Some(crate::repair::Filed::Failed("injected".into()))
+    );
+    assert!(pointed.lock().unwrap().is_empty(), "a failed write sends nothing");
+    assert_eq!(check_consequence(rel, &refused, &ledger, &point), Some(crate::repair::Filed::New));
+    assert_eq!(check_consequence(rel, &refused, &ledger, &point), Some(crate::repair::Filed::NotNew));
+    assert_eq!(pointed.lock().unwrap().len(), 1, "one pointer for one new row");
+    let noted = Comparison::Noted("예행 동안 실제 환경의 항목이 바뀌었으나 다시 돌렸을 때는 바뀌지 않았습니다(x)".into());
+    assert_eq!(check_consequence(rel, &noted, &ledger, &point), Some(crate::repair::Filed::New));
+    assert_eq!(pointed.lock().unwrap().len(), 1, "a noted difference is no pointer");
+    assert_eq!(check_consequence(rel, &Comparison::Clean, &ledger, &point), None);
+    // the production consequence has no helper thread and keeps nothing in memory
+    let src = include_str!("repair_approval.rs");
+    let body = src
+        .split("pub(crate) fn comparison_consequence(")
+        .nth(1)
+        .and_then(|b| b.split("\n}\n").next())
+        .unwrap();
+    assert!(!body.contains("spawn_thread") && !body.contains("static "), "{body}");
+    // the pointer is one attempt: no retrying delivery, no loop
+    let pm = src
+        .split("fn point_master_now(")
+        .nth(1)
+        .and_then(|b| b.split("\n}\n").next())
+        .unwrap();
+    assert!(
+        !pm.contains("deliver_once") && !pm.contains("for ") && !pm.contains("loop") && !pm.contains("while "),
+        "{pm}"
+    );
+}
+
+/// RULINGS GA8 (2) on the unknown-approval finding: the repair is remembered as reported only after
+/// the ledger answered — a failed write (the restart's first sweep) is tried again by the next submit,
+/// then nothing more.
+#[test]
+fn unknown_finding_is_cached_only_after_the_ledger_answered() {
+    let r = rig("ga8-unknown");
     let eff = effects();
-    *eff.step3_err.lock().unwrap() = Some(Step3Err {
-        why: "예행이 실제 환경의 항목을 다시 썼습니다(x)".into(),
-        intake: vec![("hooks/h.sh".into(), "다시 썼습니다".into())],
-        owner_line: Some("수리 R-1 … 돌려보냈습니다".into()),
-    });
-    pending(&r, &t, &eff, T0);
-    pending(&r, &t, &eff, T0 + 10.0);
-    assert_eq!(eff.master.lock().unwrap().len(), 1, "one owner line for one candidate");
-    assert_eq!(eff.intake.lock().unwrap().len(), 2);
+    *eff.consumed_answer.lock().unwrap() =
+        Some(cys::repair::consumed::ApprovalUse::Unknown("no evidence".into()));
+    *eff.intake_answer.lock().unwrap() = Some(crate::repair::Filed::Failed("injected".into()));
+    let (_id, _rid, t) = approved_then_restart(&r, &eff);
+    let n0 = eff.intake.lock().unwrap().len();
+    sweep(&r.ctx(T0 + 60.0), &t, &eff);
+    let n1 = eff.intake.lock().unwrap().len();
+    assert!(n1 > n0, "the finding was tried");
+    assert!(t.lock().unwrap().unknown_reported.is_empty(), "a failed write marks nothing");
+    *eff.intake_answer.lock().unwrap() = None;
+    let submit_at = |at: f64| {
+        let e = submit(&r.ctx(at), &worker(), &json!({"repair": "R-1"}), &t, &eff, Ok(())).unwrap_err();
+        assert!(e.message.contains("알 수 없어"), "{}", e.message);
+    };
+    submit_at(T0 + 120.0);
+    let n2 = eff.intake.lock().unwrap().len();
+    assert_eq!(n2, n1 + 1, "tried again after the failure");
+    assert!(t.lock().unwrap().unknown_reported.contains("R-1"), "remembered once the ledger answered");
+    submit_at(T0 + 180.0);
+    sweep(&r.ctx(T0 + 240.0), &t, &eff);
+    assert_eq!(eff.intake.lock().unwrap().len(), n2, "then never again");
 }
 
 /// RULINGS CZ3: the rehearsal of step 3 runs INSIDE the scoped after-run comparison — a candidate hook
@@ -1010,7 +1146,7 @@ fn step3_finds_a_rehearsal_writing_the_live_lane() {
     };
     let home = r.dir.join("realhome");
     std::fs::create_dir_all(&home).unwrap();
-    let e = production_step3_with(&s3, &home).unwrap_err();
+    let e = production_step3_with(&s3, &home, &|_, _| crate::repair::Filed::New).unwrap_err();
     assert!(e.why.contains("다시 썼습니다"), "{}", e.why);
     assert!(e.why.contains("guard.sh"), "{}", e.why);
     assert_eq!(e.intake.first().map(|(f, _)| f.as_str()), Some(rel));
