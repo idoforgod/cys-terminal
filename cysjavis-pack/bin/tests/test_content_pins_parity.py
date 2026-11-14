@@ -347,6 +347,8 @@ class M2DirectiveRewrite(unittest.TestCase):
 # 다시 쓰지 않는다 — 다시 쓰려면 부록의 동결 개정(두 리뷰어 확인 + master 기록)이 먼저다(Part 10).
 # ★동결 개정 반영(RULINGS AH5 · TESTPLAN_RULINGS Part 15 A7): P02·P14 "주인님 보고 후" → "오너에게 보고한 뒤" · P53 산문
 #   `doctor` → `owner(사용자)` · P74·P82 개인 기억 파일 포인터 제거 · P11·P23 괄호 "(팩 업데이트가 강제 복원)" 제거.
+# ★동결 개정 반영(RULINGS DC4 · T8b): P11·P23 — 승격이 사용자 파일을 '덮는다'는 문장이 0.15.0 의 조립과 모순(codex J6 G6)이라
+#   같은 자리의 같은 세 줄을 조립 설명으로 바꾼다(새 단위 아님 · 종전 기대 문장은 impl/reports/T8b-report.md 에 그대로 인용).
 STOP_REPORT_ANNEX = (
     ("P01", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "충돌 시 우선순위: 오너 명시 지시 > soul.md > 이 지침 > 개별 작업 브리프."),
     ("P02", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "★단 디렉티브·soul 소실 FAIL의 복구에서 **팩 템플릿 강제 복원은 절대 금지**다(계약 §1-1·§11-13) —\n   백업 없는 템플릿 덮어쓰기는 주권 편집을 비가역 소실시킨다. 복원은 preflight 출력이 안내하는\n   절차(백업 선행 → 오너에게 보고한 뒤 지시에 따라 복구)만 따른다."),
@@ -358,7 +360,7 @@ STOP_REPORT_ANNEX = (
     ("P08", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "부여된 경우의 계약: **denylist에서만\n멈추고 나머지는 무정지로 달린다** — \"로드맵 안·가역이면 달리고, 로드맵 밖·비가역이면 주차한다.\""),
     ("P09", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "**정지 경계 (denylist — 이것만 멈춰서 오너 승인)**: ①승인된 로드맵(BUILD_PLAN/Phase)을\n  벗어나는 새 범위 ②soul·CLAUDE.md·헌법(디렉티브) 변경 ③외부 발행/발송(git push·메시지\n  전송·공개 배포 = 비가역. **로컬 커밋은 가역 = 허용**) ④비가역 삭제 ⑤오너가 명시 보유한\n  결정권."),
     ("P10", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "(Phase 중간에는 §4 비자명 지시 보고·금지선 격상 외 다변 보고를 억제한다 — 무정지 원칙)"),
-    ("P11", "cysjavis-pack/directives/CEO_TEMPLATE.md", "템플릿은 **시스템 소유** 이고 살아 있는 규약 파일은 **사용자 소유**인데,\n  **승격은 사용자 파일을 템플릿으로 덮는다** ⇒ 살아 있는 파일에만 있는 조항은 **다음 부서 생성이\n  파괴한다.**"),
+    ("P11", "cysjavis-pack/directives/CEO_TEMPLATE.md", "템플릿은 **시스템 소유** 이고 살아 있는 규약 파일은 **사용자 소유**인데,\n  **승격은 조립이다(템플릿의 머리말 + 구분선 + 사용자 본부 지침)** ⇒ 구분선 뒤 본문은 그대로 남지만, 살아 있는 파일의\n  머리말에만 있는 조항은 **다음 승격 확인이 시각 붙은 사본으로 옮기고 템플릿의 머리말로 다시 조립한다.**"),
     ("P12", "cysjavis-pack/directives/CEO_TEMPLATE.md", "충돌 시 머리글>이 서문>본문 순 우선(전역: 오너>soul.md>이 지침>브리프)."),
     ("P13", "cysjavis-pack/directives/CEO_TEMPLATE.md", "충돌 시 우선순위: 오너 명시 지시 > soul.md > 이 지침 > 개별 작업 브리프."),
     ("P14", "cysjavis-pack/directives/CEO_TEMPLATE.md", "★단 디렉티브·soul 소실 FAIL의 복구에서 **팩 템플릿 강제 복원은 절대 금지**다(계약 §1-1·§11-13) —\n   백업 없는 템플릿 덮어쓰기는 주권 편집을 비가역 소실시킨다. 복원은 preflight 출력이 안내하는\n   절차(백업 선행 → 오너에게 보고한 뒤 지시에 따라 복구)만 따른다."),
@@ -370,7 +372,7 @@ STOP_REPORT_ANNEX = (
     ("P20", "cysjavis-pack/directives/CEO_TEMPLATE.md", "부여된 경우의 계약: **denylist에서만\n멈추고 나머지는 무정지로 달린다** — \"로드맵 안·가역이면 달리고, 로드맵 밖·비가역이면 주차한다.\""),
     ("P21", "cysjavis-pack/directives/CEO_TEMPLATE.md", "**정지 경계 (denylist — 이것만 멈춰서 오너 승인)**: ①승인된 로드맵(BUILD_PLAN/Phase)을\n  벗어나는 새 범위 ②soul·CLAUDE.md·헌법(디렉티브) 변경 ③외부 발행/발송(git push·메시지\n  전송·공개 배포 = 비가역. **로컬 커밋은 가역 = 허용**) ④비가역 삭제 ⑤오너가 명시 보유한\n  결정권."),
     ("P22", "cysjavis-pack/directives/CEO_TEMPLATE.md", "(Phase 중간에는 §4 비자명 지시 보고·금지선 격상 외 다변 보고를 억제한다 — 무정지 원칙)"),
-    ("P23", "scripts/ceo_template_header.md", "템플릿은 **시스템 소유** 이고 살아 있는 규약 파일은 **사용자 소유**인데,\n  **승격은 사용자 파일을 템플릿으로 덮는다** ⇒ 살아 있는 파일에만 있는 조항은 **다음 부서 생성이\n  파괴한다.**"),
+    ("P23", "scripts/ceo_template_header.md", "템플릿은 **시스템 소유** 이고 살아 있는 규약 파일은 **사용자 소유**인데,\n  **승격은 조립이다(템플릿의 머리말 + 구분선 + 사용자 본부 지침)** ⇒ 구분선 뒤 본문은 그대로 남지만, 살아 있는 파일의\n  머리말에만 있는 조항은 **다음 승격 확인이 시각 붙은 사본으로 옮기고 템플릿의 머리말로 다시 조립한다.**"),
     ("P24", "scripts/ceo_template_header.md", "충돌 시 머리글>이 서문>본문 순 우선(전역: 오너>soul.md>이 지침>브리프)."),
     ("P25", "cysjavis-pack/directives/WORKER_DIRECTIVE.md", "충돌 시: 오너 명시 지시 > master 지시 > 이 지침 > 개별 작업 브리프."),
     ("P26", "cysjavis-pack/directives/WORKER_DIRECTIVE.md", "정의처 고지: 이 문서는 헌장·운영계약 조문의 현장 배치본이다 — 문서 간 규정이 갈리면 정본이 이긴다\n> (**충돌 시 헌장 > 운영계약 > 이 디렉티브**)."),
