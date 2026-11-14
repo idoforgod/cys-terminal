@@ -396,16 +396,41 @@ pub fn note_owner_input_in(root: &Path, lane: &LaneKey, now: f64) -> Result<bool
         return Ok(false);
     }
     let p = pause_path_in(root, lane);
+    // RULINGS DG4: one writer at a time per lane, and the stored end never moves back — a stalled
+    // older write that completes after a newer one keeps the newer input
+    let write_lock = pause_write_lock(root, lane);
+    let _held = write_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let at = match std::fs::read(&p)
+        .map_err(|e| corrupt(&p, e))
+        .and_then(|b| parse_versioned::<PauseMark>(&p, &b))
+    {
+        Ok(m) if m.paused_at.is_finite() => now.max(m.paused_at),
+        _ => now,
+    };
     // RULINGS CV3: the mark covers the inputs a coalesced writer may skip after it (the
     // coalescing window) — the persisted end is never earlier than 30 minutes after the last input
     let mark = PauseMark {
         schema: super::REPAIR_SCHEMA,
         lane_key: lane.clone(),
-        paused_at: now,
-        resumed_at: now + PAUSE_QUIET_SECS as f64 + PAUSE_WRITE_COALESCE_SECS,
+        paused_at: at,
+        resumed_at: at + PAUSE_QUIET_SECS as f64 + PAUSE_WRITE_COALESCE_SECS,
     };
     crate::atomic_write_json(&p, &mark).map_err(|e| io_err(&p, e))?;
     Ok(true)
+}
+
+/// RULINGS DG4 — the per-lane writer lock of this process (each lane's mark has one writer: that
+/// lane's daemon; its threads take this lock for the read-compare-write of the mark).
+fn pause_write_lock(root: &Path, lane: &LaneKey) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static W: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PauseKey, std::sync::Arc<std::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    W.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry((root.to_path_buf(), lane.0.clone()))
+        .or_default()
+        .clone()
 }
 
 /// RULINGS CV3 (T4b) — the coalescing window of one lane's pause writes (seconds): at most one write

@@ -1209,3 +1209,31 @@ fn dg2_final_admission_is_one_coherent_read() {
         assert!(closed(&r, placed[0].0), "{case}: own claim closed");
     }
 }
+
+/// DG4: a durable pause end never moves backward — reversed completion (the older input's write
+/// completes after the newer one's) keeps the newer input; eight concurrent writers leave the
+/// latest input stored.
+#[test]
+fn dg4_a_stored_pause_end_never_moves_back() {
+    let r = root("dg4");
+    grant_on(&r, 5);
+    let lane = LaneKey("dg4".into());
+    let t = t0();
+    assert!(note_owner_input_in(&r, &lane, t + 10.0).unwrap(), "the newer input completes first");
+    assert!(note_owner_input_in(&r, &lane, t).unwrap(), "the stalled older write completes after it");
+    let m: PauseMark = serde_json::from_slice(&std::fs::read(pause_path_in(&r, &lane)).unwrap()).unwrap();
+    assert_eq!(m.paused_at, t + 10.0, "the older write did not move the end back");
+    assert_eq!(m.resumed_at, t + 10.0 + PAUSE_QUIET_SECS as f64 + PAUSE_WRITE_COALESCE_SECS);
+    let r2 = root("dg4-threads");
+    grant_on(&r2, 5);
+    std::thread::scope(|sc| {
+        for k in 0..8u32 {
+            let (r2, lane) = (&r2, &lane);
+            sc.spawn(move || {
+                note_owner_input_in(r2, lane, t + f64::from(k)).unwrap();
+            });
+        }
+    });
+    let m: PauseMark = serde_json::from_slice(&std::fs::read(pause_path_in(&r2, &lane)).unwrap()).unwrap();
+    assert_eq!(m.paused_at, t + 7.0, "the latest input is stored whatever the completion order");
+}
