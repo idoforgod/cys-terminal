@@ -388,6 +388,19 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     # 0.14.52 seal audit: Private sealed env reaches bash workflow bodies and their Python verifier children.
     "scripts/tests/test_unix_pty_results.py",
     "scripts/verify-gatekeeper-user-path.sh",
+    # 2026-11-15 registration (0.15.0 TW1, fourth measurement push; the set was 44 files, now 45). **Seal inspection
+    #   result (registering IS that declaration)**: NOT a python entry point of the product and NOT an enforcement
+    #   point. It is the CI-only Windows measurement driver (scripts/windows-measure/); on the hosted runner it starts
+    #   the INSTALLED product's bundled Python with -B. The needle appears twice: the G14 pipe form gives the measured
+    #   tool's child PYTHONDONTWRITEBYTECODE=1 (the seal ON, as the product's own launchers give it), and one comment
+    #   names what the daemon's direct spawn sets. It never strips the seal.
+    "scripts/windows-measure/tw1_probes.py",
+    # 2026-11-14 registration (0.15.0 TW1, RULINGS FC3 / CCR-TW1-2). **Seal inspection result (registering IS that
+    #   declaration)**: NOT a python entry point of the product and NOT an enforcement point. It is the pure record
+    #   logic of the CI-only Windows measurement driver (scripts/windows-measure/); it starts no process. The needle
+    #   is one entry of the record's environment allow-list (ENV_VALUE_ALLOW: the names whose values may be written
+    #   into the public measurement record) - it neither sets nor strips the seal.
+    "scripts/windows-measure/tw1_record.py",
     "src-tauri/src/main.rs",
     "src/app_bundle.rs",
     "src/bin/cys.rs",
