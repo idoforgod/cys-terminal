@@ -662,3 +662,143 @@ fn a_commit_in_its_hook_phase_excludes_the_start_pass() {
         commit.join().unwrap().unwrap();
     });
 }
+
+// ───────────────────────────── RULINGS HS — an update inside a general repair's probation ─────────────────────────────
+
+/// The job's probation pass over the rig (the daemon's job with test doubles; after an update no
+/// check and no reference check may run).
+fn run_probation(r: &Rig, now: f64) -> cys::repair::probation::TickReport {
+    let never = |_: &str, _: &Path, _: std::time::Duration| -> Result<cys::repair::apply::CheckOutcome, RepairError> { panic!("no check after an update") };
+    let reference = |_: CheckKind, _: std::time::Duration| -> Result<cys::repair::apply::CheckOutcome, RepairError> { panic!("no reference check after an update") };
+    let hooks = |_: &RepairId, _: &LaneKey, _: cys::repair::apply::HookStep| -> Result<cys::repair::apply::ReconcileReport, RepairError> {
+        Ok(cys::repair::apply::ReconcileReport { hooks: Vec::new() })
+    };
+    let registrar = |_: &Path, _: bool| -> Result<String, RepairError> { Ok("{\"hooks\": []}".into()) };
+    let lock = r.base.join(".pack-apply.lock");
+    let env = cys::repair::probation::JobEnv {
+        op: cys::repair::apply::OpEnv {
+            root: &r.root,
+            pack: &r.pack,
+            lane: &r.lane,
+            now,
+            form: cys::repair::platform::ApplyForm::Exchange,
+            faults: &cys::repair::apply::NoFaults,
+            own_check: &|_, _| None,
+        },
+        incarnation: "inc-2",
+        check: &never,
+        reference: &reference,
+        hooks: &hooks,
+        registrar: &registrar,
+        locked: &cys::repair::apply::no_repair_lock,
+        excluded: &|_| true,
+        original: &|_| None,
+        intake: &|_, _| true,
+        apply_lock: &lock,
+    };
+    cys::repair::probation::run_tick(&env, false).unwrap()
+}
+
+/// Two committed general repairs, then an update inside their probation: a new pack generation that
+/// keeps `bin/a.py` (the first repair's bytes survive — HS1 (b)) and writes `hooks/h.sh` (the
+/// second's — HS1 (a)); then the job's probation pass. Returns (kept, wrote).
+fn an_update_inside_two_probations(r: &Rig) -> (String, String) {
+    let kept = committed(r, "bin/a.py", b"print('fixed')\n");
+    let wrote = committed(r, "hooks/h.sh", b"#!/bin/sh\necho fixed\n");
+    std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
+    std::fs::write(r.pack.join("hooks/h.sh"), b"#!/bin/sh\necho vendor\n").unwrap();
+    let _ = run_probation(r, T0 + 60.0);
+    (kept, wrote)
+}
+
+/// RULINGS HS1 through the daemon's verbs: the repair whose bytes survived the update is in force
+/// (사용 중) in `list`, and `cleanup` refuses its vault slots (a repair in use still depends on them);
+/// the one whose file the update wrote is superseded and its slots may go (as before HS1). Without
+/// HS1 both were superseded and both vaults were offered to `cleanup`.
+#[test]
+fn an_update_that_kept_the_bytes_leaves_the_repair_in_force_with_its_vault() {
+    let r = rig("hs1verbs");
+    let (kept, wrote) = an_update_inside_two_probations(&r);
+    let l = r.call(T0 + 61.0, &human(), "list", json!({})).unwrap();
+    let state_of = |id: &str| l["repairs"].as_array().unwrap().iter().find(|s| s["repair"] == id).map(|s| s["state"].clone());
+    assert_eq!(state_of(&kept), Some(json!("in_use")), "{l}");
+    assert_eq!(state_of(&wrote), Some(json!("superseded")), "{l}");
+    let kept_id = RepairId::parse(&kept).unwrap();
+    let slots = ledger::list_slots_in(&r.root, &kept_id);
+    assert!(!slots.is_empty());
+    // every slot it has is one a repair in force depends on (P6 — the verb's own match)
+    let needed = cys::repair::apply::slots_needed_in_force_in(&r.root, &kept_id).unwrap();
+    for s in &slots {
+        assert!(needed.iter().any(|n| n == &s.dir || s.dir.starts_with(n) || n.starts_with(&s.dir)), "{} not needed: {needed:?}", s.dir.display());
+    }
+    // the verb removes nothing of it (in this rig the verb reads the product root for the needed
+    // slots, cannot, and refuses every slot — the refusal path of an in-force repair)
+    match r.call(T0 + 62.0, &human(), "cleanup", json!({"repair": kept})) {
+        Ok(c) => assert!(c["removed"].as_array().is_some_and(|a| a.is_empty()), "nothing of a repair in use is removed: {c}"),
+        Err(e) => assert_eq!(e.code, "repair_precondition", "{}", e.message),
+    }
+    assert_eq!(ledger::list_slots_in(&r.root, &kept_id).len(), slots.len(), "nothing of a repair in use is removed");
+    let c = r.call(T0 + 63.0, &human(), "cleanup", json!({"repair": wrote})).unwrap();
+    assert!(c["removed"].as_array().is_some_and(|a| !a.is_empty()), "a superseded repair's slots may go: {c}");
+}
+
+/// RULINGS HS2: `cys repair status <R>` says truthfully how the update ended each probation — the
+/// repair whose bytes survived: 사용 중 with its closure sentence; the one whose file the update wrote:
+/// the 대체됨 sentence naming that file (never "다른 수리로 대체됨" — no other repair replaced it), and
+/// why its propagation is not complete. Without HS2 the label was the state's ("다른 수리로 대체됨").
+#[test]
+fn status_says_how_an_update_ended_the_probation() {
+    let r = rig("hs2status");
+    let (kept, wrote) = an_update_inside_two_probations(&r);
+    let s = r.call(T0 + 61.0, &human(), "status", json!({"repair": kept})).unwrap();
+    assert_eq!(s["state"], "in_use", "{s}");
+    assert_eq!(
+        s["state_label"],
+        "사용 중 — 업데이트 뒤에도 수리한 내용이 그대로 있습니다 — 시험 기간은 업데이트로 끝났고 자동 되돌리기는 하지 않습니다",
+        "{s}"
+    );
+    let s = r.call(T0 + 61.0, &human(), "status", json!({"repair": wrote})).unwrap();
+    assert_eq!(s["state"], "superseded", "{s}");
+    assert_eq!(
+        s["state_label"],
+        "대체됨 — 업데이트가 수리한 파일을 바꿨습니다(hooks/h.sh) — 아무것도 되돌리지 않습니다(새 버전 우선)",
+        "{s}"
+    );
+}
+
+/// RULINGS IL2: `reapply`'s refusal of a second re-application says what is true for the CLASS of the
+/// repair that re-applies — a boot-critical / protection-related one reaches another department only
+/// through that department's own repair (`--resolves`), both signatures and the owner's final approval;
+/// any other is carried by each department's daemon (a department whose file differs keeps its bytes
+/// and shows 충돌). Before IL2 both said "그 수리가 적용되면 전파로 이 부서에도 닿습니다".
+#[test]
+fn reapply_refusal_says_what_reaches_this_department_by_class() {
+    let r = rig("il2reapply");
+    let w = seat(3, "worker");
+    let id = committed(&r, "hooks/h.sh", b"#!/bin/sh\necho mine\n");
+    park(&r, "hooks/h.sh", b"#!/bin/sh\necho mine\n", b"#!/bin/sh\necho vendor\n");
+    let mut rec = r.record_of(&id);
+    rec.state = RepairState::Superseded;
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let v = r.call(T0 + 12.0, &w, "reapply", json!({"repair": id})).unwrap();
+    let new_id = v["repair"].as_str().unwrap().to_string();
+    let e = r.call(T0 + 14.0, &w, "reapply", json!({"repair": id})).unwrap_err();
+    assert!(
+        e.message.ends_with("두 번 입히지 않습니다. 이 수리는 각 부서의 데몬이 그 부서에 전파합니다 — 파일이 다른 부서는 제 바이트를 그대로 두고 그 수리를 충돌로 보입니다"),
+        "{}",
+        e.message
+    );
+    // the re-application is boot-critical (as a parked update file is)
+    let mut rp = r.record_of(&new_id);
+    rp.classification = Classification::BootCritical;
+    ledger::write_record_in(&r.root, &rp).unwrap();
+    let e = r.call(T0 + 15.0, &w, "reapply", json!({"repair": id})).unwrap_err();
+    assert!(
+        e.message.ends_with(&format!(
+            "두 번 입히지 않습니다. 기동 필수·보호장치 관련 수리는 다른 부서에 저절로 전해지지 않습니다 — 다른 부서에는 그 부서 자신의 수리(cys repair begin … --resolves {new_id})와 두 리뷰어의 서명, 그 부서에서의 주인 최종 승인으로만 들어갑니다"
+        )),
+        "{}",
+        e.message
+    );
+    assert!(!e.message.contains("전파로 이 부서에도 닿습니다"), "{}", e.message);
+}

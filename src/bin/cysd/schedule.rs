@@ -484,7 +484,17 @@ pub(crate) const REPAIR_JOB_ID: &str = "repair-probation-tick";
 /// `validate_schedule_root`). The repair mechanism re-lives displaced schedule bytes only when this
 /// passes; it never writes through this module's writer (placement stays rule one's exchange).
 pub(crate) fn schedule_file_passes_own_check(path: &std::path::Path) -> bool {
-    matches!(read_schedule_root(path, &|p| std::fs::read(p)), Ok(Some(_)))
+    // T6b · RULINGS JH2: run inside the pack-apply exclusion — the repair engine's bounded reader (a
+    // regular file, a non-blocking open, one handle, at most its limit + 1 bytes); anything else fails
+    // the check at once (nothing is re-lived), never a wait or a whole read
+    let bounded = |p: &std::path::Path| -> std::io::Result<Vec<u8>> {
+        match cys::repair::durable::read_record_bytes(p) {
+            cys::repair::durable::RecordRead::Bytes(b) => Ok(b),
+            cys::repair::durable::RecordRead::NotFound => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            cys::repair::durable::RecordRead::Unreadable(why) => Err(std::io::Error::other(why)),
+        }
+    };
+    matches!(read_schedule_root(path, &bounded), Ok(Some(_)))
 }
 
 /// 저장된 잡 배열에서 `action:"push" + via_queue:true` 를 `action:"push_queued"` 로 접는다(순수).
