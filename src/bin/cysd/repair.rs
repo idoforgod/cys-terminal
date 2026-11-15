@@ -367,7 +367,34 @@ pub(crate) struct Ctx<'a> {
     /// T4: the per-seat prompt record (`Daemon.repair_prompt_origin` in production — T3 writes it,
     /// the owner-decision verbs read it and register their questions in it).
     pub prompts: &'a Mutex<HashMap<u64, PromptOrigin>>,
+    /// RULINGS HP2 (T4e): the product's pause is in force — the daemon's own kill-switch (`cys pause`)
+    /// or the pack's `AUTOPILOT_PAUSED` mark ([`product_pause_in_force`] in production).
+    pub product_pause: &'a dyn Fn() -> bool,
 }
+
+/// RULINGS HP2 (T4e) — the product's pause, as the pack's tools honour it: the daemon's own kill-switch
+/// (`cys pause` → `system.pause`, `Daemon::paused`) or the file-convention mark `<pack>/AUTOPILOT_PAUSED`
+/// (the wake queue's rule, its `paused_evidence`; the convention's setter writes it in the
+/// pack and in the project's `_round/` together, and the daemon knows the pack).
+pub(crate) fn product_pause_in_force(daemon: &Daemon, pack_dir: &Path) -> bool {
+    daemon.paused.load(std::sync::atomic::Ordering::Relaxed) || pause_mark_present(pack_dir)
+}
+
+/// The pack's `AUTOPILOT_PAUSED` mark (RULINGS HP2), read the bounded way: one look at the name, no link
+/// followed, no content read; present → paused, and anything but "not found" (it cannot be judged) →
+/// paused too.
+pub(crate) fn pause_mark_present(pack_dir: &Path) -> bool {
+    match std::fs::symlink_metadata(pack_dir.join("AUTOPILOT_PAUSED")) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// RULINGS HP2 (T4e): an autonomous (`--trigger grant`) start refused under the product's pause.
+pub(crate) const PRODUCT_PAUSE_START_KO: &str = "제품이 일시정지 중입니다(`cys pause` 또는 AUTOPILOT_PAUSED) — 자동 수리를 시작하지 않습니다(주인의 '고쳐라' 수리와 이미 시작한 수리의 commit · revert 는 됩니다)";
+/// RULINGS HP2 (T4e): a new round of a grant repair refused under the product's pause (B4's rule for the
+/// grant's own pause, applied to the product's).
+pub(crate) const PRODUCT_PAUSE_ROUND_KO: &str = "제품이 일시정지 중입니다(`cys pause` 또는 AUTOPILOT_PAUSED) — 자동 수리의 새 라운드를 열지 않습니다(commit · revert 는 됩니다)";
 
 /// The shape of `grant::try_claim_autonomous_start` (injected so a pick-up's claim answers —
 /// CapReached, Busy … — are testable; RULINGS AQ11 / AW8).
@@ -439,6 +466,7 @@ pub(crate) fn handle(
     }
     let classify = |rel: &str| production_classify(rel, &cys::pack::pack_dir());
     let check = production_check;
+    let product_pause = || product_pause_in_force(daemon, &cys::pack::pack_dir());
     let ctx = Ctx {
         root: production_root(daemon),
         lane: LaneKey::of_socket(&daemon.socket_path),
@@ -458,6 +486,7 @@ pub(crate) fn handle(
         hook_step: &cys::repair::apply::hook_lines_step,
         claim: &cys::repair::grant::try_claim_autonomous_start,
         prompts: &daemon.repair_prompt_origin,
+        product_pause: &product_pause,
     };
     Reply::Single(match handle_with(&ctx, &caller, sub, params) {
         Ok(v) => ok_response(id, v),
@@ -2381,6 +2410,11 @@ mod ledger_verbs {
         id: &RepairId,
     ) -> Result<Option<u32>, VerbError> {
         use cys::repair::grant::StartVerdict;
+        // RULINGS HP2 (T4e): the product's pause (`cys pause` or AUTOPILOT_PAUSED) refuses an autonomous start
+        // before the grant is asked — in addition to the grant's own pause (B4)
+        if (ctx.product_pause)() {
+            return Err(VerbError::new(cys::repair::types::ERR_PRECONDITION, super::PRODUCT_PAUSE_START_KO));
+        }
         match (ctx.claim)(owner, id)? {
             StartVerdict::Allowed { claim } => Ok(Some(claim)),
             StartVerdict::Paused => Err(VerbError::new(
@@ -2616,6 +2650,13 @@ mod ledger_verbs {
                     ));
                 }
                 if rec.trigger == Trigger::Grant && rec.resolves.is_none() {
+                    // RULINGS HP2 (T4e): the product's pause refuses a new round as the grant's own does (B4)
+                    if (ctx.product_pause)() {
+                        return Err(VerbError::new(
+                            cys::repair::types::ERR_PRECONDITION,
+                            format!("{}: {}", id.as_str(), super::PRODUCT_PAUSE_ROUND_KO),
+                        ));
+                    }
                     // B4 / K3: a new round of a grant-triggered repair asks T4 (paused → refused).
                     if !cys::repair::grant::may_open_new_round(&id)? {
                         // CH7 (T4): the sentence says whether the grant is off or paused
@@ -5154,6 +5195,7 @@ pub(crate) fn release_locks_for_seat(daemon: &Arc<Daemon>, sid: u64) {
     );
     let classify = |rel: &str| production_classify(rel, &cys::pack::pack_dir());
     let check = production_check;
+    let product_pause = || product_pause_in_force(daemon, &cys::pack::pack_dir());
     let ctx = Ctx {
         root: production_root(daemon),
         lane: LaneKey::of_socket(&daemon.socket_path),
@@ -5169,6 +5211,7 @@ pub(crate) fn release_locks_for_seat(daemon: &Arc<Daemon>, sid: u64) {
         hook_step: &cys::repair::apply::hook_lines_step,
         claim: &cys::repair::grant::try_claim_autonomous_start,
         prompts: &daemon.repair_prompt_origin,
+        product_pause: &product_pause,
     };
     ledger_verbs::release_seat(&ctx, sid);
 }

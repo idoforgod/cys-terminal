@@ -947,6 +947,409 @@ def loose_deny(n, n_slash=""):
             return "헌법파일 쓰기/덮어쓰기 차단(soul·CLAUDE·*_DIRECTIVE) — 규칙 문서는 오너 지시로만 고친다"
     return None
 
+# ================= 수리 장부 (RULINGS HP1 · ID1 · T4e) =================
+# ★0.15.0 「스스로 해결」: 수리 장부는 데몬이 `cys repair …` 동사로만 쓴다. 좌석이 파일 도구나 이 가드가 알아보는 셸 쓰기
+#   형태(리다이렉트 · tee/cp/dd/mv/install/ln/truncate/patch/편집기 · sed -i · rm/rmdir/chmod/chown)로 장부 아래를 쓰면
+#   역할과 모드에 상관없이 막는다. 좌석이 쓰는 자리는 계약이 준 하나 — 수리의 고정 작업 사본 `R-<n>/staging/`
+#   (RULINGS U3) — 뿐이다. 장부의 자리(GUARD_LEDGER_ROOTS)는 bash 부분이 **이 훅 파일이 놓인 자리**에서 구해 넘긴다:
+#   데몬이 쓰는 `<팩의 부모>/local/repairs`(pack.rs local_dir() 의 기본값 · paths.rs repairs_root()). 훅의 환경 변수
+#   (CYS_LOCAL_DIR · CYS_PACK_DIR · HOME)는 그 자리를 정하지 않는다.
+#   RULINGS ID1: 낱말의 자리는 셸이 닿는 대로 잰다 — 셸 낱말은 STRICT 와 같은 토큰화(따옴표 안의 공백을 지키는 shlex)로
+#   나누고, 상대 낱말은 호출의 작업 폴더와 **명령 스스로 옮겨 가는 폴더(cd · pushd 의 모든 대상)** 각각에서 푼다; 장부
+#   자리의 철자(두 빗금 형태 · 대소문자 접음 · ~ · $HOME)는 낱말 안에서 글자로 찾는다(공백 분리에 기대지 않는다).
+LEDGER_ROOTS = []          # compared case-folded (a case-insensitive volume reaches the same files)
+LEDGER_SHOWN = ""          # the first root as it is spelled, for the sentence
+_LEDGER_RAW = []
+for _r in os.environ.get("GUARD_LEDGER_ROOTS", "").split("\n"):
+    if _r.strip():
+        _LEDGER_RAW.append(_r.strip())
+        try:
+            _rr = os.path.realpath(_r.strip())
+        except Exception:
+            _rr = os.path.normpath(_r.strip())
+        LEDGER_SHOWN = LEDGER_SHOWN or _rr
+        if _rr.casefold() not in LEDGER_ROOTS:
+            LEDGER_ROOTS.append(_rr.casefold())
+
+def _ledger_fold(t):
+    return unicodedata.normalize("NFKC", t or "").replace("\\", "/").casefold()
+
+def _ledger_spellings():
+    """Every spelling a command can use for a root: as given and with links resolved, '/'-separated and case-folded,
+    and under HOME also with `~`, `$HOME`, `${HOME}` (the HOME the seat's shell expands them with). Longest first."""
+    home = _ledger_fold(os.environ.get("HOME", "")).rstrip("/")
+    out = set()
+    for raw in _LEDGER_RAW:
+        forms = {raw}
+        try:
+            forms.add(os.path.realpath(raw))
+        except Exception:
+            pass
+        for f in forms:
+            sp = _ledger_fold(f).rstrip("/")
+            if not sp:
+                continue
+            out.add(sp)
+            if home and sp.startswith(home + "/"):
+                tail = sp[len(home):]
+                out.update(("~" + tail, "$home" + tail, "${home}" + tail))
+    return sorted(out, key=len, reverse=True)
+
+LEDGER_SPELLINGS = _ledger_spellings()
+# RULINGS IN4 — the programs a command that names the ledger may run (a closed list: none has an option or operand that
+#   writes a file; the interpreters stay by IJ5 / HP3). Every other program is refused when the ledger is named.
+LEDGER_READERS = ("ls", "cat", "head", "tail", "grep", "egrep", "fgrep", "wc", "stat", "jq", "cmp", "shasum",
+                  "sha256sum", "md5", "md5sum", "du", "cut", "tr", "nl", "tac", "column", "od", "hexdump", "basename",
+                  "dirname", "realpath", "readlink", "pwd", "cd", "pushd", "echo", "test", "[", "true", "false")
+LEDGER_DENY = ("수리 장부(%s)는 데몬이 `cys repair …` 동사로만 쓴다 — 좌석의 파일 도구는 장부를 쓰지 못하고, 장부의 자리를 "
+               "적은 셸 명령은 읽기 명령(" + " ".join(LEDGER_READERS) + ")만 `|` · `&&` · `||` · `;` · 새 줄로 잇고 출력을 "
+               "터미널 · 파이프 · /dev/null 로만 보낼 때 통과한다 — 장부의 내용은 읽어서 파일 도구로 다른 곳에 쓴다(좌석이 쓰는 "
+               "자리는 수리의 작업 사본 `R-<번호>/staging/` 하나). %s")
+LEDGER_HINTS = {
+    "owner-tokens": "주인 지시 표는 주인이 직접 답한 뒤 데몬이 발급한다: 마스터가 `cys repair owner-token ask --path "
+                    "<문서>` 로 묻고, 주인이 답하면 `cys repair owner-token --path <문서>`.",
+    "grant": "자동 수리 허락은 주인의 답으로만 켜고 끈다: 마스터가 `cys repair grant ask` 로 묻고, 주인이 답하면 "
+             "`cys repair grant on` 또는 `cys repair grant off` — 지금 상태는 `cys repair grant status`.",
+    "tombstones": "지운 파일의 묘비는 그 수리의 `cys repair commit` 이 남기고 `cys repair revert <R-번호>` 가 지운다.",
+    "displaced": "보관 사본은 데몬이 `cys repair begin` 과 적용 때 만든다 — 되돌리기는 `cys repair revert <R-번호>`.",
+    "intake": "결함 신고는 `cys repair` 의 `report` 동사로 한다(--file <팩 기준 상대 경로> --error <줄>).",
+    "lanes": "점검 작업의 상태는 데몬의 작업이 쓴다 — 점검을 청하려면 `cys repair sweep`.",
+    "record": "수리 기록은 `cys repair begin` · `cys repair record` · `cys repair commit` 이 쓴다.",
+}
+
+def _ledger_abs(p, cwd):
+    """A path as the seat's shell would reach it: `~` and `$HOME` with the HOME the shell expands them with, a
+    relative path against the given working directory; links resolved."""
+    home = os.environ.get("HOME", "")
+    if p == "~" or p.startswith("~/"):
+        p = home + p[1:]
+    for pre in ("${HOME}", "$HOME"):
+        if p == pre or p.startswith(pre + "/"):
+            p = home + p[len(pre):]
+            break
+    if not os.path.isabs(p):
+        p = os.path.join(cwd or os.getcwd(), p)
+    try:
+        return os.path.realpath(p)
+    except Exception:
+        return os.path.normpath(p)
+
+def _ledger_rest_place(rest):
+    """The place of a path's part below a root: None if it climbs out of the root; "staging" for the repair's working
+    copy (U3); otherwise the store's key for the sentence."""
+    rest = (rest or "").replace("\\", "/").strip("/")
+    norm = os.path.normpath(rest).replace("\\", "/") if rest else ""
+    if norm in ("", "."):
+        return "record"
+    if norm == ".." or norm.startswith("../"):
+        return None
+    parts = [x for x in norm.split("/") if x]
+    if len(parts) >= 2 and re.fullmatch(r"r-[0-9]+", parts[0]) and parts[1] == "staging":
+        return "staging"
+    head = parts[0]
+    if head in ("grant.json", "grant-pause", "grant-seq"):
+        return "grant"
+    if head in ("owner-tokens", "tombstones", "displaced", "intake", "lanes"):
+        return head
+    return "record"
+
+def ledger_place(path, cwd):
+    """None = not under the daemon's repair ledger; "staging" = the repair's working copy (U3 — the seat's place);
+    otherwise the store's key for the sentence. The path as the shell reaches it from `cwd` (links resolved)."""
+    if not path or not LEDGER_ROOTS:
+        return None
+    return _ledger_place_of(_ledger_abs(path, cwd))
+
+def _ledger_place_of(rp):
+    """ledger_place's verdict for a path already resolved as the shell reaches it."""
+    rp = rp.casefold()
+    for root in LEDGER_ROOTS:
+        if rp == root or rp.startswith(root.rstrip(os.sep) + os.sep):
+            return _ledger_rest_place(rp[len(root):].replace(os.sep, "/"))
+    return None
+
+def ledger_deny(place):
+    return LEDGER_DENY % (LEDGER_SHOWN or "local/repairs", LEDGER_HINTS.get(place, LEDGER_HINTS["record"]))
+
+_LEDGER_STOP = set(" \t\n\"'`;&|<>()")
+
+def _ledger_lex(path):
+    """Lexical dot-component normalisation of a '/'-separated path (RULINGS IJ3): `.` dropped, `x/..` folded."""
+    lead = "/" if path.startswith("/") else ""
+    out = []
+    for part in path.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if out and out[-1] != "..":
+                out.pop()
+            elif not lead:
+                out.append("..")
+            continue
+        out.append(part)
+    return lead + "/".join(out)
+
+def _ledger_text_places(text):
+    """The ledger places a text names by a root's spelling (case-folded, both slash forms) — no splitting on white space:
+    the component after the spelling decides. Staging is reported as "staging"."""
+    out = []
+    for v in {unicodedata.normalize("NFKC", text or "").casefold(), _ledger_fold(text)}:
+        for sp in LEDGER_SPELLINGS:
+            i = v.find(sp)
+            while i >= 0:
+                end = i + len(sp)
+                if end == len(v) or v[end] == "/" or v[end] in _LEDGER_STOP:
+                    j = end
+                    while j < len(v) and v[j] not in _LEDGER_STOP:
+                        j += 1
+                    # RULINGS IJ3: the dot components of the WHOLE path are folded before the place is judged
+                    path, spn = _ledger_lex(v[i:j]), _ledger_lex(sp)
+                    pl = None
+                    if path == spn or path.startswith(spn.rstrip("/") + "/"):
+                        pl = _ledger_rest_place(path[len(spn):])
+                    if pl is not None and pl not in out:
+                        out.append(pl)
+                i = v.find(sp, i + 1)
+    return out
+
+def _ledger_tokens(n):
+    """STRICT's tokenization (quotes kept together, punctuation split) — used for NAMING only; None when it cannot."""
+    try:
+        lex = shlex.shlex(n, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        return list(lex)
+    except ValueError:
+        return None
+
+LEDGER_NOT_LITERAL = re.compile(r"[$`*?\[]")
+_LEDGER_CD_OPT = re.compile(r"-[LPeqs@]+")
+_LEDGER_TERM = re.compile(r"[;&|<>(){}\n]")
+
+def _ledger_cd_operands(words, k):
+    """The operands of the `cd` / `pushd` at words[k]: its options (-L -P -e -q -s -@, then `--`) skipped, at most two
+    (zsh's `cd OLD NEW` — the seat's shell is zsh); a word holding a shell operator ends them."""
+    ops, j, opts = [], k + 1, True
+    while j < len(words) and len(ops) < 2:
+        w = words[j]
+        if not w or _LEDGER_TERM.search(w):
+            break
+        if opts and w == "--":
+            opts = False
+        elif not (opts and _LEDGER_CD_OPT.fullmatch(w)):
+            opts = False
+            ops.append(w)
+        j += 1
+    return ops
+
+def _ledger_cd_told(t):
+    """A `cd` / `pushd` operand whose directory the command itself tells: literal, and not the shell's own state (`-`,
+    `-<n>` / `+<n>` of the directory stack, `~-` / `~+` / `~<name>`)."""
+    if not t or LEDGER_NOT_LITERAL.search(t) or t.startswith(("-", "+")):
+        return False
+    return not t.startswith("~") or t == "~" or t.startswith("~/")
+
+def _ledger_walk(words, cwd):
+    """RULINGS IT1 / IU1 — the LINEAR walk: the tool call's cwd, then each `cd` / `pushd` operand resolved against the
+    directory before it, in order, none dropped, no cap. A bare `cd` goes HOME; zsh's `cd OLD NEW` replaces OLD in the
+    directory before it; an operand the command does not tell leaves the walk where it is."""
+    cur = _ledger_abs(cwd or os.getcwd(), "/")
+    walk, gone = [cur], not os.path.lexists(cur)
+    for k, w in enumerate(words):
+        if w not in ("cd", "pushd"):
+            continue
+        ops = _ledger_cd_operands(words, k)
+        nxt = None
+        if not ops:
+            if w == "cd" and os.environ.get("HOME"):
+                nxt = _ledger_abs("~", cur)
+        elif len(ops) == 2 and _ledger_cd_told(ops[0]) and _ledger_cd_told(ops[1]) and ops[0] in cur:
+            nxt = _ledger_abs(cur.replace(ops[0], ops[1], 1), cur)
+        elif _ledger_cd_told(ops[0]):
+            if gone and _ledger_plain(ops[0]):
+                cur = os.path.normpath(os.path.join(cur, ops[0]))   # below a missing directory nothing exists: no link
+                walk.append(cur)
+                continue
+            nxt = _ledger_abs(ops[0], cur)
+        if nxt:
+            cur, gone = nxt, not os.path.lexists(nxt)
+            walk.append(cur)
+    return walk
+
+def _ledger_parts(c):
+    """A word's path components as the platform splits them (a back-slash is a separator on Windows only)."""
+    return [x for x in (re.split(r"[\\/]", c) if os.name == "nt" else c.split("/")) if x not in ("", ".")]
+
+def _ledger_plain(c):
+    """A relative word with no `..` component and no `~` / `$HOME` start: it can only go DOWN from its directory."""
+    return not (not c or os.path.isabs(c) or c.startswith(("~", "$HOME", "${HOME}")) or ".." in _ledger_parts(c))
+
+def _ledger_named(n, cwd):
+    """The ledger places outside the working copy that a command NAMES (RULINGS IT1 / IU1 · IJ5 · IJ3): a root's
+    spelling anywhere in its normalised text, or a word — STRICT's tokens and the coarse loose words, and the value after
+    a word's first `=` — that resolves under a root from the tool call's cwd or from any directory of the command's linear
+    `cd` / `pushd` walk (each tokenization walked on its own; none dropped, no cap). Any positive names the command; the
+    number of directory changes alone never does."""
+    places = [pl for pl in _ledger_text_places(n) if pl != "staging"]
+    toks = _ledger_tokens(n)
+    seqs = ([list(toks)] if toks is not None else []) + [norm_loose(n).split(), norm_loose_slash(n).split()]
+    dirs, cands = [], []
+    for seq in seqs:
+        for d in _ledger_walk(seq, cwd):
+            if d not in dirs:
+                dirs.append(d)
+        for w in seq:
+            for c in [w] + ([w.split("=", 1)[1]] if "=" in w else []):
+                if c and c not in cands:
+                    cands.append(c)
+    # The walk is linear but words × directories is not. Where a word only goes DOWN (`_ledger_plain`) and its first
+    # component does not exist in the directory (a resolved path), nothing below that entry exists, so no link can
+    # redirect it: the shell reaches exactly <dir>/<word>, and the place is judged on that text without a system call —
+    # skipped outright when the directory is neither under a root nor above one. Every other pair is resolved.
+    roots = [r.rstrip(os.sep) for r in LEDGER_ROOTS]
+
+    def aside(d):
+        dc = d.casefold().rstrip(os.sep)
+        return not any(dc == r or dc.startswith(r + os.sep) or r.startswith(dc + os.sep) for r in roots)
+    far = {d: aside(d) for d in dirs}
+    there = {d: os.path.lexists(d) for d in dirs}
+    in_copy = {d: not far[d] and _ledger_place_of(d) == "staging" for d in dirs}   # going DOWN stays in the working copy
+    seen = {}
+    for c in cands:
+        plain = _ledger_plain(c)
+        parts = _ledger_parts(c) if plain else []
+        for d in dirs:
+            if plain and parts:
+                key = (d, parts[0])
+                if key not in seen:
+                    seen[key] = there[d] and os.path.lexists(os.path.join(d, parts[0]))
+                if not seen[key]:
+                    if far[d] or in_copy[d]:
+                        continue
+                    pl = _ledger_place_of(os.path.normpath(os.path.join(d, c)))
+                    if pl is not None and pl != "staging" and pl not in places:
+                        places.append(pl)
+                    continue
+            pl = ledger_place(c, d)
+            if pl is not None and pl != "staging" and pl not in places:
+                places.append(pl)
+            if os.path.isabs(c) or c.startswith(("~", "$HOME", "${HOME}")):
+                break
+    return places
+
+class _LedgerRefuse(Exception):
+    """A named command outside the grammar (RULINGS IT1 G0–G3)."""
+
+_LEDGER_G0_HOME = re.compile(r"\$\{HOME\}|\$HOME(?![A-Za-z0-9_])")
+_LEDGER_G0_BANNED = re.compile(r"[$`(){}<!#\\\x00-\x08\x0b-\x1f\x7f]")
+_LEDGER_G_OPS = ("&&", "||", ";;", "|&", "&>", ">>", ">&", ">|", "|", ";", "&", ">")
+_LEDGER_G_SEPS = ("|", "&&", "||", ";", "\n")
+
+def _ledger_g_tokens(raw):
+    """RULINGS IT1 G0 + G1 on the RAW text: G0's characters refused anywhere (inside quotes too; `$` only as the exact
+    `$HOME` / `${HOME}`); words grouped by quotes only; operators recognised outside quotes, also when glued to a word.
+    Tokens: ("w", value, start, end) · ("fd", digits, start, end) for digits glued to `>` · ("op", op, start, end)."""
+    if _LEDGER_G0_BANNED.search(_LEDGER_G0_HOME.sub("", raw)):
+        raise _LedgerRefuse("G0")
+    toks, i, n = [], 0, len(raw)
+    while i < n:
+        c = raw[i]
+        if c in " \t":
+            i += 1
+            continue
+        if c == "\n":
+            toks.append(("op", "\n", i, i + 1))
+            i += 1
+            continue
+        op = next((o for o in _LEDGER_G_OPS if raw.startswith(o, i)), None)
+        if op:
+            toks.append(("op", op, i, i + len(op)))
+            i += len(op)
+            continue
+        start, buf = i, []
+        while i < n and raw[i] not in " \t\n|&;>":
+            if raw[i] in "'\"":
+                j = raw.find(raw[i], i + 1)
+                if j < 0:
+                    raise _LedgerRefuse("G1 unterminated quote")
+                buf.append(raw[i + 1:j])
+                i = j + 1
+                continue
+            buf.append(raw[i])
+            i += 1
+        word = "".join(buf)
+        glued_fd = i < n and raw[i] == ">" and raw[start:i].isdigit()
+        toks.append(("fd" if glued_fd else "w", word, start, i))
+    return toks
+
+def _ledger_grammar(raw):
+    """RULINGS IT1 G2 + G3: simple commands joined by `|` `&&` `||` `;` or a new line (new lines may lead, trail and
+    repeat, and may follow another separator; no other empty command), each beginning with a word that is exactly a
+    member of LEDGER_READERS; redirections only `>` `>>` `1>` `1>>` `2>` `2>>` to exactly /dev/null and the exact
+    `2>&1` `>&2` `1>&2` — NO FILE IS WRITTEN. Every other operator is refused. Raises _LedgerRefuse."""
+    segs, seg, pending = [], [], None
+    for t in _ledger_g_tokens(raw):
+        if t[0] == "op" and t[1] in _LEDGER_G_SEPS:
+            if t[1] == "\n":                    # a new line ends a command; it may lead, repeat, or follow a separator
+                if seg:
+                    segs.append(seg)
+                    seg = []
+                continue
+            if not seg:
+                raise _LedgerRefuse("G2 empty command")
+            segs.append(seg)
+            seg, pending = [], t[1]
+            continue
+        seg.append(t)
+        pending = None
+    if seg:
+        segs.append(seg)
+    elif pending:
+        raise _LedgerRefuse("G2 trailing separator")
+    if not segs:
+        raise _LedgerRefuse("G2 no command")
+    for seg in segs:
+        if seg[0][0] != "w" or seg[0][1] not in LEDGER_READERS:
+            raise _LedgerRefuse("G2 first word")
+        k = 1
+        while k < len(seg):
+            kind, val, s0, e0 = seg[k]
+            if kind == "w":
+                k += 1
+                continue
+            fd = None
+            if kind == "fd":
+                fd = val
+                if k + 1 >= len(seg) or seg[k + 1][0] != "op":
+                    raise _LedgerRefuse("G3")
+                k += 1
+                kind, val, s0, e0 = seg[k]
+            if fd not in (None, "1", "2") or val not in (">", ">>", ">&") or k + 1 >= len(seg) or seg[k + 1][0] != "w":
+                raise _LedgerRefuse("G3 operator")
+            tgt = seg[k + 1]
+            if val == ">&":
+                if tgt[2] != e0 or (fd, tgt[1]) not in (("2", "1"), (None, "2"), ("1", "2")):
+                    raise _LedgerRefuse("G3 duplication")
+            elif tgt[1] != "/dev/null":
+                raise _LedgerRefuse("G3 sink")
+            k += 2
+
+def ledger_shell_write(command, cwd):
+    """The store a shell command would reach, or None (RULINGS IN1 · IT1 · IU1). NAMED OR NOT first, on the normalised
+    text: a command that names no ledger place outside the working copy is not touched (an error before that is known
+    skips the rule). A named command is judged on its RAW text by the grammar (G0–G3); anything outside it — and an error
+    after naming — refuses this call."""
+    try:
+        named = _ledger_named(norm_base(command), cwd)
+    except Exception:
+        return None
+    if not named:
+        return None
+    try:
+        _ledger_grammar(command)
+        return None
+    except Exception:
+        return named[0]
+
 # ================= 메인 =================
 def out_deny(reason):
     print("DENY\t" + reason); sys.exit(2)
@@ -959,6 +1362,19 @@ def out_deny(reason):
 def owner_token_allows(fp):
     r = _cys_exec(["repair", "rule-doc-allowed", "--path", fp], soft=True)
     return r is not None and r[0] == 0
+
+# RULINGS HP1 (T4e): the daemon's repair ledger — before every other rule, in every mode, for every role
+_ledger_cwd = data.get("cwd") if isinstance(data.get("cwd"), str) else ""
+if tool in WRITE_TOOLS:
+    _nb = ti.get("notebook_path") if isinstance(ti.get("notebook_path"), str) else ""
+    for _lp in (file_path, _nb):
+        _place = ledger_place(_lp, _ledger_cwd)
+        if _place is not None and _place != "staging":
+            out_deny(ledger_deny(_place))
+if tool == "Bash" and command:
+    _place = ledger_shell_write(command, _ledger_cwd)
+    if _place is not None:
+        out_deny(ledger_deny(_place))
 
 if PAUSED and not PREFLIGHT:
     if tool in WRITE_TOOLS:
@@ -1041,6 +1457,12 @@ sys.exit(0)
 PY
 
 # ===== 실행 =====
+# ★RULINGS HP1 (T4e): 수리 장부의 자리 = 데몬이 쓰는 자리 `<팩의 부모>/local/repairs`. 이 훅 파일 자신의 자리에서 구한다
+#   (실제 경로 ROUND_DIR 와 이 훅이 불린 논리 경로 둘 다) — 훅의 환경 변수(CYS_LOCAL_DIR · CYS_PACK_DIR · HOME)는 읽지 않는다.
+GUARD_LEDGER_ROOTS="$(dirname "$ROUND_DIR")/local/repairs"
+_GL_PACK="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd -L)"
+[ -n "$_GL_PACK" ] && GUARD_LEDGER_ROOTS="$GUARD_LEDGER_ROOTS
+$(dirname "$_GL_PACK")/local/repairs"
 GUARD_PAUSED=0; [ -e "$PAUSED_FILE" ] && GUARD_PAUSED=1
 GUARD_ACTIVE=0; [ -e "$ACTIVE_FILE" ] && GUARD_ACTIVE=1
 
@@ -1054,11 +1476,120 @@ if [ "$GUARD_ACTIVE" != "1" ] && [ -f "$CONST_TOKEN" ] && [ ! -L "$CONST_TOKEN" 
   fi
 fi
 
+# ★RULINGS ID2 · IN6 · IT3 (T4e): 수리 장부 규칙은 강등된 백스톱에서도 순수 셸로 지킨다(규칙 문서처럼). 장부의 자리는 위에서
+#   이 훅의 자리로 구한 GUARD_LEDGER_ROOTS 그대로다. 파일 도구의 경로가 장부 아래이고 `R-<n>/staging/` 이 아니면 막고,
+#   셸 명령의 글에 장부의 자리가 적혀 있으면(작업 사본만이 아니고) 그 명령은 G0 의 글자만 쓴 읽기 명령 하나일 때만 통과한다(IT3).
+#   장부의 자리를 가리키지 않는 호출은 결코 막지 않는다(치명 4: 모든 것을 막는 강등된 가드는 모든 좌석을 죽인다).
+ledger_rest_is_ledger() {
+  # RULINGS IJ3: the shell cannot normalise dot components here — the root's spelling followed by anything that holds a
+  #   `..` component IS a ledger place (the working-copy exception does not apply to it)
+  local rest="${1#/}" re='^r-[0-9]+/staging(/|$)' dd='(^|/)\.\.(/|$)'
+  if [[ $rest =~ $dd ]]; then return 0; fi
+  if [[ $rest =~ $re ]]; then return 1; fi
+  return 0
+}
+ledger_backstop_spellings() {
+  local r sp home t
+  home="$(printf '%s' "${HOME:-}" | tr 'A-Z\\' 'a-z/')"; home="${home%/}"
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    sp="$(printf '%s' "$r" | tr 'A-Z\\' 'a-z/')"; sp="${sp%/}"
+    [ -n "$sp" ] || continue
+    printf '%s\n' "$sp"
+    if [ -n "$home" ]; then
+      case "$sp" in "$home"/*) t="${sp#"$home"}"; printf '%s\n' "~$t" "\$home$t" "\${home}$t" ;; esac
+    fi
+  done <<EOF_LEDGER_ROOTS
+$GUARD_LEDGER_ROOTS
+EOF_LEDGER_ROOTS
+}
+ledger_backstop_one_reader() {
+  # RULINGS IT3 (= IS4): 0 when the command ($1, as given) is ONE simple command with G0's characters (no `$` but the
+  #   exact `$HOME` / `${HOME}`, no back-quote, ( ) { } < ! # back-slash, no control character but a tab — and no new
+  #   line), whose first word is a reader other than `cd` / `pushd`, and whose only redirections are the whole words
+  #   2>/dev/null, >/dev/null, 2>&1; any other word holding ; | & > is refused (a quoted one too — the degraded cost).
+  local c="$1" g w readers nl=$'\n' re_home='^(.*)\$HOME($|[^A-Za-z0-9_].*)$'
+  local -a words=()
+  case "$c" in *"$nl"*) return 1 ;; esac
+  g="${c//'${HOME}'/}"
+  while [[ $g =~ $re_home ]]; do g="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"; done
+  case "$g" in *'$'*|*'`'*|*'('*|*')'*|*'{'*|*'}'*|*'<'*|*'!'*|*'#'*|*'\'*) return 1 ;; esac
+  g="${g//$'\t'/}"
+  [[ $g =~ [[:cntrl:]] ]] && return 1
+  IFS=$' \t' read -r -a words <<EOF_LEDGER_CMD
+$c
+EOF_LEDGER_CMD
+  [ "${#words[@]}" -gt 0 ] || return 1
+  # RULINGS IU2: the reader names are the judge's own LEDGER_READERS — ONE list, read here from the PYSRC text in pure bash
+  #   (no call, no subshell); IT3 leaves `cd` and `pushd` out. A list that cannot be read stays empty, and then every
+  #   command that names the ledger is refused.
+  local re='LEDGER_READERS = \(([^)]*)\)'
+  [[ $PYSRC =~ $re ]] || return 1
+  readers="${BASH_REMATCH[1]}"; readers="${readers//\"/}"; readers="${readers//,/ }"; readers=" ${readers//$'\n'/ } "
+  case "${words[0]}" in cd|pushd) return 1 ;; esac
+  case "$readers" in *" ${words[0]} "*) ;; *) return 1 ;; esac
+  for w in "${words[@]:1}"; do
+    case "$w" in
+      '2>/dev/null'|'>/dev/null'|'2>&1') ;;
+      *[\;\|\&\>]*) return 1 ;;
+    esac
+  done
+  return 0
+}
+ledger_backstop() {
+  # RULINGS IJ4 / IN6: the degraded backstop protects the ledger exactly as far as it protects the rule documents — with
+  #   jq: a WRITING tool's path (a Read is never refused) and, AFTER the early return for a command that does not name the
+  #   ledger, the one-simple-reader form (IN6 / IT3); without jq every field is empty and nothing is protected (GAPS G22).
+  local tool="$1" fp="$2" nb="$3" cmd="$4" sps sp p lp s c seg named="" first
+  [ -n "$GUARD_LEDGER_ROOTS" ] || return 0
+  sps="$(ledger_backstop_spellings)"
+  first="$(printf '%s\n' "$GUARD_LEDGER_ROOTS" | sed -n '1p')"
+  local msg="백스톱: 수리 장부(${first})는 데몬이 \`cys repair …\` 동사로만 쓴다 — 좌석의 파일 도구는 장부를 쓰지 못하고, 판정기가 없는 지금 장부의 자리를 적은 셸 명령은 읽기 명령 하나(cd · pushd 아님 · 리다이렉트는 2>/dev/null · >/dev/null · 2>&1 만 · \$ 는 \$HOME 만)일 때만 통과한다(좌석이 쓰는 자리는 수리의 작업 사본 \`R-<번호>/staging/\` 하나)."
+  case "$tool" in
+    Write|Edit|MultiEdit|NotebookEdit)
+      for p in "$fp" "$nb"; do
+        [ -n "$p" ] || continue
+        lp="$(printf '%s' "$p" | tr 'A-Z\\' 'a-z/')"
+        while IFS= read -r sp; do
+          [ -n "$sp" ] || continue
+          case "$lp" in "$sp"|"$sp"/*) ledger_rest_is_ledger "${lp#"$sp"}" && emit_deny "$msg" ;; esac
+        done <<EOF_LEDGER_SPS
+$sps
+EOF_LEDGER_SPS
+      done ;;
+  esac
+  [ "$tool" = "Bash" ] && [ -n "$cmd" ] || return 0
+  local lc; lc="$(printf '%s' "$cmd" | tr 'A-Z\\' 'a-z/')"
+  while IFS= read -r sp; do
+    [ -n "$sp" ] || continue
+    s="$lc"
+    while [[ "$s" == *"$sp"* ]]; do
+      s="${s#*"$sp"}"
+      c="${s:0:1}"
+      case "$c" in
+        ""|/|" "|$'\t'|$'\n'|'"'|"'"|';'|'&'|'|'|'<'|'>'|'('|')')
+          seg="${s%%[[:space:]]*}"; seg="${seg%%[\"\';\&\|\<\>\(\)]*}"
+          if ledger_rest_is_ledger "$seg"; then named=1; break 2; fi ;;
+      esac
+    done
+  done <<EOF_LEDGER_SPS
+$sps
+EOF_LEDGER_SPS
+  [ -n "$named" ] || return 0
+  ledger_backstop_one_reader "$cmd" || emit_deny "$msg"
+  return 0
+}
+
 run_loose_backstop() {
   printf '%s\n' "AUTOPILOT GUARD: python3 미가용 → bash 백스톱(LOOSE degraded) 모드" >&2
-  local cmd fp low
+  local cmd fp low tool nb
   cmd="$(printf '%s' "$INPUT" | jq -r '.tool_input.command // ""' 2>/dev/null)"
   fp="$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // ""' 2>/dev/null)"
+  # ★RULINGS IJ4: the ledger rule reads the tool's name and the notebook path the same way (jq) — without jq every field
+  #   is empty and the backstop protects nothing, the rule documents included (GAPS G22)
+  tool="$(printf '%s' "$INPUT" | jq -r '.tool_name // ""' 2>/dev/null)"
+  nb="$(printf '%s' "$INPUT" | jq -r '.tool_input.notebook_path // ""' 2>/dev/null)"
+  ledger_backstop "$tool" "$fp" "$nb" "$cmd"
   low="$(printf '%s' "$cmd" | tr 'A-Z' 'a-z' | tr -s ' \t' ' ')"
   case "$low" in
     *"git push"*|*"git remote set-url"*|*"git remote remove"*|*"gh release create"*|*"gh pr create"*|*"scp "*)
@@ -1095,12 +1626,12 @@ fi
 #   인터프리터는 종전처럼 아래 '파서 크래시' 갈래(STRICT deny · LOOSE 백스톱)로 간다.
 GUARD_PYFILE="$(mktemp "${TMPDIR:-/tmp}/.guard_pysrc.XXXXXX" 2>/dev/null || printf '%s' '')"
 if [ -n "$GUARD_PYFILE" ] && printf '%s' "$PYSRC" > "$GUARD_PYFILE" 2>/dev/null; then
-  PYOUT="$(printf '%s' "$INPUT" | GUARD_PAUSED="$GUARD_PAUSED" GUARD_ACTIVE="$GUARD_ACTIVE" GUARD_CONST_AUTH="$GUARD_CONST_AUTH" GUARD_CONST_SCOPE="$GUARD_CONST_SCOPE" GUARD_PREFLIGHT="$PREFLIGHT" "$PYBIN" -I -S -B -X utf8 "$(cys_native_path "$GUARD_PYFILE")" 2>/tmp/.guard_py_err.$$)"
+  PYOUT="$(printf '%s' "$INPUT" | GUARD_PAUSED="$GUARD_PAUSED" GUARD_ACTIVE="$GUARD_ACTIVE" GUARD_CONST_AUTH="$GUARD_CONST_AUTH" GUARD_CONST_SCOPE="$GUARD_CONST_SCOPE" GUARD_PREFLIGHT="$PREFLIGHT" GUARD_LEDGER_ROOTS="$GUARD_LEDGER_ROOTS" "$PYBIN" -I -S -B -X utf8 "$(cys_native_path "$GUARD_PYFILE")" 2>/tmp/.guard_py_err.$$)"
   RC=$?
   rm -f "$GUARD_PYFILE" 2>/dev/null
 else
   [ -n "$GUARD_PYFILE" ] && rm -f "$GUARD_PYFILE" 2>/dev/null
-  PYOUT="$(printf '%s' "$INPUT" | GUARD_PAUSED="$GUARD_PAUSED" GUARD_ACTIVE="$GUARD_ACTIVE" GUARD_CONST_AUTH="$GUARD_CONST_AUTH" GUARD_CONST_SCOPE="$GUARD_CONST_SCOPE" GUARD_PREFLIGHT="$PREFLIGHT" "$PYBIN" -I -S -B -X utf8 -c "$PYSRC" 2>/tmp/.guard_py_err.$$)"
+  PYOUT="$(printf '%s' "$INPUT" | GUARD_PAUSED="$GUARD_PAUSED" GUARD_ACTIVE="$GUARD_ACTIVE" GUARD_CONST_AUTH="$GUARD_CONST_AUTH" GUARD_CONST_SCOPE="$GUARD_CONST_SCOPE" GUARD_PREFLIGHT="$PREFLIGHT" GUARD_LEDGER_ROOTS="$GUARD_LEDGER_ROOTS" "$PYBIN" -I -S -B -X utf8 -c "$PYSRC" 2>/tmp/.guard_py_err.$$)"
   RC=$?
 fi
 # RULINGS FV1 / FZ1 (T4c): with GUARD_TEST_REPORT_LIMITS=1 forward the parser's ONE limits line from the existing

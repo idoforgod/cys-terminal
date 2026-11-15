@@ -26,6 +26,8 @@ struct Rig {
     prompts: Mutex<HashMap<u64, PromptOrigin>>,
     lane: LaneKey,
     inc: String,
+    /// RULINGS HP2: the daemon whose kill-switch the rig's product pause reads (`None` → the pack mark only).
+    daemon: Option<Arc<crate::state::Daemon>>,
 }
 
 const CSO_HEAD: &str = "# CSO ABSOLUTE DIRECTIVE\n<!-- cso-directive-rev: 2026-09-06-alert-inbox -->\n\nbody line\n";
@@ -51,6 +53,7 @@ fn rig(tag: &str) -> Rig {
         prompts: Mutex::new(HashMap::new()),
         lane: LaneKey("base".into()),
         inc: "inc-1".into(),
+        daemon: None,
     }
 }
 
@@ -96,6 +99,10 @@ impl Rig {
                 id,
             )
         };
+        let product_pause = || match &self.daemon {
+            Some(d) => product_pause_in_force(d, &self.pack),
+            None => pause_mark_present(&self.pack),
+        };
         let ctx = Ctx {
             root: self.root.clone(),
             lane: self.lane.clone(),
@@ -111,6 +118,7 @@ impl Rig {
             hook_step: &cys::repair::apply::hook_lines_step,
             claim: &claim,
             prompts: &self.prompts,
+            product_pause: &product_pause,
         };
         handle_with(&ctx, who, sub, &p)
     }
@@ -1890,4 +1898,242 @@ fn dg3_after_a_daemon_start_autonomous_starts_wait_owner_orders_do_not() {
         .call(t - 60.0 + 1_801.0, &seat(4, "worker-2"), "begin", json!({"trigger": "grant", "files": ["bin/a.py"]}))
         .unwrap();
     assert!(v["repair"].is_string(), "after 30 minutes the hold is over: {v}");
+}
+
+// ───────────────────────────── RULINGS HP1 (T4e) ─────────────────────────────
+
+/// Runs a copy of the product's `hooks/guard.sh` placed in `pack/hooks/` (so the ledger it protects is
+/// `<pack's parent>/local/repairs` — this rig's root) on one tool call; returns (exit status, stderr).
+#[cfg(unix)]
+fn guard_in_pack(pack: &Path, call: Value) -> (i32, String) {
+    use std::io::Write as _;
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("cysjavis-pack").join("hooks");
+    std::fs::create_dir_all(pack.join("hooks")).unwrap();
+    for f in ["guard.sh", "_lib.sh"] {
+        std::fs::copy(src.join(f), pack.join("hooks").join(f)).unwrap();
+    }
+    let flags = pack.join("flags");
+    std::fs::create_dir_all(&flags).unwrap();
+    let mut child = std::process::Command::new("bash")
+        .arg(pack.join("hooks").join("guard.sh"))
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()))
+        .env("HOME", pack.join("home"))
+        .env("GUARD_TEST_MODE", "1")
+        .env("AUTOPILOT_PAUSED_FILE", flags.join("AUTOPILOT_PAUSED"))
+        .env("AUTOPILOT_ACTIVE_FILE", flags.join("AUTOPILOT_ACTIVE"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(call.to_string().as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// RULINGS HP1 (T4e) — the reviewer's route F1, end to end. A seat writes an owner token for its lane and
+/// a rule document into the ledger with its file tool (and with a shell redirection): the guard refuses
+/// both with the ledger sentence, so no token file exists; `begin --owner-token` with that token then
+/// finds none and `rule-doc-allowed` answers no. Control — the same file WRITTEN, which is what the tool
+/// call did before HP1: `begin` accepts the token and `rule-doc-allowed` answers yes, so the refusal is
+/// what closes the route.
+#[cfg(unix)]
+#[test]
+fn hp1_route_f1_the_token_write_is_refused_and_begin_finds_none() {
+    let r = rig("hp1-f1");
+    let t = now0();
+    let token = oo::token_from_bytes(&[7u8; 16]);
+    let sha = oo::token_sha256(&token);
+    let forged = oo::OwnerToken {
+        schema: 1,
+        token_sha256: sha.clone(),
+        lane_key: r.lane.clone(),
+        issued_to_seat: 3,
+        paths: vec!["soul.md".into()],
+        repair: None,
+        prompt_digest: "d".into(),
+        prompt_excerpt: "예".into(),
+        issued_at: t,
+        expires_at: t + 3_600.0,
+        used_by_repair: None,
+    };
+    let body = serde_json::to_string(&forged).unwrap();
+    let target = oo::token_path_in(&r.root, &sha);
+    let (rc, err) = guard_in_pack(
+        &r.pack,
+        json!({"tool_name": "Write", "tool_input": {"file_path": target, "content": body}}),
+    );
+    assert_eq!(rc, 2, "{err}");
+    assert!(err.contains("수리 장부") && err.contains("cys repair owner-token ask --path"), "{err}");
+    let (rc, err) = guard_in_pack(
+        &r.pack,
+        json!({"tool_name": "Bash", "tool_input": {"command": format!("printf '%s' '{body}' > {}", target.display())}}),
+    );
+    assert_eq!(rc, 2, "{err}");
+    assert!(err.contains("수리 장부"), "{err}");
+    // RULINGS ID1: the same token copied in after a `cd` into the working copy, climbing out with `../../`
+    let staging = r.root.join("R-1").join("staging");
+    let (rc, err) = guard_in_pack(
+        &r.pack,
+        json!({"tool_name": "Bash", "tool_input": {"command": format!(
+            "cd {} && cp /tmp/forged.json ../../owner-tokens/{sha}.json",
+            staging.display()
+        )}}),
+    );
+    assert_eq!(rc, 2, "{err}");
+    assert!(err.contains("수리 장부"), "{err}");
+    // the refused call wrote nothing: begin with that token finds none, rule-doc-allowed answers no
+    assert!(!target.exists());
+    let w = seat(3, "worker");
+    let begin = json!({"trigger": "owner_order", "files": ["soul.md"], "owner_token": token});
+    let e = r.call(t + 1.0, &w, "begin", begin.clone()).unwrap_err();
+    assert!(e.message.contains("발급된 적이 없습니다"), "{}", e.message);
+    let allowed = |at: f64| r.call(at, &w, "rule_doc_allowed", json!({"path": "soul.md"})).unwrap()["allowed"].clone();
+    assert_eq!(allowed(t + 2.0), json!(false));
+    assert!(r.ids().is_empty(), "nothing was begun");
+    // control: the write the guard refuses, done anyway (the world before HP1) — the route was real
+    oo::create_token_in(&r.root, &forged).unwrap();
+    assert!(r.call(t + 3.0, &w, "begin", begin).is_ok());
+    assert_eq!(allowed(t + 4.0), json!(true));
+}
+
+/// RULINGS HP1 (T4e) — the reviewer's F2 (`grant.json`), a tombstone and a vault file: each write is refused
+/// by the guard with the ledger sentence; the repair's working copy (`R-<n>/staging/`, U3) stays the seat's.
+#[cfg(unix)]
+#[test]
+fn hp1_grant_tombstone_and_vault_writes_are_refused_staging_is_not() {
+    let r = rig("hp1-stores");
+    let lane = r.lane.0.clone();
+    for (rel, hint) in [
+        ("grant.json".to_string(), "cys repair grant ask"),
+        (format!("tombstones/{lane}.json"), "cys repair commit"),
+        ("displaced/R-1/20261115T000000Z/sealed/guard.sh".to_string(), "cys repair revert"),
+    ] {
+        let p = r.root.join(&rel);
+        for call in [
+            json!({"tool_name": "Write", "tool_input": {"file_path": p, "content": "{}"}}),
+            json!({"tool_name": "Bash", "tool_input": {"command": format!("echo '{{}}' > {}", p.display())}}),
+        ] {
+            let (rc, err) = guard_in_pack(&r.pack, call);
+            assert_eq!(rc, 2, "{rel}: {err}");
+            assert!(err.contains("수리 장부") && err.contains(hint), "{rel}: {err}");
+        }
+    }
+    let staged = r.root.join("R-1/staging/hooks/guard.sh");
+    let (rc, err) = guard_in_pack(
+        &r.pack,
+        json!({"tool_name": "Write", "tool_input": {"file_path": staged, "content": "x"}}),
+    );
+    assert_eq!(rc, 0, "the working copy is the seat's (U3): {err}");
+}
+
+// ───────────────────────────── RULINGS HP2 (T4e) ─────────────────────────────
+
+/// RULINGS HP2 (T4e) — an autonomous start respects the owner's product pause, in addition to the grant's own:
+/// - the daemon's kill-switch (`cys pause` → `Daemon.paused`) and the pack's `AUTOPILOT_PAUSED` mark each refuse
+///   `begin --trigger grant` with the pause sentence, and nothing is begun;
+/// - resumed (both gone) → the same begin is admitted;
+/// - under the pause an owner-ordered `begin` is accepted, the `commit` of the grant repair begun before the pause
+///   is accepted, and a new round of a grant repair is refused (B4's rule, applied to the product's pause).
+#[test]
+fn hp2_an_autonomous_start_respects_the_product_pause() {
+    let daemon = crate::team_gate_tests::tmp_daemon("t4e-hp2", false);
+    let mut r = rig("hp2");
+    r.daemon = Some(daemon.clone());
+    r.grant_on(5);
+    let t = now0();
+    let w = seat(3, "worker");
+    let grant_begin = |file: &str| json!({"trigger": "grant", "files": [file]});
+    let refused = format!("repair.begin: {PRODUCT_PAUSE_START_KO}");
+    // paused by `cys pause` (the daemon's kill-switch)
+    daemon.paused.store(true, Ordering::SeqCst);
+    let e = r.call(t, &w, "begin", grant_begin("bin/a.py")).unwrap_err();
+    assert_eq!(e.message, refused);
+    // paused by the pack's mark
+    daemon.paused.store(false, Ordering::SeqCst);
+    std::fs::write(r.pack.join("AUTOPILOT_PAUSED"), b"").unwrap();
+    let e = r.call(t, &w, "begin", grant_begin("bin/a.py")).unwrap_err();
+    assert_eq!(e.message, refused);
+    assert!(r.ids().is_empty(), "nothing was begun while paused");
+    assert_eq!(r.claims(), 0, "no claim taken while paused");
+    // resumed → admitted
+    std::fs::remove_file(r.pack.join("AUTOPILOT_PAUSED")).unwrap();
+    let id = r.call(t, &w, "begin", grant_begin("bin/a.py")).unwrap()["repair"].as_str().unwrap().to_string();
+    std::fs::write(r.pack.join("bin/a.py"), b"print('fixed')\n").unwrap();
+    r.call(t + 1.0, &w, "record", json!({"repair": id, "note": "fix"})).unwrap();
+    r.call(t + 2.0, &seat(7, "reviewer-codex"), "attest_verify", json!({"repair": id, "verdict": "pass", "note": "ok"}))
+        .unwrap();
+    // paused again: an owner-ordered begin is accepted, the begun grant repair still commits
+    daemon.paused.store(true, Ordering::SeqCst);
+    assert!(r
+        .call(t + 3.0, &seat(4, "worker-2"), "begin", json!({"trigger": "owner_order", "files": ["bin/b.py"]}))
+        .is_ok());
+    let v = r.call(t + 4.0, &w, "commit", json!({"repair": id})).unwrap();
+    assert_eq!(v["state"], json!("probation"), "{v}");
+    // a new round of a grant repair is refused under the pause
+    daemon.paused.store(false, Ordering::SeqCst);
+    let id2 = r
+        .call(t + 5.0, &seat(5, "worker-3"), "begin", grant_begin("bin/c.py"))
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::write(r.pack.join("bin/c.py"), b"print('c')\n").unwrap();
+    r.call(t + 6.0, &seat(5, "worker-3"), "record", json!({"repair": id2, "note": "try"})).unwrap();
+    r.call(t + 7.0, &seat(7, "reviewer-codex"), "attest_verify", json!({"repair": id2, "verdict": "fail", "note": "no"}))
+        .unwrap();
+    std::fs::write(r.pack.join("AUTOPILOT_PAUSED"), b"").unwrap();
+    let e = r
+        .call(t + 8.0, &seat(5, "worker-3"), "record", json!({"repair": id2, "note": "round 2"}))
+        .unwrap_err();
+    assert_eq!(e.message, format!("repair.record: {id2}: {PRODUCT_PAUSE_ROUND_KO}"));
+}
+
+/// RULINGS HP2 (T4e) — the pack's mark is read the bounded way: absent → not paused; present (a file, an empty
+/// directory, a dangling link — nothing is followed or read) → paused; not judgeable (the pack path is a file, or
+/// the pack cannot be searched) → paused. The daemon's kill-switch alone pauses too; production passes the daemon
+/// and the lane's pack (source pin).
+#[test]
+fn hp2_the_pause_mark_is_read_the_bounded_way() {
+    let r = rig("hp2-mark");
+    assert!(!pause_mark_present(&r.pack));
+    let mark = r.pack.join("AUTOPILOT_PAUSED");
+    std::fs::write(&mark, b"").unwrap();
+    assert!(pause_mark_present(&r.pack));
+    std::fs::remove_file(&mark).unwrap();
+    std::fs::create_dir(&mark).unwrap();
+    assert!(pause_mark_present(&r.pack), "a directory of that name counts");
+    std::fs::remove_dir(&mark).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(r.pack.join("no-such-target"), &mark).unwrap();
+        assert!(pause_mark_present(&r.pack), "a dangling link counts (never followed)");
+        std::fs::remove_file(&mark).unwrap();
+    }
+    assert!(pause_mark_present(&r.pack.join("soul.md")), "not judgeable (the pack path is a file) → paused");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let shut = r.pack.join("shut");
+        std::fs::create_dir(&shut).unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unjudgeable = std::fs::symlink_metadata(shut.join("AUTOPILOT_PAUSED"))
+            .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound);
+        if unjudgeable {
+            assert!(pause_mark_present(&shut), "a pack that cannot be searched → paused");
+        }
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let daemon = crate::team_gate_tests::tmp_daemon("t4e-hp2-mark", false);
+    assert!(!product_pause_in_force(&daemon, &r.pack));
+    daemon.paused.store(true, Ordering::SeqCst);
+    assert!(product_pause_in_force(&daemon, &r.pack));
+    let src = include_str!("repair.rs");
+    assert_eq!(
+        src.matches("let product_pause = || product_pause_in_force(daemon, &cys::pack::pack_dir());").count(),
+        2,
+        "both production contexts read the daemon's kill-switch and the lane's pack"
+    );
+    assert_eq!(src.matches("product_pause: &product_pause,").count(), 2);
 }
