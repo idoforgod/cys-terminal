@@ -4595,7 +4595,7 @@ mod grant_verbs {
         }
         if super::rule_document_name(&rel).is_none() {
             return Err(VerbError::invalid(format!(
-                "{rel}: 규칙 문서(soul.md·CLAUDE.md·*_DIRECTIVE.md·VIBECODING_*·ROUTE_CONTRACT)가 아닙니다 — 주인 지시 표는 규칙 문서에만 씁니다"
+                "{rel}: 규칙 문서(soul.md·CLAUDE.md·*_DIRECTIVE.md·CEO_TEMPLATE.md·VIBECODING_*·ROUTE_CONTRACT)가 아닙니다 — 주인 지시 표는 규칙 문서에만 씁니다"
             )));
         }
         Ok(rel)
@@ -5512,13 +5512,18 @@ pub(crate) fn open_overlap(
     None
 }
 
-/// C10's rule-document base names (as `guard.sh:PROTECTED_NAMES`), lower-cased.
-const RULE_DOC_NAMES: [&str; 5] = [
+/// C10's rule-document base names, lower-cased: the five of `guard.sh:PROTECTED_NAMES`, and
+/// (RULINGS JV4) `ceo_template.md` — the CEO directive's template, whose live header `cys-dept`
+/// composes into the protected `MASTER_DIRECTIVE.md`; a repair of it is what a repair of a
+/// directive is. The guard's list does NOT hold the template (GAPS G27: a seat's plain file edit of
+/// it is not refused there — the cure, the guard's list, is the next release's item).
+const RULE_DOC_NAMES: [&str; 6] = [
     "soul.md",
     "claude.md",
     "vibecoding_constitution.md",
     "vibecoding_enforcement.md",
     "route_contract.md",
+    "ceo_template.md",
 ];
 
 /// RULINGS AD6 / BJ3: the rule-document name a target's base name folds to (full case folding —
@@ -5555,12 +5560,12 @@ pub(crate) fn is_windows_alias(rel: &str) -> bool {
     })
 }
 
-/// Rule-document base names in a prompt, lower-cased, `.md` form (C10's classification, as
-/// `guard.sh:PROTECTED_NAMES` + `*_directive.md`): `soul.md`, `claude.md`,
-/// `vibecoding_constitution.md`, `vibecoding_enforcement.md`, `route_contract.md`, any
+/// Rule-document base names in a prompt, lower-cased, `.md` form (C10's classification —
+/// `RULE_DOC_NAMES` + `*_directive.md`): `soul.md`, `claude.md`, `vibecoding_constitution.md`,
+/// `vibecoding_enforcement.md`, `route_contract.md`, `ceo_template.md` (RULINGS JV4), any
 /// `<x>_directive.md`; a bare `<X>_DIRECTIVE` counts as `<x>_directive.md` (Q2's example).
 pub(crate) fn named_rule_docs(text: &str) -> Vec<String> {
-    const NAMES: [&str; 5] = RULE_DOC_NAMES;
+    const NAMES: [&str; 6] = RULE_DOC_NAMES;
     let mut out: Vec<String> = Vec::new();
     for tok in text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))) {
         let t = tok.trim_matches('.').to_ascii_lowercase();
