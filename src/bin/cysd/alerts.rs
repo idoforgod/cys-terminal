@@ -4142,6 +4142,45 @@ mod defect_intake_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// H-04-N1-01 (design §6-4 "큐 상한 100은 올리지 않는다" · TESTPLAN_RULINGS Part 3 OQ-H-04 · RULINGS HN3): the cap
+    /// 100 at EACH of its six sites, one assertion per site — the `contains` check above stays green when one site is
+    /// raised while another keeps the literal. A site is named by the enqueue it guards (its producer call, unique in its
+    /// file); the cap is the last `q.len() >= N` before it, in the same critical section (no other lock or enqueue in
+    /// between). The census: the grep of `q.len() >= ` over the two files returns exactly these six sites (at the tag
+    /// 31f87878: governance.rs 2610 · 13056 · 13382, handlers.rs 4142 · 7183 · 8025; at d00f4075: governance.rs 2610 ·
+    /// 13058 · 13384, handlers.rs 4160 · 7211 · 8054). This file holds neither, so its own text cannot satisfy a needle.
+    #[test]
+    fn queue_cap_100_at_each_of_its_six_sites() {
+        let governance = include_str!("governance.rs");
+        let handlers = include_str!("handlers.rs");
+        let sites: [(&str, &str, &str); 6] = [
+            ("governance.rs enqueue_master_wakeup (approval wake)", governance, "daemon.next_queue_entry(text.to_string(), None, \"governance-approval\")"),
+            ("governance.rs queue_expiry_pass (expired-entry notice)", governance, "daemon.next_queue_entry(text, None, QUEUE_NOTICE_ORIGIN)"),
+            ("governance.rs revive_queue_entry", governance, "return Err(QueueOpDenied::QueueFull);"),
+            ("handlers.rs enqueue_bound_body (send)", handlers, "daemon.next_queue_entry(body.text.clone(), entry_from, \"send\")"),
+            ("handlers.rs dispatch_method send --queued / converted send", handlers, "daemon.next_queue_entry(text.clone(), entry_from, \"send\")"),
+            ("handlers.rs dispatch_method send-key --queued", handlers, "daemon.next_queue_entry(String::new(), entry_from, \"send-key\")"),
+        ];
+        let probe = "q.len() >= ";
+        for (site, src, guarded) in sites {
+            assert_eq!(src.matches(guarded).count(), 1, "{site}: the guarded enqueue `{guarded}` is gone or duplicated — re-pin the site");
+            let at = src.find(guarded).unwrap();
+            let k = src[..at].rfind(probe).unwrap_or_else(|| panic!("{site}: no queue cap before the enqueue"));
+            let between = &src[k..at];
+            assert!(
+                between.len() < 1_000 && !between.contains(".lock()") && !between.contains("next_queue_entry("),
+                "{site}: the nearest cap is not the one guarding this enqueue:\n{between}"
+            );
+            let value: String = between[probe.len()..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            assert_eq!(value, "100", "{site}: the queue cap changed (`{probe}{value}`) — 「큐 상한 100은 올리지 않는다」");
+        }
+        assert_eq!(
+            (governance.matches(probe).count(), handlers.matches(probe).count()),
+            (3, 3),
+            "the queue-cap sites changed in number — the census of H-04-N1-01 is six (governance ×3, handlers ×3)"
+        );
+    }
+
     /// RULINGS BF3: the SAME raw failure text filed by `cys repair report` and observed by the detector
     /// is ONE row (one normaliser), updated, never replaced; an existing row is not a NEW row for the share.
     #[test]
