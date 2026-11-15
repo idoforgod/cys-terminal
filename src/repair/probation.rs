@@ -21,6 +21,18 @@ use super::types::{LaneKey, RepairError, RepairId, RepairState, TargetState};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// ★0.15.0 (T6 · C7 O-C7-1): the id of the ONE appended built-in scheduled job whose work this module does
+/// (`CYS_NO_AUTOSTART=1 cys repair tick`). The daemon's scheduler defines the job under this id
+/// (`cysd/schedule.rs::builtin_jobs`); moved here from the daemon by WS1 (RULINGS KN1) so that both binaries read it.
+pub const REPAIR_JOB_ID: &str = "repair-probation-tick";
+
+/// ★0.15.0 (WS1 · RULINGS KN1): the built-in scheduled jobs NO writer may remove or change (RULINGS AW7 / AY7) — the
+/// ONE definition of "fixed", by the job's id; a field in the user-writable schedule file never decides it. The daemon
+/// restores these jobs whole at its start and at every tick that holds the schedule's lock (`cysd/schedule.rs`); the
+/// CLI's `schedule remove` refuses them (`cys.rs::remove_schedule_job`). Today exactly the repair job; a later safety
+/// job joins by its id here.
+pub const FIXED_BUILTIN_JOB_IDS: &[&str] = &[REPAIR_JOB_ID];
+
 /// Everything the job needs (the daemon builds it; tests build it with doubles).
 pub struct JobEnv<'a> {
     pub op: OpEnv<'a>,
