@@ -207,6 +207,7 @@ fn committed_in_hq(r: &Rig, id: &RepairId, class: Classification, rel: &str, pre
         merge_lock: None,
         merge_attempt: 0,
         reason: String::new(),
+        hook_ops: Vec::new(),
         updated_at: T0 - 5.0,
     };
     ledger::write_lane_durable_in(&r.root, &row).unwrap();
@@ -2444,6 +2445,137 @@ fn an_interrupted_hook_unit_is_completed_by_recovery_and_its_row_has_a_probation
     assert_eq!(row.state, LaneState::Verified, "{}", row.reason);
     let p = row.probation.unwrap();
     assert!(p.closed.is_none(), "an OPEN probation — the lane applied R itself: {:?}", p.closed);
+    // JD2 (added): the operation the recovery completed is in the row's content
+    assert!(row.hook_ops.iter().any(|h| h.op == op.op && h.lines == vec!["Stop:x.sh".to_string()]), "{:?}", row.hook_ops);
+}
+
+// ───────────────────────────── RULINGS JD2 — the row's content records the hook operation ─────────────────────────────
+
+/// A mixed repair made in HQ: the edit of bin/a.py (old → new) and the un-registration of Stop:x.sh.
+fn edit_and_hook_in_hq(r: &Rig, id: &RepairId) -> RepairRecord {
+    let mut rec = committed_in_hq(r, id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    rec.files.push(FileChange { rel: "settings:Stop:x.sh".into(), kind: ChangeKind::HookUnregister { event: "Stop".into(), script: "x.sh".into() }, pre: PreImage::Absent, post: TargetState::Absent, diff: None });
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    rec
+}
+
+/// The hook operation the default hook double reports.
+fn op_test_hooks() -> Vec<HookOpDone> {
+    vec![HookOpDone { op: "op-test".into(), lines: vec!["Stop:x.sh".into()] }]
+}
+
+/// THIS lane's completed hook operation for R (its write-ahead record) as the row records it.
+fn own_hook_op(r: &Rig, id: &RepairId) -> HookOpDone {
+    let op = r.ops(id).into_iter().find(|o| o.lane_key == lane(DEPT) && o.kind == "hook-unregister" && o.finished).expect("its write-ahead record");
+    HookOpDone { op: op.op, lines: vec!["Stop:x.sh".into()] }
+}
+
+/// JD2 (i) — `recheck` whose hook unit completed and whose check PASSES: the 검증됨 row carries the
+/// hook operation in its content (`hook_ops`); its reason is the newer event's sentence (JD1).
+#[test]
+fn a_passing_recheck_keeps_the_hook_operation_in_the_rows_content() {
+    let r = rig("jd2a");
+    let id = rid("R-1");
+    edit_and_hook_in_hq(&r, &id);
+    r.put(DEPT, "bin/a.py", b"mine\n", 0o644);
+    tick(&r, DEPT, &doubles(), &fid(1));
+    conflicted_with_lock(&r, &id, b"mine\n");
+    let d = doubles();
+    assert_eq!(recheck(&r, &id, &d, 5, "합침").unwrap(), LaneState::Verified);
+    assert_eq!(d.hook_calls.get(), 1, "the hook unit ran in this call");
+    let row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Verified);
+    assert_eq!(row.hook_ops, op_test_hooks(), "the row's content records the hook operation");
+    assert!(row.reason.starts_with("합친 뒤 이 부서의 살아 있는 파일에서 검사 통과"), "{}", row.reason);
+}
+
+/// JD2 (ii) — the same with the check FAILING: the 충돌 row (published) carries the hook operation.
+#[test]
+fn a_failing_recheck_keeps_the_hook_operation_in_the_rows_content() {
+    let r = rig("jd2b");
+    let id = rid("R-1");
+    edit_and_hook_in_hq(&r, &id);
+    r.put(DEPT, "bin/a.py", b"mine\n", 0o644);
+    tick(&r, DEPT, &doubles(), &fid(1));
+    conflicted_with_lock(&r, &id, b"mine\n");
+    let d = doubles();
+    d.pass.set(false);
+    assert!(matches!(recheck(&r, &id, &d, 5, ""), Err(RepairError::CheckFailed(_))));
+    assert_eq!(d.hook_calls.get(), 1);
+    let row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Conflict);
+    assert_eq!(row.hook_ops, op_test_hooks(), "the row's content records the hook operation");
+    assert!(row.reason.starts_with("합친 뒤의 다시 검사 실패"), "{}", row.reason);
+}
+
+/// JD2 (iii) — the tick's "already there" arm with T6's real unit: the row carries the operation ONCE
+/// (the unit's own, which is also the evidence's — IG3), with its open probation bundle.
+#[test]
+fn the_already_there_arm_keeps_the_hook_operation_in_the_rows_content() {
+    let r = rig("jd2c");
+    let id = rid("R-1");
+    hook_repair_in_hq(&r, &id);
+    let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let d = doubles();
+    *d.unit.borrow_mut() = Some(real_unit(&r, Box::new(|| {}), Box::new(|| {}), calls.clone()));
+    tick(&r, DEPT, &d, &fid(1));
+    assert_eq!(*calls.borrow(), vec![true, false]);
+    let row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Verified, "{}", row.reason);
+    assert_eq!(row.hook_ops, vec![own_hook_op(&r, &id)]);
+    assert!(row.probation.as_ref().is_some_and(|p| p.closed.is_none()), "the return is owed on this row");
+}
+
+/// JD2 (iv) — the ordinary door path: (1) applied and checked → the 검증됨 row carries the hook
+/// operation with its open probation bundle; (2) the record changed after the completed hook unit →
+/// the 충돌 row published at once (IO1) carries it; (3) this lane's tombstone could not be written
+/// after it → the 충돌 row carries it.
+#[test]
+fn the_door_path_keeps_the_hook_operation_in_the_rows_content() {
+    let id = rid("R-1");
+    // (1)
+    let r = rig("jd2d");
+    edit_and_hook_in_hq(&r, &id);
+    r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    let d = doubles();
+    tick(&r, DEPT, &d, &fid(1));
+    assert_eq!(d.hook_calls.get(), 1);
+    let row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Verified, "{}", row.reason);
+    assert_eq!(row.hook_ops, op_test_hooks());
+    assert!(row.probation.as_ref().is_some_and(|p| p.closed.is_none()));
+    // (2)
+    let r2 = rig("jd2e");
+    edit_and_hook_in_hq(&r2, &id);
+    r2.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let d2 = doubles();
+    *d2.unit.borrow_mut() = Some(real_unit(&r2, Box::new(|| {}), supersede(&r2.root, &id), calls.clone()));
+    tick(&r2, DEPT, &d2, &fid(1));
+    assert_eq!(*calls.borrow(), vec![true, false]);
+    let row2 = r2.row(&id, DEPT).unwrap();
+    assert_eq!(row2.state, LaneState::Conflict);
+    assert!(row2.reason.contains("bin/a.py") && row2.reason.contains("이 부서의 훅 등록을 해제했습니다"), "{}", row2.reason);
+    assert_eq!(row2.hook_ops, vec![own_hook_op(&r2, &id)]);
+    // (3) a deleting target already at its result; the lane's tombstone file cannot be written
+    let r3 = rig("jd2f");
+    let mut rec = edit_and_hook_in_hq(&r3, &id);
+    r3.put(HQ, "bin/b.py", b"gone\n", 0o644);
+    let live = r3.hq.join("bin/b.py");
+    let pre = ledger::copy_preimage_in(&r3.root, &id, &lane(HQ), "bin/b.py", &live, T0 - 10.0).unwrap();
+    std::fs::remove_file(&live).unwrap();
+    rec.files.push(FileChange { rel: "bin/b.py".into(), kind: ChangeKind::Delete, pre, post: TargetState::Absent, diff: None });
+    rec.committed.push(("bin/b.py".into(), TargetState::Absent.canon()));
+    ledger::write_record_in(&r3.root, &rec).unwrap();
+    r3.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    std::fs::create_dir_all(crate::repair::tombstones::path_in(&r3.root, &lane(DEPT))).unwrap();
+    let d3 = doubles();
+    tick(&r3, DEPT, &d3, &fid(1));
+    assert_eq!(d3.hook_calls.get(), 1);
+    let row3 = r3.row(&id, DEPT).unwrap();
+    assert_eq!(row3.state, LaneState::Conflict);
+    assert!(row3.reason.contains("bin/b.py"), "{}", row3.reason);
+    assert_eq!(row3.hook_ops, op_test_hooks());
 }
 
 // ───────────────────────────── RULINGS JA2 / JA3 — what a row and the catch-up mean ─────────────────────────────
