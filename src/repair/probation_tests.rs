@@ -120,40 +120,70 @@ fn windows_recheck_failure_reports_only() {
 /// wrote the vendor's bytes (vendor-first) → live ≠ expected → the probation closes `대체됨` and the
 /// job NEVER restores the old bytes, even though the old repair's check would now fail. RULINGS HS1
 /// (b) — the second arm: the update changed the pack generation and the repaired bytes SURVIVED → the
-/// probation ends (no check, no automatic return) and the repair STAYS IN FORCE as 사용 중.
+/// probation ends (no check, no automatic return) and the repair STAYS IN FORCE as 사용 중. RULINGS HN3
+/// (stage 5, H-SEQ-04 (b)) — the generation is the version label AND the pro channel's revision: an
+/// update that changes ONLY the revision (the label stays) is a generation change for both of HS1's
+/// cases — (b) the bytes survived → 사용 중; (a) the update wrote the file → 대체됨 naming it.
 #[test]
 fn update_inside_probation_never_restores_old_bytes() {
-    for gen_change in [false, true] {
-        let r = rig("update");
-        let a = rid("R-4");
-        committed_general(&r, &a, "hooks/s.sh", Some(b"OLD\n"), Some(b"REPAIRED\n"));
-        if gen_change {
-            std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
-        } else {
-            r.put("hooks/s.sh", b"VENDOR-NEW\n", 0o755);
+    // (update, the update wrote the file): "vendor" — the same generation; "label" — `.pack-version`
+    // changes; "revision" — only `.pack-state.json`'s `pro_revision` changes. Every arm runs and every
+    // failing arm is named (one arm's failure never hides the next one's)
+    let failed: Vec<String> = [("vendor", true), ("label", false), ("revision", false), ("revision", true)]
+        .into_iter()
+        .filter(|(update, wrote)| std::panic::catch_unwind(|| update_arm(update, *wrote)).is_err())
+        .map(|(update, wrote)| format!("{update}/{wrote}"))
+        .collect();
+    assert!(failed.is_empty(), "failing arms: {failed:?}");
+}
+
+fn update_arm(update: &str, wrote: bool) {
+    let r = rig("update");
+    let a = rid("R-4");
+    if update == "revision" {
+        std::fs::write(r.pack.join(".pack-state.json"), r#"{"channel": "pro", "base_version": "0.15.0", "pro_revision": 1}"#).unwrap();
+    }
+    committed_general(&r, &a, "hooks/s.sh", Some(b"OLD\n"), Some(b"REPAIRED\n"));
+    match update {
+        "label" => std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap(),
+        "revision" => std::fs::write(r.pack.join(".pack-state.json"), r#"{"channel": "pro", "base_version": "0.15.0", "pro_revision": 2}"#).unwrap(),
+        _ => {}
+    }
+    if wrote {
+        r.put("hooks/s.sh", b"VENDOR-NEW\n", 0o755);
+    }
+    let fail = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Fail("would fail".into()), 5);
+    let d = Doubles { check: &fail, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    assert!(rep.reverted.is_empty(), "{update}/{wrote}: never reverted");
+    let want: &[u8] = if wrote { b"VENDOR-NEW\n" } else { b"REPAIRED\n" };
+    assert_eq!(std::fs::read(r.pack.join("hooks/s.sh")).unwrap(), want, "{update}/{wrote}");
+    let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
+    let closed = row.probation.unwrap().closed.unwrap();
+    let state = ledger::read_record_in(&r.root, &a).unwrap().unwrap().state;
+    match (update, wrote) {
+        ("vendor", _) => {
+            assert_eq!(rep.superseded, vec![a.clone()]);
+            assert!(closed.starts_with("대체됨"));
         }
-        let fail = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Fail("would fail".into()), 5);
-        let d = Doubles { check: &fail, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
-        let lock = r.base.join(".pack-apply.lock");
-        let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
-        assert!(rep.reverted.is_empty(), "never reverted");
-        let want: &[u8] = if gen_change { b"REPAIRED\n" } else { b"VENDOR-NEW\n" };
-        assert_eq!(std::fs::read(r.pack.join("hooks/s.sh")).unwrap(), want);
-        let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
-        if gen_change {
-            // RULINGS HS1 (b) — the old expectation of this arm was `assert_eq!(rep.superseded,
+        (_, false) => {
+            // RULINGS HS1 (b) — the old expectation of the label arm was `assert_eq!(rep.superseded,
             // vec![a.clone()])` and `row.probation.unwrap().closed.unwrap().starts_with("대체됨")`
             // (the record left the in-force set although its bytes were live)
-            assert!(rep.superseded.is_empty(), "{:?}", rep.superseded);
-            assert_eq!(rep.ended, vec![a.clone()]);
+            assert!(rep.superseded.is_empty(), "{update}: {:?}", rep.superseded);
+            assert_eq!(rep.ended, vec![a.clone()], "{update}");
             assert_eq!(
-                row.probation.unwrap().closed.unwrap(),
-                "사용 중 — 업데이트 뒤에도 수리한 내용이 그대로 있습니다 — 시험 기간은 업데이트로 끝났고 자동 되돌리기는 하지 않습니다"
+                closed,
+                "사용 중 — 업데이트 뒤에도 수리한 내용이 그대로 있습니다 — 시험 기간은 업데이트로 끝났고 자동 되돌리기는 하지 않습니다",
+                "{update}"
             );
-            assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::InUse, "still in force");
-        } else {
-            assert_eq!(rep.superseded, vec![a.clone()]);
-            assert!(row.probation.unwrap().closed.unwrap().starts_with("대체됨"));
+            assert_eq!(state, RepairState::InUse, "{update}: still in force");
+        }
+        (_, true) => {
+            assert_eq!(rep.superseded, vec![a.clone()], "{update}");
+            assert_eq!(closed, "대체됨 — 업데이트가 수리한 파일을 바꿨습니다(hooks/s.sh) — 아무것도 되돌리지 않습니다(새 버전 우선)", "{update}");
+            assert_eq!(state, RepairState::Superseded, "{update}");
         }
     }
 }
