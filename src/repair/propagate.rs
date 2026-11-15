@@ -155,6 +155,12 @@ pub fn in_force(rec: &RepairRecord) -> bool {
     matches!(rec.state, RepairState::Probation | RepairState::InUse)
 }
 
+/// RULINGS LA1 / LB — a row whose probation bundle is OPEN (`closed: null`): this lane applied R itself
+/// and owes the return if the check fails; T6's probation is its one judge until it closes the bundle.
+fn open_bundle(row: &LaneRecord) -> bool {
+    row.probation.as_ref().is_some_and(|p| p.closed.is_none())
+}
+
 /// A repair that concerns its ORIGIN lane only: RULINGS R7 — one made with `resolves`; RULINGS KF2 — a
 /// RULE-DOCUMENT repair (the record's class, which `begin` sets from the daemon's ONE definition,
 /// `rule_document_name`, for every repair naming a rule document — C10 refuses to mix one with any other
@@ -501,13 +507,15 @@ fn verify_only(env: &PassEnv<'_>, mut st: JobState, identity: Option<DirIdentity
     let mut demoted = 0u32;
     for rec in &recs {
         let Some(row) = ledger::read_lane_in(env.root, &rec.id, env.lane)? else { continue };
-        if !matches!(row.state, LaneState::Applied | LaneState::Verified) {
+        // RULINGS LA1 / LB: a row holding an OPEN probation bundle is T6's — its re-check judges a
+        // changed file (and its generation rule an update); the pass leaves it as it is
+        if open_bundle(&row) || !matches!(row.state, LaneState::Applied | LaneState::Verified) {
             continue;
         }
         let differs = recorded_result(&row).iter().any(|(rel, canon)| live_canon(env.pack, rel).as_deref() != Ok(canon.as_str()));
         if differs
             && update_row(env.root, env.lane, &rec.id, env.locked, env.now, &|r| {
-                if matches!(r.state, LaneState::Applied | LaneState::Verified) {
+                if !open_bundle(r) && matches!(r.state, LaneState::Applied | LaneState::Verified) {
                     r.state = LaneState::Pending;
                     true
                 } else {
@@ -562,7 +570,10 @@ fn full_reset(
     let mut demoted = 0u32;
     for rec in &recs {
         let changed = update_row(env.root, env.lane, &rec.id, env.locked, env.now, &|r| {
-            if !matches!(r.state, LaneState::Applied | LaneState::Verified | LaneState::Conflict) {
+            // RULINGS LA1 / LB: a row holding an OPEN probation bundle (this lane applied R itself — T6's
+            // approved apply, T3's commit, or this lane's own propagate — and owes the return if the check
+            // fails) is not demoted: T6's probation alone judges it until T6 closes the bundle
+            if open_bundle(r) || !matches!(r.state, LaneState::Applied | LaneState::Verified | LaneState::Conflict) {
                 return false;
             }
             r.state = LaneState::Pending;
@@ -1126,6 +1137,30 @@ fn decide(env: &LaneEnv<'_>, rec: &RepairRecord, bound: &Bound, report: &mut Tic
         Some(r) => r.clone(),
         None => new_row(id, lane, env.op.now),
     };
+    // RULINGS LA1 / LB — an OPEN probation bundle is T6's: no decision ends, replaces, drops or re-stamps
+    // it, and no decision re-applies R under it (P2, the "already there" branch, the door are never
+    // reached with one). The ONE exception (LB2): the after-apply check of THIS lane's own propagate that
+    // stopped before its check (적용됨) — and only while the bundle's `expected`, the row's `applied` and
+    // R's current result agree and every target still holds that result; anything else is left to T6
+    // (after T6 closes an older bundle, P2 delivers the newer result)
+    if open_bundle(&row) {
+        let ours_now = row.state == LaneState::Applied
+            && row.applied == rec.committed
+            && row.probation.as_ref().is_some_and(|p| p.expected == rec.committed);
+        if !ours_now {
+            return Ok(Some(row.state));
+        }
+        // a target that cannot be measured (or is over the read limit) is not "still at the result": T6
+        let live = match live_states(env.op.pack, rec) {
+            Ok(l) => l,
+            Err(_unmeasured) => return Ok(Some(row.state)),
+        };
+        if canon_list(&live) != rec.committed {
+            return Ok(Some(row.state));
+        }
+        let stamp = Stamp::take(env, rec, Some(&live));
+        return check_live(env, stored.as_ref(), row, rec, None, &stamp, report);
+    }
     // T6's probation in THIS lane returned or failed the propagated apply (its closure `실패 — …` /
     // `되돌려짐 — …` on a row of the CURRENT result) while R is still in force: the lane does not hold R
     // — 충돌 for its worker (H8), never "검증됨" over files that were put back
@@ -2571,11 +2606,16 @@ pub fn recheck_lane_in(
                 note: note.chars().take(400).collect(),
                 via_repair: None,
             });
-            row.applied = rec.committed.clone();
+            // RULINGS LB5: an OPEN bundle (T3's commit with a failed hook step, …) stays as it is, with the
+            // `applied` it was opened for — T6 judges the merged files against its `expected` (never newer
+            // committed bytes recorded under an older bundle, LB2); without one, as before
+            if !open_bundle(&row) {
+                row.applied = rec.committed.clone();
+                row.probation = None;
+            }
             row.state = LaneState::Verified;
             row.merge_lock = None;
             row.conflict_live.clear();
-            row.probation = None;
             row.reason = "합친 뒤 이 부서의 살아 있는 파일에서 검사 통과(recheck)".into();
             row.updated_at = env.op.now;
             // IQ1 + IQ2 + IV4: the checked publication (the stamp measured again; a deleting repair's
