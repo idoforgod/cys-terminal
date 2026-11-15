@@ -2211,6 +2211,25 @@ def _merge_hook_ops_line(v, lane_key):
     return None
 
 
+def _not_propagated_here(v, repair, lane_key):
+    """RULINGS KI1 (KF2): 묻는 부서에 전파되지 않는 수리(규칙 문서 수리 · resolves 수리)면 그 까닭 한 줄, 아니면 None.
+    분류를 여기서 다시 가리지 않는다 — 데몬의 `status` 가 이미 준 답을 읽는다: 그 수리의 전파 부서 목록(`lanes` —
+    데몬이 부서 등록부를 읽어 `propagation_complete` 를 판정했을 때만)에 묻는 부서가 없거나, 그 부서의 안내 행이
+    있으면 전파 대상이 아니다. 문장은 그 안내 행의 것을 그대로 쓴다(아직 행이 없으면 같은 뜻의 한 줄)."""
+    if lane_key is None:
+        return None
+    row = next((x for x in (v.get("lane_rows") or []) if isinstance(x, dict) and x.get("lane") == lane_key), None)
+    lanes = v.get("lanes")
+    outside = isinstance(v.get("propagation_complete"), bool) and isinstance(lanes, dict) and lane_key not in lanes
+    if not outside:
+        return None
+    reason = row.get("reason") if isinstance(row, dict) else None
+    if isinstance(reason, str) and reason.strip():
+        return "%s: %s" % (repair, reason.strip())
+    return ("%s: 이 수리는 이 부서(%s)에 전파되지 않습니다(전파 부서: %s) — 이 부서에 필요하면 이 부서의 주인 지시로 "
+            "이 부서의 수리를 시작하세요" % (repair, lane_key, ", ".join(sorted(lanes)) or "-"))
+
+
 def _merge_ticket_lines(repair, lane_key=None):
     """E-4-11/12 · AU6 · AR4: 그 부서 워커가 **그대로** 실행할 수리 명령 줄 — `--files`(R 의 파일 대상 전부)와
     `--trigger`(R 자신의 계기)를 늘 싣는다. 일반 경로 = `--joins` + `recheck`(H8), 기동 필수·보호장치 경로 =
@@ -2228,6 +2247,10 @@ def _merge_ticket_lines(repair, lane_key=None):
         return None, "%s 의 기록을 읽지 못했습니다(%s)" % (repair, e)
     if not isinstance(v, dict):
         return None, "%s 의 기록을 읽지 못했습니다(exit %s)" % (repair, getattr(r, "returncode", "?"))
+    # RULINGS KI1: a repair that does not propagate to this lane gets no ticket line at all
+    outside = _not_propagated_here(v, repair, lane_key)
+    if outside:
+        return None, "병합 티켓을 내지 않습니다 — " + outside
     trigger = _TRIGGER_CLI.get(v.get("trigger"))
     files = [f.get("rel") for f in (v.get("files") or [])
              if isinstance(f, dict) and isinstance(f.get("rel"), str) and not str(f.get("kind", "")).startswith("hook")
