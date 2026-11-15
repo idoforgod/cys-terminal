@@ -1612,6 +1612,66 @@ fn the_budget_notice_is_sent_after_both_locks_are_released() {
     assert_eq!(*eff.sends_free.lock().unwrap(), vec![(true, true)], "a lock was held across the send");
 }
 
+/// RULINGS KJ2 — "a notice is due" only after the settlement's write succeeded: the stale request's
+/// FINAL expiry settled by a `submit` after a restart (the budget used up) while the record cannot be
+/// written (its folder read-only) — repeated submits are refused, nothing is settled on disk and NO
+/// notice is sent; the store recovers → the next submit saves the settlement and sends exactly ONE
+/// line; a further submit sends none. (The old `submit` decided the notice before the write and
+/// sent it although the write failed — so every later submit sent it again.)
+#[cfg(unix)]
+#[test]
+fn the_budget_notice_waits_for_the_settlements_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = rig("kj2");
+    let id = r.signed_repair();
+    let eff = effects();
+    let t = Mutex::new(ApprovalTable::default());
+    pending(&r, &t, &eff, T0);
+    drop(t);
+    // E1 … E3 counted as in the CZ2 sequence, then a restart while S3 is pending
+    let t = Mutex::new(ApprovalTable::default());
+    let mut now = T0 + 1801.0;
+    pending(&r, &t, &eff, now);
+    sweep(&r.ctx(now + 1.0), &t, &eff);
+    now += 2.0;
+    for _ in 0..2 {
+        now += 1801.0;
+        sweep(&r.ctx(now), &t, &eff);
+        now += 1.0;
+        pending(&r, &t, &eff, now);
+    }
+    assert_eq!(r.rec(&id).resubmits, vec![(fp_of(&r, &id), 3)]);
+    assert!(eff.master.lock().unwrap().is_empty());
+    drop(t);
+    let t = Mutex::new(ApprovalTable::default());
+    /// Gives the record's folder back its mode, also when an assertion fails first.
+    struct Writable(PathBuf);
+    impl Drop for Writable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let folder = Writable(ledger::repair_dir_in(&r.root, &id));
+    std::fs::set_permissions(&folder.0, std::fs::Permissions::from_mode(0o500)).unwrap();
+    now += 1801.0;
+    for n in 1..=3 {
+        now += 1.0;
+        let e = submit(&r.ctx(now), &worker(), &json!({"repair": "R-1"}), &t, &eff, Ok(())).unwrap_err();
+        assert!(!e.message.contains("만료"), "submit {n}: refused for the budget although nothing was saved");
+        assert_eq!(r.rec(&id).resubmits, vec![(fp_of(&r, &id), 3)], "submit {n}: settled on disk");
+        assert!(eff.master.lock().unwrap().is_empty(), "submit {n}: a notice for an unsaved settlement");
+    }
+    drop(folder);
+    now += 1.0;
+    let e = submit(&r.ctx(now), &worker(), &json!({"repair": "R-1"}), &t, &eff, Ok(())).unwrap_err();
+    assert!(e.message.contains("만료"), "{}", e.message);
+    assert_eq!(r.rec(&id).resubmits, vec![(fp_of(&r, &id), 4)]);
+    assert_eq!(eff.master.lock().unwrap().len(), 1, "exactly one line once the settlement is saved");
+    now += 1.0;
+    assert!(submit(&r.ctx(now), &worker(), &json!({"repair": "R-1"}), &t, &eff, Ok(())).is_err());
+    assert_eq!(eff.master.lock().unwrap().len(), 1, "never a second line");
+}
+
 /// RULINGS DF5 (joins CZ2): a durable `approval: approved` a crash left between its write and the
 /// apply is cleared by the restart's reconciliation — it is never a consumable approval.
 #[test]
