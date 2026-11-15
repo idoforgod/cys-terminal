@@ -416,16 +416,23 @@ fn update_row(root: &Path, lane: &LaneKey, id: &RepairId, locked: &RepairLock<'_
 /// RULINGS I8 / K2 / L5 — the pack-instance pass, run at EVERY tick after readiness and before any
 /// propagation. `fresh_id` (64 hex, the daemon's CSPRNG) is used only by a full reset.
 pub fn pack_instance_pass_in(env: &PassEnv<'_>, fresh_id: &str) -> PassOutcome {
+    pack_instance_pass_used(env, fresh_id).0
+}
+
+/// RULINGS IZ3 — the pass, and the generation and instance it USED (read inside the pass's lock at its
+/// start; the instance the pass found equal, or the fresh one a reset recorded). That value — never a
+/// later reading — is the tick's stamp for completeness and for the catch-up record (unit (d)).
+pub fn pack_instance_pass_used(env: &PassEnv<'_>, fresh_id: &str) -> (PassOutcome, Option<PackGeneration>, Option<String>) {
     if !is_pack_instance_id(fresh_id) {
-        return PassOutcome::Skipped("새 팩 식별자가 형식에 맞지 않습니다".into());
+        return (PassOutcome::Skipped("새 팩 식별자가 형식에 맞지 않습니다".into()), None, None);
     }
     let job = read_job_state_checked(env.root, env.lane);
     if let FileRead::ReadError(w) = &job {
-        return PassOutcome::Skipped(format!("상태 파일을 지금 읽을 수 없습니다 — {w}"));
+        return (PassOutcome::Skipped(format!("상태 파일을 지금 읽을 수 없습니다 — {w}")), None, None);
     }
     let id_now = read_pack_instance(env.pack);
     if let FileRead::ReadError(w) = &id_now {
-        return PassOutcome::Skipped(format!("팩 식별자를 지금 읽을 수 없습니다 — {w}"));
+        return (PassOutcome::Skipped(format!("팩 식별자를 지금 읽을 수 없습니다 — {w}")), None, None);
     }
     // interpretation 31 / P5: the identity and the generation are read ONCE at the start and recorded
     // at the end; an unreadable one skips its watch for this tick (never "changed")
@@ -440,17 +447,23 @@ pub fn pack_instance_pass_in(env: &PassEnv<'_>, fresh_id: &str) -> PassOutcome {
         let dir_changed = st.pack_dir.as_deref() != Some(env.pack)
             || identity.as_ref().is_some_and(|i| st.pack_dir_identity.as_ref() != Some(i));
         let gen_changed = generation.as_ref().is_some_and(|g| st.pack_generation.as_ref() != Some(g));
+        let used = match &id_now {
+            FileRead::Value(id) => Some(id.clone()),
+            _ => None,
+        };
         if !dir_changed && !gen_changed {
-            return PassOutcome::Equal;
+            return (PassOutcome::Equal, generation, used);
         }
+        let g = generation.clone();
         return match verify_only(env, st, identity, generation) {
-            Ok(demoted) => PassOutcome::VerifyOnly { demoted },
-            Err(e) => PassOutcome::Skipped(format!("{e:?}")),
+            Ok(demoted) => (PassOutcome::VerifyOnly { demoted }, g, used),
+            Err(e) => (PassOutcome::Skipped(format!("{e:?}")), None, None),
         };
     }
+    let g = generation.clone();
     match full_reset(env, job, id_now, fresh_id, identity, generation) {
-        Ok(demoted) => PassOutcome::Reset { demoted },
-        Err(e) => PassOutcome::Skipped(format!("{e:?}")),
+        Ok(demoted) => (PassOutcome::Reset { demoted }, g, Some(fresh_id.to_string())),
+        Err(e) => (PassOutcome::Skipped(format!("{e:?}")), None, None),
     }
 }
 
@@ -631,7 +644,7 @@ pub fn propagation_tick_in(env: &LaneEnv<'_>, fresh_id: Option<&str>) -> Result<
     // each repair's door operations and each row's publication; NO check child runs while it is held
     // (a check that hangs to its deadline in one lane never holds another lane's turn or an update)
     let pass_env = PassEnv { root: env.op.root, lane: env.op.lane, pack: env.op.pack, now: env.op.now, locked: env.locked, stop: env.pass_stop };
-    let pass = match crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || pack_instance_pass_in(&pass_env, fresh_id)) {
+    let (pass, used_generation, used_instance) = match crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || pack_instance_pass_used(&pass_env, fresh_id)) {
         Ok(Some(p)) => p,
         Ok(None) => {
             report.lines.push("다른 적용이나 업데이트가 팩을 바꾸는 중 — 이번 차례의 전파는 하지 않습니다".into());
@@ -642,11 +655,15 @@ pub fn propagation_tick_in(env: &LaneEnv<'_>, fresh_id: Option<&str>) -> Result<
             return Ok(report);
         }
     };
-    tick_body(env, pass, &mut report)?;
+    #[cfg(test)]
+    seam(&AFTER_PASS, env.op.pack);
+    // IZ3: the tick's stamp for completeness and the catch-up = what the pass used inside its lock
+    let judged = Stamp { committed: Vec::new(), generation: used_generation, instance: used_instance, states: None };
+    tick_body(env, pass, &judged, &mut report)?;
     Ok(report)
 }
 
-fn tick_body(env: &LaneEnv<'_>, pass: PassOutcome, report: &mut TickReport) -> Result<(), RepairError> {
+fn tick_body(env: &LaneEnv<'_>, pass: PassOutcome, judged: &Stamp, report: &mut TickReport) -> Result<(), RepairError> {
     let root = env.op.root;
     let lane = env.op.lane;
     report.pass = Some(pass.clone());
@@ -666,8 +683,6 @@ fn tick_body(env: &LaneEnv<'_>, pass: PassOutcome, report: &mut TickReport) -> R
     };
     // EJ1: the binding of every apply this tick is born here, once
     let bound = Bound::now(env.op.pack);
-    // IV3: the generation and instance this tick's completeness is judged on
-    let judged = Stamp::of_pack(env);
     let mut complete = true;
     for rec in &recs {
         let left_before = report.left.len();
@@ -825,11 +840,6 @@ impl Stamp {
         let (generation, instance) = Stamp::pack_now(env.op.pack);
         Stamp { committed: rec.committed.clone(), generation, instance, states: live.map(canon_list) }
     }
-    /// The catch-up's stamp (IV3): the generation and instance the tick's completeness is judged on.
-    fn of_pack(env: &LaneEnv<'_>) -> Stamp {
-        let (generation, instance) = Stamp::pack_now(env.op.pack);
-        Stamp { committed: Vec::new(), generation, instance, states: None }
-    }
     /// After a door operation of THIS lane: the target's state is what the door itself placed.
     fn placed(&mut self, rel: &str, st: &TargetState) {
         if let Some(e) = self.states.as_mut().and_then(|v| v.iter_mut().find(|(r, _)| r == rel)) {
@@ -870,6 +880,8 @@ thread_local! {
     pub(crate) static AFTER_DECISION: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> = const { std::cell::RefCell::new(None) };
     pub(crate) static AFTER_DOOR_PHASE: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> = const { std::cell::RefCell::new(None) };
     pub(crate) static BEFORE_CATCHUP: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> = const { std::cell::RefCell::new(None) };
+    /// IZ3: right after the instance pass released its lock.
+    pub(crate) static AFTER_PASS: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
