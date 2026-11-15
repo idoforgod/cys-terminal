@@ -4915,3 +4915,83 @@ fn ww1_km2_the_report_map_and_both_directions_of_the_join() {
     assert_eq!(alias_row, (json!("R-1"), json!(false)), "an alias row meets a repair begun under the real name");
     assert_eq!(real_row, (json!("R-1"), json!(false)), "a real-name row meets a repair begun under the alias");
 }
+
+/// WW2 (RULINGS KY): a general file THIS binary ships (`hooks/README.md`, in the embedded template, on
+/// no compiled list, not a rule document) whose directory entry the user renamed by letter case alone.
+fn ww2_shipped() -> (&'static str, &'static str) {
+    let (rel, body) = cys::pack::PACK_ALL
+        .iter()
+        .find(|(r, _)| *r == "hooks/README.md")
+        .copied()
+        .expect("the template ships hooks/README.md");
+    assert!(!cys::pack::listed_in_compiled_lists(rel), "{rel} is on a compiled list");
+    assert!(super::rule_document_name(rel).is_none(), "{rel} is a rule document");
+    (rel, body)
+}
+
+/// WW2 (RULINGS KY · whole-diff review pass 2, slice WIN, M1), through the real verbs and the real install
+/// on THIS volume. Case-blind volume: the shipped `hooks/README.md` is renamed on disk to `hooks/readme.MD`
+/// (a real rename of the directory entry); for each typed spelling — the vendor's, the disk's, a third —
+/// `report --file` then `begin --files` then the deletion through record / verify / commit: the report is
+/// joined, the record and the tombstone carry the VENDOR's rel, and the next install (`install_into_with`
+/// with the lane's tombstones) keeps the file absent. Case-sensitive volume: `hooks/README.md` and
+/// `hooks/README.MD` are two files and stay two repairs' targets.
+#[test]
+fn ww2_a_shipped_file_renamed_by_case_keeps_the_vendors_name() {
+    let (vendor, body) = ww2_shipped();
+    let probe = rig("ww2probe");
+    let blind = ww1_case_blind_volume(&probe.pack);
+    eprintln!("ww2: the temporary volume is {}", if blind { "case-blind" } else { "case-sensitive" });
+    let w = seat(3, "worker");
+    if !blind {
+        let r = rig("ww2cs");
+        std::fs::write(r.pack.join("hooks/README.md"), body).unwrap();
+        std::fs::write(r.pack.join("hooks/README.MD"), b"another file\n").unwrap();
+        let rels = |who: &Caller, typed: &str| -> Vec<String> {
+            let v = r.call(T0, who, "begin", json!({"trigger": "owner_order", "files": [typed]})).unwrap();
+            r.record_of(v["repair"].as_str().unwrap()).files.iter().map(|f| f.rel.clone()).collect()
+        };
+        assert_eq!(rels(&w, "hooks/README.md"), ["hooks/README.md"]);
+        assert_eq!(rels(&seat(13, "worker-3"), "hooks/README.MD"), ["hooks/README.MD"], "two files stay two targets");
+        return;
+    }
+    let disk = "hooks/readme.MD";
+    for (i, typed) in [vendor, disk, "HOOKS/Readme.Md"].into_iter().enumerate() {
+        let r = rig(&format!("ww2b{i}"));
+        std::fs::write(r.pack.join(vendor), body).unwrap();
+        std::fs::rename(r.pack.join(vendor), r.pack.join(disk)).unwrap();
+        let names: Vec<String> = std::fs::read_dir(r.pack.join("hooks")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        assert!(names.iter().any(|n| n == "readme.MD"), "the directory entry was renamed: {names:?}");
+        let rep = r.call(T0, &w, "report", json!({"file": typed, "error": "ValueError: bad"})).unwrap();
+        let begun = r.call(T0, &w, "begin", json!({"trigger": "owner_order", "files": [typed]})).unwrap();
+        let id = begun["repair"].as_str().unwrap().to_string();
+        std::fs::remove_file(r.pack.join(typed)).unwrap();
+        r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "delete it"})).unwrap();
+        r.call(T0 + 2.0, &seat(7, "reviewer-codex"), "attest_verify", json!({"repair": id, "verdict": "pass", "note": "gone"}))
+            .unwrap();
+        r.call(T0 + 3.0, &w, "commit", json!({"repair": id})).unwrap();
+        let rels: Vec<String> = r.record_of(&id).files.iter().map(|f| f.rel.clone()).collect();
+        let ts = cys::repair::tombstones::load_in(&r.root, &r.lane).unwrap();
+        let tomb: Vec<String> = ts.iter().map(|t| t.rel.clone()).collect();
+        // the next real install, with this lane's tombstones
+        cys::pack::install_into_with(
+            r.pack.clone(),
+            [(vendor, body)],
+            false,
+            "9.9.9",
+            false,
+            false,
+            cys::pack::PackScope::Base,
+            None,
+            None,
+            &cys::pack::UpdateSources::none().with_tombstones(ts),
+        )
+        .unwrap();
+        let back = std::fs::symlink_metadata(r.pack.join(vendor)).is_ok();
+        assert_eq!(
+            (rep["rel"].clone(), begun["intake_signatures"].clone(), rels, tomb, back),
+            (json!(vendor), json!([rep["signature"]]), vec![vendor.to_string()], vec![vendor.to_string()], false),
+            "typed {typed:?}: report rel · joined · record · tombstone · the file back after the install"
+        );
+    }
+}

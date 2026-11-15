@@ -97,6 +97,13 @@ pub fn normalize_rel(raw: &str) -> Result<String, RepairError> {
 /// fold to the typed component (a volume that distinguishes case); the difference is more than case
 /// (e.g. a Unicode normal form); the identities differ; or neither way gives a name (a pack folder that
 /// can be neither listed nor resolved — a broken installation). Nothing is refused here.
+///
+/// RULINGS KY1 (WW2), the rule in one sentence: a general file THIS binary ships is recorded under the
+/// embedded template's rel (`crate::pack::PACK_ALL`) when the typed rel folds to exactly that one shipped
+/// rel and names the same file on this volume, any other existing general file under the name its
+/// directory entries give it, and a listed, absent, linked or more-than-case-different target under the
+/// typed spelling. (Two shipped rels that fold alike — none in the template today — keep the typed
+/// spelling.)
 pub fn on_disk_rel(pack: &Path, rel: &str) -> String {
     on_disk_case_alias(pack, rel, &list_names).unwrap_or_else(|| rel.to_string())
 }
@@ -131,6 +138,19 @@ fn on_disk_case_alias(pack: &Path, rel: &str, list: &Lister<'_>) -> Option<Strin
     if crate::pack::listed_in_compiled_lists(rel) {
         return None;
     }
+    // KY1: a general file this binary ships is named by the template — the vendor's spelling is kept as
+    // typed (no listing), another spelling of the same file on this volume becomes the vendor's rel;
+    // otherwise (another file, an absent target, a link) WW1's rule below decides.
+    match shipped_rels_folding(rel, crate::pack::PACK_ALL.iter().map(|(r, _)| *r)).as_slice() {
+        [] => {}
+        [vendor] if *vendor == rel => return None,
+        [vendor] => {
+            if same_file_no_link(pack, rel, vendor) {
+                return Some(vendor.to_string());
+            }
+        }
+        _ => return None,
+    }
     let real = match spelled_by_listing(pack, rel, list) {
         Spelled::Name(n) => n,
         Spelled::NoName => return None,
@@ -141,6 +161,28 @@ fn on_disk_case_alias(pack: &Path, rel: &str, list: &Lister<'_>) -> Option<Strin
     }
     let typed_id = super::boot_critical::file_identity(&pack.join(rel))?;
     (super::boot_critical::file_identity(&pack.join(&real))? == typed_id).then_some(real)
+}
+
+/// RULINGS KY1: the shipped rels that `crate::pack::list_key` folds to the typed rel's key.
+fn shipped_rels_folding<'a>(rel: &str, shipped: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let key = crate::pack::list_key(rel);
+    shipped.filter(|r| crate::pack::list_key(r) == key).collect()
+}
+
+/// RULINGS KY1: `pack/a` and `pack/b` are the same file on this volume (volume + file id), with no link
+/// on either chain inside the pack (no listing — one `lstat` per component).
+fn same_file_no_link(pack: &Path, a: &str, b: &str) -> bool {
+    let no_link = |rel: &str| {
+        let mut p = pack.to_path_buf();
+        rel.split('/').all(|c| {
+            p = p.join(c);
+            std::fs::symlink_metadata(&p).is_ok_and(|m| !m.file_type().is_symlink())
+        })
+    };
+    no_link(a)
+        && no_link(b)
+        && super::boot_critical::file_identity(&pack.join(a))
+            .is_some_and(|x| super::boot_critical::file_identity(&pack.join(b)) == Some(x))
 }
 
 /// What the directory entries say about a typed rel.
@@ -893,6 +935,51 @@ mod tests {
         let got = on_disk_case_alias(&d, "BIN/A.py", &mid_way);
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(got.as_deref(), Some("bin/a.py"));
+    }
+
+    /// WW2 (RULINGS KY1): the fold over the shipped rels — exactly one match, none, or (a template that
+    /// would ship two names differing by case — none today) two, which keeps the typed spelling.
+    #[test]
+    fn ww2_shipped_rels_folding() {
+        let shipped = ["hooks/README.md", "bin/a.py"];
+        assert_eq!(shipped_rels_folding("HOOKS/readme.MD", shipped.iter().copied()), ["hooks/README.md"]);
+        assert_eq!(shipped_rels_folding("hooks/README.md", shipped.iter().copied()), ["hooks/README.md"]);
+        assert!(shipped_rels_folding("hooks/other.md", shipped.iter().copied()).is_empty());
+        let two = ["docs/X.md", "docs/x.md"];
+        assert_eq!(shipped_rels_folding("DOCS/x.MD", two.iter().copied()).len(), 2);
+        assert!(crate::pack::PACK_ALL.iter().any(|(r, _)| *r == "hooks/README.md"), "the template ships hooks/README.md");
+    }
+
+    /// WW2 (RULINGS KY1) on this machine's temporary volume (measured): the shipped `hooks/README.md`
+    /// renamed on disk to `hooks/readme.MD` — every spelling records the template's rel on a case-blind
+    /// volume; a file the template does not ship keeps WW1's rule (the disk's spelling). On a volume that
+    /// distinguishes case `hooks/README.md` and `hooks/README.MD` are two files and each stays itself.
+    #[test]
+    fn ww2_a_shipped_rel_is_named_by_the_template() {
+        let d = tmp(35);
+        std::fs::create_dir_all(d.join("hooks")).unwrap();
+        let blind = case_blind(&d);
+        eprintln!("ww2: the temporary volume is {}", if blind { "case-blind" } else { "case-sensitive" });
+        if blind {
+            std::fs::write(d.join("hooks/README.md"), b"vendor\n").unwrap();
+            std::fs::rename(d.join("hooks/README.md"), d.join("hooks/readme.MD")).unwrap();
+            for typed in ["hooks/README.md", "hooks/readme.MD", "HOOKS/Readme.Md"] {
+                assert_eq!(on_disk_rel(&d, typed), "hooks/README.md", "{typed}");
+            }
+            // a file the template does not ship: WW1's rule, the disk's spelling
+            std::fs::write(d.join("hooks/Not-Shipped-WW2.md"), b"mine\n").unwrap();
+            assert_eq!(on_disk_rel(&d, "hooks/not-shipped-ww2.MD"), "hooks/Not-Shipped-WW2.md");
+            // an absent shipped file keeps the typed spelling (#191 stays a stated limit)
+            std::fs::remove_file(d.join("hooks/readme.MD")).unwrap();
+            assert_eq!(on_disk_rel(&d, "HOOKS/Readme.Md"), "HOOKS/Readme.Md");
+        } else {
+            std::fs::write(d.join("hooks/README.md"), b"vendor\n").unwrap();
+            std::fs::write(d.join("hooks/README.MD"), b"another file\n").unwrap();
+            assert_eq!(on_disk_rel(&d, "hooks/README.md"), "hooks/README.md");
+            assert_eq!(on_disk_rel(&d, "hooks/README.MD"), "hooks/README.MD", "two files stay two");
+            assert_eq!(on_disk_rel(&d, "hooks/readme.md"), "hooks/readme.md", "absent here: typed");
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// RULINGS AW3 (a): Windows short names are refused on every system; a `~` that is not followed
