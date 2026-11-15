@@ -199,6 +199,11 @@ pub struct LaneRecord {
     pub merge_lock: Option<Lease>,
     pub merge_attempt: u32,
     pub updated_at: f64,
+    /// RULINGS IK2 (T7b) — why the row is in its state, in a person's words (the propagation's reason
+    /// for a 충돌, a 대기 or a 검증됨); shown by `status`, printed in the merge ticket. Absent in rows
+    /// written before it (empty — the serde default), and not written while empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
 }
 
 /// `repairs/lanes/<lane_key>.job.json` (O-C7-4, RULINGS I7, I8, L1, O4).
@@ -1497,6 +1502,7 @@ mod tests {
             merge_base: vec![("bin/a.py".into(), "file:aa:0644".into())],
             merge_lock: Some(lease(None)),
             merge_attempt: 1,
+            reason: String::new(),
             updated_at: 7.5,
         };
         let v = serde_json::to_value(&lane).unwrap();

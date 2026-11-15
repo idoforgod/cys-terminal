@@ -3408,6 +3408,7 @@ mod ledger_verbs {
                 merge_base: Vec::new(),
                 merge_lock: None,
                 merge_attempt: 0,
+                reason: String::new(),
                 updated_at: ctx.now,
             };
             ledger::write_lane_in(&ctx.root, &row)?;
@@ -3666,6 +3667,7 @@ mod ledger_verbs {
                     Some(_) => "merge_unchanged",
                 };
                 json!({"lane": r.lane.0, "state": r.state, "state_label": r.state.label_ko(), "holds": holds,
+                       "reason": r.reason, // RULINGS IK2 (T7b): why the row is in its state
                        "applied_is_current": r.applied == rec.committed,
                        "merge_lock": r.merge_lock.as_ref().map(|l| json!({"seat": l.owner.seat, "expires_at": l.expires_at}))})
             })

@@ -256,6 +256,28 @@ class TicketGate(unittest.TestCase):
             rc, out, err = run_tp(merge="R-7")
         self.assertEqual((rc, out), (2, ""), "a record that cannot be read gives no ticket")
 
+    # RULINGS IK2: the merge ticket prints the department row's reason (the worker learns that R's bytes never
+    # arrived, or that its check failed) — the row of the lane the ticket is FOR, nothing of another lane
+    def test_merge_ticket_prints_the_rows_reason(self):
+        sock = os.path.join(self.tmp, "state", "cys-dept-dept-a", "cys.sock")
+        with open(os.environ["CYS_DEPTS_JSON"], "w", encoding="utf-8") as f:
+            json.dump({"depts": {"dept-a": {"socket": sock}}}, f)
+        import javis_lane
+        key = javis_lane.lane_key(sock)
+        why = "사본 검사 실패 — 살아 있는 파일은 바꾸지 않았습니다 · bin/a.py: 검사 시간 초과"
+        status = {"repair": "R-7", "trigger": "update", "classification": "general",
+                  "files": [{"rel": "bin/a.py", "kind": "edit"}],
+                  "lane_rows": [{"lane": "base", "state_label": "검증됨", "reason": "적용 뒤 이 부서의 검사 통과"},
+                                {"lane": key, "state_label": "충돌", "reason": why}]}
+        with path_with(self.stub(GATE_HELD, 95, status)):
+            rc, out, err = run_tp(merge="R-7", surface="dept-a/surface:5")
+        self.assertEqual(rc, 0, err)
+        lines = out.splitlines()
+        self.assertIn("  까닭(이 부서의 행 · 충돌): %s" % why, lines)
+        self.assertNotIn("적용 뒤 이 부서의 검사 통과", out, "never another lane's row")
+        head = [i for i, ln in enumerate(lines) if ln.startswith("병합 티켓 — R-7")][0]
+        self.assertTrue(lines[head + 1].startswith("  까닭("), "the reason follows the head line")
+
     # T-9 (the real CLI): the merge lines parse with the built `cys` when it is there (exit ≠ 2 = not a
     # usage error; no daemon is started — `cys repair` never autostarts, the socket points nowhere)
     def test_merge_lines_are_accepted_by_the_real_cli(self):
