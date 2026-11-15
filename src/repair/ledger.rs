@@ -388,7 +388,15 @@ pub fn pack_instance_pass(
         locked: &super::apply::no_repair_lock,
         stop: &|_| false,
     };
-    match super::propagate::pack_instance_pass_in(&env, fresh_id) {
+    // RULINGS IV2 (T7b): the pass writes rows, the job state and the pack's id file — inside the tried
+    // pack-apply lock, as the tick runs it (this T0 entry has no caller; it must not be a way round it)
+    let lock = crate::pack_apply_lock::pack_apply_lock_path_for(pack_dir);
+    let outcome = match crate::pack_apply_lock::try_with_apply_lock(&lock, || super::propagate::pack_instance_pass_in(&env, fresh_id)) {
+        Ok(Some(o)) => o,
+        Ok(None) => return Err(RepairError::Locked("다른 적용이나 업데이트가 팩을 바꾸는 중 — 팩 식별 확인은 다음 차례에".into())),
+        Err(why) => return Err(RepairError::Io(why)),
+    };
+    match outcome {
         super::propagate::PassOutcome::Equal | super::propagate::PassOutcome::VerifyOnly { .. } => Ok(PackInstanceOutcome::Same),
         super::propagate::PassOutcome::Reset { demoted } => Ok(PackInstanceOutcome::Reset { demoted }),
         super::propagate::PassOutcome::Skipped(why) => Err(RepairError::Io(why)),
