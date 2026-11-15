@@ -1018,7 +1018,7 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, _listed_row: &LaneRecor
         }
         let why = format!(
             "팩 세대가 적용 때와 다르거나 알 수 없습니다(지금 {}) — 아무것도 되돌리지 않습니다(새 버전 우선)",
-            now_bound.known().map_or_else(|| "unknown".to_string(), |g| g.version)
+            now_bound.version_label()
         );
         close_row(env, id, &format!("대체됨 — {why}"), &[], Some(RepairState::Superseded))?;
         report.superseded.push(id.clone());
