@@ -594,8 +594,12 @@ fn incoming_copy(
                     source.display()
                 )));
             }
-            let bytes = std::fs::read(&source)
-                .map_err(|e| RepairError::Io(format!("{}: {e}", source.display())))?;
+            // RULINGS JH2: at most the limit + 1 bytes from one handle
+            let bytes = match super::durable::read_record_bytes(&source) {
+                super::durable::RecordRead::Bytes(b) => b,
+                super::durable::RecordRead::NotFound => return Err(RepairError::Io(format!("{}: 없음", source.display()))),
+                super::durable::RecordRead::Unreadable(why) => return Err(RepairError::Precondition(why)),
+            };
             write_new(&p, &bytes, mode)?;
         }
         Staged::Bytes { bytes, mode } => write_new(&p, &bytes, mode)?,
@@ -909,12 +913,12 @@ fn step4(
     rec: &mut OpRecord,
     slot: &Slot,
     live: &Path,
-    deposit: &TargetState,
+    deposit: &super::types::Observed,
     depth: u8,
 ) -> Result<OpDone, RepairError> {
     let gen_ok = Bound::of(rec.pack_generation.clone()).equals_now(env.pack);
     let expected = canon_req(&rec.expected, &rec.rel)?;
-    if *deposit == expected && gen_ok {
+    if deposit.is(&expected) && gen_ok {
         // CT3 — the outcome reported is the outcome measured: what is NOW live must be the state
         // this operation was to put live; otherwise it is another writer's (GK2, below)
         let incoming = canon_req(&rec.incoming, &rec.rel)?;
@@ -943,17 +947,25 @@ fn step4(
         wal::finish(env.root, rec, "applied", "", env.now)?;
         return Ok(done(ApplyOutcome::Applied, Some(rec)));
     }
-    let mut note = if *deposit != expected {
+    let mut note = if !deposit.is(&expected) {
         format!(
             "{}: 보관소에 들어간 것이 기대한 바이트가 아닙니다(다른 작성자가 그 사이에 썼습니다 · {} ≠ {})",
             spec.rel,
-            deposit.canon(),
+            deposit.describe(),
             expected.canon()
         )
     } else {
         format!("{}: 그 사이 팩 세대가 바뀌었습니다", spec.rel)
     };
-    if *deposit != expected && depth == 0 {
+    // RULINGS JH2 — a deposit kept unsealed over the limit is never re-lived (never a source)
+    if let super::types::Observed::OverLimit { .. } = deposit {
+        note.push_str(&format!(
+            " · 밀려난 바이트가 엔진의 읽기 한도 {}바이트를 넘어 봉인하지 않고 보관 칸({})에 옮긴 그대로 두었습니다 — 되살리지 않았습니다(충돌)",
+            super::durable::RECORD_READ_CAP,
+            slot.dir.display()
+        ));
+    }
+    if let (super::types::Observed::State(deposit), true) = (deposit, !deposit.is(&expected) && depth == 0) {
         // the other writer's bytes are re-lived only from the SEALED copy (or the link itself)
         let holder = if std::fs::symlink_metadata(slot.sealed()).is_ok() {
             slot.sealed()
@@ -1070,7 +1082,7 @@ fn after_seal_move_in(
     }
     let expected = canon_req(&rec.expected, &rec.rel)?;
     let gen_ok = Bound::of(rec.pack_generation.clone()).equals_now(env.pack);
-    if facts.sealed_state == expected && gen_ok {
+    if facts.sealed_state.is(&expected) && gen_ok {
         if env.faults.at(Point::BeforeDone, live, Some(slot)) {
             return Err(stop(Point::BeforeDone));
         }
@@ -1081,13 +1093,21 @@ fn after_seal_move_in(
     let mut note = format!(
         "{}: 옮겨 넣은 것이 기대한 바이트가 아닙니다({} ≠ {})",
         spec.rel,
-        facts.sealed_state.canon(),
+        facts.sealed_state.describe(),
         expected.canon()
     );
     if !gen_ok {
         note.push_str(" · 팩 세대가 바뀌었습니다");
     }
-    if facts.sealed_state != expected && depth == 0 {
+    // RULINGS JH2 — a deposit kept unsealed over the limit is never placed back (never a source)
+    if let super::types::Observed::OverLimit { .. } = &facts.sealed_state {
+        note.push_str(&format!(
+            " · 옮겨 넣은 바이트가 엔진의 읽기 한도 {}바이트를 넘어 봉인하지 않고 보관 칸({})에 그대로 두었습니다 — 다시 놓지 않았습니다(충돌)",
+            super::durable::RECORD_READ_CAP,
+            slot.dir.display()
+        ));
+    }
+    if let (super::types::Observed::State(sealed_state), true) = (&facts.sealed_state, !facts.sealed_state.is(&expected) && depth == 0) {
         let holder = if std::fs::symlink_metadata(slot.sealed()).is_ok() {
             slot.sealed()
         } else {
@@ -1102,7 +1122,7 @@ fn after_seal_move_in(
                 kind: "undo-superseded".into(),
                 // GK2: what this move-in operation left (its record: absent)
                 expected: Recorded::placed_by(rec)?,
-                incoming: facts.sealed_state.clone(),
+                incoming: sealed_state.clone(),
                 source: Source::Slot { holder },
                 bound: Bound::of(rec.pack_generation.clone()),
             };
@@ -2012,7 +2032,16 @@ fn recover_one_revert(
         let outcome = if live_now.is(&pre) {
             ApplyOutcome::Applied // restored before the crash
         } else if live_now.is(&applied) {
-            let (_, holder) = pre_image_for(env.root, rec, env.lane, &t.rel)?;
+            // RULINGS JH2: a pre-image kept unsealed over the limit is never a source — that target
+            // is a conflict (once: the revert intent then ends incomplete), the others go on
+            let holder = match pre_image_for(env.root, rec, env.lane, &t.rel) {
+                Ok((_, holder)) => holder,
+                Err(RepairError::Declined(m)) => {
+                    files.push((t.rel.clone(), ApplyOutcome::Declined(m)));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             run_op(
                 env,
                 &OpSpec {
@@ -2123,7 +2152,12 @@ pub fn revert_in(
         let expected = parse_canon(canon).ok_or_else(|| {
             RepairError::Corrupt(format!("{rel}: 기록된 상태를 읽을 수 없습니다({canon})"))
         })?;
-        let (pre, holder, slot) = pre_image_slot_for(env.root, &rec, env.lane, rel)?;
+        // RULINGS JH2: a pre-image kept unsealed over the limit is never a return's source — a conflict
+        let (pre, holder, slot) = match pre_image_slot_for(env.root, &rec, env.lane, rel) {
+            Ok(x) => x,
+            Err(RepairError::Declined(m)) => return Ok(close_conflict(env, &rec, &m, &by_label, locked)?),
+            Err(e) => return Err(e),
+        };
         // FI1: the door's binding for a put-back is the generation of the bytes put back — GV1: a
         // generation that moved on is judged FIRST and closes the revert "superseded"
         let bound = put_back_bound(slot.as_deref(), &row_bound);
