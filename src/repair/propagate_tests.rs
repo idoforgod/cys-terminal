@@ -560,6 +560,11 @@ fn pass_read_error_skips_without_a_reset() {
 
 /// L1 / L5 (a): the same id in ANOTHER directory (a replacement) → the VERIFY-ONLY pass: an
 /// unchanged row stays (no check runs, the lane is not held), a row whose live file differs → 대기.
+/// (Rewritten by WP1, RULINGS LA / LB: the rows here are the propagation's own applies, whose OPEN
+/// bundles are T6's — the pass now leaves them; the old sequence went straight from the tick to the
+/// replacement and expected `VerifyOnly { demoted: 1 }`. Now T6 first ends both 24-hour probations, as
+/// it does, and the pass demotes the changed row as before; the open-bundle case is
+/// `wp1_a_receiving_lanes_open_bundle_is_left_to_t6_through_a_reset`.)
 #[test]
 fn pass_directory_change_runs_the_verify_only_pass() {
     let r = rig("p8");
@@ -572,6 +577,8 @@ fn pass_directory_change_runs_the_verify_only_pass() {
     tick(&r, DEPT, &d, &fid(1));
     assert_eq!(r.row(&a, DEPT).unwrap().state, LaneState::Verified);
     assert_eq!(gate_verdict_in(&r.root, &lane(DEPT)), GateVerdict::Open);
+    t6_tick(&r, DEPT, T0 + crate::repair::ledger::PROBATION_SECS as f64 + 1.0, false);
+    assert!(r.row(&b, DEPT).unwrap().probation.and_then(|p| p.closed).is_some(), "T6 ended the probation");
     // the department's pack is replaced by a copy (a new directory, the id file copied along) whose
     // b.py lost the repair
     let old = r.base.join("pack-dept-old");
@@ -592,7 +599,9 @@ fn pass_directory_change_runs_the_verify_only_pass() {
 }
 
 /// O4: a generation change (an in-place update — department packs and `pack-update` change in place,
-/// GH1) → the verify-only pass too.
+/// GH1) → the verify-only pass too. (Rewritten by WP1, RULINGS LA / LB: the row is the propagation's own
+/// apply; its OPEN bundle is T6's and the pass leaves it — the old sequence expected `demoted: 1`
+/// straight after the tick. Now T6 ends the 24-hour probation first, and the pass demotes as before.)
 #[test]
 fn pass_generation_change_runs_the_verify_only_pass() {
     let r = rig("p9");
@@ -600,6 +609,7 @@ fn pass_generation_change_runs_the_verify_only_pass() {
     committed_in_hq(&r, &a, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
     r.put(DEPT, "bin/a.py", b"old\n", 0o644);
     tick(&r, DEPT, &doubles(), &fid(1));
+    t6_tick(&r, DEPT, T0 + crate::repair::ledger::PROBATION_SECS as f64 + 1.0, false);
     std::fs::write(r.dept.join(".pack-version"), "0.15.1\n").unwrap();
     r.put(DEPT, "bin/a.py", b"vendor\n", 0o644);
     let l = lane(DEPT);
@@ -1198,7 +1208,11 @@ fn a_mode_only_change_uses_the_lanes_own_bytes() {
 }
 
 /// P2: a re-committed repair reaches a verified lane again — its previous applied result is a valid
-/// pre-image; a lane that holds a MERGE of the old result → 충돌 (interpretation 41).
+/// pre-image; a lane that holds a MERGE of the old result → 충돌 (interpretation 41). (Rewritten by WP1,
+/// RULINGS LA / LB: a re-commit reaches a lane whose OPEN bundle of the older result T6 has CLOSED — the
+/// old sequence re-committed right after the apply and expected the new result at the next tick; now T6
+/// ends each 24-hour probation first. The wait itself: `wp1_a_re_commit_waits_for_t6_to_close_the_older_
+/// open_bundle`.)
 #[test]
 fn a_re_commit_reaches_the_lane_again_and_a_merge_lane_conflicts() {
     let r = rig("r7");
@@ -1213,6 +1227,7 @@ fn a_re_commit_reaches_the_lane_again_and_a_merge_lane_conflicts() {
     let mut rec = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
     rec.committed = vec![("bin/a.py".into(), c.state.canon())];
     ledger::write_record_in(&r.root, &rec).unwrap();
+    t6_tick(&r, DEPT, T0 + crate::repair::ledger::PROBATION_SECS as f64 + 1.0, false);
     tick(&r, DEPT, &doubles(), &fid(2));
     assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"v2\n");
     let row = r.row(&id, DEPT).unwrap();
@@ -1227,6 +1242,7 @@ fn a_re_commit_reaches_the_lane_again_and_a_merge_lane_conflicts() {
     let c = seal_committed_copy_in(&r.root, &id, &lane(HQ), "bin/a.py", &r.hq.join("bin/a.py"), T0 + 1.0).unwrap();
     rec.committed = vec![("bin/a.py".into(), c.state.canon())];
     ledger::write_record_in(&r.root, &rec).unwrap();
+    t6_tick(&r, DEPT, T0 + 2.0 * crate::repair::ledger::PROBATION_SECS as f64 + 2.0, false);
     tick(&r, DEPT, &doubles(), &fid(3));
     assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Conflict, "a merge's bytes are not a pre-image");
     assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"v2\n");
@@ -2905,7 +2921,8 @@ fn a_row_records_its_observation_until_the_generation_changes() {
 
 /// JA3 (a meaning, stated): the catch-up is the first processing of the repairs observed for this
 /// pack instance; a re-commit after it does not cancel it — the gate stays OPEN, the row is demoted by
-/// P2 and decided anew.
+/// P2 and decided anew. (Rewritten by WP1, RULINGS LA / LB: P2 waits until T6 has closed the row's open
+/// bundle of the older result — the old sequence expected the new result at the very next tick.)
 #[test]
 fn a_recommit_after_the_catchup_leaves_the_gate_open_and_demotes_the_row() {
     let r = rig("ja3");
@@ -2922,6 +2939,7 @@ fn a_recommit_after_the_catchup_leaves_the_gate_open_and_demotes_the_row() {
     rec.committed = vec![("bin/a.py".into(), st.canon())];
     ledger::write_record_in(&r.root, &rec).unwrap();
     assert_eq!(gate_verdict_in(&r.root, &lane(DEPT)), GateVerdict::Open, "the catch-up is not cancelled");
+    t6_tick(&r, DEPT, T0 + crate::repair::ledger::PROBATION_SECS as f64 + 1.0, false);
     tick(&r, DEPT, &doubles(), &fid(1));
     let row = r.row(&id, DEPT).unwrap();
     assert_eq!(row.applied, rec.committed, "P2: demoted and decided anew — the new result applied");
