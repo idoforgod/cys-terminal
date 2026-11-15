@@ -1093,6 +1093,11 @@ fn run_with(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, rpc: Rpc<
                     s(&v, "lane"),
                     s(&v, "lane_state_label")
                 );
+                // RULINGS JD2: what the call changed, on a line of its own
+                let changed = s(&v, "changed");
+                if !changed.is_empty() {
+                    let _ = writeln!(out, "  {changed}");
+                }
                 0
             }
             Err(e) => fail(err, &e),
@@ -2086,6 +2091,30 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\n  dept-a: 충돌 — 사본 검사 실패 — 살아 있는 파일은 바꾸지 않았습니다\n"), "{text}");
         assert!(!text.contains("  base:"), "{text}");
+    }
+
+    /// RULINGS JD2 / JF (CCR-JD2b): `cys repair recheck R` prints the daemon's sentence of what the call
+    /// changed on a line of its own, after the state line; an answer without it (an older daemon) prints
+    /// the state line only.
+    #[test]
+    fn recheck_prints_what_the_call_changed_on_its_own_line() {
+        let cmd = parse(&["recheck", "R-1"]).unwrap();
+        let changed = "이 호출이 바꾼 것: 이 부서의 행('충돌' → '검증됨', 합친 기록을 남기고 합치기 잠금을 풂), 이 부서의 훅 등록 해제(작업 op-1: Stop:x.sh)";
+        let rpc = |m: &str, p: Value| -> Result<Value, String> {
+            assert_eq!(m, "repair.recheck");
+            assert_eq!(p["repair"], "R-1");
+            Ok(json!({"repair": "R-1", "lane": "dept-a", "lane_state": "verified", "lane_state_label": "검증됨", "changed": changed}))
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(run_with(&cmd, &mut out, &mut err, &rpc), 0);
+        assert!(err.is_empty());
+        assert_eq!(String::from_utf8(out).unwrap(), format!("R-1: 이 부서(dept-a)에서 다시 검사 — 검증됨\n  {changed}\n"));
+        let older = |_: &str, _: Value| -> Result<Value, String> {
+            Ok(json!({"repair": "R-1", "lane": "dept-a", "lane_state": "verified", "lane_state_label": "검증됨"}))
+        };
+        let mut out = Vec::new();
+        assert_eq!(run_with(&cmd, &mut out, &mut Vec::new(), &older), 0);
+        assert_eq!(String::from_utf8(out).unwrap(), "R-1: 이 부서(dept-a)에서 다시 검사 — 검증됨\n");
     }
 
     /// RULINGS IK1 (blocking — queue blocking): every key `lane::lane_key` makes for a department whose

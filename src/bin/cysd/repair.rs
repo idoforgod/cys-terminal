@@ -4001,8 +4001,9 @@ pub(crate) mod propagate_verbs {
             pass_stop: &|_| false,
         };
         let owner = ctx.owner(sid);
-        let state = cys::repair::propagate::recheck_lane_in(&env, &id, sid, &owner, &ctx.incarnation, &note).map_err(VerbError::from)?;
-        Ok(json!({"repair": id.as_str(), "lane": ctx.lane.0, "lane_state": state, "lane_state_label": state.label_ko()}))
+        let r = cys::repair::propagate::recheck_lane_in(&env, &id, sid, &owner, &ctx.incarnation, &note).map_err(VerbError::from)?;
+        // RULINGS JD2: the answer names what the call changed (the row, the hook operation, tombstones)
+        Ok(json!({"repair": id.as_str(), "lane": ctx.lane.0, "lane_state": r.state, "lane_state_label": r.state.label_ko(), "changed": r.changed}))
     }
 
     /// RULINGS HH4 — this lane's propagation on the job thread (`repair_job::run_job`, after T6's
