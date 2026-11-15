@@ -465,37 +465,35 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
         //   수리를 재검사 — `javis_dept_schedule.py` 의 본부 전용 목록에 넣지 않는다) · via_queue 없음.
         //   데몬은 `repair.tick` 에 곧바로 답하고(started|busy|not_ready|idle) 일은 데몬 스레드 하나가 한다 —
         //   예약기의 발화 규칙·600초 시간 초과·다른 작업은 그대로다. 결과는 장부에만 남는다(큐·경보·버스 0).
-        // ★WS1 (RULINGS JX1): `_builtin_fixed` = BUILTIN_FIXED_KEY — no writer may remove or change this job: the boot
-        //   restores it whole and the scheduler's tick re-ensures it in a valid file (the attribute is the ONE place).
+        // ★WS1 (RULINGS KN1): this job is FIXED by its id (`cys::repair::probation::FIXED_BUILTIN_JOB_IDS`) — no writer
+        //   may remove or change it: the boot restores it whole and the scheduler's tick re-ensures it in a valid file.
         json!({
             "id": REPAIR_JOB_ID,
             "every_minutes": 2,
             "action": "command",
             "command": "CYS_NO_AUTOSTART=1 cys repair tick",
             "_builtin": "repair",
-            "_builtin_version": BUILTIN_JOBS_VERSION,
-            "_builtin_fixed": true
+            "_builtin_version": BUILTIN_JOBS_VERSION
         }),
     ]
 }
 
-/// ★0.15.0 (T6 · C7 O-C7-1): the ONE appended built-in job's id.
-pub(crate) const REPAIR_JOB_ID: &str = "repair-probation-tick";
+/// ★0.15.0 (T6 · C7 O-C7-1): the ONE appended built-in job's id — defined in the library
+/// (`cys::repair::probation::REPAIR_JOB_ID`, WS1 · RULINGS KN1) so that the CLI reads the same id.
+pub(crate) use cys::repair::probation::REPAIR_JOB_ID;
 
-/// ★0.15.0 (WS1 · RULINGS JX1): the attribute on a built-in job's entry in [`builtin_jobs`] that says NO writer may
-/// remove or change that job (RULINGS AW7 / AY7). It is the ONE place the property lives — not a list of ids: the boot's
-/// ensure restores such a job WHOLE ([`restore_fixed_builtin`]) and the scheduler's tick re-ensures it in a valid file
-/// ([`restore_fixed_builtin_jobs`]). Today exactly the repair job carries it; a later safety job joins by carrying it.
-/// The CLI's `schedule remove` reads the same name from the stored entry (`cys.rs::SCHEDULE_BUILTIN_FIXED_KEY`).
-pub(crate) const BUILTIN_FIXED_KEY: &str = "_builtin_fixed";
-
-/// Does this built-in definition carry [`BUILTIN_FIXED_KEY`]?
+/// ★0.15.0 (WS1 · RULINGS KN1): is this built-in definition a FIXED job — one no writer may remove or change
+/// (RULINGS AW7 / AY7)? Decided by the job's ID in the library's ONE definition
+/// (`cys::repair::probation::FIXED_BUILTIN_JOB_IDS`), never by a field of the file: a `_builtin_fixed` left in a stored
+/// entry by a preview build decides nothing (the whole-definition restore drops it), and a user's job that carries one is
+/// an ordinary job. The boot's ensure restores such a job WHOLE ([`restore_fixed_builtin`]) and the scheduler's tick
+/// re-ensures it in a valid file ([`restore_fixed_builtin_jobs`]).
 fn is_fixed_builtin(bj: &serde_json::Value) -> bool {
-    bj.get(BUILTIN_FIXED_KEY).and_then(|v| v.as_bool()) == Some(true)
+    bj.get("id").and_then(|v| v.as_str()).is_some_and(|id| cys::repair::probation::FIXED_BUILTIN_JOB_IDS.contains(&id))
 }
 
-/// ★0.15.0 (T6 · RULINGS AW7 as amended by AY7 · AGREEMENT 21 "내장 자가치유 작업"; WS1 · RULINGS JX1): put ONE fixed
-/// built-in job (`bj`, it carries [`BUILTIN_FIXED_KEY`]) back WHOLE in `jobs` — its ENTIRE definition from code (every
+/// ★0.15.0 (T6 · RULINGS AW7 as amended by AY7 · AGREEMENT 21 "내장 자가치유 작업"; WS1 · RULINGS JX1 / KN1): put ONE
+/// fixed built-in job (`bj`, its id is in `FIXED_BUILTIN_JOB_IDS`) back WHOLE in `jobs` — its ENTIRE definition from code (every
 /// field, compared canonically: serde_json values compare as maps), whatever the stored entry holds (marker or not);
 /// duplicate entries under its id are dropped (CU4); logged once per restore. Returns whether `jobs` changed. The ONE
 /// restore of such a job: the boot's ensure ([`apply_builtin_jobs`]) and the scheduler's tick
@@ -858,7 +856,7 @@ fn apply_builtin_jobs(
             None => continue,
         };
         // ★0.15.0 (T6 · RULINGS AW7 as amended by AY7 · AGREEMENT 21 "내장 자가치유 작업"; WS1 · RULINGS JX1): a FIXED
-        //   built-in job (its definition carries `BUILTIN_FIXED_KEY` — today the appended self-repair job) is not
+        //   built-in job (its id is in `FIXED_BUILTIN_JOB_IDS` — today the appended self-repair job) is not
         //   removable or editable through schedule.json: its ENTIRE definition is restored from code by
         //   `restore_fixed_builtin`, the one restore the scheduler's tick also uses. Every OTHER built-in keeps the rule
         //   below unchanged (a user may hold their ids).
@@ -5450,7 +5448,6 @@ exit 0
         // ④ 전역 버전은 이 이관으로 올라가지 않는다(범프 = 모든 builtin 통째 교체).
         assert_eq!(BUILTIN_JOBS_VERSION, 2, "표적 이관에 전역 버전을 올렸다(§B-5 위반)");
     }
-
 }
 
 /// ★U4-B2①(0.14.41) 스케줄 잡 결과 원장 검체 — 메모리 전용 · 드러내기만.
@@ -8340,20 +8337,19 @@ mod repair_job_schedule_tests {
         jobs
     }
 
-    /// WS1 · RULINGS JX1 — the property "no writer may remove it" lives in the job's ONE definition as the attribute
-    /// `_builtin_fixed: true`; today exactly the repair job carries it (a later safety job joins by carrying it).
+    /// WS1 · RULINGS KN1 — "no writer may remove it" is the job's ID in the library's ONE definition
+    /// (`cys::repair::probation::FIXED_BUILTIN_JOB_IDS`, beside `REPAIR_JOB_ID`); today exactly the repair job (a later
+    /// safety job joins by its id there). Every fixed id has its definition in `builtin_jobs()`, the daemon's predicate
+    /// selects exactly that set, and no definition carries a `_builtin_fixed` field (a field of the file decides nothing).
+    /// (Before KN1: the set of definitions carrying `"_builtin_fixed": true` was asserted to be `[REPAIR_JOB_ID]`.)
     #[test]
-    fn ws1_the_fixed_attribute_marks_exactly_the_repair_job() {
-        let fixed: Vec<String> = builtin_jobs()
-            .iter()
-            .filter(|j| j.get("_builtin_fixed") == Some(&json!(true)))
-            .filter_map(|j| j["id"].as_str().map(str::to_string))
-            .collect();
-        assert_eq!(fixed, vec![REPAIR_JOB_ID.to_string()], "the set of fixed built-in jobs");
-        assert_eq!(BUILTIN_FIXED_KEY, "_builtin_fixed");
-        let by_predicate: Vec<String> =
-            builtin_jobs().iter().filter(|j| is_fixed_builtin(j)).filter_map(|j| j["id"].as_str().map(str::to_string)).collect();
-        assert_eq!(by_predicate, fixed, "the code's predicate selects the same set");
+    fn ws1_the_fixed_set_is_exactly_the_repair_job() {
+        assert_eq!(cys::repair::probation::FIXED_BUILTIN_JOB_IDS, &[REPAIR_JOB_ID], "the library's fixed set");
+        assert_eq!(REPAIR_JOB_ID, "repair-probation-tick");
+        let defs = builtin_jobs();
+        let by_predicate: Vec<&str> = defs.iter().filter(|j| is_fixed_builtin(j)).filter_map(|j| j["id"].as_str()).collect();
+        assert_eq!(by_predicate, vec![REPAIR_JOB_ID], "the daemon's predicate selects the library's set, each with a definition");
+        assert!(defs.iter().all(|j| j.get("_builtin_fixed").is_none()), "a definition carries a fixedness field again");
     }
 
     /// WS1 · RULINGS JV3 / JX1 — the whole-diff review's sequence (F3-B2): the preflight's C16 reads the schedule (no
@@ -8530,6 +8526,57 @@ mod repair_job_schedule_tests {
         assert!(!interval_due(job.every_minutes, fired, fired + 60), "due at once because it was re-registered");
         assert!(interval_due(job.every_minutes, fired, fired + 120), "not due at its interval");
         assert!(!interval_due(job.every_minutes, fired + 120, fired + 121), "due twice");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS1 · RULINGS KN1 — "fixed" is a property of the job's ID in ONE definition, never a field the file carries: the
+    /// boot writes no `_builtin_fixed` into the file; the repair job's stored entry without the marker, with `false`, with
+    /// a forged value or with `true` (a preview build's form) is put back WHOLE all the same, and the file is left without
+    /// the marker; an ordinary user job that carries `"_builtin_fixed": true` is left as it is, and once another writer
+    /// removed it, it is never restored.
+    #[test]
+    fn ws1_fixedness_is_the_jobs_id_never_a_marker_in_the_file() {
+        let dir = ws1_dir("marker");
+        let path = dir.join("schedule.json");
+        ensure_builtin_jobs_at(&path); // the boot on a fresh lane
+        let booted = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        assert!(booted.contains(REPAIR_JOB_ID), "the boot registered the job");
+        assert!(!booted.contains("_builtin_fixed"), "the boot wrote a fixedness marker into the file");
+        let variants: [(&str, Option<serde_json::Value>); 4] =
+            [("no marker", None), ("false", Some(json!(false))), ("forged", Some(json!("yes"))), ("a preview build's true", Some(json!(true)))];
+        for (variant, marker) in variants {
+            let mut entry = def();
+            if let Some(o) = entry.as_object_mut() {
+                o.remove("_builtin_fixed");
+                if let Some(m) = &marker {
+                    o.insert("_builtin_fixed".into(), m.clone());
+                }
+            }
+            let mut jobs = ws1_released();
+            jobs.push(entry);
+            ws1_replace(&path, &json!({"jobs": jobs}));
+            let run = load_jobs_at(&path, LoadMode::HotReload);
+            assert_eq!(run.iter().filter(|j| j.id == REPAIR_JOB_ID).count(), 1, "{variant}: the tick runs the job");
+            let after = ws1_jobs(&path);
+            let mine: Vec<&serde_json::Value> = after.iter().filter(|j| j["id"] == REPAIR_JOB_ID).collect();
+            assert_eq!(mine, vec![&def()], "{variant}: put back whole");
+            assert!(mine[0].get("_builtin_fixed").is_none(), "{variant}: the file still carries a fixedness marker");
+        }
+        // an ordinary user job that carries the marker: left as it is; removed by another writer: never restored
+        let marked = json!({"id": "user-marked", "every_minutes": 15, "action": "push", "to": "master", "text": "x", "_builtin_fixed": true});
+        let mut jobs = ws1_released();
+        jobs.push(def());
+        jobs.push(marked.clone());
+        ws1_replace(&path, &json!({"jobs": jobs.clone()}));
+        let kept = ws1_stamp(&path);
+        load_jobs_at(&path, LoadMode::HotReload);
+        assert!(ws1_stamp(&path) == kept, "a user's job that carries the marker was rewritten");
+        jobs.retain(|j| j["id"] != "user-marked");
+        ws1_replace(&path, &json!({"jobs": jobs}));
+        for tick in 1..=2 {
+            let run = load_jobs_at(&path, LoadMode::HotReload);
+            assert!(run.iter().all(|j| j.id != "user-marked"), "tick {tick} restored a user's job because it carried the marker");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
