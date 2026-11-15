@@ -979,7 +979,9 @@ fn run_with(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, rpc: Rpc<
     }
     // Track T5b — the hidden OS-verification helper (LOCAL: no daemon request; spawned by the daemon)
     if let RepairCmd::AuthHelper { request, reason } = cmd {
-        return auth_helper::run(request, reason, err);
+        // RULINGS JW1: the request's one-time nonce comes in the environment the daemon set
+        let nonce = std::env::var(auth_helper::NONCE_VAR).ok();
+        return auth_helper::run(request, reason, nonce.as_deref(), out, err);
     }
     // Track T5b — `submit` returns the request number at once (C5 5.6; no waiting anywhere)
     if let RepairCmd::Submit { repair, json } = cmd {
@@ -1066,16 +1068,51 @@ mod auth_helper {
             && !reason.chars().any(|c| c.is_control())
     }
 
-    pub(crate) fn run(request: &str, reason: &str, err: &mut dyn Write) -> i32 {
-        if !valid_args(request, reason) {
-            let _ = writeln!(err, "auth-helper: 잘못된 인자");
-            return EXIT_CANNOT_EVALUATE;
+    /// RULINGS JW1 — the environment variable in which the daemon hands this helper its request's
+    /// one-time nonce (the daemon's `HELPER_NONCE_VAR`).
+    pub(crate) const NONCE_VAR: &str = "CYS_REPAIR_AUTH_NONCE";
+
+    /// A nonce the daemon issues (hex, 16–64 characters).
+    pub(crate) fn valid_nonce(nonce: &str) -> bool {
+        (16..=64).contains(&nonce.len()) && nonce.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    /// RULINGS JW1 (HL3 (ii)) — the helper's answer on its standard output: ONE success record bound
+    /// to the request (its id and its one-time nonce), printed ONLY when the system's approval call
+    /// returned success (`code` 0); nothing otherwise. A record that cannot be written is no
+    /// success.
+    pub(crate) fn answer(code: i32, request: &str, nonce: &str, out: &mut dyn Write) -> i32 {
+        if code != 0 {
+            return code;
         }
+        if writeln!(out, "CYS-AUTH-OK v1 request={request} nonce={nonce}")
+            .and_then(|()| out.flush())
+            .is_err()
+        {
+            return EXIT_NO_COMPLETION;
+        }
+        0
+    }
+
+    pub(crate) fn run(
+        request: &str,
+        reason: &str,
+        nonce: Option<&str>,
+        out: &mut dyn Write,
+        err: &mut dyn Write,
+    ) -> i32 {
+        let nonce = match nonce {
+            Some(n) if valid_args(request, reason) && valid_nonce(n) => n,
+            _ => {
+                let _ = writeln!(err, "auth-helper: 잘못된 인자");
+                return EXIT_CANNOT_EVALUATE;
+            }
+        };
         if !cfg!(target_os = "macos") {
             let _ = writeln!(err, "auth-helper: 이 운영체제에서는 1차 출시에서 최종 승인을 받지 않습니다(대기)");
             return cys::repair::types::EXIT_REPAIR_PLATFORM_PENDING;
         }
-        evaluate(reason)
+        answer(evaluate(reason), request, nonce, out)
     }
 
     #[cfg(test)]
@@ -2267,11 +2304,28 @@ mod tests {
         for (r, why) in [("rq-", "x"), ("daemon-1", "x"), ("rq-zz", "x"), ("rq-12", ""), ("rq-12", "a\nb")] {
             assert!(!auth_helper::valid_args(r, why), "{r:?} {why:?}");
         }
-        let mut err = Vec::new();
-        assert_eq!(auth_helper::run("bad", "x", &mut err), auth_helper::EXIT_CANNOT_EVALUATE);
-        let mut err = Vec::new();
-        let code = auth_helper::run("rq-01", "이유", &mut err);
+        // RULINGS JW1 (rewritten — old calls `run("bad", "x", &mut err)` and `run("rq-01", "이유",
+        // &mut err)`): the helper now also takes its request's nonce and the output it answers on
+        let nonce = "00112233445566778899aabbccddeeff";
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(auth_helper::run("bad", "x", Some(nonce), &mut out, &mut err), auth_helper::EXIT_CANNOT_EVALUATE);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = auth_helper::run("rq-01", "이유", Some(nonce), &mut out, &mut err);
         assert_eq!(code, if cfg!(target_os = "macos") { auth_helper::EXIT_CANNOT_EVALUATE } else { cys::repair::types::EXIT_REPAIR_PLATFORM_PENDING });
+        assert!(out.is_empty(), "no record without the approval call's success");
+        // no nonce, or a malformed one: never evaluated, no record
+        for n in [None, Some("zz"), Some("0011")] {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(auth_helper::run("rq-01", "이유", n, &mut out, &mut err), auth_helper::EXIT_CANNOT_EVALUATE, "{n:?}");
+            assert!(out.is_empty());
+        }
+        // RULINGS JW1: the ONE record, only on the approval call's success
+        let mut out = Vec::new();
+        assert_eq!(auth_helper::answer(0, "rq-01", nonce, &mut out), 0);
+        assert_eq!(String::from_utf8(out).unwrap(), format!("CYS-AUTH-OK v1 request=rq-01 nonce={nonce}\n"));
+        let mut out = Vec::new();
+        assert_eq!(auth_helper::answer(auth_helper::EXIT_AUTH_FAILED, "rq-01", nonce, &mut out), auth_helper::EXIT_AUTH_FAILED);
+        assert!(out.is_empty());
         // measured LAError codes → the helper's exit codes (Ma-helper-auth-prompt.md §4)
         assert_eq!(auth_helper::exit_for_la_error(-2), 10);
         assert_eq!(auth_helper::exit_for_la_error(-9), 11);
