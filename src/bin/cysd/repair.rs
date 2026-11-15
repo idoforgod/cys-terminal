@@ -3409,6 +3409,7 @@ mod ledger_verbs {
                 merge_lock: None,
                 merge_attempt: 0,
                 reason: String::new(),
+                hook_ops: Vec::new(),
                 updated_at: ctx.now,
             };
             ledger::write_lane_in(&ctx.root, &row)?;

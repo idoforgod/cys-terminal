@@ -13,8 +13,8 @@
 use super::apply::{self, ApplyOutcome, Bound, CheckFn, HookStep, HookUnitEnd, OpEnv, OpSpec, Recorded, ReferenceFn, RepairLock, Source};
 use super::durable::{self, RecordRead};
 use super::ledger::{
-    self, DirIdentity, GateVerdict, HoldCause, JobState, LaneRecord, MergeRecord, PackGeneration, RegisteredLanes,
-    RepairRecord,
+    self, DirIdentity, GateVerdict, HoldCause, HookOpDone, JobState, LaneRecord, MergeRecord, PackGeneration,
+    RegisteredLanes, RepairRecord,
 };
 use super::platform::ApplyForm;
 use super::rehearsal::CheckResult;
@@ -756,6 +756,7 @@ fn new_row(id: &RepairId, lane: &LaneKey, now: f64) -> LaneRecord {
         merge_lock: None,
         merge_attempt: 0,
         reason: String::new(),
+        hook_ops: Vec::new(),
         updated_at: now,
     }
 }
@@ -1265,11 +1266,13 @@ fn failed_closure(env: &LaneEnv<'_>, why: &str) -> String {
 /// RULINGS IG3 — evidence that THIS lane applied R's current result itself: a completed (`applied`)
 /// door operation of kind `propagate`, of this lane, for R, bound to the present generation, whose
 /// incoming state is R's committed state of that file AND the live state now (the write-ahead records
-/// of 1.13). `Ok(Some(at))` = the time of the latest such operation; `Ok(None)` = none; `Err` = the
-/// records cannot be read (nothing is decided on a partial log).
-fn own_apply_evidence(env: &LaneEnv<'_>, rec: &RepairRecord, live: &[(String, TargetState)], bound: &Bound) -> Result<Option<f64>, String> {
+/// of 1.13). `Ok(Some((at, hooks)))` = the time of the latest such operation and the hook operations
+/// among them (JD2: the row records them); `Ok(None)` = none; `Err` = the records cannot be read
+/// (nothing is decided on a partial log).
+fn own_apply_evidence(env: &LaneEnv<'_>, rec: &RepairRecord, live: &[(String, TargetState)], bound: &Bound) -> Result<Option<(f64, Vec<HookOpDone>)>, String> {
     let Bound::Known(gen) = bound else { return Ok(None) };
     let mut at: Option<f64> = None;
+    let mut hooks: Vec<HookOpDone> = Vec::new();
     for op in super::wal::list_checked_in(env.op.root, &rec.id)? {
         if op.lane_key != *env.op.lane || !op.finished || op.outcome.as_deref() != Some("applied") || op.pack_generation.as_ref() != Some(gen) {
             continue;
@@ -1279,6 +1282,7 @@ fn own_apply_evidence(env: &LaneEnv<'_>, rec: &RepairRecord, live: &[(String, Ta
         // a hook repair is the re-registration T6's revert does)
         if op.kind == "hook-unregister" && ledger::hook_lines(rec).next().is_some() {
             at = Some(at.map_or(op.updated_at, |a| a.max(op.updated_at)));
+            hooks.push(HookOpDone { op: op.op.clone(), lines: op.hooks.iter().map(|h| format!("{}:{}", h.event, h.script)).collect() });
             continue;
         }
         if op.kind != "propagate" {
@@ -1290,7 +1294,7 @@ fn own_apply_evidence(env: &LaneEnv<'_>, rec: &RepairRecord, live: &[(String, Ta
             at = Some(at.map_or(op.updated_at, |a| a.max(op.updated_at)));
         }
     }
-    Ok(at)
+    Ok(at.map(|a| (a, hooks)))
 }
 
 /// J2 / 11.4: R's check on the LIVE files of this lane → `검증됨` (with the merge record restored or
@@ -1451,7 +1455,11 @@ fn decide_pending(
         // IG3: "already there" because THIS lane applied R and stopped before its row (evidence: its own
         // completed door operations) → the probation bundle, as if the write had not been interrupted
         match own_apply_evidence(env, rec, live, bound) {
-            Ok(Some(at)) => {
+            Ok(Some((at, hooks))) => {
+                // JD2: this lane's completed hook operations for R (one T6's recovery completed too)
+                for h in &hooks {
+                    keep_hook_op(&mut row, h);
+                }
                 // IQ3: the row this lane's uninterrupted apply would have written — R's committed result
                 // as `applied` (what T6's `revert_in` / `revertible_here` return), no merge state — BEFORE
                 // the check, so every later path (pass, fail, time-out) acts on a RETURNABLE row
@@ -1530,7 +1538,9 @@ fn hook_step(env: &LaneEnv<'_>, rec: &RepairRecord, guard: &dyn Fn() -> Result<(
     match (env.hooks)(&rec.id, env.op.lane, HookStep::Unregister, guard) {
         Ok(HookUnitEnd::Nothing) => HookOutcome::Nothing,
         Ok(HookUnitEnd::Refused(why)) => HookOutcome::Refused(why),
-        Ok(HookUnitEnd::Ran { op, lines, result: Ok(_) }) => HookOutcome::Done(format!("이 부서의 훅 등록을 해제했습니다(작업 {op}: {})", lines.join(", "))),
+        Ok(HookUnitEnd::Ran { op, lines, result: Ok(_) }) => {
+            HookOutcome::Done(format!("이 부서의 훅 등록을 해제했습니다(작업 {op}: {})", lines.join(", ")), HookOpDone { op, lines })
+        }
         Ok(HookUnitEnd::Ran { op, lines, result: Err(e) }) => {
             HookOutcome::FailedAfter(format!("이 부서의 훅 등록 해제를 시작했으나 마치지 못했습니다(작업 {op}: {}) — {e:?}", lines.join(", ")))
         }
@@ -1546,8 +1556,9 @@ enum HookOutcome {
     Refused(String),
     /// Failed before any durable write (the dry run or the settings could not be measured).
     FailedBefore(String),
-    /// The unit began AND finished its writes — this sentence is its trace (the operation, what changed).
-    Done(String),
+    /// The unit began AND finished its writes — this sentence is its trace (the operation, what changed),
+    /// and the operation as the row records it (JD2).
+    Done(String, HookOpDone),
     /// The unit began its writes and did not finish them — its trace (the operation, the error).
     FailedAfter(String),
 }
@@ -1558,15 +1569,34 @@ fn stamp_guard<'s>(env: &'s LaneEnv<'_>, rec: &'s RepairRecord, stamp: &'s Stamp
     move || stamp.holds(env, rec, true).map_err(str::to_string)
 }
 
+/// RULINGS JD2 — the row's own record of a hook operation this lane completed (`hook_ops`, once per
+/// operation): every later publication of the row starts from the stored row, so it is kept.
+fn keep_hook_op(row: &mut LaneRecord, done: &HookOpDone) {
+    if !row.hook_ops.iter().any(|h| h.op == done.op) {
+        row.hook_ops.push(done.clone());
+    }
+}
+
 /// RULINGS JA1 — a hook unit that BEGAN its durable writes leaves its trace on the lane's row, whether
 /// or not R is still what the decision saw: called inside the unit's own lock, with no stamp (it
 /// records what THIS lane changed). The row keeps its state (a new one is 대기), or becomes 충돌 when the
-/// unit could not finish; its reason is the trace. Returns the row as written.
-fn record_hook_trace(env: &LaneEnv<'_>, rec: &RepairRecord, stored: Option<&LaneRecord>, trace: &str, failed: bool) -> Result<Option<LaneRecord>, RepairError> {
+/// unit could not finish; its reason is the trace; a unit that finished is in its `hook_ops` (JD2).
+/// Returns the row as written.
+fn record_hook_trace(
+    env: &LaneEnv<'_>,
+    rec: &RepairRecord,
+    stored: Option<&LaneRecord>,
+    trace: &str,
+    done: Option<&HookOpDone>,
+    failed: bool,
+) -> Result<Option<LaneRecord>, RepairError> {
     let mut row = match stored {
         Some(r) => r.clone(),
         None => new_row(&rec.id, env.op.lane, env.op.now),
     };
+    if let Some(d) = done {
+        keep_hook_op(&mut row, d);
+    }
     if failed {
         row.state = LaneState::Conflict;
         if let Ok(l) = live_states(env.op.pack, rec) {
@@ -1616,12 +1646,12 @@ fn locked_hook_step(env: &LaneEnv<'_>, rec: &RepairRecord, stamp: &Stamp, stored
             HookOutcome::Nothing => Ok(HookUnitDone::default()),
             HookOutcome::Refused(why) => Err(why),
             HookOutcome::FailedBefore(why) => Ok(HookUnitDone { conflict: Some(why), ..HookUnitDone::default() }),
-            HookOutcome::Done(trace) => {
-                let traced = record_hook_trace(env, rec, stored, &trace, false).map_err(|e| format!("{trace} — 그 흔적을 행에 남기지 못했습니다({e:?})"))?;
+            HookOutcome::Done(trace, op) => {
+                let traced = record_hook_trace(env, rec, stored, &trace, Some(&op), false).map_err(|e| format!("{trace} — 그 흔적을 행에 남기지 못했습니다({e:?})"))?;
                 Ok(HookUnitDone { trace: Some(trace), traced, ..HookUnitDone::default() })
             }
             HookOutcome::FailedAfter(trace) => {
-                let traced = record_hook_trace(env, rec, stored, &trace, true).map_err(|e| format!("{trace} — 그 흔적을 행에 남기지 못했습니다({e:?})"))?;
+                let traced = record_hook_trace(env, rec, stored, &trace, None, true).map_err(|e| format!("{trace} — 그 흔적을 행에 남기지 못했습니다({e:?})"))?;
                 Ok(HookUnitDone { trace: Some(trace), traced, failed: true, ..HookUnitDone::default() })
             }
         }
@@ -1663,8 +1693,9 @@ thread_local! {
 enum DoorEnd {
     /// Every target applied, the hook step done, the row published as 적용됨 (this is the row).
     Applied(LaneRecord),
-    /// A door refusal / a tombstone or hook error → 충돌 with this reason (published after the lock).
-    Conflict(String),
+    /// A door refusal / a tombstone or hook error → 충돌 with this reason (published after the lock),
+    /// with the hook operation this phase completed before it, for the row's content (JD2).
+    Conflict(String, Option<HookOpDone>),
     /// Nothing written: the lock was held, or the record changed before the first operation, or the
     /// generation moved (Superseded) — the row stays as it was; `bool` = write a NEW 대기 row.
     Left(String, bool),
@@ -2010,7 +2041,13 @@ fn apply_general(
     drop(scratch);
     let mut row = match end {
         DoorEnd::Applied(r) => r,
-        DoorEnd::Conflict(why) => return finish(env, rec, stored, row, LaneState::Conflict, &why, &stamp, report),
+        DoorEnd::Conflict(why, hook) => {
+            let mut row = row;
+            if let Some(h) = &hook {
+                keep_hook_op(&mut row, h);
+            }
+            return finish(env, rec, stored, row, LaneState::Conflict, &why, &stamp, report);
+        }
         DoorEnd::Left(why, new_row) => {
             report.left.push((rec.id.clone(), why.clone()));
             if new_row && stored.is_none() {
@@ -2063,13 +2100,15 @@ fn door_phase(
     stamp: &mut Stamp,
 ) -> Result<DoorEnd, RepairError> {
     let mut done: Vec<String> = Vec::new();
+    // JD2: the hook operation this phase completed — in the content of every row it publishes after it
+    let mut hook_op: Option<HookOpDone> = None;
     // IV1 + IO1: the stamp measured again before every write; a difference before the first write →
     // nothing written; MIDWAY → the 충돌 row published now (naming what this lane already changed)
-    let changed = |done: &Vec<String>, why: &'static str| -> Result<DoorEnd, RepairError> {
+    let changed = |done: &Vec<String>, hook: Option<&HookOpDone>, why: &'static str| -> Result<DoorEnd, RepairError> {
         if done.is_empty() {
             Ok(DoorEnd::Left(why.to_string(), false))
         } else {
-            changed_midway(env, stored, row, rec, done, why)
+            changed_midway(env, stored, row, rec, done, hook, why)
         }
     };
     // rule one per target through T6's engine; the binding was born at the tick's start (EJ1)
@@ -2078,16 +2117,16 @@ fn door_phase(
             continue;
         }
         if let Err(why) = stamp.holds(env, rec, true) {
-            return changed(&done, why);
+            return changed(&done, None, why);
         }
         let result = match result_state(rec, rel) {
             Ok(r) => r,
-            Err(why) => return Ok(DoorEnd::Conflict(why)),
+            Err(why) => return Ok(DoorEnd::Conflict(why, None)),
         };
         let expected = match pos {
             Position::AtPrevApplied => match prev_applied.map(|p| Recorded::applied_in(p, rel)) {
                 Some(Ok(r)) => r,
-                _ => return Ok(DoorEnd::Conflict(format!("{rel}: 이전에 적용한 상태를 읽을 수 없습니다"))),
+                _ => return Ok(DoorEnd::Conflict(format!("{rel}: 이전에 적용한 상태를 읽을 수 없습니다"), None)),
             },
             Position::AtVendor(r) => r.clone(),
             _ => Recorded::pre_of(rec, rel),
@@ -2112,7 +2151,7 @@ fn door_phase(
                 done.push(rel.clone());
             }
             ApplyOutcome::Superseded(m) => return Ok(DoorEnd::Left(format!("{rel}: {m}"), true)),
-            ApplyOutcome::Declined(m) => return Ok(DoorEnd::Conflict(format!("{rel}: {m}"))),
+            ApplyOutcome::Declined(m) => return Ok(DoorEnd::Conflict(format!("{rel}: {m}"), None)),
         }
         #[cfg(test)]
         if STOP_AFTER_DOOR_OP.with(|c| c.replace(false)) {
@@ -2123,7 +2162,7 @@ fn door_phase(
         if result == TargetState::Absent && pre_present {
             let t = super::tombstones::Tombstone { rel: rel.clone(), kind: super::tombstones::TombstoneKind::File, repair: rec.id.clone() };
             if let Err(e) = super::tombstones::record_in(env.op.root, env.op.lane, &t) {
-                return Ok(DoorEnd::Conflict(format!("{rel}: 삭제 표식(묘비) 기록 실패 — {e:?}")));
+                return Ok(DoorEnd::Conflict(format!("{rel}: 삭제 표식(묘비) 기록 실패 — {e:?}"), None));
             }
         }
     }
@@ -2133,28 +2172,34 @@ fn door_phase(
         let guard = stamp_guard(env, rec, stamp);
         match hook_step(env, rec, &guard) {
             HookOutcome::Nothing => {}
-            HookOutcome::Refused(why) => return changed(&done, if why == RECORD_CHANGED { RECORD_CHANGED } else { STATES_CHANGED }),
-            HookOutcome::FailedBefore(why) => return Ok(DoorEnd::Conflict(why)),
-            HookOutcome::Done(trace) => done.push(trace),
+            HookOutcome::Refused(why) => return changed(&done, None, if why == RECORD_CHANGED { RECORD_CHANGED } else { STATES_CHANGED }),
+            HookOutcome::FailedBefore(why) => return Ok(DoorEnd::Conflict(why, None)),
+            HookOutcome::Done(trace, op) => {
+                done.push(trace);
+                hook_op = Some(op);
+            }
             HookOutcome::FailedAfter(trace) => {
                 // JA1: it began writing and did not finish — its trace (and every target this phase
                 // already changed) on the row NOW, inside this lock, whatever R is now
                 done.push(trace);
-                return changed_midway(env, stored, row, rec, &done, "훅 등록 해제를 마치지 못했습니다");
+                return changed_midway(env, stored, row, rec, &done, None, "훅 등록 해제를 마치지 못했습니다");
             }
         }
     }
     if let Err(why) = stamp.holds(env, rec, true) {
-        return changed(&done, why);
+        return changed(&done, hook_op.as_ref(), why);
     }
     // IG2: an applied row of a deleting repair implies this lane's tombstones
     if let Err(why) = ensure_tombstones(env, rec) {
-        return Ok(DoorEnd::Conflict(why));
+        return Ok(DoorEnd::Conflict(why, hook_op));
     }
     // 적용됨, durably, before this lane's own check (a stop here is resumed by the next tick's check)
     let mut row = row.clone();
     row.state = LaneState::Applied;
     row.applied = rec.committed.clone();
+    if let Some(h) = &hook_op {
+        keep_hook_op(&mut row, h);
+    }
     row.merge = None;
     row.merge_base.clear();
     row.merge_lock = None;
@@ -2183,7 +2228,16 @@ fn door_phase(
 /// phase's lock, so without asking the record to be unchanged (the row describes what THIS lane did,
 /// not what R is now) — with the reason naming the targets already changed and the live states
 /// (`conflict_live`). Nothing is put back, nothing further is written; the lane's worker merges it.
-fn changed_midway(env: &LaneEnv<'_>, stored: Option<&LaneRecord>, row: &LaneRecord, rec: &RepairRecord, done: &[String], cause: &str) -> Result<DoorEnd, RepairError> {
+#[allow(clippy::too_many_arguments)]
+fn changed_midway(
+    env: &LaneEnv<'_>,
+    stored: Option<&LaneRecord>,
+    row: &LaneRecord,
+    rec: &RepairRecord,
+    done: &[String],
+    hook: Option<&HookOpDone>,
+    cause: &str,
+) -> Result<DoorEnd, RepairError> {
     let what = if cause == RECORD_CHANGED {
         "수리 기록이 바뀌었습니다(대체·다시 확정·되돌림)"
     } else if cause == STATES_CHANGED {
@@ -2198,6 +2252,9 @@ fn changed_midway(env: &LaneEnv<'_>, stored: Option<&LaneRecord>, row: &LaneReco
     );
     let mut row = row.clone();
     row.state = LaneState::Conflict;
+    if let Some(h) = hook {
+        keep_hook_op(&mut row, h);
+    }
     row.reason = why.chars().take(400).collect();
     row.conflict_live = match live_states(env.op.pack, rec) {
         Ok(l) => canon_list(&l),
