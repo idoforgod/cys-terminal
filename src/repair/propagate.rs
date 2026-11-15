@@ -806,14 +806,16 @@ enum Published {
     RecordChanged,
     StatesChanged,
     LockBusy,
+    /// IQ2: the tombstones that belong to this row could not be written — the row is not written either.
+    NotWritten(String),
 }
 
 /// How a row is published: plain (`Plain`) or as the result of a check made outside the lock
-/// (`Checked` — IQ1: only for the state it checked).
+/// (`Checked` — IQ1: only for the state it checked; IQ2: with the tombstones of a deleting repair).
 #[derive(Clone, Copy)]
 enum Publication<'a> {
     Plain,
-    Checked { seen: &'a Observed },
+    Checked { seen: &'a Observed, tombstones: bool },
 }
 
 /// RULINGS IK3 + IG5 — a row decided OUTSIDE the lock is PUBLISHED inside it: the pack-apply lock is
@@ -824,10 +826,16 @@ fn publish(env: &LaneEnv<'_>, rec: &RepairRecord, stored: Option<&LaneRecord>, r
         if !record_unchanged(env, rec) {
             return Ok(Published::RecordChanged);
         }
-        if let Publication::Checked { seen } = how {
+        if let Publication::Checked { seen, tombstones } = how {
             // IQ1: measured AGAIN — the targets, the generation, the instance — inside this lock
             if !seen.holds_now(env, rec) {
                 return Ok(Published::StatesChanged);
+            }
+            // IQ2: the tombstones of a deleting repair, in the same unit as the row (after both checks)
+            if tombstones {
+                if let Err(why) = ensure_tombstones(env, rec) {
+                    return Ok(Published::NotWritten(why));
+                }
             }
         }
         Ok(if write_row_if(env, stored, row)? { Published::Written } else { Published::OtherWriter })
@@ -851,6 +859,7 @@ fn publish_row_as(env: &LaneEnv<'_>, rec: &RepairRecord, stored: Option<&LaneRec
         Published::RecordChanged => RECORD_CHANGED.to_string(),
         Published::StatesChanged => STATES_CHANGED.to_string(),
         Published::LockBusy => LOCK_BUSY_ROW.to_string(),
+        Published::NotWritten(why) => why,
     };
     report.left.push((rec.id.clone(), why));
     Ok(false)
@@ -1091,7 +1100,7 @@ fn finish(
     finish_as(env, rec, stored, row, state, why, Publication::Plain, report)
 }
 
-/// `finish` with the publication's kind (IQ1 for the result of a check made outside the lock).
+/// `finish` with the publication's kind (IQ1 / IQ2 for the result of a check made outside the lock).
 #[allow(clippy::too_many_arguments)]
 fn finish_as(
     env: &LaneEnv<'_>,
@@ -1175,13 +1184,9 @@ fn check_live(
             if let Some(p) = row.probation.as_mut().filter(|p| p.closed.is_none()) {
                 p.closed = Some(failed_closure(env, &why));
             }
-            return finish_as(env, rec, stored, row, LaneState::Conflict, &format!("이 부서의 검사 실패 — {why}"), Publication::Checked { seen: &seen }, report);
+            return finish_as(env, rec, stored, row, LaneState::Conflict, &format!("이 부서의 검사 실패 — {why}"), Publication::Checked { seen: &seen, tombstones: false }, report);
         }
     };
-    // IG2: a verified row of a deleting repair implies this lane's tombstones (also "already there")
-    if let Err(why) = ensure_tombstones(env, rec) {
-        return finish(env, rec, stored, row, LaneState::Conflict, &why, report);
-    }
     row.applied = rec.committed.clone();
     if merge.is_some() {
         row.merge = merge;
@@ -1209,7 +1214,9 @@ fn check_live(
             });
         }
     }
-    finish_as(env, rec, stored, row, LaneState::Verified, "이 부서의 검사 통과", Publication::Checked { seen: &seen }, report)
+    // IG2 + IQ2: the tombstones of a deleting repair are completed INSIDE the publication's lock, after
+    // the record and the checked states were validated again — one unit with the 검증됨 row
+    finish_as(env, rec, stored, row, LaneState::Verified, "이 부서의 검사 통과", Publication::Checked { seen: &seen, tombstones: true }, report)
 }
 
 /// R's recorded check of every FILE target whose result is a file, against `root` (the live pack, or
@@ -1780,7 +1787,7 @@ fn apply_general(
             if let Some(p) = row.probation.as_mut() {
                 p.check_timings = timings;
             }
-            finish_as(env, rec, Some(&applied_row), row, LaneState::Verified, "적용 뒤 이 부서의 검사 통과", Publication::Checked { seen: &seen }, report)
+            finish_as(env, rec, Some(&applied_row), row, LaneState::Verified, "적용 뒤 이 부서의 검사 통과", Publication::Checked { seen: &seen, tombstones: true }, report)
         }
         Err(why) => {
             // the lane's own failure: T6's probation owes the return of THIS lane's operations
@@ -1788,7 +1795,7 @@ fn apply_general(
             if let Some(p) = row.probation.as_mut() {
                 p.closed = Some(failed_closure(env, &why));
             }
-            finish_as(env, rec, Some(&applied_row), row, LaneState::Conflict, &format!("적용 뒤 이 부서의 검사 실패 — {why}"), Publication::Checked { seen: &seen }, report)
+            finish_as(env, rec, Some(&applied_row), row, LaneState::Conflict, &format!("적용 뒤 이 부서의 검사 실패 — {why}"), Publication::Checked { seen: &seen, tombstones: false }, report)
         }
     }
 }

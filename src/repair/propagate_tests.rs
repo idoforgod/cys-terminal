@@ -1349,6 +1349,56 @@ fn a_check_is_published_only_for_the_state_it_checked() {
     }
 }
 
+/// RULINGS IQ2 — the tombstone of IG2 is written WITH the row: R (delete a, edit b) is reverted at the
+/// origin while this lane's live check runs on the "already there" path → no row AND the tombstone file
+/// untouched — an install then restores the vendor file. (Before: the tombstone was written before the
+/// publication was refused, and it stayed.)
+#[test]
+fn a_tombstone_is_written_only_with_its_row() {
+    let r = rig("iq2");
+    let id = rid("R-1");
+    // a deleting + editing repair made in HQ
+    let mut changes = Vec::new();
+    let mut committed = Vec::new();
+    for (rel, pre, post) in [("bin/a.py", &b"x\n"[..], None), ("bin/b.py", &b"old-b\n"[..], Some(&b"new-b\n"[..]))] {
+        let live = r.hq.join(rel);
+        r.put(HQ, rel, pre, 0o644);
+        let pre_img = ledger::copy_preimage_in(&r.root, &id, &lane(HQ), rel, &live, T0 - 10.0).unwrap();
+        let _ = std::fs::remove_file(&live);
+        if let Some(b) = post {
+            r.put(HQ, rel, b, 0o644);
+            seal_committed_copy_in(&r.root, &id, &lane(HQ), rel, &live, T0 - 5.0).unwrap();
+        }
+        let post_st = TargetState::read(&live).unwrap();
+        changes.push(FileChange { rel: rel.into(), kind: kind_of(&pre_img.state(), &post_st), pre: pre_img, post: post_st.clone(), diff: None });
+        committed.push((rel.to_string(), post_st.canon()));
+    }
+    record(&r, &id, Classification::General, changes, committed, HQ);
+    // the department is already at R's result (a absent, b edited) — no row, no operation, no tombstone yet
+    r.put(DEPT, "bin/b.py", b"new-b\n", 0o644);
+    let tomb_file = crate::repair::tombstones::path_in(&r.root, &lane(DEPT));
+    let before = std::fs::read(&tomb_file).ok();
+    let d = doubles();
+    {
+        let (root, id, dept) = (r.root.clone(), id.clone(), r.dept.clone());
+        *d.during_check.borrow_mut() = Some(Box::new(move |checked: &Path| {
+            if checked == dept.as_path() {
+                let mut rec = ledger::read_record_in(&root, &id).unwrap().unwrap();
+                rec.state = RepairState::Reverted;
+                ledger::write_record_in(&root, &rec).unwrap();
+            }
+        }));
+    }
+    tick(&r, DEPT, &d, &fid(1));
+    assert!(r.row(&id, DEPT).is_none(), "no row");
+    assert_eq!(std::fs::read(&tomb_file).ok(), before, "the tombstone file is not changed");
+    let ts = crate::repair::tombstones::load_in(&r.root, &lane(DEPT)).unwrap();
+    assert!(ts.is_empty(), "{ts:?}");
+    let with = crate::pack::UpdateSources::none().with_tombstones(ts);
+    crate::pack::install_into_with(r.dept.clone(), vec![("bin/a.py", "x\n")], false, "0.15.0", false, false, crate::pack::PackScope::Dept, None, None, &with).unwrap();
+    assert!(matches!(r.live(DEPT, "bin/a.py"), TargetState::File { .. }), "an install restores the vendor file");
+}
+
 /// RULINGS IK3 — NO LOCK ACROSS A CHECK: while this lane's copy-check and its live check run (a check
 /// child "parked" by the seam), the machine-wide pack-apply lock is free — a `try` of it succeeds and
 /// ANOTHER lane's tick runs its pass (which needs the lock) to its end. (On the old shape the whole tick
