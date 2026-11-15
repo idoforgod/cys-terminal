@@ -5227,10 +5227,38 @@ async fn repair_approval_decide(request_id: String, decision: String, socket: Op
     Err(cys::repair::NOT_IMPLEMENTED_KO.to_string())
 }
 
+/// 「스스로 해결」 T6 — 앱의 '직전 수리 되돌리기'(설계 §4-9 · §6-9 (7)): 이 레인에서 가장 최근의 시험 기간·사용 중
+/// 수리 한 건을 데몬이 규칙 하나(맞바꾸기)로 되돌린다. 모든 창이 죽어 있어도 동작한다 — 좌석·창을 거치지 않고 데몬
+/// 소켓에 직접 두 요청(`repair.list` → `repair.revert`)만 보낸다. 데몬을 띄우지 않는다(부록 A 1-16: `rpc_full` 은
+/// 소켓에 붙기만 한다 — 죽은 소켓이면 그 사실을 문장으로 돌려준다). 되돌리기 요청에는 그 소켓의 조작자 토큰을 매번
+/// 새로 읽어 붙인다(해석 36 — 사람의 버튼; 토큰은 이 백엔드에서만 다루고 화면으로 내보내지 않는다).
 #[tauri::command]
 async fn repair_revert_last(socket: Option<String>) -> Result<Value, String> {
-    let _ = socket;
-    Err(cys::repair::NOT_IMPLEMENTED_KO.to_string())
+    let sock = resolve_socket(&socket);
+    let params = repair_revert_last_params(read_operator_token_for(&sock));
+    let resp = rpc_full(&sock, "repair.revert", params).await.map_err(|e| {
+        format!("데몬에 닿지 못했습니다(앱은 데몬을 띄우지 않습니다) — 되돌리지 않았습니다: {e}")
+    })?;
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(resp["result"].clone())
+    } else {
+        Err(format!(
+            "{}: {}",
+            resp["error"]["code"].as_str().unwrap_or("error"),
+            resp["error"]["message"].as_str().unwrap_or("unknown error")
+        ))
+    }
+}
+
+/// The request '직전 수리 되돌리기' sends (pure; RULINGS CT11): the DAEMON chooses the most recently
+/// applied repair of this lane by the lane's own application evidence (`{"latest": true}`) — the app
+/// no longer picks by repair number or by origin.
+fn repair_revert_last_params(operator_token: Option<String>) -> Value {
+    let mut params = json!({"latest": true});
+    if let Some(tok) = operator_token {
+        params["operator_token"] = json!(tok);
+    }
+    params
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -18923,6 +18951,9 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
                 // S6 adds only owner_token to close; no operator exemption is granted.
                 "close_surface".to_string(),
                 "feed_reply".to_string(),
+                // 0.15.0 T6 (interpretation 36): the revert button is a human's — old expectation had no
+                // repair_revert_last in this set
+                "repair_revert_last".to_string(),
                 "send_input".to_string(),
                 "trash_delete".to_string(),
                 "trash_preview_poll".to_string(),
@@ -19059,7 +19090,63 @@ mod repair_stub_tests {
         tauri::async_runtime::block_on(async {
             assert_eq!(repair_approval_list(None).await, Err(nyi.clone()));
             assert_eq!(repair_approval_decide("rq-1".into(), "approve".into(), Some("/x.sock".into())).await, Err(nyi.clone()));
-            assert_eq!(repair_revert_last(None).await, Err(nyi.clone()));
+            // T6 (rewrite — old expectation `Err(nyi)`): the body exists; with no daemon at the given
+            // socket it answers a sentence and never starts a daemon (appendix A 1-16)
+            let r = repair_revert_last(Some("/nonexistent-dir-t6/cys.sock".into())).await;
+            assert!(matches!(&r, Err(m) if m.contains("데몬에 닿지 못했습니다")), "{r:?}");
+            assert_ne!(r, Err(nyi.clone()));
         });
+    }
+
+    /// T6 — '직전 수리 되돌리기' picks the newest repair in force of this lane (then of any lane), never
+    /// a closed one; none in force → no pick.
+    #[test]
+    fn repair_revert_last_picks_newest_in_force() {
+        // RULINGS CT11 — REWRITTEN. Old expectation: the app picked from `repair.list` by repair NUMBER,
+        // this lane's own first — `{R-2 probation base, R-10 in_use base, R-11 reverted base,
+        // R-12 probation dept-x}` → "R-10". Now the daemon chooses by this lane's application
+        // evidence; the app sends `{"latest": true}` (+ the operator token when it has one) and names
+        // no repair itself.
+        assert_eq!(repair_revert_last_params(None), serde_json::json!({"latest": true}));
+        assert_eq!(
+            repair_revert_last_params(Some("tok".into())),
+            serde_json::json!({"latest": true, "operator_token": "tok"})
+        );
+    }
+
+    /// Appendix A 1-16: the button's command never starts a daemon — it talks to the socket only
+    /// (`rpc_full`); no `cys` sidecar, no launchctl, no daemon start in its body.
+    /// RULINGS CT11: the palette's confirmation says what each platform does — Windows: the two-move
+    /// deposit-first form, never "원자적 맞바꾸기" — and names the most recently APPLIED repair.
+    #[test]
+    fn repair_revert_last_sentences_are_platform_true() {
+        let ui = include_str!("../../ui/src/main.ts");
+        let at = ui.find("id: \"act:repair-revert-last\"").expect("the palette item");
+        let item = &ui[at..at + ui[at..].find("action:").unwrap()];
+        assert!(item.contains("body: IS_WINDOWS"), "the body depends on the platform");
+        // DR8 (REWRITTEN — old expectation: the Windows text contains "두 번의 옮기기" for every
+        // revert): each form is named for what it really does — changed files moved out then the
+        // pre-image placed, created files only moved out, deleted files only placed, hooks re-registered
+        // the Windows text runs from `? "` to the first `: "` AFTER it (the item's own `id: "` comes
+        // before it)
+        let q = item.find("? \"").unwrap();
+        let colon = q + item[q..].find(": \"").unwrap();
+        let win = &item[q..colon];
+        assert!(win.contains("먼저 보관소로 옮긴 뒤") && win.contains("새로 만든 파일은 보관소로 옮기기만") && win.contains("지운 파일은 적용 전 내용을 놓기만") && win.contains("훅 등록은 다시 등록"), "{win}");
+        assert!(!win.contains("원자적 맞바꾸기"), "{win}");
+        let mac = &item[colon..];
+        assert!(mac.contains("바뀐 파일은 원자적 맞바꾸기로") && mac.contains("새로 만든 파일은 보관소로 옮겨서"), "{mac}");
+        assert!(item.contains("가장 최근에 적용된 수리"));
+    }
+
+    #[test]
+    fn repair_revert_last_never_autostarts() {
+        let src = include_str!("main.rs");
+        let at = src.find("async fn repair_revert_last(socket: Option<String>)").unwrap();
+        let body = &src[at..at + src[at..].find("\n}\n").unwrap()];
+        for forbidden in ["launchctl", "Command::new", "spawn", "start_daemon", "ensure_daemon", "sidecar"] {
+            assert!(!body.contains(forbidden), "{forbidden} in repair_revert_last");
+        }
+        assert!(body.contains("rpc_full(&sock, \"repair.revert\""));
     }
 }

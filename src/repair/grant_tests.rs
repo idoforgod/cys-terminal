@@ -73,6 +73,7 @@ fn rec(id: &RepairId, state: RepairState, lock: Option<Lease>) -> RepairRecord {
         committed: vec![],
         fixer_seats: vec![],
         checks: vec![],
+        reapplies: None,
     }
 }
 

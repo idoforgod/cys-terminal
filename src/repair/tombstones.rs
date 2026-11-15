@@ -86,7 +86,9 @@ fn write_file(root: &Path, lane: &LaneKey, list: Vec<Tombstone>) -> Result<(), R
         lane: lane.clone(),
         tombstones: list,
     };
-    crate::atomic_write_json(&p, &f).map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))
+    // RULINGS AK7 (T6): written with the durable helper (full flush of the file and its folder) — a
+    // committed deletion must never be left without its tombstone by a power loss; same bytes as before.
+    super::durable::write_json_durable(&p, &f)
 }
 
 /// Records one tombstone in the lane's file (written only by that lane's daemon — B1). Idempotent:
@@ -127,6 +129,26 @@ pub fn remove_for_repair_in(root: &Path, lane: &LaneKey, id: &RepairId) -> Resul
         .tombstones
         .into_iter()
         .filter(|t| t.repair != *id)
+        .collect();
+    if kept.len() == before {
+        return Ok(());
+    }
+    write_file(root, lane, kept)
+}
+
+/// RULINGS DR7 (T6): removes ONE repair's HOOK tombstones from the lane's file (its re-registration
+/// is done); its FILE tombstones stay — each goes only when that file is restored.
+pub fn remove_hooks_for_repair_in(root: &Path, lane: &LaneKey, id: &RepairId) -> Result<(), RepairError> {
+    let lane_mutex = lane_mutex(root, lane);
+    let _lane_guard = lane_mutex.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(f) = read_file(root, lane)? else {
+        return Ok(());
+    };
+    let before = f.tombstones.len();
+    let kept: Vec<Tombstone> = f
+        .tombstones
+        .into_iter()
+        .filter(|t| !(t.repair == *id && matches!(t.kind, TombstoneKind::Hook { .. })))
         .collect();
     if kept.len() == before {
         return Ok(());

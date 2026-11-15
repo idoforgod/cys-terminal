@@ -11,20 +11,31 @@
 
 pub mod apply;
 pub mod boot_critical;
+pub mod consumed;
 pub mod durable;
 pub mod exchange;
 pub mod grant;
+pub mod guard;
 pub mod intake;
 pub mod ledger;
 pub mod lock;
 pub mod owner_origin;
 pub mod paths;
 pub mod platform;
+/// T6 — the appended job's work: probation re-check, M10, the start-time pass.
+pub mod probation;
+pub mod reapply_claim;
 pub mod rehearsal;
 pub mod roles;
 pub mod rules;
+/// Track T5b — the protection screen beside the rehearsal runner (RULINGS AT9).
+pub mod screen;
 pub mod tombstones;
 pub mod types;
+/// T6 — the vault's fresh write-once slots and the seal (C2).
+pub mod vault;
+/// T6 — write-ahead operation records (C1 1.13).
+pub mod wal;
 
 /// The ONE candidate reader (RULINGS V2(a)) — see [`ledger::candidate_states`].
 pub use ledger::candidate_states;

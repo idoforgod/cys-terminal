@@ -26,6 +26,11 @@ mod t5a_seam_tests;
 #[path = "repair_grant_tests.rs"]
 mod grant_tests;
 
+// Track T6 — `revert` / `reapply` through the verb dispatcher.
+#[cfg(test)]
+#[path = "repair_apply_tests.rs"]
+mod t6_tests;
+
 use crate::handlers::Reply;
 use crate::state::Daemon;
 use cys::repair::roles::{reviewer_slot_of, verb_class, CallerKind, ReviewerSlot, VerbClass};
@@ -88,6 +93,9 @@ pub(crate) const T4_VERBS: &[&str] = &[
     "rule_doc_allowed",
     "grant_status",
 ];
+
+/// The sub-verbs whose bodies are track T6's (C3 `revert` / `reapply`, C7 `tick` / `sweep`).
+pub(crate) const T6_VERBS: &[&str] = &["revert", "reapply", "tick", "sweep"];
 
 /// M4 (★OWNER-REPORT with the other Windows limits): on Windows a seatless command line is not a
 /// human in 0.15.0 — the app's button is the path.
@@ -422,6 +430,13 @@ pub(crate) fn handle(
         ));
     }
     let caller = caller_of(daemon, caller_sid, owner_grade, caller_pid);
+    // T6 (C7 O-C7-2 (a)): the appended job's trigger answers at once from the daemon's own state.
+    if sub == "tick" || sub == "sweep" {
+        return Reply::Single(match role_check(sub, &caller, cfg!(windows)) {
+            Ok(()) => ok_response(id, crate::repair_job::trigger(daemon, sub, params)),
+            Err(e) => err_response(id, &e.code, &format!("repair.{sub}: {}", e.message)),
+        });
+    }
     let classify = |rel: &str| production_classify(rel, &cys::pack::pack_dir());
     let check = production_check;
     let ctx = Ctx {
@@ -475,13 +490,18 @@ pub(crate) fn handle_with(
         "owner_token_ask" => grant_verbs::owner_token_ask(ctx, caller, params),
         "rule_doc_allowed" => grant_verbs::rule_doc_allowed(ctx, caller, params),
         "grant_status" => grant_verbs::grant_status(ctx, params),
-        "revert" => {
-            ledger_verbs::worker_lane_check(ctx, caller, params).and_then(|_| not_implemented(sub))
-        }
+        // T6 (C3, design §4-9): revert by rule one; reapply starts R′ (RULINGS AQ5 / AR1)
+        "revert" => apply_verbs::revert(ctx, caller, params),
+        "reapply" => apply_verbs::reapply(ctx, caller, params),
+        // T6: the trigger needs the daemon's readiness / single-flight state — `handle` answers it
+        "tick" | "sweep" => Err(VerbError::new(
+            cys::repair::types::ERR_PRECONDITION,
+            "데몬의 요청 처리기에서만 작업을 시작합니다",
+        )),
         _ => {
             debug_assert!(
-                !T3_VERBS.contains(&sub) && !T4_VERBS.contains(&sub),
-                "a T3 / T4 verb fell through to the stub"
+                !T3_VERBS.contains(&sub) && !T4_VERBS.contains(&sub) && !T6_VERBS.contains(&sub),
+                "a T3 / T4 / T6 verb fell through to the stub"
             );
             not_implemented(sub)
         }
@@ -1997,6 +2017,7 @@ mod ledger_verbs {
                 committed: Vec::new(),
                 fixer_seats: Vec::new(),
                 checks: Vec::new(),
+                reapplies: None, // T6 (AQ5): `reapply` sets it on R′ after this body created R′
             };
             Ok(rec)
         })?;
@@ -2881,6 +2902,10 @@ mod ledger_verbs {
     /// lane's File tombstones (AD3) → this lane's own row (K1; 검증됨, or 충돌 on a step error — Y2(c)).
     pub(crate) fn commit(ctx: &Ctx<'_>, caller: &Caller, p: &Value) -> Result<Value, VerbError> {
         let id = repair_id(p)?;
+        // T6 · RULINGS EJ4 / EN6: the repair's ONE guard for the whole commit, its hook phase included
+        let Some(_guard) = cys::repair::guard::RepairGuard::try_take(&ctx.root, &id) else {
+            return Err(VerbError::new(cys::repair::types::ERR_LOCKED, format!("{}: {}", id.as_str(), cys::repair::guard::BUSY)));
+        };
         // (1) preconditions under the per-repair mutex
         let (snapshot, states) = ctx.locked(id.as_str(), || -> Result<(RepairRecord, Vec<(String, TargetState)>), VerbError> {
             let mut rec = load(ctx, &id)?;
@@ -3100,6 +3125,10 @@ mod ledger_verbs {
                     applied_history.push(prev.applied.clone());
                 }
             }
+            // T6 · RULINGS GK4 (the EN8 seam; FI1 on the general commit): pre-images taken in another
+            // generation than the one live NOW, or in an unknown one → the commit stands, the row says
+            // it cannot be returned automatically, and it is never offered to the automatic return
+            let not_revertible = cys::repair::apply::begun_in_another_generation(&rec, &ctx.pack_dir);
             let row = LaneRecord {
                 schema: cys::repair::REPAIR_SCHEMA,
                 repair: id.clone(),
@@ -3110,7 +3139,7 @@ mod ledger_verbs {
                     pro_revision: pro,
                     applied_at: ctx.now,
                     expected: committed.clone(),
-                    closed: None,
+                    closed: not_revertible.then(cys::repair::apply::not_revertible_closure),
                     check_timings: timings,
                     check_timeouts: Vec::new(),
                 }),
@@ -3174,6 +3203,12 @@ mod ledger_verbs {
             if !candidate {
                 continue;
             }
+            // T6 · RULINGS FG5 (the EN6 seam): an older repair is written only under ITS guard, tried
+            // — held (a re-check / return / recovery owns it) → left for later (its own re-check sees
+            // the live file changed; the job's start pass supersedes it)
+            let Some(_older_guard) = cys::repair::guard::RepairGuard::try_take(&ctx.root, &oid) else {
+                continue;
+            };
             let changed = ctx.locked(oid.as_str(), || -> Result<bool, VerbError> {
                 let Some(mut r) = ledger::read_record_in(&ctx.root, &oid)? else {
                     return Ok(false);
@@ -3317,6 +3352,12 @@ mod ledger_verbs {
                 "waiting": r1.is_empty() || r2.is_empty(),
             },
         });
+        // T6 · RULINGS GK3: the owner notices closed "not confirmed" (handed out three times without
+        // their receiver's confirmation) stay visible here
+        out["notices_not_confirmed"] = match cys::repair::probation::notices_not_confirmed_in(&ctx.root, &ctx.lane) {
+            Ok(keys) => json!(keys),
+            Err(e) => json!({"unreadable": VerbError::from(e).message}),
+        };
         // RULINGS H3: the lane's catch-up fields (display only; T7b computes them).
         match cys::repair::apply::catchup_status(&ctx.lane) {
             Ok(c) => {
@@ -3399,6 +3440,7 @@ mod ledger_verbs {
                 "audit_due_at": rec.audit_due_at,
                 "lock": lock,
                 "resolves": rec.resolves.as_ref().map(|r| r.as_str().to_string()),
+                "reapplies": rec.reapplies.as_ref().map(|r| r.as_str().to_string()), // T6 (AQ5)
                 "committed": rec.committed,
                 "pending_request": rec.pending_request,
                 "resubmits": rec.resubmits,
@@ -3577,6 +3619,341 @@ mod ledger_verbs {
                 }
             });
         }
+    }
+}
+
+// Track T6 — `revert` (C3 · design §4-9, the rule-one engine of `cys::repair::apply`) and `reapply`
+// (RULINGS AQ5 / AR1: a NEW repair R′ through `begin`'s own body). An inline module like
+// `ledger_verbs` (the C8 dormancy census follows production FILE modules from `main.rs` only).
+// ★Nothing here may panic; nothing here sends anything to a queue (F1).
+mod apply_verbs {
+    use super::{Caller, Ctx, VerbError};
+    use cys::repair::apply::{revert_in, ApplyOutcome, NoFaults, OpEnv, RevertCaller};
+    use cys::repair::ledger;
+    use cys::repair::platform::ApplyForm;
+    use cys::repair::types::{RepairError, RepairId, RepairState};
+    use serde_json::{json, Value};
+
+    fn repair_id(p: &Value) -> Result<RepairId, VerbError> {
+        let raw = p
+            .get("repair")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| VerbError::invalid("수리 번호(R-<n>)가 필요합니다"))?;
+        RepairId::parse(raw)
+            .map_err(|_| VerbError::invalid(format!("수리 번호는 R-<숫자> 형식이어야 합니다: {raw:?}")))
+    }
+
+    fn outcome_json(o: &ApplyOutcome) -> Value {
+        match o {
+            ApplyOutcome::Applied => json!({"outcome": "applied"}),
+            ApplyOutcome::Superseded(m) => json!({"outcome": "superseded", "why": m}),
+            ApplyOutcome::Declined(m) => json!({"outcome": "declined", "why": m}),
+        }
+    }
+
+    /// `cys repair revert <R-id>` / the app's "직전 수리 되돌리기" — a human (M4 per OS, the app's
+    /// token on both) or a worker seat of a lane holding a row (T3's `worker_lane_check`; the role table
+    /// refuses master / CEO / CSO / reviewers). While the grant is paused this is accepted (B4 / K3 /
+    /// CH3: a running repair may still CLOSE). The existing pack-apply lock is TRIED, never waited for
+    /// in a request (the CLI waits 40 s): held by `cys pack-update` → refused, nothing changed.
+    pub(crate) fn revert(ctx: &Ctx<'_>, caller: &Caller, p: &Value) -> Result<Value, VerbError> {
+        // CT11: `{"latest": true}` (the app's "직전 수리 되돌리기") — the most recently APPLIED repair
+        // of THIS lane, chosen by this lane's application evidence (the time its row records the
+        // apply here), never by repair number or by origin
+        let picked;
+        let p = if p.get("repair").is_none_or(|v| v.is_null()) && p.get("latest").and_then(|v| v.as_bool()) == Some(true) {
+            let Some(id) = latest_applied_here(ctx) else {
+                return Err(VerbError::new(
+                    cys::repair::types::ERR_PRECONDITION,
+                    "되돌릴 수리가 없습니다(이 부서에 적용된 시험 기간·사용 중인 수리가 없습니다)",
+                ));
+            };
+            let mut q = p.clone();
+            q["repair"] = json!(id.as_str());
+            picked = q;
+            &picked
+        } else {
+            p
+        };
+        let rec = super::ledger_verbs::worker_lane_check(ctx, caller, p)?;
+        let id = rec.id.clone();
+        let by = match caller.seat() {
+            Some(seat) => RevertCaller::TicketedWorker { seat },
+            None => RevertCaller::Human,
+        };
+        let form = if ctx.windows {
+            ApplyForm::DepositFirst
+        } else {
+            cys::repair::platform::apply_form()
+        };
+        let env = OpEnv {
+            root: &ctx.root,
+            pack: &ctx.pack_dir,
+            lane: &ctx.lane,
+            now: ctx.now,
+            form,
+            faults: &NoFaults,
+            own_check: &crate::repair_job::own_check,
+        };
+        let locked = |rid: &RepairId, f: &mut dyn FnMut() -> Result<(), RepairError>| {
+            ctx.locked(rid.as_str(), f)
+        };
+        let lock_file = cys::pack_apply_lock::pack_apply_lock_path_for(&ctx.pack_dir);
+        let ran = cys::pack_apply_lock::try_with_apply_lock(&lock_file, || {
+            revert_in(&env, &id, by, ctx.hook_step, &locked)
+        })
+        .map_err(|e| VerbError::new("io", e))?;
+        let Some(result) = ran else {
+            return Err(VerbError::new(
+                cys::repair::types::ERR_LOCKED,
+                format!(
+                    "{}: 다른 적용이나 업데이트가 팩을 바꾸는 중이라 지금은 되돌리지 않습니다(아무것도 바꾸지 않았습니다) — 그 작업이 끝난 뒤 다시 하세요",
+                    id.as_str()
+                ),
+            ));
+        };
+        let report = result.map_err(VerbError::from)?;
+        Ok(json!({
+            "repair": id.as_str(),
+            "reverted": report.outcome == ApplyOutcome::Applied,
+            "result": outcome_json(&report.outcome),
+            "files": report.files.iter().map(|(rel, o)| { let mut v = outcome_json(o); v["rel"] = json!(rel); v }).collect::<Vec<_>>(),
+            "hook_step": match &report.hook_step { None => Value::Null, Some(Ok(())) => json!("ok"), Some(Err(e)) => json!({"error": e}) },
+        }))
+    }
+
+    /// CT11 / DX1: the repair whose apply in THIS lane is the most recent (its row's `applied_at`)
+    /// among those `revert_in` accepts — asked of THE predicate `cys::repair::apply::revertible_here`
+    /// (a probation closed 실패 included); no state list of its own.
+    pub(crate) fn latest_applied_here(ctx: &Ctx<'_>) -> Option<RepairId> {
+        let mut best: Option<(f64, RepairId)> = None;
+        for id in ledger::list_ids_in(&ctx.root) {
+            let Ok(Some(row)) = ledger::read_lane_in(&ctx.root, &id, &ctx.lane) else {
+                continue;
+            };
+            let Ok(Some(rec)) = ledger::read_record_in(&ctx.root, &id) else {
+                continue;
+            };
+            if !cys::repair::apply::revertible_here(&rec, &row, &ctx.lane) {
+                continue;
+            }
+            let at = row.probation.as_ref().map(|p| p.applied_at).unwrap_or(row.updated_at);
+            if best.as_ref().is_none_or(|(t, _)| at > *t) {
+                best = Some((at, id));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    fn being_worked(s: RepairState) -> bool {
+        matches!(
+            s,
+            RepairState::InProgress | RepairState::AwaitingApproval | RepairState::ReopenedByAudit
+        )
+    }
+
+    /// `cys repair reapply <R-id>` (RULINGS AQ5, AR1; WORK — a worker seat of this lane): R′ is created
+    /// through `begin`'s own body with the files of R that the update PARKED in THIS lane's pack — a
+    /// `.merge-pending.json` entry of kind `vendor-first` whose side copy (`<rel>.user`, written by the
+    /// install core's vendor-first arm, `src/pack.rs` `park_user_copy`) is a regular file — with
+    /// `trigger: update`; the vendor bytes now live are R′'s pre-image; `reapplies: R` is recorded on
+    /// R′. R is not re-opened and not locked. Refused: no parked copy of R here; a repair with
+    /// `reapplies: R` unfinished or in force (it reaches this lane by propagation); a being-worked
+    /// repair of this lane already holds one of the files (the ordinary `begin` rule). RULINGS CQ2: when
+    /// no target is parked but a target's `<rel>.user` IS on disk without a `vendor-first` record naming
+    /// it (e.g. the record was replaced by `kept-drift`), the refusal names that copy and the route that
+    /// works — `cys repair begin --files <rel> --trigger update` — instead of "nothing to re-apply".
+    pub(crate) fn reapply(ctx: &Ctx<'_>, caller: &Caller, p: &Value) -> Result<Value, VerbError> {
+        if !caller.is_worker() {
+            return Err(VerbError::refused(
+                "다시 입히기(reapply)는 이 부서의 워커 좌석만 합니다",
+            ));
+        }
+        let r_id = repair_id(p)?;
+        let r = ledger::read_record_in(&ctx.root, &r_id)
+            .map_err(VerbError::from)?
+            .ok_or_else(|| VerbError::not_found(format!("{}: 그런 수리가 없습니다", r_id.as_str())))?;
+        let pending = cys::pack::load_merge_pending(&ctx.pack_dir);
+        let mut parked: Vec<(String, std::path::PathBuf)> = Vec::new();
+        // CQ2: a regular `<rel>.user` on disk that no `vendor-first` record names
+        let mut unrecorded: Vec<(String, std::path::PathBuf)> = Vec::new();
+        let mut foreign: Vec<(String, std::path::PathBuf)> = Vec::new();
+        let is_regular = |p: &std::path::Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file());
+        for f in ledger::file_targets(&r) {
+            let copy_at_rel = ctx.pack_dir.join(format!("{}.user", f.rel));
+            let vendor_first = pending
+                .get(&f.rel)
+                .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("vendor-first"));
+            let Some(e) = vendor_first else {
+                if is_regular(&copy_at_rel) {
+                    unrecorded.push((f.rel.clone(), copy_at_rel));
+                }
+                continue;
+            };
+            let side = e
+                .get("side")
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{}.user", f.rel));
+            let path = ctx.pack_dir.join(&side);
+            if is_regular(&path) {
+                // CU4: the parked copy must be R's OWN edit (its bytes = R's repaired state of the
+                // file); a copy of something else is never re-applied as R
+                let own = match &f.post {
+                    cys::repair::types::TargetState::File { sha256, .. } => cys::repair::types::TargetState::read(&path)
+                        .ok()
+                        .is_some_and(|st| matches!(st, cys::repair::types::TargetState::File { sha256: s, .. } if s == *sha256)),
+                    _ => false,
+                };
+                if own {
+                    parked.push((f.rel.clone(), path));
+                } else {
+                    foreign.push((f.rel.clone(), path));
+                }
+            } else if path != copy_at_rel && is_regular(&copy_at_rel) {
+                // the record names another side copy that is gone; `<rel>.user` is not the one it names
+                unrecorded.push((f.rel.clone(), copy_at_rel));
+            }
+        }
+        if parked.is_empty() && !foreign.is_empty() {
+            let copies = foreign.iter().map(|(_, p)| p.display().to_string()).collect::<Vec<_>>().join(", ");
+            let rels = foreign.iter().map(|(rel, _)| rel.as_str()).collect::<Vec<_>>().join(" ");
+            return Err(VerbError::new(
+                cys::repair::types::ERR_PRECONDITION,
+                format!(
+                    "{id}: 보관 사본 {copies} 은 {id} 의 수정본이 아닙니다(내용이 다릅니다) — 다시 입히기(reapply)로는 입히지 않습니다. 그 사본을 살리는 길은 수리입니다: cys repair begin --files {rels} --trigger update (작업 사본에서 <파일>.user 를 합친 뒤 검증·감사 서명 → 주인 최종 승인)",
+                    id = r_id.as_str()
+                ),
+            ));
+        }
+        if parked.is_empty() && !unrecorded.is_empty() {
+            let copies = unrecorded
+                .iter()
+                .map(|(_, p)| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rels = unrecorded.iter().map(|(rel, _)| rel.as_str()).collect::<Vec<_>>().join(" ");
+            return Err(VerbError::new(
+                cys::repair::types::ERR_PRECONDITION,
+                format!(
+                    "{id}: 보관 사본 {copies} 는 그대로 있지만 그 사본을 가리키는 vendor-first 기록이 없어 다시 입히기(reapply)로는 입히지 않습니다 — 그 사본을 살리는 길은 수리입니다: cys repair begin --files {rels} --trigger update (작업 사본에서 <파일>.user 를 합친 뒤 검증·감사 서명 → 주인 최종 승인)",
+                    id = r_id.as_str()
+                ),
+            ));
+        }
+        if parked.is_empty() {
+            return Err(VerbError::new(
+                cys::repair::types::ERR_PRECONDITION,
+                format!(
+                    "{id}: 이 부서의 팩에는 업데이트가 보관한 {id} 의 수정본이 없습니다(vendor-first 기록과 보관 사본 <파일>.user 가 함께 있어야 합니다) — 다시 입힐 것이 없습니다",
+                    id = r_id.as_str()
+                ),
+            ));
+        }
+        let ids = ledger::list_ids_in(&ctx.root);
+        for oid in &ids {
+            let Ok(Some(o)) = ledger::read_record_in(&ctx.root, oid) else {
+                continue;
+            };
+            // AR1: one re-application serves every lane
+            if o.reapplies.as_ref() == Some(&r_id)
+                && (being_worked(o.state) || matches!(o.state, RepairState::Probation | RepairState::InUse))
+            {
+                return Err(VerbError::new(
+                    cys::repair::types::ERR_PRECONDITION,
+                    format!(
+                        "{r}: 이미 {o} 가 {r} 의 수정본을 다시 입히고 있습니다(상태: {s}) — 두 번 입히지 않습니다. 그 수리가 적용되면 전파로 이 부서에도 닿습니다",
+                        r = r_id.as_str(),
+                        o = o.id.as_str(),
+                        s = o.state.label_ko()
+                    ),
+                ));
+            }
+            // the ordinary `begin` rule: one open repair per file
+            if o.origin_lane == ctx.lane
+                && being_worked(o.state)
+                && o.files.iter().any(|f| parked.iter().any(|(rel, _)| *rel == f.rel))
+            {
+                let shared = o
+                    .files
+                    .iter()
+                    .find(|f| parked.iter().any(|(rel, _)| *rel == f.rel))
+                    .map(|f| f.rel.clone())
+                    .unwrap_or_default();
+                return Err(VerbError::new(
+                    cys::repair::types::ERR_PRECONDITION,
+                    format!(
+                        "{shared}: 이 파일을 고치는 수리 {o} 가 이미 열려 있습니다 — 그 수리를 이어받거나 끝낸 뒤 다시 하세요(한 파일에 열린 수리는 하나뿐입니다)",
+                        o = o.id.as_str()
+                    ),
+                ));
+            }
+        }
+        // CT8 / DR4 — ONE re-application per parked edit ACROSS lanes, by the grant's claim protocol:
+        // (1) bind R′ first — `begin` (R′ holds its own lock) and `reapplies: R` under R′'s mutex;
+        // (2) place claim k naming R′ (no-replace); (3) after placement, our claim must not be
+        // closed. A refusal at (2)/(3) closes R′ (truthfully: overtaken) and answers with the holder.
+        let files: Vec<String> = parked.iter().map(|(rel, _)| rel.clone()).collect();
+        let mut out = super::ledger_verbs::begin(ctx, caller, &json!({"files": files, "trigger": "update"}))?;
+        let new_id = out
+            .get("repair")
+            .and_then(|x| x.as_str())
+            .and_then(|s| RepairId::parse(s).ok())
+            .ok_or_else(|| VerbError::new("io", "새 수리 번호를 읽을 수 없습니다"))?;
+        ctx.locked(new_id.as_str(), || -> Result<(), VerbError> {
+            let Some(mut rec) = ledger::read_record_in(&ctx.root, &new_id).map_err(VerbError::from)? else {
+                return Err(VerbError::new("io", format!("{}: 방금 만든 수리 기록을 읽을 수 없습니다", new_id.as_str())));
+            };
+            rec.reapplies = Some(r_id.clone());
+            ledger::write_record_durable_in(&ctx.root, &rec).map_err(VerbError::from)
+        })?;
+        let holder_of = |h: &RepairId| match ledger::read_record_in(&ctx.root, h) {
+            Ok(Some(o)) if being_worked(o.state) || matches!(o.state, RepairState::Probation | RepairState::InUse) => {
+                cys::repair::reapply_claim::Holder::Alive
+            }
+            Ok(Some(_)) => cys::repair::reapply_claim::Holder::Ended,
+            // unreadable holder evidence (or a holder that is gone) — assume held (G7)
+            Ok(None) | Err(_) => cys::repair::reapply_claim::Holder::Unreadable,
+        };
+        let refused = match cys::repair::reapply_claim::claim_in(&ctx.root, &r_id, &ctx.lane, &new_id, ctx.now, &holder_of) {
+            Ok(_) => None,
+            Err(cys::repair::reapply_claim::ClaimRefused::Held { holder }) => {
+                let s = ledger::read_record_in(&ctx.root, &holder)
+                    .ok()
+                    .flatten()
+                    .map(|o| o.state.label_ko())
+                    .unwrap_or("확인할 수 없음");
+                Some(format!(
+                    "{r}: 이미 {o} 가 {r} 의 수정본을 다시 입히고 있습니다(상태: {s}) — 두 번 입히지 않습니다. 그 수리가 적용되면 전파로 이 부서에도 닿습니다",
+                    r = r_id.as_str(),
+                    o = holder.as_str()
+                ))
+            }
+            Err(cys::repair::reapply_claim::ClaimRefused::LostRace) | Err(cys::repair::reapply_claim::ClaimRefused::ClosedAfterPlacement { .. }) => Some(format!(
+                "{r}: 다른 부서가 방금 {r} 의 수정본을 다시 입히기 시작했습니다 — 두 번 입히지 않습니다. 그 수리가 적용되면 전파로 이 부서에도 닿습니다",
+                r = r_id.as_str()
+            )),
+            Err(cys::repair::reapply_claim::ClaimRefused::Io(e)) => Some(format!("{}: 다시 입히기 주장을 남기지 못했습니다 — {e}", r_id.as_str())),
+        };
+        if let Some(why) = refused {
+            // the bound R′ is closed: it never re-applies anything
+            let _ = ctx.locked(new_id.as_str(), || -> Result<(), VerbError> {
+                if let Some(mut rec) = ledger::read_record_in(&ctx.root, &new_id).map_err(VerbError::from)? {
+                    rec.state = RepairState::Superseded;
+                    rec.lock = None;
+                    rec.methods.push(format!("다시 입히기 주장에서 밀려 닫음 — {why}").chars().take(300).collect());
+                    ledger::write_record_durable_in(&ctx.root, &rec).map_err(VerbError::from)?;
+                }
+                Ok(())
+            });
+            return Err(VerbError::new(cys::repair::types::ERR_PRECONDITION, why));
+        }
+        out["reapplies"] = json!(r_id.as_str());
+        out["parked"] = json!(parked
+            .iter()
+            .map(|(rel, path)| json!({"rel": rel, "parked_copy": path}))
+            .collect::<Vec<_>>());
+        Ok(out)
     }
 }
 
@@ -4850,8 +5227,10 @@ mod tests {
                         code_of(handle(&daemon, sub, params, &json!(7), sid, grade, pid))
                     }));
                     let (code, msg) = result.unwrap_or_else(|_| panic!("repair.{sub} panicked"));
-                    if T3_VERBS.contains(sub) || T4_VERBS.contains(sub) {
-                        // T3's / T4's bodies answer a success or a structured error — never the stub
+                    // T6 (rewrite: `revert` / `reapply` / `tick` / `sweep` left the stub set — the old
+                    // expectation for them was `repair_not_implemented` after the role table)
+                    if T3_VERBS.contains(sub) || T4_VERBS.contains(sub) || T6_VERBS.contains(sub) {
+                        // T3's / T4's / T6's bodies answer a success or a structured error — never the stub
                         assert_ne!(code, "repair_not_implemented", "repair.{sub}: {msg}");
                         assert_ne!(code, "method_not_found", "repair.{sub}");
                         continue;

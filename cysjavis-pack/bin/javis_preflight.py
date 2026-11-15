@@ -481,6 +481,8 @@ def _unrecorded_copies_part(unrecorded, incomplete=None):
 # 어떤 훅 묘비도 적용하지 않는다(지금 동작). 상태줄 훅(`cys-statusline.sh`)은 그 목록에서 빠지지만
 # (O-C4-4) 그 등록기(C32)는 묘비를 아예 보지 않으므로 언제나 등록된다(구조로 생명줄).
 TOMBSTONE_QUERY_TIMEOUT_S = 5
+# ★0.15.0 M10(T6): `cys repair sweep` 는 데몬이 곧바로 답한다(started|busy|not_ready) — 일은 데몬 스레드가 한다.
+REPAIR_SWEEP_TIMEOUT_S = 10
 _REG_TOMBSTONED = "__registration-refused-by-tombstone__"   # 등록기 반환 표식(실패 아님)
 _TOMB_CACHE = {}
 
@@ -7957,6 +7959,40 @@ class Preflight:
                  % (len(d["added"]), len(d["changed"]), len(d["missing"]),
                     ", ".join(sample), npm_hint, self.RUNTIME_SEAL_RECOVERY))
 
+    # ── ★0.15.0 「스스로 해결」 M10(T6 · 설계 §4-10 · 계약 C7 F9) — 점검 때의 미승인 변경 훑기 요청 ──
+    #   판정·되돌리기는 이 레인의 데몬이 한다(승인 기록 3중 확인 F9 · 규칙 하나의 맞바꾸기 · 규칙 문서 제외 · 윈도우는
+    #   알리기만). 이 점검은 데몬에게 훑기를 **청하고**(`cys repair sweep --json` — 데몬을 깨우지 않는다), 지난 훑기의
+    #   알림(같은 파일의 같은 바이트는 한 번만 · 줄바꿈만 다른 발견은 알리지 않음)을 보고할 뿐이다. 보고 모드에서는
+    #   청하지 않는다(무변경 계약 — 데몬의 한 시간마다 훑기는 그대로 돈다).
+    def c84_repair_sweep(self):
+        cid = "C84.repair-sweep"
+        if self.skipped(cid):
+            return
+        if not self.fix:
+            self.add(cid, SKIP, "보고 모드 — 훑기를 청하지 않음(데몬의 한 시간마다 훑기는 그대로 돈다)")
+            return
+        data = _cys_local_json(["repair", "sweep", "--json"], timeout=REPAIR_SWEEP_TIMEOUT_S)
+        if not isinstance(data, dict):
+            # 일반 SKIP(부트 준비 판정에 새 축을 더하지 않는다 — P1 · 점검이 데몬 부재로 막히지 않는다)
+            self.add(cid, SKIP, "데몬 응답 없음 — 이번 점검에서는 훑기를 청하지 못함(데몬의 한 시간마다 훑기는 그대로 돈다)")
+            return
+        state = str(data.get("tick", "?"))
+        notices = [n for n in (data.get("notices") or []) if isinstance(n, dict)]
+        if notices:
+            lines = ["%s — %s" % (n.get("rel", "?"), n.get("note", "")) for n in notices]
+            self.add(cid, WARN, "승인 없이 바뀐 기동 필수 파일 %d건(이번에 처음 알림): %s · 훑기 요청 %s"
+                     % (len(lines), " · ".join(lines), state))
+            # RULINGS GK3: the notices are taken (reported above) — only now are their keys confirmed,
+            # in a SECOND call; a notice never confirmed is handed out at most three times
+            keys = [str(n["key"]) for n in notices if n.get("key")]
+            if keys:
+                args = ["repair", "sweep", "--json"]
+                for k in keys:
+                    args += ["--confirm", k]
+                _cys_local_json(args, timeout=REPAIR_SWEEP_TIMEOUT_S)
+        else:
+            self.add(cid, PASS, "훑기 요청 %s — 새로 알릴 미승인 변경 없음" % state)
+
     def c83_lane_guard_tripped(self):
         """레인 훅 조기 종료 표식과 좌석의 SessionStart 설정을 읽기 전용으로 대조한다."""
         cid = "C83.lane-guard-tripped"
@@ -8092,6 +8128,8 @@ class Preflight:
             self.c82_gate_corpus_drift,
             # C83 — 레인 훅 조기 종료·좌석 설정 대조(읽기 전용 · C62 앞).
             self.c83_lane_guard_tripped,
+            # C84(0.15.0 「스스로 해결」 M10 · T6) — 데몬에게 미승인 변경 훑기를 청하고 새 알림만 보고(C62 앞).
+            self.c84_repair_sweep,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,

@@ -25197,55 +25197,10 @@ fn collect_tree(root: &std::path::Path) -> Result<Vec<(String, String)>, String>
     Ok(out)
 }
 
-/// flock(LOCK_EX) 임계영역에서 f를 실행(§7-⑧ 폴백 apply-lock — per-file write_atomic + writer 배타).
-/// non-unix는 잠금 없이 실행.
-///
-/// ⚠보장 범위(정직 명시 · 층위 분리):
-/// 1) 이 락은 **writer 측 상호배제(serialization)만** 제공한다 — 동시 writer가 같은 pack_dir를
-///    겹쳐 쓰는 것을 직렬화할 뿐이다.
-/// 2) **트랜잭션 rollback/commit marker는 이 락의 책임이 아니라 apply_pack_transactional의 책임이다**
-///    — backup journal + `.pack-version` hard commit marker로 부분커밋 0(all-or-nothing)을 보장한다
-///    (pack-update 경로). 이 락은 그 트랜잭션을 writer 배타 창 안에서 단독 실행시키는 역할만 한다.
-/// 3) 그러나 §6-4 심링크(pack_dir) 1회 마이그레이션이 보류된 현재(디렉터리 일괄 atomic 스왑 미구현),
-///    **외부 동시 live READER의 snapshot atomic(multi-file SET 일관성·torn-read)은 여전히 보장되지
-///    않는다.** §7-⑧ 폴백이 요구한 reader-측 차단(공유 flock)을 load-bearing 리더(compose_directive —
-///    MASTER_DIRECTIVE/soul.md/MEMORY.md/각 SKILL.md 순차 읽기 · Tauri read_board_catalog)가 취하지
-///    않기 때문이다. 그 결과 apply 창 동안 외부 리더는 신규-directive + 구-soul 같은 혼재(torn) 집합을
-///    관측할 수 있다. pack-update 자신의 reinject는 apply 이후 실행되어 안전하고, 노출 대상은 외부 동시
-///    리더뿐이다. 진짜 reader 집합 원자성은 §6-4 심링크 스왑 도입 시 확보된다.
-fn with_apply_lock<T>(lock_path: &std::path::Path, f: impl FnOnce() -> T) -> Result<T, String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        // CI fresh 환경엔 ~/.cys/ 가 없어 lock 파일 open이 ENOENT로 실패한다.
-        // 락 파일 열기 직전 부모 디렉토리를 보장한다(이미 있으면 무해).
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                format!("apply-lock 부모 디렉토리 생성 실패 {}: {e}", parent.display())
-            })?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(lock_path)
-            .map_err(|e| format!("apply-lock 열기 실패 {}: {e}", lock_path.display()))?;
-        let fd = file.as_raw_fd();
-        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
-            return Err(format!("flock 실패: {}", std::io::Error::last_os_error()));
-        }
-        let out = f();
-        unsafe {
-            libc::flock(fd, libc::LOCK_UN);
-        }
-        Ok(out)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = lock_path;
-        Ok(f())
-    }
-}
+/// RULINGS B7 (pure move): `with_apply_lock` lives in the library (`cys::pack_apply_lock`) so the
+/// daemon's revert takes the SAME lock file with the same flock protocol; this name stays for the
+/// CLI's callers and its test.
+use cys::pack_apply_lock::with_apply_lock;
 
 /// pack-update 코어 결과(§2-② 흐름 1~5). reinject(6)는 라이브 데몬 단계로 분리.
 #[derive(Debug, Clone)]
@@ -25454,13 +25409,8 @@ fn pack_update_from_dir(
     })
 }
 
-/// ~/.cys (pack_dir의 부모) — 무중단 채널 상태파일(.pack-staging·.pack-apply.lock·.pack-accepted.json) 루트.
-fn pack_state_base() -> std::path::PathBuf {
-    cys::pack::pack_dir()
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-}
+/// RULINGS B7 (pure move): `pack_state_base` lives in the library (`cys::pack_apply_lock`).
+use cys::pack_apply_lock::pack_state_base;
 
 /// `cys pack-downgrade-to-free`(free/pro v3 §5) — 유일한 pro→free 전환 경로. license-aware:
 /// 유효 pro 라이선스 실재 시 기본 거부(--override-valid-license로만 통과). 실행 = state를

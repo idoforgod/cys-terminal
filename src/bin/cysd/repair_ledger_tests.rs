@@ -324,7 +324,17 @@ fn detached_caller_reads_reports_triggers_only() {
             json!({"file": "bin/a.py", "error": "E: x"})
         )
         .is_ok());
-    for verb in ["tick", "sweep", "approval_list"] {
+    for verb in ["tick", "sweep"] {
+        // T6 (rewrite — the old expectation was `repair_not_implemented`): accepted by the role table;
+        // the bare dispatcher holds no daemon state, so it refuses with a sentence — the daemon's own
+        // `handle` answers these two (`repair_job::trigger`, tested in repair_job_tests.rs)
+        assert_eq!(
+            r.call(T0, &detached(), verb, json!({})).unwrap_err().code,
+            "repair_precondition",
+            "{verb}"
+        );
+    }
+    for verb in ["approval_list"] {
         // accepted by the role table, the body is another track's
         assert_eq!(
             r.call(T0, &detached(), verb, json!({})).unwrap_err().code,
@@ -1092,21 +1102,32 @@ fn pick_up_of_in_force_and_revert_role() {
     let r = rig("inforce");
     let id = committed_general(&r);
     assert_eq!(r.record_of(&id).state, RepairState::Probation);
-    let before_lock = r.record_of(&id).lock.clone();
-    let e = r
-        .call(
-            T0 + 5.0,
-            &seat(13, "worker-3"),
-            "revert",
-            json!({"repair": id}),
-        )
-        .unwrap_err();
-    assert_eq!(e.code, "repair_not_implemented", "{}", e.message);
-    assert_eq!(
-        r.record_of(&id).lock,
-        before_lock,
-        "revert touched the lock"
-    );
+    // T6 (rewrite — the old expectation was `repair_not_implemented` from the stub): a worker seat of
+    // the lane passes the role table, the revert body runs and never touches the lock (C1 1.12 / P4).
+    // On its own rig, so the in-force repair below stays in force for the pick-up check.
+    {
+        let rr = rig("inforce-revert");
+        // GK4 / FI1: a repair is returned only when its pre-image's generation is the pack's now —
+        // this rig's pack states its generation (the T3 rig has none: every repair begun in it is
+        // "not returned automatically", which is not what this check is about)
+        std::fs::write(rr.pack.join(".pack-version"), "0.15.0\n").unwrap();
+        let rid_ = committed_general(&rr);
+        let before_lock = rr.record_of(&rid_).lock.clone();
+        let v = rr
+            .call(
+                T0 + 5.0,
+                &seat(13, "worker-3"),
+                "revert",
+                json!({"repair": rid_}),
+            )
+            .unwrap();
+        assert_eq!(v["repair"], json!(rid_), "{v}");
+        assert_eq!(
+            rr.record_of(&rid_).lock,
+            before_lock,
+            "revert touched the lock"
+        );
+    }
     let in_force = r.record_of(&id);
     let p = r
         .call(
@@ -1438,8 +1459,12 @@ fn unregister_hook_rules() {
     assert!(ledger::list_ids_in(&r.root).is_empty());
 }
 
-/// RULINGS Y1: until T6's `hook_lines_step` lands, a commit whose record has a hook line is refused
-/// with the not-implemented sentence and the record is left exactly as before; no lane row appears.
+/// RULINGS Y1 / Y2(c) — T6 rewrite (the old pin: "until T6's `hook_lines_step` lands, a commit whose
+/// record has a hook line is refused with the not-implemented sentence and the record is left exactly
+/// as before; no lane row appears"). T6's step is real now: when it cannot complete (here the
+/// production step cannot see this rig's ledger — any registrar or record error behaves the same) the
+/// commit STANDS (the committed state was durable before the step ran — Y1 order) and this lane's row
+/// is `충돌` with the step's error — never a silent `검증됨`; the confirming case is `ak5_…` below.
 #[test]
 fn commit_with_hook_line_refused_while_step_is_stub() {
     let r = rig("hookcommit");
@@ -1477,20 +1502,19 @@ fn commit_with_hook_line_refused_while_step_is_stub() {
     )
     .unwrap();
     let before = r.record_of(&id);
-    let e = r
+    let c = r
         .call(T0 + 3.0, &w, "commit", json!({"repair": id}))
-        .unwrap_err();
-    assert_eq!(e.code, "repair_not_implemented", "{}", e.message);
-    assert!(e.message.contains("hook_lines_step"));
+        .unwrap();
+    assert!(c["hook_step"]["error"].is_string(), "{c}");
     let after = r.record_of(&id);
-    assert_eq!(after.state, RepairState::InProgress);
-    assert!(after.committed.is_empty());
+    assert_eq!(after.state, RepairState::Probation, "the commit stands");
+    assert!(!after.committed.is_empty());
     assert_eq!(after.files, before.files);
-    assert!(after.lock.is_some());
-    assert!(
-        !r.root.join(&id).join("lanes").exists(),
-        "no lane row for a refused commit"
-    );
+    assert!(!after.checks.iter().any(|(_, how)| how == "hook-registrar"), "never claimed");
+    let row = ledger::read_lane_in(&r.root, &after.id, &r.lane)
+        .unwrap()
+        .expect("this lane's row");
+    assert_eq!(row.state, LaneState::Conflict, "충돌 — Y2(c)");
     // the hook line is skipped by every file walker (W3(b))
     assert_eq!(
         cys::repair::ledger::candidate_states_in(&r.root, &after.id)

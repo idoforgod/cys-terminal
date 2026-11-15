@@ -134,6 +134,11 @@ pub struct RepairRecord {
     /// that did not run is never listed.
     #[serde(default)]
     pub checks: Vec<(String, String)>,
+    /// RULINGS AQ5 (T6): set on R′ when `cys repair reapply <R>` started it — `reapplies: R`
+    /// (shown by `status`); `None` for every other repair. AR1: a second `reapply R` is refused while
+    /// a repair with `reapplies: R` is unfinished or in force.
+    #[serde(default)]
+    pub reapplies: Option<RepairId>,
 }
 
 /// The probation bundle of one lane (C1 1.6, K4, N3).
@@ -533,10 +538,11 @@ fn corrupt(p: &Path, why: impl std::fmt::Display) -> RepairError {
 /// Reads a ledger JSON file: `Ok(None)` if absent; `Err(Corrupt)` if unreadable, malformed or of a
 /// higher `schema` than this build knows (O-C1-6 / O-C1-7).
 fn read_json<T: serde::de::DeserializeOwned>(p: &Path) -> Result<Option<T>, RepairError> {
-    let bytes = match std::fs::read(p) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(corrupt(p, e)),
+    // T6 · RULINGS GK5 (the seam's reads made bounded): through THE bounded record reader
+    let bytes = match super::durable::read_record_bytes(p) {
+        super::durable::RecordRead::Bytes(b) => b,
+        super::durable::RecordRead::NotFound => return Ok(None),
+        super::durable::RecordRead::Unreadable(why) => return Err(corrupt(p, why)),
     };
     let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| corrupt(p, e))?;
     let schema = v.get("schema").and_then(|s| s.as_u64()).unwrap_or(u64::MAX);
@@ -645,6 +651,55 @@ pub fn list_ids_in(root: &Path) -> Vec<RepairId> {
         .collect();
     ids.sort();
     ids
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only (T6 · FG1): the next enumerations of the repairs root fail (an unlistable root).
+    pub(crate) static FAIL_LIST_IDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// T6 · RULINGS FG1 (a granted seam beside `list_ids_in`, whose callers keep its behaviour): the
+/// repairs root's ids with three answers — `Ok(ids)`; `Ok(empty)` only on positive evidence (the root
+/// does not exist AND its parent could be read); `Err` for everything else (an unlistable root, an
+/// entry whose name or type cannot be read).
+pub fn list_ids_checked_in(root: &Path) -> Result<Vec<RepairId>, RepairError> {
+    #[cfg(test)]
+    if FAIL_LIST_IDS.with(|c| c.get()) {
+        return Err(RepairError::Io(format!("{}: 목록을 읽을 수 없습니다(시험 주입)", root.display())));
+    }
+    let rd = match std::fs::read_dir(root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return match root.parent().map(std::fs::read_dir) {
+                Some(Ok(_)) => Ok(Vec::new()),
+                _ => Err(RepairError::Io(format!("{}: 없음, 그러나 그 상위 폴더도 읽을 수 없습니다", root.display()))),
+            };
+        }
+        Err(e) => return Err(RepairError::Io(format!("{}: 목록을 읽을 수 없습니다 — {e}", root.display()))),
+    };
+    let mut ids = Vec::new();
+    for entry in rd {
+        let entry = entry.map_err(|e| RepairError::Io(format!("{}: 항목을 읽을 수 없습니다 — {e}", root.display())))?;
+        let ft = entry.file_type().map_err(|e| RepairError::Io(format!("{}: 항목 종류를 읽을 수 없습니다 — {e}", entry.path().display())))?;
+        if !ft.is_dir() {
+            continue;
+        }
+        if let Some(id) = entry.file_name().to_str().and_then(|n| RepairId::parse(n).ok()) {
+            ids.push(id);
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+/// T6 · RULINGS FG4 (a granted seam beside `write_lane_in`): the lane row written through the durable
+/// writer (file flushed, placed, directory flushed); a failure is returned — the event is not final.
+pub fn write_lane_durable_in(root: &Path, row: &LaneRecord) -> Result<(), RepairError> {
+    let p = lane_path_in(root, &row.repair, &row.lane);
+    let mut r = row.clone();
+    r.schema = super::REPAIR_SCHEMA;
+    super::durable::write_json_durable(&p, &r)
 }
 
 /// Allocates the next `R-<n>` by an exclusive directory create (O-C1-2: n = highest + 1; on
@@ -929,6 +984,13 @@ fn copy_link_new(target: &str, dst: &Path) -> Result<(), RepairError> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only (T6 · GK1): runs between the pre-image's copy and the second reading of the
+    /// generation (an update completing there).
+    pub(crate) static BETWEEN_PREIMAGE_COPY_AND_GENERATION: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// C2 2.3(a) / C1 1.7 — the `begin` pre-image: an existing live entry is COPIED into a fresh,
 /// write-once vault slot `displaced/R-<n>/<시각>/payload/<basename>` with `meta/pre.json` (the live
 /// file is not touched); a path that does not exist is recorded as `absent` (no copy). The slot and
@@ -946,6 +1008,18 @@ pub fn copy_preimage_in(
     if state == TargetState::Absent {
         return Ok(PreImage::Absent);
     }
+    // T6 · RULINGS FI1 / GK1 (a granted seam in T3's begin): the pack is `live` without `rel` — every
+    // caller passes `pack.join(rel)`; when it is not, the generation is absent (Unknown). Read here,
+    // BEFORE the copy (and again after it, below).
+    let pack_of_live = {
+        let mut p = live.to_path_buf();
+        let mut ok = true;
+        for _ in rel.split('/').filter(|c| !c.is_empty()) {
+            ok &= p.pop();
+        }
+        (ok && p.join(rel) == live).then_some(p)
+    };
+    let generation_before = pack_of_live.as_ref().and_then(|p| super::apply::pack_generation_checked(p).ok());
     let io = |p: &Path, e: std::io::Error| RepairError::Io(format!("{}: {e}", p.display()));
     let vault = vault_dir_in(root, id);
     std::fs::create_dir_all(&vault).map_err(|e| io(&vault, e))?;
@@ -978,7 +1052,7 @@ pub fn copy_preimage_in(
             (sha, mode, None)
         }
     };
-    let pre = serde_json::json!({
+    let mut pre = serde_json::json!({
         "schema": super::REPAIR_SCHEMA,
         "repair": id.as_str(),
         "lane_key": lane.0,
@@ -989,7 +1063,26 @@ pub fn copy_preimage_in(
         "mode": mode,
         "link_target": link_target,
     });
+    // (T6 · FI1 / GK1: the generation measured around the copy is written below)
     let pre_path = meta.join("pre.json");
+    // T6 · RULINGS GK1 (a) / GM1 (the seam): the generation read BEFORE and AFTER the copy — equal →
+    // recorded; unequal or unreadable → absent (Unknown); and a `#!` regular file without the
+    // owner's execute bit (unix) → absent: its mode may not be the generation's final one (the
+    // non-transactional install sets that bit after `.pack-version`)
+    #[cfg(test)]
+    BETWEEN_PREIMAGE_COPY_AND_GENERATION.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f();
+        }
+    });
+    let generation_after = pack_of_live.as_ref().and_then(|p| super::apply::pack_generation_checked(p).ok());
+    let stable = matches!((&generation_before, &generation_after), (Some(b), Some(a)) if b == a);
+    let mode_may_lag = cfg!(unix) && link_target.is_none() && mode & 0o100 == 0 && std::fs::read(&dst).map(|b| b.starts_with(b"#!")).unwrap_or(true);
+    if stable && !mode_may_lag {
+        if let Some(g) = &generation_before {
+            pre["pack_generation"] = serde_json::json!(g);
+        }
+    }
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -1254,6 +1347,7 @@ mod tests {
             committed: vec![("bin/a.py".into(), "file:bb:0755".into())],
             fixer_seats: vec![3, 9],
             checks: vec![("bin/a.py".into(), "py-compile".into())],
+            reapplies: Some(id("R-11")),
         };
         let v = serde_json::to_value(&rec).unwrap();
         assert_eq!(
@@ -1286,6 +1380,8 @@ mod tests {
                 "committed",
                 "fixer_seats",
                 "checks",
+                // T6 (RULINGS AQ5) — the old expectation ended at "checks"
+                "reapplies",
             ])
         );
         assert_eq!(
@@ -1506,6 +1602,7 @@ mod storage_tests {
             committed: vec![],
             fixer_seats: vec![],
             checks: vec![],
+            reapplies: None,
         }
     }
 
@@ -1938,9 +2035,10 @@ mod storage_tests {
         let mut v = serde_json::to_value(sample(&id)).unwrap();
         v.as_object_mut().unwrap().remove("fixer_seats");
         v.as_object_mut().unwrap().remove("checks");
+        v.as_object_mut().unwrap().remove("reapplies"); // T6 (AQ5): a record from before the field
         std::fs::write(record_path_in(&root, &id), serde_json::to_vec(&v).unwrap()).unwrap();
         let r = read_record_in(&root, &id).unwrap().unwrap();
-        assert!(r.fixer_seats.is_empty() && r.checks.is_empty());
+        assert!(r.fixer_seats.is_empty() && r.checks.is_empty() && r.reapplies.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
