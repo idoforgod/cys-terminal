@@ -154,6 +154,10 @@ QUEUE_BAN = "는 자동 조치(강제 배달 `cys queue deliver`·드레인·키
 NO_TURN_WAIT = "이 턴에서 기다리지 않는다"
 REVIEWER_DUTIES = "리뷰어1=적대 검증·리뷰어2=감사"
 STAGING = "~/.cys/local/repairs/R-<n>/staging/"
+# H-06-N3-01 (설계 §6-6 "워커는 기다리는 동안 메시지를 밀지 않음" · RULINGS HN3): 워커 지침의 대기 규율 — 대기는 상태
+# 자기보고로만 드러내고 master 에 새 push 를 보내지 않는다(순환마다 push 가 늘면 폭주 방향 · F1). 런타임 CONTENT_PINS 에는
+# 없다(그 표는 제품 자료 — 여기서 고치지 않는다) — 저장소 시험으로 건다.
+NO_PUSH_WHILE_WAITING = "대기 중이라는 사실은 상태 자기보고로만 드러낸다 — 그것 때문에 master 에 새 push 를 보내지 않는다"
 # 설계·계약 C3 가 고정한 동사 이름 — 지침이 인용하는 철자(티켓 T1b: report/begin/record/submit/commit/attest-verify/
 # attest-audit/revert/status).
 C3_QUOTED = ("cys repair report", "begin", "record", "submit", "commit", "attest-verify", "attest-audit",
@@ -241,6 +245,13 @@ class M2DirectiveRewrite(unittest.TestCase):
         # RULINGS AH2: `record` renews the lease only while editing — after asking for signatures it would void them.
         self.assertIn("**리뷰어 서명을 청한 뒤에는 `record` 를 부르지 않는다**", w)
         self.assertIn("같은 파일로 `begin` 을 다시 불러 그 수리를 이어받은 뒤 `submit`·`commit` 한다", w)
+
+    def test_h06_n3_waiting_is_shown_only_by_self_report_never_by_a_push(self):
+        """H-06-N3-01: 워커 지침에 '대기는 상태 자기보고로만 · master 에 새 push 금지' 조항이 글자 그대로 남고(줄바꿈은
+        norm 규칙), 새 수리 승인 문장은 제출하고 계속하라고만 한다(기다리거나 push 하라고 하지 않는다)."""
+        w = norm(self._t("WORKER_DIRECTIVE.md"))
+        self.assertIn(NO_PUSH_WHILE_WAITING, w, "WORKER_DIRECTIVE 에 '대기 중 push 금지' 조항이 없다(H-06-N3-01)")
+        self.assertIn("`cys feed push --wait` 를 쓰지 않고 `cys repair submit <R-id>` 만 쓴다", w)
 
     def test_reviewer_slots_match_orchestra_and_name_the_attest_verbs(self):
         """RULINGS B2: 리뷰어1 = codex 슬롯(reviewer-codex·reviewer-claude-2) · 리뷰어2 = gemini 슬롯(reviewer-gemini·
@@ -487,6 +498,7 @@ class M2MutationControls(unittest.TestCase):
         ("MASTER_DIRECTIVE.md", NO_TURN_WAIT, "test_n4_no_in_turn_waiting_and_repair_text_does_not_wait"),
         ("WORKER_DIRECTIVE.md", "어떤 에이전트도 결정하지 않는다", "test_d7_owner_only_approval_line"),
         ("WORKER_DIRECTIVE.md", "한 시간에 한 번 이상", "test_worker_submit_not_wait_and_hourly_verb_and_staging"),
+        ("WORKER_DIRECTIVE.md", NO_PUSH_WHILE_WAITING, "test_h06_n3_waiting_is_shown_only_by_self_report_never_by_a_push"),
         ("REVIEWER_DIRECTIVE.md", "대체 좌석 `reviewer-claude-2`", "test_reviewer_slots_match_orchestra_and_name_the_attest_verbs"),
         ("CSO_DIRECTIVE.md", "`cys repair report|list|status`", "test_cso_reports_only_and_allowlist_sentence"),
         ("REVIEWER_DIRECTIVE.md", "`cys todo-path` 가 출력하는 경로", "test_reviewer_todo_path_follows_the_todo_path_naming_rule"),
