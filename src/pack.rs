@@ -8770,7 +8770,20 @@ fn journal_move(from: &Path, to: &Path) -> std::io::Result<()> {
 /// never removed recursively; no retry of our own — HG3). `after_rename` is the crash-proof seam (`false` = stop there).
 /// `Ok(true)` = removed; `Ok(false)` = stopped after the rename; `Err` = the rename failed (the folder is left as it is)
 /// or the removal failed (the next entry removes `d.<id>`).
+#[cfg(all(test, unix))]
+thread_local! {
+    /// ★WJ2 (TEST ONLY — compiled in unix test builds only): called with the folder at the start of every [`settle_journal`] on
+    /// this thread; the descriptor tests read the process's open descriptors there. Production has no probe.
+    static SETTLE_PROBE: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn settle_journal(held: &Path, id: &str, after_rename: &mut dyn FnMut() -> bool) -> Result<bool, String> {
+    #[cfg(all(test, unix))]
+    SETTLE_PROBE.with(|p| {
+        if let Some(f) = p.borrow_mut().as_mut() {
+            f(held)
+        }
+    });
     let slot = held.parent().map(Path::to_path_buf).unwrap_or_default();
     let done = slot.join(format!("d.{id}"));
     journal_move(held, &done)
@@ -16867,6 +16880,232 @@ mod tests {
         eprintln!("[wj1 #185] embedded pack: {} files; announced changes with one changed file: pristine present = {}, pristine missing = {}", PACK_ALL.len(), counts[0].1, counts[1].1);
         assert!(counts[0].1 >= 4 && counts[0].1 <= 8, "pristine present: {counts:?}");
         assert!(counts[1].1 >= PACK_ALL.len() / 2, "pristine missing: {counts:?}");
+    }
+
+    // ───────────────────────── ★WJ2 (RULINGS LD): no handle of the placement log outlives its announcement ─────────────────────────
+
+    /// Every descriptor of THIS process that is open on the file at `p`, read for real from the descriptor table: each entry of
+    /// `/dev/fd` is `fstat`ed and matched by device + inode; its path is the kernel's (macOS `fcntl(F_GETPATH)`, elsewhere the
+    /// `/proc/self/fd` link). Empty when `p` does not exist.
+    #[cfg(unix)]
+    fn wj2_open_fds_on(p: &Path) -> Vec<(i32, String)> {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(m) = std::fs::metadata(p) else { return Vec::new() };
+        let fds: Vec<i32> = std::fs::read_dir("/dev/fd")
+            .map(|rd| rd.flatten().filter_map(|e| e.file_name().to_str().and_then(|n| n.parse().ok())).collect())
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for fd in fds {
+            // SAFETY: fstat on a descriptor number with a zeroed out-struct; a closed number fails and is skipped.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd, &mut st) } != 0 {
+                continue;
+            }
+            if st.st_dev as u64 == m.dev() && st.st_ino as u64 == m.ino() {
+                out.push((fd, wj2_fd_path(fd)));
+            }
+        }
+        out
+    }
+
+    #[cfg(target_os = "macos")]
+    fn wj2_fd_path(fd: i32) -> String {
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes at most PATH_MAX bytes, NUL-terminated, into the buffer.
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+            return "?".to_string();
+        }
+        let n = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn wj2_fd_path(fd: i32) -> String {
+        std::fs::read_link(format!("/proc/self/fd/{fd}")).map(|p| p.display().to_string()).unwrap_or_else(|_| "?".to_string())
+    }
+
+    /// Installs a settle probe recording, for every settle on this thread, (the folder, the descriptors open on its `placed.log`).
+    #[cfg(unix)]
+    fn wj2_probe_settles() -> std::rc::Rc<std::cell::RefCell<Vec<(PathBuf, Vec<(i32, String)>)>>> {
+        let seen: std::rc::Rc<std::cell::RefCell<Vec<(PathBuf, Vec<(i32, String)>)>>> = Default::default();
+        let s2 = seen.clone();
+        SETTLE_PROBE.with(|p| {
+            *p.borrow_mut() = Some(Box::new(move |held: &Path| {
+                s2.borrow_mut().push((held.to_path_buf(), wj2_open_fds_on(&held.join(PLACED_LOG))));
+            }))
+        });
+        seen
+    }
+
+    #[cfg(unix)]
+    fn wj2_probe_off() {
+        SETTLE_PROBE.with(|p| *p.borrow_mut() = None);
+    }
+
+    /// ★WJ2 (RULINGS LD1 / LD3 — the mechanism of the Windows refusal, measured on unix): an ordinary, SUCCESSFUL apply that
+    /// placed files — right before its ⑥ SETTLE (the `PostCommitted` boundary) and at the settle itself, this process holds NO
+    /// descriptor on its own `placed.log` (Windows refuses to rename a folder while a file inside it is open: push 5's
+    /// `Access is denied. (os error 5)`). Red on af5c554c (the placement log's append handle lived until the transaction
+    /// returned).
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "WJ2 red on af5c554c — un-ignored with the change"]
+    fn wj2_no_descriptor_on_placed_log_at_the_commit_settle() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (root, _pd, _pre, _env) = t9r2_lane("wj2-commit");
+        let seen = wj2_probe_settles();
+        let mut before_settle: Option<(PathBuf, Vec<(i32, String)>, usize)> = None;
+        let r = apply_pack_transactional_steps(&t9r2_items(), "0.15.1", &test_free_state("0.15.1"), None, || Ok(()), &mut |s| {
+            if s == TxStep::PostCommitted {
+                if let Some(j) = wj1_own_journal() {
+                    let lines = std::fs::read_to_string(j.join(PLACED_LOG)).map(|t| t.lines().count()).unwrap_or(0);
+                    before_settle = Some((j.clone(), wj2_open_fds_on(&j.join(PLACED_LOG)), lines));
+                }
+            }
+            true
+        });
+        wj2_probe_off();
+        let settles = seen.borrow().clone();
+        let slot_left = pack_journal_dir().join(JOURNAL_SLOT).exists();
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(r.is_ok(), "{r:?}");
+        let (_, fds, lines) = before_settle.expect("the PostCommitted boundary saw the journal");
+        assert!(lines > 0, "the apply announced its changes");
+        assert!(fds.is_empty(), "right before SETTLE this process holds descriptors on its placed.log: {fds:?}");
+        assert_eq!(settles.len(), 1, "one settle: {settles:?}");
+        assert!(settles[0].1.is_empty(), "at the SETTLE this process holds descriptors on its placed.log: {settles:?}");
+        assert!(!slot_left, "the journal is settled");
+    }
+
+    /// ★WJ2: a FAILED apply (the install record cannot be written — the R2CODE2 fail-closed path) rolls back from its own
+    /// folder and settles it: at that settle this process holds NO descriptor on the folder's `placed.log`. Red on af5c554c.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "WJ2 red on af5c554c — un-ignored with the change"]
+    fn wj2_no_descriptor_on_placed_log_at_a_failed_apply_s_rollback_settle() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (base, pd, _env) = txn_prestate("wj2-failed", &[("README.md", "OLD-SOUL")], "1.0.0");
+        let mp = pd.join(INSTALL_MANIFEST);
+        std::fs::remove_file(&mp).unwrap();
+        std::fs::create_dir_all(mp.join("child")).unwrap();
+        let seen = wj2_probe_settles();
+        let items: Vec<(&str, &str)> = vec![("README.md", "NEW-SOUL"), ("new.txt", "NEW")];
+        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), None, || Ok(()));
+        wj2_probe_off();
+        let settles = seen.borrow().clone();
+        let readme = std::fs::read_to_string(pd.join("README.md")).unwrap_or_default();
+        let slot_left = pack_journal_dir().join(JOURNAL_SLOT).exists();
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(res.is_err(), "{res:?}");
+        assert_eq!(readme, "OLD-SOUL", "rolled back");
+        assert_eq!(settles.len(), 1, "the roll-back settled its own journal once: {settles:?}");
+        assert!(settles[0].1.is_empty(), "at the roll-back's SETTLE this process holds descriptors on its placed.log: {settles:?}");
+        assert!(!slot_left, "the journal is settled");
+    }
+
+    /// ★WJ2: crash-proof forms recovered IN THE SAME PROCESS — the apply dies after some announcements (the placement seam) or
+    /// after a step boundary, the writer is gone, the next recovery takes the journal, rolls back and settles: at that settle
+    /// no descriptor of this process is open on the journal's `placed.log`; then a second whole apply in the same process
+    /// settles its own journal the same way and is not refused (the shape of push 5's failing tests and of the verb test
+    /// `pack_update_pro_channel_e2e`). On unix the dying apply's handle was already dropped when it returned, so the first
+    /// part also holds on af5c554c; the second apply's own settle is red there.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "WJ2 red on af5c554c — un-ignored with the change"]
+    fn wj2_crash_proof_recovered_in_the_same_process_then_a_second_apply_meet_no_descriptor() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut failures: Vec<String> = Vec::new();
+        for (case, stop_after, stop_step) in [("placement-3", Some(3usize), None), ("step-Installed", None, Some(TxStep::Installed)), ("step-VersionWritten", None, Some(TxStep::VersionWritten))] {
+            let (root, pd, pre, _env) = t9r2_lane(&format!("wj2-crash-{case}"));
+            let seen = wj2_probe_settles();
+            let r = apply_pack_transactional_core(&t9r2_items(), "0.15.1", &test_free_state("0.15.1"), None, || Ok(()), &mut |s| Some(s) != stop_step, stop_after);
+            t9_writers_gone();
+            let rec = recover_pack_journal();
+            let after_rec = m15da_state(&pd);
+            let again = apply_pack_transactional(&t9r2_items(), "0.15.1", &test_free_state("0.15.1"), None, || Ok(()));
+            wj2_probe_off();
+            let settles = seen.borrow().clone();
+            let slot_left = pack_journal_dir().join(JOURNAL_SLOT).exists();
+            drop(_env);
+            let _ = std::fs::remove_dir_all(&root);
+            let held_fds: Vec<_> = settles.iter().filter(|(_, f)| !f.is_empty()).collect();
+            if r.is_ok() || rec != Ok(true) || !m15da_diff(&pre, &after_rec).is_empty() || again.is_err() || settles.len() != 2 || !held_fds.is_empty() || slot_left {
+                failures.push(format!("[{case}] apply={r:?} recovery={rec:?} second={again:?} settles={settles:?} slot_left={slot_left}"));
+            }
+        }
+        assert!(failures.is_empty(), "WJ2 crash-proof:\n  {}", failures.join("\n  "));
+    }
+
+    /// ★WJ2 controls (RULINGS LD1 — nothing else about the log changes): a failed open / write / sync of one announcement
+    /// fails that change and every later one (sticky); the FIRST announcement still makes the log's own name durable (the
+    /// folder flush), a later one does not flush the folder again.
+    #[test]
+    fn wj2_announcement_failure_is_sticky_and_the_first_one_makes_the_name_durable() {
+        let root = m15da_root("wj2-sticky");
+        let own = root.join("j");
+        std::fs::create_dir_all(&own).unwrap();
+        // (1) placed.log cannot be opened (a folder at its name): this announcement and every later one fail
+        std::fs::create_dir_all(own.join(PLACED_LOG)).unwrap();
+        let mut log = PlacementLog::new(&root, &own, None);
+        let a1 = log.announce("a", Some(b"x"));
+        std::fs::remove_dir_all(own.join(PLACED_LOG)).unwrap();
+        let a2 = log.announce("b", Some(b"y"));
+        let sticky = a1.is_err() && a2.is_err() && log.count == 0 && log.failed.is_some() && !own.join(PLACED_LOG).exists();
+        // (2) the first announcement flushes the folder (the log's name): an injected folder-flush failure fails it
+        let own2 = root.join("j2");
+        std::fs::create_dir_all(&own2).unwrap();
+        FAIL_DIR_SYNC_FOR.with(|f| *f.borrow_mut() = Some(PLACED_LOG.to_string()));
+        let mut log2 = PlacementLog::new(&root, &own2, None);
+        let first_flushes = log2.announce("a", Some(b"x")).is_err();
+        FAIL_DIR_SYNC_FOR.with(|f| *f.borrow_mut() = None);
+        // (3) a later announcement does not flush the folder again
+        let own3 = root.join("j3");
+        std::fs::create_dir_all(&own3).unwrap();
+        let mut log3 = PlacementLog::new(&root, &own3, None);
+        let first_ok = log3.announce("a", Some(b"x")).is_ok();
+        FAIL_DIR_SYNC_FOR.with(|f| *f.borrow_mut() = Some(PLACED_LOG.to_string()));
+        let second_ok = log3.announce("b", None).is_ok();
+        FAIL_DIR_SYNC_FOR.with(|f| *f.borrow_mut() = None);
+        let lines = std::fs::read_to_string(own3.join(PLACED_LOG)).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(sticky, "a failed announcement must fail that change and every later one: {a1:?} {a2:?}");
+        assert!(first_flushes, "the first announcement must make the log's name durable (flush its folder)");
+        assert!(first_ok && second_ok && lines.lines().count() == 2, "later announcements append without flushing the folder again: {lines:?}");
+    }
+
+    /// ★WJ2 (RULINGS LD1 — the cost): open / close pairs and wall time of one apply of the embedded pack with ONE changed
+    /// file, with the pristine mirrors present and without them; measured on this Mac (not on Windows).
+    #[test]
+    fn wj2_placement_open_close_cost_measured() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<String> = Vec::new();
+        for pristine in [true, false] {
+            let root = m15da_root(&format!("wj2-cost-{pristine}"));
+            let pd = root.join("pack");
+            let env = set_pack_env(&pd, root.join("cfg"));
+            install_into(pd.clone(), PACK_ALL.iter().copied(), false, "0.15.0", false, false, PackScope::Base, None, None).unwrap();
+            if !pristine {
+                std::fs::remove_dir_all(pd.join(PRISTINE_DIR)).unwrap();
+            }
+            let changed = format!("{}\n(changed by the next release)\n", PACK_ALL.iter().find(|(r, _)| *r == "README.md").map(|(_, c)| *c).unwrap_or(""));
+            let items: Vec<(&str, &str)> = PACK_ALL.iter().map(|(r, c)| if *r == "README.md" { (*r, changed.as_str()) } else { (*r, *c) }).collect();
+            let mut n = 0usize;
+            let t0 = std::time::Instant::now();
+            let r = apply_pack_transactional_core(&items, "0.15.1", &test_free_state("0.15.1"), None, || Ok(()), &mut |s| {
+                if s == TxStep::PostCommitted {
+                    n = wj1_own_journal().map(|j| std::fs::read_to_string(j.join(PLACED_LOG)).unwrap_or_default().lines().count()).unwrap_or(0);
+                }
+                true
+            }, None);
+            let ms = t0.elapsed().as_millis();
+            rows.push(format!("pristine {}: {n} announcements = {n} open/close pairs of placed.log, apply {ms} ms ({})", if pristine { "present" } else { "missing" }, if r.is_ok() { "ok" } else { "ERR" }));
+            drop(env);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        eprintln!("[wj2 cost] embedded pack {} files: {}", PACK_ALL.len(), rows.join(" · "));
+        assert!(rows.iter().all(|r| r.ends_with("(ok)")), "{rows:?}");
     }
 
     /// GX1: every lane's journal is its own folder under `.pack-journal.d`, never the legacy shared folder.
