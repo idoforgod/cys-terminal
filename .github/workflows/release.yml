@@ -1471,7 +1471,18 @@ jobs:
       #   (알림 rc 2 를 단계 detail 에만 적는다) **보류 사실을 master 에게 알리는 통로가 통째로 사라진다** — B-360 이
       #   막으려는 바로 그 손실이다(기능 의존 — RELEASE.md 불변 규칙 :75-77). pack-release.yml
       #   PACK_MIN_BINARY_OVERRIDE · docs/RELEASE.md §0-A 2단계 리터럴과 같은 커밋에서 동시 상향(두 값 동일 계약).
-      PACK_MIN_BINARY: '0.14.52'
+      # ★0.15.0 상향(2026-11-15 · 「스스로 해결」 릴리스 버전 커밋 · 설계 v0.5 §4-11 카 · RULINGS AE3). 이 세대 팩이
+      #   **0.15.0 에 처음 생긴 CLI 표면의 실행을 직접 지시**한다 — `cys repair …`: 지침의 결함 접수
+      #   `cys repair report --file … --error …`(MASTER_DIRECTIVE.md:104·CEO_TEMPLATE.md:220·CSO_DIRECTIVE.md:165) ·
+      #   javis_preflight.py:521/:556 의 `cys repair boot-critical --list --json` / `cys repair tombstones --json` ·
+      #   javis_report_gate.py:1971/:2027 의 `cys repair list --json`. 부재 실측(2026-11-15 · v0.14.56=31f87878 대조):
+      #   `git show v0.14.56:src/bin/cys.rs | grep -cE 'repair_cli|RepairCmd'` → 0, `src/bin/cys/repair_cli.rs` 는
+      #   v0.14.56 트리에 없다. 하나라도 빠지면 0.14.52~0.14.56 본체가 0.15.0 팩을 옛 규칙으로 깔고 새 지침이
+      #   시키는 `cys repair` 가 없어 실패한다(설계 §4-11 카). 세 곳 동일성과 AE3(Cargo.toml ≥ 0.15.0 ⇒ 하한 ≥ 0.15.0)는
+      #   scripts/check_min_binary_floor.py 가 검사한다(ci-branch `release-floor-parity`). pack-release.yml
+      #   PACK_MIN_BINARY_OVERRIDE · docs/RELEASE.md §0-A 2단계 리터럴과 같은 커밋에서 동시 상향(두 값 동일 계약).
+      #   security-floor.txt(보안 하한 0.12.48)는 건드리지 않는다.
+      PACK_MIN_BINARY: '0.15.0'
     steps:
       - uses: actions/checkout@v4
 
