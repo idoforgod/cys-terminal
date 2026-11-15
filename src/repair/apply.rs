@@ -4584,6 +4584,40 @@ pub fn hook_lines_step_in(
     registrar: &RegistrarFn<'_>,
     now: f64,
 ) -> Result<ReconcileReport, RepairError> {
+    match hook_lines_unit_in(root, pack, id, lane, step, registrar, now, &|| Ok(()))? {
+        HookUnitEnd::Nothing => Ok(ReconcileReport { hooks: Vec::new() }),
+        HookUnitEnd::Refused(why) => Err(RepairError::Precondition(why)), // never with the open guard
+        HookUnitEnd::Ran { result, .. } => result,
+    }
+}
+
+/// How one hook unit ended (RULINGS IZ2 / JA1 — the seam T7b's propagation calls).
+#[derive(Debug)]
+pub enum HookUnitEnd {
+    /// R names no hook line: nothing to do.
+    Nothing,
+    /// The guard refused right before the unit's first durable write: NOTHING was written.
+    Refused(String),
+    /// The unit BEGAN its durable writes — its write-ahead record `op` is written; `lines` are the
+    /// hook lines it set out to change (`EVENT:SCRIPT`); `result` is how its writes ended.
+    Ran { op: String, lines: Vec<String>, result: Result<ReconcileReport, RepairError> },
+}
+
+/// [`hook_lines_step_in`] with a GUARD (RULINGS IZ1 / IZ2): `guard` runs after every slow or waiting
+/// preparation of the unit — the registrar's dry run and the settings measurement — and IMMEDIATELY
+/// before its first durable write (the write-ahead record); a refusal writes nothing. After the record
+/// the unit writes without further validation (IZ1's line); an `Err` here means nothing was written.
+#[allow(clippy::too_many_arguments)]
+pub fn hook_lines_unit_in(
+    root: &Path,
+    pack: &Path,
+    id: &RepairId,
+    lane: &LaneKey,
+    step: HookStep,
+    registrar: &RegistrarFn<'_>,
+    now: f64,
+    guard: &dyn Fn() -> Result<(), String>,
+) -> Result<HookUnitEnd, RepairError> {
     let rec = ledger::read_record_in(root, id)?
         .ok_or_else(|| RepairError::Precondition(format!("{}: 그런 수리가 없습니다", id.as_str())))?;
     let named: Vec<(String, String)> = ledger::hook_lines(&rec)
@@ -4593,7 +4627,7 @@ pub fn hook_lines_step_in(
         })
         .collect();
     if named.is_empty() {
-        return Ok(ReconcileReport { hooks: Vec::new() });
+        return Ok(HookUnitEnd::Nothing);
     }
     // (i) the record first, with the targets of a dry run (matcher / timeout as found). CT3: a dry
     // run that cannot be measured DECLINES before anything is recorded or changed (the caller marks
@@ -4650,8 +4684,15 @@ pub fn hook_lines_step_in(
         updated_at: now,
         notice: None,
     };
+    // IZ1 / IZ2: the unit's ONE validation — after the dry run and the settings measurement, right
+    // before its first durable write
+    if let Err(why) = guard() {
+        return Ok(HookUnitEnd::Refused(why));
+    }
     wal::write_in(root, &op)?;
-    finish_hook_op(root, pack, &rec, &mut op, registrar, now)
+    let op_id = op.op.clone();
+    let result = finish_hook_op(root, pack, &rec, &mut op, registrar, now);
+    Ok(HookUnitEnd::Ran { op: op_id, lines: named.iter().map(|(e, sc)| format!("{e}:{sc}")).collect(), result })
 }
 
 fn finish_hook_op(
@@ -4782,6 +4823,16 @@ pub fn mark_lane_conflict(root: &Path, id: &RepairId, lane: &LaneKey, now: f64, 
 }
 
 /// RULINGS Y1: the ONE hook step (operation record first, tombstone, reconcile, record finished).
+/// [`hook_lines_unit_in`] over this process's repairs root and pack, with the production registrar.
+pub fn hook_lines_unit(
+    id: &RepairId,
+    lane: &LaneKey,
+    step: HookStep,
+    guard: &dyn Fn() -> Result<(), String>,
+) -> Result<HookUnitEnd, RepairError> {
+    hook_lines_unit_in(&super::paths::repairs_root(), &crate::pack::pack_dir(), id, lane, step, &run_registrar, ledger::now_epoch(), guard)
+}
+
 pub fn hook_lines_step(
     id: &RepairId,
     lane: &LaneKey,
