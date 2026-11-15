@@ -953,8 +953,8 @@ pub const CENSUS_PINS: &[(&str, &str, &str, &str, usize, &str)] = &[
         "pin",
         "",
         "",
-        1125,
-        "03a2720602f65f481a88a63276b18fa95555e75233254cc6039a51f076aa1506",
+        1656,
+        "a659cfab729842d8a4a26b4eabc2504e1581b8113952eaa2bcaafdcd705487c2",
     ),
     (
         "hooks/role-capability-gate.sh",
