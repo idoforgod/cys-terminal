@@ -8447,6 +8447,50 @@ fn admission_refused_line(slot: &Path, e: &std::io::Error) -> String {
     format!("[pack-journal] 팩 업데이트를 시작하지 않습니다({}): {why} ({e})", slot.display())
 }
 
+/// ① backup set = 새 manifest.files(=items) ∪ 현재 install-manifest 키(prune·overwrite 대상)
+///    ∪ .install-manifest.json ∪ .pack-state.json(v4 — rollback이 state도 pre-state로 복원).
+/// ★HV1 (T9 round 3): pure — `installed_manifest` is the pack's install record as read AFTER the admission.
+fn journal_backup_set(
+    items: &[(&str, &str)],
+    installed_manifest: Option<&str>,
+) -> std::collections::BTreeSet<String> {
+    let mut backup_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (rel, _) in items {
+        backup_set.insert((*rel).to_string());
+    }
+    if let Some(s) = installed_manifest {
+        if let Ok(m) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(s) {
+            for k in m.keys() {
+                backup_set.insert(k.clone());
+            }
+        }
+    }
+    backup_set.insert(INSTALL_MANIFEST.to_string());
+    backup_set.insert(PACK_STATE_FILE.to_string());
+    // ★GX2: the version marker joins the backup set — a rollback before the commit marker restores it (a crash after ④
+    //   no longer leaves "new label, old files").
+    backup_set.insert(PACK_VERSION_FILE.to_string());
+    // ★커스터마이즈 절충 부수효과(.pristine/·.new·.user·병합 원장)도 저널 편입 — rollback이
+    // pre-state 를 **글자 단위로** 복원한다는 기존 계약(mid_apply_fault 테스트)을 부수효과까지 확장.
+    // 대부분 부재 경로라 저널 증가는 미미하다(write_journal 은 존재/부재를 그대로 스냅샷).
+    let side_paths: Vec<String> = backup_set
+        .iter()
+        .filter(|rel| !rel.starts_with('.')) // 마커·매니페스트·state 파일 자신은 제외
+        .flat_map(|rel| {
+            [
+                format!("{}/{rel}", PRISTINE_DIR),
+                format!("{rel}.new"),
+                format!("{rel}.user"),
+                format!("{rel}.base"), // ★T3(v2 §4 ⑤): 충돌 조상 사이드카 — rollback 원자성 편입
+            ]
+        })
+        .collect();
+    backup_set.extend(side_paths);
+    backup_set.insert(MERGE_PENDING_FILE.to_string());
+    // ★MERGE_AUDIT_FILE 은 의도적 비등재 — append-only 감사 원장은 rollback 을 생존한다(G3-축3).
+    backup_set
+}
+
 /// 무중단 pack-update 적용 트랜잭션(§7-⑤ 옵션 b + free/pro v4 §3 상태 계약). 호출 전제:
 /// apply-lock 보유(writer 배타).
 /// 순서: ⓪orphan 저널 자가치유 → ①backup journal(변경·삭제 대상 + `.pack-state.json` 포함) →
@@ -8500,42 +8544,11 @@ where
     let dir = pack_dir();
     // ★W0-d: 저널·파일 반영 어떤 부수효과보다 먼저 라이브 인가 검사(비라이브·인가 보유는 통과).
     authorize_pack_write(&dir, auth)?;
-    // ① backup set = 새 manifest.files(=items) ∪ 현재 install-manifest 키(prune·overwrite 대상)
-    //    ∪ .install-manifest.json ∪ .pack-state.json(v4 — rollback이 state도 pre-state로 복원).
-    let mut backup_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for (rel, _) in items {
-        backup_set.insert((*rel).to_string());
-    }
-    if let Ok(s) = std::fs::read_to_string(dir.join(INSTALL_MANIFEST)) {
-        if let Ok(m) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&s) {
-            for k in m.keys() {
-                backup_set.insert(k.clone());
-            }
-        }
-    }
-    backup_set.insert(INSTALL_MANIFEST.to_string());
-    backup_set.insert(PACK_STATE_FILE.to_string());
-    // ★GX2: the version marker joins the backup set — a rollback before the commit marker restores it (a crash after ④
-    //   no longer leaves "new label, old files").
-    backup_set.insert(PACK_VERSION_FILE.to_string());
-    // ★커스터마이즈 절충 부수효과(.pristine/·.new·.user·병합 원장)도 저널 편입 — rollback이
-    // pre-state 를 **글자 단위로** 복원한다는 기존 계약(mid_apply_fault 테스트)을 부수효과까지 확장.
-    // 대부분 부재 경로라 저널 증가는 미미하다(write_journal 은 존재/부재를 그대로 스냅샷).
-    let side_paths: Vec<String> = backup_set
-        .iter()
-        .filter(|rel| !rel.starts_with('.')) // 마커·매니페스트·state 파일 자신은 제외
-        .flat_map(|rel| {
-            [
-                format!("{}/{rel}", PRISTINE_DIR),
-                format!("{rel}.new"),
-                format!("{rel}.user"),
-                format!("{rel}.base"), // ★T3(v2 §4 ⑤): 충돌 조상 사이드카 — rollback 원자성 편입
-            ]
-        })
-        .collect();
-    backup_set.extend(side_paths);
-    backup_set.insert(MERGE_PENDING_FILE.to_string());
-    // ★MERGE_AUDIT_FILE 은 의도적 비등재 — append-only 감사 원장은 rollback 을 생존한다(G3-축3).
+    // ★HV1 (T9 round 3): NOTHING of the pack's content is read before the admission — the backup list is computed
+    //   only after it (below). Before the admission the transaction reads: the lane's slot (⓪, the protocol itself), the
+    //   pack PATH (`pack_dir`, `authorize_pack_write` — a path comparison, not content), and the apply record's inputs
+    //   (`items` and `state` from the caller, this process's pid / start time, the clock, a sequence) — none depends on
+    //   the pack's state, so the prepared folder and the journal name do not either.
     // ★GX2: this apply's record.
     let items_digest = pack_items_sha256(items);
     let apply = PackApplied {
@@ -8575,6 +8588,10 @@ where
     if !step(TxStep::Admitted) {
         return Err(stopped_at(TxStep::Admitted));
     }
+    // ★HV1: the pack's state this transaction depends on is read only NOW — after the admission succeeded, when this
+    //   apply is the lane's one journal and no other changer can exist (HE3). A reading made before it decides nothing.
+    let installed_manifest = std::fs::read_to_string(dir.join(INSTALL_MANIFEST)).ok();
+    let backup_set = journal_backup_set(items, installed_manifest.as_deref());
     match write_journal(&own, target_version, &backup_set, &apply, step) {
         Ok(true) => {}
         Ok(false) => return Err(stopped_at(TxStep::BackedUp)),
@@ -15548,7 +15565,6 @@ mod tests {
     /// A's journal. Correct: the pack is B's state ENTIRE — every file, X included, the install record, the version
     /// marker and B's commit marker. Ordered by the step seam in one thread (B runs inside A's pause); no sleep.
     #[test]
-    #[ignore = "T9 round 3 red (RULINGS HV1): FAILS on 37cc8027 / ffc9f030 by design — the apply computes its backup list from the manifest it read BEFORE its admission, so a file another apply added in between is never journaled and is lost on recovery; un-ignore with the reordering"]
     fn t9_r3_backup_list_is_read_after_admission_so_a_file_added_meanwhile_is_restored() {
         let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (root, pd, _pre, _env) = t9r2_lane("t9r3-hv1");
