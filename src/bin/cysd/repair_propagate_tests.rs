@@ -246,6 +246,7 @@ fn recheck_after_a_merge_through_the_dispatcher() {
         merge_base: Vec::new(),
         merge_lock: None,
         merge_attempt: 0,
+        reason: String::new(),
         updated_at: T0,
     };
     ledger::write_lane_in(&r.root, &row).unwrap();
@@ -343,4 +344,22 @@ fn status_reads_the_catchup_from_its_root_and_hq_carries_the_summary_line() {
     std::fs::create_dir_all(&d.root).unwrap();
     let v = d.call(T0, &who, "status", json!({})).unwrap();
     assert!(v.get("conflict_summary").is_none(), "{v}");
+}
+
+/// RULINGS IK2 — `cys repair status R` carries each department row's reason (and the CLI prints it on a
+/// line of its own — `repair_cli::lane_reason_lines`).
+#[test]
+fn status_of_a_repair_shows_each_rows_reason() {
+    let r = rig("st-reason");
+    let who = seat(3, "worker");
+    let id = verified(&r, "bin/a.py", b"print('fixed')\n");
+    r.call(T0 + 3.0, &who, "commit", json!({"repair": id})).unwrap();
+    let rid = RepairId::parse(&id).unwrap();
+    let mut row = ledger::read_lane_in(&r.root, &rid, &r.lane).unwrap().unwrap();
+    row.state = LaneState::Conflict;
+    row.reason = "사본 검사 실패 — 살아 있는 파일은 바꾸지 않았습니다 · bin/a.py: 검사 시간 초과".into();
+    ledger::write_lane_in(&r.root, &row).unwrap();
+    let v = r.call(T0 + 4.0, &who, "status", json!({"repair": id})).unwrap();
+    let rows = v["lane_rows"].as_array().unwrap();
+    assert!(rows.iter().any(|x| x["lane"] == "base" && x["reason"] == row.reason.as_str()), "{v}");
 }
