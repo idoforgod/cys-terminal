@@ -15541,6 +15541,57 @@ mod tests {
             "empty slot (windows: refused, nothing touched): a={a:?} prepared={prepared:?}");
     }
 
+    /// RULINGS HV1 (round 3) — reviewer1's sequence against 37cc8027 (verdict-T9-r2-codex.json, blocking at
+    /// `apply_pack_transactional_steps`): A (to V2, no file X) is stopped right after preparing its admission folder;
+    /// B applies V1 COMPLETELY (it adds the vendor file X) and leaves the slot empty; A is then admitted, installs
+    /// (the installer prunes X from B's manifest) and dies right after ② (`TxStep::Installed`); the next entry recovers
+    /// A's journal. Correct: the pack is B's state ENTIRE — every file, X included, the install record, the version
+    /// marker and B's commit marker. Ordered by the step seam in one thread (B runs inside A's pause); no sleep.
+    #[test]
+    #[ignore = "T9 round 3 red (RULINGS HV1): FAILS on 37cc8027 / ffc9f030 by design — the apply computes its backup list from the manifest it read BEFORE its admission, so a file another apply added in between is never journaled and is lost on recovery; un-ignore with the reordering"]
+    fn t9_r3_backup_list_is_read_after_admission_so_a_file_added_meanwhile_is_restored() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (root, pd, _pre, _env) = t9r2_lane("t9r3-hv1");
+        // B: V1 = the V2 items of the stage tests plus a NEW vendor file X.
+        let mut items_b = m15da_v2_items(M15DA_BASE);
+        items_b.push(("bin/x-added-in-v1.sh", "#!/bin/sh\necho x-added-in-v1\n"));
+        // A: V2 = another revision of the base files, WITHOUT X.
+        let mut items_a = m15da_v2_items(M15DA_BASE);
+        for it in items_a.iter_mut() {
+            match it.0 {
+                "bin/selfheal.sh" => it.1 = "#!/bin/sh\necho selfheal-v3\n",
+                "README.md" => it.1 = "README v3\n",
+                _ => {}
+            }
+        }
+        let mut b: Option<(Result<(usize, usize, bool), String>, M15daState)> = None;
+        let a = apply_pack_transactional_steps(&items_a, "0.15.2", &test_free_state("0.15.2"), None, || Ok(()), &mut |s| {
+            match s {
+                TxStep::Prepared if b.is_none() => {
+                    let r = apply_pack_transactional(&items_b, "0.15.1", &test_free_state("0.15.1"), None, || Ok(()));
+                    b = Some((r, m15da_state(&pd)));
+                    true
+                }
+                TxStep::Installed => false, // A dies right after ②
+                _ => true,
+            }
+        });
+        t9_writers_gone();
+        let rec = recover_pack_journal();
+        let after = m15da_state(&pd);
+        let slot_left = pack_journal_dir().join(JOURNAL_SLOT).exists();
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
+        let (b_result, b_state) = b.expect("B ran inside A's pause");
+        assert!(b_result.is_ok(), "precondition: B's apply must complete: {b_result:?}");
+        assert!(b_state.contains_key("bin/x-added-in-v1.sh"), "precondition: B added X");
+        assert!(a.is_err(), "precondition: A was stopped after ②: {a:?}");
+        assert_eq!(rec, Ok(true), "the next entry must recover A's journal");
+        assert!(!slot_left, "the slot must be gone");
+        let d = m15da_diff(&b_state, &after);
+        assert!(d.is_empty(), "the pack is not B's state entire after recovering A: {d:?}");
+    }
+
     /// GX1: every lane's journal is its own folder under `.pack-journal.d`, never the legacy shared folder.
     #[test]
     fn t9_each_lane_has_its_own_journal_folder() {
