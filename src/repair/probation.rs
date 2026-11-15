@@ -794,6 +794,17 @@ fn note_timeouts(env: &JobEnv<'_>, id: &RepairId, timeouts: &[(String, f64)]) ->
     })
 }
 
+/// The sha256 of the approved holder's bytes, read under the pack-apply exclusion by M10's put-back —
+/// RULINGS IW2: through the engine's one bounded reader (a regular file, a non-blocking open that
+/// follows no link, one handle, at most the limit + 1 bytes); anything else gives no hash at once
+/// (nothing is put back), never a wait or a whole read.
+fn holder_sha(holder: &Path) -> Option<String> {
+    match super::durable::read_record_bytes(holder) {
+        super::durable::RecordRead::Bytes(b) => Some(sha_hex(&b)),
+        super::durable::RecordRead::NotFound | super::durable::RecordRead::Unreadable(_) => None,
+    }
+}
+
 /// Every repair in probation in THIS lane re-checked — only repaired files (no full sweep), with
 /// the file's own check (never seat readiness — "보류" is not failure).
 fn probation_pass(env: &JobEnv<'_>, report: &mut TickReport) {
@@ -987,10 +998,40 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, _listed_row: &LaneRecor
     }
     let id = &rec.id;
     // the binding: this lane, the pack generation, the expected live states
-    if !apply::Bound::from_row(p).equals_now(env.op.pack) {
+    let row_bound = apply::Bound::from_row(p);
+    // RULINGS IE1 — the pack's present generation is observed ONCE and that one value decides
+    let now_bound = apply::Bound::now(env.op.pack);
+    let same_generation = matches!((&row_bound, &now_bound), (apply::Bound::Known(a), apply::Bound::Known(b)) if a == b);
+    if !same_generation {
+        // RULINGS HS1 — a GENERAL repair whose row and pack both state a KNOWN generation, and the
+        // generation moved on (an update): every target still holds this lane's applied result → the
+        // probation ENDS without a check and the repair STAYS IN FORCE (사용 중, no automatic return
+        // armed any more); the update wrote a target → 대체됨 naming it, nothing put back, the record
+        // superseded. An unknown generation (EJ1 / EN3) and the other classes: as before.
+        if rec.classification == super::types::Classification::General && row_bound.known().is_some() && now_bound.known().is_some() {
+            let mut written: Vec<String> = Vec::new();
+            for (rel, canon) in &p.expected {
+                // JH1: an over-limit file has no state — the update wrote it
+                match TargetState::observe(&env.op.pack.join(rel))? {
+                    super::types::Observed::State(s) if s.canon() == *canon => {}
+                    _ => written.push(rel.clone()),
+                }
+            }
+            if written.is_empty() {
+                close_row(env, id, &apply::update_kept_closure(), &[], Some(RepairState::InUse))?;
+                report.ended.push(id.clone());
+                report.lines.push(format!("{}: {}", id.as_str(), apply::UPDATE_KEPT_SENTENCE));
+            } else {
+                let closure = apply::update_wrote_closure(&written);
+                close_row(env, id, &closure, &[], Some(RepairState::Superseded))?;
+                report.superseded.push(id.clone());
+                report.lines.push(format!("{}: {closure}", id.as_str()));
+            }
+            return Ok(());
+        }
         let why = format!(
             "팩 세대가 적용 때와 다르거나 알 수 없습니다(지금 {}) — 아무것도 되돌리지 않습니다(새 버전 우선)",
-            apply::pack_generation(env.op.pack).version
+            now_bound.version_label()
         );
         close_row(env, id, &format!("대체됨 — {why}"), &[], Some(RepairState::Superseded))?;
         report.superseded.push(id.clone());
@@ -998,8 +1039,9 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, _listed_row: &LaneRecor
         return Ok(());
     }
     for (rel, canon) in &p.expected {
-        let live = TargetState::read(&env.op.pack.join(rel))?;
-        if live.canon() != *canon {
+        // JH1: an over-limit file has no state — it is not the applied result
+        let live = TargetState::observe(&env.op.pack.join(rel))?;
+        if !matches!(&live, super::types::Observed::State(s) if s.canon() == *canon) {
             let why = format!("{rel}: 살아 있는 파일이 적용 결과와 다릅니다 — 아무것도 되돌리지 않고 워커 검토로 남깁니다");
             close_row(env, id, &format!("대체됨 — {why}"), &[], Some(RepairState::Superseded))?;
             report.superseded.push(id.clone());
@@ -1801,11 +1843,11 @@ fn m10_sweep_full(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
             if !bound.equals_now(pack) {
                 return Ok(None);
             }
-            if TargetState::read(&live)? != sampled_live {
+            if !TargetState::observe(&live)?.is(&sampled_live) {
                 return Ok(None);
             }
             let source_now: Option<String> = match apply::resolve_approved_copy_in(root, pack, lane, rel) {
-                apply::ApprovedCopy::Approved { state: TargetState::File { .. }, holder, .. } => std::fs::read(&holder).ok().map(|b| sha_hex(&b)),
+                apply::ApprovedCopy::Approved { state: TargetState::File { .. }, holder, .. } => holder_sha(&holder),
                 apply::ApprovedCopy::Approved { .. } | apply::ApprovedCopy::Unknown(_) | apply::ApprovedCopy::LedgerUnreadable { .. } => None,
                 apply::ApprovedCopy::NoApproval => (env.original)(rel).map(|o| sha_hex(&o)),
             };

@@ -325,6 +325,21 @@ pub(crate) fn stop(p: Point) -> RepairError {
     RepairError::Io(format!("{INJECTED_STOP} at {p:?}"))
 }
 
+/// RULINGS IV5 — `.pack-version` read through the engine's ONE bounded reader (a regular file, a
+/// non-blocking open that follows no link, one handle, at most the limit + 1 bytes): a missing,
+/// special, unreadable or oversized marker is an error at once — never a wait (the generation is read
+/// inside the pack-apply exclusion). The state file is read by the pack's own bounded start reader
+/// (`pack::read_pack_state` → `read_start_meta`: the same four properties, its own limit).
+fn read_pack_version(pack: &Path) -> Result<String, String> {
+    match super::durable::read_record_bytes(&pack.join(".pack-version")) {
+        super::durable::RecordRead::Bytes(b) => String::from_utf8(b)
+            .map(|s| s.trim().to_string())
+            .map_err(|e| format!(".pack-version: {e}")),
+        super::durable::RecordRead::NotFound => Err(".pack-version: 없음".into()),
+        super::durable::RecordRead::Unreadable(why) => Err(format!(".pack-version: {why}")),
+    }
+}
+
 /// The pack generation of a lane's pack (C1 1.6, RULINGS O4): `.pack-version` + the pro revision
 /// (only for the pro channel — a pro revision under the same version is another generation).
 /// RULINGS FG1 — the pack generation with three answers: `Ok` (a readable `.pack-version`; the pro
@@ -332,10 +347,7 @@ pub(crate) fn stop(p: Point) -> RepairError {
 /// `Err` for everything else (no / unreadable / empty version, a CORRUPT state, a state whose
 /// `base_version` disagrees with `.pack-version`). Decisions read it through `Bound::now`.
 pub fn pack_generation_checked(pack: &Path) -> Result<PackGeneration, String> {
-    let version = std::fs::read_to_string(pack.join(".pack-version"))
-        .map_err(|e| format!(".pack-version: {e}"))?
-        .trim()
-        .to_string();
+    let version = read_pack_version(pack)?;
     if version.is_empty() {
         return Err(".pack-version: 비어 있음".into());
     }
@@ -355,9 +367,7 @@ pub fn pack_generation_checked(pack: &Path) -> Result<PackGeneration, String> {
 /// The pack generation for DISPLAY and records only (the word unknown when it cannot be read —
 /// never a decision: decisions use [`Bound::now`]).
 pub fn pack_generation(pack: &Path) -> PackGeneration {
-    let version = std::fs::read_to_string(pack.join(".pack-version"))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
+    let version = read_pack_version(pack).unwrap_or_else(|_| "unknown".to_string());
     let pro_revision = match crate::pack::read_pack_state(pack) {
         crate::pack::PackStateRead::Valid(st) if st.channel == "pro" => Some(st.pro_revision),
         _ => None,
@@ -404,6 +414,13 @@ pub enum Bound {
     Unknown,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests (RULINGS IE1): scripted answers of [`Bound::now`], consumed in order — an interleaving
+    /// of marker reads made deterministic.
+    pub(crate) static BOUND_NOW_SCRIPT: std::cell::RefCell<std::collections::VecDeque<Bound>> = std::cell::RefCell::new(std::collections::VecDeque::new());
+}
+
 impl Bound {
     /// THE one reading of a generation value (EN3): the empty string and the literal `unknown` are
     /// Unknown; nothing else in the repair module compares the raw string.
@@ -419,6 +436,10 @@ impl Bound {
     }
     /// The pack's generation read at this moment (FG1: unreadable / inconsistent metadata → Unknown).
     pub fn now(pack: &Path) -> Bound {
+        #[cfg(test)]
+        if let Some(b) = BOUND_NOW_SCRIPT.with(|q| q.borrow_mut().pop_front()) {
+            return b;
+        }
         match pack_generation_checked(pack) {
             Ok(g) => Bound::of(Some(g)),
             Err(_) => Bound::Unknown,
@@ -432,6 +453,14 @@ impl Bound {
         match self {
             Bound::Known(g) => Some(g.clone()),
             Bound::Unknown => None,
+        }
+    }
+    /// The version this binding names, for a sentence — "unknown" when Unknown (RULINGS IE1: the
+    /// one observation's own value is said; EN3: the one place a generation becomes text).
+    pub fn version_label(&self) -> String {
+        match self {
+            Bound::Known(g) => g.version.clone(),
+            Bound::Unknown => "unknown".to_string(),
         }
     }
     /// Whether this is the free-channel generation of release `version` (the binary's own).
@@ -479,12 +508,13 @@ fn door(env: &OpEnv<'_>, binding: &Binding, live: &Path, act: DoorAct<'_>) -> Re
     // GK2: the live path holds EXACTLY the recorded state at this moment, or nothing is touched —
     // GV1: another writer's bytes are a CONFLICT (declined), never "superseded"
     if let Some(expected) = act.expected() {
-        let now = TargetState::read(live)?;
-        if now != *expected.state() {
+        // JH1: an over-limit file is measured, never a state — it is not the recorded state
+        let now = TargetState::observe(live)?;
+        if !now.is(expected.state()) {
             return Err(RepairError::Declined(format!(
                 "{}: 살아 있는 것이 기록된 상태가 아닙니다(지금 {} · 기록 {}) — 다른 작성자의 바이트를 그대로 둡니다",
                 live.display(),
-                now.canon(),
+                now.describe(),
                 expected.canon()
             )));
         }
@@ -564,8 +594,12 @@ fn incoming_copy(
                     source.display()
                 )));
             }
-            let bytes = std::fs::read(&source)
-                .map_err(|e| RepairError::Io(format!("{}: {e}", source.display())))?;
+            // RULINGS JH2: at most the limit + 1 bytes from one handle
+            let bytes = match super::durable::read_record_bytes(&source) {
+                super::durable::RecordRead::Bytes(b) => b,
+                super::durable::RecordRead::NotFound => return Err(RepairError::Io(format!("{}: 없음", source.display()))),
+                super::durable::RecordRead::Unreadable(why) => return Err(RepairError::Precondition(why)),
+            };
             write_new(&p, &bytes, mode)?;
         }
         Staged::Bytes { bytes, mode } => write_new(&p, &bytes, mode)?,
@@ -732,15 +766,16 @@ fn run_op_depth(env: &OpEnv<'_>, spec: &OpSpec, depth: u8) -> Result<OpDone, Rep
         Err(e) => return Err(e),
     }
     // step 0 — the live entry is the expected one, the pack generation the bound one
-    let now_state = TargetState::read(&live)?;
-    if now_state != spec.expected {
-        // GV1: the live file is not the recorded state — another writer's bytes: a CONFLICT
+    let now_state = TargetState::observe(&live)?;
+    if !now_state.is(&spec.expected) {
+        // GV1: the live file is not the recorded state — another writer's bytes: a CONFLICT (JH1: an
+        // over-limit file is one)
         return Ok(done(
             ApplyOutcome::Declined(format!(
                 "{}: 살아 있는 파일이 기대한 상태가 아닙니다(기대 {} · 지금 {}) — 아무것도 바꾸지 않았습니다",
                 spec.rel,
                 spec.expected.canon(),
-                now_state.canon()
+                now_state.describe()
             )),
             None,
         ));
@@ -878,21 +913,21 @@ fn step4(
     rec: &mut OpRecord,
     slot: &Slot,
     live: &Path,
-    deposit: &TargetState,
+    deposit: &super::types::Observed,
     depth: u8,
 ) -> Result<OpDone, RepairError> {
     let gen_ok = Bound::of(rec.pack_generation.clone()).equals_now(env.pack);
     let expected = canon_req(&rec.expected, &rec.rel)?;
-    if *deposit == expected && gen_ok {
+    if deposit.is(&expected) && gen_ok {
         // CT3 — the outcome reported is the outcome measured: what is NOW live must be the state
         // this operation was to put live; otherwise it is another writer's (GK2, below)
         let incoming = canon_req(&rec.incoming, &rec.rel)?;
-        let live_now = TargetState::read(live)?;
-        if live_now != incoming {
+        let live_now = TargetState::observe(live)?;
+        if !live_now.is(&incoming) {
             let mut note = format!(
                 "{}: 들인 뒤 살아 있는 것이 들일 상태가 아닙니다(지금 {} ≠ 들일 {})",
                 spec.rel,
-                live_now.canon(),
+                live_now.describe(),
                 incoming.canon()
             );
             // RULINGS GK2: the exchange is atomic — a difference from what this operation placed is
@@ -912,17 +947,25 @@ fn step4(
         wal::finish(env.root, rec, "applied", "", env.now)?;
         return Ok(done(ApplyOutcome::Applied, Some(rec)));
     }
-    let mut note = if *deposit != expected {
+    let mut note = if !deposit.is(&expected) {
         format!(
             "{}: 보관소에 들어간 것이 기대한 바이트가 아닙니다(다른 작성자가 그 사이에 썼습니다 · {} ≠ {})",
             spec.rel,
-            deposit.canon(),
+            deposit.describe(),
             expected.canon()
         )
     } else {
         format!("{}: 그 사이 팩 세대가 바뀌었습니다", spec.rel)
     };
-    if *deposit != expected && depth == 0 {
+    // RULINGS JH2 — a deposit kept unsealed over the limit is never re-lived (never a source)
+    if let super::types::Observed::OverLimit { .. } = deposit {
+        note.push_str(&format!(
+            " · 밀려난 바이트가 엔진의 읽기 한도 {}바이트를 넘어 봉인하지 않고 보관 칸({})에 옮긴 그대로 두었습니다 — 되살리지 않았습니다(충돌)",
+            super::durable::RECORD_READ_CAP,
+            slot.dir.display()
+        ));
+    }
+    if let (super::types::Observed::State(deposit), true) = (deposit, !deposit.is(&expected) && depth == 0) {
         // the other writer's bytes are re-lived only from the SEALED copy (or the link itself)
         let holder = if std::fs::symlink_metadata(slot.sealed()).is_ok() {
             slot.sealed()
@@ -1039,7 +1082,7 @@ fn after_seal_move_in(
     }
     let expected = canon_req(&rec.expected, &rec.rel)?;
     let gen_ok = Bound::of(rec.pack_generation.clone()).equals_now(env.pack);
-    if facts.sealed_state == expected && gen_ok {
+    if facts.sealed_state.is(&expected) && gen_ok {
         if env.faults.at(Point::BeforeDone, live, Some(slot)) {
             return Err(stop(Point::BeforeDone));
         }
@@ -1050,13 +1093,21 @@ fn after_seal_move_in(
     let mut note = format!(
         "{}: 옮겨 넣은 것이 기대한 바이트가 아닙니다({} ≠ {})",
         spec.rel,
-        facts.sealed_state.canon(),
+        facts.sealed_state.describe(),
         expected.canon()
     );
     if !gen_ok {
         note.push_str(" · 팩 세대가 바뀌었습니다");
     }
-    if facts.sealed_state != expected && depth == 0 {
+    // RULINGS JH2 — a deposit kept unsealed over the limit is never placed back (never a source)
+    if let super::types::Observed::OverLimit { .. } = &facts.sealed_state {
+        note.push_str(&format!(
+            " · 옮겨 넣은 바이트가 엔진의 읽기 한도 {}바이트를 넘어 봉인하지 않고 보관 칸({})에 그대로 두었습니다 — 다시 놓지 않았습니다(충돌)",
+            super::durable::RECORD_READ_CAP,
+            slot.dir.display()
+        ));
+    }
+    if let (super::types::Observed::State(sealed_state), true) = (&facts.sealed_state, !facts.sealed_state.is(&expected) && depth == 0) {
         let holder = if std::fs::symlink_metadata(slot.sealed()).is_ok() {
             slot.sealed()
         } else {
@@ -1064,14 +1115,14 @@ fn after_seal_move_in(
         };
         if (env.own_check)(&spec.rel, &holder) == Some(false) {
             note.push_str(" · 그 파일 자신의 검사를 통과하지 못해 되살리지 않았습니다");
-        } else if TargetState::read(live)? == TargetState::Absent {
+        } else if TargetState::observe(live)?.is(&TargetState::Absent) {
             let relive = OpSpec {
                 id: spec.id.clone(),
                 rel: spec.rel.clone(),
                 kind: "undo-superseded".into(),
                 // GK2: what this move-in operation left (its record: absent)
                 expected: Recorded::placed_by(rec)?,
-                incoming: facts.sealed_state.clone(),
+                incoming: sealed_state.clone(),
                 source: Source::Slot { holder },
                 bound: Bound::of(rec.pack_generation.clone()),
             };
@@ -1096,14 +1147,14 @@ fn after_seal_move_in(
 fn verify_placed(env: &OpEnv<'_>, rec: &OpRecord, live: &Path) -> Result<Option<String>, RepairError> {
     let _ = env;
     let incoming = canon_req(&rec.incoming, &rec.rel)?;
-    let live_now = TargetState::read(live)?;
-    if live_now == incoming {
+    let live_now = TargetState::observe(live)?;
+    if live_now.is(&incoming) {
         return Ok(None);
     }
     let mut note = format!(
         "{}: 놓은 뒤 살아 있는 것이 들일 상태가 아닙니다(지금 {} ≠ 들일 {})",
         rec.rel,
-        live_now.canon(),
+        live_now.describe(),
         incoming.canon()
     );
     // RULINGS GK2: another writer's bytes after OUR placement stay live (conflict)
@@ -1633,6 +1684,19 @@ pub fn no_repair_lock(
 pub type HookStepFn<'a> =
     dyn Fn(&RepairId, &LaneKey, HookStep) -> Result<ReconcileReport, RepairError> + 'a;
 
+/// RULINGS IL2 — what is TRUE in release 0.15.0 about repair `id` reaching a department other than
+/// the one that made it, decided by the class of the repair (unit T7d is not built — RULINGS II /
+/// IL1): a boot-critical or protection-related repair reaches another department ONLY through that
+/// department's own repair; any other repair is carried there by that department's daemon, and a
+/// department whose file differs keeps its bytes and shows the repair 충돌.
+pub fn reach_of_other_departments(class: Classification, id: &str) -> String {
+    if is_approval_class(class) {
+        format!("기동 필수·보호장치 관련 수리는 다른 부서에 저절로 전해지지 않습니다 — 다른 부서에는 그 부서 자신의 수리(cys repair begin … --resolves {id})와 두 리뷰어의 서명, 그 부서에서의 주인 최종 승인으로만 들어갑니다")
+    } else {
+        "이 수리는 각 부서의 데몬이 그 부서에 전파합니다 — 파일이 다른 부서는 제 바이트를 그대로 두고 그 수리를 충돌로 보입니다".to_string()
+    }
+}
+
 fn is_approval_class(c: Classification) -> bool {
     matches!(c, Classification::BootCritical | Classification::ProtectionRelated)
 }
@@ -1751,6 +1815,36 @@ pub fn not_revertible_closure() -> String {
 /// Whether a closure is FI1's "not revertible by the mechanism".
 pub fn closure_not_revertible(closed: &str) -> bool {
     closed.starts_with(&format!("{NOT_REVERTIBLE} — "))
+}
+
+/// RULINGS HS1 (b) — a GENERAL repair's probation that an update ended (the pack generation moved on)
+/// while EVERY target still held the repaired bytes: the probation is over (no check, no automatic
+/// return any more — after an update the recorded pre-image is not what a return should restore) and
+/// the repair stays in force, 사용 중, with this sentence.
+pub const UPDATE_KEPT_SENTENCE: &str = "업데이트 뒤에도 수리한 내용이 그대로 있습니다 — 시험 기간은 업데이트로 끝났고 자동 되돌리기는 하지 않습니다";
+
+/// The closure HS1 (b) writes.
+pub fn update_kept_closure() -> String {
+    format!("사용 중 — {UPDATE_KEPT_SENTENCE}")
+}
+
+/// RULINGS HS1 (a) — the update wrote one of the targets (vendor-first, a merge): 대체됨, nothing put
+/// back, the record superseded; the closure names the files the update wrote.
+pub const UPDATE_WROTE_SENTENCE: &str = "업데이트가 수리한 파일을 바꿨습니다";
+
+/// The closure HS1 (a) writes.
+pub fn update_wrote_closure(rels: &[String]) -> String {
+    format!("대체됨 — {UPDATE_WROTE_SENTENCE}({}) — 아무것도 되돌리지 않습니다(새 버전 우선)", rels.join(", "))
+}
+
+/// RULINGS HS2 — the sentence `status` shows for a repair whose probation an update ended: the origin
+/// lane's closure when it is one of HS1's two AND the record holds the state that closure set (사용 중
+/// / superseded); `None` otherwise (the state's own label stands).
+pub fn update_closure_sentence(rec: &RepairRecord, origin_row: Option<&ledger::LaneRecord>) -> Option<String> {
+    let closed = origin_row?.probation.as_ref()?.closed.as_deref()?;
+    let kept = closed == update_kept_closure() && rec.state == RepairState::InUse;
+    let wrote = closed.starts_with(&format!("대체됨 — {UPDATE_WROTE_SENTENCE}(")) && rec.state == RepairState::Superseded;
+    (kept || wrote).then(|| closed.to_string())
 }
 
 /// RULINGS FI1 — whether `rec`'s pre-images were taken in a generation other than the pack's NOW:
@@ -1934,11 +2028,20 @@ fn recover_one_revert(
     for t in &ri.targets {
         let pre = parse_canon(&t.pre).ok_or_else(|| RepairError::Corrupt(format!("{}: 되돌리기 의도의 상태를 읽을 수 없습니다", t.rel)))?;
         let applied = parse_canon(&t.applied).ok_or_else(|| RepairError::Corrupt(format!("{}: 되돌리기 의도의 상태를 읽을 수 없습니다", t.rel)))?;
-        let live_now = TargetState::read(&env.pack.join(&t.rel))?;
-        let outcome = if live_now == pre {
+        let live_now = TargetState::observe(&env.pack.join(&t.rel))?;
+        let outcome = if live_now.is(&pre) {
             ApplyOutcome::Applied // restored before the crash
-        } else if live_now == applied {
-            let (_, holder) = pre_image_for(env.root, rec, env.lane, &t.rel)?;
+        } else if live_now.is(&applied) {
+            // RULINGS JH2: a pre-image kept unsealed over the limit is never a source — that target
+            // is a conflict (once: the revert intent then ends incomplete), the others go on
+            let holder = match pre_image_for(env.root, rec, env.lane, &t.rel) {
+                Ok((_, holder)) => holder,
+                Err(RepairError::Declined(m)) => {
+                    files.push((t.rel.clone(), ApplyOutcome::Declined(m)));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             run_op(
                 env,
                 &OpSpec {
@@ -2049,7 +2152,12 @@ pub fn revert_in(
         let expected = parse_canon(canon).ok_or_else(|| {
             RepairError::Corrupt(format!("{rel}: 기록된 상태를 읽을 수 없습니다({canon})"))
         })?;
-        let (pre, holder, slot) = pre_image_slot_for(env.root, &rec, env.lane, rel)?;
+        // RULINGS JH2: a pre-image kept unsealed over the limit is never a return's source — a conflict
+        let (pre, holder, slot) = match pre_image_slot_for(env.root, &rec, env.lane, rel) {
+            Ok(x) => x,
+            Err(RepairError::Declined(m)) => return Ok(close_conflict(env, &rec, &m, &by_label, locked)?),
+            Err(e) => return Err(e),
+        };
         // FI1: the door's binding for a put-back is the generation of the bytes put back — GV1: a
         // generation that moved on is judged FIRST and closes the revert "superseded"
         let bound = put_back_bound(slot.as_deref(), &row_bound);
@@ -2063,8 +2171,8 @@ pub fn revert_in(
         }
         // GV1: in the same generation, a live file that is not what the row records the apply left
         // is ANOTHER writer's — a CONFLICT: the bytes stay, the row 충돌, its report owed (FG3)
-        let live_now = TargetState::read(&env.pack.join(rel))?;
-        if live_now != expected {
+        let live_now = TargetState::observe(&env.pack.join(rel))?;
+        if !live_now.is(&expected) {
             return Ok(close_conflict(
                 env,
                 &rec,
@@ -3053,8 +3161,9 @@ pub fn apply_candidate_in(
     };
     if rec.origin_lane != *env.lane {
         return Err(RepairError::Precondition(format!(
-            "{}: 승인된 적용은 처음 고친 부서에서만 합니다(다른 부서는 전파)",
-            id.as_str()
+            "{}: 승인된 적용은 처음 고친 부서에서만 합니다 — {}",
+            id.as_str(),
+            reach_of_other_departments(rec.classification, id.as_str())
         )));
     }
     if matches!(rec.state, RepairState::Probation | RepairState::InUse | RepairState::Reverted | RepairState::Superseded | RepairState::UpstreamFixed) {
@@ -3211,8 +3320,8 @@ pub fn apply_candidate_in(
             .find(|x| x.rel == *rel)
             .map(|x| x.pre.state())
             .unwrap_or(TargetState::Absent);
-        let live_now = TargetState::read(&env.pack.join(rel))?;
-        if live_now != pre {
+        let live_now = TargetState::observe(&env.pack.join(rel))?;
+        if !live_now.is(&pre) {
             return decline(format!(
                 "{rel}: 살아 있는 파일이 수리를 시작할 때와 다릅니다(그 사이 되돌리기·업데이트·다른 작성자) — 승인은 무효가 되었습니다"
             ));
@@ -3335,10 +3444,15 @@ pub fn apply_candidate_in(
     }
     // Q3: the live states reproduce the approved fingerprint
     let mut live_states = Vec::new();
+    let mut over_limit = false;
     for (rel, _) in &slots {
-        live_states.push((rel.clone(), TargetState::read(&env.pack.join(rel))?));
+        // JH1: an over-limit file has no state — the live states then cannot reproduce the fingerprint
+        match TargetState::observe(&env.pack.join(rel))? {
+            super::types::Observed::State(s) => live_states.push((rel.clone(), s)),
+            super::types::Observed::OverLimit { .. } => over_limit = true,
+        }
     }
-    if super::types::fingerprint(&live_states) != approval.fingerprint_sha256 {
+    if over_limit || super::types::fingerprint(&live_states) != approval.fingerprint_sha256 {
         if let Some(r) = undo_then("적용 뒤 살아 있는 파일이 승인된 지문과 다릅니다", results.clone())? {
             return Ok(r);
         }
@@ -3482,7 +3596,7 @@ fn exchange_prepared(
         }
         Err(e) => return Ok(done(ApplyOutcome::Declined(format!("{e:?}")), None)),
     }
-    if TargetState::read(&live)? != spec.expected {
+    if !TargetState::observe(&live)?.is(&spec.expected) {
         return Ok(done(
             ApplyOutcome::Superseded(format!("{}: 살아 있는 파일이 기대한 상태가 아닙니다", spec.rel)),
             None,
@@ -3554,7 +3668,7 @@ fn undo_applied(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord) -> Resu
 fn undo_applied_with(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord, _only_ours: bool) -> Result<Vec<(String, String)>, RepairError> {
     let mut left = Vec::new();
     for spec in applied.iter().rev() {
-        if TargetState::read(&env.pack.join(&spec.rel))? == spec.expected {
+        if TargetState::observe(&env.pack.join(&spec.rel))?.is(&spec.expected) {
             continue; // nothing of this target was changed (its pre-image is live)
         }
         // RULINGS GK2: the state THIS apply's own operation record says it placed — the only state
@@ -3575,12 +3689,12 @@ fn undo_applied_with(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord, _o
                 continue;
             }
         };
-        let live_now = TargetState::read(&env.pack.join(&spec.rel))?;
-        if live_now == pre {
+        let live_now = TargetState::observe(&env.pack.join(&spec.rel))?;
+        if live_now.is(&pre) {
             continue; // already the pre-image (e.g. undone by the operation's own CT3 check)
         }
-        if live_now != placed {
-            left.push((spec.rel.clone(), format!("살아 있는 것이 이 적용이 놓은 것이 아닙니다({}) — 다른 작성자의 바이트를 그대로 둠(충돌)", live_now.canon())));
+        if !live_now.is(&placed) {
+            left.push((spec.rel.clone(), format!("살아 있는 것이 이 적용이 놓은 것이 아닙니다({}) — 다른 작성자의 바이트를 그대로 둠(충돌)", live_now.describe())));
             continue;
         }
         let back = OpSpec {
@@ -3624,9 +3738,9 @@ fn mark_incomplete_apply(
 ) -> Result<(), RepairError> {
     let mut applied_now: Vec<(String, String)> = Vec::new();
     for spec in plan {
-        let live_now = TargetState::read(&env.pack.join(&spec.rel))?;
-        if live_now == spec.incoming && spec.incoming != spec.expected {
-            applied_now.push((spec.rel.clone(), live_now.canon()));
+        let live_now = TargetState::observe(&env.pack.join(&spec.rel))?;
+        if live_now.is(&spec.incoming) && spec.incoming != spec.expected {
+            applied_now.push((spec.rel.clone(), spec.incoming.canon()));
         }
     }
     let (gen_version, gen_pro) = plan.first().map(|s| s.bound.clone()).unwrap_or(Bound::Unknown).row_fields();
@@ -4399,10 +4513,14 @@ pub fn reconcile_hook_registrations(
 /// settings file that does not exist has none; one that cannot be read or parsed is an `Err` (the
 /// hook step then declines — never records "no matcher" for an entry it could not see).
 fn found_matcher_timeout(settings: &Path, event: &str, script: &str) -> Result<(Option<String>, Option<u64>), String> {
-    let bytes = match std::fs::read(settings) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
-        Err(e) => return Err(format!("{}: {e}", settings.display())),
+    // RULINGS IZ5 — read inside the pack-apply exclusion (the apply's, the revert's, T7b's recheck),
+    // so through the bounded reader: a non-regular or over-limit file is refused at once (the hook
+    // unit declines, the exclusion is released), never a wait; a user's link to a regular file is
+    // followed as before
+    let bytes = match super::durable::read_bounded_following(settings) {
+        super::durable::RecordRead::Bytes(b) => b,
+        super::durable::RecordRead::NotFound => return Ok((None, None)),
+        super::durable::RecordRead::Unreadable(why) => return Err(why),
     };
     let v = serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| format!("{}: {e}", settings.display()))?;
     Ok(found_matcher_timeout_in(&v, event, script))

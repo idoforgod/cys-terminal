@@ -225,15 +225,63 @@ pub enum TargetState {
     },
 }
 
+/// RULINGS JH1 — what ONE bounded measurement of a target found: its STATE, or a regular file LONGER
+/// than the engine's read limit. The second is a measured difference (IW1), NOT a state: it has no
+/// hash, no canon and no serialized form, so no recorded field — a sealed copy's hash, a row's
+/// applied state, a probation's expected state, a record's committed result, a fingerprint, an
+/// identity — can hold it: the compiler forbids it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Observed {
+    State(TargetState),
+    OverLimit { len: u64 },
+}
+
+impl Observed {
+    /// Whether the observation IS this state (an over-limit file is no state at all).
+    pub fn is(&self, st: &TargetState) -> bool {
+        matches!(self, Observed::State(s) if s == st)
+    }
+
+    /// The observation for a sentence: a state's canon, or the length and the limit.
+    pub fn describe(&self) -> String {
+        match self {
+            Observed::State(s) => s.canon(),
+            Observed::OverLimit { len } => format!(
+                "엔진의 읽기 한도 {}바이트를 넘는 파일({len}바이트)",
+                super::durable::RECORD_READ_CAP
+            ),
+        }
+    }
+}
+
 impl TargetState {
     /// Reads a target's state with `lstat` semantics — a symbolic link is reported as a link and
     /// never followed. A regular file is opened without following links and re-checked through
     /// its open handle, so a swap between the `lstat` and the open cannot make this read follow a
     /// link. A missing path is `Absent`; a directory or any other kind of entry is refused.
+    ///
+    /// RULINGS JH1 — a regular file longer than the engine's read limit has no state: `read` answers
+    /// an error naming the limit; the operations that must go on past it (several targets, a
+    /// conflict) measure through [`TargetState::observe`].
     pub fn read(path: &Path) -> Result<TargetState, RepairError> {
+        match Self::observe(path)? {
+            Observed::State(s) => Ok(s),
+            Observed::OverLimit { len } => Err(RepairError::Precondition(format!(
+                "{}: 크기 {len}바이트가 엔진의 읽기 한도 {}바이트를 넘어 상태를 매기지 않습니다",
+                path.display(),
+                super::durable::RECORD_READ_CAP
+            ))),
+        }
+    }
+
+    /// RULINGS IE4 / IG1 / JH1 — THE bounded measurement behind [`TargetState::read`]: at most
+    /// RECORD_READ_CAP + 1 bytes from ONE handle; a regular file longer than the limit (at the open,
+    /// or found while it is read) is `Observed::OverLimit` (a measured difference, never a state of a
+    /// prefix); a size that changed within the limit while it was read is an error (read again later).
+    pub fn observe(path: &Path) -> Result<Observed, RepairError> {
         let meta = match std::fs::symlink_metadata(path) {
             Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(TargetState::Absent),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Observed::State(TargetState::Absent)),
             Err(e) => return Err(RepairError::Io(format!("{}: {e}", path.display()))),
         };
         let kind = meta.file_type();
@@ -246,7 +294,7 @@ impl TargetState {
                     path.display()
                 ))
             })?;
-            return Ok(TargetState::Link { target });
+            return Ok(Observed::State(TargetState::Link { target }));
         }
         if !kind.is_file() {
             return Err(RepairError::Precondition(format!(
@@ -265,20 +313,41 @@ impl TargetState {
                 path.display()
             )));
         }
+        let cap = super::durable::RECORD_READ_CAP;
+        if opened.len() > cap {
+            return Ok(Observed::OverLimit { len: opened.len() });
+        }
+        super::durable::seam_after_open(path);
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; 64 * 1024];
+        let mut total: u64 = 0;
+        let mut limited = std::io::Read::take(&mut file, cap + 1);
         loop {
-            let n = std::io::Read::read(&mut file, &mut buf)
+            let n = std::io::Read::read(&mut limited, &mut buf)
                 .map_err(|e| RepairError::Io(format!("{}: {e}", path.display())))?;
             if n == 0 {
                 break;
             }
+            total += n as u64;
             hasher.update(&buf[..n]);
         }
-        Ok(TargetState::File {
+        drop(limited);
+        super::durable::seam_count(path, total);
+        if total > cap {
+            let len = file.metadata().map(|m| m.len()).unwrap_or(total).max(total);
+            return Ok(Observed::OverLimit { len });
+        }
+        if total != opened.len() {
+            return Err(RepairError::Precondition(format!(
+                "{}: 읽는 동안 크기가 바뀌었습니다({}바이트 → {total}바이트) — 그 상태를 쓰지 않습니다",
+                path.display(),
+                opened.len()
+            )));
+        }
+        Ok(Observed::State(TargetState::File {
             sha256: hex(&hasher.finalize()),
             mode: permission_bits(&opened),
-        })
+        }))
     }
 
     /// `absent` | `file:<sha256>:<mode as 4 octal digits>` | `link:<target>` (RULINGS U2).
