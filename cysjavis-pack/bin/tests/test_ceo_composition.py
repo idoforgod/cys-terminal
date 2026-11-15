@@ -181,8 +181,12 @@ class Rig(unittest.TestCase):
         return os.path.join(self.home, ".cys", "state", "ceo-notices")
 
     def outbox_files(self, sent=False):
+        # ★RULINGS JZ2(WC1): 알림함의 알림은 이제 시도가 적힌 형태(<키>.notice.<k>)와 받힘 표지(<키>.notice.done)로도 남는다 —
+        #   알림함 쪽은 그 모두를 센다. 종전 정의(그대로 인용): `if f.endswith(".notice")` — 알림함·sent/ 모두 .notice 로 끝나는 것만.
         d = os.path.join(self.outbox(), "sent") if sent else self.outbox()
-        return sorted(os.path.join(d, f) for f in (os.listdir(d) if os.path.isdir(d) else []) if f.endswith(".notice"))
+        names = os.listdir(d) if os.path.isdir(d) else []
+        keep = (lambda f: f.endswith(".notice")) if sent else (lambda f: ".notice" in f and not f.startswith("."))
+        return sorted(os.path.join(d, f) for f in names if keep(f) and os.path.isfile(os.path.join(d, f)))
 
     def notices_text(self):
         """영속 알림함의 알림 — 아직 배달되지 않은 것과 sent/ 의 것 — 의 제목·본문(시험이 '알림이 있다'를 재는 곳)."""
@@ -2126,6 +2130,90 @@ class DurableOutbox(Rig):
         rc, out, err = self.run_dept("promote-if-pending")
         self.assertEqual(rc, 0, out + err)
         return out + err
+
+    # ── ★RULINGS JZ2 · WC1 — 한 알림을 올리는 시도는 알림함 안에 먼저 적히고, 알림 하나는 모든 입구를 통틀어 많아야 1 + N 번 올라간다 ──
+    BUDGET = 3          # 1 + N, N = 2 (cys-dept CEO_NOTICE_RETRIES)
+    TITLE_A = "CEO 지침 교체 기록 확인 필요"
+
+    def put_notice(self, key, title, body="본문 — 시험이 직접 놓은 알림"):
+        _write(os.path.join(self.outbox(), key + ".notice"), "%s\n%s\n" % (title, body))
+
+    def notice_forms(self, key):
+        """알림함에 남은 그 알림의 파일(어느 형태든) — 사람이 읽을 수 있는 제목 줄과 함께."""
+        box = self.outbox()
+        names = sorted(n for n in (os.listdir(box) if os.path.isdir(box) else []) if n.startswith(key + ".notice"))
+        return [(n, _slurp(os.path.join(box, n), encoding="utf-8").split("\n", 1)[0]) for n in names
+                if os.path.isfile(os.path.join(box, n))]
+
+    def break_sent(self):
+        """sent/ 를 쓸 수 없게 — 그 이름에 일반 파일(mkdir -p 도 mv 도 실패한다)."""
+        os.makedirs(self.outbox(), exist_ok=True)
+        _write(os.path.join(self.outbox(), "sent"), "sent 는 폴더가 아니다\n")
+
+    def test_an_accepted_notice_is_not_pushed_again_when_sent_cannot_be_written(self):
+        """codex WF1-r1 M1(RULINGS JZ2): 피드가 받았다 → sent/ 에 옮기지 못한다 → 받는 쪽이 닫는다 → 다음 입구가 같은 제목을 대기 중에서
+        찾지 못해 같은 알림을 또 올렸다 — 저장 실패가 이어지는 동안 끝없이. 이제 깨끗이 받힌 뒤에는 sent/ 로 못 옮겨도 더 올리지 않고,
+        알림은 알림함에 사람이 읽을 수 있는 파일로 남는다(지운 것 없음). 배달은 관문이 아니다 — 입구는 늘 0 으로 끝난다."""
+        self.seed()
+        key = "a" * 32
+        self.put_notice(key, self.TITLE_A)
+        self.break_sent()
+        for _ in range(8):                  # 스텁의 대기 목록은 비어 있다 — 받는 쪽이 매번 닫았다
+            self.tick()
+        self.assertLessEqual(self.pushes(self.TITLE_A), self.BUDGET, "받힌 알림이 입구마다 다시 올라갔다(상한 없음 — JZ2)")
+        self.assertEqual(self.pushes(self.TITLE_A), 1, "깨끗이 받힌 알림을 sent/ 실패 뒤에 또 올렸다")
+        forms = self.notice_forms(key)
+        self.assertEqual(len(forms), 1, "알림 파일이 하나로 남지 않았다: %r" % forms)
+        self.assertEqual(forms[0][1], self.TITLE_A, "남은 파일을 사람이 읽을 수 없다")
+
+    def test_a_notice_the_feed_never_takes_is_pushed_at_most_the_budget_and_then_kept(self):
+        """올리기가 1 + N 번 모두 실패하면(받지 않았음이 확인됨) 그 뒤로는 조용하다 — 그 알림 파일은 그대로 남아 사람이 읽는다."""
+        self.seed()
+        key = "b" * 32
+        self.put_notice(key, self.TITLE_A)
+        _write(self.pushfail, "1\n")
+        for _ in range(8):
+            self.tick()
+        self.assertEqual(self.pushes(self.TITLE_A), self.BUDGET, "받지 않는 알림이 1 + N 번을 넘거나 못 미치게 올라갔다")
+        forms = self.notice_forms(key)
+        self.assertEqual([t for _n, t in forms], [self.TITLE_A], "예산을 다 쓴 알림 파일이 남지 않았다: %r" % forms)
+
+    def test_a_second_notice_is_not_held_back_by_the_first_ones_exhausted_budget(self):
+        self.seed()
+        self.put_notice("c" * 32, self.TITLE_A)
+        _write(self.pushfail, "1\n")
+        for _ in range(5):
+            self.tick()
+        self.assertEqual(self.pushes(self.TITLE_A), self.BUDGET)
+        os.unlink(self.pushfail)
+        second = "CEO 지침 보류(파일을 읽지 못함)"
+        self.put_notice("d" * 32, second)
+        self.tick()
+        self.assertEqual(self.pushes(second), 1, "다른 알림이 앞 알림의 다 쓴 예산에 막혔다")
+        self.assertEqual(self.pushes(self.TITLE_A), self.BUDGET, "예산을 다 쓴 알림이 다시 올라갔다")
+
+    def test_a_lasting_hold_whose_notice_is_never_taken_is_pushed_at_most_the_budget(self):
+        """ceo_py 가 같은 보류(같은 키)의 알림을 입구마다 다시 놓으려 해도, 시도가 적힌 알림은 '이미 있다'로 본다 — 예산이 새로 생기지
+        않는다(종전: 넣지 못한 알림이 알림함에 그대로 남아 매 입구 다시 올라갔다)."""
+        self.barrier()
+        _write(self.pushfail, "1\n")
+        for _ in range(8):
+            self.tick()
+        self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), self.BUDGET,
+                         "같은 보류의 알림이 입구마다 새 예산으로 올라갔다")
+
+    def test_delivery_never_holds_the_composition_or_a_launch(self):
+        """sent/ 를 쓸 수 없고 올리기도 실패해도 배달은 관문이 아니다 — 부서 켜기는 0 으로 끝나고 조립은 이루어진다."""
+        self.seed()
+        self.put_notice("e" * 32, self.TITLE_A)
+        self.break_sent()
+        _write(self.pushfail, "1\n")
+        rc, out, err = self.run_dept("launch", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER, "배달 실패가 조립을 막았다")
+        for _ in range(4):
+            self.tick()
+        self.assertLessEqual(self.pushes(self.TITLE_A), self.BUDGET)
 
     def test_a_notice_survives_the_shell_dying_before_delivery(self):
         """codex R3 — 종전: 보류 알림을 임시 파일에 덧붙인 뒤 .held 표지를 적어, 셸이 그 파일을 배달하기 전에 죽으면 알림은 영영
