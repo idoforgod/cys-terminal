@@ -996,10 +996,16 @@ def _ledger_spellings():
     return sorted(out, key=len, reverse=True)
 
 LEDGER_SPELLINGS = _ledger_spellings()
-LEDGER_WRITERS = {"tee", "cp", "dd", "mv", "install", "ln", "truncate", "patch", "vim", "vi", "nano", "emacs", "ex",
-                  "rm", "rmdir", "chmod", "chown"}
-LEDGER_DENY = ("수리 장부(%s)는 데몬이 `cys repair …` 동사로만 쓴다 — 좌석이 파일 도구나 셸 쓰기로 장부를 쓰는 것은 역할과 "
-               "상관없이 막는다(좌석이 쓰는 자리는 수리의 작업 사본 `R-<번호>/staging/` 하나). %s")
+# RULINGS IN4 — the programs a command that names the ledger may run (a closed list: none has an option or operand that
+#   writes a file; the interpreters stay by IJ5 / HP3). Every other program is refused when the ledger is named.
+LEDGER_READERS = ("ls", "cat", "head", "tail", "grep", "egrep", "fgrep", "wc", "stat", "jq", "cmp", "shasum",
+                  "sha256sum", "md5", "md5sum", "du", "cut", "tr", "nl", "tac", "column", "od", "hexdump", "basename",
+                  "dirname", "realpath", "readlink", "pwd", "cd", "pushd", "popd", "echo", "printf", "test", "[", "true",
+                  "false", "date", "python3", "python", "node")
+LEDGER_DENY = ("수리 장부(%s)는 데몬이 `cys repair …` 동사로만 쓴다 — 좌석의 파일 도구는 장부를 쓰지 못하고, 장부의 자리를 "
+               "적은 셸 명령은 읽기 명령(" + " ".join(LEDGER_READERS) + ")만 `|` · `&&` · `||` · `;` 로 잇고 출력을 "
+               "/dev/null 이나 장부 밖의 파일로만 보낼 때 통과한다(좌석이 쓰는 자리는 수리의 작업 사본 `R-<번호>/staging/` "
+               "하나). %s")
 LEDGER_HINTS = {
     "owner-tokens": "주인 지시 표는 주인이 직접 답한 뒤 데몬이 발급한다: 마스터가 `cys repair owner-token ask --path "
                     "<문서>` 로 묻고, 주인이 답하면 `cys repair owner-token --path <문서>`.",
@@ -1104,7 +1110,7 @@ def _ledger_text_places(text):
     return out
 
 def _ledger_tokens(n):
-    """STRICT's tokenization (quotes kept together, punctuation split); None when it cannot be told."""
+    """STRICT's tokenization (quotes kept together, punctuation split) — used for NAMING only; None when it cannot."""
     try:
         lex = shlex.shlex(n, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
@@ -1114,35 +1120,63 @@ def _ledger_tokens(n):
 
 LEDGER_NOT_LITERAL = re.compile(r"[$`*?\[]")
 
-def _ledger_bases(cmds, cwd):
-    """The call's working directory and every directory the command changes to by a `cd` / `pushd` target NAMED
-    LITERALLY in it (no `$`, back-quote or glob — RULINGS IJ5), each resolved from every base before it; at most 16."""
+_LEDGER_CD_OPT = re.compile(r"-[LPeqs@]+")
+_LEDGER_TERM = re.compile(r"[;&|<>(){}\n]")
+
+def _ledger_cd_operands(words, k):
+    """The operands of the `cd` / `pushd` at words[k]: its options (-L -P -e -q -s -@, then `--`) skipped, at most two
+    (zsh's `cd OLD NEW` — the seat's shell is zsh); a word holding a shell operator ends them."""
+    ops, j, opts = [], k + 1, True
+    while j < len(words) and len(ops) < 2:
+        w = words[j]
+        if not w or _LEDGER_TERM.search(w):
+            break
+        if opts and w == "--":
+            opts = False
+        elif not (opts and _LEDGER_CD_OPT.fullmatch(w)):
+            opts = False
+            ops.append(w)
+        j += 1
+    return ops
+
+def _ledger_cd_told(t):
+    """A `cd` / `pushd` operand whose directory the command itself tells: literal, and not the shell's own state (`-`,
+    `-<n>` / `+<n>` of the directory stack, `~-` / `~+` / `~<name>`)."""
+    if not t or LEDGER_NOT_LITERAL.search(t) or t.startswith(("-", "+")):
+        return False
+    return not t.startswith("~") or t == "~" or t.startswith("~/")
+
+def _ledger_bases(words, cwd):
+    """The call's working directory, HOME (where a bare `cd` goes), and every `cd` / `pushd` target the command tells
+    (`_ledger_cd_told`; options skipped; zsh's `cd OLD NEW` as OLD replaced by NEW), each resolved from every base before
+    it; at most 16. No wrapper is stripped (RULINGS IN3)."""
     bases = [cwd or os.getcwd()]
-    for prog, args in cmds:
-        if prog not in ("cd", "pushd"):
+
+    def add(p):
+        if p and p not in bases and len(bases) < 16:
+            bases.append(p)
+    for k, w in enumerate(words):
+        if w not in ("cd", "pushd"):
             continue
-        ops = [x for x in args if not x.startswith("-") and x not in REDIRECTS]
-        if not ops or LEDGER_NOT_LITERAL.search(ops[0]):
-            continue
+        if os.environ.get("HOME"):
+            add(_ledger_abs("~", bases[0]))
+        ops = _ledger_cd_operands(words, k)
         for b in list(bases):
-            nb = _ledger_abs(ops[0], b)
-            if nb not in bases and len(bases) < 16:
-                bases.append(nb)
+            if ops and _ledger_cd_told(ops[0]):
+                add(_ledger_abs(ops[0], b))
+            if len(ops) == 2 and _ledger_cd_told(ops[0]) and _ledger_cd_told(ops[1]) and ops[0] in b:
+                add(_ledger_abs(b.replace(ops[0], ops[1], 1), b))
     return bases
 
 def _ledger_named(n, cwd):
-    """The ledger places outside the working copy that a command NAMES (RULINGS IJ1 / IJ5): a root's spelling anywhere in
-    its text (an operand, an assignment, a quoted string), and every word — and the value after its first `=` — as a path
-    from the call's cwd and from each literally named `cd` / `pushd` target. Returns (places, tokens or None, bases)."""
+    """The ledger places outside the working copy that a command NAMES (RULINGS IJ5 / IN1): a root's spelling anywhere in
+    its text (an operand, an assignment, a quoted string; IJ3's dot components folded), and every word — STRICT's tokens
+    and the coarse loose words, and the value after a word's first `=` — as a path from the call's cwd and from each
+    literally named `cd` / `pushd` target. Returns (places, bases)."""
     places = [pl for pl in _ledger_text_places(n) if pl != "staging"]
     toks = _ledger_tokens(n)
-    nl = norm_loose(n)
-    loose = nl.split() + norm_loose_slash(n).split()        # the coarse words too: a path inside `$(…)` stays a word
-    if toks is not None:
-        words, cmds = list(toks) + loose, extract_commands(toks)
-    else:
-        words, cmds = loose, [l_cmd_word(seg) for seg in l_segments(nl)]
-    bases = _ledger_bases(cmds, cwd)
+    words = (list(toks) if toks is not None else []) + norm_loose(n).split() + norm_loose_slash(n).split()
+    bases = _ledger_bases(words, cwd)
     for w in words:
         for c in [w] + ([w.split("=", 1)[1]] if "=" in w else []):
             if not c:
@@ -1153,45 +1187,178 @@ def _ledger_named(n, cwd):
                     places.append(pl)
                 if os.path.isabs(c) or c.startswith(("~", "$HOME", "${HOME}")):
                     break
-    return places, toks, bases
+    return places, bases
 
-def _ledger_harmless_sink(op, tgt, bases):
-    """RULINGS IJ2: a redirection target that cannot be a write of the ledger — /dev/null, a descriptor duplicate
-    (`&1`, `&2`, `2>&1`, `>&-`), or a literal path (no `$`, back-quote, glob) that resolves outside every root from the
-    cwd and every literal `cd` target."""
+class _LedgerRefuse(Exception):
+    """A named command that is not a plain read (RULINGS IN2 / IN5)."""
+
+# zsh's clobbering forms (`>!` `>>!` `>&!` `&>!` `&>>!` — the seat's shell is zsh) are operators of their own: refused
+_LEDGER_OPS = ("&&", "||", ";;", "|&", "&>>!", "&>>", "&>!", "&>", ">>!", ">>", ">|", ">&!", ">&", ">!", "<<<", "<<", "<>",
+               "<&", "|", ";", "&", "(", ")", "<", ">")
+_LEDGER_SEPARATORS = ("|", "&&", "||", ";")
+_LEDGER_WRITE_OPS = (">", ">>", ">|", "&>", "&>>", "<>", ">&")
+
+def _ledger_shell_lex(s):
+    """The command's tokens WITH its syntax boundaries (RULINGS IN2): ("w", text, literal) for a word, ("fd", n, True) for
+    a descriptor number written right before `<` / `>`, ("op", operator, True) for an operator. A command or process
+    substitution (outside single quotes) or an unclosed quote raises _LedgerRefuse."""
+    toks, i, n = [], 0, len(s)
+    while i < n:
+        c = s[i]
+        if c in " \t":
+            i += 1
+            continue
+        if c == "\n":
+            toks.append(("op", ";", True))
+            i += 1
+            continue
+        if c == "#":
+            while i < n and s[i] != "\n":
+                i += 1
+            continue
+        if c in "<>" and s.startswith("(", i + 1):
+            raise _LedgerRefuse("process substitution")
+        op = next((o for o in _LEDGER_OPS if s.startswith(o, i)), None)
+        if op:
+            toks.append(("op", op, True))
+            i += len(op)
+            continue
+        buf, literal = [], True
+        while i < n and s[i] not in " \t\n|&;<>()":
+            ch = s[i]
+            if ch == "'":
+                j = s.find("'", i + 1)
+                if j < 0:
+                    raise _LedgerRefuse("unclosed quote")
+                buf.append(s[i + 1:j])
+                i = j + 1
+                continue
+            if ch == '"':
+                i += 1
+                while i < n and s[i] != '"':
+                    if s[i] == "\\" and i + 1 < n:
+                        buf.append(s[i + 1])
+                        i += 2
+                        continue
+                    if s[i] == "`" or s.startswith("$(", i):
+                        raise _LedgerRefuse("command substitution")
+                    if s[i] == "$":
+                        literal = False
+                    buf.append(s[i])
+                    i += 1
+                if i >= n:
+                    raise _LedgerRefuse("unclosed quote")
+                i += 1
+                continue
+            if ch == "\\":
+                if i + 1 < n:
+                    buf.append(s[i + 1])
+                i += 2
+                continue
+            if ch == "`" or s.startswith("$(", i):
+                raise _LedgerRefuse("command substitution")
+            if ch in "$*?[{":
+                literal = False
+            buf.append(ch)
+            i += 1
+        word = "".join(buf)
+        if word.isdigit() and i < n and s[i] in "<>":
+            toks.append(("fd", word, True))
+        else:
+            toks.append(("w", word, literal))
+    return toks
+
+def _ledger_check_redirect(op, fd, tgt, literal, bases, untold=False):
+    """RULINGS IN5 — by OPERATOR: `<` is a read; a duplication only `2>&1`, `>&2`, `1>&2`; every writing operator's target
+    exactly /dev/null or a literal path that resolves (links followed; the cwd and every `cd` target) outside every ledger
+    root and not under /dev/. After a `cd` whose directory the command does not tell (`untold`), a relative target cannot
+    be resolved and is refused."""
+    if op == "<":
+        return
+    if op == ">&" and tgt.isdigit():
+        if (fd, tgt) in (("2", "1"), (None, "2"), ("1", "2")):
+            return
+        raise _LedgerRefuse("descriptor %s" % tgt)
+    if op not in _LEDGER_WRITE_OPS:
+        raise _LedgerRefuse("operator %s" % op)
     if tgt == "/dev/null":
-        return True
-    if op == ">&" and (tgt.isdigit() or tgt == "-"):
-        return True
-    if tgt in ("&1", "&2", "&-"):
-        return True
-    if not tgt or LEDGER_NOT_LITERAL.search(tgt) or _ledger_text_places(tgt):
-        return False
-    return all(ledger_place(tgt, b) is None for b in bases)
+        return
+    if not tgt or not literal or LEDGER_NOT_LITERAL.search(tgt) or _ledger_text_places(tgt):
+        raise _LedgerRefuse("target %s" % tgt)
+    if tgt.startswith("=") or (tgt.startswith("~") and not (tgt == "~" or tgt.startswith("~/"))):
+        raise _LedgerRefuse("target %s" % tgt)       # zsh's `=cmd`, and `~-` / `~+` / `~<name>`: the shell's own state
+    if untold and not (os.path.isabs(tgt) or tgt == "~" or tgt.startswith("~/")):
+        raise _LedgerRefuse("target %s after an untold cd" % tgt)
+    for b in bases:
+        rp = _ledger_abs(tgt, b).replace("\\", "/")
+        if rp == "/dev" or rp.startswith("/dev/") or ledger_place(tgt, b) is not None:
+            raise _LedgerRefuse("target %s" % tgt)
+
+def _ledger_judge_shell(s, bases):
+    """RULINGS IN2: a named command passes only as SIMPLE COMMANDS joined by `|`, `&&`, `||`, `;` or a new line, each a
+    BARE program name from LEDGER_READERS (no slash; no wrapper is stripped — IN3) and then words; its redirections by
+    IN5. Refused wherever they stand: substitutions, groups, `!`, a function definition, `<<` / `<<<`, a background `&`,
+    an assignment prefix (its first word is not a reader)."""
+    seg = []
+    segs = [seg]
+    untold = False
+    for t in _ledger_shell_lex(s):
+        if t[0] == "op" and t[1] in _LEDGER_SEPARATORS:
+            seg = []
+            segs.append(seg)
+            continue
+        seg.append(t)
+    for seg in segs:
+        if not seg:
+            continue
+        k, cmdword, fd = 0, None, None
+        while k < len(seg):
+            kind, val, lit = seg[k]
+            if kind == "fd":
+                fd = val
+                k += 1
+                continue
+            if kind == "op":
+                if val in ("<<", "<<<"):
+                    raise _LedgerRefuse("here-document")
+                if val in _LEDGER_WRITE_OPS or val in ("<", "<&"):
+                    if k + 1 >= len(seg) or seg[k + 1][0] != "w":
+                        raise _LedgerRefuse("redirection without a target")
+                    _ledger_check_redirect(val, fd, seg[k + 1][1], seg[k + 1][2], bases, untold)
+                    fd = None
+                    k += 2
+                    continue
+                raise _LedgerRefuse("operator %s" % val)
+            if cmdword is None:
+                if val not in LEDGER_READERS:
+                    raise _LedgerRefuse("not a reader: %s" % val)
+                cmdword = val
+            k += 1
+        if cmdword is None:
+            raise _LedgerRefuse("no program")
+        if cmdword in ("cd", "pushd"):
+            words = [w for w in seg if w[0] == "w"]
+            ops = _ledger_cd_operands([w[1] for w in words], 0)
+            lit = all(w[2] for w in words)
+            if (cmdword == "pushd" and not ops) or not lit or not all(_ledger_cd_told(o) for o in ops):
+                untold = True
 
 def ledger_shell_write(command, cwd):
-    """The store a shell command writes into, or None — RULINGS IJ1 / IJ2, ONE coarse rule.
-    (a) The command NAMES a ledger place outside the working copy (`_ledger_named`), and (b) any segment's program is a
-    writer (the round-1 set, or `sed -i`) → refused; no operand is interpreted (a copy OUT is refused too — the coarse
-    judgment's cost). With no writer, the command's redirections are writes unless EVERY redirection target is a harmless
-    sink (`_ledger_harmless_sink`); a command whose tokens cannot be told is refused if it has a `>` at all."""
-    n = norm_base(command)
-    named, toks, bases = _ledger_named(n, cwd)
+    """The store a shell command would reach, or None (RULINGS IN1–IN5). NAMED OR NOT first: a command that names no
+    ledger place outside the working copy is not touched (an error before that is known skips the rule). A named command
+    passes only as plain reads (`_ledger_judge_shell`); anything else — and an error after naming — refuses this call."""
+    try:
+        n = norm_base(command)
+        named, bases = _ledger_named(n, cwd)
+    except Exception:
+        return None
     if not named:
         return None
-    nl = norm_loose(n)
-    for seg in l_segments(nl):
-        p, a = l_cmd_word(seg)
-        if p in LEDGER_WRITERS or (p == "sed" and any(x == "-i" or x.startswith("-i") for x in a)):
-            return named[0]
-    if toks is None:
-        return named[0] if ">" in n else None
-    for k, t in enumerate(toks):
-        if t in REDIRECTS or t == "<>":
-            tgt = toks[k + 1] if k + 1 < len(toks) else ""
-            if not _ledger_harmless_sink(t, tgt, bases):
-                return named[0]
-    return None
+    try:
+        _ledger_judge_shell(n, bases)
+        return None
+    except Exception:
+        return named[0]
 
 # ================= 메인 =================
 def out_deny(reason):
