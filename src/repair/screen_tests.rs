@@ -1,0 +1,2271 @@
+//! Tests of the protection screen (T5b). Every run is hermetic: the screen lays out its own scratch
+//! roots under this test's private folder, calls only its own stub `cys`, binds only its own scratch
+//! socket, and the "real" HOME / lane it compares are folders of this test too.
+
+use super::*;
+use crate::repair::replay;
+use crate::repair::screen_corpus::{self as corpus, Device, CELLS, CENSUS_PINS};
+use std::sync::Arc;
+
+/// A private test root inside the replay's own scratch base (RULINGS DE6: no test writes outside its
+/// scratch directory; never under a temporary folder — the registrar refuses a pack there; a
+/// `.nosync` folder, so no file provider re-stamps what the after-run comparison watches).
+fn test_root(name: &str) -> PathBuf {
+    let p = crate::repair::rehearsal::scratch_base()
+        .join("tests.nosync")
+        .join(format!("screen-{name}-{}", replay::random_hex(4)));
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+fn released(rel: &str) -> String {
+    replay::released_text(rel)
+        .unwrap_or_else(|| panic!("{rel} is not embedded"))
+        .to_string()
+}
+
+/// A lane laid out with the RELEASED copies of every input file (+ `state/` folder).
+fn lane_of(root: &Path, overrides: &[(&str, Option<String>)]) -> PathBuf {
+    let lane = root.join("lane").join("pack");
+    for rel in all_input_rels().unwrap() {
+        if let Some(c) = super::super::rehearsal::released_copy(&rel) {
+            replay::lay_out(&lane.join(&rel), &c).unwrap();
+        }
+    }
+    for (rel, c) in overrides {
+        let p = lane.join(rel);
+        let _ = std::fs::remove_file(&p);
+        if let Some(text) = c {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, text).unwrap();
+        }
+    }
+    lane
+}
+
+/// A candidate whose targets are given as (rel, Some(text) | None = deleted).
+fn candidate_of(root: &Path, targets: &[(&str, Option<String>)]) -> ScreenCandidate {
+    let files = root.join("staging");
+    let mut t = Vec::new();
+    for (rel, c) in targets {
+        let p = files.join(rel);
+        match c {
+            Some(text) => {
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, text).unwrap();
+                replay::set_mode(&p, 0o755);
+                t.push((rel.to_string(), TargetState::read(&p).unwrap()));
+            }
+            None => t.push((rel.to_string(), TargetState::Absent)),
+        }
+    }
+    ScreenCandidate { files, targets: t }
+}
+
+fn cfg(
+    root: &Path,
+    classes: Option<Vec<&'static str>>,
+    cells: Option<Vec<&'static str>>,
+    i3: bool,
+) -> ScreenConfig {
+    let mut c = ScreenConfig::production();
+    c.scratch_base = root.join("scr");
+    c.real_home = root.join("realhome");
+    std::fs::create_dir_all(&c.real_home).unwrap();
+    c.classes = classes;
+    c.cells = cells;
+    c.run_i3 = i3;
+    assert!(
+        c.interpreter.is_some(),
+        "no python3 on PATH — the screen cannot be measured in this environment"
+    );
+    c
+}
+
+const LONG: Duration = Duration::from_secs(900);
+
+fn decisions<'a>(r: &'a ScreenReport, class: &str) -> Vec<&'a ProbeResult> {
+    r.probes
+        .iter()
+        .filter(|p| p.class == class || p.class.starts_with(&format!("{class}#")))
+        .collect()
+}
+
+fn cleanup(root: &Path) {
+    replay::remove_tree(root).expect("the test root is removed");
+}
+
+/// RULINGS DE6: no T5b test writes outside its scratch directory — every test folder and file lies in
+/// the replay's own scratch base (a plain `cargo test` must not write into the real HOME).
+#[test]
+fn t5b_tests_write_only_inside_their_scratch_base() {
+    let home_call = ["dirs::", "home_dir()"].concat();
+    for (name, src) in [
+        ("screen_tests.rs", include_str!("screen_tests.rs")),
+        ("rehearsal_tests.rs", include_str!("rehearsal_tests.rs")),
+        ("repair_approval_tests.rs", include_str!("../bin/cysd/repair_approval_tests.rs")),
+        ("repair_t5b_check_tests.rs", include_str!("../bin/cysd/repair_t5b_check_tests.rs")),
+    ] {
+        assert!(!src.contains(&home_call), "{name} builds a path from HOME");
+        assert!(src.contains("tests.nosync"), "{name} has no folder in the scratch base");
+    }
+}
+
+/// RULINGS EL4 — a census of the WAIT sites of this unit: no process wait blocks. Every `waitpid` /
+/// `waitid` asks for WNOHANG; every `.wait()` is the body of a detached reaper thread (a child that
+/// would not die is never waited for by the caller); no `wait_with_output`.
+#[test]
+fn wait_site_census_no_blocking_wait() {
+    let files = [
+        ("replay.rs", include_str!("replay.rs")),
+        ("rehearsal.rs", include_str!("rehearsal.rs")),
+        ("screen.rs", include_str!("screen.rs")),
+        ("repair_approval.rs", include_str!("../bin/cysd/repair_approval.rs")),
+    ];
+    let mut bad = Vec::new();
+    for (name, src) in files {
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, l) in lines.iter().enumerate() {
+            let code = l.split("//").next().unwrap_or("");
+            if code.contains(concat!("wait_with", "_output(")) {
+                bad.push(format!("{name}:{} wait_with_output", i + 1));
+            }
+            if code.contains("waitpid(") || code.contains("waitid(") {
+                let window = lines[i..(i + 6).min(lines.len())].join(" ");
+                if !window.contains("WNOHANG") {
+                    bad.push(format!("{name}:{} wait without WNOHANG", i + 1));
+                }
+            }
+            if code.contains(".wait()") {
+                let before = lines[i.saturating_sub(2)..i].join(" ");
+                if !before.contains("spawn(move ||") {
+                    bad.push(format!("{name}:{} a blocking .wait() outside a detached reaper", i + 1));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "blocking wait sites: {bad:?}");
+}
+
+/// RULINGS EL3 / EO4 — a census of the READ sites of the screen / replay modules: a file a candidate
+/// could have produced is read only through the bounded reader; the only other opens are the bounded
+/// reader itself, `/dev/urandom` and Linux's `/proc` files.
+#[test]
+fn read_site_census_only_the_bounded_reader() {
+    let allowed: &[&str] = &[
+        "std::fs::File::open(\"/dev/urandom\")",
+        "std::fs::read_to_string(format!(\"/proc/{pid}/stat\"))",
+        "std::fs::read(e.path().join(\"environ\"))",
+        "std::fs::OpenOptions::new()",
+        "    std::fs::File::open(p)",
+    ];
+    // RULINGS GA5: the daemon side too — the approval channel and the check's consequence step, and
+    // the T5b functions of the daemon's repair module (the intake filing, the worker's `check`)
+    let region = |src: &'static str, from: &str, to: &str| -> &'static str {
+        let a = src.find(from).unwrap_or_else(|| panic!("census region start {from:?}"));
+        let b = a + src[a..].find(to).unwrap_or_else(|| panic!("census region end {to:?}"));
+        &src[a..b]
+    };
+    let daemon_repair = include_str!("../bin/cysd/repair.rs");
+    let files = [
+        ("screen.rs", include_str!("screen.rs")),
+        ("replay.rs", include_str!("replay.rs")),
+        ("rehearsal.rs", include_str!("rehearsal.rs")),
+        ("screen_corpus.rs", include_str!("screen_corpus.rs")),
+        ("repair_approval.rs", include_str!("../bin/cysd/repair_approval.rs")),
+        (
+            "repair.rs (file_intake)",
+            region(daemon_repair, "/// Track T5b — one intake row", "/// The verb dispatcher behind"),
+        ),
+        (
+            "repair.rs (check)",
+            region(daemon_repair, "pub(crate) fn production_check_with(", "// Track T3 — the verb bodies"),
+        ),
+    ];
+    // direct opens, and the readers that read on the caller's behalf without a bound (the shared
+    // type's EOF hash loop and the ledger functions built on it)
+    let readers = [
+        "fs::read(",
+        "read_to_string(",
+        "File::open(",
+        "OpenOptions::new(",
+        "TargetState::read(",
+        "read_under_no_link(",
+    ];
+    let mut bad = Vec::new();
+    for (name, src) in files {
+        for (i, l) in src.lines().enumerate() {
+            let code = l.split("//").next().unwrap_or("");
+            if readers.iter().any(|o| code.contains(o)) && !allowed.iter().any(|a| l.contains(a)) {
+                bad.push(format!("{name}:{}: {}", i + 1, l.trim()));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "unbounded read sites: {bad:#?}");
+    // RULINGS GR5: the ONE candidate reader (V2 (a)) reads with the size limit — no allow-list entry
+    let ledger = include_str!("ledger.rs");
+    let reader = region(ledger, "pub fn candidate_states_in(", "\n}\n");
+    assert!(
+        reader.contains("TargetState::read_capped(") && reader.contains("MAX_CANDIDATE_BYTES"),
+        "the candidate reader is capped: {reader}"
+    );
+}
+
+/// RULINGS GR5 (CCR-T5b-1) — the capped read: a file far over the limit (a 64 GiB sparse file) is
+/// refused at once without being read to the end; a file within it reads exactly as the uncapped
+/// read; a link stays a link. The cap is at least eight times the largest file the two compiled lists
+/// name (measured here from the embedded copies).
+#[test]
+fn candidate_read_is_capped() {
+    use crate::repair::ledger::MAX_CANDIDATE_BYTES;
+    let root = test_root("gr5-cap");
+    let huge = root.join("huge.sh");
+    let f = std::fs::File::create(&huge).unwrap();
+    f.set_len(64 * 1024 * 1024 * 1024).unwrap();
+    drop(f);
+    match TargetState::read_capped(&huge, MAX_CANDIDATE_BYTES) {
+        Err(RepairError::Precondition(m)) => assert!(m.contains("over the size limit"), "{m}"),
+        other => panic!("a 64 GiB candidate was not refused: {other:?}"),
+    }
+    let small = root.join("small.sh");
+    std::fs::write(&small, b"#!/bin/sh\nexit 0\n").unwrap();
+    assert_eq!(
+        TargetState::read_capped(&small, MAX_CANDIDATE_BYTES).unwrap(),
+        TargetState::read(&small).unwrap()
+    );
+    // exactly at the cap: read; one byte over: refused
+    let edge = root.join("edge");
+    std::fs::write(&edge, vec![b'x'; 16]).unwrap();
+    assert!(TargetState::read_capped(&edge, 16).is_ok());
+    assert!(TargetState::read_capped(&edge, 15).is_err());
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&huge, root.join("l")).unwrap();
+        assert!(matches!(
+            TargetState::read_capped(&root.join("l"), MAX_CANDIDATE_BYTES),
+            Ok(TargetState::Link { .. })
+        ));
+    }
+    let largest = crate::repair::boot_critical::entries()
+        .iter()
+        .chain(crate::repair::boot_critical::protection_entries().iter())
+        .filter_map(|e| replay::released_text(e.rel).map(|t| (t.len() as u64, e.rel)))
+        .max()
+        .unwrap();
+    assert!(largest.0 > 100_000, "{largest:?}");
+    assert!(
+        MAX_CANDIDATE_BYTES >= 8 * largest.0,
+        "cap {MAX_CANDIDATE_BYTES} < 8 × {largest:?}"
+    );
+    eprintln!("T5b MEASURED: largest listed file {largest:?}; candidate cap {MAX_CANDIDATE_BYTES}");
+    cleanup(&root);
+}
+
+/// RULINGS GA5 — the stub's call log has three answers: absent (no call), the calls, and "could not
+/// be read" for a folder, a FIFO, a link and a file over the cap — never an empty list.
+#[test]
+fn stub_call_log_has_three_answers() {
+    let root = test_root("ga5-log");
+    let log = root.join("cys-calls.log");
+    assert_eq!(replay::stub_calls(&root), replay::StubCalls::Absent);
+    std::fs::write(&log, "cys a\ncys b\n").unwrap();
+    assert_eq!(
+        replay::stub_calls(&root),
+        replay::StubCalls::Read(vec!["cys a".into(), "cys b".into()])
+    );
+    std::fs::remove_file(&log).unwrap();
+    std::fs::create_dir(&log).unwrap();
+    let mut unread = vec![("a folder", replay::stub_calls(&root))];
+    std::fs::remove_dir(&log).unwrap();
+    #[cfg(unix)]
+    {
+        let c = std::ffi::CString::new(log.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        unread.push(("a FIFO", replay::stub_calls(&root)));
+        std::fs::remove_file(&log).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), &log).unwrap();
+        unread.push(("a link", replay::stub_calls(&root)));
+        std::fs::remove_file(&log).unwrap();
+    }
+    let f = std::fs::File::create(&log).unwrap();
+    f.set_len(replay::MAX_READ + 1).unwrap();
+    drop(f);
+    unread.push(("over the cap", replay::stub_calls(&root)));
+    for (name, got) in &unread {
+        assert!(matches!(got, replay::StubCalls::Unreadable(_)), "{name}: {got:?}");
+    }
+    cleanup(&root);
+}
+
+/// RULINGS GA5 — a candidate `_lib.sh` that turns the stub's call log into a folder before the hook
+/// asks the stub: the hook's answer is unchanged, the log cannot be read — the probe FAILS (an
+/// ERROR answer, refused), never "stub calls 0" beside the old answer.
+#[test]
+fn unreadable_stub_log_fails_the_probe() {
+    let root = test_root("ga5-probe");
+    let lane = lane_of(&root, &[]);
+    let lib = released("hooks/_lib.sh")
+        + "\n{ __c=$(command -v cys 2>/dev/null) && [ -n \"$__c\" ] && rm -f \"${__c%/*}/cys-calls.log\" && mkdir \"${__c%/*}/cys-calls.log\"; } 2>/dev/null || :\n";
+    let cand = candidate_of(&root, &[("hooks/_lib.sh", Some(lib))]);
+    let c = cfg(&root, Some(vec!["R-1"]), Some(vec!["E-1"]), false);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let r1 = rep
+        .probes
+        .iter()
+        .find(|p| p.class.starts_with("R-1") && p.cell == "E-1")
+        .unwrap_or_else(|| panic!("{:#?}", rep.probes));
+    assert_eq!(r1.released, Answer::Deny, "{r1:#?}");
+    assert_eq!(r1.clean, Some(Answer::Error), "{r1:#?}");
+    assert_eq!(r1.decision, ProbeDecision::Refused, "{r1:#?}");
+    cleanup(&root);
+}
+
+/// RULINGS EL3: a candidate registrar that leaves a writer-less FIFO where `settings.json` was cannot
+/// hang the screen — the read refuses at once and the I3 rows are not measurable (→ refused).
+#[test]
+fn registrar_leaving_a_fifo_cannot_hang_the_screen() {
+    let root = test_root("el3-fifo");
+    let lane = lane_of(&root, &[]);
+    let pf = released("bin/javis_preflight.py");
+    let at = "        cmd = _cys_hook_cmd(script_name)\n        refused = []\n";
+    assert_eq!(pf.matches(at).count(), 1);
+    let fifo = "        try:\n            os.remove(settings_path)\n        except OSError:\n            pass\n        os.mkfifo(settings_path)\n        return None\n";
+    let cand = candidate_of(
+        &root,
+        &[("bin/javis_preflight.py", Some(pf.replacen(at, &format!("{fifo}{at}"), 1)))],
+    );
+    let c = cfg(&root, Some(vec![]), Some(vec![]), true);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    assert_eq!(rep.verdict, ScreenVerdict::Refused, "{:?}", rep.refusals);
+    cleanup(&root);
+}
+
+// ───────────────────────────── parity, census (i) and (iii) ─────────────────────────────
+
+/// RULINGS AU1 / BM5: the screen's inputs ARE the generated per-test inputs — exactly G, R, C, I3,
+/// each file list EQUAL to `boot_critical::protection_inputs()`; every variant lays out exactly the
+/// union of those files.
+#[test]
+fn parity_inputs_equal_generated_inputs() {
+    let gen = crate::repair::boot_critical::protection_inputs();
+    let ids: Vec<&str> = gen.iter().map(|(t, _)| *t).collect();
+    assert_eq!(
+        ids,
+        vec!["C", "G", "I3", "R"],
+        "generated tests are not exactly G, R, C, I3"
+    );
+    let mine = inputs_by_test().unwrap();
+    for (t, files) in gen {
+        let want: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+        assert_eq!(
+            mine.get(t),
+            Some(&want),
+            "test {t}: the screen's inputs differ from the generated ones"
+        );
+    }
+    let root = test_root("parity");
+    let lane = lane_of(&root, &[]);
+    let c = cfg(&root, Some(vec![]), Some(vec![]), false);
+    let rels = all_input_rels().unwrap();
+    let v = build_variants(&c, &candidate_of(&root, &[]), &lane, &rels).unwrap();
+    for f in [&v.released, &v.lane, &v.candidate, &v.clean, &v.attribution] {
+        assert_eq!(
+            f.keys().cloned().collect::<Vec<_>>(),
+            rels,
+            "a variant lays out other files"
+        );
+    }
+    // the device subsets are exactly the generated lists
+    assert_eq!(
+        subset(&v.released, &mine["G"])
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        mine["G"]
+    );
+    cleanup(&root);
+}
+
+/// C4 AY2 census (i): every tabled class has a probe in every tabled cell its device reads — the
+/// guard 16 cells (E-21 for the I4 classes), the gate 14.
+#[test]
+fn census_i_every_class_has_a_probe_in_every_cell() {
+    assert_eq!(CELLS.len(), 21);
+    let ids: Vec<&str> = CELLS.iter().map(|c| c.id).collect();
+    for n in 1..=21 {
+        assert!(
+            ids.contains(&format!("E-{n}").as_str()),
+            "cell E-{n} missing"
+        );
+    }
+    assert_eq!(corpus::cells_of(Device::Guard).count(), 16);
+    assert_eq!(corpus::cells_of(Device::Gate).count(), 14);
+    let g: Vec<&str> = corpus::CORPUS_G.iter().map(|c| c.id).collect();
+    let mut want_g: Vec<String> = (1..=21).map(|n| format!("G-{n}")).collect();
+    want_g.push("G-24".into());
+    assert_eq!(g, want_g.iter().map(String::as_str).collect::<Vec<_>>());
+    let r: Vec<&str> = corpus::CORPUS_R.iter().map(|c| c.id).collect();
+    assert_eq!(
+        r,
+        (1..=16)
+            .map(|n| format!("R-{n}"))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+    let cc: Vec<&str> = corpus::CORPUS_C.iter().map(|c| c.id).collect();
+    assert_eq!(
+        cc,
+        (1..=25)
+            .map(|n| format!("C-{n}"))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+    let bs: Vec<&str> = corpus::BACKSTOP_CLASSES.iter().map(|b| b.0).collect();
+    assert_eq!(bs, vec!["G-22", "G-23", "G-24np"]);
+    for c in corpus::all_classes() {
+        assert!(!c.probes.is_empty(), "{} has no probe", c.id);
+        // every probe of a class runs in every cell its device reads: the matrix is the product
+        let cells = corpus::cells_of(c.device)
+            .filter(|x| x.setup != corpus::Setup::Backstop)
+            .count();
+        assert!(cells >= 14, "{} would be probed in {cells} cells", c.id);
+    }
+}
+
+/// C4 AY2 census (iii) — THE test the pack-release gate (unit T2d) runs (RULINGS CM4): a change of a
+/// released device's deny rules or environment branches without a table review fails here.
+#[test]
+fn census_iii_deny_rules_and_branches_pinned() {
+    let mut actual = Vec::new();
+    let mut differs = Vec::new();
+    for (rel, kind, start, end, n, digest) in CENSUS_PINS {
+        // RULINGS GA7: every row pins a WHOLE file — no free region (old: `kind` was "pin" or "free")
+        assert_eq!((*kind, *start, *end), ("pin", "", ""), "{rel}: a row pins the whole file");
+        let (an, ad) = corpus::census_pinned(&released(rel));
+        actual.push(format!("({rel:?}, {an}, {ad:?})"));
+        assert!(an > 100, "{rel}: only {an} pinned lines");
+        if (an, ad.as_str()) != (*n, *digest) {
+            differs.push(format!("{rel} ({n} → {an} lines)"));
+        }
+    }
+    assert!(
+        differs.is_empty(),
+        "census (iii): a pinned protection file changed in {}. Review CORPUS_G / CORPUS_R / CORPUS_C \
+         and the cell table against the device, then update CENSUS_PINS. Current values: {}",
+        differs.join(", "),
+        actual.join(", ")
+    );
+    // every pinned device has exactly one pin row
+    for rel in ["hooks/guard.sh", "hooks/role-capability-gate.sh", "hooks/_lib.sh"] {
+        assert_eq!(CENSUS_PINS.iter().filter(|p| p.0 == rel).count(), 1, "{rel} pinned once");
+    }
+    // RULINGS EL6 / EO3 / CZ7 / GA7 — mutation controls: every edit changes the digest
+    let digest = |_rel: &str, text: &str| corpus::census_pinned(text);
+    let cases: [(&str, &str, &str, bool); 12] = [
+        // the gate's dispatch: main() replaced by pass — outside every named region before EL6
+        ("hooks/role-capability-gate.sh", "    main()\nPYEOF", "    pass\nPYEOF", true),
+        // the CAPGATE_SELF_TEST branch
+        (
+            "hooks/role-capability-gate.sh",
+            "if os.environ.get(\"CAPGATE_SELF_TEST\"):",
+            "if os.environ.get(\"CAPGATE_SELF_TESTS\"):",
+            true,
+        ),
+        // the prelude sourcing of both devices (EO3: the fallback and the `exit 0` when missing)
+        (
+            "hooks/guard.sh",
+            "|| . \"${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh\" 2>/dev/null",
+            "|| . \"${CYS_PACK_DIR:-$HOME/.cys/elsewhere}/hooks/_lib.sh\" 2>/dev/null",
+            true,
+        ),
+        (
+            "hooks/guard.sh",
+            "|| { echo \"[cys-hook] _lib.sh 소실 — 훅 강등(guard)\" >&2; exit 0; }",
+            "|| { echo \"[cys-hook] _lib.sh 소실 — 훅 강등(guard)\" >&2; exit 2; }",
+            true,
+        ),
+        (
+            "hooks/role-capability-gate.sh",
+            "|| { echo \"[cys-hook] _lib.sh 소실 — 훅 강등(role-capability-gate)\" >&2; exit 0; }",
+            "|| { echo \"[cys-hook] _lib.sh 소실 — 훅 강등(role-capability-gate)\" >&2; exit 1; }",
+            true,
+        ),
+        // the rules (CZ7's controls stay)
+        (
+            "hooks/guard.sh",
+            "x in args for x in (\"create\", \"merge\")",
+            "x in args for x in (\"create\",)",
+            true,
+        ),
+        (
+            "hooks/role-capability-gate.sh",
+            "{\"commit\", \"push\", \"add\",",
+            "{\"commit\", \"add\",",
+            true,
+        ),
+        (
+            "hooks/_lib.sh",
+            "_cys_sh_d=\"${CYS_DEVTOOLS_SHIM_DIR:-/usr/bin}\"",
+            "_cys_sh_d=\"${CYS_DEVTOOLS_SHIM_DIR:-/usr/local/bin}\"",
+            true,
+        ),
+        // default = pinned: a header comment is pinned too
+        (
+            "hooks/guard.sh",
+            "# guard.sh — Autopilot 집행 hook",
+            "# guard.sh — Autopilot 집행 훅",
+            true,
+        ),
+        (
+            "hooks/_lib.sh",
+            "# _lib.sh — cysjavis 훅 공용 프리루드",
+            "# _lib.sh — cysjavis 훅 공용 머리말",
+            true,
+        ),
+        // RULINGS GA7: the gate's self-test body is pinned too (old expectation: `false` — EL6's
+        // only free region)
+        (
+            "hooks/role-capability-gate.sh",
+            "# ── ① reviewer/planner(종전 핀 · 무변경)",
+            "# ── ① reviewer/planner(종전 핀)",
+            true,
+        ),
+        // RULINGS GA7: a top-level statement at column 0 between the self-tests and the dispatch —
+        // the reviewer's mutation, which EL6's free region accepted
+        (
+            "hooks/role-capability-gate.sh",
+            "\nif os.environ.get(\"CAPGATE_SELF_TEST\"):",
+            "\nmain = lambda: None\nif os.environ.get(\"CAPGATE_SELF_TEST\"):",
+            true,
+        ),
+    ];
+    for (rel, from, to, changes) in cases {
+        let t = released(rel);
+        assert_eq!(t.matches(from).count(), 1, "{rel}: mutation anchor {from:?}");
+        let m = t.replacen(from, to, 1);
+        assert_eq!(digest(rel, &t) != digest(rel, &m), changes, "{rel}: {from:?} → {to:?}");
+    }
+    // (GA7: no anchors remain — old assertion: a doubled free-region anchor made `census_pinned` an
+    // error; the doubled line now simply changes the digest)
+    let g = released("hooks/role-capability-gate.sh");
+    let doubled = g.replacen("def self_test():", "def self_test():\ndef self_test():", 1);
+    assert_ne!(corpus::census_pinned(&doubled), corpus::census_pinned(&g));
+}
+
+/// RULINGS DF5: an I4 anchor that occurs twice gives no region (never the first copy's).
+#[test]
+fn i4_anchors_must_occur_exactly_once() {
+    let g = released("hooks/guard.sh");
+    for (name, first, last) in corpus::I4_REGIONS {
+        assert!(corpus::i4_region(&g, first, last).is_some(), "{name}");
+        let doubled = g.replacen(first, &format!("{first}\n{first}"), 1);
+        assert!(corpus::i4_region(&doubled, first, last).is_none(), "{name}: doubled start");
+        if *last != "}" {
+            let doubled = g.replacen(last, &format!("{last}\n{last}"), 1);
+            assert!(corpus::i4_region(&doubled, first, last).is_none(), "{name}: doubled end");
+        }
+    }
+}
+
+/// I4's anchors are found in the released guard.sh, and each region is non-trivial.
+#[test]
+fn i4_anchors_found_in_released_guard() {
+    let g = released("hooks/guard.sh");
+    for (name, first, last) in corpus::I4_REGIONS {
+        let r = corpus::i4_region(&g, first, last)
+            .unwrap_or_else(|| panic!("I4 region {name}: anchor not found"));
+        assert!(
+            r.lines().count() >= 10,
+            "I4 region {name} is only {} lines",
+            r.lines().count()
+        );
+    }
+    let b = corpus::i4_region(&g, "run_loose_backstop() {", "}").unwrap();
+    assert!(b.contains("백스톱: 비가역 명령") && b.contains("백스톱: 파괴적 파일연산"));
+    assert!(b.contains(corpus::BACKSTOP_MARKER));
+}
+
+// ───────────────────────────── census (ii) — every class binds on the released copies ─────────────────────────────
+
+/// C4 AY2 census (ii): on the RELEASED copies every class BINDS (RELEASED denies) in at least one
+/// cell; no RELEASED probe errors (an error there would decline every apply — AY5); the stub was
+/// reached in E-1 (its call log); invariant I3 on RELEASED ends registered in every layout, scenario
+/// and run (both runs judged — BH5). The screen's duration is measured here.
+#[test]
+fn census_ii_every_class_binds_on_released() {
+    let root = test_root("census2");
+    let lane = lane_of(&root, &[]);
+    let c = cfg(&root, None, None, true);
+    let t0 = std::time::Instant::now();
+    let rep = screen_with(&c, &candidate_of(&root, &[]), &lane, LONG).unwrap();
+    let took = t0.elapsed();
+    eprintln!(
+        "T5b MEASURED: full screen on the released copies (no candidate change): {} probes, {:.1} s wall, {} threads",
+        rep.probes.len(),
+        took.as_secs_f64(),
+        c.threads
+    );
+    // the same screen again in this process: every answer comes from the per-process cache (the same
+    // input bytes) — what a later screen in a running daemon costs for devices a candidate does not
+    // touch; the verdict and every decision are identical
+    let t1 = std::time::Instant::now();
+    let again = screen_with(&c, &candidate_of(&root, &[]), &lane, LONG).unwrap();
+    eprintln!(
+        "T5b MEASURED: the same screen again (answers cached in this process): {:.1} s wall",
+        t1.elapsed().as_secs_f64()
+    );
+    // the measurement is also kept in a file (a passing test's standard error is not shown by the
+    // runner) — RULINGS DE6: only inside the cargo target folder the run names (a build scratch
+    // folder), never in HOME; without one nothing is written
+    if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from) {
+        let _ = std::fs::write(
+            dir.join("t5b-screen-measured.txt"),
+        format!(
+            "full screen, released copies, no candidate change: {} probes, {:.1} s wall, {} threads, after-run repeat: {}\nsame screen again (answers cached in this process): {:.1} s wall\n",
+            rep.probes.len(),
+            took.as_secs_f64(),
+            c.threads,
+            !rep.after_run.first.is_empty(),
+            t1.elapsed().as_secs_f64()
+        ),
+        );
+    }
+    assert_eq!(again.verdict, rep.verdict);
+    assert_eq!(
+        again
+            .probes
+            .iter()
+            .map(|p| (&p.class, &p.cell, p.released, p.decision))
+            .collect::<Vec<_>>(),
+        rep.probes
+            .iter()
+            .map(|p| (&p.class, &p.cell, p.released, p.decision))
+            .collect::<Vec<_>>()
+    );
+    let errors: Vec<String> = rep
+        .probes
+        .iter()
+        .filter(|p| p.released == Answer::Error && p.test != "I4")
+        .map(|p| format!("{} {} {} — {}", p.test, p.class, p.cell, p.detail))
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "RELEASED errored ({}): {:#?}",
+        errors.len(),
+        &errors[..errors.len().min(20)]
+    );
+    for class in corpus::all_classes() {
+        let binds = decisions(&rep, class.id)
+            .iter()
+            .any(|p| p.released == Answer::Deny);
+        assert!(
+            binds,
+            "census (ii): {} binds in no cell on the released copies",
+            class.id
+        );
+    }
+    // the stub was reached: guard LOOSE asks `approval check`, the gate asks `surface-role`
+    let g1 = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "G-1" && p.cell == "E-1")
+        .unwrap();
+    assert!(
+        g1.detail.contains("cys --socket") && g1.detail.contains("approval check"),
+        "G-1 E-1: {}",
+        g1.detail
+    );
+    let r1 = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "R-1" && p.cell == "E-1")
+        .unwrap();
+    assert!(r1.detail.contains("surface-role"), "R-1 E-1: {}", r1.detail);
+    // I3 on the released copies: registered in every layout, scenario and both runs
+    let i3: Vec<&ProbeResult> = rep
+        .probes
+        .iter()
+        .filter(|p| p.test == "I3" && p.class.starts_with("I3:"))
+        .collect();
+    assert!(
+        i3.len() >= 12,
+        "I3 judged only {} (layout, scenario, run, target)s",
+        i3.len()
+    );
+    // the profiles the RELEASED hook-target table denies (`eligibility.capgate: deny`) end unregistered
+    // there and bind nothing; `.claude`, the account folder (L1) and the department account (L2) end
+    // registered in every scenario and BOTH runs (BH5)
+    for l in ["L1", "L2"] {
+        for s in ["S1", "S2", "S3"] {
+            for k in ["run1", "run2"] {
+                let cell = format!("{l}/{s}/{k}");
+                let here: Vec<&&ProbeResult> = i3.iter().filter(|p| p.cell == cell).collect();
+                assert!(!here.is_empty(), "I3 {cell} not judged");
+                let want: &[&str] = if l == "L1" {
+                    &["I3:.claude", "I3:claude"]
+                } else {
+                    &["I3:acct-dept-x"]
+                };
+                for w in want {
+                    let p = here
+                        .iter()
+                        .find(|p| p.class == *w)
+                        .unwrap_or_else(|| panic!("I3 {cell}: {w} not judged"));
+                    assert_eq!(
+                        p.released,
+                        Answer::Deny,
+                        "I3 {w} {cell}: released does not end registered — {}",
+                        p.detail
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(
+        rep.verdict,
+        ScreenVerdict::Accepted,
+        "notes: {:?} refusals: {:?}",
+        rep.notes,
+        rep.refusals
+    );
+    // the screen writes nothing of the lane: no compared item's STATE, inode or modification time
+    // moved. (A change-time-only move is no write by the screen: the harness's private HOME lies in a
+    // Desktop folder whose file provider re-stamps files' change time tens of seconds after they were
+    // laid out — measured in T5b-cz-c4: ctime +56 s, same inode, same mtime, same bytes. The product
+    // keeps ctime in its stamp — RULINGS DE2; the live pack is not such a folder.)
+    let without_ctime = |s: &str| {
+        s.split_whitespace()
+            .filter(|w| !w.starts_with("ctime="))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let written: Vec<&LiveDifference> = rep
+        .after_run
+        .first
+        .iter()
+        .filter(|d| without_ctime(&d.before) != without_ctime(&d.after))
+        .collect();
+    assert!(written.is_empty(), "the screen changed the lane: {written:?}");
+    assert!(rep.after_run.leftover_processes.is_empty());
+    cleanup(&root);
+}
+
+// ───────────────────────────── the differential rule (AY1, BD1, BC5, BG1) ─────────────────────────────
+
+fn guard_without_push_deny() -> String {
+    let g = released("hooks/guard.sh");
+    let line =
+        "            if sub == \"push\": return \"git push (외부발행=비가역). 오너 승인 필요\"";
+    assert!(
+        g.contains(line),
+        "guard.sh no longer holds the git push LOOSE deny line"
+    );
+    g.replace(line, "            if sub == \"push\": return None")
+}
+
+/// A candidate that lets `git push` through in normal mode is REFUSED (G-1), naming the protection.
+#[test]
+fn refuses_candidate_that_opens_git_push() {
+    let root = test_root("g1");
+    let lane = lane_of(&root, &[]);
+    let c = cfg(
+        &root,
+        Some(vec!["G-1", "G-17"]),
+        Some(vec!["E-4", "E-5"]),
+        false,
+    );
+    let cand = candidate_of(
+        &root,
+        &[("hooks/guard.sh", Some(guard_without_push_deny()))],
+    );
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    assert_eq!(rep.verdict, ScreenVerdict::Refused, "{:#?}", rep.probes);
+    let g1 = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "G-1" && p.cell == "E-4")
+        .unwrap();
+    assert_eq!(g1.decision, ProbeDecision::Refused);
+    assert_eq!(g1.clean, Some(Answer::Allow));
+    assert!(
+        rep.refusals
+            .iter()
+            .any(|r| r.contains("외부 발송·영구 삭제 전 주인 승인")),
+        "{:?}",
+        rep.refusals
+    );
+    // STRICT still denies git push (G-17 held)
+    let g17 = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "G-17" && p.cell == "E-5")
+        .unwrap();
+    assert_eq!(g17.decision, ProbeDecision::Held);
+    assert!(rep.declines_apply());
+    cleanup(&root);
+}
+
+/// A candidate DELETING hooks/guard.sh is screened as deleted and refused (RULINGS CM1).
+#[test]
+fn refuses_candidate_deleting_guard() {
+    let root = test_root("gdel");
+    let lane = lane_of(&root, &[]);
+    let c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-4"]), false);
+    let cand = candidate_of(&root, &[("hooks/guard.sh", None)]);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    assert_eq!(rep.verdict, ScreenVerdict::Refused, "{:#?}", rep.probes);
+    let i4: Vec<&ProbeResult> = rep.probes.iter().filter(|p| p.test == "I4").collect();
+    assert!(
+        i4.iter().all(|p| p.decision == ProbeDecision::Refused),
+        "I4 must refuse a deleted guard.sh: {i4:#?}"
+    );
+    cleanup(&root);
+}
+
+/// A candidate capability gate that no longer treats Write as a mutation is REFUSED for the
+/// reviewer (R-1) and the CSO (C-4).
+#[test]
+fn refuses_gate_opened_for_reviewer_and_cso() {
+    let root = test_root("gate");
+    let lane = lane_of(&root, &[]);
+    let gate = released("hooks/role-capability-gate.sh");
+    let line = "MUTATION_TOOLS = {\"Edit\", \"Write\", \"NotebookEdit\", \"MultiEdit\"}";
+    assert!(gate.contains(line));
+    let cand = candidate_of(
+        &root,
+        &[(
+            "hooks/role-capability-gate.sh",
+            Some(gate.replace(line, "MUTATION_TOOLS = set()")),
+        )],
+    );
+    let c = cfg(
+        &root,
+        Some(vec!["R-1", "C-4", "R-8"]),
+        Some(vec!["E-1"]),
+        false,
+    );
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    assert_eq!(rep.verdict, ScreenVerdict::Refused, "{:#?}", rep.probes);
+    let r1 = rep.probes.iter().find(|p| p.class == "R-1").unwrap();
+    assert_eq!(r1.decision, ProbeDecision::Refused, "{r1:#?}");
+    assert!(
+        rep.refusals
+            .iter()
+            .any(|r| r.contains("리뷰어는 검토 대상을 못 고침")),
+        "{:?}",
+        rep.refusals
+    );
+    // a probe the change does not touch stays held (git commit by a reviewer)
+    let r8 = rep.probes.iter().find(|p| p.class == "R-8").unwrap();
+    assert_eq!(r8.decision, ProbeDecision::Held, "{r8:#?}");
+    cleanup(&root);
+}
+
+/// BD1: a lane whose guard.sh already lets git push through cannot hide a candidate that keeps it
+/// open — CLEAN (RELEASED + the candidate's files) does not deny → REFUSED.
+#[test]
+fn clean_refuses_even_when_lane_already_off() {
+    let root = test_root("bd1");
+    let open = guard_without_push_deny();
+    let lane = lane_of(&root, &[("hooks/guard.sh", Some(open.clone()))]);
+    let c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-4"]), false);
+    let cand = candidate_of(&root, &[("hooks/guard.sh", Some(open))]);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let g1 = rep.probes.iter().find(|p| p.class == "G-1").unwrap();
+    assert_eq!(
+        (g1.lane, g1.candidate, g1.clean),
+        (
+            Some(Answer::Allow),
+            Some(Answer::Allow),
+            Some(Answer::Allow)
+        )
+    );
+    assert_eq!(g1.decision, ProbeDecision::Refused);
+    assert_eq!(rep.verdict, ScreenVerdict::Refused);
+    cleanup(&root);
+}
+
+/// BC5: a lane whose guard.sh lets git push through, and a candidate that touches no guard input →
+/// the attribution run (LANE with the touched files at their released copies) still does not deny →
+/// a LANE FINDING (note + intake line), not a refusal of the unrelated candidate.
+#[test]
+fn attribution_gives_lane_finding_not_refusal() {
+    let root = test_root("bc5");
+    let lane = lane_of(
+        &root,
+        &[("hooks/guard.sh", Some(guard_without_push_deny()))],
+    );
+    let c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-4"]), false);
+    let cand = candidate_of(
+        &root,
+        &[("bin/javis_lock.py", Some(released("bin/javis_lock.py")))],
+    );
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let g1 = rep.probes.iter().find(|p| p.class == "G-1").unwrap();
+    assert_eq!(g1.decision, ProbeDecision::LaneFinding, "{g1:#?}");
+    assert_eq!(rep.verdict, ScreenVerdict::AcceptedWithNotes);
+    assert!(
+        rep.notes.iter().any(|n| n.starts_with("보호장치 시험 1건")),
+        "{:?}",
+        rep.notes
+    );
+    assert_eq!(rep.lane_findings.len(), 1);
+    assert!(!rep.declines_apply());
+    cleanup(&root);
+}
+
+/// BG1: restoring guard.sh to its RELEASED bytes in a lane whose _lib.sh is broken is never a ground
+/// for refusal (it becomes a lane finding); the same restore with one byte changed IS refused.
+#[test]
+fn released_restore_never_refused() {
+    let root = test_root("bg1");
+    let g = released("hooks/guard.sh");
+    let src_line = ". \"$(dirname \"$0\")/_lib.sh\" 2>/dev/null \\";
+    assert!(g.contains(src_line));
+    // the lane: a guard that does not source _lib.sh (still denies — through its backstop) and a
+    // broken _lib.sh that ends any hook sourcing it
+    let lane_guard = g.replace(src_line, "true \\").replace(
+        "  || . \"${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh\" 2>/dev/null \\",
+        "  || true \\",
+    );
+    let lane = lane_of(
+        &root,
+        &[
+            ("hooks/guard.sh", Some(lane_guard)),
+            ("hooks/_lib.sh", Some("exit 0\n".into())),
+        ],
+    );
+    let c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-4"]), false);
+    let rep = screen_with(
+        &c,
+        &candidate_of(&root, &[("hooks/guard.sh", Some(g.clone()))]),
+        &lane,
+        LONG,
+    )
+    .unwrap();
+    let g1 = rep.probes.iter().find(|p| p.class == "G-1").unwrap();
+    assert_eq!(
+        (g1.lane, g1.candidate),
+        (Some(Answer::Deny), Some(Answer::Allow)),
+        "{g1:#?}"
+    );
+    assert_eq!(g1.decision, ProbeDecision::LaneFinding, "BG1: {g1:#?}");
+    assert_ne!(rep.verdict, ScreenVerdict::Refused);
+    // control: the same restore with one extra comment byte is a candidate of its own → refused
+    let root2 = test_root("bg1b");
+    let lane2 = lane_of(&root2, &[]);
+    let _ = lane2;
+    let lane_guard2 = released("hooks/guard.sh")
+        .replace(src_line, "true \\")
+        .replace(
+            "  || . \"${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh\" 2>/dev/null \\",
+            "  || true \\",
+        );
+    let lane2 = lane_of(
+        &root2,
+        &[
+            ("hooks/guard.sh", Some(lane_guard2)),
+            ("hooks/_lib.sh", Some("exit 0\n".into())),
+        ],
+    );
+    let rep2 = screen_with(
+        &c,
+        &candidate_of(&root2, &[("hooks/guard.sh", Some(format!("{g}#\n")))]),
+        &lane2,
+        LONG,
+    )
+    .unwrap();
+    let g1b = rep2.probes.iter().find(|p| p.class == "G-1").unwrap();
+    assert_eq!(g1b.decision, ProbeDecision::Refused, "{g1b:#?}");
+    cleanup(&root);
+    cleanup(&root2);
+}
+
+/// AY1 (5): RELEASED errors → NOT MEASURABLE: refused for a candidate touching an input of that
+/// device, a note (and an apply decline) otherwise.
+#[test]
+fn not_measurable_refuses_only_touching_candidates() {
+    let root = test_root("nm");
+    let lane = lane_of(&root, &[]);
+    let mut c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-4"]), false);
+    // a released source whose guard.sh crashes (exit 3) — injected for this test only
+    c.released = Arc::new(|rel: &str| {
+        if rel == "hooks/guard.sh" {
+            Some(LaidSource::Bytes {
+                bytes: b"#!/bin/sh\nexit 3\n".to_vec(),
+                mode: 0o755,
+            })
+        } else {
+            super::super::rehearsal::released_copy(rel)
+        }
+    });
+    let touching = candidate_of(
+        &root,
+        &[(
+            "hooks/_lib.sh",
+            Some(format!("{}\n# x\n", released("hooks/_lib.sh"))),
+        )],
+    );
+    let rep = screen_with(&c, &touching, &lane, LONG).unwrap();
+    let g1 = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "G-1" && p.cell == "E-4")
+        .unwrap();
+    assert_eq!(g1.released, Answer::Error);
+    assert_eq!(g1.decision, ProbeDecision::Refused);
+    let other = candidate_of(
+        &root,
+        &[(
+            "bin/javis_lock.py",
+            Some(format!("{}\n# x\n", released("bin/javis_lock.py"))),
+        )],
+    );
+    let rep2 = screen_with(&c, &other, &lane, LONG).unwrap();
+    let g1 = rep2
+        .probes
+        .iter()
+        .find(|p| p.class == "G-1" && p.cell == "E-4")
+        .unwrap();
+    assert_eq!(g1.decision, ProbeDecision::NotMeasurable);
+    assert_eq!(rep2.verdict, ScreenVerdict::AcceptedWithNotes);
+    assert!(
+        rep2.declines_apply(),
+        "AY5: at apply a not-measurable probe declines"
+    );
+    cleanup(&root);
+}
+
+// ───────────────────────────── I3, I4, E-21, AT4 ─────────────────────────────
+
+/// I3 (BC1): a candidate registrar whose condition is always "off" ends the gate unregistered where
+/// the released one keeps it registered → REFUSED.
+#[test]
+fn i3_refuses_registrar_that_unregisters() {
+    let root = test_root("i3");
+    let lane = lane_of(&root, &[]);
+    let pf = released("bin/javis_preflight.py");
+    let line = "        state = capgate_registration_state(a, b)";
+    assert!(pf.contains(line));
+    let cand = candidate_of(
+        &root,
+        &[(
+            "bin/javis_preflight.py",
+            Some(pf.replace(line, "        state = CAPGATE_OFF")),
+        )],
+    );
+    let c = cfg(&root, Some(vec![]), Some(vec![]), true);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    assert_eq!(
+        rep.verdict,
+        ScreenVerdict::Refused,
+        "{:#?}",
+        rep.probes
+            .iter()
+            .filter(|p| p.test == "I3")
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        rep.refusals.iter().any(|r| r.contains("관문의 등록")),
+        "{:?}",
+        rep.refusals
+    );
+    let s1 = rep
+        .probes
+        .iter()
+        .find(|p| p.test == "I3" && p.cell == "L1/S1/run1" && p.class == "I3:.claude")
+        .unwrap();
+    assert_eq!(
+        (s1.released, s1.clean),
+        (Answer::Deny, Some(Answer::Allow)),
+        "{s1:#?}"
+    );
+    cleanup(&root);
+}
+
+/// RULINGS CZ1: "registered" = the hook EXECUTES the gate. Each form is read under the closed grammar;
+/// the old substring check (`command.contains(<gate path>)`) called every `false` row below registered.
+#[test]
+fn gate_registration_reads_the_effective_invocation() {
+    let root = test_root("cz1-unit");
+    let pack = root.join("pack");
+    let gate = pack.join("hooks").join(CAPGATE_SCRIPT);
+    std::fs::create_dir_all(gate.parent().unwrap()).unwrap();
+    std::fs::write(&gate, "#!/bin/sh\nexit 0\n").unwrap();
+    replay::set_mode(&gate, 0o644);
+    let g = gate.to_string_lossy().into_owned();
+    let hook = |cmd: &str| serde_json::json!({"type": "command", "command": cmd, "timeout": 15});
+    let rows: Vec<(&str, serde_json::Value, bool)> = vec![
+        ("the registrar's form", hook(&format!("sh {g}")), true),
+        ("double-quoted path", hook(&format!("sh \"{g}\"")), true),
+        ("single-quoted path", hook(&format!("sh '{g}'")), true),
+        ("absolute interpreter", hook(&format!("/bin/sh {g}")), true),
+        ("bash", hook(&format!("bash {g}")), true),
+        ("no timeout (the tool's default)", serde_json::json!({"type": "command", "command": format!("sh {g}")}), true),
+        ("comment", hook(&format!("true # sh {g}")), false),
+        ("no-op wrapper", hook(&format!("true sh {g}")), false),
+        ("colon wrapper", hook(&format!(": sh {g}")), false),
+        ("syntax-check-only flag", hook(&format!("sh -n {g}")), false),
+        ("conditional", hook(&format!("[ -n \"$CYS_NEVER\" ] && sh {g}")), false),
+        ("or-true", hook(&format!("sh {g} || true")), false),
+        ("sequence", hook(&format!("exit 0; sh {g}")), false),
+        ("an argument", hook(&format!("sh {g} --self-test")), false),
+        ("an assignment in front", hook(&format!("CAPGATE_SELF_TEST=1 sh {g}")), false),
+        ("env wrapper", hook(&format!("env sh {g}")), false),
+        ("redirection", hook(&format!("sh {g} 2>/dev/null")), false),
+        ("expansion in quotes", hook(&format!("sh \"$HOME{g}\"")), false),
+        ("another interpreter", hook(&format!("zsh {g}")), false),
+        ("quoted interpreter", hook(&format!("'sh' {g}")), false),
+        ("another path", hook(&format!("sh {}/hooks/../hooks/{CAPGATE_SCRIPT}", pack.display())), false),
+        ("direct, not executable", hook(&g), false),
+        ("incompatible type", serde_json::json!({"type": "prompt", "command": format!("sh {g}")}), false),
+        ("no type", serde_json::json!({"command": format!("sh {g}")}), false),
+        ("timeout below the floor", serde_json::json!({"type": "command", "command": format!("sh {g}"), "timeout": 1}), false),
+        ("timeout not a number", serde_json::json!({"type": "command", "command": format!("sh {g}"), "timeout": "15"}), false),
+        ("a key the registrar never writes", serde_json::json!({"type": "command", "command": format!("sh {g}"), "async": true}), false),
+    ];
+    let settings = root.join("settings.json");
+    let write = |doc: serde_json::Value| std::fs::write(&settings, doc.to_string()).unwrap();
+    let mut wrong = Vec::new();
+    for (name, h, want) in &rows {
+        write(serde_json::json!({"hooks": {"PreToolUse": [{"hooks": [h]}]}}));
+        if gate_registered(&settings, &pack) != Some(*want) {
+            wrong.push(*name);
+        }
+    }
+    // the direct form runs only an executable file
+    replay::set_mode(&gate, 0o755);
+    write(serde_json::json!({"hooks": {"PreToolUse": [{"hooks": [hook(&g)]}]}}));
+    if gate_registered(&settings, &pack) != Some(true) {
+        wrong.push("direct, executable");
+    }
+    // entry-level forms: a narrower matcher, an unknown entry key, every hook disabled, the gate gone
+    for (name, doc) in [
+        ("matcher Bash", serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [hook(&format!("sh {g}"))]}]}})),
+        ("unknown entry key", serde_json::json!({"hooks": {"PreToolUse": [{"if": "never", "hooks": [hook(&format!("sh {g}"))]}]}})),
+        ("disableAllHooks", serde_json::json!({"disableAllHooks": true, "hooks": {"PreToolUse": [{"hooks": [hook(&format!("sh {g}"))]}]}})),
+        ("another event", serde_json::json!({"hooks": {"PostToolUse": [{"hooks": [hook(&format!("sh {g}"))]}]}})),
+    ] {
+        write(doc);
+        if gate_registered(&settings, &pack) != Some(false) {
+            wrong.push(name);
+        }
+    }
+    std::fs::remove_file(&gate).unwrap();
+    write(serde_json::json!({"hooks": {"PreToolUse": [{"hooks": [hook(&format!("sh {g}"))]}]}}));
+    if gate_registered(&settings, &pack) != Some(false) {
+        wrong.push("gate file missing");
+    }
+    assert!(wrong.is_empty(), "misjudged forms: {wrong:?}");
+    cleanup(&root);
+}
+
+/// RULINGS CZ1 — a registrar-mutation regression per form: a candidate `javis_preflight.py` whose C28
+/// registration leaves an entry that names the gate but cannot run it is REFUSED on the real
+/// registrar's own run (L1, s3: starts unregistered), the released registrar registering it.
+fn i3_refuses_registrar_mutation(name: &str, from: &str, to: &str) {
+    let root = test_root(name);
+    let lane = lane_of(&root, &[]);
+    let pf = released("bin/javis_preflight.py");
+    assert_eq!(pf.matches(from).count(), 1, "{name}: mutation anchor");
+    let cand = candidate_of(
+        &root,
+        &[("bin/javis_preflight.py", Some(pf.replace(from, to)))],
+    );
+    let c = cfg(&root, Some(vec![]), Some(vec![]), true);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let i3: Vec<&ProbeResult> = rep.probes.iter().filter(|p| p.test == "I3").collect();
+    assert_eq!(rep.verdict, ScreenVerdict::Refused, "{name}: {i3:#?}");
+    let s3 = i3
+        .iter()
+        .find(|p| p.cell == "L1/S3/run1" && p.class == "I3:.claude")
+        .unwrap_or_else(|| panic!("{name}: no L1/S3 probe: {i3:#?}"));
+    // measured, not an error: the released registrar registers, the candidate's leaves it unrun
+    assert_eq!(
+        (s3.released, s3.clean, s3.decision),
+        (Answer::Deny, Some(Answer::Allow), ProbeDecision::Refused),
+        "{name}: {s3:#?}"
+    );
+    // RULINGS GA2: the refusal says that in release 1 the registrar's output changes only by a vendor
+    // update
+    assert!(
+        rep.refusals.iter().any(|r| r.contains("공급사 업데이트로만")),
+        "{name}: {:?}",
+        rep.refusals
+    );
+    cleanup(&root);
+}
+
+const REGISTRAR_FORM: &str = "    return \"sh \" + script";
+
+/// The line of the released registrar that builds the gate's new entry (s3: starts unregistered).
+const REGISTRAR_ENTRY: &str = "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd}]}";
+
+/// RULINGS GA2 — the WHOLE settings document decides, not a projection of the gate's entries: each
+/// control differs from the released registrar's document and is refused; the same document written
+/// under another run root, in another key order and layout, is the same. `projection` lists the
+/// controls the EL2 projection (the gate's entries + the closed grammar — the code before GA2) still
+/// read as registered: those passed I3 before this rule.
+#[test]
+fn i3_compares_the_whole_settings_document() {
+    let root = test_root("ga2-unit");
+    let run_a = root.join("run-a");
+    let run_b = root.join("run-b");
+    let gate_cmd = |run: &Path| format!("sh {}/x/pack/hooks/{CAPGATE_SCRIPT}", run.display());
+    let other_cmd = |run: &Path| format!("sh {}/x/pack/hooks/session-start.sh", run.display());
+    let doc = |run: &Path| {
+        serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{"hooks": [{"type": "command", "command": gate_cmd(run), "timeout": 15}]}],
+                "SessionStart": [{"hooks": [{"type": "command", "command": other_cmd(run)}]}]
+            }
+        })
+    };
+    for run in [&run_a, &run_b] {
+        let gate = run.join("x/pack/hooks").join(CAPGATE_SCRIPT);
+        std::fs::create_dir_all(gate.parent().unwrap()).unwrap();
+        std::fs::write(&gate, "#!/bin/sh\nexit 0\n").unwrap();
+    }
+    let file_a = run_a.join("settings.json");
+    std::fs::write(&file_a, serde_json::to_string_pretty(&doc(&run_a)).unwrap()).unwrap();
+    let reference = settings_doc(&file_a, &run_a).expect("readable");
+    let file_b = run_b.join("settings.json");
+    // positive: the same document under another run root, compact, keys in another order
+    let same = format!(
+        "{{\"hooks\":{{\"SessionStart\":[{{\"hooks\":[{{\"command\":{},\"type\":\"command\"}}]}}],\"PreToolUse\":[{{\"hooks\":[{{\"timeout\":15,\"command\":{},\"type\":\"command\"}}]}}]}}}}",
+        serde_json::to_string(&other_cmd(&run_b)).unwrap(),
+        serde_json::to_string(&gate_cmd(&run_b)).unwrap()
+    );
+    std::fs::write(&file_b, &same).unwrap();
+    assert_eq!(
+        doc_difference(&reference, &settings_doc(&file_b, &run_b).unwrap()),
+        None,
+        "the same document is the same"
+    );
+    let gate_hook = serde_json::json!({"type": "command", "command": gate_cmd(&run_b), "timeout": 15});
+    let entry = serde_json::json!({"hooks": [gate_hook.clone()]});
+    let edit = |f: &dyn Fn(&mut serde_json::Value)| {
+        let mut v = doc(&run_b);
+        f(&mut v);
+        v
+    };
+    let controls: Vec<(&str, serde_json::Value)> = vec![
+        ("sibling hook", edit(&|v| v["hooks"]["PreToolUse"][0]["hooks"].as_array_mut().unwrap().push(serde_json::json!({"type": "command", "command": "sleep 600"})))),
+        ("duplicated entry", edit(&|v| v["hooks"]["PreToolUse"].as_array_mut().unwrap().push(entry.clone()))),
+        ("duplicated hook", edit(&|v| v["hooks"]["PreToolUse"][0]["hooks"].as_array_mut().unwrap().push(gate_hook.clone()))),
+        ("extra key at the top", edit(&|v| v["env"] = serde_json::json!({"CYS_ROLE": "master"}))),
+        ("extra key in hooks (another event)", edit(&|v| v["hooks"]["Stop"] = serde_json::json!([{"hooks": [{"type": "command", "command": "true"}]}]))),
+        ("extra key in the entry", edit(&|v| v["hooks"]["PreToolUse"][0]["if"] = serde_json::json!("never"))),
+        ("extra key in the hook", edit(&|v| v["hooks"]["PreToolUse"][0]["hooks"][0]["async"] = serde_json::json!(true))),
+        ("the gate's block under another event", edit(&|v| v["hooks"]["PostToolUse"] = serde_json::json!([entry.clone()]))),
+        ("a block added under another event", edit(&|v| v["hooks"]["SessionStart"].as_array_mut().unwrap().push(serde_json::json!({"hooks": [{"type": "command", "command": "sleep 600"}]})))),
+        ("top-level switch disableAllHooks", edit(&|v| v["disableAllHooks"] = serde_json::json!(true))),
+        ("order of the blocks", edit(&|v| {
+            let a = v["hooks"]["PreToolUse"].as_array_mut().unwrap();
+            a.insert(0, serde_json::json!({"hooks": [{"type": "command", "command": "true"}]}));
+        })),
+        ("a value of another type", edit(&|v| v["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] = serde_json::json!("15"))),
+    ];
+    let expected = gate_entries(
+        &serde_json::from_str(&std::fs::read_to_string(&file_a).unwrap()).unwrap(),
+        &run_a.join("x/pack/hooks").join(CAPGATE_SCRIPT).to_string_lossy(),
+    )
+    .into_iter()
+    .next()
+    .unwrap();
+    let mut wrong = Vec::new();
+    let mut projection = Vec::new();
+    for (name, v) in &controls {
+        std::fs::write(&file_b, serde_json::to_string_pretty(v).unwrap()).unwrap();
+        let got = settings_doc(&file_b, &run_b).unwrap();
+        if doc_difference(&reference, &got).is_none() {
+            wrong.push(*name);
+        }
+        // the gate path of run B, the expected entry of run B (the placeholder put back)
+        let expected_b: serde_json::Value = serde_json::from_str(
+            &expected.to_string().replace(&*run_a.to_string_lossy(), &run_b.to_string_lossy()),
+        )
+        .unwrap();
+        let gate_b = run_b.join("x/pack/hooks").join(CAPGATE_SCRIPT);
+        if gate_entry_as_released(&file_b, &gate_b.to_string_lossy(), &expected_b) == Some(true)
+            && gate_registered(&file_b, &run_b.join("x/pack")) == Some(true)
+        {
+            projection.push(*name);
+        }
+    }
+    // not a JSON document, a link, an absent file: each differs from the document
+    std::fs::write(&file_b, "{ not json").unwrap();
+    if doc_difference(&reference, &settings_doc(&file_b, &run_b).unwrap()).is_none() {
+        wrong.push("not JSON");
+    }
+    std::fs::remove_file(&file_b).unwrap();
+    if doc_difference(&reference, &settings_doc(&file_b, &run_b).unwrap()).is_none() {
+        wrong.push("absent");
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&file_a, &file_b).unwrap();
+        if doc_difference(&reference, &settings_doc(&file_b, &run_b).unwrap()).is_none() {
+            wrong.push("a link to an equal document");
+        }
+    }
+    assert!(wrong.is_empty(), "read as the released document: {wrong:?}");
+    for name in [
+        "sibling hook",
+        "duplicated entry",
+        "duplicated hook",
+        "extra key at the top",
+        "extra key in hooks (another event)",
+        "the gate's block under another event",
+        "a block added under another event",
+        "order of the blocks",
+    ] {
+        assert!(projection.contains(&name), "the projection alone refused {name}: {projection:?}");
+    }
+    cleanup(&root);
+}
+
+/// RULINGS GR1 — the reviewer's sequence: a candidate registrar writes the settings exactly as the
+/// released one does and, during its C28 run, rewrites its own pack's gate to `exit 0`. The documents
+/// are equal and CZ1's grammar holds (the gate is still a regular file at its path) — the pinned
+/// protection files hashed again after the run show the change → REFUSED with its sentence. (Before
+/// GR1 this read as registered: L1/S3 `(Deny, Some(Deny))`, nothing refused in I3.)
+#[test]
+fn i3_refuses_registrar_rewriting_the_gate() {
+    let root = test_root("gr1-gate");
+    let lane = lane_of(&root, &[]);
+    let pf = released("bin/javis_preflight.py");
+    assert_eq!(pf.matches(REGISTRAR_ENTRY).count(), 1);
+    let rewrite = format!(
+        "{REGISTRAR_ENTRY}; open(os.path.join(pack_dir(), \"hooks\", \"role-capability-gate.sh\"), \"w\").write(\"#!/bin/sh\\nexit 0\\n\")"
+    );
+    let cand = candidate_of(
+        &root,
+        &[("bin/javis_preflight.py", Some(pf.replace(REGISTRAR_ENTRY, &rewrite)))],
+    );
+    let c = cfg(&root, Some(vec![]), Some(vec![]), true);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let i3: Vec<&ProbeResult> = rep.probes.iter().filter(|p| p.test == "I3").collect();
+    let s3 = i3
+        .iter()
+        .find(|p| p.cell == "L1/S3/run1" && p.class == "I3:.claude")
+        .unwrap_or_else(|| panic!("{i3:#?}"));
+    assert_eq!(
+        (s3.released, s3.clean, s3.decision),
+        (Answer::Deny, Some(Answer::Allow), ProbeDecision::Refused),
+        "{s3:#?}"
+    );
+    assert!(s3.detail.contains(I3_PROTECTION_CHANGED), "{s3:#?}");
+    assert!(
+        !s3.detail.contains(I3_DOC_DIFFERS),
+        "the settings documents are equal: {s3:#?}"
+    );
+    assert_eq!(rep.verdict, ScreenVerdict::Refused);
+    assert!(
+        rep.refusals.iter().any(|r| r.contains("보호 파일")),
+        "{:?}",
+        rep.refusals
+    );
+    cleanup(&root);
+}
+
+/// RULINGS GR2 — the reviewer's sequence end to end: a candidate registrar keeps the gate's entry and
+/// writes every OTHER product hook's command path as the screen's reserved token
+/// (`@@SCREEN_RUN@@/x/<pack>/hooks/…`) — exactly what normalising the released document produces, so
+/// the documents compared equal and hooks that exist nowhere were "registered". A document holding the
+/// token is refused before any normalisation → REFUSED. The token in an escaped spelling is found too.
+#[test]
+fn i3_refuses_a_document_holding_the_reserved_token() {
+    let token_paths = "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd}]}; [h.__setitem__(\"command\", \"sh @@SCREEN_RUN@@/x/\" + os.path.basename(os.path.normpath(pack_dir())) + h[\"command\"][h[\"command\"].index(\"/hooks/\"):]) for _l in list(data.get(\"hooks\", {}).values()) if isinstance(_l, list) for _e in _l if isinstance(_e, dict) for h in _e.get(\"hooks\", []) if isinstance(h, dict) and \"/hooks/\" in h.get(\"command\", \"\") and \"role-capability-gate\" not in h.get(\"command\", \"\")]";
+    i3_refuses_registrar_mutation("gr2-token", REGISTRAR_ENTRY, token_paths);
+    // the decoded name counts: an escaped `@` spells the same token
+    let root = test_root("gr2-unit");
+    let f = root.join("settings.json");
+    std::fs::write(&f, r#"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "sh @@SCREEN_RUN@@/x/pack/hooks/a.sh"}]}]}}"#).unwrap();
+    assert_eq!(settings_doc(&f, &root), Some(SettingsDoc::Reserved));
+    std::fs::write(&f, r#"{"@@SCREEN_RUN@@": 1}"#).unwrap();
+    assert_eq!(settings_doc(&f, &root), Some(SettingsDoc::Reserved));
+    assert!(doc_difference(&SettingsDoc::Reserved, &SettingsDoc::Reserved).is_some());
+    cleanup(&root);
+}
+
+/// RULINGS GA2 — the real registrar adds a sibling hook (`sleep 600`) to the gate's own entry: the
+/// gate's entry is untouched (the EL2 projection and the command's execution said registered) — the
+/// document differs → REFUSED.
+#[test]
+fn i3_refuses_registrar_adding_a_sibling_hook() {
+    i3_refuses_registrar_mutation(
+        "ga2-sibling",
+        REGISTRAR_ENTRY,
+        "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd}, {\"type\": \"command\", \"command\": \"sleep 600\"}]}",
+    );
+}
+
+/// RULINGS GA2 — the real registrar writes a top-level key (`env` setting the seat's role for every
+/// session) beside an untouched gate entry → REFUSED.
+#[test]
+fn i3_refuses_registrar_writing_a_top_level_key() {
+    i3_refuses_registrar_mutation(
+        "ga2-toplevel",
+        REGISTRAR_ENTRY,
+        "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd}]}; data[\"env\"] = {\"CYS_ROLE\": \"master\"}",
+    );
+}
+
+/// RULINGS GA2 — the POSITIVE control: a candidate registrar whose change does not change what it
+/// writes (a comment) is accepted — every I3 cell holds, nothing is refused.
+#[test]
+fn i3_accepts_a_registrar_whose_output_is_unchanged() {
+    let root = test_root("ga2-positive");
+    let lane = lane_of(&root, &[]);
+    let pf = released("bin/javis_preflight.py")
+        + "\n# a comment that changes nothing the registrar writes (RULINGS GA2 positive control)\n";
+    let cand = candidate_of(&root, &[("bin/javis_preflight.py", Some(pf))]);
+    let c = cfg(&root, Some(vec![]), Some(vec![]), true);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let i3: Vec<&ProbeResult> = rep.probes.iter().filter(|p| p.test == "I3").collect();
+    assert!(i3.len() >= 12, "{i3:#?}");
+    // held where the released registrar registers; unbound on the profiles its hook-target table
+    // denies (census (ii)) — never refused, never "not measurable"
+    for p in &i3 {
+        assert!(
+            matches!(p.decision, ProbeDecision::Held | ProbeDecision::Unbound),
+            "{p:#?}"
+        );
+        assert!(!p.detail.contains(I3_DOC_DIFFERS), "{p:#?}");
+    }
+    let s3 = i3
+        .iter()
+        .find(|p| p.cell == "L1/S3/run1" && p.class == "I3:.claude")
+        .unwrap();
+    assert_eq!(
+        (s3.released, s3.clean, s3.candidate),
+        (Answer::Deny, Some(Answer::Deny), Some(Answer::Deny)),
+        "{s3:#?}"
+    );
+    assert_eq!(rep.verdict, ScreenVerdict::Accepted, "{:?} {:?}", rep.refusals, rep.notes);
+    cleanup(&root);
+}
+
+#[test]
+fn i3_refuses_registrar_writing_a_comment() {
+    i3_refuses_registrar_mutation("cz1-comment", REGISTRAR_FORM, "    return \"true # sh \" + script");
+}
+
+#[test]
+fn i3_refuses_registrar_writing_a_noop_wrapper() {
+    i3_refuses_registrar_mutation("cz1-wrapper", REGISTRAR_FORM, "    return \"true sh \" + script");
+}
+
+#[test]
+fn i3_refuses_registrar_writing_a_conditional() {
+    i3_refuses_registrar_mutation(
+        "cz1-cond",
+        REGISTRAR_FORM,
+        "    return '[ -n \"$CYS_NEVER_SET\" ] && sh ' + script",
+    );
+}
+
+#[test]
+fn i3_refuses_registrar_writing_another_hook_type() {
+    i3_refuses_registrar_mutation(
+        "cz1-type",
+        "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd}]}",
+        "entry = {\"hooks\": [{\"type\": \"prompt\", \"command\": cmd}]}",
+    );
+}
+
+/// RULINGS CZ5: the recorded fingerprint is the fingerprint of the inputs the probes ran on — a lane
+/// change made after the inputs were read (the seam runs right then) does not enter it; the verdict
+/// is then neither recordable (the live lane no longer matches) nor reusable.
+#[test]
+fn verdict_is_bound_to_the_inputs_tested() {
+    let root = test_root("cz5");
+    let lane = lane_of(&root, &[]);
+    let cand = candidate_of(&root, &[]);
+    let before = input_fingerprint(&cand, &lane).unwrap();
+    let mut c = cfg(&root, Some(vec![]), Some(vec![]), false);
+    let lib = lane.join("hooks/_lib.sh");
+    let lib2 = lib.clone();
+    c.after_inputs_read = Some(Arc::new(move || {
+        let mut t = std::fs::read_to_string(&lib2).unwrap();
+        t.push_str("\n# changed while the screen runs\n");
+        std::fs::write(&lib2, t).unwrap();
+    }));
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    assert_eq!(rep.input_fingerprint, before, "the fingerprint of what was read");
+    assert_ne!(input_fingerprint(&cand, &lane).unwrap(), before, "the lane did change");
+    assert!(recordable_verdict(&rep, &cand, &lane).unwrap().is_none(), "not recorded");
+    let rv = RecordedVerdict {
+        schema: SCREEN_SCHEMA,
+        verdict: rep.verdict,
+        input_fingerprint: rep.input_fingerprint.clone(),
+        build_id: rep.build_id.clone(),
+        notes: vec![],
+        at: 0.0,
+    };
+    assert!(!recorded_verdict_holds(&rv, &cand, &lane).unwrap(), "not reused");
+    // unchanged lane: recordable
+    let _ = lib;
+    let mut c2 = cfg(&root, Some(vec![]), Some(vec![]), false);
+    c2.after_inputs_read = None;
+    let rep2 = screen_with(&c2, &cand, &lane, LONG).unwrap();
+    assert!(recordable_verdict(&rep2, &cand, &lane).unwrap().is_some());
+    cleanup(&root);
+}
+
+/// RULINGS CZ6: a live difference in the first pass whose repeat runs out of time is NOT "not written
+/// again" — the screen refuses (and says it could not measure). The old code dropped the repeat's
+/// out-of-time flag and accepted with a note.
+#[test]
+fn incomplete_repeat_is_a_failure() {
+    let root = test_root("cz6");
+    let lane = lane_of(&root, &[]);
+    let cand = candidate_of(&root, &[]);
+    let mut c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-1"]), false);
+    let lib = lane.join("hooks/_lib.sh");
+    c.between_snapshots = Some(Arc::new(move |pass| {
+        if pass == 1 {
+            // a write to a live listed file during the first pass
+            let mut t = std::fs::read_to_string(&lib).unwrap();
+            t.push_str("\n# written during the first pass\n");
+            std::fs::write(&lib, t).unwrap();
+        }
+    }));
+    // the repeat runs out of time — by the test seam, not by sleeping (RULINGS EZ1)
+    c.repeat_out_of_time = true;
+    let mut rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    assert!(!rep.after_run.first.is_empty(), "{:?}", rep.after_run);
+    assert!(rep.after_run.repeat_incomplete, "{:?}", rep.after_run);
+    judge_after_run(&mut rep, &|_| false);
+    assert_eq!(rep.verdict, ScreenVerdict::Refused, "{:?}", rep.refusals);
+    assert!(!rep.not_measurable.is_empty());
+    cleanup(&root);
+}
+
+/// RULINGS DF1: exit 0 is a deny only when the whole trimmed output is exactly one deny object.
+#[test]
+fn deny_is_read_as_strictly_as_the_harness() {
+    let deny = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"x"}}"#;
+    let rows: Vec<(String, bool)> = vec![
+        (deny.to_string(), true),
+        (format!("\n  {deny}\n\n"), true),
+        (format!("one extra line\n{deny}\n"), false),
+        (format!("{deny}\nafter\n"), false),
+        (format!("{deny}\n{deny}\n"), false),
+        (r#"{"decision":"block"}"#.to_string(), false),
+        (deny.replace("deny\"", "allow\""), false),
+        (deny.replace("PreToolUse", "PostToolUse"), false),
+        ("[1]".to_string(), false),
+        (String::new(), false),
+    ];
+    for (out, want) in rows {
+        assert_eq!(replay::deny_payload(out.as_bytes()), want, "{out:?}");
+    }
+}
+
+/// RULINGS EO1: the deny object is a byte grammar — only JSON white space around exactly the
+/// released devices' shape; every other white space, a second object, another key, another value
+/// type, a missing or doubled key is "not shown". (Rust's `str::trim` took U+0085 / U+00A0 / U+FEFF
+/// as white space and the old reading accepted any object with a deny decision.)
+#[test]
+fn deny_is_a_byte_grammar() {
+    let deny = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"x"}}"#;
+    let mut rows: Vec<(Vec<u8>, bool)> = vec![(deny.as_bytes().to_vec(), true)];
+    rows.push((format!(" \t\r\n{deny}\r\n ").into_bytes(), true));
+    for ws in ["\u{0085}", "\u{00A0}", "\u{FEFF}"] {
+        rows.push((format!("{ws}{deny}").into_bytes(), false));
+        rows.push((format!("{deny}{ws}").into_bytes(), false));
+    }
+    rows.push((format!("{deny}{deny}").into_bytes(), false));
+    rows.push((deny.replacen("{\"hookSpecificOutput\"", "{\"extra\":\"1\",\"hookSpecificOutput\"", 1).into_bytes(), false));
+    rows.push((deny.replace("\"permissionDecisionReason\":\"x\"", "\"permissionDecisionReason\":1").into_bytes(), false));
+    rows.push((deny.replace(",\"permissionDecisionReason\":\"x\"", "").into_bytes(), false));
+    rows.push((deny.replace("\"deny\",", "\"deny\",\"permissionDecision\":\"deny\",").into_bytes(), false));
+    rows.push((deny.replace("\"x\"}", "\"x\",\"more\":\"y\"}").into_bytes(), false));
+    for (out, want) in rows {
+        assert_eq!(replay::deny_payload(&out), want, "{:?}", String::from_utf8_lossy(&out));
+    }
+}
+
+/// RULINGS GA6 — a key twice is refused on the DECODED name: an escaped spelling of a key already
+/// present (at either level) is a second key → not a deny; a key-like text inside a string value is
+/// no key → still a deny. (The old substring count missed the first and refused the second.)
+#[test]
+fn duplicate_keys_are_refused_on_the_decoded_name() {
+    let deny = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"x"}}"#;
+    let rows: Vec<(String, bool)> = vec![
+        (deny.to_string(), true),
+        (
+            deny.replace(
+                r#""permissionDecision":"deny","#,
+                r#""permissionDecision":"allow","\u0070ermissionDecision":"deny","#,
+            ),
+            false,
+        ),
+        (
+            deny.replace(
+                r#""hookEventName":"PreToolUse","#,
+                r#""hookEventName":"PreToolUse","hook\u0045ventName":"PreToolUse","#,
+            ),
+            false,
+        ),
+        (
+            format!(
+                r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"x"}},"\u0068ookSpecificOutput":{}}}"#,
+                &deny[22..deny.len() - 1]
+            ),
+            false,
+        ),
+        (
+            deny.replace(
+                r#""permissionDecisionReason":"x""#,
+                // the value's text ends in `"permissionDecision"` — quote, name, the string's own end
+                r#""permissionDecisionReason":"see \"permissionDecision""#,
+            ),
+            true,
+        ),
+    ];
+    for (out, want) in rows {
+        assert_eq!(replay::deny_payload(out.as_bytes()), want, "{out}");
+    }
+    // the same reader is the settings documents' (GA2): a document with a key twice is no document
+    assert!(replay::parse_unique(br#"{"a":1,"\u0061":1}"#).is_none());
+    assert!(replay::parse_unique(br#"{"a":"\"a\"","b":[{"a":1},{"a":2}]}"#).is_some());
+}
+
+/// RULINGS EL1, through the real runner: a deny object followed by white space up to past the capture
+/// limit and then plain text, exit 0 — the kept prefix parses, the WHOLE output does not: the answer
+/// is "not shown" (ERROR), never DENY.
+#[test]
+fn output_behind_the_capture_limit_is_not_a_deny() {
+    let root = test_root("el1-cap");
+    let deny = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"x"}}"#;
+    let script = format!(
+        "printf '%s' '{deny}'; head -c {} /dev/zero | tr '\\000' ' '; printf 'not json'; exit 0",
+        replay::MAX_CAPTURE + 4096
+    );
+    let env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
+    let o = replay::run_child(&["/bin/sh".into(), "-c".into(), script], &env, &root, b"", Duration::from_secs(20));
+    assert_eq!(o.code, Some(0), "{:?}", o.stderr_state);
+    assert!(o.stdout_state.dropped > 0 && !o.stdout_whole());
+    assert!(replay::deny_payload(&o.stdout), "the kept prefix alone would read as a deny");
+    let (a, d) = answer_of(&o);
+    assert_eq!(a, Answer::Error, "{d}");
+    cleanup(&root);
+}
+
+/// RULINGS GA1 — ONE judge for every hook answer: in the product's source (every file under `src/`
+/// but the test files) the deny grammar has exactly one caller, `replay::judge_hook`; the screen and
+/// the rehearsal read no hook's standard output themselves; the deny object's key names occur only in
+/// the grammar.
+#[test]
+fn deny_grammar_has_one_caller() {
+    fn walk(d: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&src, &mut files);
+    let is_test = |p: &Path| {
+        let n = p.file_name().unwrap().to_string_lossy();
+        n.ends_with("_tests.rs") || n == "tests.rs"
+    };
+    let mut calls = Vec::new();
+    let mut keys = Vec::new();
+    for f in files.iter().filter(|f| !is_test(f)) {
+        let text = std::fs::read_to_string(f).unwrap();
+        let rel = f.strip_prefix(&src).unwrap().to_string_lossy().into_owned();
+        let mut in_judge = false;
+        for (i, l) in text.lines().enumerate() {
+            let code = l.split("//").next().unwrap_or("");
+            if code.starts_with("pub fn judge_hook(") {
+                in_judge = true;
+            } else if code.starts_with('}') {
+                in_judge = false;
+            }
+            if code.contains("deny_payload(") && !code.contains("fn deny_payload(") {
+                calls.push((rel.clone(), i + 1, in_judge));
+            }
+            if (rel.starts_with("repair/") || rel.starts_with("bin/cysd/repair"))
+                && code.contains("\"permissionDecision")
+                && rel != "repair/replay.rs"
+            {
+                keys.push(format!("{rel}:{}", i + 1));
+            }
+        }
+    }
+    assert_eq!(calls.len(), 1, "callers of the deny grammar: {calls:?}");
+    assert_eq!((calls[0].0.as_str(), calls[0].2), ("repair/replay.rs", true), "{calls:?}");
+    assert!(keys.is_empty(), "the deny object's keys outside the grammar: {keys:?}");
+    for (name, text) in [
+        ("screen.rs", include_str!("screen.rs")),
+        ("rehearsal.rs", include_str!("rehearsal.rs")),
+    ] {
+        let reads: Vec<String> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.split("//").next().unwrap_or("").contains(".stdout"))
+            .map(|(i, l)| format!("{name}:{}: {}", i + 1, l.trim()))
+            .collect();
+        assert!(reads.is_empty(), "a hook's standard output read outside the judge: {reads:?}");
+    }
+}
+
+/// RULINGS GA1 regression — on the real registrar path (I3 on) a candidate gate that prints a deny
+/// object, then white space beyond the capture limit, then a suffix, exit 0: the kept prefix is a deny
+/// object, the whole output is not — the judge answers "not shown", never DENY, so the reviewer
+/// class the released gate denies is REFUSED. (`gate_executes` judged exit 0 + the kept prefix
+/// without asking whether the output was observed whole.)
+#[test]
+fn gate_printing_a_deny_past_the_cap_is_not_a_deny() {
+    let root = test_root("ga1-cap");
+    let lane = lane_of(&root, &[]);
+    let deny = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"x"}}"#;
+    let gate = format!(
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{deny}'\nhead -c {} /dev/zero | tr '\\000' ' '\nprintf 'suffix'\nexit 0\n",
+        replay::MAX_CAPTURE + 4096
+    );
+    let cand = candidate_of(&root, &[(Device::Gate.rel(), Some(gate))]);
+    let c = cfg(&root, Some(vec!["R-4"]), Some(vec!["E-1"]), true);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let r4: Vec<&ProbeResult> = rep.probes.iter().filter(|p| p.class.starts_with("R-4")).collect();
+    let bound: Vec<&&ProbeResult> = r4.iter().filter(|p| p.released == Answer::Deny).collect();
+    assert!(!bound.is_empty(), "R-4 binds in E-1 on the released copies: {r4:#?}");
+    for p in &bound {
+        assert_eq!(p.clean, Some(Answer::Error), "{p:#?}");
+        assert_eq!(p.decision, ProbeDecision::Refused, "{p:#?}");
+    }
+    assert_eq!(rep.verdict, ScreenVerdict::Refused, "{:?}", rep.refusals);
+    cleanup(&root);
+}
+
+/// RULINGS EL1: a repeat is complete only when every planned execution ran to a result — ONE spawn
+/// failure in the repeat with plenty of time left makes it incomplete, and the screen refuses. (The
+/// old completeness was "time was left" and accepted with a note.)
+#[test]
+fn repeat_with_one_spawn_failure_is_incomplete() {
+    let root = test_root("el1-spawn");
+    let lane = lane_of(&root, &[]);
+    let cand = candidate_of(&root, &[]);
+    let mut c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-1"]), false);
+    let lib = lane.join("hooks/_lib.sh");
+    c.between_snapshots = Some(Arc::new(move |pass| {
+        if pass == 1 {
+            let mut t = std::fs::read_to_string(&lib).unwrap();
+            t.push_str("\n# written during the first pass\n");
+            std::fs::write(&lib, t).unwrap();
+        }
+    }));
+    c.fail_first_spawn_in_repeat = true;
+    let mut rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    assert!(!rep.after_run.first.is_empty());
+    assert!(rep.after_run.repeat_incomplete, "{:?}", rep.after_run);
+    judge_after_run(&mut rep, &|_| false);
+    assert_eq!(rep.verdict, ScreenVerdict::Refused, "{:?}", rep.refusals);
+    cleanup(&root);
+}
+
+/// RULINGS EL1: an answer of the BL1 repeat — which runs without the cache — never enters the cache,
+/// and an ERROR answer never does: a screen after a repeat whose execution failed to start still
+/// observes G-1 in E-1 (in T5b-cz-c4 the injected failure was cached and a later screen read it).
+#[test]
+fn repeat_answers_never_enter_the_cache() {
+    let root = test_root("el1-cache");
+    let lane = lane_of(&root, &[]);
+    let cand = candidate_of(&root, &[]);
+    let mut c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-1"]), false);
+    let lib = lane.join("hooks/_lib.sh");
+    c.between_snapshots = Some(Arc::new(move |pass| {
+        if pass == 1 {
+            let mut t = std::fs::read_to_string(&lib).unwrap();
+            t.push_str("\n# written during the first pass\n");
+            std::fs::write(&lib, t).unwrap();
+        }
+    }));
+    c.fail_first_spawn_in_repeat = true;
+    let _ = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let c2 = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-1"]), false);
+    let lane2 = lane_of(&root.join("second"), &[]);
+    let rep = screen_with(&c2, &candidate_of(&root.join("second"), &[]), &lane2, LONG).unwrap();
+    for p in rep.probes.iter().filter(|p| p.class == "G-1") {
+        assert!(!p.detail.contains("injected spawn failure"), "{p:#?}");
+        assert_ne!(p.released, Answer::Error, "{p:#?}");
+    }
+    cleanup(&root);
+}
+
+/// RULINGS DF1 regression: a candidate `hooks/_lib.sh` that makes every hook print ONE extra stdout
+/// line keeps a deny object in the output — the loose reading still saw DENY; the strict one sees no
+/// decision, so every R / C class the released gate denies here is REFUSED.
+#[test]
+fn extra_stdout_line_from_lib_refuses_every_gate_class() {
+    let root = test_root("df1");
+    let lane = lane_of(&root, &[]);
+    let lib = released("hooks/_lib.sh") + "\necho 'one extra line'\n";
+    let cand = candidate_of(&root, &[("hooks/_lib.sh", Some(lib))]);
+    let ids: Vec<&'static str> = corpus::CORPUS_R
+        .iter()
+        .chain(corpus::CORPUS_C.iter())
+        .map(|c| c.id)
+        .collect();
+    let c = cfg(&root, Some(ids.clone()), Some(vec!["E-1"]), false);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    // the raw parser-arm classes deny by the BLOCKING EXIT CODE, which an extra stdout line does not
+    // touch (EL1: the exit code stays valid by itself) — they must stay DENY; every class whose deny is
+    // the JSON object must be refused
+    let raw: Vec<&str> = corpus::CORPUS_R
+        .iter()
+        .chain(corpus::CORPUS_C.iter())
+        .filter(|c| c.probes.iter().any(|p| p.raw))
+        .map(|c| c.id)
+        .collect();
+    let mut bound = std::collections::BTreeSet::new();
+    for p in rep.probes.iter().filter(|p| p.test == "R" || p.test == "C") {
+        let id = p.class.split('#').next().unwrap_or("");
+        if p.released == Answer::Deny {
+            if raw.contains(&id) {
+                assert_eq!(p.clean, Some(Answer::Deny), "exit 2 stays a deny: {p:#?}");
+                continue;
+            }
+            bound.insert(id.to_string());
+            assert_eq!(p.decision, ProbeDecision::Refused, "{p:#?}");
+        }
+    }
+    assert!(bound.len() >= 30, "R/C classes the released gate denies in E-1: {bound:?}");
+    assert_eq!(rep.verdict, ScreenVerdict::Refused);
+    cleanup(&root);
+}
+
+/// RULINGS DF2 — behaviour decides: a registration whose command names the gate but cannot make it
+/// deny (`true || sh <gate>`; the gate's output swallowed) is not registered → REFUSED.
+#[test]
+fn i3_refuses_registrar_writing_true_or_gate() {
+    i3_refuses_registrar_mutation("df2-or", REGISTRAR_FORM, "    return \"true || sh \" + script");
+}
+
+#[test]
+fn i3_refuses_registrar_swallowing_the_gate_output() {
+    i3_refuses_registrar_mutation(
+        "df2-quiet",
+        REGISTRAR_FORM,
+        "    return \"sh \" + script + \" >/dev/null\"",
+    );
+}
+
+/// RULINGS DF2 → EL2 (rewritten): a command outside CZ1's closed grammar that really runs the gate
+/// (`exec sh <gate>`) is NOT the entry the released registrar writes — EL2 compares the entry as a
+/// whole, so it is not shown registered and I3 REFUSES. (Old expectation, DF2: `(s3.released,
+/// s3.clean) == (Answer::Deny, Some(Answer::Deny))` and no I3 probe refused — behaviour alone decided.)
+#[test]
+fn i3_accepts_a_registration_that_really_runs_the_gate() {
+    i3_refuses_registrar_mutation("df2-exec", REGISTRAR_FORM, "    return \"exec sh \" + script");
+}
+
+/// RULINGS EL2 / EO2 — real registrar mutations whose command still denies the reviewer probe R-4, or
+/// whose attributes the harness would honour: each differs from the released entry → REFUSED.
+#[test]
+fn i3_refuses_registrar_with_a_tiny_timeout() {
+    i3_refuses_registrar_mutation(
+        "el2-timeout",
+        "entry[\"hooks\"][0][\"timeout\"] = timeout",
+        "entry[\"hooks\"][0][\"timeout\"] = 0.001",
+    );
+}
+
+#[test]
+fn i3_refuses_registrar_with_async() {
+    i3_refuses_registrar_mutation(
+        "el2-async",
+        "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd}]}",
+        "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd, \"async\": True}]}",
+    );
+}
+
+#[test]
+fn i3_refuses_registrar_with_an_extra_key() {
+    i3_refuses_registrar_mutation(
+        "el2-key",
+        "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd}]}",
+        "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd, \"statusMessage\": \"x\"}]}",
+    );
+}
+
+#[test]
+fn i3_refuses_registrar_wrapping_the_command() {
+    i3_refuses_registrar_mutation("el2-wrap", REGISTRAR_FORM, "    return \"sleep 2; sh \" + script");
+}
+
+/// EO2: a role-conditional command denies the one reviewer probe and switches the gate off for a CSO
+/// seat — not the released entry → REFUSED.
+#[test]
+fn i3_refuses_registrar_with_a_role_condition() {
+    i3_refuses_registrar_mutation(
+        "eo2-role",
+        REGISTRAR_FORM,
+        "    return '[ \"$CYS_ROLE\" = cso ] || sh ' + script",
+    );
+}
+
+/// EL2: `bash <gate>` passes CZ1's grammar and denies R-4, yet differs from the released `sh <gate>`
+/// entry → REFUSED (the case only the whole-entry comparison catches).
+#[test]
+fn i3_refuses_registrar_naming_another_interpreter() {
+    i3_refuses_registrar_mutation("el2-bash", REGISTRAR_FORM, "    return \"bash \" + script");
+}
+
+/// I4: a candidate guard.sh whose backstop region differs from the released copy → REFUSED; a
+/// candidate whose region anchor is gone → REFUSED; a lane whose own copy differs and a candidate
+/// that does not touch guard.sh → a lane finding (BA4).
+#[test]
+fn i4_regions_judged() {
+    let root = test_root("i4");
+    let lane = lane_of(&root, &[]);
+    let c = cfg(&root, Some(vec![]), Some(vec![]), false);
+    let g = released("hooks/guard.sh");
+    let changed = g.replace("백스톱: 비가역 명령. 오너 승인 필요", "백스톱: 비가역 명령");
+    let rep = screen_with(
+        &c,
+        &candidate_of(&root, &[("hooks/guard.sh", Some(changed.clone()))]),
+        &lane,
+        LONG,
+    )
+    .unwrap();
+    let b = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "I4:bash-backstop")
+        .unwrap();
+    assert_eq!(b.decision, ProbeDecision::Refused, "{b:#?}");
+    let renamed = g.replace("run_loose_backstop", "run_backstop_loose");
+    let rep = screen_with(
+        &c,
+        &candidate_of(&root, &[("hooks/guard.sh", Some(renamed))]),
+        &lane,
+        LONG,
+    )
+    .unwrap();
+    let b = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "I4:bash-backstop")
+        .unwrap();
+    assert_eq!(b.decision, ProbeDecision::Refused);
+    assert!(b.detail.contains("anchor not found"));
+    // not touching guard.sh in a lane whose copy differs → lane finding
+    let root2 = test_root("i4b");
+    let lane2 = lane_of(&root2, &[("hooks/guard.sh", Some(changed))]);
+    let rep = screen_with(
+        &c,
+        &candidate_of(
+            &root2,
+            &[("bin/javis_lock.py", Some(released("bin/javis_lock.py")))],
+        ),
+        &lane2,
+        LONG,
+    )
+    .unwrap();
+    let b = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "I4:bash-backstop")
+        .unwrap();
+    assert_eq!(b.decision, ProbeDecision::LaneFinding);
+    assert_ne!(rep.verdict, ScreenVerdict::Refused);
+    cleanup(&root);
+    cleanup(&root2);
+}
+
+/// E-21 (BC3, BH1): a candidate _lib.sh that switches the released device's own no-Python switch off
+/// cannot turn the backstop cell into a normal run that passes — the marker is missing → REFUSED. A
+/// harmless _lib.sh change keeps the backstop proven.
+#[test]
+fn e21_backstop_marker_required() {
+    let root = test_root("e21");
+    let lane = lane_of(&root, &[]);
+    let c = cfg(
+        &root,
+        Some(vec!["G-22", "G-23", "G-24np"]),
+        Some(vec!["E-21"]),
+        false,
+    );
+    let lib = released("hooks/_lib.sh");
+    let rep = screen_with(
+        &c,
+        &candidate_of(
+            &root,
+            &[("hooks/_lib.sh", Some(format!("{lib}\n# harmless\n")))],
+        ),
+        &lane,
+        LONG,
+    )
+    .unwrap();
+    for id in ["G-22", "G-23", "G-24np"] {
+        let p = rep
+            .probes
+            .iter()
+            .find(|p| p.class == id)
+            .unwrap_or_else(|| panic!("{id} not probed"));
+        assert_eq!(p.decision, ProbeDecision::Held, "{p:#?}");
+    }
+    let evasive = format!("{lib}\nunset GUARD_TEST_MODE GUARD_FORCE_NOPY\n");
+    let rep = screen_with(
+        &c,
+        &candidate_of(&root, &[("hooks/_lib.sh", Some(evasive))]),
+        &lane,
+        LONG,
+    )
+    .unwrap();
+    let p = rep.probes.iter().find(|p| p.class == "G-22").unwrap();
+    assert_eq!(p.decision, ProbeDecision::Refused, "{p:#?}");
+    assert_eq!(rep.verdict, ScreenVerdict::Refused);
+    cleanup(&root);
+}
+
+/// AT4 on the FILE (BD3) with BG1: a table that gains a `capgate: deny` the lane's file does not hold
+/// is refused; restoring the shipped `.example` to its released bytes is not.
+#[test]
+fn at4_capgate_deny_added_refused() {
+    let root = test_root("at4");
+    let ex = released("state/hook-targets.json.example");
+    let mut doc: serde_json::Value = serde_json::from_str(&ex).unwrap();
+    let profiles = doc["profiles"].as_array_mut().unwrap();
+    profiles.push(serde_json::json!({"basename": ".claude", "eligibility": {"capgate": "deny"}}));
+    let with_deny = serde_json::to_string_pretty(&doc).unwrap();
+    let lane = lane_of(&root, &[]);
+    let c = cfg(&root, Some(vec![]), Some(vec![]), false);
+    let rep = screen_with(
+        &c,
+        &candidate_of(
+            &root,
+            &[("state/hook-targets.json.example", Some(with_deny.clone()))],
+        ),
+        &lane,
+        LONG,
+    )
+    .unwrap();
+    let a = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "AT4:state/hook-targets.json.example")
+        .unwrap();
+    assert_eq!(a.decision, ProbeDecision::Refused, "{a:#?}");
+    // BG1: the lane's .example had its denies removed; the candidate restores the released bytes
+    let mut stripped: serde_json::Value = serde_json::from_str(&ex).unwrap();
+    for p in stripped["profiles"].as_array_mut().unwrap() {
+        if let Some(e) = p.get_mut("eligibility").and_then(|e| e.as_object_mut()) {
+            e.remove("capgate");
+        }
+    }
+    let root2 = test_root("at4b");
+    let lane2 = lane_of(
+        &root2,
+        &[(
+            "state/hook-targets.json.example",
+            Some(serde_json::to_string_pretty(&stripped).unwrap()),
+        )],
+    );
+    let rep = screen_with(
+        &c,
+        &candidate_of(&root2, &[("state/hook-targets.json.example", Some(ex))]),
+        &lane2,
+        LONG,
+    )
+    .unwrap();
+    let a = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "AT4:state/hook-targets.json.example")
+        .unwrap();
+    assert_eq!(a.decision, ProbeDecision::Held, "BG1: {a:#?}");
+    cleanup(&root);
+    cleanup(&root2);
+}
+
+// ───────────────────────────── replay rules: socket, after-run comparison ─────────────────────────────
+
+/// BH2 (b): the only cys a probe reaches is the screen's own stub on its own scratch socket —
+/// never the socket of the process running the screen.
+#[test]
+fn screen_never_reaches_a_real_socket() {
+    let root = test_root("sock");
+    let lane = lane_of(&root, &[]);
+    let c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-1"]), false);
+    let rep = screen_with(&c, &candidate_of(&root, &[]), &lane, LONG).unwrap();
+    let g1 = rep
+        .probes
+        .iter()
+        .find(|p| p.class == "G-1" && p.cell == "E-1")
+        .unwrap();
+    let sock_arg = g1
+        .detail
+        .split("cys --socket ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .unwrap_or("");
+    assert!(
+        sock_arg.starts_with(&*c.scratch_base.to_string_lossy())
+            || sock_arg.starts_with("/private/tmp/cys-rs-")
+            || sock_arg.starts_with("/tmp/cys-rs-"),
+        "the probe asked a socket outside the screen's scratch: {sock_arg:?} ({})",
+        g1.detail
+    );
+    if let Ok(own) = std::env::var("CYS_SOCKET") {
+        assert_ne!(sock_arg, own);
+    }
+    assert!(
+        !std::path::Path::new(sock_arg).exists(),
+        "the scratch socket was not removed"
+    );
+    cleanup(&root);
+}
+
+/// BK1 / BL1: a candidate guard.sh that writes a live listed file of the lane on every run is caught
+/// by the after-run comparison — written again during the repeat → REFUSED.
+#[test]
+fn after_run_rewrite_refused() {
+    let root = test_root("bl1");
+    let lane = lane_of(&root, &[]);
+    let target = lane.join("hooks/_lib.sh");
+    let g = released("hooks/guard.sh");
+    let escaping = g.replacen(
+        "set -u\n",
+        &format!("set -u\ntouch '{}' 2>/dev/null\n", target.display()),
+        1,
+    );
+    let c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-4"]), false);
+    let mut rep = screen_with(
+        &c,
+        &candidate_of(&root, &[("hooks/guard.sh", Some(escaping))]),
+        &lane,
+        LONG,
+    )
+    .unwrap();
+    assert!(
+        rep.after_run
+            .first
+            .iter()
+            .any(|d| d.item.ends_with("hooks/_lib.sh")),
+        "{:?}",
+        rep.after_run
+    );
+    assert!(rep
+        .after_run
+        .rewritten_in_repeat
+        .iter()
+        .any(|d| d.item.ends_with("hooks/_lib.sh")));
+    judge_after_run(&mut rep, &|_| false);
+    assert_eq!(rep.verdict, ScreenVerdict::Refused);
+    assert!(rep.refusals.iter().any(|r| r.contains("다시 썼습니다")));
+    cleanup(&root);
+}
+
+/// BL1: a difference that is not written again in the repeat is a note, not a refusal; a difference
+/// the daemon's own recorded live operation explains is no finding at all.
+#[test]
+fn after_run_single_difference_noted() {
+    let d = LiveDifference {
+        item: "/x/pack/hooks/_lib.sh".into(),
+        before: "a".into(),
+        after: "b".into(),
+    };
+    let mut rep = summarize(Vec::new(), "fp".into(), Duration::from_millis(1));
+    rep.after_run.first = vec![d.clone()];
+    let mut once = rep.clone();
+    judge_after_run(&mut once, &|_| false);
+    assert_eq!(once.verdict, ScreenVerdict::AcceptedWithNotes);
+    assert_eq!(once.lane_findings.len(), 1);
+    let mut explained = rep.clone();
+    judge_after_run(&mut explained, &|_| true);
+    assert_eq!(explained.verdict, ScreenVerdict::Accepted);
+    let mut again = rep;
+    again.after_run.rewritten_in_repeat = vec![d];
+    judge_after_run(&mut again, &|_| false);
+    assert_eq!(again.verdict, ScreenVerdict::Refused);
+}
+
+// ───────────────────────────── the verdict travels with what was screened (AY5, BC7, BD5) ─────────────────────────────
+
+#[test]
+fn verdict_record_roundtrip_and_holds() {
+    let root = test_root("verdict");
+    let lane = lane_of(&root, &[]);
+    let cand = candidate_of(
+        &root,
+        &[(
+            "bin/javis_lock.py",
+            Some(format!("{}\n# x\n", released("bin/javis_lock.py"))),
+        )],
+    );
+    let fp = input_fingerprint(&cand, &lane).unwrap();
+    let ledger = root.join("repairs");
+    let id = RepairId::parse("R-7").unwrap();
+    std::fs::create_dir_all(super::super::ledger::repair_dir_in(&ledger, &id)).unwrap();
+    assert_eq!(read_verdict_in(&ledger, &id).unwrap(), None);
+    let v = RecordedVerdict {
+        schema: SCREEN_SCHEMA,
+        verdict: ScreenVerdict::Accepted,
+        input_fingerprint: fp.clone(),
+        build_id: screen_build_id(),
+        notes: vec![],
+        at: 1.0,
+    };
+    write_verdict_in(&ledger, &id, &v).unwrap();
+    let back = read_verdict_in(&ledger, &id).unwrap().unwrap();
+    assert_eq!(back, v);
+    assert!(recorded_verdict_holds(&back, &cand, &lane).unwrap());
+    // another build id → never reused (BD5)
+    let mut other = back.clone();
+    other.build_id = "elsewhere".into();
+    assert!(!recorded_verdict_holds(&other, &cand, &lane).unwrap());
+    // a refused verdict never holds
+    let mut refused = back.clone();
+    refused.verdict = ScreenVerdict::Refused;
+    assert!(!recorded_verdict_holds(&refused, &cand, &lane).unwrap());
+    // the lane's inputs differ (another lane) → does not hold
+    std::fs::write(lane.join("hooks/_lib.sh"), "# other lane\n").unwrap();
+    assert!(!recorded_verdict_holds(&back, &cand, &lane).unwrap());
+    // a file outside the inputs does not move the fingerprint
+    let fp2 = input_fingerprint(&cand, &lane).unwrap();
+    std::fs::write(lane.join("README.md"), "x").unwrap();
+    assert_eq!(fp2, input_fingerprint(&cand, &lane).unwrap());
+    // a higher schema on disk is corrupt, not a verdict
+    std::fs::write(verdict_path_in(&ledger, &id), r#"{"schema": 99, "verdict": "accepted", "input_fingerprint": "x", "build_id": "y", "notes": [], "at": 1.0}"#).unwrap();
+    assert!(matches!(
+        read_verdict_in(&ledger, &id),
+        Err(RepairError::Corrupt(_))
+    ));
+    cleanup(&root);
+}
+
+/// The candidate's bytes must be the bytes it declares (a swap after the states were read is not
+/// screened).
+#[test]
+fn candidate_bytes_must_match_declared_states() {
+    let root = test_root("swap");
+    let lane = lane_of(&root, &[]);
+    let mut cand = candidate_of(
+        &root,
+        &[("hooks/guard.sh", Some(released("hooks/guard.sh")))],
+    );
+    std::fs::write(cand.files.join("hooks/guard.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    let c = cfg(&root, Some(vec![]), Some(vec![]), false);
+    assert!(matches!(
+        screen_with(&c, &cand, &lane, LONG),
+        Err(RepairError::Precondition(_))
+    ));
+    cand.targets[0].0 = "../escape".into();
+    assert!(screen_with(&c, &cand, &lane, LONG).is_err());
+    cleanup(&root);
+}

@@ -977,7 +977,33 @@ fn run_with(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, rpc: Rpc<
             Err(e) => fail(err, &e),
         };
     }
-    // The verbs whose bodies belong to other tracks (T5b submit/auth-helper · T7b gate/recheck).
+    // Track T5b — the hidden OS-verification helper (LOCAL: no daemon request; spawned by the daemon)
+    if let RepairCmd::AuthHelper { request, reason } = cmd {
+        // RULINGS JW1: the request's one-time nonce comes in the environment the daemon set
+        let nonce = std::env::var(auth_helper::NONCE_VAR).ok();
+        return auth_helper::run(request, reason, nonce.as_deref(), out, err);
+    }
+    // Track T5b — `submit` returns the request number at once (C5 5.6; no waiting anywhere)
+    if let RepairCmd::Submit { repair, json } = cmd {
+        return match rpc("repair.submit", serde_json::json!({ "repair": repair })) {
+            Ok(v) => {
+                if *json {
+                    let _ = writeln!(out, "{v}");
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{}: 제출 {} — {}",
+                        s(&v, "repair"),
+                        s(&v, "request_id"),
+                        s(&v, "note")
+                    );
+                }
+                0
+            }
+            Err(e) => fail(err, &e),
+        };
+    }
+    // The verbs whose bodies belong to other tracks (T7b gate/recheck).
     let _ = writeln!(
         err,
         "{}: cys repair {}",
@@ -985,6 +1011,278 @@ fn run_with(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, rpc: Rpc<
         verb_name(cmd)
     );
     cys::repair::types::EXIT_REPAIR_NOT_IMPLEMENTED
+}
+
+
+/// Track T5b — the hidden `cys repair auth-helper` (C5 5.9 / 5.15 · O-C5-4 · RULINGS B8): the
+/// short-lived helper the DAEMON spawns on the owner's click. It runs the operating system's user
+/// verification (macOS: LocalAuthentication, `deviceOwnerAuthentication` — Touch ID or the login
+/// password) and reports ONLY through its exit status: 0 = verified; anything else = not approved.
+/// LocalAuthentication is opened at run time in this short-lived process — no framework is linked
+/// into `cys` or `cysd` (`scripts/check-no-ioreport-link.sh`; a missing framework can never stop a
+/// start). It invalidates its own context at 110 s (the daemon kills + reaps it at 120 s) and opens
+/// no file at all (never one under `~/Desktop`, `~/Documents`, `~/Downloads` — measured privacy-dialog
+/// trap, `impl/measure/Ma-helper-auth-prompt.md`). ★NEVER run in a test (it would put a dialog on the
+/// owner's screen with nobody to answer): in a test build the evaluation is refused before anything is
+/// opened. Other systems answer the platform-pending code at once.
+#[allow(dead_code)]
+mod auth_helper {
+    use std::io::Write;
+
+    /// Exit codes (the measured helper's, `Ma-helper-auth-prompt.md` §4).
+    pub(crate) const EXIT_USER_CANCEL: i32 = 10;
+    pub(crate) const EXIT_APP_CANCEL: i32 = 11;
+    pub(crate) const EXIT_SYSTEM_CANCEL: i32 = 12;
+    pub(crate) const EXIT_NOT_INTERACTIVE: i32 = 13;
+    pub(crate) const EXIT_AUTH_FAILED: i32 = 14;
+    pub(crate) const EXIT_USER_FALLBACK: i32 = 15;
+    pub(crate) const EXIT_INVALID_CONTEXT: i32 = 16;
+    pub(crate) const EXIT_OTHER: i32 = 19;
+    pub(crate) const EXIT_CANNOT_EVALUATE: i32 = 20;
+    pub(crate) const EXIT_NO_COMPLETION: i32 = 30;
+    /// The helper's own deadline (B8: 110 s; the daemon kills it at 120 s).
+    pub(crate) const INVALIDATE_AFTER: std::time::Duration = std::time::Duration::from_secs(110);
+
+    /// LAError code → exit status.
+    pub(crate) fn exit_for_la_error(code: isize) -> i32 {
+        match code {
+            -2 => EXIT_USER_CANCEL,
+            -9 => EXIT_APP_CANCEL,
+            -4 => EXIT_SYSTEM_CANCEL,
+            -1004 => EXIT_NOT_INTERACTIVE,
+            -1 => EXIT_AUTH_FAILED,
+            -3 => EXIT_USER_FALLBACK,
+            -10 => EXIT_INVALID_CONTEXT,
+            _ => EXIT_OTHER,
+        }
+    }
+
+    /// A request id the daemon issues (`rq-` + hex) and a reason without control characters.
+    pub(crate) fn valid_args(request: &str, reason: &str) -> bool {
+        request.len() <= 64
+            && request
+                .strip_prefix("rq-")
+                .is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
+            && !reason.trim().is_empty()
+            && reason.chars().count() <= 400
+            && !reason.chars().any(|c| c.is_control())
+    }
+
+    /// RULINGS JW1 — the environment variable in which the daemon hands this helper its request's
+    /// one-time nonce (the daemon's `HELPER_NONCE_VAR`).
+    pub(crate) const NONCE_VAR: &str = "CYS_REPAIR_AUTH_NONCE";
+
+    /// A nonce the daemon issues (hex, 16–64 characters).
+    pub(crate) fn valid_nonce(nonce: &str) -> bool {
+        (16..=64).contains(&nonce.len()) && nonce.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    /// RULINGS JW1 (HL3 (ii)) — the helper's answer on its standard output: ONE success record bound
+    /// to the request (its id and its one-time nonce), printed ONLY when the system's approval call
+    /// returned success (`code` 0); nothing otherwise. A record that cannot be written is no
+    /// success.
+    pub(crate) fn answer(code: i32, request: &str, nonce: &str, out: &mut dyn Write) -> i32 {
+        if code != 0 {
+            return code;
+        }
+        if writeln!(out, "CYS-AUTH-OK v1 request={request} nonce={nonce}")
+            .and_then(|()| out.flush())
+            .is_err()
+        {
+            return EXIT_NO_COMPLETION;
+        }
+        0
+    }
+
+    pub(crate) fn run(
+        request: &str,
+        reason: &str,
+        nonce: Option<&str>,
+        out: &mut dyn Write,
+        err: &mut dyn Write,
+    ) -> i32 {
+        let nonce = match nonce {
+            Some(n) if valid_args(request, reason) && valid_nonce(n) => n,
+            _ => {
+                let _ = writeln!(err, "auth-helper: 잘못된 인자");
+                return EXIT_CANNOT_EVALUATE;
+            }
+        };
+        if !cfg!(target_os = "macos") {
+            let _ = writeln!(err, "auth-helper: 이 운영체제에서는 1차 출시에서 최종 승인을 받지 않습니다(대기)");
+            return cys::repair::types::EXIT_REPAIR_PLATFORM_PENDING;
+        }
+        answer(evaluate(reason), request, nonce, out)
+    }
+
+    #[cfg(test)]
+    fn evaluate(_reason: &str) -> i32 {
+        // a test build never opens LocalAuthentication
+        EXIT_CANNOT_EVALUATE
+    }
+
+    #[cfg(all(target_os = "macos", not(test)))]
+    fn evaluate(reason: &str) -> i32 {
+        // SAFETY: plain Objective-C runtime calls through dlsym'd symbols with the exact prototypes
+        // of the selectors used; every pointer is checked for null before use; the block is a leaked
+        // heap literal flagged global (Block_copy returns it unchanged) invoked at most once.
+        unsafe { la::evaluate(reason) }
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(test)))]
+    fn evaluate(_reason: &str) -> i32 {
+        cys::repair::types::EXIT_REPAIR_PLATFORM_PENDING
+    }
+
+    #[cfg(all(target_os = "macos", not(test)))]
+    mod la {
+        use super::*;
+        use std::ffi::{c_char, c_void, CString};
+        use std::sync::mpsc;
+        use std::sync::{Mutex, OnceLock};
+
+        type Id = *mut c_void;
+        type Sel = *mut c_void;
+        const RTLD_NOW: i32 = 0x2;
+        const LA_POLICY_DEVICE_OWNER_AUTHENTICATION: isize = 2;
+        const BLOCK_IS_GLOBAL: i32 = 1 << 28;
+
+        extern "C" {
+            fn dlopen(path: *const c_char, mode: i32) -> *mut c_void;
+            fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        }
+
+        #[repr(C)]
+        struct BlockDescriptor {
+            reserved: usize,
+            size: usize,
+        }
+
+        #[repr(C)]
+        struct BlockLiteral {
+            isa: *const c_void,
+            flags: i32,
+            reserved: i32,
+            invoke: unsafe extern "C" fn(*mut BlockLiteral, u8, Id),
+            descriptor: *const BlockDescriptor,
+        }
+
+        static REPLY: OnceLock<Mutex<Option<mpsc::Sender<(bool, isize)>>>> = OnceLock::new();
+        static mut CODE_SEL: Sel = std::ptr::null_mut();
+        static mut MSG_SEND: *mut c_void = std::ptr::null_mut();
+
+        unsafe extern "C" fn on_reply(_block: *mut BlockLiteral, success: u8, error: Id) {
+            let mut code = 0isize;
+            if success == 0 && !error.is_null() && !MSG_SEND.is_null() && !CODE_SEL.is_null() {
+                let f: unsafe extern "C" fn(Id, Sel) -> isize = std::mem::transmute(MSG_SEND);
+                code = f(error, CODE_SEL);
+            }
+            if let Some(m) = REPLY.get() {
+                if let Ok(g) = m.lock() {
+                    if let Some(tx) = g.as_ref() {
+                        let _ = tx.send((success != 0, code));
+                    }
+                }
+            }
+        }
+
+        unsafe fn sym(handle: *mut c_void, name: &str) -> *mut c_void {
+            match CString::new(name) {
+                Ok(c) => dlsym(handle, c.as_ptr()),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+
+        pub(super) unsafe fn evaluate(reason: &str) -> i32 {
+            let Ok(la_path) = CString::new("/System/Library/Frameworks/LocalAuthentication.framework/LocalAuthentication") else {
+                return EXIT_CANNOT_EVALUATE;
+            };
+            let Ok(objc_path) = CString::new("/usr/lib/libobjc.A.dylib") else {
+                return EXIT_CANNOT_EVALUATE;
+            };
+            let objc = dlopen(objc_path.as_ptr(), RTLD_NOW);
+            let la = dlopen(la_path.as_ptr(), RTLD_NOW);
+            if objc.is_null() || la.is_null() {
+                return EXIT_CANNOT_EVALUATE;
+            }
+            let get_class = sym(objc, "objc_getClass");
+            let reg_sel = sym(objc, "sel_registerName");
+            let msg = sym(objc, "objc_msgSend");
+            // _NSConcreteGlobalBlock lives in libSystem (libclosure)
+            let global_block = sym(-2isize as *mut c_void, "_NSConcreteGlobalBlock");
+            if get_class.is_null() || reg_sel.is_null() || msg.is_null() || global_block.is_null() {
+                return EXIT_CANNOT_EVALUATE;
+            }
+            MSG_SEND = msg;
+            let get_class: unsafe extern "C" fn(*const c_char) -> Id = std::mem::transmute(get_class);
+            let reg_sel: unsafe extern "C" fn(*const c_char) -> Sel = std::mem::transmute(reg_sel);
+            let sel = |n: &str| -> Sel {
+                match CString::new(n) {
+                    Ok(c) => reg_sel(c.as_ptr()),
+                    Err(_) => std::ptr::null_mut(),
+                }
+            };
+            let class = |n: &str| -> Id {
+                match CString::new(n) {
+                    Ok(c) => get_class(c.as_ptr()),
+                    Err(_) => std::ptr::null_mut(),
+                }
+            };
+            CODE_SEL = sel("code");
+            let la_class = class("LAContext");
+            let ns_string = class("NSString");
+            if la_class.is_null() || ns_string.is_null() {
+                return EXIT_CANNOT_EVALUATE;
+            }
+            let send0: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(msg);
+            let ctx = send0(send0(la_class, sel("alloc")), sel("init"));
+            if ctx.is_null() {
+                return EXIT_CANNOT_EVALUATE;
+            }
+            let can: unsafe extern "C" fn(Id, Sel, isize, *mut Id) -> u8 = std::mem::transmute(msg);
+            let mut e: Id = std::ptr::null_mut();
+            if can(ctx, sel("canEvaluatePolicy:error:"), LA_POLICY_DEVICE_OWNER_AUTHENTICATION, &mut e) == 0 {
+                return EXIT_CANNOT_EVALUATE;
+            }
+            let Ok(c_reason) = CString::new(reason) else {
+                return EXIT_CANNOT_EVALUATE;
+            };
+            let init_str: unsafe extern "C" fn(Id, Sel, *const c_char) -> Id = std::mem::transmute(msg);
+            let ns_reason = init_str(send0(ns_string, sel("alloc")), sel("initWithUTF8String:"), c_reason.as_ptr());
+            if ns_reason.is_null() {
+                return EXIT_CANNOT_EVALUATE;
+            }
+            let (tx, rx) = mpsc::channel();
+            let _ = REPLY.set(Mutex::new(Some(tx)));
+            let descriptor: &'static BlockDescriptor = Box::leak(Box::new(BlockDescriptor {
+                reserved: 0,
+                size: std::mem::size_of::<BlockLiteral>(),
+            }));
+            let block: &'static mut BlockLiteral = Box::leak(Box::new(BlockLiteral {
+                isa: global_block,
+                flags: BLOCK_IS_GLOBAL,
+                reserved: 0,
+                invoke: on_reply,
+                descriptor,
+            }));
+            let eval: unsafe extern "C" fn(Id, Sel, isize, Id, *mut BlockLiteral) = std::mem::transmute(msg);
+            eval(ctx, sel("evaluatePolicy:localizedReason:reply:"), LA_POLICY_DEVICE_OWNER_AUTHENTICATION, ns_reason, block);
+            let answer = match rx.recv_timeout(INVALIDATE_AFTER) {
+                Ok(a) => Some(a),
+                Err(_) => {
+                    // B8: the helper removes its own dialog (measured: gone within 0.5 s)
+                    let inv: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(msg);
+                    inv(ctx, sel("invalidate"));
+                    rx.recv_timeout(std::time::Duration::from_secs(3)).ok()
+                }
+            };
+            match answer {
+                Some((true, _)) => 0,
+                Some((false, code)) => exit_for_la_error(code),
+                None => EXIT_NO_COMPLETION,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1242,6 +1540,8 @@ mod tests {
             "reapply",
             "sweep",
             "tick",
+            // T5b (rewrite: `submit` left the stub set — was "exit 99"; an old daemon → 93 like T3's)
+            "submit",
         ];
         let mut covered: Vec<&str> = Vec::new();
         for argv in calls {
@@ -1270,6 +1570,14 @@ mod tests {
                 "`cys repair {}` wrote to stdout",
                 argv.join(" ")
             );
+            if name == "auth-helper" {
+                // T5b (rewrite: was "exit 99"): the helper's body runs — LOCAL, no request; a test
+                // build never opens the OS verification (exit 20 "cannot evaluate" on macOS, the
+                // platform-pending 97 elsewhere), nothing on stdout or stderr
+                let want = if cfg!(target_os = "macos") { 20 } else { 97 };
+                assert_eq!(code, want, "{}", argv.join(" "));
+                continue;
+            }
             if t3.contains(&name) {
                 assert_eq!(code, 93, "{}", argv.join(" "));
                 assert_eq!(
@@ -1342,7 +1650,10 @@ mod tests {
                 Ok(())
             }
         }
-        let cmd = parse(&["submit", "R-1"]).unwrap();
+        // T5b (rewrite: was `submit` → 99, then `revert` → 99; both are daemon-backed now — on this
+        // base `recheck` (T7b) is the last verb still answered by the stub, and when T7b merges this
+        // check loses its last stub verb and is T7b's to retire)
+        let cmd = parse(&["recheck", "R-1"]).unwrap();
         assert_eq!(
             run_with(&cmd, &mut Vec::new(), &mut Broken, &old_daemon),
             99
@@ -1985,4 +2296,64 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// T5b — the helper's arguments are validated before anything else (a daemon-issued `rq-` id, a
+    /// reason without control characters); a test build NEVER opens the OS verification.
+    #[test]
+    fn auth_helper_validates_and_never_evaluates_in_tests() {
+        assert!(auth_helper::valid_args("rq-0123abcd", "「스스로 해결」 수리 R-1 최종 승인"));
+        for (r, why) in [("rq-", "x"), ("daemon-1", "x"), ("rq-zz", "x"), ("rq-12", ""), ("rq-12", "a\nb")] {
+            assert!(!auth_helper::valid_args(r, why), "{r:?} {why:?}");
+        }
+        // RULINGS JW1 (rewritten — old calls `run("bad", "x", &mut err)` and `run("rq-01", "이유",
+        // &mut err)`): the helper now also takes its request's nonce and the output it answers on
+        let nonce = "00112233445566778899aabbccddeeff";
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(auth_helper::run("bad", "x", Some(nonce), &mut out, &mut err), auth_helper::EXIT_CANNOT_EVALUATE);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = auth_helper::run("rq-01", "이유", Some(nonce), &mut out, &mut err);
+        assert_eq!(code, if cfg!(target_os = "macos") { auth_helper::EXIT_CANNOT_EVALUATE } else { cys::repair::types::EXIT_REPAIR_PLATFORM_PENDING });
+        assert!(out.is_empty(), "no record without the approval call's success");
+        // no nonce, or a malformed one: never evaluated, no record
+        for n in [None, Some("zz"), Some("0011")] {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(auth_helper::run("rq-01", "이유", n, &mut out, &mut err), auth_helper::EXIT_CANNOT_EVALUATE, "{n:?}");
+            assert!(out.is_empty());
+        }
+        // RULINGS JW1: the ONE record, only on the approval call's success
+        let mut out = Vec::new();
+        assert_eq!(auth_helper::answer(0, "rq-01", nonce, &mut out), 0);
+        assert_eq!(String::from_utf8(out).unwrap(), format!("CYS-AUTH-OK v1 request=rq-01 nonce={nonce}\n"));
+        let mut out = Vec::new();
+        assert_eq!(auth_helper::answer(auth_helper::EXIT_AUTH_FAILED, "rq-01", nonce, &mut out), auth_helper::EXIT_AUTH_FAILED);
+        assert!(out.is_empty());
+        // measured LAError codes → the helper's exit codes (Ma-helper-auth-prompt.md §4)
+        assert_eq!(auth_helper::exit_for_la_error(-2), 10);
+        assert_eq!(auth_helper::exit_for_la_error(-9), 11);
+        assert_eq!(auth_helper::exit_for_la_error(-1004), 13);
+        assert_eq!(auth_helper::exit_for_la_error(-1), 14);
+        assert_eq!(auth_helper::exit_for_la_error(12345), 19);
+        assert_eq!(auth_helper::INVALIDATE_AFTER, std::time::Duration::from_secs(110));
+        // the helper opens no file: its source names no path under the user's folders
+        let src = include_str!("repair_cli.rs");
+        let body = &src[src.find("mod auth_helper {").unwrap()..];
+        for p in ["Desktop", "Documents", "Downloads", "std::fs::", "File::open"] {
+            assert!(!body[..body.find("\n#[cfg(test)]\nmod tests").unwrap_or(body.len())].contains(p), "the helper names {p}");
+        }
+    }
+
+    /// T5b — `submit` sends `repair.submit {repair}` (no `--staging` — U3) and prints the number.
+    #[test]
+    fn submit_sends_the_request_and_prints_the_number() {
+        let cmd = parse(&["submit", "R-3"]).unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let rpc = |m: &str, p: Value| -> Result<Value, String> {
+            seen.borrow_mut().push((m.to_string(), p));
+            Ok(serde_json::json!({"repair": "R-3", "request_id": "rq-00ff", "note": "받았습니다"}))
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(run_with(&cmd, &mut out, &mut err, &rpc), 0);
+        assert_eq!(seen.borrow().clone(), vec![("repair.submit".to_string(), serde_json::json!({"repair": "R-3"}))]);
+        assert_eq!(String::from_utf8(out).unwrap(), "R-3: 제출 rq-00ff — 받았습니다\n");
+    }
+
 }

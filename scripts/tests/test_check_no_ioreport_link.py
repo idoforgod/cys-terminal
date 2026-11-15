@@ -44,7 +44,7 @@ class IoreportLinkGate(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.bin = os.path.join(self.tmp, "bin")
         os.mkdir(self.bin)
-        for tool in ("awk", "wc", "tr", "head"):   # 스크립트가 쓰는 외부 도구 — PATH 를 이 폴더 하나로 한정하므로 링크로 건네준다
+        for tool in ("awk", "wc", "tr", "head", "grep"):   # 스크립트가 쓰는 외부 도구 — PATH 를 이 폴더 하나로 한정하므로 링크로 건네준다
             real = shutil.which(tool)
             self.assertIsNotNone(real, "검체가 쓰는 도구 %s 가 이 기계에 없다" % tool)
             os.symlink(real, os.path.join(self.bin, tool))
@@ -118,6 +118,22 @@ class IoreportLinkGate(unittest.TestCase):
                     rc, out, err = self.run_gate(args=args, uname=uname)
                     self.assertEqual(rc, 2, out + err)
                     self.assertIn("인자 누락", err)
+
+    def test_binary_holding_the_repair_test_double_fails_with_exit_1(self):
+        # RULINGS CZ8 (T5b): the scripted OS-verification double of `repair-test-auth` in the artifact → fail
+        with open(self.target, "ab") as f:
+            f.write(b"\x00padding\x00CYS_REPAIR_TEST" + b"_AUTH_ANSWER\x00")
+        rc, out, err = self.run_gate()
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("repair-test-auth", err)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads every file")
+    def test_unreadable_binary_is_exit_2(self):
+        os.chmod(self.target, 0)
+        self.addCleanup(os.chmod, self.target, 0o644)
+        rc, out, err = self.run_gate()
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("읽을 수 없다", err)
 
     def test_missing_file_is_exit_2(self):
         rc, out, err = self.run_gate(args=[os.path.join(self.tmp, "no-such-binary")])
