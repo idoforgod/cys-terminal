@@ -15230,8 +15230,17 @@ mod tests {
 
     /// HB3 (3) / HE7 (d): two recoverers of ONE journal — exactly one acts. (i) R1 judges the gone writer, R2 recovers
     /// the journal completely inside R1's pause, R1 resumes: its take finds no such name → nothing touched, Ok(false).
-    /// (ii) two takers, one name: R2 takes and dies holding it; R1's take finds nothing → exactly one holder. (iii) a
-    /// second recoverer beside a taker mid roll-back (the holder's name is a running process) touches nothing.
+    /// (ii) R2 takes inside R1's pause and stops holding it; R1's take finds its source gone → R1 touches nothing, R2's
+    /// name is the ONE holder, the pack is unchanged. ★T9w (RULINGS IY b) — the two forms of (ii):
+    /// (ii-a) R2 is ANOTHER process (its taker name relabelled to a gone identity, see [`t9_relabel`]): R1's target name
+    ///   is free → the move reports not-found on every platform → `Ok(false)`, silent.
+    /// (ii-b) R2 is THIS process (taker names carry pid + start time, so only one process can produce R1's own taker
+    ///   name — and the product never runs two recoveries at once in one process: cysd recovers once before it listens,
+    ///   `cys pack-update` twice in sequence under the apply lock). R1's target `r.<me>.<id>` already exists: Unix
+    ///   `rename(2)` reports the missing source (ENOENT → `Ok(false)`); Windows' no-replace move reports the existing
+    ///   target (`AlreadyExists`, see [`windows_move_no_replace`]) → the one refusal line "… 을 맡지 못했습니다(…) —
+    ///   손대지 않습니다". The platform's answer is stated here, not mapped in the product: either way nothing is touched.
+    /// (iii) a second recoverer beside a taker mid roll-back (the holder's name is a running process) touches nothing.
     #[test]
     fn t9_r2_two_recoverers_one_name_exactly_one_acts() {
         let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -15253,22 +15262,37 @@ mod tests {
             drop(_env);
             let _ = std::fs::remove_dir_all(&root);
         }
-        // (ii)
-        {
-            let (root, pd, _pre, _env) = t9r2_lane("t9r2-two-rec-ii");
+        // (ii-a) R2 = another process; (ii-b) R2 = this process (R1's own taker name) — see the doc above.
+        for (case, r2_elsewhere) in [("ii-a", true), ("ii-b", false)] {
+            let (root, pd, _pre, _env) = t9r2_lane(&format!("t9r2-two-rec-{case}"));
             let _ = t9r2_stopped_apply(TxStep::Installed);
             t9_writers_gone();
             let crashed = m15da_state(&pd);
             let mut r2: Option<Result<bool, String>> = None;
             let r1 = recover_pack_journal_with(&mut || {
                 r2 = Some(t9r2_recover(&mut || true, &mut || false, &mut |_| true, &mut || true));
+                if r2_elsewhere {
+                    t9_writers_gone();
+                }
                 true
             });
-            let holder = t9_slot_entry(&pack_journal_dir()).map(|e| e.0);
-            let expected = format!("r.{}.{}", t9r2_me().tag(), "");
-            let one_holder = holder.as_deref().map(|h| h.starts_with(&expected)).unwrap_or(false);
-            if r1 != Ok(false) || !one_holder || !m15da_diff(&crashed, &m15da_state(&pd)).is_empty() {
-                failures.push(format!("(ii) r1={r1:?} r2={r2:?} holder={holder:?}"));
+            let slot_names: Vec<String> = std::fs::read_dir(pack_journal_dir().join(JOURNAL_SLOT))
+                .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+                .unwrap_or_default();
+            let me = t9r2_me();
+            let r2_name = if r2_elsewhere { format!("r.{}.1.", me.pid) } else { format!("r.{}.", me.tag()) };
+            // exactly one acts: R2 took (and stopped holding it) …
+            let r2_acted = r2 == Some(Err(RECOVERY_STOPPED.to_string()));
+            let one_holder = slot_names.len() == 1 && slot_names[0].starts_with(&r2_name);
+            // … and R1 does not act — the platform's answer for (ii-b) on Windows is the one refusal line.
+            let r1_ok = if r2_elsewhere || !cfg!(windows) {
+                r1 == Ok(false)
+            } else {
+                matches!(&r1, Err(line) if line.contains("을 맡지 못했습니다") && line.contains("손대지 않습니다"))
+            };
+            let pack_diff = m15da_diff(&crashed, &m15da_state(&pd));
+            if !r2_acted || !r1_ok || !one_holder || !pack_diff.is_empty() {
+                failures.push(format!("({case}) r1={r1:?} r2={r2:?} slot={slot_names:?} pack vs crashed={pack_diff:?}"));
             }
             drop(_env);
             let _ = std::fs::remove_dir_all(&root);
