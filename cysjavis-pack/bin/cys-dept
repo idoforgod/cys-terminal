@@ -3010,7 +3010,9 @@ def publish_notice(md, key, title, body):
     box = outbox_dir(md)
     name = key + ".notice"
     try:
-        if present(os.path.join(box, name)) or present(os.path.join(box, "sent", name)):
+        # ★RULINGS JZ2(WC1): 그 키의 알림은 어느 형태로든 있으면 '있다' — <키>.notice · 시도가 적힌 <키>.notice.<k> · 받힘 표지
+        #   <키>.notice.done · sent/<키>.notice. 다시 쓰면 시도 예산이 새로 생긴다(한 알림이 1 + N 번을 넘어 올라간다).
+        if present(os.path.join(box, "sent", name)) or any(n == name or n.startswith(name + ".") for n in fs_list(box)):
             return True
         fs_mkdir(box)
         tmp = write_temp(os.path.join(box, name), ("%s\n%s\n" % (clean(title), clean(body))).encode("utf-8"))
@@ -3664,23 +3666,48 @@ ceo_notice_once(){  # $1=제목 $2=본문 — 0 = 피드가 받았다(같은 제
 # ★RULINGS FY3 — 영속 알림함 배달(한 실행에 최대 20건 · ceo_demote_notices_close 와 같은 상한): 알림마다 제목 dedupe(ceo_notice_once)를
 #   지나고, 피드가 받았을 때만(올리기 rc 0 또는 같은 제목이 이미 대기 중) sent/ 로 옮긴다. 올리지 못한 것은 남아 다음 입구가 다시
 #   한다. 배달은 관문이 아니다 — 데몬·소켓이 없어 비우지 못해도 조립·부서 켜기를 막지 않는다(S3 · DC3: 늘 0).
+# ★RULINGS JZ2(WC1) — 한 알림을 올리는 시도는 올리기 **전에** 알림함 안에 적힌다: <키>.notice(또는 <키>.notice.<k>)를
+#   <키>.notice.<k+1>(k+1 = 이번이 몇 번째 시도인가)로 이름을 바꾼 뒤에야 올린다. 그 번호는 되돌리지 않는다 — 올리기의 답이 무엇이든,
+#   sent/ 가 어떻든, 어느 두 걸음 사이에서 멈추든. 그래서 알림 하나는 모든 입구를 통틀어 많아야 1 + CEO_NOTICE_RETRIES 번 올라간다
+#   (종전: 받힌 뒤 sent/ 로 못 옮기면 알림함에 그대로 남아, 받는 쪽이 닫을 때마다 다음 입구가 같은 알림을 또 올렸다 — 상한 없음).
+#   피드가 받으면(올리기 rc 0 · 같은 제목이 이미 대기 중) sent/<키>.notice 로 옮기고, 그것이 안 되면 알림함 안에서
+#   <키>.notice.done 으로 — 받힌 알림은 다시 올리지 않는다. 시도를 적지 못하면(알림함 안에서 이름을 바꿀 수 없다) 그 실행에서는
+#   올리지 않는다(stderr 한 번). 예산을 다 쓴 알림은 <키>.notice.<1+N> 으로 남아 사람이 읽는다(지우지 않는다). 잠금·대기·되풀이
+#   없음 — 알림마다 한 실행에 한 번 · 늘 0(배달은 관문이 아니다).
+CEO_NOTICE_RETRIES=2
 _CEO_DELIVERED=0
 _CEO_TRIED="|"
+_CEO_UNRECORDED=""
 ceo_outbox_deliver(){
-  local _f _t _b
+  local _f _n _base _k _next _t _b
   [ -d "$CEO_OUTBOX" ] || return 0
-  for _f in "$CEO_OUTBOX"/*.notice; do
+  for _f in "$CEO_OUTBOX"/*.notice "$CEO_OUTBOX"/*.notice.[0-9]; do
     [ -f "$_f" ] || continue
-    case "$_CEO_TRIED" in *"|${_f##*/}|"*) continue ;; esac   # 한 실행에 알림마다 한 번만 시도한다
-    _CEO_TRIED="${_CEO_TRIED}${_f##*/}|"
+    _n="${_f##*/}"
+    case "$_n" in
+      *.notice) _base="$_f"; _k=0 ;;
+      *.notice.[0-9]) _base="${_f%.*}"; _k="${_n##*.}" ;;
+      *) continue ;;
+    esac
+    case "$_CEO_TRIED" in *"|${_base##*/}|"*) continue ;; esac   # 한 실행에 알림마다 한 번만 시도한다
+    _CEO_TRIED="${_CEO_TRIED}${_base##*/}|"
+    [ "$_k" -lt $((1 + CEO_NOTICE_RETRIES)) ] || continue        # 예산을 다 썼다 — 그 파일은 그대로(사람이 읽는다) · 더 올리지 않는다
     [ "$_CEO_DELIVERED" -lt 20 ] || break
     _CEO_DELIVERED=$((_CEO_DELIVERED + 1))
     _t=""; _b=""
     { IFS= read -r _t; IFS= read -r _b; } < "$_f" 2>/dev/null || true
     [ -n "$_t" ] || continue
+    _next="$_base.$((_k + 1))"
+    if ! { mv -n "$_f" "$_next" 2>/dev/null && [ -f "$_next" ] && [ ! -e "$_f" ]; }; then
+      # 시도를 적지 못했다 — 이번에는 올리지 않는다(적지 못한 시도는 세지 못한다)
+      [ -n "$_CEO_UNRECORDED" ] || echo "[cys-dept] WARN: CEO 알림을 올리기 전에 그 시도를 알림함에 적지 못해 이번에는 올리지 않는다($_f) — 다음 입구가 다시 한다" >&2
+      _CEO_UNRECORDED=1
+      continue
+    fi
     if ceo_notice_once "$_t" "$_b"; then
-      { mkdir -p "$CEO_OUTBOX/sent" && mv -n "$_f" "$CEO_OUTBOX/sent/"; } 2>/dev/null \
-        || echo "[cys-dept] WARN: 피드가 받은 알림을 sent/ 로 옮기지 못했다($_f) — 다음 입구가 다시 본다" >&2
+      { { mkdir -p "$CEO_OUTBOX/sent" && mv -n "$_next" "$CEO_OUTBOX/sent/${_base##*/}"; } 2>/dev/null && [ ! -e "$_next" ]; } \
+        || { mv -n "$_next" "$_base.done" 2>/dev/null && [ ! -e "$_next" ]; } \
+        || echo "[cys-dept] WARN: 피드가 받은 알림을 sent/ 로도 받힘 표지($_base.done)로도 옮기지 못했다 — 그 시도 번호가 남아 많아야 $((1 + CEO_NOTICE_RETRIES))번까지만 다시 올린다" >&2
     fi
   done
   return 0
