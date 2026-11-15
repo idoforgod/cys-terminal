@@ -234,7 +234,8 @@ impl Effects for Rec {
     }
     fn spawn_helper(
         &self,
-        _request_id: &str,
+        request_id: &str,
+        nonce: &str,
         _reason: &str,
     ) -> std::io::Result<std::process::Child> {
         match *self.helper_exit.lock().unwrap() {
@@ -242,17 +243,21 @@ impl Effects for Rec {
             Some(code) => {
                 use cys::SpawnPolicy;
                 // 137 stands for a helper KILLED by a signal (an unsigned binary is killed at exec —
-                // measured, Ma:108–112): the child really dies of SIGKILL
-                let script = if code == 137 {
-                    "kill -KILL $$".to_string()
-                } else {
-                    format!("exit {code}")
+                // measured, Ma:108–112): the child really dies of SIGKILL; RULINGS JW1: exit 0 is
+                // the helper whose approval call succeeded — it prints its request's ONE record
+                let script = match code {
+                    137 => "kill -KILL $$".to_string(),
+                    0 => "printf 'CYS-AUTH-OK v1 request=%s nonce=%s\\n' \"$1\" \"$CYS_REPAIR_AUTH_NONCE\"; exit 0".to_string(),
+                    c => format!("exit {c}"),
                 };
-                std::process::Command::new("/bin/sh")
-                    .args(["-c", &script])
-                    .stdin(std::process::Stdio::null())
-                    .spawn_policy(cys::ChildLifetime::Attached)
-                    .spawn()
+                bind_helper(
+                    std::process::Command::new("/bin/sh")
+                        .args(["-c", &script, "sh", request_id])
+                        .stdin(std::process::Stdio::null()),
+                    nonce,
+                )
+                .spawn_policy(cys::ChildLifetime::Attached)
+                .spawn()
             }
         }
     }
@@ -349,7 +354,7 @@ fn approve(r: &Rig, t: &Mutex<ApprovalTable>, eff: Arc<Rec>, rid: &str, click: f
         .unwrap()
         .pop()
         .expect("the helper was spawned");
-    let verified = wait_helper(child);
+    let verified = wait_helper(child, rid, &nonce);
     // a result that does not carry this request's one-time nonce is no result
     finish_verification(&r.ctx(at), t, eff.as_ref(), rid, "not-the-nonce", verified).unwrap();
     assert_eq!(
@@ -700,6 +705,50 @@ fn helper_failure_signal_or_spawn_failure_is_not_approval() {
     }
 }
 
+/// RULINGS JW1 (HL3 (ii)) — only a VALIDATED success record approves, whatever the exit code: the
+/// PRODUCTION helper boundary (`bind_helper` + `wait_helper_for`) driven by stand-in helper programs.
+/// (The old boundary returned the exit status alone: the first three stand-ins approved.)
+#[test]
+fn only_the_requests_success_record_approves() {
+    use cys::SpawnPolicy;
+    let (rid, nonce) = ("rq-00aa", "00112233445566778899aabbccddeeff");
+    let run = |script: &str| -> bool {
+        let child = bind_helper(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", script, "sh", rid])
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+            nonce,
+        )
+        .spawn_policy(cys::ChildLifetime::Attached)
+        .spawn()
+        .unwrap();
+        wait_helper_for(child, Duration::from_secs(20), rid, nonce)
+    };
+    let record = "printf 'CYS-AUTH-OK v1 request=%s nonce=%s\\n' \"$1\" \"$CYS_REPAIR_AUTH_NONCE\"";
+    for (name, script) in [
+        ("malformed output + exit 0", "printf 'ok\\n'; exit 0".to_string()),
+        ("empty output + exit 0", "exit 0".to_string()),
+        ("another request's record + exit 0", "printf 'CYS-AUTH-OK v1 request=rq-00bb nonce=%s\\n' \"$CYS_REPAIR_AUTH_NONCE\"; exit 0".to_string()),
+        ("the valid record + exit 1", format!("{record}; exit 1")),
+        ("another nonce + exit 0", "printf 'CYS-AUTH-OK v1 request=%s nonce=ffffffffffffffffffffffffffffffff\\n' \"$1\"; exit 0".to_string()),
+        ("two records + exit 0", format!("{record}; {record}; exit 0")),
+        ("an over-long output + exit 0", format!("{record}; head -c 4096 /dev/zero; exit 0")),
+    ] {
+        assert!(!run(&script), "{name} approved");
+    }
+    assert!(run(&format!("{record}; exit 0")), "the valid record + exit 0 is the one approval");
+    // the helper (the `cys` binary) prints exactly this form, from the nonce in this variable
+    let cli = include_str!("../cys/repair_cli.rs");
+    assert!(cli.contains("\"CYS-AUTH-OK v1 request={request} nonce={nonce}\""));
+    assert_eq!(
+        helper_success_record("rq-1", "ab"),
+        format!("{HELPER_RECORD_TAG} request=rq-1 nonce=ab\n")
+    );
+    assert_eq!(HELPER_RECORD_TAG, "CYS-AUTH-OK v1");
+    assert!(cli.contains(&format!("\"{HELPER_NONCE_VAR}\"")));
+}
+
 /// A helper that never answers is killed and reaped at the limit and that is not an approval.
 #[test]
 fn helper_timeout_is_killed_and_not_approval() {
@@ -712,7 +761,7 @@ fn helper_timeout_is_killed_and_not_approval() {
     let pid = child.id();
     // RULINGS EZ1: no real-clock premise — a wait that ignored the limit would see the helper exit 0
     // after its 30 s and call that an approval; the verdict below tells the two apart
-    assert!(!wait_helper_for(child, Duration::from_millis(500)));
+    assert!(!wait_helper_for(child, Duration::from_millis(500), "rq-00", "00112233445566778899aabbccddeeff"));
     assert!(!cys::repair::replay::pid_alive(pid), "the helper survived");
     assert_eq!(HELPER_KILL_SECS, 120);
     assert_eq!(HELPER_INVALIDATE_SECS, 110);
@@ -816,7 +865,7 @@ fn second_click_while_verifying_is_a_noop() {
     assert_eq!(again["state"], json!("verifying"));
     assert_eq!(spawned.load(Ordering::SeqCst), 1);
     for c in kids.lock().unwrap().drain(..) {
-        wait_helper_for(c, Duration::from_secs(5));
+        wait_helper_for(c, Duration::from_secs(5), "rq-00", "00112233445566778899aabbccddeeff");
     }
 }
 
@@ -1669,7 +1718,7 @@ fn racing_enders_claim_once_over_a_verifying_request() {
         )
         .unwrap();
         let (nonce, child) = kids.lock().unwrap().pop().unwrap();
-        let verified = wait_helper(child);
+        let verified = wait_helper(child, &rid, &nonce);
         assert!(verified);
         let n0 = eff.delivered.lock().unwrap().len();
         let op = |name: &str| match name {

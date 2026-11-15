@@ -158,8 +158,14 @@ pub(crate) trait Effects: Send + Sync {
     fn point_master(&self, text: String);
     /// An event on the existing bus (`repair.approval.created` / `.resolved`).
     fn publish(&self, name: &str, payload: Value);
-    /// Spawns the OS-verification helper (the daemon's own child).
-    fn spawn_helper(&self, request_id: &str, reason: &str) -> std::io::Result<std::process::Child>;
+    /// Spawns the OS-verification helper (the daemon's own child), bound to `request_id` and its
+    /// one-time `nonce` ([`bind_helper`] — RULINGS JW1).
+    fn spawn_helper(
+        &self,
+        request_id: &str,
+        nonce: &str,
+        reason: &str,
+    ) -> std::io::Result<std::process::Child>;
     /// The apply of an approved candidate (T6 — `apply::apply_candidate`).
     fn apply(
         &self,
@@ -1274,7 +1280,7 @@ pub(crate) fn approval_start(
             _ => return Err(precondition(format!("{rid}: 승인할 수 없는 상태입니다"))),
         }
     }
-    match eff.spawn_helper(&rid, &reason) {
+    match eff.spawn_helper(&rid, &nonce, &reason) {
         Ok(child) => {
             let pid = child.id();
             {
@@ -1311,25 +1317,117 @@ pub(crate) fn approval_start(
     }
 }
 
-/// Waits for the helper (killed + reaped at [`HELPER_KILL_SECS`]); the exit status alone decides.
-pub(crate) fn wait_helper(child: std::process::Child) -> bool {
-    wait_helper_for(child, Duration::from_secs(HELPER_KILL_SECS))
+/// RULINGS JW1 (HL3 (ii)) — the tag of THE helper's success record.
+pub(crate) const HELPER_RECORD_TAG: &str = "CYS-AUTH-OK v1";
+/// RULINGS JW1 — the environment variable that hands a helper its request's one-time nonce (never
+/// on its command line).
+pub(crate) const HELPER_NONCE_VAR: &str = "CYS_REPAIR_AUTH_NONCE";
+/// RULINGS JW1 — the most bytes of a helper's standard output the daemon reads; more = no answer.
+pub(crate) const HELPER_OUTPUT_CAP: usize = 256;
+
+/// RULINGS JW1 — THE success record a helper prints, only after the system's approval call returned
+/// success: ONE line bound to the request it answers (its id and its one-time nonce).
+pub(crate) fn helper_success_record(request_id: &str, nonce: &str) -> String {
+    format!("{HELPER_RECORD_TAG} request={request_id} nonce={nonce}\n")
+}
+
+/// RULINGS JW1 — binds a helper command to its request: the nonce in its environment, its standard
+/// output piped for the one record (the production spawn, the test double and the stand-ins alike).
+pub(crate) fn bind_helper<'c>(
+    cmd: &'c mut std::process::Command,
+    nonce: &str,
+) -> &'c mut std::process::Command {
+    cmd.env(HELPER_NONCE_VAR, nonce)
+        .stdout(std::process::Stdio::piped())
+}
+
+/// One turn of reading the helper's standard output without blocking: `Some(true)` = its end,
+/// `Some(false)` = no answer (over the cap or a read error), `None` = nothing more for now.
+fn drain_helper_output(out: &mut std::process::ChildStdout, buf: &mut Vec<u8>) -> Option<bool> {
+    use std::io::Read;
+    let mut chunk = [0u8; 512];
+    for _ in 0..64 {
+        match out.read(&mut chunk) {
+            Ok(0) => return Some(true),
+            Ok(n) => {
+                if buf.len() + n > HELPER_OUTPUT_CAP {
+                    return Some(false);
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Some(false),
+        }
+    }
+    None
+}
+
+/// Waits for the helper (killed + reaped at [`HELPER_KILL_SECS`]); RULINGS JW1: approved only by a
+/// validated success record.
+pub(crate) fn wait_helper(child: std::process::Child, request_id: &str, nonce: &str) -> bool {
+    wait_helper_for(child, Duration::from_secs(HELPER_KILL_SECS), request_id, nonce)
 }
 
 /// [`wait_helper`] with an explicit limit: past it the child is killed and reaped — not approved.
-pub(crate) fn wait_helper_for(mut child: std::process::Child, limit: Duration) -> bool {
+///
+/// RULINGS JW1 (HL3 (ii)): the helper's standard output is read without blocking, with a size bound,
+/// inside the same limit; the answer is "approved" ONLY on exit 0 AND an output read to its end that
+/// is exactly ONE [`helper_success_record`] of THIS request and nonce. No record, a second record, a
+/// malformed one, another request's id or nonce, an over-long output, an output still open at the
+/// limit, a pipe that could not be read — "not approved", whatever the exit code.
+pub(crate) fn wait_helper_for(
+    mut child: std::process::Child,
+    limit: Duration,
+    request_id: &str,
+    nonce: &str,
+) -> bool {
     let started = std::time::Instant::now();
+    let mut out = child.stdout.take();
+    #[cfg(unix)]
+    let readable = out.as_ref().is_some_and(|o| {
+        use std::os::fd::AsRawFd;
+        let fd = o.as_raw_fd();
+        // SAFETY: fcntl on a pipe descriptor this process owns (the helper's standard output)
+        unsafe {
+            let fl = libc::fcntl(fd, libc::F_GETFL);
+            fl >= 0 && libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) >= 0
+        }
+    });
+    #[cfg(not(unix))]
+    let readable = false;
+    let mut buf: Vec<u8> = Vec::new();
+    // Some(true) = the end was read; Some(false) = no answer
+    let mut output: Option<bool> = if readable { None } else { Some(false) };
+    let mut exited: Option<bool> = None;
     loop {
-        match child.try_wait() {
-            Ok(Some(st)) => return st.success(),
-            Ok(None) => {}
-            Err(_) => break,
+        if output.is_none() {
+            if let Some(o) = out.as_mut() {
+                output = drain_helper_output(o, &mut buf);
+            }
+        }
+        if exited.is_none() {
+            match child.try_wait() {
+                Ok(Some(st)) => exited = Some(st.success()),
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+        if let (Some(success), Some(read_whole)) = (exited, output) {
+            return success
+                && read_whole
+                && buf == helper_success_record(request_id, nonce).as_bytes();
+        }
+        if output == Some(false) {
+            // no answer can come any more: the helper is ended at once (below) — not approved
+            break;
         }
         if started.elapsed() >= limit {
             break;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(20));
     }
+    drop(out);
     // RULINGS DR3 (the same rule as the replay runner): killed, its exit polled for a short fixed
     // grace, never waited for — a helper stuck in the kernel is left to a detached reap
     let _ = child.kill();
@@ -1349,7 +1447,8 @@ pub(crate) fn wait_helper_for(mut child: std::process::Child, limit: Duration) -
 }
 
 /// The helper's result consumed (design §4-7 steps 6–9; I3 validity by timestamp; verify → apply →
-/// consume). `verified` = the helper exited 0.
+/// consume). `verified` = the helper exited 0 WITH its request's validated success record
+/// ([`wait_helper_for`] — RULINGS JW1).
 ///
 /// RULINGS CZ2 / DE4: under the repair lock (the record and the candidate read first) and then the
 /// table lock, the result is re-validated — the request's identity (this id, still `Verifying`, its
@@ -1886,8 +1985,13 @@ impl Effects for DaemonEffects {
         self.daemon.bus.publish(name, "repair", None, payload);
     }
 
-    fn spawn_helper(&self, request_id: &str, reason: &str) -> std::io::Result<std::process::Child> {
-        spawn_helper(request_id, reason)
+    fn spawn_helper(
+        &self,
+        request_id: &str,
+        nonce: &str,
+        reason: &str,
+    ) -> std::io::Result<std::process::Child> {
+        spawn_helper(request_id, nonce, reason)
     }
 
     fn apply(
@@ -1948,60 +2052,72 @@ fn deliver_once(daemon: &Arc<Daemon>, seat: u64, text: String) {
 /// binary the real helper is NEVER spawned (it would put a Touch ID / password dialog on the screen
 /// with nobody to answer) — tests use their own scripted child.
 #[cfg(not(any(test, feature = "repair-test-auth")))]
-pub(crate) fn spawn_helper(request_id: &str, reason: &str) -> std::io::Result<std::process::Child> {
+pub(crate) fn spawn_helper(
+    request_id: &str,
+    nonce: &str,
+    reason: &str,
+) -> std::io::Result<std::process::Child> {
     use cys::SpawnPolicy;
     // a bounded child the daemon keeps hold of (killed + reaped at 120 s); on Windows no console
-    // window; the rival-daemon autostart sealed (a `cys` child never starts a daemon — flood ①)
-    std::process::Command::new(crate::state::sibling_cli_path())
-        .args([
-            "repair",
-            "auth-helper",
-            "--request",
-            request_id,
-            "--reason",
-            reason,
-        ])
-        .current_dir("/")
-        .env_remove("CYS_SURFACE_ID")
-        .env_remove("CYS_ROLE")
-        .env_remove("JAVIS_SURFACE_ID")
-        .env_remove("AITERM_SURFACE_ID")
-        .env_remove("CYS_SURFACE_ROLE")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn_policy(cys::ChildLifetime::Attached)
-        .no_autostart()
-        .spawn()
+    // window; the rival-daemon autostart sealed (a `cys` child never starts a daemon — flood ①);
+    // RULINGS JW1: bound to its request (the nonce in its environment, its output piped)
+    bind_helper(
+        std::process::Command::new(crate::state::sibling_cli_path())
+            .args([
+                "repair",
+                "auth-helper",
+                "--request",
+                request_id,
+                "--reason",
+                reason,
+            ])
+            .current_dir("/")
+            .env_remove("CYS_SURFACE_ID")
+            .env_remove("CYS_ROLE")
+            .env_remove("JAVIS_SURFACE_ID")
+            .env_remove("AITERM_SURFACE_ID")
+            .env_remove("CYS_SURFACE_ROLE")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+        nonce,
+    )
+    .spawn_policy(cys::ChildLifetime::Attached)
+    .no_autostart()
+    .spawn()
 }
 
 /// TESTPLAN OQ-H-10 — the scripted double behind the cargo feature `repair-test-auth` (off by
 /// default; no workflow enables it): it replaces ONLY the helper spawn. It reads its answer from the
-/// file the rig names (`ok` → exit 0, `hang` → never answers, `crash` → killed by a signal, anything
-/// else → exit 1). Request table, fingerprint, expiry, signatures and apply are the production code.
+/// file the rig names (`ok` → the success record of ITS request and exit 0 — RULINGS JW1: the double
+/// keeps the boundary's contract; `hang` → never answers, `crash` → killed by a signal, anything else
+/// → exit 1). Request table, fingerprint, expiry, signatures and apply are the production code.
 #[cfg(all(feature = "repair-test-auth", not(test)))]
 pub(crate) fn spawn_helper(
     request_id: &str,
+    nonce: &str,
     _reason: &str,
 ) -> std::io::Result<std::process::Child> {
     use cys::SpawnPolicy;
     let rig = std::env::var("CYS_REPAIR_TEST_AUTH_ANSWER").unwrap_or_default();
-    std::process::Command::new("/bin/sh")
-        .args(["-c", TEST_AUTH_SCRIPT, "sh", &rig, request_id])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn_policy(cys::ChildLifetime::Attached)
-        .spawn()
+    bind_helper(
+        std::process::Command::new("/bin/sh")
+            .args(["-c", TEST_AUTH_SCRIPT, "sh", &rig, request_id])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+        nonce,
+    )
+    .spawn_policy(cys::ChildLifetime::Attached)
+    .spawn()
 }
 
 #[cfg(all(feature = "repair-test-auth", not(test)))]
-const TEST_AUTH_SCRIPT: &str = "a=$(cat \"$1\" 2>/dev/null); case \"$a\" in ok) exit 0 ;; hang) exec sleep 600 ;; crash) kill -SEGV $$ ;; *) exit 1 ;; esac";
+const TEST_AUTH_SCRIPT: &str = "a=$(cat \"$1\" 2>/dev/null); case \"$a\" in ok) printf 'CYS-AUTH-OK v1 request=%s nonce=%s\\n' \"$2\" \"$CYS_REPAIR_AUTH_NONCE\"; exit 0 ;; hang) exec sleep 600 ;; crash) kill -SEGV $$ ;; *) exit 1 ;; esac";
 
 /// In this binary's unit tests the production spawn refuses (no dialog can ever appear).
 #[cfg(test)]
 pub(crate) fn spawn_helper(
     _request_id: &str,
+    _nonce: &str,
     _reason: &str,
 ) -> std::io::Result<std::process::Child> {
     Err(std::io::Error::other(
@@ -2088,7 +2204,8 @@ pub(crate) fn handle_start(
         let (d1, rid1, nonce1) = (d.clone(), rid.clone(), nonce.clone());
         let started = start_waiter_or_reap(
             move || {
-                let verified = wait_helper(child);
+                // RULINGS JW1: approved only by a validated success record of THIS request
+                let verified = wait_helper(child, &rid1, &nonce1);
                 let eff = DaemonEffects { daemon: d1.clone() };
                 crate::repair::with_daemon_ctx(&d1, |ctx| {
                     let _ =
