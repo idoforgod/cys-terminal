@@ -1346,23 +1346,57 @@ ledger_backstop_spellings() {
 $GUARD_LEDGER_ROOTS
 EOF_LEDGER_ROOTS
 }
-ledger_backstop() {
-  local fp="$1" nb="$2" cmd="$3" sps sp p lp s c seg named="" first
-  [ -n "$GUARD_LEDGER_ROOTS" ] || return 0
-  sps="$(ledger_backstop_spellings)"
-  first="$(printf '%s\n' "$GUARD_LEDGER_ROOTS" | sed -n '1p')"
-  local msg="백스톱: 수리 장부(${first})는 데몬이 \`cys repair …\` 동사로만 쓴다 — 좌석이 파일 도구나 셸 쓰기로 장부를 쓰는 것은 역할과 상관없이 막는다(좌석이 쓰는 자리는 수리의 작업 사본 \`R-<번호>/staging/\` 하나)."
-  for p in "$fp" "$nb"; do
-    [ -n "$p" ] || continue
-    lp="$(printf '%s' "$p" | tr 'A-Z\\' 'a-z/')"
+ledger_backstop_sinks_ok() {
+  # RULINGS IJ2 / IJ4 in the shell's coarse form: 0 when every redirection target in the lower-cased command ($1) is a
+  #   harmless sink — /dev/null, a descriptor duplicate (&1 · &2 · >&-), or an absolute literal path (no `$`, back-quote,
+  #   glob, `..`) that is not under a root ($2 = the spellings). A relative target is not told here (no `cd` is followed).
+  local s="$1" sps="$2" t sp dd='(^|/)\.\.(/|$)'
+  while [[ "$s" == *">"* ]]; do
+    s="${s#*>}"
+    t="$s"
+    while [[ "$t" == ">"* || "$t" == "|"* || "$t" == " "* || "$t" == $'\t'* ]]; do t="${t:1}"; done
+    case "$t" in "&"*) t="${t:1}"; case "$t" in [0-9]*|-*) continue ;; esac ;; esac
+    case "$t" in
+      \"*) t="${t:1}"; t="${t%%\"*}" ;;            # a quoted target is taken whole (a root with a space)
+      \'*) t="${t:1}"; t="${t%%\'*}" ;;
+      *) t="${t%%[[:space:];|&<>()]*}"; t="${t//\"/}"; t="${t//\'/}" ;;
+    esac
+    [ "$t" = "/dev/null" ] && continue
+    case "$t" in /*|"~/"*) ;; *) return 1 ;; esac
+    case "$t" in *'$'*|*'`'*|*'*'*|*'?'*|*'['*) return 1 ;; esac
+    [[ $t =~ $dd ]] && return 1
     while IFS= read -r sp; do
       [ -n "$sp" ] || continue
-      case "$lp" in "$sp"|"$sp"/*) ledger_rest_is_ledger "${lp#"$sp"}" && emit_deny "$msg" ;; esac
+      case "$t" in "$sp"|"$sp"/*) return 1 ;; esac
     done <<EOF_LEDGER_SPS
 $sps
 EOF_LEDGER_SPS
   done
-  [ -n "$cmd" ] || return 0
+  return 0
+}
+ledger_backstop() {
+  # RULINGS IJ4: the degraded backstop protects the ledger exactly as far as it protects the rule documents — with jq: a
+  #   WRITING tool's path (a Read is never refused) and the coarse shell form (IJ1 / IJ2); without jq every field is empty
+  #   and nothing is protected (GAPS G22). A call that does not name the ledger is never refused.
+  local tool="$1" fp="$2" nb="$3" cmd="$4" sps sp p lp s c seg named="" first
+  [ -n "$GUARD_LEDGER_ROOTS" ] || return 0
+  sps="$(ledger_backstop_spellings)"
+  first="$(printf '%s\n' "$GUARD_LEDGER_ROOTS" | sed -n '1p')"
+  local msg="백스톱: 수리 장부(${first})는 데몬이 \`cys repair …\` 동사로만 쓴다 — 좌석이 파일 도구나 셸 쓰기로 장부를 쓰는 것은 역할과 상관없이 막는다(좌석이 쓰는 자리는 수리의 작업 사본 \`R-<번호>/staging/\` 하나)."
+  case "$tool" in
+    Write|Edit|MultiEdit|NotebookEdit)
+      for p in "$fp" "$nb"; do
+        [ -n "$p" ] || continue
+        lp="$(printf '%s' "$p" | tr 'A-Z\\' 'a-z/')"
+        while IFS= read -r sp; do
+          [ -n "$sp" ] || continue
+          case "$lp" in "$sp"|"$sp"/*) ledger_rest_is_ledger "${lp#"$sp"}" && emit_deny "$msg" ;; esac
+        done <<EOF_LEDGER_SPS
+$sps
+EOF_LEDGER_SPS
+      done ;;
+  esac
+  [ "$tool" = "Bash" ] && [ -n "$cmd" ] || return 0
   local lc; lc="$(printf '%s' "$cmd" | tr 'A-Z\\' 'a-z/')"
   while IFS= read -r sp; do
     [ -n "$sp" ] || continue
@@ -1380,28 +1414,24 @@ EOF_LEDGER_SPS
 $sps
 EOF_LEDGER_SPS
   [ -n "$named" ] || return 0
-  local wre='>|(^|[[:space:];&|(])(tee|cp|dd|mv|install|ln|truncate|patch|vim|vi|nano|emacs|ex|rm|rmdir|chmod|chown)([[:space:]]|$)|(^|[[:space:];&|(])sed[[:space:]].*-i'
+  local wre='(^|[[:space:];&|(])(tee|cp|dd|mv|install|ln|truncate|patch|vim|vi|nano|emacs|ex|rm|rmdir|chmod|chown)([[:space:]]|$)|(^|[[:space:];&|(])sed[[:space:]].*-i'
   if [[ $lc =~ $wre ]]; then
     emit_deny "$msg"
   fi
+  ledger_backstop_sinks_ok "$lc" "$sps" || emit_deny "$msg"
   return 0
 }
 
 run_loose_backstop() {
   printf '%s\n' "AUTOPILOT GUARD: python3 미가용 → bash 백스톱(LOOSE degraded) 모드" >&2
-  local cmd fp low nb
-  if command -v jq >/dev/null 2>&1; then
-    cmd="$(printf '%s' "$INPUT" | jq -r '.tool_input.command // ""' 2>/dev/null)"
-    fp="$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // ""' 2>/dev/null)"
-    nb="$(printf '%s' "$INPUT" | jq -r '.tool_input.notebook_path // ""' 2>/dev/null)"
-  else
-    # ★RULINGS ID2: jq 없이도 장부 규칙이 서도록 경로·명령을 글에서 거칠게 뽑는다(이 둘은 장부 판정에만 쓴다)
-    cmd="$(printf '%s' "$INPUT" | sed -n 's/.*"command"[[:space:]]*:[[:space:]]*"\(.*\)".*/\1/p' | sed -n '1p')"
-    fp="$(printf '%s' "$INPUT" | sed -n 's/.*"file_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')"
-    nb="$(printf '%s' "$INPUT" | sed -n 's/.*"notebook_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')"
-  fi
-  ledger_backstop "$fp" "$nb" "$cmd"
-  if ! command -v jq >/dev/null 2>&1; then cmd=""; fp=""; fi
+  local cmd fp low tool nb
+  cmd="$(printf '%s' "$INPUT" | jq -r '.tool_input.command // ""' 2>/dev/null)"
+  fp="$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // ""' 2>/dev/null)"
+  # ★RULINGS IJ4: the ledger rule reads the tool's name and the notebook path the same way (jq) — without jq every field
+  #   is empty and the backstop protects nothing, the rule documents included (GAPS G22)
+  tool="$(printf '%s' "$INPUT" | jq -r '.tool_name // ""' 2>/dev/null)"
+  nb="$(printf '%s' "$INPUT" | jq -r '.tool_input.notebook_path // ""' 2>/dev/null)"
+  ledger_backstop "$tool" "$fp" "$nb" "$cmd"
   low="$(printf '%s' "$cmd" | tr 'A-Z' 'a-z' | tr -s ' \t' ' ')"
   case "$low" in
     *"git push"*|*"git remote set-url"*|*"git remote remove"*|*"gh release create"*|*"gh pr create"*|*"scp "*)
