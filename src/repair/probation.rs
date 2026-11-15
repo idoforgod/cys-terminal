@@ -1011,8 +1011,10 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, _listed_row: &LaneRecor
         if rec.classification == super::types::Classification::General && row_bound.known().is_some() && now_bound.known().is_some() {
             let mut written: Vec<String> = Vec::new();
             for (rel, canon) in &p.expected {
-                if TargetState::read(&env.op.pack.join(rel))?.canon() != *canon {
-                    written.push(rel.clone());
+                // JH1: an over-limit file has no state — the update wrote it
+                match TargetState::observe(&env.op.pack.join(rel))? {
+                    super::types::Observed::State(s) if s.canon() == *canon => {}
+                    _ => written.push(rel.clone()),
                 }
             }
             if written.is_empty() {
@@ -1037,8 +1039,9 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, _listed_row: &LaneRecor
         return Ok(());
     }
     for (rel, canon) in &p.expected {
-        let live = TargetState::read(&env.op.pack.join(rel))?;
-        if live.canon() != *canon {
+        // JH1: an over-limit file has no state — it is not the applied result
+        let live = TargetState::observe(&env.op.pack.join(rel))?;
+        if !matches!(&live, super::types::Observed::State(s) if s.canon() == *canon) {
             let why = format!("{rel}: 살아 있는 파일이 적용 결과와 다릅니다 — 아무것도 되돌리지 않고 워커 검토로 남깁니다");
             close_row(env, id, &format!("대체됨 — {why}"), &[], Some(RepairState::Superseded))?;
             report.superseded.push(id.clone());
@@ -1840,7 +1843,7 @@ fn m10_sweep_full(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
             if !bound.equals_now(pack) {
                 return Ok(None);
             }
-            if TargetState::read(&live)? != sampled_live {
+            if !TargetState::observe(&live)?.is(&sampled_live) {
                 return Ok(None);
             }
             let source_now: Option<String> = match apply::resolve_approved_copy_in(root, pack, lane, rel) {
