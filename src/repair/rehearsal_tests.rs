@@ -734,3 +734,46 @@ fn reference_fixtures_pass() {
         );
     }
 }
+
+// ───────────── WY1 (RULINGS LH1 / LH2): the checks on a platform without the replay runner ─────────────
+
+/// A fake Windows install under the test's own folder: `<dir>\runtime\python\python3.exe` and the
+/// bundled Git's MSYS shells `<dir>\runtime\git\usr\bin\{sh,bash}.exe` (empty regular files — the
+/// lookup only looks).
+fn wy1_fake_install(name: &str) -> PathBuf {
+    let r = root(name);
+    for rel in [
+        "runtime/python/python3.exe",
+        "runtime/git/usr/bin/sh.exe",
+        "runtime/git/usr/bin/bash.exe",
+    ] {
+        put(&r, rel, "");
+    }
+    r
+}
+
+/// RULINGS LH1 / LH2 — THE LOOKUP, driven with the Windows answer on any host: the interpreter of the
+/// compile check is `<daemon's folder>\runtime\python\python3.exe` (the coordinate the product's health
+/// list requires), the shells of the syntax check are the bundled Git's MSYS `sh.exe` / `bash.exe` in
+/// `<daemon's folder>\runtime\git\usr\bin`. On 29632b90 the interpreter is looked for under the name
+/// `python3` (no `.exe`) and the shells are `/bin/sh` / `/bin/bash`: a runtime holding `python3.exe`
+/// is not found.
+#[test]
+fn wy1_lookup_finds_the_bundled_windows_programs() {
+    let r = wy1_fake_install("wy1-lookup");
+    let rt = r.join("runtime");
+    assert_eq!(
+        bundled_check_program_for(&r, "windows", CheckProgram::Python),
+        Ok(rt.join("python").join("python3.exe")),
+        "the bundled interpreter of a Windows install is not found"
+    );
+    assert_eq!(
+        bundled_check_program_for(&r, "windows", CheckProgram::Sh),
+        Ok(rt.join("git").join("usr").join("bin").join("sh.exe"))
+    );
+    assert_eq!(
+        bundled_check_program_for(&r, "windows", CheckProgram::Bash),
+        Ok(rt.join("git").join("usr").join("bin").join("bash.exe"))
+    );
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
