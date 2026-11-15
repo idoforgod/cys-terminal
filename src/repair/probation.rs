@@ -794,6 +794,17 @@ fn note_timeouts(env: &JobEnv<'_>, id: &RepairId, timeouts: &[(String, f64)]) ->
     })
 }
 
+/// The sha256 of the approved holder's bytes, read under the pack-apply exclusion by M10's put-back —
+/// RULINGS IW2: through the engine's one bounded reader (a regular file, a non-blocking open that
+/// follows no link, one handle, at most the limit + 1 bytes); anything else gives no hash at once
+/// (nothing is put back), never a wait or a whole read.
+fn holder_sha(holder: &Path) -> Option<String> {
+    match super::durable::read_record_bytes(holder) {
+        super::durable::RecordRead::Bytes(b) => Some(sha_hex(&b)),
+        super::durable::RecordRead::NotFound | super::durable::RecordRead::Unreadable(_) => None,
+    }
+}
+
 /// Every repair in probation in THIS lane re-checked — only repaired files (no full sweep), with
 /// the file's own check (never seat readiness — "보류" is not failure).
 fn probation_pass(env: &JobEnv<'_>, report: &mut TickReport) {
@@ -1833,7 +1844,7 @@ fn m10_sweep_full(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
                 return Ok(None);
             }
             let source_now: Option<String> = match apply::resolve_approved_copy_in(root, pack, lane, rel) {
-                apply::ApprovedCopy::Approved { state: TargetState::File { .. }, holder, .. } => std::fs::read(&holder).ok().map(|b| sha_hex(&b)),
+                apply::ApprovedCopy::Approved { state: TargetState::File { .. }, holder, .. } => holder_sha(&holder),
                 apply::ApprovedCopy::Approved { .. } | apply::ApprovedCopy::Unknown(_) | apply::ApprovedCopy::LedgerUnreadable { .. } => None,
                 apply::ApprovedCopy::NoApproval => (env.original)(rel).map(|o| sha_hex(&o)),
             };
