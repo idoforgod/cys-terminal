@@ -8136,7 +8136,10 @@ const RECORD_NAMES: [&str; 4] = [INSTALL_MANIFEST, PACK_STATE_FILE, PACK_VERSION
 struct PlacementLog {
     pack: PathBuf,
     path: PathBuf,
-    file: Option<std::fs::File>,
+    /// ★WJ2 (RULINGS LD1): the log keeps NO open handle — every announcement opens `placed.log`, appends, makes it durable
+    /// and closes it. This records only that the FIRST announcement already made the log's own name durable (its folder
+    /// flushed), as before.
+    named: bool,
     /// Lines made durable so far.
     count: usize,
     /// STICKY: after one failure every later announcement fails too (RULINGS KB2) — so a best-effort arm or a merge
@@ -8152,7 +8155,7 @@ impl PlacementLog {
         PlacementLog {
             pack: pack.to_path_buf(),
             path: own.join(PLACED_LOG),
-            file: None,
+            named: false,
             count: 0,
             failed: None,
             stop_after,
@@ -8181,9 +8184,12 @@ impl PlacementLog {
         }
         let mut line = serde_json::json!({ "rel": rel, "sha256": bytes.map(sha256_hex) }).to_string();
         line.push('\n');
+        // ★WJ2 (RULINGS LD1): open, append, make durable, CLOSE — the handle never outlives this announcement, so no settle,
+        //   roll-back or take of the journal folder (a rename of the FOLDER) meets a handle of this process: Windows refuses
+        //   to rename a folder while a file inside it is open (push 5: `Access is denied. (os error 5)`).
         let r = (|| -> std::io::Result<()> {
-            if self.file.is_none() {
-                let f = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+            if !self.named {
                 if let Some(parent) = self.path.parent() {
                     // the log's own name is durable before the first change it announces ('지원하지 않음' alone is tolerated).
                     if let Err(e) = sync_parent_dir(&self.path, parent) {
@@ -8192,11 +8198,11 @@ impl PlacementLog {
                         }
                     }
                 }
-                self.file = Some(f);
+                self.named = true;
             }
-            let f = self.file.as_mut().expect("opened above");
             f.write_all(line.as_bytes())?;
             f.sync_data()
+            // `f` is closed here, at the end of this announcement.
         })();
         match r {
             Ok(()) => {
@@ -16949,7 +16955,6 @@ mod tests {
     /// returned).
     #[cfg(unix)]
     #[test]
-    #[ignore = "WJ2 red on af5c554c — un-ignored with the change"]
     fn wj2_no_descriptor_on_placed_log_at_the_commit_settle() {
         let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (root, _pd, _pre, _env) = t9r2_lane("wj2-commit");
@@ -16982,7 +16987,6 @@ mod tests {
     /// folder and settles it: at that settle this process holds NO descriptor on the folder's `placed.log`. Red on af5c554c.
     #[cfg(unix)]
     #[test]
-    #[ignore = "WJ2 red on af5c554c — un-ignored with the change"]
     fn wj2_no_descriptor_on_placed_log_at_a_failed_apply_s_rollback_settle() {
         let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (base, pd, _env) = txn_prestate("wj2-failed", &[("README.md", "OLD-SOUL")], "1.0.0");
@@ -17013,7 +17017,6 @@ mod tests {
     /// part also holds on af5c554c; the second apply's own settle is red there.
     #[cfg(unix)]
     #[test]
-    #[ignore = "WJ2 red on af5c554c — un-ignored with the change"]
     fn wj2_crash_proof_recovered_in_the_same_process_then_a_second_apply_meet_no_descriptor() {
         let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut failures: Vec<String> = Vec::new();
