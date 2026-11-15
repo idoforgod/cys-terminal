@@ -8258,6 +8258,28 @@ fn run_persona(action: PersonaAction) -> i32 {
     }
 }
 
+/// ★0.15.0 (WS1 · RULINGS JX3 (b)): the daemon's `cysd/schedule.rs::BUILTIN_FIXED_KEY`, read from the stored entry (source
+/// pin `ws1_removing_a_fixed_builtin_job_is_refused_and_the_file_is_untouched`). A job that carries it is put back whole
+/// by the daemon's next tick, so `remove` refuses it instead of answering "removed" for a job that comes back.
+const SCHEDULE_BUILTIN_FIXED_KEY: &str = "_builtin_fixed";
+
+/// `cys schedule remove <id>`'s change to the stored jobs (inside [`schedule_file_transaction`]): the entries under
+/// `id` go; no entry under `id` is an error and the file is not written. A fixed built-in job (it carries
+/// [`SCHEDULE_BUILTIN_FIXED_KEY`]) is refused with one sentence and the file is not written (RULINGS JX3 (b)).
+fn remove_schedule_job(arr: &mut Vec<Value>, id: &str) -> Result<(), String> {
+    if arr.iter().any(|j| j["id"].as_str() == Some(id) && j[SCHEDULE_BUILTIN_FIXED_KEY] == true) {
+        return Err(format!(
+            "'{id}' 은 「스스로 해결」의 내장 작업이라 지우지 않습니다 — 지워도 데몬이 30초 안에 코드 정의 그대로 다시 넣습니다"
+        ));
+    }
+    let before = arr.len();
+    arr.retain(|j| j["id"].as_str() != Some(id));
+    if arr.len() == before {
+        return Err(format!("no job '{id}'"));
+    }
+    Ok(())
+}
+
 /// ★(0.14.31 · 성찰 C10) 데몬 `schedule.rs::ACTION_PUSH_QUEUED` 의 CLI 미러(소스 대조 핀
 /// `c10_cli_schedule_saves_go_through_the_canonicalizing_locked_atomic_transaction`).
 const SCHEDULE_ACTION_PUSH_QUEUED: &str = "push_queued";
@@ -8581,12 +8603,7 @@ fn run_schedule(action: ScheduleAction) -> i32 {
         ScheduleAction::Remove { id } => (|| {
             // ★(성찰 C10) 삭제도 같은 트랜잭션(잠금 · 정규화 · 원자 쓰기)이다.
             let folded = schedule_file_transaction(&path, |arr| {
-                let before = arr.len();
-                arr.retain(|j| j["id"].as_str() != Some(id.as_str()));
-                if arr.len() == before {
-                    return Err(format!("no job '{id}'"));
-                }
-                Ok(())
+                remove_schedule_job(arr, &id)
             })?;
             if !folded.is_empty() {
                 eprintln!(
@@ -49512,6 +49529,52 @@ mod tests {
         assert!(
             (SCHEDULE_LOCK_WAIT_MS / 1_000) < SCHEDULE_LOCK_STALE_SECS,
             "대기 상한이 부패 문턱보다 길면 정상 대기자가 상대의 산 잠금을 깬다"
+        );
+    }
+
+    /// WS1 · RULINGS JX3 (b): the daemon's tick restores a fixed built-in job (`_builtin_fixed: true` — today the
+    /// self-repair job) within one tick, so `cys schedule remove` of it would answer "removed" for a job that comes back.
+    /// It is refused with one sentence and the file is not written; an ordinary built-in and a user's job are removed as
+    /// before (RULINGS JX2), and an unknown id is still "no job". Driven through the same transaction and the same
+    /// function `run_schedule`'s remove arm calls (a test cannot run `run_schedule` itself: it resolves the lane's pack).
+    #[test]
+    fn ws1_removing_a_fixed_builtin_job_is_refused_and_the_file_is_untouched() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let td = std::env::temp_dir().join(format!(
+            "cys-ws1-cli-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let path = td.join("schedule.json");
+        let doc = json!({"jobs": [
+            {"id": "user-custom-job", "every_minutes": 30, "action": "push", "to": "master", "text": "mine"},
+            {"id": "phoenix-drill-weekly", "every_minutes": 10080, "action": "push", "to": "master", "_builtin": "phoenix", "_builtin_version": 2},
+            {"id": "repair-probation-tick", "every_minutes": 2, "action": "command", "command": "CYS_NO_AUTOSTART=1 cys repair tick",
+             "_builtin": "repair", "_builtin_version": 2, "_builtin_fixed": true}
+        ]});
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let err = schedule_file_transaction(&path, |arr| remove_schedule_job(arr, "repair-probation-tick"))
+            .expect_err("removing the fixed self-repair job answered as if it were removed");
+        assert!(err.contains("repair-probation-tick"), "{err}");
+        assert_eq!(err.matches(['.', '!', '?']).count(), 0, "one sentence: {err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "a refused remove wrote the file");
+        schedule_file_transaction(&path, |arr| remove_schedule_job(arr, "phoenix-drill-weekly")).expect("an ordinary built-in is removed as before");
+        schedule_file_transaction(&path, |arr| remove_schedule_job(arr, "user-custom-job")).expect("a user's job is removed as before");
+        let left: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let ids: Vec<&str> = left["jobs"].as_array().unwrap().iter().filter_map(|j| j["id"].as_str()).collect();
+        assert_eq!(ids, vec!["repair-probation-tick"]);
+        assert_eq!(schedule_file_transaction(&path, |arr| remove_schedule_job(arr, "nope")).unwrap_err(), "no job 'nope'");
+        let _ = std::fs::remove_dir_all(&td);
+        // the remove arm goes through this function, and the attribute's name is the daemon's
+        let src = include_str!("cys.rs");
+        assert!(refl_fn_body(src, "run_schedule").contains("remove_schedule_job(arr, &id)"), "the remove arm bypasses remove_schedule_job");
+        let sched = include_str!("cysd/schedule.rs");
+        assert!(
+            sched.contains(&format!("pub(crate) const BUILTIN_FIXED_KEY: &str = \"{SCHEDULE_BUILTIN_FIXED_KEY}\";")),
+            "the daemon's attribute name differs from the one the CLI reads"
         );
     }
 
