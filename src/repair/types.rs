@@ -265,15 +265,45 @@ impl TargetState {
                 path.display()
             )));
         }
+        // RULINGS IE4 / IG1 — the engine's ONE bound, for every caller (a candidate and a live file
+        // alike): at most RECORD_READ_CAP + 1 bytes from this ONE handle. Over the limit (before or
+        // while it is read) or a size that changed while it was read is an error that says so —
+        // never a state computed from a prefix
+        let cap = super::durable::RECORD_READ_CAP;
+        if opened.len() > cap {
+            return Err(RepairError::Precondition(format!(
+                "{}: 크기 {}바이트가 엔진의 읽기 한도 {cap}바이트를 넘어 읽지 않았습니다",
+                path.display(),
+                opened.len()
+            )));
+        }
+        super::durable::seam_after_open(path);
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; 64 * 1024];
+        let mut total: u64 = 0;
+        let mut limited = std::io::Read::take(&mut file, cap + 1);
         loop {
-            let n = std::io::Read::read(&mut file, &mut buf)
+            let n = std::io::Read::read(&mut limited, &mut buf)
                 .map_err(|e| RepairError::Io(format!("{}: {e}", path.display())))?;
             if n == 0 {
                 break;
             }
+            total += n as u64;
             hasher.update(&buf[..n]);
+        }
+        super::durable::seam_count(path, total);
+        if total > cap {
+            return Err(RepairError::Precondition(format!(
+                "{}: 읽는 동안 엔진의 읽기 한도 {cap}바이트를 넘었습니다 — 그 상태를 쓰지 않습니다",
+                path.display()
+            )));
+        }
+        if total != opened.len() {
+            return Err(RepairError::Precondition(format!(
+                "{}: 읽는 동안 크기가 바뀌었습니다({}바이트 → {total}바이트) — 그 상태를 쓰지 않습니다",
+                path.display(),
+                opened.len()
+            )));
         }
         Ok(TargetState::File {
             sha256: hex(&hasher.finalize()),
