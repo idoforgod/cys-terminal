@@ -522,6 +522,8 @@ pub(crate) fn with_daemon_ctx<T>(daemon: &Arc<Daemon>, f: impl FnOnce(&Ctx<'_>) 
             crate::repair_approval::comparison_consequence(&d, rel, c)
         })
     };
+    // T4e (HP2) joined: the daemon's own work reads the kill-switch exactly as `handle` does
+    let product_pause = || product_pause_in_force(daemon, &cys::pack::pack_dir());
     let ctx = Ctx {
         root: production_root(daemon),
         lane: LaneKey::of_socket(&daemon.socket_path),
@@ -537,6 +539,7 @@ pub(crate) fn with_daemon_ctx<T>(daemon: &Arc<Daemon>, f: impl FnOnce(&Ctx<'_>) 
         hook_step: &cys::repair::apply::hook_lines_step,
         claim: &cys::repair::grant::try_claim_autonomous_start,
         prompts: &daemon.repair_prompt_origin,
+        product_pause: &product_pause,
     };
     f(&ctx)
 }
