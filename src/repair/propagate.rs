@@ -1630,6 +1630,8 @@ struct HookUnitDone {
     trace: Option<String>,
     traced: Option<LaneRecord>,
     failed: bool,
+    /// The operation of a unit that finished (JD2: `recheck`'s answer names it).
+    op: Option<HookOpDone>,
 }
 
 /// The hook unit of the "already there" arm and of `recheck` (IZ1 (b)), inside the tried pack-apply
@@ -1648,7 +1650,7 @@ fn locked_hook_step(env: &LaneEnv<'_>, rec: &RepairRecord, stamp: &Stamp, stored
             HookOutcome::FailedBefore(why) => Ok(HookUnitDone { conflict: Some(why), ..HookUnitDone::default() }),
             HookOutcome::Done(trace, op) => {
                 let traced = record_hook_trace(env, rec, stored, &trace, Some(&op), false).map_err(|e| format!("{trace} — 그 흔적을 행에 남기지 못했습니다({e:?})"))?;
-                Ok(HookUnitDone { trace: Some(trace), traced, ..HookUnitDone::default() })
+                Ok(HookUnitDone { trace: Some(trace), traced, op: Some(op), ..HookUnitDone::default() })
             }
             HookOutcome::FailedAfter(trace) => {
                 let traced = record_hook_trace(env, rec, stored, &trace, None, true).map_err(|e| format!("{trace} — 그 흔적을 행에 남기지 못했습니다({e:?})"))?;
@@ -2274,10 +2276,36 @@ fn same_bytes(prev: Option<&LaneRecord>, rel: &str, result: &TargetState) -> boo
 
 // ───────────────────────────── `recheck` (H8) ─────────────────────────────
 
+/// `recheck`'s answer (RULINGS JD2): the row's state and ONE sentence naming what the call changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rechecked {
+    pub state: LaneState,
+    pub changed: String,
+}
+
+/// RULINGS JD2 — the sentence of `recheck`'s answer naming what the call changed: the row (검증됨, or
+/// 충돌 with a new reason), the hook operation it completed, a deleting repair's tombstones.
+fn recheck_changed(rec: &RepairRecord, verified: bool, hook: Option<&HookOpDone>) -> String {
+    let mut parts = vec![if verified {
+        "이 부서의 행('충돌' → '검증됨', 합친 기록을 남기고 합치기 잠금을 풂)".to_string()
+    } else {
+        "이 부서의 행('충돌' 그대로, 사유와 살아 있는 상태를 새로 적음)".to_string()
+    }];
+    if let Some(h) = hook {
+        parts.push(format!("이 부서의 훅 등록 해제(작업 {}: {})", h.op, h.lines.join(", ")));
+    }
+    let deletes = ledger::file_targets(rec).any(|f| f.pre != ledger::PreImage::Absent && matches!(result_state(rec, &f.rel), Ok(TargetState::Absent)));
+    if verified && deletes {
+        parts.push("이 부서의 삭제 표식(묘비) 확인·기록".to_string());
+    }
+    format!("이 호출이 바꾼 것: {}", parts.join(", "))
+}
+
 /// RULINGS H8 — the lane's re-evaluation after its worker's merge: a general repair's `충돌` row
 /// whose merge lock this seat holds; R's check on the LIVE files → `검증됨` with the merge record
 /// `{by_seat, result (rel, canon), changed, note}` (V2(c)), the merge lock released; a failure leaves
-/// `충돌` (the lock kept). A boot-critical / protection-related path is refused (R1 / T1).
+/// `충돌` (the lock kept). A boot-critical / protection-related path is refused (R1 / T1). The answer
+/// (`Rechecked`, or the failure's sentence) says what the call changed (JD2).
 #[allow(clippy::too_many_arguments)]
 pub fn recheck_lane_in(
     env: &LaneEnv<'_>,
@@ -2286,7 +2314,7 @@ pub fn recheck_lane_in(
     owner: &super::types::LockOwner,
     incarnation: &str,
     note: &str,
-) -> Result<LaneState, RepairError> {
+) -> Result<Rechecked, RepairError> {
     let root = env.op.root;
     let lane = env.op.lane;
     let rec = ledger::read_record_in(root, id)?.ok_or_else(|| RepairError::Precondition(format!("{}: 그런 수리가 없습니다", id.as_str())))?;
@@ -2344,6 +2372,7 @@ pub fn recheck_lane_in(
     }
     let mut row = stored.clone();
     let trace = unit.trace.clone();
+    let hook_op = unit.op.clone();
     let refused = |p: Published| -> RepairError {
         let why = match p {
             Published::RecordChanged => RECORD_CHANGED.to_string(),
@@ -2379,7 +2408,7 @@ pub fn recheck_lane_in(
             // IQ1 + IQ2 + IV4: the checked publication (the stamp measured again; a deleting repair's
             // tombstones in the same unit as the 검증됨 row)
             match publish(env, &rec, Some(&stored), &row, Publication::checked(&stamp, true))? {
-                Published::Written => Ok(LaneState::Verified),
+                Published::Written => Ok(Rechecked { state: LaneState::Verified, changed: recheck_changed(&rec, true, hook_op.as_ref()) }),
                 other => Err(refused(other)),
             }
         }
@@ -2388,7 +2417,11 @@ pub fn recheck_lane_in(
             row.reason = format!("합친 뒤의 다시 검사 실패 — {why}").chars().take(400).collect();
             row.updated_at = env.op.now;
             match publish(env, &rec, Some(&stored), &row, Publication::checked(&stamp, false))? {
-                Published::Written => Err(RepairError::CheckFailed(format!("{}: 이 부서의 살아 있는 파일에서 검사가 실패해 '충돌'로 남습니다 — {why}", id.as_str()))),
+                Published::Written => Err(RepairError::CheckFailed(format!(
+                    "{}: 이 부서의 살아 있는 파일에서 검사가 실패해 '충돌'로 남습니다 — {why} · {}",
+                    id.as_str(),
+                    recheck_changed(&rec, false, hook_op.as_ref())
+                ))),
                 other => Err(refused(other)),
             }
         }
