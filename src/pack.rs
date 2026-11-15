@@ -8663,6 +8663,54 @@ where
     Ok((written, kept, post_commit_ok))
 }
 
+/// ★WJ1 (RULINGS KA4 — a TEST SEAM, hidden; no key, no switch a user can reach, no existing name changed): the REAL
+/// transaction of the current lane (`CYS_PACK_DIR`) paused right after `pause_after` (a [`TxStep`] name: `Journaled`,
+/// `Installed`, `StateWritten`, `VersionWritten` — all after the backup) — `pause()` runs there (the test's other writer) —
+/// and then stopped before its commit in one of the two ways a stopped update ends: `writer_dies = false` → the writer's
+/// OWN failure path (the same [`rollback_and_settle_own`] `fail_before_commit` runs); `writer_dies = true` → it dies: no
+/// roll-back, and its journal's name is given a GONE identity (`j.<pid>.1.<id>` — what a dead writer of that pid leaves),
+/// so the next [`recover_pack_journal`] takes it. `Ok(())` = stopped as asked; `Err` = the transaction or its roll-back
+/// failed otherwise (the line).
+#[doc(hidden)]
+pub fn apply_pack_transactional_paused(
+    items: &[(&str, &str)],
+    target_version: &str,
+    state: &PackState,
+    pause_after: &str,
+    pause: &mut dyn FnMut(),
+    writer_dies: bool,
+) -> Result<(), String> {
+    let mut paused = false;
+    let r = apply_pack_transactional_steps(items, target_version, state, None, || Ok(()), &mut |s| {
+        if !paused && format!("{s:?}") == pause_after {
+            paused = true;
+            pause();
+            return false;
+        }
+        true
+    });
+    if !paused {
+        return Err(format!("[pack-journal] seam: the transaction did not reach {pause_after}: {r:?}"));
+    }
+    let me = JournalWriter::current();
+    let slot = pack_journal_dir().join(JOURNAL_SLOT);
+    let prefix = format!("j.{}.", me.tag());
+    let own = std::fs::read_dir(&slot)
+        .map_err(|e| format!("[pack-journal] seam: {} 목록 실패: {e}", slot.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&prefix)))
+        .ok_or_else(|| format!("[pack-journal] seam: no own journal {prefix}* in {}", slot.display()))?;
+    if writer_dies {
+        let name = own.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        let id = name.rsplit('.').next().unwrap_or_default();
+        std::fs::rename(&own, slot.join(format!("j.{}.1.{id}", me.pid)))
+            .map_err(|e| format!("[pack-journal] seam: relabel failed: {e}"))?;
+        return Ok(());
+    }
+    rollback_and_settle_own(&own)
+}
+
 pub fn role_directive_path(role: &str) -> Option<PathBuf> {
     // 접두 일치: reviewer-gemini / worker-2 같은 변형 역할도 표준 지침을 받는다
     let file = match role {
@@ -15638,6 +15686,88 @@ mod tests {
         assert!(!slot_left, "the slot must be gone");
         let d = m15da_diff(&b_state, &after);
         assert!(d.is_empty(), "the pack is not B's state entire after recovering A: {d:?}");
+    }
+
+    /// ★WJ1 T-b (RULINGS JV2 · AUTH-B1): a GENERAL file changed after the update's backup survives the roll-back — in the
+    /// three ways a stopped update ends: (1) it dies before ② (the journal is complete, nothing installed) and a seat edits
+    /// a file the update never touches (a plain write) and a file the update WILL change (on macOS through the repair
+    /// door's own placement primitive, the atomic exchange); (2) it dies after ② and a seat edits a file the update DID
+    /// change; (3) the writer's OWN failure before its commit with the edits made inside its pause. Each time the next
+    /// recovery puts back what the update wrote (the control `bin/selfheal.sh`, written by the update, untouched since)
+    /// and leaves every byte written after the backup. Red on base8: the roll-back wrote the backup over every entry.
+    #[test]
+    #[ignore = "WJ1 red on base8's roll-back — un-ignored with the fix"]
+    fn wj1_general_file_changed_after_the_backup_survives_the_rollback() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut failures: Vec<String> = Vec::new();
+        let memory_u = "U: a seat's edit of a file the update never touches\n";
+        let readme_u = "U: a seat's edit made after the update's backup\n";
+        // (1) dies after ① (Journaled), edits, recovery.
+        {
+            let (root, pd, _pre, _env) = t9r2_lane("wj1-b-1");
+            let _ = t9r2_stopped_apply(TxStep::Journaled);
+            t9_writers_gone();
+            std::fs::write(pd.join("memory/MEMORY.md"), memory_u).unwrap();
+            #[cfg(target_os = "macos")]
+            {
+                let staged = pd.join(".wj1-door-stage");
+                std::fs::write(&staged, readme_u).unwrap();
+                crate::repair::exchange::exchange(&pd.join("README.md"), &staged).unwrap();
+                let _ = std::fs::remove_file(&staged);
+            }
+            #[cfg(not(target_os = "macos"))]
+            std::fs::write(pd.join("README.md"), readme_u).unwrap();
+            let r = recover_pack_journal();
+            let mem = std::fs::read_to_string(pd.join("memory/MEMORY.md")).unwrap_or_default();
+            let readme = std::fs::read_to_string(pd.join("README.md")).unwrap_or_default();
+            if r != Ok(true) || mem != memory_u || readme != readme_u {
+                failures.push(format!("(1) r={r:?} memory={mem:?} readme={readme:?}"));
+            }
+            drop(_env);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (2) dies after ② (Installed: README v2 and selfheal v2 written by the update), a seat edits README, recovery.
+        {
+            let (root, pd, _pre, _env) = t9r2_lane("wj1-b-2");
+            let _ = t9r2_stopped_apply(TxStep::Installed);
+            t9_writers_gone();
+            let v2 = std::fs::read_to_string(pd.join("README.md")).unwrap_or_default();
+            std::fs::write(pd.join("README.md"), readme_u).unwrap();
+            let r = recover_pack_journal();
+            let readme = std::fs::read_to_string(pd.join("README.md")).unwrap_or_default();
+            let selfheal = std::fs::read_to_string(pd.join("bin/selfheal.sh")).unwrap_or_default();
+            if v2 != "README v2\n" || r != Ok(true) || readme != readme_u || selfheal != "#!/bin/sh\necho selfheal-v1\n" {
+                failures.push(format!("(2) v2={v2:?} r={r:?} readme={readme:?} selfheal={selfheal:?}"));
+            }
+            drop(_env);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (3) the writer's own failure right after ②, the edits made inside its pause.
+        {
+            let (root, pd, _pre, _env) = t9r2_lane("wj1-b-3");
+            let pdc = pd.clone();
+            let r = apply_pack_transactional_paused(
+                &t9r2_items(),
+                "0.15.1",
+                &test_free_state("0.15.1"),
+                "Installed",
+                &mut || {
+                    std::fs::write(pdc.join("memory/MEMORY.md"), memory_u).unwrap();
+                    std::fs::write(pdc.join("README.md"), readme_u).unwrap();
+                },
+                false,
+            );
+            let mem = std::fs::read_to_string(pd.join("memory/MEMORY.md")).unwrap_or_default();
+            let readme = std::fs::read_to_string(pd.join("README.md")).unwrap_or_default();
+            let selfheal = std::fs::read_to_string(pd.join("bin/selfheal.sh")).unwrap_or_default();
+            let slot_gone = !pack_journal_dir().join(JOURNAL_SLOT).exists();
+            if r.is_err() || mem != memory_u || readme != readme_u || selfheal != "#!/bin/sh\necho selfheal-v1\n" || !slot_gone {
+                failures.push(format!("(3) r={r:?} memory={mem:?} readme={readme:?} selfheal={selfheal:?} slot_gone={slot_gone}"));
+            }
+            drop(_env);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        assert!(failures.is_empty(), "WJ1 T-b:\n  {}", failures.join("\n  "));
     }
 
     /// GX1: every lane's journal is its own folder under `.pack-journal.d`, never the legacy shared folder.
