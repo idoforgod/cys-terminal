@@ -643,3 +643,48 @@ fn status_cannot_tell_the_completed_hook_operations_when_a_record_is_unreadable(
     let why = v["hook_ops_unreadable"].as_str().unwrap_or_default();
     assert!(why.starts_with("완료한 훅 작업을 확인할 수 없습니다 — ") && why.contains("broken.json"), "{v}");
 }
+
+/// RULINGS KF2 — `cys repair status R` of a RULE-DOCUMENT repair made in another lane (`dept-x`): its lanes
+/// are its origin's only (lane-local, the propagation's one predicate `lane_local`) — this lane's
+/// informational row is not counted as a lane of its propagation — and the row is shown in `lane_rows`
+/// with its sentence.
+#[test]
+fn status_of_a_rule_document_repair_counts_its_origin_lane_only() {
+    let r = rig("kf2-status");
+    let id = RepairId::parse("R-1").unwrap();
+    hook_only_in_force(&r, &id);
+    let mut rec = r.record_of("R-1");
+    rec.classification = Classification::RuleDocument;
+    rec.files = vec![ledger::FileChange {
+        rel: "directives/WORKER_DIRECTIVE.md".into(),
+        kind: ledger::ChangeKind::Edit,
+        pre: ledger::PreImage::Absent,
+        post: TargetState::Absent,
+        diff: None,
+    }];
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let row = ledger::LaneRecord {
+        schema: 1,
+        repair: id.clone(),
+        lane: r.lane.clone(),
+        state: LaneState::Pending,
+        probation: None,
+        merge: None,
+        merge_history: Vec::new(),
+        approval_ref: None,
+        conflict_live: Vec::new(),
+        applied: Vec::new(),
+        applied_history: Vec::new(),
+        merge_base: Vec::new(),
+        merge_lock: None,
+        merge_attempt: 0,
+        reason: cys::repair::propagate::RULE_DOCUMENT_ELSEWHERE.into(),
+        updated_at: T0,
+    };
+    ledger::write_lane_in(&r.root, &row).unwrap();
+    let v = status_hook_ops(&r, "R-1");
+    assert_eq!(v["lanes"], json!({"dept-x": "대기"}), "the origin only: {v}");
+    assert_eq!(v["propagation_complete"], false, "{v}");
+    let rows = v["lane_rows"].as_array().unwrap();
+    assert!(rows.iter().any(|x| x["lane"] == "base" && x["reason"] == cys::repair::propagate::RULE_DOCUMENT_ELSEWHERE), "{v}");
+}

@@ -12,6 +12,11 @@ use std::cell::Cell;
 use std::time::Duration;
 
 const T0: f64 = 1_800_000_000.0;
+
+thread_local! {
+    /// The time of the next `tick_with` (T0 unless a test moves it — KF1 counts rewrites by `updated_at`).
+    static TICK_NOW: Cell<f64> = const { Cell::new(T0) };
+}
 const HQ: &str = "base";
 const DEPT: &str = "dept-a";
 
@@ -299,7 +304,7 @@ fn tick_with(r: &Rig, which: &str, d: &Doubles, fresh: &str, faults: &dyn Faults
     let lock_file = r.base.join(".pack-apply.lock");
     let sources = sources_of(d);
     let env = LaneEnv {
-        op: OpEnv { root: &r.root, pack: &pack, lane: &l, now: T0, form: d.form.get(), faults, own_check: &|_, _| None },
+        op: OpEnv { root: &r.root, pack: &pack, lane: &l, now: TICK_NOW.with(|n| n.get()), form: d.form.get(), faults, own_check: &|_, _| None },
         check: &check,
         reference: &|_, _| Ok(CheckOutcome { result: CheckResult::Pass, ms: d.reference_ms.get() }),
         classify: &classify,
@@ -2002,6 +2007,7 @@ const WRITE_SITES: &[(&str, &str, usize, &str, &str)] = &[
     ("full_reset", "write_job_state(", 2, "the instance pass", "I8 steps 1 and 4"),
     ("hook_step", "(env.hooks)(", 1, "unit (b)", "inside T6's hook step — its write-ahead record, tombstone and registrar run are classified by T6's own write census"),
     ("note_reason", "update_row(", 1, "the reason note", "inside the tried lock; the reason text only (IK2); validated by no stamp by design"),
+    ("note_rule_document", "write_row_if(", 1, "the rule-document note (KF2)", "a rule-document repair of ANOTHER lane: its one informational row (대기, nothing applied) — compare-and-write under the per-repair mutex; no decision, no stamp, never the pack"),
     ("publish", "write_row_if(", 1, "unit (c)", "every row the tick and `recheck` publish, after the stamp held (IV1 / IQ1)"),
     ("record_hook_trace", "write_row_if(", 1, "unit (b)", "JA1: the trace of a hook unit that BEGAN writing — inside the unit's own lock, no stamp (it records what THIS lane changed)"),
     ("replace_pack_instance", ".create_new(true)", 1, "the instance pass", "I8 step 3: the new id created NEW"),
@@ -2504,6 +2510,89 @@ fn a_target_over_the_limit_ends_its_repairs_turn_and_the_next_job_runs() {
     };
     let rep = crate::repair::probation::run_tick(&job, false).unwrap();
     assert!(!rep.deferred_probation && !rep.deferred_sweep, "{rep:?}");
+}
+
+// ───────────────────────────── RULINGS KF1 / KF2 (the delta check of the rebase) ─────────────────────────────
+
+/// RULINGS KF1 — an APPROVAL-class repair made in HQ whose receiving file in DEPT is over the engine's read
+/// limit: the first tick publishes its 충돌 row (the sentence names the limit) and logs it once; more
+/// ticks at later times — the same file, repair and generation, and a "restart" (a fresh tick has no
+/// memory) — rewrite nothing (the row's bytes, `updated_at` included, stay) and log nothing; a CHANGED
+/// observation (the file grew) is evaluated again — one more write, one more line.
+#[test]
+fn the_same_over_limit_observation_of_an_approval_class_repair_is_published_once() {
+    use crate::repair::durable::RECORD_READ_CAP as CAP;
+    let r = rig("kf1");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::BootCritical, "hooks/x.sh", Some((b"#!/bin/sh\nold\n", 0o755)), Some((b"#!/bin/sh\nnew\n", 0o755)));
+    r.put(DEPT, "hooks/x.sh", b"#!/bin/sh\nold\n", 0o755);
+    let live = r.dept.join("hooks/x.sh");
+    std::fs::OpenOptions::new().write(true).open(&live).unwrap().set_len(CAP + 1).unwrap();
+    let path = ledger::lane_path_in(&r.root, &id, &lane(DEPT));
+    let lines = |t: &TickReport| t.rows.iter().filter(|(i, _, _)| *i == id).count();
+    let mut published = Vec::new();
+    for (k, at) in [T0, T0 + 120.0, T0 + 240.0, T0 + 3600.0].into_iter().enumerate() {
+        TICK_NOW.with(|n| n.set(at));
+        let t = tick(&r, DEPT, &doubles(), &fid(1));
+        published.push(lines(&t));
+        let row = r.row(&id, DEPT).unwrap();
+        assert_eq!(row.state, LaneState::Conflict, "tick {k}: {t:?}");
+        assert!(row.reason.contains(&(CAP + 1).to_string()), "tick {k}: {}", row.reason);
+        assert_eq!(row.updated_at, T0, "tick {k}: the row was not rewritten");
+    }
+    let first = std::fs::read(&path).unwrap();
+    assert_eq!(published, vec![1, 0, 0, 0], "one log line for one observation");
+    // the observation changes: evaluated again
+    std::fs::OpenOptions::new().write(true).open(&live).unwrap().set_len(CAP + 2).unwrap();
+    TICK_NOW.with(|n| n.set(T0 + 7200.0));
+    let t = tick(&r, DEPT, &doubles(), &fid(1));
+    TICK_NOW.with(|n| n.set(T0));
+    assert_eq!(lines(&t), 1, "{t:?}");
+    let row = r.row(&id, DEPT).unwrap();
+    assert!(row.reason.contains(&(CAP + 2).to_string()) && row.updated_at == T0 + 7200.0, "{}", row.reason);
+    assert_ne!(std::fs::read(&path).unwrap(), first);
+    assert!(row.conflict_live.is_empty(), "nothing of the over-limit file recorded as a state (JH1)");
+}
+
+/// RULINGS KF2 — a committed RULE-DOCUMENT repair (`directives/WORKER_DIRECTIVE.md`, the record's class)
+/// made in HQ is never applied in DEPT, even with DEPT's file equal to the pre-image: the file is untouched,
+/// no operation, no check; ONE informational row (대기, nothing applied, the sentence), written once and
+/// logged once; DEPT's gate is not held by it and the catch-up completes. The control in the same tick: a
+/// general repair still propagates (검증됨).
+#[test]
+fn a_rule_document_repair_is_never_applied_in_another_lane_and_said_once() {
+    let r = rig("kf2");
+    let (doc, gen) = (rid("R-1"), rid("R-2"));
+    let rel = "directives/WORKER_DIRECTIVE.md";
+    committed_in_hq(&r, &doc, Classification::RuleDocument, rel, Some((b"# rules v1\n", 0o644)), Some((b"# rules v2\n", 0o644)));
+    committed_in_hq(&r, &gen, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, rel, b"# rules v1\n", 0o644);
+    r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    let m0 = r.mtime(DEPT, rel);
+    let d = doubles();
+    let t = tick(&r, DEPT, &d, &fid(1));
+    assert_eq!(std::fs::read(r.dept.join(rel)).unwrap(), b"# rules v1\n", "the document is untouched");
+    assert_eq!(r.mtime(DEPT, rel), m0);
+    assert!(r.ops(&doc).iter().all(|o| o.lane_key != lane(DEPT)), "no operation in the lane");
+    let row = r.row(&doc, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Pending);
+    assert_eq!(row.reason, RULE_DOCUMENT_ELSEWHERE);
+    assert!(row.applied.is_empty() && row.probation.is_none() && row.merge_lock.is_none());
+    assert_eq!(t.rows.iter().filter(|(i, _, _)| *i == doc).count(), 1, "said once: {t:?}");
+    assert_eq!(r.row(&gen, DEPT).unwrap().state, LaneState::Verified, "the control propagates");
+    assert!(t.catchup_completed, "the catch-up does not wait for it: {t:?}");
+    assert_eq!(gate_verdict_in(&r.root, &lane(DEPT)), GateVerdict::Open);
+    assert!(!in_force_for_lane(&r.root, &lane(DEPT)).unwrap().iter().any(|x| x.id == doc), "not this lane's repair");
+    assert!(in_force_for_lane(&r.root, &lane(HQ)).unwrap().iter().any(|x| x.id == doc), "its origin's");
+    // written once per state: a later tick writes and logs nothing
+    let bytes = std::fs::read(ledger::lane_path_in(&r.root, &doc, &lane(DEPT))).unwrap();
+    TICK_NOW.with(|n| n.set(T0 + 600.0));
+    let t2 = tick(&r, DEPT, &d, &fid(1));
+    TICK_NOW.with(|n| n.set(T0));
+    assert_eq!(std::fs::read(ledger::lane_path_in(&r.root, &doc, &lane(DEPT))).unwrap(), bytes);
+    assert!(!t2.rows.iter().any(|(i, _, _)| *i == doc), "{t2:?}");
+    // `recheck` in DEPT refuses it: not this lane's repair
+    assert!(matches!(recheck(&r, &doc, &d, 5, ""), Err(RepairError::Precondition(_))));
 }
 
 // ───────────────────────────── RULINGS JD2 / JI1 — what a lane's hook unit did, READ from its record ─────────────────────────────
