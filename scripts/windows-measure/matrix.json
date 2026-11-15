@@ -46,6 +46,12 @@
    "pack"
   ]
  },
+ "unit_source_markers": {
+  "T9": [
+   "src/pack.rs",
+   "fn t9_r2_two_starters_exactly_one_admitted"
+  ]
+ },
  "scenario": {
   "listed_changed": [
    "bin/javis_bootstrap.py",
@@ -453,7 +459,7 @@
    "cmd": "REM tw1 next-version marker (TNV build only, never committed)"
   }
  },
- "expected_top_rows": 77,
+ "expected_top_rows": 78,
  "order": [
   "s0_env",
   "s1_base",
@@ -476,6 +482,7 @@
   "s3_repair_flow",
   "s7_primitives",
   "s7_t9_libtests",
+  "s7_w3_bootstep",
   "s5_checklist",
   "s6_variants",
   "s6_inplace",
@@ -641,6 +648,14 @@
    "leaves_state": "same",
    "read_only": true,
    "does": "OS primitives in a scratch folder with the installed bash / Python as holders: G06, G16.prim, EC2.prim, EC4.prim, T7C.prim, G09.flush, G09.kill, T9's directory moves"
+  },
+  "s7_w3_bootstep": {
+   "stage": "S7",
+   "time_limit_s": 1800,
+   "requires_state": "updated",
+   "leaves_state": "same",
+   "read_only": false,
+   "does": "RULINGS JG1 / plan W3: the boot chain's step 1 (`javis_preflight.py --fix` to a pipe, the supervisor's environment) under cp949 streams - today, [A] UTF-8 mode, [B] backslashreplace, [C] the W-A4 block; recorded"
   },
   "s7_t9_libtests": {
    "stage": "S7",
@@ -1943,7 +1958,15 @@
        "id": "prev",
        "role": "check",
        "fact": "p9_prev_left",
-       "op": "empty"
+       "op": "empty",
+       "text": "RULINGS JG3: the installer's own <bin>.prev*.exe"
+      },
+      {
+       "id": "prev-other",
+       "role": "check",
+       "fact": "p9_prev_other",
+       "op": "present",
+       "text": "recorded: other *.prev* names - the daemon's state (queue-blocked.prev.json, since 0.14.43)"
       },
       {
        "id": "new-exe",
@@ -9609,6 +9632,45 @@
      ],
      "class": "YES",
      "phase": 1
+    },
+    {
+     "id": "T5C-JUDGES.runtime-write",
+     "kind": "record",
+     "probe": "s3_judges",
+     "needs_units": [
+      "T5c"
+     ],
+     "title": "RULINGS JG2 (GAPS G25, information only): a seat's plain write of sitecustomize.py into the bundled runtime's folder - Write and a Bash redirect, worker and reviewer, through role-capability-gate / pack-guard / guard (judged, never done)",
+     "checks": [
+      {
+       "id": "results",
+       "role": "check",
+       "fact": "jg2_results",
+       "op": "present",
+       "text": "recorded: per role x tool x hook - exit, deny, reason"
+      },
+      {
+       "id": "worker-write",
+       "role": "check",
+       "fact": "jg2_any_refused_worker_write",
+       "op": "present"
+      },
+      {
+       "id": "worker-bash",
+       "role": "check",
+       "fact": "jg2_any_refused_worker_bash",
+       "op": "present"
+      },
+      {
+       "id": "nothing-written",
+       "role": "check",
+       "fact": "jg2_target_absent_after",
+       "op": "true",
+       "text": "the probe only asks the hooks; nothing is written"
+      }
+     ],
+     "class": "YES",
+     "phase": 1
     }
    ],
    "kind": "assert",
@@ -10311,13 +10373,20 @@
     {
      "id": "T9-JOURNAL-TAKE.prim",
      "probe": "s7_primitives",
-     "title": "the no-replace directory move T9's protocol uses (MoveFileExW, WRITE_THROUGH, no REPLACE) on folders: to a free name, onto an empty / a non-empty folder, with a file inside held without delete sharing, after release",
+     "title": "the no-replace directory move T9's protocol uses (MoveFileExW, WRITE_THROUGH, no REPLACE) on folders: to a free name, onto an empty / a non-empty folder, with a file inside held without delete sharing; after the holder is KILLED a timed series of takes (0, 0.5, 1, 2, 5, 10, 30 s) with the Restart Manager's holders at each failure; control: a holder that closes the file and exits by itself",
      "checks": [
       {
        "id": "held",
        "role": "complete",
        "fact": "t9d_held",
        "op": "true"
+      },
+      {
+       "id": "dead",
+       "role": "complete",
+       "fact": "t9d_holder_dead",
+       "op": "true",
+       "text": "the killed holder was gone before the series started"
       },
       {
        "id": "free",
@@ -10358,10 +10427,58 @@
        "op": "true"
       },
       {
-       "id": "after-release",
+       "id": "held-holders",
        "role": "check",
+       "fact": "t9d_held_holders",
+       "op": "present",
+       "text": "recorded: who the Restart Manager says holds the file (None = the look-up failed)"
+      },
+      {
+       "id": "series",
+       "role": "check",
+       "fact": "t9d_release_attempts",
+       "op": "present",
+       "text": "recorded: every take of the series with its error and the holders"
+      },
+      {
+       "id": "first-ok",
+       "role": "check",
+       "fact": "t9d_release_first_ok_s",
+       "op": "present",
+       "text": "recorded: seconds from the holder's death to the first successful take (None = not within 30 s)"
+      },
+      {
+       "id": "within-30",
+       "role": "check",
+       "fact": "t9d_after_release_ok_by_30s",
+       "op": "true",
+       "text": "the next entry takes the folder after the holder is gone"
+      },
+      {
+       "id": "at-once",
+       "role": "assumption",
        "fact": "t9d_after_release_ok",
+       "op": "true",
+       "assumption": "minor #141: the folder can be taken at once after the holder is gone - if not, a settle that runs right after a holder exits fails transiently"
+      },
+      {
+       "id": "ctl-closed",
+       "role": "complete",
+       "fact": "t9d_ctl_closed",
        "op": "true"
+      },
+      {
+       "id": "ctl-exited",
+       "role": "complete",
+       "fact": "t9d_ctl_exited",
+       "op": "true"
+      },
+      {
+       "id": "ctl-series",
+       "role": "check",
+       "fact": "t9d_ctl_first_ok_s",
+       "op": "present",
+       "text": "recorded: the same series after a holder that closed the file itself"
       }
      ],
      "class": "YES",
@@ -10513,6 +10630,242 @@
    "checks": [],
    "class": "WAIT",
    "probe": null
+  },
+  {
+   "id": "W3-BOOTSTEP",
+   "group": "ruling",
+   "kind": "record",
+   "probe": "s7_w3_bootstep",
+   "title": "the boot chain's step 1 (`javis_preflight.py --fix` to a pipe, without UTF-8 mode) under cp949 streams: today, [A] PYTHONUTF8=1, [B] backslashreplace, [C] the W-A4 block (RULINGS JG1, plan W3 section 3)",
+   "source": "RULINGS JG1; impl/plans/W3.md section 3; javis_bootstrap.py:3594; javis_preflight.py:11981; boot_supervisor.rs:1784-1863",
+   "why": "a hosted runner's ANSI code page is 1252: cp949 is applied to the streams only (PYTHONIOENCODING) - open()'s default and subprocess decoding stay 1252, so the plan's settings-rewrite and decoding cases are not reproduced; recorded, no verdict yet",
+   "expected": "recorded: D0 red (exit 1, \\u2014) today; D-A, D-B, D-C green; D-B-literal keeps the locale's encoding and sets only the handler",
+   "checks": [
+    {
+     "id": "preflight",
+     "role": "complete",
+     "fact": "w3_preflight_present",
+     "op": "true"
+    },
+    {
+     "id": "locale",
+     "role": "check",
+     "fact": "w3_locale_encoding",
+     "op": "present"
+    },
+    {
+     "id": "dbl-encoding",
+     "role": "check",
+     "fact": "w3_dbl_stdout_encoding",
+     "op": "present"
+    },
+    {
+     "id": "dbl-errors",
+     "role": "check",
+     "fact": "w3_dbl_stdout_errors",
+     "op": "present"
+    },
+    {
+     "id": "dbl-keeps-locale",
+     "role": "check",
+     "fact": "w3_dbl_keeps_locale",
+     "op": "present"
+    },
+    {
+     "id": "d0-rc",
+     "role": "check",
+     "fact": "w3_d0_rc",
+     "op": "present"
+    },
+    {
+     "id": "d0-secs",
+     "role": "check",
+     "fact": "w3_d0_secs",
+     "op": "present"
+    },
+    {
+     "id": "d0-traceback",
+     "role": "check",
+     "fact": "w3_d0_traceback",
+     "op": "present"
+    },
+    {
+     "id": "d0-encode_error_char",
+     "role": "check",
+     "fact": "w3_d0_encode_error_char",
+     "op": "present"
+    },
+    {
+     "id": "d0-result_lines_dash",
+     "role": "check",
+     "fact": "w3_d0_result_lines_dash",
+     "op": "present"
+    },
+    {
+     "id": "d0-result_lines_escaped",
+     "role": "check",
+     "fact": "w3_d0_result_lines_escaped",
+     "op": "present"
+    },
+    {
+     "id": "d0-summary",
+     "role": "check",
+     "fact": "w3_d0_summary",
+     "op": "present"
+    },
+    {
+     "id": "d0-replacement_chars",
+     "role": "check",
+     "fact": "w3_d0_replacement_chars",
+     "op": "present"
+    },
+    {
+     "id": "da-rc",
+     "role": "check",
+     "fact": "w3_da_rc",
+     "op": "present"
+    },
+    {
+     "id": "da-secs",
+     "role": "check",
+     "fact": "w3_da_secs",
+     "op": "present"
+    },
+    {
+     "id": "da-traceback",
+     "role": "check",
+     "fact": "w3_da_traceback",
+     "op": "present"
+    },
+    {
+     "id": "da-encode_error_char",
+     "role": "check",
+     "fact": "w3_da_encode_error_char",
+     "op": "present"
+    },
+    {
+     "id": "da-result_lines_dash",
+     "role": "check",
+     "fact": "w3_da_result_lines_dash",
+     "op": "present"
+    },
+    {
+     "id": "da-result_lines_escaped",
+     "role": "check",
+     "fact": "w3_da_result_lines_escaped",
+     "op": "present"
+    },
+    {
+     "id": "da-summary",
+     "role": "check",
+     "fact": "w3_da_summary",
+     "op": "present"
+    },
+    {
+     "id": "da-replacement_chars",
+     "role": "check",
+     "fact": "w3_da_replacement_chars",
+     "op": "present"
+    },
+    {
+     "id": "db-rc",
+     "role": "check",
+     "fact": "w3_db_rc",
+     "op": "present"
+    },
+    {
+     "id": "db-secs",
+     "role": "check",
+     "fact": "w3_db_secs",
+     "op": "present"
+    },
+    {
+     "id": "db-traceback",
+     "role": "check",
+     "fact": "w3_db_traceback",
+     "op": "present"
+    },
+    {
+     "id": "db-encode_error_char",
+     "role": "check",
+     "fact": "w3_db_encode_error_char",
+     "op": "present"
+    },
+    {
+     "id": "db-result_lines_dash",
+     "role": "check",
+     "fact": "w3_db_result_lines_dash",
+     "op": "present"
+    },
+    {
+     "id": "db-result_lines_escaped",
+     "role": "check",
+     "fact": "w3_db_result_lines_escaped",
+     "op": "present"
+    },
+    {
+     "id": "db-summary",
+     "role": "check",
+     "fact": "w3_db_summary",
+     "op": "present"
+    },
+    {
+     "id": "db-replacement_chars",
+     "role": "check",
+     "fact": "w3_db_replacement_chars",
+     "op": "present"
+    },
+    {
+     "id": "dc-rc",
+     "role": "check",
+     "fact": "w3_dc_rc",
+     "op": "present"
+    },
+    {
+     "id": "dc-secs",
+     "role": "check",
+     "fact": "w3_dc_secs",
+     "op": "present"
+    },
+    {
+     "id": "dc-traceback",
+     "role": "check",
+     "fact": "w3_dc_traceback",
+     "op": "present"
+    },
+    {
+     "id": "dc-encode_error_char",
+     "role": "check",
+     "fact": "w3_dc_encode_error_char",
+     "op": "present"
+    },
+    {
+     "id": "dc-result_lines_dash",
+     "role": "check",
+     "fact": "w3_dc_result_lines_dash",
+     "op": "present"
+    },
+    {
+     "id": "dc-result_lines_escaped",
+     "role": "check",
+     "fact": "w3_dc_result_lines_escaped",
+     "op": "present"
+    },
+    {
+     "id": "dc-summary",
+     "role": "check",
+     "fact": "w3_dc_summary",
+     "op": "present"
+    },
+    {
+     "id": "dc-replacement_chars",
+     "role": "check",
+     "fact": "w3_dc_replacement_chars",
+     "op": "present"
+    }
+   ],
+   "phase": 1,
+   "class": "PARTLY"
   }
  ]
 }

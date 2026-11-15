@@ -177,7 +177,9 @@ def _registered_alive(work):
 def _units(m, ctx):
     ml = ctx.get("merge_log") or {}
     beh = ctx.get("units_behaviour") or {}
-    return {u: {"merge_log": ml.get(u), "behaviour": beh.get(u), "has_marker": u in m.get("unit_markers", {})}
+    marked = set(m.get("unit_markers", {})) | set(m.get("unit_source_markers", {}))
+    return {u: {"merge_log": ml.get(u), "behaviour": beh.get(u), "has_marker": u in marked,
+                "source_marker": u in m.get("unit_source_markers", {})}
             for u in m["units"]}
 
 

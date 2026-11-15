@@ -60,7 +60,7 @@ C = lambda cid, role, fact, op, **kw: dict({"id": cid, "role": role, "fact": fac
 class MatrixTests(unittest.TestCase):
     def test_real_matrix_is_valid(self):
         m = R.load_matrix(MATRIX)
-        self.assertEqual(len(m["rows"]), 77)
+        self.assertEqual(len(m["rows"]), 78)
 
     def test_class_counts_match_the_approved_plan(self):
         m = load()
@@ -73,7 +73,8 @@ class MatrixTests(unittest.TestCase):
         # RULINGS HK2 (2) / HL1: +1 PARTLY (I-CLEAR-CHAIN)
         # push 4 (T6 in the tree from d00f4075): G15 WAIT -> PARTLY (timing now, no-false-revert with T5b);
         # I-AUTOOFF, R-T0-TS, R-T6-TICKSHELL WAIT -> YES (driven now; the first two stop at commit until T5b)
-        self.assertEqual(counts, {"YES": 35, "PARTLY": 27, "NO": 8, "WAIT": 7})
+        # push 5 (RULINGS JG1): +1 PARTLY (W3-BOOTSTEP, recorded)
+        self.assertEqual(counts, {"YES": 35, "PARTLY": 28, "NO": 8, "WAIT": 7})
 
     def test_every_required_row_exists_once(self):
         ids = [r["id"] for r, _ in R.iter_rows(load())]
@@ -951,6 +952,55 @@ class ReleaseBlockingRowTests(unittest.TestCase):
         self.assertEqual(subs["T9-JOURNAL-TAKE.shipped"]["class"], "NO")
         import tw1_probes as P
         self.assertEqual(len(P.T9_EXPECTED_TESTS), 22)
+
+    def test_push5_probe_fixes(self):
+        """RULINGS JG3: the four probe faults of run 4."""
+        import tw1_probes as P
+        # G02.P9 judges only the installer's own <bin>.prev*.exe
+        p9 = next(s for s in self._row("G02")["subrows"] if s["id"] == "G02.P9")
+        prev = next(c for c in p9["checks"] if c["id"] == "prev")
+        self.assertEqual((prev["fact"], prev["op"]), ("p9_prev_left", "empty"))
+        with open(P.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('f["p9_prev_left"] = _exes(pr, "*.prev*.exe")', src)
+        # the seat command line keeps a spaced argument one word
+        self.assertEqual(P._pane_quote("tw1 repair flow", "native"), "'tw1 repair flow'")
+        self.assertEqual(P._pane_quote("it's", "bash"), "'it'\\''s'")
+        self.assertEqual(P._pane_quote("--note", "bash"), "--note")
+        # T9's presence by the tree: a source marker decides over the merge log
+        units = {"T9": {"merge_log": False, "behaviour": True, "has_marker": True, "source_marker": True}}
+        self.assertEqual(R.unit_status("T9", units), "present")
+        units["T9"]["behaviour"] = None
+        self.assertEqual(R.unit_status("T9", units), "unknown")
+        units = {"T6": {"merge_log": False, "behaviour": True, "has_marker": True}}
+        self.assertEqual(R.unit_status("T6", units), "disagree")
+        self.assertEqual(load()["unit_source_markers"]["T9"][0], "src/pack.rs")
+        # T9-JOURNAL-TAKE.prim: the timed series, the holders, a control; at-once is an assumption (minor #141)
+        prim = next(s for s in self._row("T9-JOURNAL-TAKE")["subrows"] if s["id"] == "T9-JOURNAL-TAKE.prim")
+        roles = {c["id"]: c["role"] for c in prim["checks"]}
+        self.assertEqual(roles["at-once"], "assumption")
+        self.assertEqual(roles["within-30"], "check")
+        self.assertEqual(P.TAKE_SERIES_AT_S[0], 0.0)
+        self.assertEqual(P.TAKE_SERIES_AT_S[-1], 30.0)
+
+    def test_jg2_and_w3_rows(self):
+        import tw1_probes as P
+        rw = next(s for s in self._row("T5C-JUDGES")["subrows"] if s["id"] == "T5C-JUDGES.runtime-write")
+        self.assertEqual(rw["kind"], "record")
+        w3 = self._row("W3-BOOTSTEP")
+        self.assertEqual((w3["kind"], w3["probe"]), ("record", "s7_w3_bootstep"))
+        self.assertEqual([x[0] for x in P.W3_LEGS], ["d0", "da", "db", "dc"])
+        self.assertNotIn("PYTHONUTF8", dict(P.W3_LEGS[0][1]))
+        self.assertEqual(dict(P.W3_LEGS[1][1]), {"PYTHONUTF8": "1"})
+        out = ("[PASS] C01 \u2014 ok\n[WARN] C02 \u2014 x\nTraceback (most recent call last):\n"
+               "UnicodeEncodeError: 'cp949' codec can't encode character '\\u2014' in position 3\n")
+        fx = P.w3_output_facts(out)
+        self.assertEqual((fx["result_lines_dash"], fx["traceback"], fx["encode_error_char"], fx["summary"]),
+                         (2, True, "\\u2014", False))
+        fx = P.w3_output_facts("[PASS] C01 \\u2014 ok\npreflight: READY \u2014 FAIL 0\n")
+        self.assertEqual((fx["result_lines_escaped"], fx["summary"]), (1, True))
+        m = load()
+        self.assertLess(m["order"].index("s7_w3_bootstep"), m["order"].index("s5_checklist"))
 
     def test_clear_chain_candidate_must_be_no_weaker(self):
         cases = {"missing": [None, False], "good1": ["T1", True], "good2": ["T2", True], "stale": ["T2", True],

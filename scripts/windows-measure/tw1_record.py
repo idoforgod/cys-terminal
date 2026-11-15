@@ -62,6 +62,8 @@ REQUIRED_ROWS = tuple("G%02d" % i for i in range(1, 17)) + (
     "T9-JOURNAL-TAKE", "T5C-HANGUL",
     # the release-blocking Windows rows (RULINGS HK2 (2), HL1)
     "I-CLEAR-CHAIN",
+    # measurement push 5 (RULINGS JG1: plan W3's deciding observation, recorded)
+    "W3-BOOTSTEP",
 )
 
 # environment variables whose VALUE may appear in the record (RULINGS EQ6); every other name is listed without its value
@@ -294,7 +296,9 @@ def unit_status(unit, units):
         if log is None:
             return "unknown"
         return "present" if log else "absent"
-    if log is None:
+    if log is None or u.get("source_marker"):
+        # RULINGS JG3: a source marker reads the tree itself - it decides; the merge log is recorded only (T9 entered
+        # the push-4 tree without a `merge(...T9...)` subject)
         return "present" if beh else "absent"
     if beh == log:
         return "present" if beh else "absent"

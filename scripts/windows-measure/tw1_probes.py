@@ -761,6 +761,15 @@ def probe_s0_env(pr):
     f["merge_log"] = units
     pr.ctx_updates["merge_log"] = units
     pr.ev("merge-log.json", {"units": units, "info": info})
+    # RULINGS JG3: a unit whose commits enter the tree without a `merge(...<unit>...)` subject (T9 in push 4) is
+    # decided by the tree itself - a source marker (file, text) - as T6 / T5b / T7b are by their CLI answer.
+    src_beh = {}
+    for unit, (rel, needle) in sorted((m.get("unit_source_markers") or {}).items()):
+        txt = read_text(os.path.join(REPO, *rel.split("/")))
+        src_beh[unit] = None if txt is None else (needle in txt)
+        f["source_marker_" + unit] = src_beh[unit]
+    if src_beh:
+        pr.ctx_updates["units_behaviour"] = src_beh
     # ── versions at this commit ──
     try:
         with open(os.path.join(REPO, "src-tauri", "tauri.conf.json"), encoding="utf-8") as fh:
@@ -1586,7 +1595,7 @@ def probe_s3_cli(pr):
     f["status_exit"] = s["code"]
     f["status_has_sentence"] = bool(sentence) and sentence in (s["out"] + s["err"])
     ni = _source_const("src/repair/mod.rs", "NOT_IMPLEMENTED_KO")
-    beh = {}
+    beh = dict(pr.ctx.get("units_behaviour") or {})      # the source markers of stage S0 stay (RULINGS JG3)
     for unit, argv in m["unit_markers"].items():
         r = pr.ev_cmd("marker-%s.json" % unit, pr.cys(argv, timeout=60))
         absent = r["code"] == 99 and bool(ni) and ni in (r["out"] + r["err"])
@@ -2055,6 +2064,69 @@ def _wait_dead(pid, limit):
         kill_tree(pid)
 
 
+# ── RULINGS JG3: who holds a file (the Restart Manager), and a timed series of takes after a holder is gone ──
+TAKE_SERIES_AT_S = (0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0)
+
+if IS_WIN:
+    class _RmUniqueProcess(ctypes.Structure):
+        _fields_ = [("dwProcessId", wt.DWORD), ("ProcessStartTime", wt.FILETIME)]
+
+    class _RmProcessInfo(ctypes.Structure):
+        _fields_ = [("Process", _RmUniqueProcess), ("strAppName", wt.WCHAR * 256), ("strServiceShortName", wt.WCHAR * 64),
+                    ("ApplicationType", ctypes.c_int), ("AppStatus", wt.ULONG), ("TSSessionId", wt.DWORD),
+                    ("bRestartable", wt.BOOL)]
+
+
+def rm_holders(paths):
+    """[{pid, app, type}] of the processes the Restart Manager says hold any of `paths`; None = the look-up failed."""
+    if not IS_WIN:
+        return None
+    try:
+        rm = ctypes.WinDLL("rstrtmgr")
+        h = wt.DWORD()
+        key = ctypes.create_unicode_buffer(33)
+        if rm.RmStartSession(ctypes.byref(h), 0, key) != 0:
+            return None
+        try:
+            arr = (wt.LPCWSTR * len(paths))(*[str(x) for x in paths])
+            if rm.RmRegisterResources(h, len(paths), arr, 0, None, 0, None) != 0:
+                return None
+            needed, count, reasons = wt.UINT(0), wt.UINT(0), wt.DWORD(0)
+            rc = rm.RmGetList(h, ctypes.byref(needed), ctypes.byref(count), None, ctypes.byref(reasons))
+            if rc == 0:
+                return []
+            if rc != 234:          # ERROR_MORE_DATA
+                return None
+            infos = (_RmProcessInfo * needed.value)()
+            count = wt.UINT(needed.value)
+            if rm.RmGetList(h, ctypes.byref(needed), ctypes.byref(count), infos, ctypes.byref(reasons)) != 0:
+                return None
+            return [{"pid": int(infos[i].Process.dwProcessId), "app": infos[i].strAppName,
+                     "type": int(infos[i].ApplicationType)} for i in range(count.value)]
+        finally:
+            rm.RmEndSession(h)
+    except Exception:  # noqa: BLE001 - recorded as "look-up failed"
+        return None
+
+
+def _take_series(src, dst, inside, flags):
+    """Move `src` to `dst` at TAKE_SERIES_AT_S seconds from now, stopping at the first success; at every failure ask
+    the Restart Manager who holds a file inside. -> {attempts: [{t, ok, error, holders}], first_ok_s}."""
+    t0 = time.monotonic()
+    attempts, first_ok = [], None
+    for at in TAKE_SERIES_AT_S:
+        wait = at - (time.monotonic() - t0)
+        if wait > 0:
+            time.sleep(wait)
+        r = _move(src, dst, flags)
+        t = round(time.monotonic() - t0, 2)
+        attempts.append({"t": t, "ok": r["ok"], "error": r["error"], "holders": None if r["ok"] else rm_holders(inside)})
+        if r["ok"]:
+            first_ok = t
+            break
+    return {"attempts": attempts, "first_ok_s": first_ok}
+
+
 def probe_s7_primitives(pr):
     """G06, G16.prim (+ the 50 two-move gaps), EC2.prim, EC4.prim, T7C.prim, G09.flush, G09.kill - observations only."""
     f = pr.facts
@@ -2113,7 +2185,8 @@ def probe_s7_primitives(pr):
     f["t9d_onto_nonempty_unchanged"] = os.path.isfile(os.path.join(b, "index.json")) and os.path.isfile(os.path.join(td, "slot-full", "index.json"))
     # a file inside held open WITHOUT delete sharing (a scanner, an editor): the take must fail and touch nothing ...
     c = jdir("j.3.c", ("index.json", "backup.bin"))
-    hcode = "import time\nf=open(r'%s','rb')\nprint('held', flush=True)\ntime.sleep(300)\n" % os.path.join(c, "backup.bin")
+    inside = [os.path.join(c, "backup.bin"), os.path.join(c, "index.json")]
+    hcode = "import time\nf=open(r'%s','rb')\nprint('held', flush=True)\ntime.sleep(300)\n" % inside[0]
     hout = os.path.join(pr.ev_dir, "t9d-holder.out")
     hp = start_detached([py, "-B", "-c", hcode], env=clean_env(), stdout_path=hout)
     pr.register_pid(hp, "t9d holder")
@@ -2121,16 +2194,44 @@ def probe_s7_primitives(pr):
     while time.time() - t0 < 15 and not (read_text(hout) or "").startswith("held"):
         time.sleep(0.5)
     f["t9d_held"] = (read_text(hout) or "").startswith("held")
+    f["t9d_held_holders"] = rm_holders(inside)            # control of the look-up: the holder must be named
     r = _move(c, os.path.join(td, "r.3.c"), _WT)
     f["t9d_held_ok"], f["t9d_held_error"] = r["ok"], r["error"]
-    f["t9d_held_nothing_touched"] = (os.path.isfile(os.path.join(c, "backup.bin")) and os.path.isfile(os.path.join(c, "index.json"))
+    f["t9d_held_nothing_touched"] = (os.path.isfile(inside[0]) and os.path.isfile(inside[1])
                                      and not os.path.exists(os.path.join(td, "r.3.c")))
+    # ... the holder KILLED (a crashed tool): when is the folder movable again? (RULINGS JG3 - minor #141's question)
+    t_kill = time.monotonic()
     kill_tree(hp)
     pr.unregister_pid(hp)
     _wait_dead(hp, 10)
-    # ... and once the holder is gone the next entry takes it
-    r = _move(c, os.path.join(td, "r.3.c"), _WT)
-    f["t9d_after_release_ok"], f["t9d_after_release_error"] = r["ok"], r["error"]
+    f["t9d_holder_dead"] = not alive(hp)
+    f["t9d_holder_dead_after_s"] = round(time.monotonic() - t_kill, 2)
+    series = _take_series(c, os.path.join(td, "r.3.c"), inside, _WT)
+    pr.ev("t9d-release-series.json", series)
+    f["t9d_release_attempts"] = series["attempts"]
+    f["t9d_release_first_ok_s"] = series["first_ok_s"]
+    f["t9d_after_release_ok"] = bool(series["attempts"]) and series["attempts"][0]["ok"]
+    f["t9d_after_release_error"] = series["attempts"][0]["error"] if series["attempts"] else None
+    f["t9d_after_release_ok_by_30s"] = series["first_ok_s"] is not None
+    # control: a holder that CLOSES the file itself and exits normally - the same series
+    d4 = jdir("j.4.d", ("index.json", "backup.bin"))
+    inside4 = [os.path.join(d4, "backup.bin"), os.path.join(d4, "index.json")]
+    ccode = ("import time\nf=open(r'%s','rb')\nprint('held', flush=True)\ntime.sleep(2)\nf.close()\n"
+             "print('closed', flush=True)\n" % inside4[0])
+    cout = os.path.join(pr.ev_dir, "t9d-ctl-holder.out")
+    cp = start_detached([py, "-B", "-c", ccode], env=clean_env(), stdout_path=cout)
+    pr.register_pid(cp, "t9d control holder")
+    t0 = time.time()
+    while time.time() - t0 < 20 and "closed" not in (read_text(cout) or ""):
+        time.sleep(0.2)
+    _wait_dead(cp, 10)
+    pr.unregister_pid(cp)
+    f["t9d_ctl_closed"] = "closed" in (read_text(cout) or "")
+    f["t9d_ctl_exited"] = not alive(cp)
+    cseries = _take_series(d4, os.path.join(td, "r.4.d"), inside4, _WT)
+    pr.ev("t9d-control-series.json", cseries)
+    f["t9d_ctl_attempts"] = cseries["attempts"]
+    f["t9d_ctl_first_ok_s"] = cseries["first_ok_s"]
     shutil.rmtree(td, ignore_errors=True)
     # ── G06: a running Git Bash script / an imported Python module, renamed, rewritten in place, replaced ──
     d = os.path.join(root, "g06")
@@ -3114,6 +3215,25 @@ def probe_s3_judges(pr):
     if os.path.lexists(dj):
         run(["cmd", "/c", "rmdir", dj], 30)
     f["dj_removed"] = not os.path.lexists(dj)
+    # RULINGS JG2 (information only, GAPS G25): does the guard refuse a seat's plain write of a file into the bundled
+    # runtime's folder (whose `._pth` imports site - a sitecustomize there runs inside every judge)? Judged, never done.
+    rt_target = os.path.join(os.path.dirname(pr.bundled_python()), "sitecustomize.py")
+    f["jg2_target_existed"] = os.path.exists(rt_target)
+    jg2 = {}
+    for role in ("worker", "reviewer-codex"):
+        for tool, tinput in (("Write", {"file_path": rt_target, "content": "x"}),
+                             ("Bash", {"command": "printf x > '%s'" % _msys(rt_target)})):
+            for hook in ("role-capability-gate.sh", "pack-guard.sh", "guard.sh"):
+                if not os.path.isfile(os.path.join(pack, "hooks", hook)):
+                    continue
+                tag = "jg2-%s-%s-%s" % (role, tool.lower(), hook.split(".")[0])
+                r = _hook(pr, hook, _payload(tool, tinput, pack), seat_env(pr, {"CYS_ROLE": role}), tag)
+                deny, reason = _deny_of(r["out"])
+                jg2[tag[4:]] = {"exit": r["code"], "deny": deny or r["code"] == 2, "reason": (reason or r["err"] or "")[:200]}
+    f["jg2_results"] = jg2
+    f["jg2_any_refused_worker_write"] = any(v["deny"] for k, v in jg2.items() if k.startswith("worker-write"))
+    f["jg2_any_refused_worker_bash"] = any(v["deny"] for k, v in jg2.items() if k.startswith("worker-bash"))
+    f["jg2_target_absent_after"] = f["jg2_target_existed"] or not os.path.exists(rt_target)
     pr.restored = f["dj_removed"]
 
 
@@ -3705,7 +3825,11 @@ def probe_s5_checklist(pr):
         time.sleep(1)
     f["p9_uninstall_exit"] = None if r is None else r["code"]
     f["p9_runtime_left"] = os.path.exists(os.path.join(pr.install_dir, "runtime"))
-    f["p9_prev_left"] = _exes(pr, "*.prev*")
+    # RULINGS JG3: the installer's own left-overs are `<bin>.prev*.exe` (checklist P9's text; PREUNINSTALL nsis-hooks
+    # `Delete "$INSTDIR\cys.prev*.exe"` ...). Other `*.prev*` names in the folder are the daemon's state (on Windows the
+    # state folder IS the install folder - e.g. queue-blocked.prev.json since 0.14.43): recorded, not judged.
+    f["p9_prev_left"] = _exes(pr, "*.prev*.exe")
+    f["p9_prev_other"] = sorted(set(_exes(pr, "*.prev*")) - set(f["p9_prev_left"]))
     f["p9_new_exe_left"] = _exes(pr, "*.new.exe")
     f["p9_failure_file_left"] = os.path.isfile(pr.exe("cys-install-failure.txt"))
     f["p9_marker_left"] = os.path.isfile(pr.exe("cys-installed-version.txt"))
@@ -4061,6 +4185,85 @@ def probe_s7_t9_libtests(pr):
     pr.restored = True
 
 
+# ── RULINGS JG1 / plan W3 section 3: the boot chain's step 1 as the boot supervisor runs it (RECORD only) ──
+# javis_bootstrap.py runs `[sys.executable, <pack>/bin/javis_preflight.py, "--fix"]` with capture_output + encoding
+# utf-8 / errors replace and the environment it inherits from the boot supervisor (boot_supervisor.rs: CYS_NO_AUTOSTART,
+# PYTHONDONTWRITEBYTECODE, no PYTHONUTF8). A Korean ANSI code page gives that pipe cp949 with the strict handler; the
+# runner's is 1252, so cp949 is set with PYTHONIOENCODING (the streams only - open() / subprocess defaults stay 1252).
+W3_LEGS = (
+    ("d0", {"PYTHONIOENCODING": "cp949"}, False),                       # today on a Korean Windows (red expected)
+    ("da", {"PYTHONUTF8": "1"}, False),                                 # [A] UTF-8 mode
+    ("db", {"PYTHONIOENCODING": "cp949:backslashreplace"}, False),      # [B] as it acts on a cp949 system
+    ("dc", {"PYTHONIOENCODING": "cp949"}, True),                        # [C] the W-A4 block, simulated by a wrapper
+)
+
+_W3_WA4_WRAPPER = r"""import os, runpy, sys
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+tool = sys.argv[1]
+sys.argv = [tool] + sys.argv[2:]
+sys.path.insert(0, os.path.dirname(os.path.abspath(tool)))
+runpy.run_path(tool, run_name="__main__")
+"""
+
+
+def w3_output_facts(text):
+    """What a step-1 output says: result lines (with the em dash, or its backslash escape), the summary, a traceback,
+    the UnicodeEncodeError's character, U+FFFD count."""
+    lines = (text or "").splitlines()
+    m_enc = re.search(r"can't encode character '(\\[ux][0-9a-fA-F]+|.)'", text or "")
+    return {"result_lines_dash": sum(1 for ln in lines if re.match(r"^\[[^\]]+\] \S+ — ", ln)),
+            "result_lines_escaped": sum(1 for ln in lines if re.match(r"^\[[^\]]+\] \S+ \\u2014 ", ln)),
+            "summary": any(ln.startswith(("preflight: ", "preflight[")) for ln in lines),
+            "traceback": "Traceback (most recent call last)" in (text or ""),
+            "encode_error": "UnicodeEncodeError" in (text or ""),
+            "encode_error_char": m_enc.group(1) if m_enc else None,
+            "replacement_chars": (text or "").count("�")}
+
+
+def probe_s7_w3_bootstep(pr):
+    """Plan W3 section 3: D0 (today), D-A, D-B, D-C on the updated installation, plus D-B-literal (does
+    `PYTHONIOENCODING=:backslashreplace` keep the locale's encoding on the bundled runtime). Recorded, not judged."""
+    f = pr.facts
+    py = pr.bundled_python()
+    preflight = os.path.join(pr.pack_dir, "bin", "javis_preflight.py")
+    f["w3_preflight_present"] = os.path.isfile(preflight)
+    show = "import sys; print(sys.stdout.encoding, sys.stdout.errors, sys.stderr.errors, sys.flags.utf8_mode)"
+    r0 = run([py, "-B", "-c", show], 60, env=clean_env())
+    pr.ev("w3/no-variable.json", r0)
+    f["w3_locale_encoding"] = (r0["out"].split() or [None])[0]
+    r = run([py, "-B", "-c", show], 60, env=clean_env({"PYTHONIOENCODING": ":backslashreplace"}))
+    pr.ev("w3/db-literal.json", r)
+    parts = r["out"].split()
+    f["w3_dbl_stdout_encoding"] = parts[0] if parts else None
+    f["w3_dbl_stdout_errors"] = parts[1] if len(parts) > 1 else None
+    f["w3_dbl_stderr_errors"] = parts[2] if len(parts) > 2 else None
+    f["w3_dbl_keeps_locale"] = bool(parts) and bool(f["w3_locale_encoding"]) and parts[0].lower() == f["w3_locale_encoding"].lower()
+    if not f["w3_preflight_present"]:
+        pr.restored = True
+        return
+    wrapper = os.path.join(pr.work, "w3", "wa4_wrapper.py")
+    write_bytes(wrapper, _W3_WA4_WRAPPER.encode("utf-8"))
+    for leg, extra, wrap in W3_LEGS:
+        env = clean_env(dict({"CYS_NO_AUTOSTART": "1", "PYTHONDONTWRITEBYTECODE": "1"}, **extra))
+        cmd = [py, wrapper, preflight, "--fix"] if wrap else [py, preflight, "--fix"]
+        t0 = time.monotonic()
+        r = run(cmd, 300, env=env)
+        secs = round(time.monotonic() - t0, 1)
+        out = (r["out"] or "") + (r["err"] or "")
+        pr.ev("w3/%s.json" % leg, {"env": sorted(extra.items()), "wrapped": wrap, "rc": r["code"], "timed_out": r["timed_out"],
+                                   "secs": secs, "out_tail": (r["out"] or "")[-4000:], "err_tail": (r["err"] or "")[-4000:]})
+        f["w3_%s_rc" % leg] = r["code"]
+        f["w3_%s_timed_out" % leg] = r["timed_out"]
+        f["w3_%s_secs" % leg] = secs
+        for k, v in w3_output_facts(out).items():
+            f["w3_%s_%s" % (leg, k)] = v
+    pr.restored = True
+
+
 def _restart_storm(pr, cys, tag, n=4):
     """n quick daemon restarts (every cysd.exe of this run stopped, a fresh one started), `cys repair tick` asked
     right after each launch. -> (answers, the last launch time, the last readiness time or None)."""
@@ -4153,13 +4356,26 @@ os.replace(out + ".tmp", out)
 """
 
 
+def _pane_quote(arg, kind):
+    """One argument as the pane's shell must see it (RULINGS JG3: an unquoted `--note "tw1 flow"` became two words).
+    bash: POSIX single quotes; a native pane (PowerShell): single quotes with '' for a quote. A plain word stays as is
+    (PowerShell runs a bare path as a command only while it is unquoted)."""
+    a = str(arg)
+    if a and re.fullmatch(r"[A-Za-z0-9_./:\\=+,@%-]+", a):
+        return a
+    if kind == "bash":
+        return "'" + a.replace("'", "'\\''") + "'"
+    return "'" + a.replace("'", "''") + "'"
+
+
 def _seat_cys(pr, sid, kind, args, tag):
     d = os.path.join(pr.work, "repair-flow")
     script = os.path.join(d, "seat_cys.py")
     write_bytes(script, _SEAT_CYS_SCRIPT.encode("utf-8"))
     outp = os.path.join(d, tag + ".json")
     conv = _msys if kind == "bash" else (lambda x: x)
-    line = " ".join([conv(pr.bundled_python()), "-I", "-S", "-B", conv(script), conv(pr.exe("cys.exe")), conv(outp)]
+    line = " ".join(_pane_quote(a, kind) for a in
+                    [conv(pr.bundled_python()), "-I", "-S", "-B", conv(script), conv(pr.exe("cys.exe")), conv(outp)]
                     + list(args))
     pr.cys(["send", "--surface", sid, line], timeout=30)
     pr.cys(["send-key", "--surface", sid, "Return"], timeout=30)
@@ -4255,7 +4471,7 @@ def probe_s3_repair_flow(pr):
         write_bytes(live, edited)
         f["flow_%sedited_sha" % px] = sha256_bytes(edited)
         steps = []
-        for name, role, args in ((px + "record", "worker", ["repair", "record", rid, "--note", "tw1 flow", "--json"]),
+        for name, role, args in ((px + "record", "worker", ["repair", "record", rid, "--note", "tw1 repair flow", "--json"]),
                                  (px + "attest", "reviewer-codex", ["repair", "attest-verify", rid, "--verdict", "pass", "--note", "tw1"]),
                                  (px + "commit", "worker", ["repair", "commit", rid, "--json"])):
             steps.append(name)
@@ -4380,6 +4596,7 @@ PROBES = {
     "s3_repair_flow": probe_s3_repair_flow,
     "s7_primitives": probe_s7_primitives,
     "s7_t9_libtests": probe_s7_t9_libtests,
+    "s7_w3_bootstep": probe_s7_w3_bootstep,
     "s5_checklist": probe_s5_checklist,
     "s6_variants": probe_s6_variants,
     "s6_inplace": probe_s6_inplace,
