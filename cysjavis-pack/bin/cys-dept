@@ -3010,9 +3010,13 @@ def publish_notice(md, key, title, body):
     box = outbox_dir(md)
     name = key + ".notice"
     try:
-        # ★RULINGS JZ2(WC1): 그 키의 알림은 어느 형태로든 있으면 '있다' — <키>.notice · 시도가 적힌 <키>.notice.<k> · 받힘 표지
-        #   <키>.notice.done · sent/<키>.notice. 다시 쓰면 시도 예산이 새로 생긴다(한 알림이 1 + N 번을 넘어 올라간다).
-        if present(os.path.join(box, "sent", name)) or any(n == name or n.startswith(name + ".") for n in fs_list(box)):
+        # ★RULINGS JZ2·KE1(WC1): 그 키의 알림은 어느 형태로든 있으면 '있다' — 다시 쓰면 시도 예산이 새로 생긴다(1 + N 을 넘는다).
+        #   알림은 한 방향으로만 옮겨 간다: <키>.notice → .1 → … → .9 → (.done | sent/<키>.notice) — sent/ 를 떠나는 것은 없다. 그래서
+        #   그 **방향대로** 살핀다(알림함의 이름들 먼저, sent/ 마지막): 두 관찰 사이에 다른 실행이 옮겨도 뒤의 관찰이 반드시 본다(종전:
+        #   sent/ 를 먼저, 알림함을 나중에 봐 그 사이의 이동을 놓치고 새 <키>.notice 를 썼다 — 네 번째로 올라갔다). 관찰의 실패는
+        #   '없음'이 아니다(Unknown → 아래에서 넣지 않음).
+        forms = [name] + ["%s.%d" % (name, i) for i in range(1, 10)] + [name + ".done"]
+        if any(present(os.path.join(box, f)) for f in forms) or present(os.path.join(box, "sent", name)):
             return True
         fs_mkdir(box)
         tmp = write_temp(os.path.join(box, name), ("%s\n%s\n" % (clean(title), clean(body))).encode("utf-8"))
@@ -3691,6 +3695,11 @@ ceo_outbox_deliver(){
     esac
     case "$_CEO_TRIED" in *"|${_base##*/}|"*) continue ;; esac   # 한 실행에 알림마다 한 번만 시도한다
     _CEO_TRIED="${_CEO_TRIED}${_base##*/}|"
+    if [ -e "$CEO_OUTBOX/sent/${_base##*/}" ]; then
+      # ★RULINGS KE1(c): 같은 키가 이미 sent/ 에 있다 — 받힌 알림이다: 올리지 않고 받힘 표지로 둔다(옮기지 못하면 그대로 — 이번엔 안 올림)
+      mv -n "$_f" "$_base.done" 2>/dev/null || true
+      continue
+    fi
     [ "$_k" -lt $((1 + CEO_NOTICE_RETRIES)) ] || continue        # 예산을 다 썼다 — 그 파일은 그대로(사람이 읽는다) · 더 올리지 않는다
     [ "$_CEO_DELIVERED" -lt 20 ] || break
     _CEO_DELIVERED=$((_CEO_DELIVERED + 1))
