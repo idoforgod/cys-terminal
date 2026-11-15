@@ -1112,7 +1112,18 @@ fn load_jobs_at_access(path: &std::path::Path, mode: LoadMode, read: &ScheduleRe
             }
         },
     };
-    let mut root = match read_schedule_root(path, read) {
+    // ★0.15.0 (WS1 · RULINGS KN2): under the lock, the bytes this tick computes from are kept, so that the restore of a
+    //   fixed job writes only while the file still holds exactly them (compare-and-write against a lock-less writer).
+    let seen: std::cell::RefCell<Option<Vec<u8>>> = std::cell::RefCell::new(None);
+    let keep = |p: &std::path::Path| -> std::io::Result<Vec<u8>> {
+        let bytes = read(p);
+        if let Ok(b) = &bytes {
+            *seen.borrow_mut() = Some(b.clone());
+        }
+        bytes
+    };
+    let first: &ScheduleReader<'_> = if lock.is_some() { &keep } else { read };
+    let mut root = match read_schedule_root(path, first) {
         Ok(None) => return Vec::new(), // Direct NotFound still does not seed on hotreload.
         Ok(Some(root)) => root,
         Err(error) if error.reason == "invalid_json" && lock.is_some() => {
@@ -1136,21 +1147,29 @@ fn load_jobs_at_access(path: &std::path::Path, mode: LoadMode, read: &ScheduleRe
     //   구 표현 그대로였다 — 그 표현이 강등된 구 데몬의 직접 주입 통로다. 멱등이라 바뀔 것이
     //   없으면 파일을 건드리지 않는다(매 틱 쓰기 없음). ★(성찰 A11) 쓰기 모드에서만 · 잠금 아래에서.
     if lock.is_some() {
-        // ★0.15.0 (WS1 · RULINGS JX1): a fixed built-in job another writer removed or changed in this VALID file is put
-        //   back whole, under the lock this tick already holds — no new lock, no wait. It is written with the canonical
-        //   form below in ONE write, or alone; nothing to put back = no write (a comparison). A failed write is reported
-        //   and tried again at the next tick (the file still lacks the job; the tick runs it from memory meanwhile — its
-        //   firing time is the one recorded under its id, so it fires neither at once nor twice because of this).
+        // ★0.15.0 (WS1 · RULINGS JX1 / KN2): a fixed built-in job another writer removed or changed in this VALID file is
+        //   put back whole, under the lock this tick already holds — no new lock, no wait. Nothing to put back = no
+        //   write (a comparison), the released canonical-form write as before. Something to put back = COMPARE-AND-WRITE:
+        //   the file is read again right before the write; only if it still holds exactly the bytes the restore was
+        //   computed from is it written (with the canonical form, ONE write) — otherwise a lock-less writer (the
+        //   preflight's C16, the department seed — released, not changed) saved meanwhile, nothing is written in this
+        //   tick, and the next tick decides anew from the new content. A failed write is tried again at the next tick
+        //   (the tick runs the job from memory meanwhile — its firing time is the one recorded under its id, so it fires
+        //   neither at once nor twice because of this).
         let restored = restore_fixed_builtin_jobs(&mut root);
-        let written = match canonicalize_schedule_file(path, &mut root) {
-            Ok(true) => true,
-            Ok(false) => !restored.is_empty() && write_schedule_atomic(path, &root),
-            Err(error) => {
-                report_schedule_refusal("canonicalize", &error);
-                false
-            }
-        };
-        if !restored.is_empty() {
+        if restored.is_empty() {
+            if let Err(error) = canonicalize_schedule_file(path, &mut root) { report_schedule_refusal("canonicalize", &error); }
+        } else if read(path).ok() != *seen.borrow() {
+            eprintln!("[cysd] schedule: 내장 자가치유 작업 {restored:?} 을 되살리려고 읽은 뒤 다른 쓰기가 schedule.json 을 저장했다 — 이번 틱은 쓰지 않고 다음 틱이 새 내용으로 다시 판단한다(RULINGS KN2)");
+        } else {
+            let written = match canonicalize_schedule_file(path, &mut root) {
+                Ok(true) => true,
+                Ok(false) => write_schedule_atomic(path, &root),
+                Err(error) => {
+                    report_schedule_refusal("canonicalize", &error);
+                    false
+                }
+            };
             if written {
                 eprintln!("[cysd] schedule: 내장 자가치유 작업 {restored:?} 이 유효한 schedule.json 에서 빠졌거나 바뀌어 있어 코드 정의 그대로 되살렸다(RULINGS JX1 — 발화 시각은 그 작업의 기록 그대로)");
             } else {
@@ -8577,6 +8596,46 @@ mod repair_job_schedule_tests {
             let run = load_jobs_at(&path, LoadMode::HotReload);
             assert!(run.iter().all(|j| j.id != "user-marked"), "tick {tick} restored a user's job because it carried the marker");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS1 · RULINGS KN2 (whole-diff WS1-r1 M1) — the restore's own write never eats a lock-less writer's save. The tick
+    /// reads a valid file that lacks the repair job; before it writes, the preflight's C16 (no lock) saves the file with
+    /// its report job added. The tick re-reads under its lock, finds other bytes and writes NOTHING in this tick; the next
+    /// tick decides anew and puts the repair job back INTO the file that holds C16's job.
+    #[test]
+    fn ws1_a_lockless_save_between_the_ticks_read_and_its_write_is_kept() {
+        let dir = ws1_dir("cas");
+        let path = dir.join("schedule.json");
+        ws1_replace(&path, &json!({"jobs": ws1_released()}));
+        let c16_job = json!({
+            "id": "owner-progress-gate-5min", "every_minutes": 5, "action": "command",
+            "command": "python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py\" run", "if_absent": "skip"
+        });
+        let reads = std::cell::Cell::new(0usize);
+        // the tick's first read gets the bytes it sees; right after it, C16 saves its own read + its job (no lock)
+        let racing = |p: &std::path::Path| {
+            reads.set(reads.get() + 1);
+            let seen = std::fs::read(p);
+            if reads.get() == 1 {
+                let mut doc: serde_json::Value = serde_json::from_slice(seen.as_ref().unwrap()).unwrap();
+                doc["jobs"].as_array_mut().unwrap().push(c16_job.clone());
+                ws1_replace(p, &doc);
+            }
+            seen
+        };
+        let _ = load_jobs_at_access(&path, LoadMode::HotReload, &racing, &ScheduleFileLock::acquire);
+        let saved = ws1_jobs(&path);
+        assert!(saved.iter().any(|j| j == &c16_job), "the tick's write ate C16's saved job");
+        assert!(!saved.iter().any(|j| j["id"] == REPAIR_JOB_ID), "the tick wrote in the tick another writer saved in");
+        // the next tick decides anew from the new content
+        let run = load_jobs_at(&path, LoadMode::HotReload);
+        assert!(run.iter().any(|j| j.id == REPAIR_JOB_ID), "the next tick did not bring the repair job back");
+        let after = ws1_jobs(&path);
+        let others: Vec<serde_json::Value> = after.iter().filter(|j| j["id"] != REPAIR_JOB_ID).cloned().collect();
+        assert_eq!(others, saved, "C16's file kept whole, in order");
+        let mine: Vec<&serde_json::Value> = after.iter().filter(|j| j["id"] == REPAIR_JOB_ID).collect();
+        assert_eq!(mine, vec![&def()], "the repair job back whole, once");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
