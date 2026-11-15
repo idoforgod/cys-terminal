@@ -850,7 +850,7 @@ def main():
         # the three whole redirection words; its reader names are the judge's own LEDGER_READERS (one list)
         # (an unclosed quote is G1 of the full grammar only: the degraded form does not read quotes, and the shell runs
         #  nothing of such a command — a syntax error)
-        refused_degraded = [r for r in refused if r[0] not in ("닫히지 않은 따옴표", "역슬래시", "캐리지 리턴", "$HOMEX(정확한 $HOME 이 아님)")]
+        refused_degraded = [r for r in refused if r[0] != "닫히지 않은 따옴표"]
         for mode, extra in with_jq:
             bad = []
             for label, cmd in refused_degraded:
@@ -870,6 +870,15 @@ def main():
                 if p.returncode != 0:
                     bad.append("%s rc=%d %r" % (label, p.returncode, p.stderr[-120:]))
             check("16 %s(jq 있음) 읽기 명령 하나는 통과" % mode, not bad, "; ".join(bad))
+            bad = []
+            for label, cmd in (("cd 하나(IT3)", "cd %s/R-3" % L), ("pushd 하나(IT3)", "pushd %s" % L),
+                               ("주석(G0)", "cat %s/grant.json # c" % L), ("$변수(G0)", "cat %s/grant.json $V" % L),
+                               ("괄호(G0)", "grep 'a(b' %s/grant.json" % L), ("!(G0)", "cat %s/grant.json!" % L),
+                               ("역슬래시(G0)", "cat %s/grant\\.json" % L), ("캐리지 리턴(G0)", "cat %s/grant.json\r" % L)):
+                p, _ = run({"command": cmd}, tool="Bash", rc=0, extra=extra)
+                if not (p.returncode == 2 and "수리 장부" in p.stderr and "백스톱" in p.stderr):
+                    bad.append("%s rc=%d %r" % (label, p.returncode, p.stderr[-120:]))
+            check("16 %s(jq 있음) 강등된 형태는 G0 의 글자와 cd · pushd 를 막는다(IT3)" % mode, not bad, "; ".join(bad))
 
         # 10 — RULINGS FZ2: every stub this test started is gone at its end
         left = [pid for pid in stub_pids if not gone_soon(pid)]

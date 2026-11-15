@@ -1476,9 +1476,9 @@ if [ "$GUARD_ACTIVE" != "1" ] && [ -f "$CONST_TOKEN" ] && [ ! -L "$CONST_TOKEN" 
   fi
 fi
 
-# ★RULINGS ID2 · IN6 (T4e): 수리 장부 규칙은 강등된 백스톱에서도 순수 셸로 지킨다(규칙 문서처럼). 장부의 자리는 위에서
+# ★RULINGS ID2 · IN6 · IT3 (T4e): 수리 장부 규칙은 강등된 백스톱에서도 순수 셸로 지킨다(규칙 문서처럼). 장부의 자리는 위에서
 #   이 훅의 자리로 구한 GUARD_LEDGER_ROOTS 그대로다. 파일 도구의 경로가 장부 아래이고 `R-<n>/staging/` 이 아니면 막고,
-#   셸 명령의 글에 장부의 자리가 적혀 있으면(작업 사본만이 아니고) 그 명령은 읽기 명령 하나일 때만 통과한다(IN6).
+#   셸 명령의 글에 장부의 자리가 적혀 있으면(작업 사본만이 아니고) 그 명령은 G0 의 글자만 쓴 읽기 명령 하나일 때만 통과한다(IT3).
 #   장부의 자리를 가리키지 않는 호출은 결코 막지 않는다(치명 4: 모든 것을 막는 강등된 가드는 모든 좌석을 죽인다).
 ledger_rest_is_ledger() {
   # RULINGS IJ3: the shell cannot normalise dot components here — the root's spelling followed by anything that holds a
@@ -1504,26 +1504,34 @@ $GUARD_LEDGER_ROOTS
 EOF_LEDGER_ROOTS
 }
 ledger_backstop_one_reader() {
-  # RULINGS IN6: 0 when the command ($1, as given) is ONE simple command whose first word is a bare reader and whose only
-  #   redirections are the whole words 2>/dev/null, >/dev/null, 2>&1. Refused: a new line, `$(`, a back-quote, `<(`,
-  #   `>(`, `<<`, and any other word holding one of ; | & < > ( ) { } (a quoted one too — the degraded form's cost).
-  local c="$1" w readers nl=$'\n'
+  # RULINGS IT3 (= IS4): 0 when the command ($1, as given) is ONE simple command with G0's characters (no `$` but the
+  #   exact `$HOME` / `${HOME}`, no back-quote, ( ) { } < ! # back-slash, no control character but a tab — and no new
+  #   line), whose first word is a reader other than `cd` / `pushd`, and whose only redirections are the whole words
+  #   2>/dev/null, >/dev/null, 2>&1; any other word holding ; | & > is refused (a quoted one too — the degraded cost).
+  local c="$1" g w readers nl=$'\n' re_home='^(.*)\$HOME($|[^A-Za-z0-9_].*)$'
   local -a words=()
-  case "$c" in *"$nl"*|*'$('*|*'`'*|*'<('*|*'>('*|*'<<'*) return 1 ;; esac
+  case "$c" in *"$nl"*) return 1 ;; esac
+  g="${c//'${HOME}'/}"
+  while [[ $g =~ $re_home ]]; do g="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"; done
+  case "$g" in *'$'*|*'`'*|*'('*|*')'*|*'{'*|*'}'*|*'<'*|*'!'*|*'#'*|*'\'*) return 1 ;; esac
+  g="${g//$'\t'/}"
+  [[ $g =~ [[:cntrl:]] ]] && return 1
   IFS=$' \t' read -r -a words <<EOF_LEDGER_CMD
 $c
 EOF_LEDGER_CMD
   [ "${#words[@]}" -gt 0 ] || return 1
-  # RULINGS IN4: the reader names are the judge's own LEDGER_READERS — ONE list, read here from the PYSRC text in pure bash
-  #   (no call, no subshell). A list that cannot be read stays empty, and then every command that names the ledger is refused.
+  # RULINGS IU2: the reader names are the judge's own LEDGER_READERS — ONE list, read here from the PYSRC text in pure bash
+  #   (no call, no subshell); IT3 leaves `cd` and `pushd` out. A list that cannot be read stays empty, and then every
+  #   command that names the ledger is refused.
   local re='LEDGER_READERS = \(([^)]*)\)'
   [[ $PYSRC =~ $re ]] || return 1
   readers="${BASH_REMATCH[1]}"; readers="${readers//\"/}"; readers="${readers//,/ }"; readers=" ${readers//$'\n'/ } "
+  case "${words[0]}" in cd|pushd) return 1 ;; esac
   case "$readers" in *" ${words[0]} "*) ;; *) return 1 ;; esac
   for w in "${words[@]:1}"; do
     case "$w" in
       '2>/dev/null'|'>/dev/null'|'2>&1') ;;
-      *[\;\|\&\<\>\(\)\{\}]*) return 1 ;;
+      *[\;\|\&\>]*) return 1 ;;
     esac
   done
   return 0
@@ -1531,12 +1539,12 @@ EOF_LEDGER_CMD
 ledger_backstop() {
   # RULINGS IJ4 / IN6: the degraded backstop protects the ledger exactly as far as it protects the rule documents — with
   #   jq: a WRITING tool's path (a Read is never refused) and, AFTER the early return for a command that does not name the
-  #   ledger, the one-simple-reader form (IN6); without jq every field is empty and nothing is protected (GAPS G22).
+  #   ledger, the one-simple-reader form (IN6 / IT3); without jq every field is empty and nothing is protected (GAPS G22).
   local tool="$1" fp="$2" nb="$3" cmd="$4" sps sp p lp s c seg named="" first
   [ -n "$GUARD_LEDGER_ROOTS" ] || return 0
   sps="$(ledger_backstop_spellings)"
   first="$(printf '%s\n' "$GUARD_LEDGER_ROOTS" | sed -n '1p')"
-  local msg="백스톱: 수리 장부(${first})는 데몬이 \`cys repair …\` 동사로만 쓴다 — 좌석의 파일 도구는 장부를 쓰지 못하고, 판정기가 없는 지금 장부의 자리를 적은 셸 명령은 읽기 명령 하나(리다이렉트는 2>/dev/null · >/dev/null · 2>&1 만)일 때만 통과한다(좌석이 쓰는 자리는 수리의 작업 사본 \`R-<번호>/staging/\` 하나)."
+  local msg="백스톱: 수리 장부(${first})는 데몬이 \`cys repair …\` 동사로만 쓴다 — 좌석의 파일 도구는 장부를 쓰지 못하고, 판정기가 없는 지금 장부의 자리를 적은 셸 명령은 읽기 명령 하나(cd · pushd 아님 · 리다이렉트는 2>/dev/null · >/dev/null · 2>&1 만 · \$ 는 \$HOME 만)일 때만 통과한다(좌석이 쓰는 자리는 수리의 작업 사본 \`R-<번호>/staging/\` 하나)."
   case "$tool" in
     Write|Edit|MultiEdit|NotebookEdit)
       for p in "$fp" "$nb"; do
