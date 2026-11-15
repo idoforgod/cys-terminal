@@ -1000,12 +1000,11 @@ LEDGER_SPELLINGS = _ledger_spellings()
 #   writes a file; the interpreters stay by IJ5 / HP3). Every other program is refused when the ledger is named.
 LEDGER_READERS = ("ls", "cat", "head", "tail", "grep", "egrep", "fgrep", "wc", "stat", "jq", "cmp", "shasum",
                   "sha256sum", "md5", "md5sum", "du", "cut", "tr", "nl", "tac", "column", "od", "hexdump", "basename",
-                  "dirname", "realpath", "readlink", "pwd", "cd", "pushd", "popd", "echo", "printf", "test", "[", "true",
-                  "false", "date", "python3", "python", "node")
+                  "dirname", "realpath", "readlink", "pwd", "cd", "pushd", "echo", "test", "[", "true", "false")
 LEDGER_DENY = ("수리 장부(%s)는 데몬이 `cys repair …` 동사로만 쓴다 — 좌석의 파일 도구는 장부를 쓰지 못하고, 장부의 자리를 "
-               "적은 셸 명령은 읽기 명령(" + " ".join(LEDGER_READERS) + ")만 `|` · `&&` · `||` · `;` 로 잇고 출력을 "
-               "/dev/null 이나 장부 밖의 파일로만 보낼 때 통과한다(좌석이 쓰는 자리는 수리의 작업 사본 `R-<번호>/staging/` "
-               "하나). %s")
+               "적은 셸 명령은 읽기 명령(" + " ".join(LEDGER_READERS) + ")만 `|` · `&&` · `||` · `;` · 새 줄로 잇고 출력을 "
+               "터미널 · 파이프 · /dev/null 로만 보낼 때 통과한다 — 장부의 내용은 읽어서 파일 도구로 다른 곳에 쓴다(좌석이 쓰는 "
+               "자리는 수리의 작업 사본 `R-<번호>/staging/` 하나). %s")
 LEDGER_HINTS = {
     "owner-tokens": "주인 지시 표는 주인이 직접 답한 뒤 데몬이 발급한다: 마스터가 `cys repair owner-token ask --path "
                     "<문서>` 로 묻고, 주인이 답하면 `cys repair owner-token --path <문서>`.",
@@ -1059,7 +1058,11 @@ def ledger_place(path, cwd):
     otherwise the store's key for the sentence. The path as the shell reaches it from `cwd` (links resolved)."""
     if not path or not LEDGER_ROOTS:
         return None
-    rp = _ledger_abs(path, cwd).casefold()
+    return _ledger_place_of(_ledger_abs(path, cwd))
+
+def _ledger_place_of(rp):
+    """ledger_place's verdict for a path already resolved as the shell reaches it."""
+    rp = rp.casefold()
     for root in LEDGER_ROOTS:
         if rp == root or rp.startswith(root.rstrip(os.sep) + os.sep):
             return _ledger_rest_place(rp[len(root):].replace(os.sep, "/"))
@@ -1119,7 +1122,6 @@ def _ledger_tokens(n):
         return None
 
 LEDGER_NOT_LITERAL = re.compile(r"[$`*?\[]")
-
 _LEDGER_CD_OPT = re.compile(r"-[LPeqs@]+")
 _LEDGER_TERM = re.compile(r"[;&|<>(){}\n]")
 
@@ -1146,216 +1148,204 @@ def _ledger_cd_told(t):
         return False
     return not t.startswith("~") or t == "~" or t.startswith("~/")
 
-def _ledger_bases(words, cwd):
-    """The call's working directory, HOME (where a bare `cd` goes), and every `cd` / `pushd` target the command tells
-    (`_ledger_cd_told`; options skipped; zsh's `cd OLD NEW` as OLD replaced by NEW), each resolved from every base before
-    it; at most 16. No wrapper is stripped (RULINGS IN3)."""
-    bases = [cwd or os.getcwd()]
-
-    def add(p):
-        if p and p not in bases and len(bases) < 16:
-            bases.append(p)
+def _ledger_walk(words, cwd):
+    """RULINGS IT1 / IU1 — the LINEAR walk: the tool call's cwd, then each `cd` / `pushd` operand resolved against the
+    directory before it, in order, none dropped, no cap. A bare `cd` goes HOME; zsh's `cd OLD NEW` replaces OLD in the
+    directory before it; an operand the command does not tell leaves the walk where it is."""
+    cur = _ledger_abs(cwd or os.getcwd(), "/")
+    walk, gone = [cur], not os.path.lexists(cur)
     for k, w in enumerate(words):
         if w not in ("cd", "pushd"):
             continue
-        if os.environ.get("HOME"):
-            add(_ledger_abs("~", bases[0]))
         ops = _ledger_cd_operands(words, k)
-        for b in list(bases):
-            if ops and _ledger_cd_told(ops[0]):
-                add(_ledger_abs(ops[0], b))
-            if len(ops) == 2 and _ledger_cd_told(ops[0]) and _ledger_cd_told(ops[1]) and ops[0] in b:
-                add(_ledger_abs(b.replace(ops[0], ops[1], 1), b))
-    return bases
+        nxt = None
+        if not ops:
+            if w == "cd" and os.environ.get("HOME"):
+                nxt = _ledger_abs("~", cur)
+        elif len(ops) == 2 and _ledger_cd_told(ops[0]) and _ledger_cd_told(ops[1]) and ops[0] in cur:
+            nxt = _ledger_abs(cur.replace(ops[0], ops[1], 1), cur)
+        elif _ledger_cd_told(ops[0]):
+            if gone and _ledger_plain(ops[0]):
+                cur = os.path.normpath(os.path.join(cur, ops[0]))   # below a missing directory nothing exists: no link
+                walk.append(cur)
+                continue
+            nxt = _ledger_abs(ops[0], cur)
+        if nxt:
+            cur, gone = nxt, not os.path.lexists(nxt)
+            walk.append(cur)
+    return walk
+
+def _ledger_parts(c):
+    """A word's path components as the platform splits them (a back-slash is a separator on Windows only)."""
+    return [x for x in (re.split(r"[\\/]", c) if os.name == "nt" else c.split("/")) if x not in ("", ".")]
+
+def _ledger_plain(c):
+    """A relative word with no `..` component and no `~` / `$HOME` start: it can only go DOWN from its directory."""
+    return not (not c or os.path.isabs(c) or c.startswith(("~", "$HOME", "${HOME}")) or ".." in _ledger_parts(c))
 
 def _ledger_named(n, cwd):
-    """The ledger places outside the working copy that a command NAMES (RULINGS IJ5 / IN1): a root's spelling anywhere in
-    its text (an operand, an assignment, a quoted string; IJ3's dot components folded), and every word — STRICT's tokens
-    and the coarse loose words, and the value after a word's first `=` — as a path from the call's cwd and from each
-    literally named `cd` / `pushd` target. Returns (places, bases)."""
+    """The ledger places outside the working copy that a command NAMES (RULINGS IT1 / IU1 · IJ5 · IJ3): a root's
+    spelling anywhere in its normalised text, or a word — STRICT's tokens and the coarse loose words, and the value after
+    a word's first `=` — that resolves under a root from the tool call's cwd or from any directory of the command's linear
+    `cd` / `pushd` walk (each tokenization walked on its own; none dropped, no cap). Any positive names the command; the
+    number of directory changes alone never does."""
     places = [pl for pl in _ledger_text_places(n) if pl != "staging"]
     toks = _ledger_tokens(n)
-    words = (list(toks) if toks is not None else []) + norm_loose(n).split() + norm_loose_slash(n).split()
-    bases = _ledger_bases(words, cwd)
-    for w in words:
-        for c in [w] + ([w.split("=", 1)[1]] if "=" in w else []):
-            if not c:
-                continue
-            for b in bases:
-                pl = ledger_place(c, b)
-                if pl is not None and pl != "staging" and pl not in places:
-                    places.append(pl)
-                if os.path.isabs(c) or c.startswith(("~", "$HOME", "${HOME}")):
-                    break
-    return places, bases
+    seqs = ([list(toks)] if toks is not None else []) + [norm_loose(n).split(), norm_loose_slash(n).split()]
+    dirs, cands = [], []
+    for seq in seqs:
+        for d in _ledger_walk(seq, cwd):
+            if d not in dirs:
+                dirs.append(d)
+        for w in seq:
+            for c in [w] + ([w.split("=", 1)[1]] if "=" in w else []):
+                if c and c not in cands:
+                    cands.append(c)
+    # The walk is linear but words × directories is not. Where a word only goes DOWN (`_ledger_plain`) and its first
+    # component does not exist in the directory (a resolved path), nothing below that entry exists, so no link can
+    # redirect it: the shell reaches exactly <dir>/<word>, and the place is judged on that text without a system call —
+    # skipped outright when the directory is neither under a root nor above one. Every other pair is resolved.
+    roots = [r.rstrip(os.sep) for r in LEDGER_ROOTS]
+
+    def aside(d):
+        dc = d.casefold().rstrip(os.sep)
+        return not any(dc == r or dc.startswith(r + os.sep) or r.startswith(dc + os.sep) for r in roots)
+    far = {d: aside(d) for d in dirs}
+    there = {d: os.path.lexists(d) for d in dirs}
+    in_copy = {d: not far[d] and _ledger_place_of(d) == "staging" for d in dirs}   # going DOWN stays in the working copy
+    seen = {}
+    for c in cands:
+        plain = _ledger_plain(c)
+        parts = _ledger_parts(c) if plain else []
+        for d in dirs:
+            if plain and parts:
+                key = (d, parts[0])
+                if key not in seen:
+                    seen[key] = there[d] and os.path.lexists(os.path.join(d, parts[0]))
+                if not seen[key]:
+                    if far[d] or in_copy[d]:
+                        continue
+                    pl = _ledger_place_of(os.path.normpath(os.path.join(d, c)))
+                    if pl is not None and pl != "staging" and pl not in places:
+                        places.append(pl)
+                    continue
+            pl = ledger_place(c, d)
+            if pl is not None and pl != "staging" and pl not in places:
+                places.append(pl)
+            if os.path.isabs(c) or c.startswith(("~", "$HOME", "${HOME}")):
+                break
+    return places
 
 class _LedgerRefuse(Exception):
-    """A named command that is not a plain read (RULINGS IN2 / IN5)."""
+    """A named command outside the grammar (RULINGS IT1 G0–G3)."""
 
-# zsh's clobbering forms (`>!` `>>!` `>&!` `&>!` `&>>!` — the seat's shell is zsh) are operators of their own: refused
-_LEDGER_OPS = ("&&", "||", ";;", "|&", "&>>!", "&>>", "&>!", "&>", ">>!", ">>", ">|", ">&!", ">&", ">!", "<<<", "<<", "<>",
-               "<&", "|", ";", "&", "(", ")", "<", ">")
-_LEDGER_SEPARATORS = ("|", "&&", "||", ";")
-_LEDGER_WRITE_OPS = (">", ">>", ">|", "&>", "&>>", "<>", ">&")
+_LEDGER_G0_HOME = re.compile(r"\$\{HOME\}|\$HOME(?![A-Za-z0-9_])")
+_LEDGER_G0_BANNED = re.compile(r"[$`(){}<!#\\\x00-\x08\x0b-\x1f\x7f]")
+_LEDGER_G_OPS = ("&&", "||", ";;", "|&", "&>", ">>", ">&", ">|", "|", ";", "&", ">")
+_LEDGER_G_SEPS = ("|", "&&", "||", ";", "\n")
 
-def _ledger_shell_lex(s):
-    """The command's tokens WITH its syntax boundaries (RULINGS IN2): ("w", text, literal) for a word, ("fd", n, True) for
-    a descriptor number written right before `<` / `>`, ("op", operator, True) for an operator. A command or process
-    substitution (outside single quotes) or an unclosed quote raises _LedgerRefuse."""
-    toks, i, n = [], 0, len(s)
+def _ledger_g_tokens(raw):
+    """RULINGS IT1 G0 + G1 on the RAW text: G0's characters refused anywhere (inside quotes too; `$` only as the exact
+    `$HOME` / `${HOME}`); words grouped by quotes only; operators recognised outside quotes, also when glued to a word.
+    Tokens: ("w", value, start, end) · ("fd", digits, start, end) for digits glued to `>` · ("op", op, start, end)."""
+    if _LEDGER_G0_BANNED.search(_LEDGER_G0_HOME.sub("", raw)):
+        raise _LedgerRefuse("G0")
+    toks, i, n = [], 0, len(raw)
     while i < n:
-        c = s[i]
+        c = raw[i]
         if c in " \t":
             i += 1
             continue
         if c == "\n":
-            toks.append(("op", ";", True))
+            toks.append(("op", "\n", i, i + 1))
             i += 1
             continue
-        if c == "#":
-            while i < n and s[i] != "\n":
-                i += 1
-            continue
-        if c in "<>" and s.startswith("(", i + 1):
-            raise _LedgerRefuse("process substitution")
-        op = next((o for o in _LEDGER_OPS if s.startswith(o, i)), None)
+        op = next((o for o in _LEDGER_G_OPS if raw.startswith(o, i)), None)
         if op:
-            toks.append(("op", op, True))
+            toks.append(("op", op, i, i + len(op)))
             i += len(op)
             continue
-        buf, literal = [], True
-        while i < n and s[i] not in " \t\n|&;<>()":
-            ch = s[i]
-            if ch == "'":
-                j = s.find("'", i + 1)
+        start, buf = i, []
+        while i < n and raw[i] not in " \t\n|&;>":
+            if raw[i] in "'\"":
+                j = raw.find(raw[i], i + 1)
                 if j < 0:
-                    raise _LedgerRefuse("unclosed quote")
-                buf.append(s[i + 1:j])
+                    raise _LedgerRefuse("G1 unterminated quote")
+                buf.append(raw[i + 1:j])
                 i = j + 1
                 continue
-            if ch == '"':
-                i += 1
-                while i < n and s[i] != '"':
-                    if s[i] == "\\" and i + 1 < n:
-                        buf.append(s[i + 1])
-                        i += 2
-                        continue
-                    if s[i] == "`" or s.startswith("$(", i):
-                        raise _LedgerRefuse("command substitution")
-                    if s[i] == "$":
-                        literal = False
-                    buf.append(s[i])
-                    i += 1
-                if i >= n:
-                    raise _LedgerRefuse("unclosed quote")
-                i += 1
-                continue
-            if ch == "\\":
-                if i + 1 < n:
-                    buf.append(s[i + 1])
-                i += 2
-                continue
-            if ch == "`" or s.startswith("$(", i):
-                raise _LedgerRefuse("command substitution")
-            if ch in "$*?[{":
-                literal = False
-            buf.append(ch)
+            buf.append(raw[i])
             i += 1
         word = "".join(buf)
-        if word.isdigit() and i < n and s[i] in "<>":
-            toks.append(("fd", word, True))
-        else:
-            toks.append(("w", word, literal))
+        glued_fd = i < n and raw[i] == ">" and raw[start:i].isdigit()
+        toks.append(("fd" if glued_fd else "w", word, start, i))
     return toks
 
-def _ledger_check_redirect(op, fd, tgt, literal, bases, untold=False):
-    """RULINGS IN5 — by OPERATOR: `<` is a read; a duplication only `2>&1`, `>&2`, `1>&2`; every writing operator's target
-    exactly /dev/null or a literal path that resolves (links followed; the cwd and every `cd` target) outside every ledger
-    root and not under /dev/. After a `cd` whose directory the command does not tell (`untold`), a relative target cannot
-    be resolved and is refused."""
-    if op == "<":
-        return
-    if op == ">&" and tgt.isdigit():
-        if (fd, tgt) in (("2", "1"), (None, "2"), ("1", "2")):
-            return
-        raise _LedgerRefuse("descriptor %s" % tgt)
-    if op not in _LEDGER_WRITE_OPS:
-        raise _LedgerRefuse("operator %s" % op)
-    if tgt == "/dev/null":
-        return
-    if not tgt or not literal or LEDGER_NOT_LITERAL.search(tgt) or _ledger_text_places(tgt):
-        raise _LedgerRefuse("target %s" % tgt)
-    if tgt.startswith("=") or (tgt.startswith("~") and not (tgt == "~" or tgt.startswith("~/"))):
-        raise _LedgerRefuse("target %s" % tgt)       # zsh's `=cmd`, and `~-` / `~+` / `~<name>`: the shell's own state
-    if untold and not (os.path.isabs(tgt) or tgt == "~" or tgt.startswith("~/")):
-        raise _LedgerRefuse("target %s after an untold cd" % tgt)
-    for b in bases:
-        rp = _ledger_abs(tgt, b).replace("\\", "/")
-        if rp == "/dev" or rp.startswith("/dev/") or ledger_place(tgt, b) is not None:
-            raise _LedgerRefuse("target %s" % tgt)
-
-def _ledger_judge_shell(s, bases):
-    """RULINGS IN2: a named command passes only as SIMPLE COMMANDS joined by `|`, `&&`, `||`, `;` or a new line, each a
-    BARE program name from LEDGER_READERS (no slash; no wrapper is stripped — IN3) and then words; its redirections by
-    IN5. Refused wherever they stand: substitutions, groups, `!`, a function definition, `<<` / `<<<`, a background `&`,
-    an assignment prefix (its first word is not a reader)."""
-    seg = []
-    segs = [seg]
-    untold = False
-    for t in _ledger_shell_lex(s):
-        if t[0] == "op" and t[1] in _LEDGER_SEPARATORS:
-            seg = []
+def _ledger_grammar(raw):
+    """RULINGS IT1 G2 + G3: simple commands joined by `|` `&&` `||` `;` or a new line (new lines may lead, trail and
+    repeat, and may follow another separator; no other empty command), each beginning with a word that is exactly a
+    member of LEDGER_READERS; redirections only `>` `>>` `1>` `1>>` `2>` `2>>` to exactly /dev/null and the exact
+    `2>&1` `>&2` `1>&2` — NO FILE IS WRITTEN. Every other operator is refused. Raises _LedgerRefuse."""
+    segs, seg, pending = [], [], None
+    for t in _ledger_g_tokens(raw):
+        if t[0] == "op" and t[1] in _LEDGER_G_SEPS:
+            if t[1] == "\n":                    # a new line ends a command; it may lead, repeat, or follow a separator
+                if seg:
+                    segs.append(seg)
+                    seg = []
+                continue
+            if not seg:
+                raise _LedgerRefuse("G2 empty command")
             segs.append(seg)
+            seg, pending = [], t[1]
             continue
         seg.append(t)
+        pending = None
+    if seg:
+        segs.append(seg)
+    elif pending:
+        raise _LedgerRefuse("G2 trailing separator")
+    if not segs:
+        raise _LedgerRefuse("G2 no command")
     for seg in segs:
-        if not seg:
-            continue
-        k, cmdword, fd = 0, None, None
+        if seg[0][0] != "w" or seg[0][1] not in LEDGER_READERS:
+            raise _LedgerRefuse("G2 first word")
+        k = 1
         while k < len(seg):
-            kind, val, lit = seg[k]
-            if kind == "fd":
-                fd = val
+            kind, val, s0, e0 = seg[k]
+            if kind == "w":
                 k += 1
                 continue
-            if kind == "op":
-                if val in ("<<", "<<<"):
-                    raise _LedgerRefuse("here-document")
-                if val in _LEDGER_WRITE_OPS or val in ("<", "<&"):
-                    if k + 1 >= len(seg) or seg[k + 1][0] != "w":
-                        raise _LedgerRefuse("redirection without a target")
-                    _ledger_check_redirect(val, fd, seg[k + 1][1], seg[k + 1][2], bases, untold)
-                    fd = None
-                    k += 2
-                    continue
-                raise _LedgerRefuse("operator %s" % val)
-            if cmdword is None:
-                if val not in LEDGER_READERS:
-                    raise _LedgerRefuse("not a reader: %s" % val)
-                cmdword = val
-            k += 1
-        if cmdword is None:
-            raise _LedgerRefuse("no program")
-        if cmdword in ("cd", "pushd"):
-            words = [w for w in seg if w[0] == "w"]
-            ops = _ledger_cd_operands([w[1] for w in words], 0)
-            lit = all(w[2] for w in words)
-            if (cmdword == "pushd" and not ops) or not lit or not all(_ledger_cd_told(o) for o in ops):
-                untold = True
+            fd = None
+            if kind == "fd":
+                fd = val
+                if k + 1 >= len(seg) or seg[k + 1][0] != "op":
+                    raise _LedgerRefuse("G3")
+                k += 1
+                kind, val, s0, e0 = seg[k]
+            if fd not in (None, "1", "2") or val not in (">", ">>", ">&") or k + 1 >= len(seg) or seg[k + 1][0] != "w":
+                raise _LedgerRefuse("G3 operator")
+            tgt = seg[k + 1]
+            if val == ">&":
+                if tgt[2] != e0 or (fd, tgt[1]) not in (("2", "1"), (None, "2"), ("1", "2")):
+                    raise _LedgerRefuse("G3 duplication")
+            elif tgt[1] != "/dev/null":
+                raise _LedgerRefuse("G3 sink")
+            k += 2
 
 def ledger_shell_write(command, cwd):
-    """The store a shell command would reach, or None (RULINGS IN1–IN5). NAMED OR NOT first: a command that names no
-    ledger place outside the working copy is not touched (an error before that is known skips the rule). A named command
-    passes only as plain reads (`_ledger_judge_shell`); anything else — and an error after naming — refuses this call."""
+    """The store a shell command would reach, or None (RULINGS IN1 · IT1 · IU1). NAMED OR NOT first, on the normalised
+    text: a command that names no ledger place outside the working copy is not touched (an error before that is known
+    skips the rule). A named command is judged on its RAW text by the grammar (G0–G3); anything outside it — and an error
+    after naming — refuses this call."""
     try:
-        n = norm_base(command)
-        named, bases = _ledger_named(n, cwd)
+        named = _ledger_named(norm_base(command), cwd)
     except Exception:
         return None
     if not named:
         return None
     try:
-        _ledger_judge_shell(n, bases)
+        _ledger_grammar(command)
         return None
     except Exception:
         return named[0]
