@@ -4785,3 +4785,77 @@ fn ww1_controls_through_begin() {
         assert!(rels_of(&r, &["lnk/a.py"]).is_err());
     }
 }
+
+/// WW1 round 2 (RULINGS KH1): a LISTED file is not mapped away from the list's spelling. On a case-blind
+/// volume whose disk spells the protection file `hooks/GUARD.SH`, the list's exact `hooks/guard.sh`
+/// classifies as before — through the production classification, and through `begin` with it.
+#[test]
+fn ww1_kh1_a_listed_file_keeps_the_lists_spelling() {
+    let r = rig("ww1kh1");
+    if !ww1_case_blind_volume(&r.pack) {
+        eprintln!("SKIPPED ww1_kh1_…: the temporary volume distinguishes letter case");
+        return;
+    }
+    std::fs::write(r.pack.join("hooks/GUARD.SH"), b"#!/bin/sh\necho guard\n").unwrap();
+    let mapped = cys::repair::intake::on_disk_rel(&r.pack, "hooks/guard.sh");
+    assert_eq!(
+        production_classify(&mapped, &r.pack).map_err(|e| format!("{e:?}")),
+        Ok(Classification::ProtectionRelated),
+        "mapped to {mapped:?}"
+    );
+    let pack = r.pack.clone();
+    let classify = move |rel: &str| production_classify(rel, &pack);
+    let w = seat(3, "worker");
+    let v = handle_with(
+        &r.ctx(T0, &classify, &pass),
+        &w,
+        "begin",
+        &json!({"trigger": "owner_order", "files": ["hooks/guard.sh"]}),
+    )
+    .map_err(|e| e.message)
+    .unwrap();
+    let rec = r.record_of(v["repair"].as_str().unwrap());
+    assert_eq!(rec.classification, Classification::ProtectionRelated);
+    assert_eq!(rec.files.iter().map(|f| f.rel.as_str()).collect::<Vec<_>>(), ["hooks/guard.sh"]);
+}
+
+/// WW1 round 2 (RULINGS KH2): a report and a repair of the same file still meet. (a) `report --file
+/// BIN/A.py` and `begin --files BIN/A.py` (both through the verbs): the begin takes the report in, and after
+/// the commit the defect is joined, not open. (b) A row recorded under the alias by a build without the
+/// map (written straight through the intake writer) meets a repair begun under the real name.
+#[test]
+fn ww1_kh2_a_report_and_a_repair_of_the_same_file_meet() {
+    let r = rig("ww1kh2");
+    if !ww1_case_blind_volume(&r.pack) {
+        eprintln!("SKIPPED ww1_kh2_…: the temporary volume distinguishes letter case");
+        return;
+    }
+    let w = seat(3, "worker");
+    let a = r
+        .call(T0, &w, "report", json!({"file": "BIN/A.py", "error": "ValueError: bad"}))
+        .unwrap();
+    let begun = r
+        .call(T0, &w, "begin", json!({"trigger": "owner_order", "files": ["BIN/A.py"]}))
+        .unwrap();
+    let id = begun["repair"].as_str().unwrap().to_string();
+    std::fs::write(r.pack.join("bin/a.py"), b"print('fixed')\n").unwrap();
+    r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "fix"})).unwrap();
+    r.call(T0 + 2.0, &seat(7, "reviewer-codex"), "attest_verify", json!({"repair": id, "verdict": "pass", "note": "ok"}))
+        .unwrap();
+    r.call(T0 + 3.0, &w, "commit", json!({"repair": id})).unwrap();
+    let l = r.call(T0 + 4.0, &human(), "list", json!({})).unwrap();
+    let row = l["defects"].as_array().unwrap().iter().find(|d| d["signature"] == a["signature"]).cloned().unwrap();
+    assert_eq!(
+        (begun["intake_signatures"].clone(), row["joined"].clone(), row["open"].clone(), l["open_defects"].clone()),
+        (json!([a["signature"]]), json!(id), json!(false), json!(0)),
+        "the report and the repair of the same file meet: {row}"
+    );
+    // (b) an alias row from a build without the map
+    let r2 = rig("ww1kh2b");
+    let rep = cys::repair::intake::parse_report("BIN/A.py", "KeyError: 'k'").unwrap();
+    cys::repair::intake::record_in(&r2.root, &r2.lane, &rep, "seat-x", T0, 0, false, "KeyError: 'k'").unwrap();
+    let begun2 = r2
+        .call(T0, &w, "begin", json!({"trigger": "owner_order", "files": ["bin/a.py"]}))
+        .unwrap();
+    assert_eq!(begun2["intake_signatures"], json!([rep.signature]), "an alias row meets the repair of its file");
+}
