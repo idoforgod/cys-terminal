@@ -208,5 +208,169 @@ class DrainZombieGuardWiring(_Patched):
         self.assertIn("target_dead", events[0]["why"])
 
 
+class DrainRefusedWhilePaused(unittest.TestCase):
+    """H-05-N4-01 (설계 §6-5 "깨우기 큐가 일시정지 중 거부하는 동작" · RULINGS HN3) — the real CLI end to end: with the
+    kill-switch mark present at EITHER of its two paths (`<pack>/AUTOPILOT_PAUSED`, `<root>/_round/AUTOPILOT_PAUSED`) and
+    repair notices queued for the master, `javis_wakeup.py drain --deliver` exits 4 with 0 deliveries — nothing reaches
+    `cys send`, the notices stay pending, the ledger records the refusal. Control: the same queue without a mark IS
+    delivered (one digest send), so the refusal is the pause guard's and not a broken rig.
+    Sealed: private HOME / JAVIS_ROOT / CYS_PACK_DIR, every CYS_* / JAVIS_* / AITERM_* / CLAUDE* variable of the caller
+    removed, a mock `cys` first on PATH that only records its arguments (no daemon, no live queue)."""
+
+    # one log line per invocation (the digest text itself spans several lines, so only the verb and its target are logged)
+    MOCK_CYS = ("#!/bin/sh\nprintf 'CALL %s %s %s %s\\n' \"$1\" \"$2\" \"$3\" \"$4\" >> \"$MOCK_CALLS\"\n"
+                "echo 'QUEUED (depth 1) · durable=true'\nexit 0\n")
+    NOTICES = (("repair-R-0007", "수리 R-0007 검증 대기 — 리뷰어 서명 요청"),
+               ("repair-R-0008", "수리 R-0008 병합 충돌 — 워커 배정 필요"))
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wakeup-paused-")
+        self.root = os.path.join(self.tmp, "ws")
+        self.pack = os.path.join(self.tmp, "pack")
+        mockbin = os.path.join(self.tmp, "bin")
+        for d in (os.path.join(self.tmp, "home"), os.path.join(self.root, "_round"), self.pack, mockbin):
+            os.makedirs(d)
+        mock = os.path.join(mockbin, "cys")
+        with open(mock, "w", encoding="utf-8") as f:
+            f.write(self.MOCK_CYS)
+        os.chmod(mock, 0o755)
+        self.calls = os.path.join(self.tmp, "cys-calls.log")
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("CYS_", "JAVIS_", "AITERM_", "CLAUDE"))}
+        env.update(HOME=os.path.join(self.tmp, "home"), JAVIS_ROOT=self.root, CYS_PACK_DIR=self.pack,
+                   JAVIS_WAKEUP_LIVENESS="alive", MOCK_CALLS=self.calls,
+                   PATH=mockbin + os.pathsep + env.get("PATH", ""))
+        self.env = env
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, *args):
+        return subprocess.run([sys.executable, os.path.join(BIN, "javis_wakeup.py"), *args], env=self.env,
+                              cwd=self.root, capture_output=True, text=True, timeout=60)
+
+    def _pending(self):
+        d = os.path.join(self.root, "_round", "wakeups", "pending")
+        return sorted(n for n in os.listdir(d) if n.endswith(".json")) if os.path.isdir(d) else []
+
+    def _cys_calls(self):
+        try:
+            with open(self.calls, encoding="utf-8") as f:
+                return [ln for ln in f.read().splitlines() if ln.strip()]
+        except FileNotFoundError:
+            return []
+
+    def _events(self):
+        try:
+            with open(os.path.join(self.root, "_round", "wakeups", "queue.jsonl"), encoding="utf-8") as f:
+                return [json.loads(ln)["event"] for ln in f if ln.strip()]
+        except FileNotFoundError:
+            return []
+
+    def _queue_repair_notices(self):
+        for task, reason in self.NOTICES:
+            r = self._run("enqueue", "--to", "master", "--task", task, "--reason", reason, "--idempotency-key", task)
+            self.assertEqual(r.returncode, 0, "enqueue: %s %s" % (r.stdout, r.stderr))
+        self.assertEqual(len(self._pending()), 2, "premise: two repair notices pending for the master")
+
+    def _assert_refused(self, mark):
+        self._queue_repair_notices()
+        before = self._pending()
+        with open(mark, "w", encoding="utf-8") as f:
+            f.write("paused by the owner\n")
+        r = self._run("drain", "--deliver")
+        self.assertEqual(r.returncode, 4, "drain --deliver under %s must exit 4 (paused): rc=%s\n%s\n%s"
+                         % (mark, r.returncode, r.stdout, r.stderr))
+        out = json.loads([ln for ln in r.stdout.splitlines() if ln.startswith("{")][-1])
+        self.assertEqual((out["delivered"], out.get("refused")), (0, "paused"), out)
+        self.assertEqual(self._cys_calls(), [], "a paused drain reached `cys send`")
+        self.assertEqual(self._pending(), before, "the queued notices must stay pending while paused")
+        self.assertIn("deliver_refused_paused", self._events())
+
+    def test_pack_mark_refuses_delivery(self):
+        self._assert_refused(os.path.join(self.pack, "AUTOPILOT_PAUSED"))
+
+    def test_workspace_mark_refuses_delivery(self):
+        self._assert_refused(os.path.join(self.root, "_round", "AUTOPILOT_PAUSED"))
+
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                     "a folder without search permission cannot be made here (Windows / root) — "
+                     "PausedEvidenceUnknownState measures the same rule in-process")
+    def test_unknown_pause_state_is_refused(self):
+        """RULINGS JE1 (H-05-N4-01 "확인 불능도 거부"): the owner's mark is written, then its folder loses search
+        permission, so the pause state cannot be read (stat -> EACCES). That is a pause: exit 4, nothing delivered,
+        the notices stay pending, and the evidence names the path and the error."""
+        self._queue_repair_notices()
+        before = self._pending()
+        mark = os.path.join(self.pack, "AUTOPILOT_PAUSED")
+        with open(mark, "w", encoding="utf-8") as f:
+            f.write("paused by the owner\n")
+        os.chmod(self.pack, 0)
+        try:
+            r = self._run("drain", "--deliver")
+        finally:
+            os.chmod(self.pack, 0o700)
+        self.assertEqual(r.returncode, 4, "unknown pause state must be refused: rc=%s\n%s\n%s"
+                         % (r.returncode, r.stdout, r.stderr))
+        out = json.loads([ln for ln in r.stdout.splitlines() if ln.startswith("{")][-1])
+        self.assertEqual((out["delivered"], out.get("refused")), (0, "paused"), out)
+        self.assertTrue(any(mark in ev and "확인 불능" in ev for ev in out["evidence"]),
+                        "the evidence must name the unreadable path and say 확인 불능: %r" % out["evidence"])
+        self.assertEqual(self._cys_calls(), [], "an unreadable pause state let the drain reach `cys send`")
+        self.assertEqual(self._pending(), before, "the notices must stay pending")
+
+    def test_control_without_a_mark_the_same_queue_is_delivered(self):
+        self._queue_repair_notices()
+        r = self._run("drain", "--deliver")
+        self.assertEqual(r.returncode, 0, "%s\n%s" % (r.stdout, r.stderr))
+        out = json.loads([ln for ln in r.stdout.splitlines() if ln.startswith("{")][-1])
+        self.assertEqual(out["delivered"], 2, out)
+        calls = self._cys_calls()
+        self.assertEqual(len(calls), 1, "one digest send for the master: %r" % calls)
+        self.assertEqual(calls[0], "CALL send --queued --to master", calls)
+        self.assertEqual(self._pending(), [])
+
+
+
+class PausedEvidenceUnknownState(_Patched):
+    """RULINGS JE1 — `paused_evidence()` asks the file system for each mark: "no such file" / "not a directory" means no
+    mark; ANY other error means the state is unknown, and unknown is a pause (fail-closed, "확인 불능도 거부"). In-process
+    and portable: the file-system calls are made to fail with EACCES for the mark only (stat and lstat both, whichever
+    the implementation asks)."""
+
+    @staticmethod
+    def _deny_mark(real):
+        def call(path, *a, **kw):
+            if os.path.basename(os.fspath(path)) == W.PAUSED_BASENAME:
+                raise PermissionError(13, "Permission denied", os.fspath(path))
+            return real(path, *a, **kw)
+        return call
+
+    def test_unreadable_mark_counts_as_paused(self):
+        from unittest import mock
+        with mock.patch.object(W.os, "stat", self._deny_mark(os.stat)), \
+                mock.patch.object(W.os, "lstat", self._deny_mark(os.lstat)):
+            paused, evidence = W.paused_evidence()
+        self.assertTrue(paused, "an unreadable pause state was read as 'not paused'")
+        self.assertEqual(len(evidence), 2, evidence)   # both paths are unknown
+        for ev, path in zip(evidence, W.paused_paths()):
+            self.assertTrue(ev.startswith(path) and "확인 불능" in ev, ev)
+
+    def test_no_mark_and_not_a_directory_are_not_a_pause(self):
+        self.assertEqual(W.paused_evidence(), (False, []), "no mark at either path")
+        blocker = os.path.join(self.tmp, "a-file")
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("x")
+        os.environ["CYS_PACK_DIR"] = blocker          # <file>/AUTOPILOT_PAUSED -> ENOTDIR = no such mark
+        self.assertEqual(W.paused_evidence(), (False, []), "'not a directory' is 'no mark', not 'unknown'")
+
+    def test_a_present_mark_is_a_pause(self):
+        mark = W.paused_paths()[0]
+        with open(mark, "w", encoding="utf-8") as f:
+            f.write("paused\n")
+        self.assertEqual(W.paused_evidence(), (True, [mark]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

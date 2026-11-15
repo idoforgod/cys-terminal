@@ -8149,4 +8149,59 @@ mod repair_job_schedule_tests {
         let others: Vec<serde_json::Value> = jobs.iter().filter(|j| j["id"] != REPAIR_JOB_ID).cloned().collect();
         assert_eq!(others, others_before);
     }
+
+    /// I-F3-12 (s4) + (s5) — RULINGS AY7 "the ENTIRE definition": the stored job's `base_only` flag set (either value)
+    /// or ANOTHER field of its definition changed (the version mark, an added `to` / `via_queue` / `text`) — the
+    /// variants `appended_job_restored_whole_others_untouched` does not exercise. Each comes back as the whole code
+    /// definition at the next ensure, so an ensure that restores only the marker / action / interval (AW7 as first
+    /// written — the test plan's own mutation) is red here. Nothing else moves; a second ensure changes nothing.
+    #[test]
+    fn appended_job_restored_whole_when_base_only_or_another_field_changed() {
+        let mut jobs: Vec<serde_json::Value> = vec![json!({"id": "user-custom-job", "every_minutes": 30, "action": "push", "to": "master"})];
+        apply_builtin_jobs(&mut jobs);
+        let others_before: Vec<serde_json::Value> = jobs.iter().filter(|j| j["id"] != REPAIR_JOB_ID).cloned().collect();
+        let variants: [(&str, fn(&mut serde_json::Value)); 6] = [
+            ("(s4) base_only set true", |j| j["base_only"] = json!(true)),
+            ("(s4) base_only set false", |j| j["base_only"] = json!(false)),
+            ("(s5) _builtin_version changed", |j| j["_builtin_version"] = json!(BUILTIN_JOBS_VERSION + 1)),
+            ("(s5) via_queue added", |j| j["via_queue"] = json!(true)),
+            ("(s5) to added", |j| j["to"] = json!("master")),
+            ("(s5) text added", |j| j["text"] = json!("operator note")),
+        ];
+        for (variant, change) in variants {
+            let mut js = jobs.clone();
+            let entry = js.iter_mut().find(|j| j["id"] == REPAIR_JOB_ID).expect("the appended job");
+            change(entry);
+            assert_ne!(entry, &def(), "{variant}: the fixture changed nothing");
+            let (changed, conflicts, _) = apply_builtin_jobs(&mut js);
+            assert!(changed, "{variant}: restored");
+            assert!(!conflicts.contains(&REPAIR_JOB_ID.to_string()), "{variant}: never a preemption");
+            let mine: Vec<&serde_json::Value> = js.iter().filter(|j| j["id"] == REPAIR_JOB_ID).collect();
+            assert_eq!(mine, vec![&def()], "{variant}: one entry, the whole definition");
+            let others: Vec<serde_json::Value> = js.iter().filter(|j| j["id"] != REPAIR_JOB_ID).cloned().collect();
+            assert_eq!(others, others_before, "{variant}: another job moved");
+            let (again, _, _) = apply_builtin_jobs(&mut js);
+            assert!(!again, "{variant}: a second ensure changes nothing");
+        }
+    }
+
+    /// I-F4-19 (design §4-9 "예약기의 일반 시간 초과 동작은 바꾸지 않는다" · RULINGS HN3 · stage-5 map I: NONE): the
+    /// scheduler's command deadline stays 600 s, report-only, on the ONE command execution path — `fire_command`, which
+    /// every `action: "command"` job (the appended `repair-probation-tick` too) goes through. Pinned without waiting:
+    /// a source pin of the call site and its value, in the form of `job_result_ledger_is_memory_only_and_never_gates_firing`
+    /// (the fn body is cut out of the production text, so this test's own needles cannot satisfy it).
+    #[test]
+    fn command_deadline_stays_600s_on_the_one_command_path() {
+        let src = include_str!("schedule.rs");
+        let at = src.find("\nasync fn fire_command(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {").expect("fire_command 소실");
+        let end = at + 1 + src[at + 1..].find("\n}\n").expect("fire_command 끝");
+        let body = &src[at..end];
+        assert_eq!(body.matches("tokio::time::timeout(").count(), 1, "the command path has exactly one deadline");
+        assert!(
+            body.contains("tokio::time::timeout(Duration::from_secs(600), c.output())"),
+            "the scheduler's command deadline is no longer 600 s around the command's output"
+        );
+        assert!(body.contains(".map_err(|_| \"command timed out (600s)\".to_string())?"), "the deadline's report changed");
+        assert_eq!(src.matches("\"command\" => fire_command(&daemon, &job).await,").count(), 1, "every command job reaches fire_command");
+    }
 }
