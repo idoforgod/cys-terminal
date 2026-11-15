@@ -3041,6 +3041,9 @@ pub struct UpdateSources {
     pub lane: Option<crate::repair::types::LaneKey>,
     /// rel → 그 삭제를 기록한 수리 번호(파일 묘비만 · 생명줄 훅 파일 제외 — `with_tombstones` 가 거른다).
     tombstoned_files: std::collections::BTreeMap<String, String>,
+    /// ★T2j(RULINGS HP4 (a)): 따르지 않은 파일 묘비 (rel, 수리 번호) — 보호 목록의 파일(설계 8-1 D⑥: 보호장치를 없애는 후보는
+    /// 거부되므로 그 묘비는 정당할 수 없다). 묘비 파일은 그대로이고, 설치 보고가 한 번 이름 댄다.
+    void_tombstones: Vec<(String, String)>,
     boot_critical: RelPredicate,
     /// ★T2f: 팩 쓰기 동사의 등재 술어(기본 = `listed_in_compiled_lists`) — 기동 필수 판정과 따로 둔다(보호 목록에만
     /// 있는 파일은 등재되지만 업데이트에서는 기동 필수가 아니다 — BC2).
@@ -3055,6 +3058,7 @@ impl std::fmt::Debug for UpdateSources {
         f.debug_struct("UpdateSources")
             .field("lane", &self.lane)
             .field("tombstoned_files", &self.tombstoned_files)
+            .field("void_tombstones", &self.void_tombstones)
             .field("snapshot_root", &self.snapshot_root)
             .finish_non_exhaustive()
     }
@@ -3090,6 +3094,7 @@ impl UpdateSources {
         UpdateSources {
             lane: None,
             tombstoned_files: std::collections::BTreeMap::new(),
+            void_tombstones: Vec::new(),
             boot_critical: Box::new(boot_critical_rel),
             listed: Box::new(listed_in_compiled_lists),
             prev_vendor: Box::new(|rel: &str| {
@@ -3144,6 +3149,14 @@ impl UpdateSources {
             if is_lifeline_rel(&t.rel) || t.rel.starts_with("settings:") {
                 continue;
             }
+            // ★T2j(RULINGS HP4 (a) · 설계 8-1 D⑥ "보호장치 넷을 없애는 후보가 거부됨"): 보호 목록의 파일은 승인된 수리로도 지울 수
+            //   없다 — 그 묘비는 정당할 수 없으므로 생명줄처럼 따르지 않는다(파일은 되살아난다). 묘비 파일은 지우지 않고 설치 보고가
+            //   한 번 이름 댄다. 기동 필수 목록에만 있는 파일의 묘비는 따른다 — 승인된 수리의 삭제가 업데이트 뒤에도 남는다
+            //   (CONTRACTS 1.5 · 8.7: 생명줄 여섯만 묘비가 적용되지 않는다).
+            if crate::repair::boot_critical::protection_entry(&t.rel).is_some() {
+                self.void_tombstones.push((t.rel, t.repair.as_str().to_string()));
+                continue;
+            }
             self.tombstoned_files.insert(t.rel, t.repair.as_str().to_string());
         }
         self
@@ -3186,6 +3199,11 @@ impl UpdateSources {
     /// 이 파일의 삭제를 기록한 수리 번호(생명줄은 결코 None 이 아닌 값을 갖지 않는다).
     pub fn tombstone_for(&self, rel: &str) -> Option<&str> {
         self.tombstoned_files.get(rel).map(String::as_str)
+    }
+
+    /// ★T2j(RULINGS HP4 (a)): 따르지 않은 보호장치 파일의 묘비 (rel, 수리 번호) — 설치 보고용.
+    pub fn void_tombstones(&self) -> &[(String, String)] {
+        &self.void_tombstones
     }
 
     /// 허가된 부재 집합 — 설치 준비본 존재 검사(`verify_staging_with`)가 쓴다.
@@ -7209,6 +7227,14 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             "[init-pack] 수리 장부에 기록된 삭제 {}건은 만들지 않았습니다(부재 유지): {} — 되돌리려면 그 수리를 `cys repair revert <번호>`",
             absent_kept.len(),
             absent_kept.join(", ")
+        );
+    }
+    // ★T2j(RULINGS HP4 (a)): 따르지 않은 보호장치 파일의 묘비 — 사실대로 한 번(묘비 파일은 지우지 않았다).
+    if !sources.void_tombstones().is_empty() {
+        println!(
+            "[init-pack] 보호장치 파일의 삭제 표식(묘비) {}건은 따르지 않았습니다 — 보호장치는 승인된 수리로도 지울 수 없어 그 표식은 정당한 기록일 수 없습니다. 그 파일은 다른 파일처럼 설치했고(없으면 되살림) 표식은 지우지 않았습니다: {}",
+            sources.void_tombstones().len(),
+            sources.void_tombstones().iter().map(|(r, n)| format!("{r} ({n})")).collect::<Vec<_>>().join(", ")
         );
     }
     // ★W-1(P0): 판독 불가라 손대지 않은 파일은 **같은 실행의 출력에 반드시 드러난다.** 침묵하면
@@ -17314,6 +17340,44 @@ mod m11_tests {
         std::fs::remove_file(rig.pack.join("bin/gone.py")).unwrap();
         rig.install(&items_ref, false, &UpdateSources::none());
         assert_eq!(rig.read("bin/gone.py").as_deref(), Some("V\n"), "기록 없는 삭제는 되살린다");
+    }
+
+    /// ★T2j(RULINGS HP4 (a) · 설계 8-1 D⑥ "보호장치 넷을 없애는 후보가 거부됨"): 보호장치 파일은 승인된 수리로도 지울 수 없다 — 그래서
+    /// 그 파일의 묘비는 정당할 수 없고, 설치는 생명줄처럼 따르지 않는다(파일은 되살아난다). 기동 필수 파일(보호장치 아님 · 생명줄 아님)의
+    /// 묘비는 따른다 — 승인된 수리의 삭제가 업데이트 뒤에도 남는다는 계약(CONTRACTS 1.5 · 8.7)을 깨지 않는다. 일반 파일도 종전 그대로.
+    #[test]
+    fn t2j_hp4_tombstone_of_a_protection_file_is_void_at_install() {
+        use crate::repair::boot_critical::{boot_critical_entry, protection_entry};
+        let rig = Rig::new("hp4");
+        let prot = ["hooks/guard.sh", "trusted-keys.json", "bin/javis_guard_register.py"];
+        let boot = "bin/javis_bootstrap.py";
+        for r in prot {
+            assert!(protection_entry(r).is_some() && !is_lifeline_rel(r), "{r}: 컴파일된 보호 목록의 행(생명줄 아님)");
+        }
+        assert!(boot_critical_entry(boot).is_some() && protection_entry(boot).is_none() && !is_lifeline_rel(boot), "{boot}: 기동 필수만");
+        let mut items: Vec<(&str, &str)> = prot.iter().map(|r| (*r, "V\n")).collect();
+        items.push((boot, "B\n"));
+        items.push(("bin/gone.py", "G\n"));
+        let mut ts: Vec<Tombstone> = prot.iter().map(|r| tomb(r, "R-5")).collect();
+        ts.push(tomb(boot, "R-6"));
+        ts.push(tomb("bin/gone.py", "R-7"));
+        let src = UpdateSources::none().with_tombstones(ts);
+        assert_eq!(
+            src.void_tombstones(),
+            prot.iter().map(|r| (r.to_string(), "R-5".to_string())).collect::<Vec<_>>().as_slice(),
+            "따르지 않은 묘비 = 보호장치 파일의 것(설치 보고가 이름 댄다)"
+        );
+        assert_eq!(
+            src.authorised_absent(),
+            [boot, "bin/gone.py"].iter().map(|r| r.to_string()).collect(),
+            "허가된 부재 = 기동 필수 · 일반 파일의 묘비"
+        );
+        rig.install(&items, false, &src);
+        for r in prot {
+            assert_eq!(rig.read(r).as_deref(), Some("V\n"), "{r}: 보호장치 파일은 묘비가 있어도 되살린다");
+        }
+        assert!(!rig.pack.join(boot).exists(), "{boot}: 기동 필수 파일의 묘비는 따른다(승인된 수리의 삭제 — CONTRACTS 1.5 · 8.7)");
+        assert!(!rig.pack.join("bin/gone.py").exists(), "일반 파일의 묘비는 따른다(종전)");
     }
 
     /// 부록 A-2 #2: 문서화된 초기화('지운 뒤 init-pack')는 묘비 없이 그대로 동작하고, seed-once 는 덮지 않는다.
