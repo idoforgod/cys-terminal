@@ -261,6 +261,8 @@ fn recheck_after_a_merge_through_the_dispatcher() {
     std::fs::write(r.pack.join("bin/a.py"), b"print('merged')\n").unwrap();
     let v = r.call(T0 + 1.0, &w, "recheck", json!({"repair": "R-1"})).unwrap();
     assert_eq!(v["lane_state"], "verified", "{v}");
+    // RULINGS JD2 (added): the answer names what the call changed
+    assert_eq!(v["changed"], "이 호출이 바꾼 것: 이 부서의 행('충돌' → '검증됨', 합친 기록을 남기고 합치기 잠금을 풂)", "{v}");
     row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
     assert_eq!(row.state, LaneState::Verified);
     let m = row.merge.unwrap();
@@ -450,7 +452,8 @@ fn a_hook_only_repairs_conflict_is_merged_through_unregister_hook_joins() {
     let v = handle_with(&ctx, &w, "recheck", &json!({"repair": "R-1"})).unwrap();
     assert_eq!(v["lane_state"], "verified", "{v}");
     assert_eq!(steps.get(), 1, "the lane's own hook step ran");
-    // RULINGS JD2 (added): the row records the hook operation the call completed
+    // RULINGS JD2 (added): the answer names the hook operation the call completed; the row records it
+    assert!(v["changed"].as_str().is_some_and(|c| c.contains("이 부서의 훅 등록 해제(작업 test-hook-op")), "{v}");
     let done = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
     assert_eq!(done.state, LaneState::Verified);
     assert!(done.merge_lock.is_none() && done.merge.is_some());
