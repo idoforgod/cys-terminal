@@ -3141,7 +3141,7 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("propagate.rs", "finish_as", "display", 1, "R1: the live states shown with a 충돌 (an unreadable member leaves the list empty; IK3 / IG5 pass the record in — the second site, a re-read of it, is gone; IQ1 renamed `finish` → `finish_as`)"),
     ("propagate.rs", "pack_now", "conservative", 1, "IV1 (`Stamp::pack_now`): an unreadable generation is None — a strict `holds` never calls a None unchanged (nothing written); IQ1's `Observed` is replaced by the stamp"),
     ("propagate.rs", "publish", "not-a-read", 1, "IV1: the stamp's own answer — every reason other than a changed record is 'states changed' (nothing written either way)"),
-    ("propagate.rs", "pack_instance_pass_in", "conservative", 2, "interpretation 31 / P5: an unreadable identity / generation skips its watch for this tick (never \"changed\")"),
+    ("propagate.rs", "pack_instance_pass_used", "conservative", 2, "interpretation 31 / P5: an unreadable identity / generation skips its watch for this tick (never \"changed\"; IZ3 renamed `pack_instance_pass_in` → `pack_instance_pass_used`)"),
     ("propagate.rs", "read_pack_instance", "not-a-read", 1, "the id line without its newline"),
     ("propagate.rs", "run_checks", "conservative", 2, "IG4: the reference recorded exactly as T6's origin apply records it — one that cannot run is 0, and T6's attribution never blames a timeout on a 0"),
     ("propagate.rs", "sweep_own_scratch", "conservative", 1, "nothing to sweep when the folder cannot be listed — retried at the next tick"),
