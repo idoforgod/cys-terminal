@@ -1218,6 +1218,90 @@ fn foreign_bytes_at_the_door_are_a_conflict_and_stay() {
     assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Conflict);
 }
 
+/// A committed repair of SEVERAL files made in HQ (as `committed_in_hq` for one): per file the pre-image
+/// copied, the HQ file edited, the committed copy sealed; the record in probation, HQ's row verified.
+#[allow(clippy::type_complexity)]
+fn committed_many_in_hq(r: &Rig, id: &RepairId, files: &[(&str, &[u8], &[u8])]) -> RepairRecord {
+    let mut changes = Vec::new();
+    let mut committed = Vec::new();
+    for (rel, pre, post) in files {
+        let live = r.hq.join(rel);
+        let _ = std::fs::remove_file(&live);
+        r.put(HQ, rel, pre, 0o644);
+        let pre_img = ledger::copy_preimage_in(&r.root, id, &lane(HQ), rel, &live, T0 - 10.0).unwrap();
+        r.put(HQ, rel, post, 0o644);
+        let post_st = TargetState::read(&live).unwrap();
+        seal_committed_copy_in(&r.root, id, &lane(HQ), rel, &live, T0 - 5.0).unwrap();
+        changes.push(FileChange { rel: (*rel).into(), kind: ChangeKind::Edit, pre: pre_img, post: post_st.clone(), diff: None });
+        committed.push(((*rel).to_string(), post_st.canon()));
+    }
+    record(r, id, Classification::General, changes, committed, HQ)
+}
+
+/// RULINGS IO1 — the record changes BETWEEN two targets of this lane's apply (here: superseded right
+/// after the first door operation): no undo — the second target is not applied, and the row is
+/// PUBLISHED as 충돌 at once with the reason naming the target already changed and the live states.
+/// Then (each from states, no new code): R re-committed → the next tick keeps the 충돌; R superseded by
+/// a newer repair → THAT repair's own row meets the half-changed files and is 충돌 where they differ.
+#[test]
+fn a_record_changed_between_two_targets_publishes_a_visible_conflict() {
+    struct SupersedeAfterFirst(PathBuf, RepairId, Cell<bool>);
+    impl Faults for SupersedeAfterFirst {
+        fn at(&self, p: Point, live: &Path, _: Option<&Slot>) -> bool {
+            if p == Point::BeforeDone && !self.2.get() && live.ends_with("bin/a.py") {
+                self.2.set(true);
+                let mut rec = ledger::read_record_in(&self.0, &self.1).unwrap().unwrap();
+                rec.state = RepairState::Superseded;
+                ledger::write_record_in(&self.0, &rec).unwrap();
+            }
+            false
+        }
+    }
+    for follow_up in ["re-committed", "superseded-by-a-newer-repair"] {
+        let r = rig(&format!("io1-{follow_up}"));
+        let id = rid("R-1");
+        committed_many_in_hq(&r, &id, &[("bin/a.py", b"old-a\n", b"new-a\n"), ("bin/b.py", b"old-b\n", b"new-b\n")]);
+        r.put(DEPT, "bin/a.py", b"old-a\n", 0o644);
+        r.put(DEPT, "bin/b.py", b"old-b\n", 0o644);
+        let f = SupersedeAfterFirst(r.root.clone(), id.clone(), Cell::new(false));
+        let t = tick_with(&r, DEPT, &doubles(), &fid(1), &f, &|_| false).unwrap();
+        assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"new-a\n", "the first target was changed");
+        assert_eq!(std::fs::read(r.dept.join("bin/b.py")).unwrap(), b"old-b\n", "the second target was NOT applied");
+        let row = r.row(&id, DEPT).unwrap();
+        assert_eq!(row.state, LaneState::Conflict, "{t:?}");
+        assert!(row.reason.contains("도중 수리 기록이 바뀌었습니다") && row.reason.contains("이미 바꾼 대상: bin/a.py"), "{}", row.reason);
+        assert!(!row.reason.contains("bin/b.py"), "{}", row.reason);
+        let live_a = r.live(DEPT, "bin/a.py").canon();
+        let live_b = r.live(DEPT, "bin/b.py").canon();
+        assert_eq!(row.conflict_live, vec![("bin/a.py".to_string(), live_a), ("bin/b.py".to_string(), live_b)]);
+        let ops_here = r.ops(&id).into_iter().filter(|o| o.lane_key == lane(DEPT)).count();
+        assert_eq!(ops_here, 1, "one door operation, nothing put back, nothing further written");
+        let bytes_before = (std::fs::read(r.dept.join("bin/a.py")).unwrap(), std::fs::read(r.dept.join("bin/b.py")).unwrap());
+        if follow_up == "re-committed" {
+            // R committed again with another result: the next tick keeps 충돌 for the changed targets
+            let mut rec = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
+            rec.state = RepairState::Probation;
+            rec.committed = vec![
+                ("bin/a.py".into(), TargetState::File { sha256: "1".repeat(64), mode: 0o644 }.canon()),
+                ("bin/b.py".into(), TargetState::File { sha256: "2".repeat(64), mode: 0o644 }.canon()),
+            ];
+            ledger::write_record_in(&r.root, &rec).unwrap();
+            tick(&r, DEPT, &doubles(), &fid(1));
+            assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Conflict);
+        } else {
+            // a newer repair R-2 of the same files (HQ's pre = R's result): its own row meets the
+            // half-changed files — a.py is at its pre-image, b.py is neither → 충돌, nothing applied
+            let id2 = rid("R-2");
+            committed_many_in_hq(&r, &id2, &[("bin/a.py", b"new-a\n", b"newer-a\n"), ("bin/b.py", b"new-b\n", b"newer-b\n")]);
+            tick(&r, DEPT, &doubles(), &fid(1));
+            let row2 = r.row(&id2, DEPT).unwrap();
+            assert_eq!(row2.state, LaneState::Conflict, "{}", row2.reason);
+            assert!(r.ops(&id2).iter().all(|o| o.lane_key != lane(DEPT)), "nothing of R-2 applied over a mixed lane");
+        }
+        assert_eq!((std::fs::read(r.dept.join("bin/a.py")).unwrap(), std::fs::read(r.dept.join("bin/b.py")).unwrap()), bytes_before, "{follow_up}: the department's bytes are never overwritten");
+    }
+}
+
 /// RULINGS IK3 — NO LOCK ACROSS A CHECK: while this lane's copy-check and its live check run (a check
 /// child "parked" by the seam), the machine-wide pack-apply lock is free — a `try` of it succeeds and
 /// ANOTHER lane's tick runs its pass (which needs the lock) to its end. (On the old shape the whole tick
