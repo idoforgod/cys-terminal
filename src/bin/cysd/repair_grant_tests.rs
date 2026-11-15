@@ -2130,10 +2130,12 @@ fn hp2_the_pause_mark_is_read_the_bounded_way() {
     daemon.paused.store(true, Ordering::SeqCst);
     assert!(product_pause_in_force(&daemon, &r.pack));
     let src = include_str!("repair.rs");
+    // T5b joined (rebase onto batch 7 — old expectation 2 and 2: `handle` and the seat release): T5b's
+    // `with_daemon_ctx` is the third production context and reads the kill-switch the same way
     assert_eq!(
         src.matches("let product_pause = || product_pause_in_force(daemon, &cys::pack::pack_dir());").count(),
-        2,
-        "both production contexts read the daemon's kill-switch and the lane's pack"
+        3,
+        "every production context reads the daemon's kill-switch and the lane's pack"
     );
-    assert_eq!(src.matches("product_pause: &product_pause,").count(), 2);
+    assert_eq!(src.matches("product_pause: &product_pause,").count(), 3);
 }
