@@ -3409,7 +3409,6 @@ mod ledger_verbs {
                 merge_lock: None,
                 merge_attempt: 0,
                 reason: String::new(),
-                hook_ops: Vec::new(),
                 updated_at: ctx.now,
             };
             ledger::write_lane_in(&ctx.root, &row)?;
@@ -3677,6 +3676,15 @@ mod ledger_verbs {
             .into_iter()
             .map(|s| json!({"slot": s.name, "dir": s.dir, "entries": s.entries, "changed_after_deposit": s.changed_after_deposit}))
             .collect();
+        // RULINGS JI1 (T7b): per lane, the hook operations that lane COMPLETED for R — READ from R's
+        // operation records (the one source; unreadable → the sentence, never an empty list)
+        let (hook_ops, hook_ops_unreadable) = match cys::repair::propagate::completed_hook_ops_in(&ctx.root, id) {
+            Ok(ops) => (
+                ops.iter().map(|o| json!({"lane": o.lane.0, "op": o.op, "kind": o.kind, "lines": o.lines, "text": o.text()})).collect::<Vec<_>>(),
+                Value::Null,
+            ),
+            Err(why) => (Vec::new(), json!(cys::repair::propagate::hook_ops_unreadable(&why))),
+        };
         let staging = ledger::staging_dir_in(&ctx.root, id);
         let lock = rec.lock.as_ref().map(|l| {
             let view = if lock::released_by_restart(l, &ctx.lane, &ctx.incarnation) {
@@ -3714,6 +3722,8 @@ mod ledger_verbs {
                 "resubmits": rec.resubmits,
                 "lane_rows": merges,
                 "lane_rows_unreadable": broken,
+                "hook_ops": hook_ops,
+                "hook_ops_unreadable": hook_ops_unreadable,
                 "vault_slots": slots,
                 "staging": if is_approval_class(rec.classification) || staging.exists() { json!(staging) } else { Value::Null },
                 "intake_signatures": rec.intake_signatures,

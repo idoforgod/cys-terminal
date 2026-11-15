@@ -250,7 +250,6 @@ fn recheck_after_a_merge_through_the_dispatcher() {
         merge_lock: None,
         merge_attempt: 0,
         reason: String::new(),
-        hook_ops: Vec::new(),
         updated_at: T0,
     };
     ledger::write_lane_in(&r.root, &row).unwrap();
@@ -431,7 +430,6 @@ fn a_hook_only_repairs_conflict_is_merged_through_unregister_hook_joins() {
         merge_lock: None,
         merge_attempt: 0,
         reason: "훅 등록 해제를 이 부서에서 마치지 못했습니다 — (시험)".into(),
-        hook_ops: Vec::new(),
         updated_at: T0,
     };
     ledger::write_lane_in(&r.root, &row).unwrap();
@@ -442,9 +440,12 @@ fn a_hook_only_repairs_conflict_is_merged_through_unregister_hook_joins() {
     assert!(locked.merge_lock.is_some(), "begin_joins took this lane's merge lock");
     // line 3: `recheck` — the lane's hook step (a double here) then 검증됨
     let steps = std::cell::Cell::new(0u32);
-    let hook = |_: &RepairId, _: &LaneKey, step: cys::repair::apply::HookStep| -> Result<cys::repair::apply::ReconcileReport, RepairError> {
+    let hook = |rid: &RepairId, l: &LaneKey, step: cys::repair::apply::HookStep| -> Result<cys::repair::apply::ReconcileReport, RepairError> {
         assert!(matches!(step, cys::repair::apply::HookStep::Unregister));
         steps.set(steps.get() + 1);
+        // JI1: the operation record a real unit writes (the double writes it, completed, under the id the
+        // verb's test unit reports)
+        hook_op_record(&r, rid, &l.0, "test-hook-op", true);
         Ok(cys::repair::apply::ReconcileReport { hooks: Vec::new() })
     };
     let mut ctx = r.ctx(T0 + 1.0);
@@ -452,10 +453,172 @@ fn a_hook_only_repairs_conflict_is_merged_through_unregister_hook_joins() {
     let v = handle_with(&ctx, &w, "recheck", &json!({"repair": "R-1"})).unwrap();
     assert_eq!(v["lane_state"], "verified", "{v}");
     assert_eq!(steps.get(), 1, "the lane's own hook step ran");
-    // RULINGS JD2 (added): the answer names the hook operation the call completed; the row records it
-    assert!(v["changed"].as_str().is_some_and(|c| c.contains("이 부서의 훅 등록 해제(작업 test-hook-op")), "{v}");
+    // RULINGS JD2 / JI1 (added): the answer names the hook operation the call completed, READ from its record
+    assert!(v["changed"].as_str().is_some_and(|c| c.ends_with("이 부서의 훅 등록 해제(작업 test-hook-op: Stop:x.sh)")), "{v}");
     let done = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
     assert_eq!(done.state, LaneState::Verified);
     assert!(done.merge_lock.is_none() && done.merge.is_some());
-    assert!(done.hook_ops.iter().any(|h| h.op == "test-hook-op"), "{:?}", done.hook_ops);
+}
+
+// ───────────────────────────── RULINGS JI1 — what a lane's hook units did, read from ONE source ─────────────────────────────
+
+/// A hook operation record of `lane` for R, as T6's hook unit writes it (`finished` = completed, outcome
+/// `applied`; else the stop right after the write-ahead record).
+fn hook_op_record(r: &Rig, id: &RepairId, lane: &str, op: &str, finished: bool) {
+    let rec = cys::repair::wal::OpRecord {
+        schema: 1,
+        op: op.into(),
+        repair: id.clone(),
+        lane_key: LaneKey(lane.into()),
+        kind: "hook-unregister".into(),
+        form: "hook".into(),
+        rel: String::new(),
+        pre_existed: false,
+        expected: String::new(),
+        incoming: String::new(),
+        pack_generation: Some(cys::repair::apply::pack_generation(&r.pack)),
+        slot: None,
+        slot_identity: None,
+        live_identity: None,
+        incoming_copy: None,
+        incoming_copy_identity: None,
+        step: if finished { "done" } else { "recorded" }.into(),
+        hooks: vec![cys::repair::wal::HookLine { event: "Stop".into(), script: "x.sh".into(), targets: Vec::new() }],
+        finished,
+        outcome: if finished { Some("applied".into()) } else { None },
+        note: String::new(),
+        created_at: T0,
+        updated_at: T0,
+        notice: None,
+    };
+    cys::repair::wal::write_in(&r.root, &rec).unwrap();
+}
+
+/// A hook-only repair of another department (`dept-x`), in force; this rig's lane (`base`) receives it.
+fn hook_only_in_force(r: &Rig, id: &RepairId) {
+    std::fs::create_dir_all(ledger::repair_dir_in(&r.root, id)).unwrap();
+    let rec = RepairRecord {
+        schema: 1,
+        id: id.clone(),
+        created_at: 1.0,
+        trigger: cys::repair::types::Trigger::Update,
+        symptom: String::new(),
+        cause: String::new(),
+        classification: Classification::General,
+        files: vec![ledger::FileChange {
+            rel: "settings:Stop:x.sh".into(),
+            kind: ledger::ChangeKind::HookUnregister { event: "Stop".into(), script: "x.sh".into() },
+            pre: ledger::PreImage::Absent,
+            post: TargetState::Absent,
+            diff: None,
+        }],
+        worker_record: None,
+        verify: None,
+        audit: None,
+        audit_due_at: None,
+        approval: None,
+        owner_token_sha256: None,
+        attempt: 1,
+        methods: Vec::new(),
+        resubmits: Vec::new(),
+        pending_request: None,
+        lock: None,
+        state: RepairState::Probation,
+        intake_signatures: Vec::new(),
+        owner_original: false,
+        origin_lane: LaneKey("dept-x".into()),
+        resolves: None,
+        committed: Vec::new(),
+        fixer_seats: Vec::new(),
+        checks: Vec::new(),
+        reapplies: None,
+    };
+    ledger::write_record_in(&r.root, &rec).unwrap();
+}
+
+fn status_hook_ops(r: &Rig, id: &str) -> Value {
+    r.call(T0 + 50.0, &seat(3, "worker"), "status", json!({"repair": id})).unwrap()
+}
+
+/// RULINGS JI (M1) — R in force, this lane's EXISTING 충돌 row with a valid merge lease; `recheck`'s hook
+/// unit wrote its write-ahead record and the daemon stopped before any trace; T6's recovery completes
+/// the operation and writes no row (the row stays as it was) → `status R` shows the completed operation
+/// for this lane, read from its record.
+#[test]
+fn status_shows_a_hook_operation_recovery_completed_on_an_existing_conflict_row() {
+    let r = rig("ji-m1");
+    let id = RepairId::parse("R-1").unwrap();
+    hook_only_in_force(&r, &id);
+    let row = ledger::LaneRecord {
+        schema: 1,
+        repair: id.clone(),
+        lane: r.lane.clone(),
+        state: LaneState::Conflict,
+        probation: None,
+        merge: None,
+        merge_history: Vec::new(),
+        approval_ref: None,
+        conflict_live: Vec::new(),
+        applied: Vec::new(),
+        applied_history: Vec::new(),
+        merge_base: Vec::new(),
+        merge_lock: Some(cys::repair::lock::new_lease(cys::repair::types::LockOwner { lane: r.lane.clone(), seat: 3, incarnation: "inc-1".into() }, T0, None)),
+        merge_attempt: 1,
+        reason: "합친 뒤의 다시 검사 실패 — (시험)".into(),
+        updated_at: T0,
+    };
+    ledger::write_lane_in(&r.root, &row).unwrap();
+    let op = cys::repair::wal::new_op_id(T0, "hook-unregister");
+    hook_op_record(&r, &id, "base", &op, false);
+    let settings = r.base.join("settings.json");
+    let registrar = |_: &std::path::Path, _: bool| -> Result<String, RepairError> {
+        Ok(json!({"hooks": [{"event": "Stop", "script": "x.sh", "lifeline": false, "desired": "unregistered",
+                  "targets": [{"path": settings.to_string_lossy(), "state": "unregistered"}]}], "errors": []}).to_string())
+    };
+    assert_eq!(cys::repair::apply::resume_hook_steps_in(&r.root, &r.pack, &r.lane, &registrar, &cys::repair::apply::no_repair_lock, T0 + 10.0), 1);
+    let after = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+    assert_eq!(after, row, "the recovery writes no row");
+    let v = status_hook_ops(&r, "R-1");
+    assert_eq!(v["hook_ops_unreadable"], Value::Null, "{v}");
+    assert_eq!(v["hook_ops"], json!([{"lane": "base", "op": op, "kind": "hook-unregister", "lines": ["Stop:x.sh"], "text": format!("훅 등록 해제(작업 {op}: Stop:x.sh)")}]), "{v}");
+}
+
+/// RULINGS JI (M2) — a completed hook operation of this lane for R; then R is re-opened by the audit,
+/// picked up, recorded, verified and committed again (the commit REBUILDS this lane's row) → `status R`
+/// still shows the operation (nothing that rebuilds a row holds the trace).
+#[test]
+fn status_still_shows_a_completed_hook_operation_after_a_commit_that_follows_an_audit_reopen() {
+    let r = rig("ji-m2");
+    let w = seat(3, "worker");
+    let id = verified(&r, "bin/a.py", b"print('fixed')\n");
+    r.call(T0 + 3.0, &w, "commit", json!({"repair": id})).unwrap();
+    let rid = RepairId::parse(&id).unwrap();
+    let op = cys::repair::wal::new_op_id(T0 + 3.5, "hook-unregister");
+    hook_op_record(&r, &rid, "base", &op, true);
+    r.call(T0 + 4.0, &seat(8, "reviewer-gemini"), "attest_audit", json!({"repair": id, "verdict": "finding", "note": "again"})).unwrap();
+    assert_eq!(r.record_of(&id).state, RepairState::ReopenedByAudit);
+    assert_eq!(r.call(T0 + 5.0, &w, "begin", json!({"trigger": "owner_order", "files": ["bin/a.py"]})).unwrap()["begin"], "picked-up");
+    std::fs::write(r.pack.join("bin/a.py"), b"print('fixed again')\n").unwrap();
+    r.call(T0 + 6.0, &w, "record", json!({"repair": id, "note": "fix again"})).unwrap();
+    r.call(T0 + 7.0, &seat(7, "reviewer-codex"), "attest_verify", json!({"repair": id, "verdict": "pass", "note": "ok"})).unwrap();
+    r.call(T0 + 8.0, &w, "commit", json!({"repair": id})).unwrap();
+    assert!(matches!(r.record_of(&id).state, RepairState::Probation | RepairState::InUse));
+    let v = status_hook_ops(&r, &id);
+    let ops = v["hook_ops"].as_array().unwrap();
+    assert!(ops.iter().any(|o| o["lane"] == "base" && o["op"] == op.as_str() && o["text"] == format!("훅 등록 해제(작업 {op}: Stop:x.sh)")), "{v}");
+}
+
+/// RULINGS JI1 — an operation record that cannot be read: `status` says it cannot tell ("확인할 수
+/// 없습니다", with the cause), never an empty list as if no hook operation had been completed.
+#[test]
+fn status_cannot_tell_the_completed_hook_operations_when_a_record_is_unreadable() {
+    let r = rig("ji-unreadable");
+    let id = RepairId::parse("R-1").unwrap();
+    hook_only_in_force(&r, &id);
+    hook_op_record(&r, &id, "base", &cys::repair::wal::new_op_id(T0, "hook-unregister"), true);
+    std::fs::write(cys::repair::wal::ops_dir_in(&r.root, &id).join("broken.json"), b"{ not json").unwrap();
+    let v = status_hook_ops(&r, "R-1");
+    assert_eq!(v["hook_ops"], json!([]), "{v}");
+    let why = v["hook_ops_unreadable"].as_str().unwrap_or_default();
+    assert!(why.starts_with("완료한 훅 작업을 확인할 수 없습니다 — ") && why.contains("broken.json"), "{v}");
 }
