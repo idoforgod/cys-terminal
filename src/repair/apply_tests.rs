@@ -716,6 +716,7 @@ pub(crate) fn lane_row(r: &Rig, id: &RepairId, applied: Vec<(String, String)>, t
             merge_lock: None,
             merge_attempt: 0,
             reason: String::new(),
+            hook_ops: Vec::new(),
             updated_at: 1.0,
         },
     )
@@ -3536,6 +3537,7 @@ fn forward_completion_rebuilds_an_existing_row() {
         merge_lock: None,
         merge_attempt: 0,
         reason: String::new(),
+        hook_ops: Vec::new(),
         updated_at: 1.0,
     }).unwrap();
     let stop = StopOn { rel: "hooks/a1.sh", point: Point::AfterRecordCommit, fired: Cell::new(false) };
