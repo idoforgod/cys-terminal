@@ -35,6 +35,10 @@ CENSUS_FILES = {
     # 상태와 같을 때만(다르면 거절·대체됨) 바꾸므로 그 뒤에 다른 작성자가 넣은 항목은 지우지 않는다(D㉘).
     "src/repair/apply.rs",               # 작성자 12(수리 엔진 · 규칙 1) — 이름은 H6(1) 자체 검사 주석
     "src/bin/cysd/repair_job.rs",        # 읽기만 — H6(1) 자체 검사(스케줄러 검증)를 수리 엔진에 넘김
+    "scripts/windows-measure/tw1_probes.py",    # NOT a writer of the product (C7 table unchanged): the CI-only Windows
+                                                # measurement driver (0.15.0 TW1, RULINGS FC3) edits the schedule.json
+                                                # of the installation UNDER TEST on a CI runner - the scenario's "the
+                                                # user removed a built-in job" - and reads it back
 }
 
 
