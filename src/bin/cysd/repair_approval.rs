@@ -399,6 +399,10 @@ pub(crate) fn submit(
     // RULINGS EL5: a finding is filed after every lock is released (the report verb takes locks)
     let mut found: Option<(String, String)> = None;
     let finding = &mut found;
+    // RULINGS JW2: under the locks only the settlement and "a notice is due" are decided; the notice
+    // is sent after BOTH locks (the repair's and the approval table's) are released, on every path
+    let mut notice: Option<String> = None;
+    let notice_due = &mut notice;
     let out = ctx.locked(id.as_str(), || {
         let mut rec = load(ctx, &id)?;
         if rec.origin_lane != ctx.lane {
@@ -460,10 +464,10 @@ pub(crate) fn submit(
         match reconcile_stale_pending(ctx.now, &tbl, id.as_str(), &mut rec, &consumed) {
             Reconciled::Nothing => {}
             Reconciled::Settled(count) => {
-                write(ctx, &rec)?;
                 if count == Some(MAX_RESUBMITS + 1) {
-                    eff.tell_master(budget_line(id.as_str(), &ctx.lane.0));
+                    *notice_due = Some(budget_line(id.as_str(), &ctx.lane.0));
                 }
+                write(ctx, &rec)?;
             }
             Reconciled::Unknown(why) => {
                 *finding = unknown_finding(&mut tbl, id.as_str(), &rec, &why);
@@ -566,6 +570,10 @@ pub(crate) fn submit(
     });
     if let Some((file, line)) = found {
         report_unknown(table, eff, id.as_str(), &file, &line);
+    }
+    // RULINGS JW2: both locks are released here
+    if let Some(line) = notice {
+        eff.tell_master(line);
     }
     out
 }
@@ -2337,7 +2345,13 @@ pub(crate) fn comparison_consequence(
         rel,
         c,
         &|f, l| crate::repair::file_intake(daemon, f, l),
-        &|text| point_master_now(daemon, text),
+        // RULINGS JW2: no lock is held across a send — the worker's check runs inside T6's commit
+        // guard, so the pointer goes out on its own thread; when no thread can be made it is not
+        // sent (GA8 (4): a pointer is never retried — the row written above is the record)
+        &|text| {
+            let d = daemon.clone();
+            let _ = spawn_thread("check-pointer", move || point_master_now(&d, text));
+        },
     )
 }
 
