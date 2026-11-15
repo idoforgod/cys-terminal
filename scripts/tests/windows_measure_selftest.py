@@ -16,7 +16,10 @@ What it pins (the rules of the record - plan impl/plans/TW1.md 3.7, each by a te
   R  the record: environment first, findings counted, sub-row FAIL counts, job conclusion (red on FAIL anywhere or a
      failed set-up; never red for findings or NOT-MEASURED alone), Markdown order;
   P  privacy: the redaction of paths / account names and the environment allow-list;
-  W  the workflow file: triggers, permissions, time limits, pins, retention, concurrency, no secret, cleanup always().
+  W  the workflow file: triggers, permissions, time limits, pins, retention, concurrency, no secret, cleanup always();
+  K  (TW2, RULINGS LH6) a kill by a REMEMBERED pid acts only while that pid still names the process that was recorded
+     (creation time + image); a tree is walked only from a verified root and only to children not older than their
+     parent; every successful stop closes the pid's registration.
 
 Standard library only. Run: python3 scripts/tests/windows_measure_selftest.py
 """
@@ -1035,6 +1038,337 @@ class ReleaseBlockingRowTests(unittest.TestCase):
         v = self._verdict("G13", {"folder_ok": False})
         self.assertEqual(v["verdict"], R.NMH)
         self.assertEqual(self._row("G13")["probe"], "s6_hangul")
+
+
+class FakeWindows:
+    """TW2: an injected process table [{pid, ppid, name, path, created}] and the one OS primitive the driver's kills go
+    through (`_os_terminate(pid, created)`: the handle-level check of the creation time, then TerminateProcess). New
+    processes get a fresh pid and a later creation time; a pid can be handed out again (reuse) by `reuse`."""
+
+    def __init__(self, procs=()):
+        self.procs = [dict(p) for p in procs]
+        self.killed = []
+        self.next_pid = 5000
+        self.clock = 50_000
+
+    def processes(self):
+        return [dict(p) for p in self.procs]
+
+    def os_terminate(self, pid, created=None):
+        for p in self.procs:
+            if p["pid"] == pid and (created is None or p["created"] == created):
+                self.procs.remove(p)
+                self.killed.append(pid)
+                return True
+        return False
+
+    def identity(self, pid):
+        for p in self.procs:
+            if p["pid"] == pid:
+                return {"created": p["created"], "image": p["path"]}
+        return None
+
+    def spawn(self, path, ppid=1, pid=None):
+        self.clock += 10
+        if pid is None:
+            self.next_pid += 4
+            pid = self.next_pid
+        p = {"pid": pid, "ppid": ppid, "name": re.split(r"[\\/]", path)[-1], "path": path, "created": self.clock}
+        self.procs.append(p)
+        return p
+
+    def popen(self):
+        world = self
+
+        class _Popen:
+            def __init__(self, cmd, **_kw):
+                self.pid = world.spawn(str(cmd[0]))["pid"]
+        return _Popen
+
+
+INST = "X:\\inst"
+CYSD = INST + "\\cysd.exe"
+
+
+class KillIdentityTests(unittest.TestCase):
+    """TW2 (RULINGS LH6): a kill by a remembered pid acts only on the process that was recorded; the registry is kept
+    true; every kill site of the driver is in the census below."""
+
+    def setUp(self):
+        import tempfile
+        from unittest import mock
+        import tw1_probes as P
+        import tw1_main as M
+        self.P, self.M, self.mock = P, M, mock
+        self.tmp = tempfile.TemporaryDirectory()
+        self.work = os.path.join(self.tmp.name, "tw1")
+        self.out = os.path.join(self.tmp.name, "tw1-record")
+        os.makedirs(self.work)
+        self.saved = (dict(P._STARTED), dict(P._REGISTRY), list(P.KILL_REFUSED))
+        P._STARTED.clear()
+        P._REGISTRY.update(path=None, probe=None)
+        del P.KILL_REFUSED[:]
+
+    def tearDown(self):
+        P = self.P
+        P._STARTED.clear()
+        P._STARTED.update(self.saved[0])
+        P._REGISTRY.clear()
+        P._REGISTRY.update(self.saved[1])
+        P.KILL_REFUSED[:] = self.saved[2]
+        self.tmp.cleanup()
+
+    def world(self, procs=()):
+        w = FakeWindows(procs)
+        mock = self.mock
+        for name, fn in (("processes", w.processes), ("_os_terminate", w.os_terminate), ("proc_identity", w.identity)):
+            pt = mock.patch.object(self.P, name, fn)
+            pt.start()
+            self.addCleanup(pt.stop)
+        return w
+
+    def probe(self, pid="s3_repair_flow"):
+        return self.P.Probe(pid, self.work, self.out, {"paths": {"install_dir": INST, "pack_dir": INST + "\\pack",
+                                                                  "local_dir": INST + "\\local"}})
+
+    def register(self, entries):
+        with open(os.path.join(self.work, "pids.jsonl"), "a", encoding="utf-8") as fh:
+            for e in entries:
+                fh.write(json.dumps(e) + "\n")
+
+    def open_registrations(self):
+        return self.P.registry_read(os.path.join(self.work, "pids.jsonl"))
+
+    # ── the pure rules ──
+    def test_identity_verdicts(self):
+        P = self.P
+        reg = {"created": 1000, "image": "X:\\Inst\\cysd.exe"}
+        self.assertEqual(P.identity_verdict(reg, {"created": 1000, "image": "\\\\?\\x:\\inst\\CYSD.EXE"}), "ours")
+        self.assertEqual(P.identity_verdict(reg, {"created": 1001, "image": "X:\\Inst\\cysd.exe"}), "pid-reused")
+        self.assertEqual(P.identity_verdict(reg, {"created": 1000, "image": "C:\\runner\\Runner.Worker.exe"}), "pid-reused")
+        self.assertEqual(P.identity_verdict(reg, None), "gone")
+        self.assertEqual(P.identity_verdict({"created": None, "image": "x"}, {"created": 5, "image": "x"}), "unverifiable")
+        self.assertEqual(P.identity_verdict(None, {"created": 5, "image": "x"}), "unverifiable")
+        self.assertEqual(P.identity_verdict(reg, {"created": None, "image": "X:\\Inst\\cysd.exe"}), "unverifiable")
+        self.assertEqual(P.identity_verdict({"created": 1000, "image": None}, {"created": 1000, "image": "y"}), "ours")
+        self.assertFalse(P.same_process(reg, None))
+
+    def test_a_tree_is_walked_only_from_a_verified_root_and_only_to_children_not_older_than_their_parent(self):
+        P = self.P
+        procs = [
+            {"pid": 100, "ppid": 1, "name": "cysd.exe", "path": CYSD, "created": 1000},
+            {"pid": 101, "ppid": 100, "name": "bash.exe", "path": "b", "created": 1010},
+            {"pid": 102, "ppid": 101, "name": "claude.exe", "path": "c", "created": 1020},
+            # older than 100: the child of an EARLIER holder of pid 100 (Windows keeps a dead parent's number)
+            {"pid": 103, "ppid": 100, "name": "Runner.Worker.exe", "path": "C:\\runner\\Runner.Worker.exe", "created": 500},
+            {"pid": 104, "ppid": 103, "name": "node.exe", "path": "n", "created": 600},
+            {"pid": 105, "ppid": 1, "name": "other.exe", "path": "o", "created": 1005},
+            {"pid": 106, "ppid": 102, "name": "x.exe", "path": "x", "created": None},   # unreadable: never walked
+        ]
+        self.assertEqual(sorted(P.tree_of(100, 1000, procs)), [101, 102])
+        plan = P.plan_tree_kill(100, {"created": 1000, "image": CYSD}, procs)
+        self.assertEqual(plan["root"], "ours")
+        self.assertEqual([k[0] for k in plan["kill"]], [102, 101, 100])      # descendants first, the root last
+        self.assertEqual(plan["kill"][0][1], 1020)                           # each kill carries its creation time
+        for expect, state in (({"created": 999, "image": CYSD}, "pid-reused"), (None, "unverifiable")):
+            plan = P.plan_tree_kill(100, expect, procs)
+            self.assertEqual((plan["root"], plan["kill"]), (state, []))
+        self.assertEqual(P.plan_tree_kill(77, {"created": 1, "image": None}, procs)["root"], "gone")
+        # a root the caller still holds a handle to (Popen) cannot have lost its pid: walked even after it exited
+        plan = P.plan_tree_kill(100, {"created": 1000, "image": CYSD, "pinned": True}, procs[1:])
+        self.assertEqual((plan["root"], [k[0] for k in plan["kill"]]), ("pinned-exited", [102, 101]))
+        # keep (a probe's timeout spares the run's registered processes) - by identity, not by number
+        keep = {101: {"pid": 101, "created": 1010, "image": "b"}, 102: {"pid": 102, "created": 7, "image": "c"}}
+        plan = P.plan_tree_kill(100, {"created": 1000, "image": CYSD}, procs, keep=keep)
+        self.assertEqual([k[0] for k in plan["kill"]], [102, 100])
+        self.assertEqual(plan["spared"], [101])
+
+    def test_registry_entries_are_the_open_registrations(self):
+        lines = [json.dumps({"pid": 10, "purpose": "a", "created": 1}), "not json",
+                 json.dumps({"pid": 11, "purpose": "b", "created": 2}), json.dumps({"pid": 10, "stopped": True}),
+                 json.dumps({"pid": 11, "purpose": "b again", "created": 3})]
+        reg = self.P.registry_entries(lines)
+        self.assertEqual(sorted(reg), [11])
+        self.assertEqual(reg[11]["created"], 3)
+
+    # ── the clean-up (K1) ──
+    def test_a_registered_pid_whose_creation_time_differs_is_not_killed_and_is_reported(self):
+        w = self.world([
+            {"pid": 200, "ppid": 1, "name": "Runner.Worker.exe", "path": "C:\\runner\\bin\\Runner.Worker.exe", "created": 9000},
+            {"pid": 201, "ppid": 200, "name": "node.exe", "path": "C:\\runner\\node.exe", "created": 9100},
+        ])
+        self.register([{"pid": 200, "purpose": "t6-storm daemon 0", "probe": "s3_t6_jobs", "created": 2000, "image": CYSD}])
+        rep = self.M.stop_registered(self.work)
+        self.assertEqual(w.killed, [])
+        self.assertEqual(rep["stopped_registered"], [])
+        self.assertEqual(len(rep["not_killed"]), 1)
+        nk = rep["not_killed"][0]
+        self.assertEqual((nk["pid"], nk["why"]), (200, "pid reused, not ours"))
+        self.assertEqual(nk["registered"]["created"], 2000)
+        self.assertEqual(nk["live"]["created"], 9000)
+        self.assertIn("Runner.Worker.exe", nk["live"]["image"])
+
+    def test_a_matching_registered_pid_is_killed_with_its_descendants(self):
+        w = self.world([
+            {"pid": 300, "ppid": 1, "name": "cysd.exe", "path": CYSD, "created": 3000},
+            {"pid": 301, "ppid": 300, "name": "bash.exe", "path": INST + "\\runtime\\git\\bin\\bash.exe", "created": 3100},
+            {"pid": 302, "ppid": 300, "name": "svc.exe", "path": "C:\\Windows\\svc.exe", "created": 100},
+            {"pid": 400, "ppid": 1, "name": "other.exe", "path": "C:\\other.exe", "created": 4500},
+        ])
+        self.register([{"pid": 300, "purpose": "new daemon", "probe": "s2_update", "created": 3000, "image": CYSD},
+                       {"pid": 400, "purpose": "holder", "probe": "s1_base", "created": 4000, "image": "X:\\h.exe"},
+                       {"pid": 500, "purpose": "gone holder", "probe": "s1_base", "created": 5000, "image": "X:\\h.exe"},
+                       {"pid": 600, "purpose": "stopped", "probe": "s1_base", "created": 6000, "image": "X:\\h.exe"},
+                       {"pid": 600, "stopped": True},
+                       {"pid": 700, "purpose": "registered before TW2 (no identity)", "probe": "s1_base"}])
+        w.spawn("C:\\runner\\x.exe", pid=700)
+        rep = self.M.stop_registered(self.work)
+        self.assertEqual(sorted(w.killed), [300, 301])
+        self.assertEqual(rep["stopped_registered"][0]["pid"], 300)
+        self.assertEqual(sorted(rep["stopped_registered"][0]["killed"]), [300, 301])
+        self.assertEqual([g["pid"] for g in rep["gone"]], [500])
+        self.assertEqual({(n["pid"], n["why"]) for n in rep["not_killed"]},
+                         {(400, "pid reused, not ours"),
+                          (700, "identity unknown (none recorded, or the live process cannot be read) - not killed")})
+        self.assertEqual({p["pid"] for p in w.procs}, {302, 400, 700})
+
+    # ── kills inside a probe (K9-K24) ──
+    def test_a_remembered_pid_in_a_probe_is_killed_only_while_it_names_the_started_process(self):
+        P = self.P
+        w = self.world()
+        self.probe()
+        with self.mock.patch.object(P.subprocess, "Popen", w.popen()):
+            hp = P.start_detached([INST + "\\runtime\\python\\python.exe", "-c", "hold"])
+        self.assertEqual(P._STARTED[hp]["created"], w.identity(hp)["created"])   # taken while the handle was open
+        w.procs = [p for p in w.procs if p["pid"] != hp]                       # the holder ended by itself ...
+        stranger = w.spawn("C:\\runner\\Runner.Listener.exe", pid=hp)             # ... and Windows gave its pid away
+        w.spawn("C:\\runner\\child.exe", ppid=hp)
+        self.assertEqual(P.kill_tree(hp), [])
+        self.assertEqual(w.killed, [])
+        self.assertEqual(P.KILL_REFUSED[-1]["pid"], hp)
+        self.assertEqual(P.KILL_REFUSED[-1]["root"], "pid-reused")
+        self.assertIn(stranger, w.procs)
+        # the started process itself: killed with its child
+        with self.mock.patch.object(P.subprocess, "Popen", w.popen()):
+            hp2 = P.start_detached([INST + "\\runtime\\python\\python.exe", "-c", "hold"])
+        kid = w.spawn("C:\\x\\kid.exe", ppid=hp2)["pid"]
+        self.assertEqual(sorted(P.kill_tree(hp2)), sorted([hp2, kid]))
+        # no identity known for this pid at all: refused, never a kill by number
+        w.spawn("C:\\runner\\y.exe", pid=4242)
+        self.assertEqual(P.kill_tree(4242), [])
+        self.assertEqual(P.KILL_REFUSED[-1]["root"], "unverifiable")
+
+    def test_a_pid_reused_between_the_listing_and_the_kill_is_not_killed(self):
+        """The kill itself re-reads the creation time through the handle it terminates with: a process that ended
+        after the snapshot, its pid given to another process before TerminateProcess, is not killed."""
+        P = self.P
+        w = self.world([{"pid": 60, "ppid": 1, "name": "cysd.exe", "path": CYSD, "created": 6},
+                        {"pid": 61, "ppid": 60, "name": "bash.exe", "path": "b", "created": 7}])
+        snapshot = w.processes()
+
+        def listing_then_reuse():
+            w.procs = [p for p in w.procs if p["pid"] != 61]
+            w.spawn("C:\\runner\\Runner.Worker.exe", pid=61)              # 61 ended and was reused after the listing
+            return [dict(p) for p in snapshot]
+        with self.mock.patch.object(P, "processes", listing_then_reuse):
+            killed = P.kill_tree(60, expect={"created": 6, "image": CYSD})
+        self.assertEqual(killed, [60])
+        self.assertIn(61, [p["pid"] for p in w.procs])
+
+    def test_a_kill_across_probes_uses_the_registered_identity(self):
+        P = self.P
+        w = self.world([{"pid": 900, "ppid": 1, "name": "cysd.exe", "path": CYSD, "created": 9}])
+        self.register([{"pid": 900, "purpose": "base daemon", "probe": "s1_base", "created": 9, "image": CYSD}])
+        pr = self.probe("s2_update")
+        self.assertTrue(pr.still_ours(900))
+        self.assertEqual(P.kill_tree(900), [900])
+        w.spawn("C:\\runner\\z.exe", pid=901)
+        self.register([{"pid": 901, "purpose": "base daemon", "probe": "s1_base", "created": 1, "image": CYSD}])
+        self.assertFalse(pr.still_ours(901))
+        self.assertEqual(P.kill_tree(901), [])
+
+    def test_every_successful_stop_closes_the_registration(self):
+        """(2) the registry is kept true wherever the driver itself stops a process it registered - also a stop by name
+        (`_kill_product`) or by the storm; a stop that failed, or of a pid that is not registered, writes nothing."""
+        P = self.P
+        w = self.world([{"pid": 30, "ppid": 1, "name": "cysd.exe", "path": CYSD, "created": 3},
+                        {"pid": 31, "ppid": 1, "name": "python.exe", "path": INST + "\\runtime\\python\\python.exe",
+                         "created": 4},
+                        {"pid": 32, "ppid": 1, "name": "cys.exe", "path": INST + "\\cys.exe", "created": 5}])
+        pr = self.probe("s6_variants")
+        pr.register_pid(30, "v_x base daemon")
+        pr.register_pid(31, "v_x holder python")
+        self.assertEqual(self.open_registrations()[30]["created"], 3)
+        with self.mock.patch.object(P.time, "sleep", lambda _s: None):
+            killed = P._kill_product(INST)
+        self.assertEqual(sorted(killed), [30, 31, 32])
+        self.assertEqual(self.open_registrations(), {})
+        with open(os.path.join(self.work, "pids.jsonl"), encoding="utf-8") as fh:
+            self.assertEqual(sum(1 for ln in fh if '"stopped"' in ln), 2)      # 32 was never registered: no line
+        self.assertFalse(P.terminate(30))                                        # already gone: nothing to close
+
+    def test_the_restart_storm_leaves_no_stale_registered_pid(self):
+        P = self.P
+        w = self.world([{"pid": 40, "ppid": 1, "name": "cysd.exe", "path": CYSD, "created": 40}])
+        pr = self.probe("s3_repair_flow")
+        pr.register_pid(40, "new daemon")
+        answer = {"code": 0, "out": "ok", "err": "", "secs": 0.0, "timed_out": False}
+        with self.mock.patch.object(P.subprocess, "Popen", w.popen()), \
+                self.mock.patch.object(P, "run", lambda *a, **k: dict(answer)), \
+                self.mock.patch.object(P.time, "sleep", lambda _s: None):
+            answers, _launch, _ready = P._restart_storm(pr, INST + "\\cys.exe", "flow-storm", n=4)
+        self.assertEqual(len(answers), 4)
+        daemons = [p for p in w.procs if p["name"] == "cysd.exe"]
+        self.assertEqual(len(daemons), 1)
+        reg = self.open_registrations()
+        self.assertEqual(sorted(reg), [daemons[0]["pid"]])                     # only the one still running
+        self.assertEqual(reg[daemons[0]["pid"]]["created"], daemons[0]["created"])
+        self.assertEqual(len(w.killed), 4)
+
+    # ── (3) the census of every kill site (a new one must be looked at, and this list changed with it) ──
+    KILL_SITES = {
+        "tw1_main.py": [
+            "killed = P.kill_tree(proc.pid, keep=keep, expect=P.popen_identity(proc)) if P.IS_WIN else []",
+            "res = P.kill_tree_report(pid, expect=P.registered_identity(entries[pid]))",
+            "if P.terminate(pid):",
+        ],
+        "tw1_probes.py": [
+            "plan[\"killed\"] = [pid for pid, created in plan[\"kill\"] if terminate(pid, created)]",
+            "return kill_tree_report(root_pid, keep=keep, expect=expect)[\"killed\"]",
+            "return bool(_k32.TerminateProcess(h, 1))",
+            "if not _os_terminate(int(pid), created):",
+            "return [p[\"pid\"] for p in procs if (p.get(\"name\") or \"\").lower() == name.lower() and terminate(p[\"pid\"], p.get(\"created\"))]",
+            "terminate(p[\"pid\"], p.get(\"created\"))",
+            "f[\"um_killed\"] = kill_tree(proc.pid, expect=popen_identity(proc))",
+            "terminate(a)",
+            "terminate(p, created.get(p))",
+            "kill_tree(hp)",
+            "kill_tree(pid)",
+            "kill_tree(hp)",
+            "kill_tree(x)",
+            "if terminate(p[\"pid\"], p.get(\"created\")):",
+            "kill_tree(hp)",
+            "kill_tree(hp)",
+            "kill_tree(con.pid, expect=popen_identity(con))",
+            "terminate(d)",
+            "kill_tree(hp)",
+            "kill_tree(ep)",
+            "kill_tree(hp)",
+            "kill_tree(proc.pid, expect=popen_identity(proc))",
+            "stop_named(\"cysd.exe\")",
+        ],
+    }
+
+    def test_every_kill_site_is_in_the_census(self):
+        pat = re.compile(r"\b(?:kill_tree|kill_tree_report|terminate|TerminateProcess|stop_named|_os_terminate)\(")
+        for fn, want in self.KILL_SITES.items():
+            with open(os.path.join(DRIVER, fn), encoding="utf-8") as fh:
+                calls = [ln.strip() for ln in fh if pat.search(ln) and not re.match(r"\s*(def |#|\"|_k32\.\w+\.arg)", ln)]
+            self.assertEqual(calls, want, fn)
+        with open(os.path.join(DRIVER, "tw1_probes.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        for banned in ("taskkill", "Stop-Process", "os.kill(", "wmic "):
+            self.assertNotIn(banned, src)
 
 
 class WorkflowTests(unittest.TestCase):

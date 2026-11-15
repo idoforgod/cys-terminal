@@ -62,6 +62,7 @@ if IS_WIN:
     _k32.TerminateProcess.argtypes = [wt.HANDLE, wt.UINT]
     _k32.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
     _k32.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+    _k32.GetProcessTimes.argtypes = [wt.HANDLE] + [ctypes.POINTER(wt.FILETIME)] * 4
     _k32.GetShortPathNameW.argtypes = [wt.LPCWSTR, wt.LPWSTR, wt.DWORD]
     _k32.ProcessIdToSessionId.argtypes = [wt.DWORD, ctypes.POINTER(wt.DWORD)]
     _WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
@@ -332,7 +333,8 @@ def clean_env(extra=None, drop_prefixes=("CYS_", "JAVIS_", "CLAUDE", "PYTHON")):
 # ───────────────────────────── processes ─────────────────────────────
 
 def processes():
-    """[{pid, ppid, name, path}] - toolhelp snapshot; PowerShell CIM as the fallback."""
+    """[{pid, ppid, name, path, created}] - toolhelp snapshot; PowerShell CIM as the fallback. `created` is the
+    process's creation time from the OS (TW2: what tells a process from a later one with the same pid)."""
     if not IS_WIN:
         return []
     out = []
@@ -350,28 +352,48 @@ def processes():
         finally:
             _k32.CloseHandle(snap)
         for p in out:
-            p["path"] = image_path(p["pid"])
+            p["path"], p["created"] = _query_process(p["pid"])
         return out
     except Exception:  # noqa: BLE001 - the fallback is the point
         data = ps_json("Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath")
         if isinstance(data, dict):
             data = [data]
-        return [{"pid": d.get("ProcessId"), "ppid": d.get("ParentProcessId"), "name": d.get("Name"),
-                 "path": d.get("ExecutablePath")} for d in (data or [])]
+        res = [{"pid": d.get("ProcessId"), "ppid": d.get("ParentProcessId"), "name": d.get("Name"),
+                "path": d.get("ExecutablePath")} for d in (data or [])]
+        for p in res:
+            path, p["created"] = _query_process(p["pid"]) if p["pid"] else (None, None)
+            p["path"] = path or p["path"]
+        return res
 
 
-def image_path(pid):
-    h = _k32.OpenProcess(0x1000, False, pid)
-    if not h:
+def _handle_created(h):
+    """Creation time of the process behind an open handle: 100-ns ticks since 1601 UTC (GetProcessTimes). None on
+    failure. The handle keeps the process object alive, so the value belongs to the process the handle names."""
+    c, x, k, u = wt.FILETIME(), wt.FILETIME(), wt.FILETIME(), wt.FILETIME()
+    if not _k32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(x), ctypes.byref(k), ctypes.byref(u)):
         return None
+    return (int(c.dwHighDateTime) << 32) | int(c.dwLowDateTime)
+
+
+def _query_process(pid):
+    """(image path, creation time) through ONE handle (PROCESS_QUERY_LIMITED_INFORMATION). (None, None) when the
+    process cannot be opened (gone, or not ours to open)."""
+    if not IS_WIN or not pid:
+        return None, None
+    h = _k32.OpenProcess(0x1000, False, int(pid))
+    if not h:
+        return None, None
     try:
         buf = ctypes.create_unicode_buffer(32768)
         n = wt.DWORD(32768)
-        if _k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
-            return buf.value
-        return None
+        path = buf.value if _k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)) else None
+        return path, _handle_created(h)
     finally:
         _k32.CloseHandle(h)
+
+
+def image_path(pid):
+    return _query_process(pid)[0]
 
 
 def alive(pid):
@@ -389,38 +411,210 @@ def alive(pid):
         _k32.CloseHandle(h)
 
 
-def terminate(pid):
+# ── TW2 (RULINGS LH6): identity before any kill by a remembered pid ──
+# Windows gives a pid to a new process as soon as the last handle to the old one is closed. A pid kept from EARLIER
+# (the registry, a holder started minutes ago, another probe's list) therefore names "our" process only while the
+# live process with that number has the creation time (and image) recorded when the pid was taken. And a process
+# tree is not "every process whose parent-pid number is X": a child keeps the number of a parent that died, so a
+# process OLDER than X's holder that names X as its parent is the child of an earlier holder of X - never ours.
+
+_STARTED = {}        # pid -> identity taken by start_detached while it still held the new process's handle
+_REGISTRY = {"path": None, "probe": None}    # this probe's registry (set by Probe): a successful stop closes the pid
+KILL_REFUSED = []    # kills refused by the identity check in this process (recorded in the probe's observation)
+
+
+def proc_identity(pid):
+    """{created, image} of the live process with this pid now; None when it cannot be opened (or off Windows)."""
+    path, created = _query_process(pid)
+    return None if created is None else {"created": created, "image": path}
+
+
+def popen_identity(proc):
+    """The identity of a child the caller still holds as a Popen: the open handle pins the pid (it cannot name another
+    process while the handle is open), so the tree may be walked even after the child itself exited."""
+    ident = proc_identity(proc.pid) or {"created": None, "image": None}
+    return dict(ident, pinned=True)
+
+
+def same_process(expected, live):
+    """PURE. Same process = both creation times known and equal, and the images equal when both are known."""
+    if not expected or not live:
+        return False
+    a, b = expected.get("created"), live.get("created")
+    if a is None or b is None or int(a) != int(b):
+        return False
+    ia, ib = norm_path(expected.get("image")), norm_path(live.get("image"))
+    return ia is None or ib is None or ia == ib
+
+
+def identity_verdict(expected, live):
+    """PURE. -> 'gone' (no live process with the pid) | 'unverifiable' (no creation time recorded, or the live one
+    cannot be read) | 'ours' | 'pid-reused' (another process holds the number now: never killed)."""
+    if live is None:
+        return "gone"
+    if not expected or expected.get("created") is None or live.get("created") is None:
+        return "unverifiable"
+    return "ours" if same_process(expected, live) else "pid-reused"
+
+
+def registered_identity(entry):
+    return None if not entry else {"created": entry.get("created"), "image": entry.get("image")}
+
+
+def _live_of(pid, procs):
+    for p in procs:
+        if p.get("pid") == pid:
+            return {"created": p.get("created"), "image": p.get("path")}
+    return None
+
+
+def tree_of(root_pid, root_created, procs):
+    """PURE. The descendants of a VERIFIED root in one snapshot, breadth first: a process is a child of Q only when its
+    parent pid is Q's pid AND it was created no earlier than Q. An unknown creation time is not walked."""
+    if root_created is None:
+        return []
+    out, seen, frontier = [], {root_pid}, [(root_pid, root_created)]
+    while frontier:
+        nxt = []
+        for qpid, qcreated in frontier:
+            for p in procs:
+                c = p.get("created")
+                if p.get("ppid") == qpid and p.get("pid") not in seen and c is not None and c >= qcreated:
+                    seen.add(p["pid"])
+                    out.append(p["pid"])
+                    nxt.append((p["pid"], c))
+        frontier = nxt
+    return out
+
+
+def plan_tree_kill(root_pid, expect, procs, keep=None):
+    """PURE. What a kill of root_pid's tree may do, given the identity recorded for it (`expect`) and one snapshot.
+    keep: {pid: registration} spared by identity (a registration without a creation time is spared by its number),
+    or an iterable of pids. -> {root, expected, live, kill: [[pid, created]...] descendants first, the root last,
+    spared}. Nothing is killed unless the root is 'ours' (or pinned by the caller's handle - 'pinned-exited')."""
+    live = _live_of(root_pid, procs)
+    verdict = identity_verdict(expect, live)
+    plan = {"root": verdict, "expected": expect, "live": live, "kill": [], "spared": []}
+    if verdict == "gone" and expect and expect.get("pinned") and expect.get("created") is not None:
+        verdict = plan["root"] = "pinned-exited"
+    if verdict not in ("ours", "pinned-exited"):
+        return plan
+    keep = keep if isinstance(keep, dict) else {int(k): None for k in (keep or ())}
+    created = {p.get("pid"): p.get("created") for p in procs}
+
+    def kept(pid):
+        if pid not in keep:
+            return False
+        ident = registered_identity(keep[pid])
+        return not ident or ident.get("created") is None or same_process(ident, _live_of(pid, procs))
+
+    for pid in list(reversed(tree_of(root_pid, expect["created"], procs))) + ([root_pid] if live else []):
+        if kept(pid):
+            plan["spared"].append(pid)
+        else:
+            plan["kill"].append([pid, created.get(pid)])
+    return plan
+
+
+def _expected_identity(pid):
+    """The identity a kill by a remembered pid is checked against: what start_detached took in this process, else the
+    run's open registration of that pid. None = unknown (the kill is refused)."""
+    if pid in _STARTED:
+        return _STARTED[pid]
+    if _REGISTRY.get("path"):
+        return registered_identity(registry_read(_REGISTRY["path"]).get(pid))
+    return None
+
+
+def kill_tree_report(root_pid, keep=None, expect=None):
+    """Terminate root_pid and its descendants - ONLY when root_pid still names the process `expect` identifies
+    (default: `_expected_identity`). Each kill goes through its own handle with the snapshot's creation time.
+    -> the plan (plan_tree_kill) + killed."""
+    root_pid = int(root_pid)
+    expect = _expected_identity(root_pid) if expect is None else expect
+    plan = plan_tree_kill(root_pid, expect, processes(), keep)
+    plan["killed"] = [pid for pid, created in plan["kill"] if terminate(pid, created)]
+    if plan["root"] not in ("ours", "pinned-exited", "gone"):
+        KILL_REFUSED.append({"pid": root_pid, "root": plan["root"], "expected": expect, "live": plan["live"],
+                             "at": time.time()})
+    return plan
+
+
+def kill_tree(root_pid, keep=None, expect=None):
+    """Terminate root_pid and its descendants except the processes in keep. -> list of pids terminated ([] when the
+    pid no longer names the process that was recorded for it)."""
+    return kill_tree_report(root_pid, keep=keep, expect=expect)["killed"]
+
+
+def _os_terminate(pid, created=None):
+    """TerminateProcess through a handle opened for it. With `created`, the creation time is read through the SAME
+    handle first and the process is terminated only when it matches (no reuse between the check and the kill)."""
     if not IS_WIN or not pid:
         return False
-    h = _k32.OpenProcess(0x0001, False, int(pid))
+    h = _k32.OpenProcess(0x0001 | (0x1000 if created is not None else 0), False, int(pid))
     if not h:
         return False
     try:
+        if created is not None and _handle_created(h) != created:
+            return False
         return bool(_k32.TerminateProcess(h, 1))
     finally:
         _k32.CloseHandle(h)
 
 
-def descendants(root_pid, procs=None):
+def terminate(pid, created=None):
+    """Stop one process (created: see _os_terminate). A successful stop closes the pid's registration in this probe's
+    registry (TW2: the registry is kept true wherever the driver stops a process it registered)."""
+    if not pid:
+        return False
+    if not _os_terminate(int(pid), created):
+        return False
+    _note_stopped(int(pid))
+    return True
+
+
+def stop_named(name, procs=None):
+    """Every process of this image name in a FRESH listing (a name, not a remembered pid), each stopped with the
+    listing's creation time. -> [pids stopped]"""
     procs = processes() if procs is None else procs
-    kids, frontier = set(), {root_pid}
-    while frontier:
-        nxt = {p["pid"] for p in procs if p["ppid"] in frontier and p["pid"] not in kids and p["pid"] != root_pid}
-        kids |= nxt
-        frontier = nxt
-    return kids
+    return [p["pid"] for p in procs if (p.get("name") or "").lower() == name.lower() and terminate(p["pid"], p.get("created"))]
 
 
-def kill_tree(root_pid, keep=()):
-    """Terminate root_pid and its descendants except the pids in keep. -> list of pids terminated."""
-    keep = set(int(k) for k in keep)
-    done = []
-    for pid in sorted(descendants(root_pid)) + [root_pid]:
-        if pid in keep:
+def registry_entries(lines):
+    """PURE. The OPEN registrations of pids.jsonl: {pid: its latest registration}; a 'stopped' line closes the pid."""
+    reg = {}
+    for ln in lines:
+        try:
+            e = json.loads(ln)
+            pid = int(e["pid"])
+        except (ValueError, TypeError, KeyError):
             continue
-        if terminate(pid):
-            done.append(pid)
-    return done
+        if e.get("stopped"):
+            reg.pop(pid, None)
+        else:
+            reg[pid] = e
+    return reg
+
+
+def registry_read(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return registry_entries(f.readlines())
+    except OSError:
+        return {}
+
+
+def _note_stopped(pid, by="terminate"):
+    path = _REGISTRY.get("path")
+    if not path:
+        return
+    try:
+        if pid in registry_read(path):
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"pid": pid, "stopped": True, "probe": _REGISTRY.get("probe"), "at": time.time(),
+                                    "by": by}) + "\n")
+    except OSError:
+        pass
 
 
 def count_named(name):
@@ -444,6 +638,9 @@ def start_detached(cmd, env=None, cwd=None, stdout_path=None):
     kw = {"creationflags": CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP} if IS_WIN else {}
     p = subprocess.Popen([str(c) for c in cmd], stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                          env=env, cwd=cwd, **kw)
+    ident = proc_identity(p.pid)  # TW2: `p` still holds the handle here - the pid cannot name another process yet
+    if ident:
+        _STARTED[p.pid] = ident
     return p.pid
 
 
@@ -527,6 +724,7 @@ class Probe:
         self.ev_dir = os.path.join(out, "evidence", pid)
         os.makedirs(self.ev_dir, exist_ok=True)
         self.mapping = [tuple(x) for x in ctx.get("redaction", [])]
+        _REGISTRY.update(path=os.path.join(work, "pids.jsonl"), probe=pid)
 
     def ev(self, name, content):
         """Write an evidence file (always redacted - RULINGS EQ6) and list it."""
@@ -559,15 +757,28 @@ class Probe:
                      "edited": {k: (None if m is None else m.get(e["rel"])) for k, e in edits.items()}}
         return m
 
-    def register_pid(self, pid, purpose):
+    def register_pid(self, pid, purpose, ident=None):
+        """Register a long-lived process for the always() clean-up WITH its identity (TW2): the creation time and the
+        image of the process the pid names now - for a process start_detached started, the identity it took while it
+        held the handle (also when the process has exited since). `ident` = from the caller's own listing."""
+        if ident is None:
+            live, started = proc_identity(pid), _STARTED.get(pid)
+            ident = started if started and (live is None or same_process(started, live)) else live
         reg = os.path.join(self.work, "pids.jsonl")
         with open(reg, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"pid": pid, "purpose": purpose, "probe": self.pid, "at": time.time()}) + "\n")
+            f.write(json.dumps({"pid": pid, "purpose": purpose, "probe": self.pid, "at": time.time(),
+                                "created": (ident or {}).get("created"), "image": (ident or {}).get("image")}) + "\n")
 
     def unregister_pid(self, pid):
         reg = os.path.join(self.work, "pids.jsonl")
         with open(reg, "a", encoding="utf-8") as f:
             f.write(json.dumps({"pid": pid, "stopped": True, "probe": self.pid, "at": time.time()}) + "\n")
+
+    def still_ours(self, pid, procs=None):
+        """Does this remembered pid still name the process the run registered under it (creation time + image)?"""
+        entry = registry_read(os.path.join(self.work, "pids.jsonl")).get(pid)
+        live = _live_of(pid, procs) if procs is not None else proc_identity(pid)
+        return identity_verdict(registered_identity(entry), live) == "ours"
 
     # convenience paths
     @property
@@ -957,7 +1168,7 @@ def probe_s1_base(pr):
     after_install = [p for p in processes() if (p.get("name") or "").lower() in ("cys.exe", "cysd.exe", "cys-app.exe")]
     f["processes_after_base_install"] = [p["name"] for p in after_install]
     for p in after_install:  # windows-build's self-contained step does the same; recorded
-        terminate(p["pid"])
+        terminate(p["pid"], p.get("created"))
     time.sleep(1)
     f["cysd_count_before_base_start"] = count_named("cysd.exe")
     f["base_marker"] = (read_text(pr.exe("cys-installed-version.txt")) or "").strip() or None
@@ -1369,7 +1580,7 @@ def probe_s2_update(pr):
     except subprocess.TimeoutExpired:
         f["update_mode_finished"] = False
         f["um_exit"] = None
-        f["um_killed"] = kill_tree(proc.pid)
+        f["um_killed"] = kill_tree(proc.pid, expect=popen_identity(proc))
     f["um_secs"] = round(time.monotonic() - t0, 2)
     pr.unregister_pid(proc.pid)
     # relaunch (/R) — observed for up to 60 s
@@ -1454,10 +1665,14 @@ def probe_s2_update(pr):
     # ── the daemon rotation the way rotate_daemon does it ──
     dr = pr.ev_cmd("drain.json", pr.cys(["drain"], timeout=45))
     f["drain_exit"] = dr["code"]
-    old = [p for p in ctx.get("base_daemon_pids", []) if alive(p)]
-    old += [p["pid"] for p in processes() if (p.get("name") or "").lower() == "cysd.exe" and p["pid"] not in old]
+    # TW2: the s1 list is REMEMBERED (another probe took it): its pid is stopped only while it still names the daemon
+    # the run registered under it; every cysd.exe of a fresh listing is stopped by name
+    procs = processes()
+    old = [p for p in ctx.get("base_daemon_pids", []) if pr.still_ours(p, procs)]
+    old += [p["pid"] for p in procs if (p.get("name") or "").lower() == "cysd.exe" and p["pid"] not in old]
+    created = {p["pid"]: p.get("created") for p in procs}
     for p in old:
-        terminate(p)
+        terminate(p, created.get(p))
         pr.unregister_pid(p)
     time.sleep(2)
     f["old_daemons_stopped"] = not any(alive(p) for p in old)
@@ -2465,7 +2680,7 @@ def _kill_product(install_dir):
         name = (p.get("name") or "").lower()
         path = norm_path(p.get("path"))
         if name in ("cys.exe", "cysd.exe", "cys-app.exe") or (path and path.startswith(norm_path(install_dir) + "\\")):
-            if terminate(p["pid"]):
+            if terminate(p["pid"], p.get("created")):
                 killed.append(p["pid"])
     time.sleep(1)
     return killed
@@ -3585,7 +3800,7 @@ def _console_run(pr, argv, tag, env, limit=90):
         rd.wait(timeout=limit + 30)
     except subprocess.TimeoutExpired:
         rd.kill()
-    kill_tree(con.pid)
+    kill_tree(con.pid, expect=popen_identity(con))
     pr.unregister_pid(con.pid)
     raw = read_text(outp) or ""
     status, _nl, text = raw.partition("\n")
@@ -3937,7 +4152,7 @@ def probe_s5_checklist(pr):
     time.sleep(P4_KILL_AFTER_S)
     f["p4_kill_after_s"] = P4_KILL_AFTER_S
     f["p4_alive_at_kill"] = proc.poll() is None
-    kill_tree(proc.pid)
+    kill_tree(proc.pid, expect=popen_identity(proc))
     pr.unregister_pid(proc.pid)
     time.sleep(3)
     f["p4_cys_exists"] = os.path.isfile(cys_exe)
@@ -4266,13 +4481,13 @@ def probe_s7_w3_bootstep(pr):
 
 def _restart_storm(pr, cys, tag, n=4):
     """n quick daemon restarts (every cysd.exe of this run stopped, a fresh one started), `cys repair tick` asked
-    right after each launch. -> (answers, the last launch time, the last readiness time or None)."""
+    right after each launch. -> (answers, the last launch time, the last readiness time or None).
+    TW2: the daemons are stopped by name from a fresh listing; each stop closes the stopped pid's registration
+    (terminate), so only the daemon that is still running stays registered."""
     answers = []
     launch = ready_at = None
     for i in range(n):
-        for p in processes():
-            if (p.get("name") or "").lower() == "cysd.exe":
-                terminate(p["pid"])
+        stop_named("cysd.exe")
         time.sleep(1)
         launch = time.time()
         dp = start_detached([pr.exe("cysd.exe")], env=clean_env(), stdout_path=os.path.join(pr.ev_dir, "%s-%d-cysd.out" % (tag, i)))

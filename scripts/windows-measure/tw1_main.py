@@ -10,6 +10,8 @@ Commands:
 
 Every probe runs in a child process with the time limit of matrix.json; on expiry its process tree is ended (the
 long-lived processes the run registered are kept for the always() cleanup) and its rows are NOT-MEASURED.
+TW2 (RULINGS LH6): a kill by a remembered pid acts only while the pid still names the process that was recorded
+(creation time + image, tw1_probes.plan_tree_kill).
 Verdicts are computed by tw1_record from the recorded facts only. Standard library only.
 """
 
@@ -109,6 +111,8 @@ def cmd_probe(a):
         pr.ev("exception.txt", tb)
         obs = {"status": "error", "reason": "%s: %s" % (type(e).__name__, e), "facts": pr.facts,
                "evidence": pr.evidence, "restored": False}
+    if P.KILL_REFUSED:  # TW2: a kill by a remembered pid that named another process by then (no verdict reads it)
+        obs["kill_refused"] = list(P.KILL_REFUSED)
     if pr.ctx_updates:
         ctx = _load_json(ctx_path, {})
         for k, v in pr.ctx_updates.items():
@@ -133,8 +137,8 @@ def _run_child(pid, a, limit_s):
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, **kw)
     state, _v, elapsed = R.wait_until(lambda: proc.poll(), time.monotonic, time.sleep, limit_s, step_s=1.0)
     if state == "timeout":
-        keep = _registered_alive(a.work)
-        killed = P.kill_tree(proc.pid, keep=keep) if P.IS_WIN else []
+        keep = _registered(a.work)  # spared by identity (TW2): a stale registered number spares nobody else
+        killed = P.kill_tree(proc.pid, keep=keep, expect=P.popen_identity(proc)) if P.IS_WIN else []
         try:
             proc.kill()
         except OSError:
@@ -153,23 +157,35 @@ def _run_child(pid, a, limit_s):
     return obs
 
 
-def _registered_alive(work):
-    reg = os.path.join(work, "pids.jsonl")
-    live = {}
-    try:
-        with open(reg, encoding="utf-8") as f:
-            for ln in f:
-                try:
-                    e = json.loads(ln)
-                except ValueError:
-                    continue
-                if e.get("stopped"):
-                    live.pop(e["pid"], None)
-                else:
-                    live[e["pid"]] = e
-    except OSError:
-        pass
-    return set(live)
+def _registered(work):
+    """{pid: registration} of every OPEN registration of the run (a 'stopped' line closes a pid)."""
+    import tw1_probes as P
+    return P.registry_read(os.path.join(work, "pids.jsonl"))
+
+
+def stop_registered(work):
+    """TW2 (RULINGS LH6): every open registration is stopped with its tree ONLY when its pid still names the process
+    that was registered (creation time + image, compared in tw1_probes.plan_tree_kill; each kill then re-checks the
+    creation time through its own handle). A pid that names another process now is NOT killed and is reported.
+    -> {stopped_registered, not_killed, gone}"""
+    import tw1_probes as P
+    entries = _registered(work)
+    rep = {"stopped_registered": [], "not_killed": [], "gone": []}
+    for pid in sorted(entries):
+        res = P.kill_tree_report(pid, expect=P.registered_identity(entries[pid]))
+        item = {"pid": pid, "purpose": entries[pid].get("purpose"), "probe": entries[pid].get("probe")}
+        if res["root"] == "ours":
+            item["killed"] = res["killed"]
+            rep["stopped_registered"].append(item)
+        elif res["root"] == "gone":
+            rep["gone"].append(item)
+        else:
+            item["why"] = ("pid reused, not ours" if res["root"] == "pid-reused"
+                           else "identity unknown (none recorded, or the live process cannot be read) - not killed")
+            item["registered"] = res["expected"]
+            item["live"] = res["live"]
+            rep["not_killed"].append(item)
+    return rep
 
 
 # ───────────────────────────── run (orchestrator) ─────────────────────────────
@@ -291,11 +307,9 @@ def cmd_cleanup(a):
     import tw1_probes as P
     ctx = _load_json(os.path.join(a.work, "ctx.json"), {}) or {}
     mapping = [tuple(x) for x in ctx.get("redaction", [])]
-    report = {"stopped_registered": [], "stopped_by_path": [], "defender_restore": None}
+    report = {"stopped_registered": [], "not_killed": [], "gone": [], "stopped_by_path": [], "defender_restore": None}
     if P.IS_WIN:
-        for pid in sorted(_registered_alive(a.work)):
-            if P.alive(pid):
-                report["stopped_registered"].append({"pid": pid, "killed": P.kill_tree(pid)})
+        report.update(stop_registered(a.work))
         folders = [ctx.get("paths", {}).get("install_dir"), a.work]
         for fo in folders:
             if fo:
