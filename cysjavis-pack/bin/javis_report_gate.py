@@ -1937,7 +1937,31 @@ OPEN_DEFECT_STATE_FILE = "open_defects.json"
 #   it after the save — another drain of the master then delivers that entry. Same size as the update notices'
 #   NOTICE_RETRY_MAX (RULINGS GB1). The state file says which end a key reached: `delivered` (the queue took it with
 #   exit 0) or `attempts` == `budget` without `delivered` (gave up after that many attempts).
+#   ★RULINGS JZ1 — unknown is not absent: only a state file that does not exist means "no previous key". One that
+#   exists but cannot be read gives no budget (no line in that run, the file untouched); one that is read but is not a
+#   state of this gate gives the CURRENT set up (`gave_up` says why) — it never restarts a count.
 OPEN_DEFECT_RETRY_MAX = 2
+
+
+def _parse_open_defect_state(raw):
+    """RULINGS JT1 / JZ1 — (key, attempts, delivered, invalid) from the bytes of `open_defects.json`. `invalid` names why
+    the bytes are not a state of this gate (the other three are then None, None, False). `attempts` None with a key =
+    the form written before JT1 (a key without a count — that key was done)."""
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except ValueError:                                     # also UnicodeDecodeError
+        return None, None, False, "not JSON"
+    if not isinstance(doc, dict):
+        return None, None, False, "not an object"
+    key = doc.get("key")
+    if "key" not in doc or not (key is None or isinstance(key, str)):
+        return None, None, False, "key is not a string or null"
+    if key is None or "attempts" not in doc:
+        return key, None, False, None
+    n = doc["attempts"]
+    if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+        return None, None, False, "attempts is not a count"
+    return key, n, doc.get("delivered") is True, None
 
 
 def collect_open_defects(cys_bin, timeout=OPEN_DEFECT_TIMEOUT_S):
@@ -2271,27 +2295,37 @@ class Gate:
                 except Exception:                          # noqa: BLE001 — 상태를 읽지 못함 = 오늘 그대로
                     pass
             state_path = os.path.join(self.state_dir, OPEN_DEFECT_STATE_FILE)
-            last, attempts, delivered = None, None, False
+            #   ★RULINGS JZ1: only "does not exist" is "no previous key"; any other read failure = the budget is
+            #     unknown → no line in this run and the file is not touched (the next run reads again).
             try:
-                with open(state_path, encoding="utf-8") as f:
-                    doc = json.load(f)
-                if isinstance(doc, dict) and isinstance(doc.get("key"), str):
-                    last = doc["key"]
-                    n = doc.get("attempts")
-                    attempts = n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else None
-                    delivered = doc.get("delivered") is True
-            except (OSError, ValueError):
-                last = None
+                with open(state_path, "rb") as f:
+                    raw = f.read()
+            except FileNotFoundError:
+                raw = None
+            except OSError:
+                return 0
+            last, attempts, delivered, invalid = (None, None, False, None) if raw is None \
+                else _parse_open_defect_state(raw)
             wake = open_defect_wake(sigs)
             if wake is None:
-                if last is not None:                      # 0건 — 다음에 열리는 집합은 변화다
+                if last is not None or invalid is not None:   # 0건 — 다음에 열리는 집합은 변화다
                     _write_json_atomic(state_path, {"key": None, "count": 0, "at": self.now_epoch_fn()})
                 return 0
             body, idem = wake
             budget = 1 + OPEN_DEFECT_RETRY_MAX
+            if invalid is not None:
+                #   ★RULINGS JZ1: read, but not a state — not transient (every write here is atomic): the CURRENT set is
+                #     given up (no line for it, never a restarted count); a later changed set gets its own budget.
+                try:
+                    _write_json_atomic(state_path, {"key": idem, "count": len(sigs), "at": self.now_epoch_fn(),
+                                                    "attempts": budget, "budget": budget, "delivered": False,
+                                                    "gave_up": "the state file held no valid state (%s)" % invalid})
+                except (OSError, TypeError, ValueError):
+                    pass
+                return 0
             if idem == last:
-                #   The same open set: silent once the queue took it cleanly, once its budget is used, and when the
-                #   count cannot be read (a state written before the count existed remembered its key as done).
+                #   The same open set: silent once the queue took it cleanly, once its budget is used, and for a state
+                #   written before the count existed (a key without `attempts` — that key was done).
                 if delivered or attempts is None or attempts >= budget:
                     return 0
                 attempt = attempts + 1
