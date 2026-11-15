@@ -457,3 +457,44 @@ fn the_intake_accepts_the_jobs_fault_rels() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// T6b · RULINGS JH2: the scheduler's own check of a `schedule.json` held in the vault runs inside the
+/// pack-apply exclusion — it reads through the bounded reader: a FIFO (a writer offering a valid
+/// schedule to every reader) or a file over the limit fails the check at once, never waited for or
+/// read whole; an ordinary schedule passes. Without JH2 it was `std::fs::read`.
+#[cfg(unix)]
+#[test]
+fn the_schedule_own_check_is_bounded_and_never_waits() {
+    use std::io::Write;
+    let base = std::env::temp_dir().join(format!("cys-t6b-jh2own-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let json = br#"{"jobs": []}"#;
+    let ok = base.join("ok.json");
+    std::fs::write(&ok, json).unwrap();
+    assert!(crate::schedule::schedule_file_passes_own_check(&ok), "an ordinary schedule passes");
+    let big = base.join("big.json");
+    std::fs::File::create(&big).unwrap().set_len(cys::repair::durable::RECORD_READ_CAP + 1).unwrap();
+    assert!(!crate::schedule::schedule_file_passes_own_check(&big), "over the limit: fails");
+    let fifo = base.join("fifo.json");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    let w_at = fifo.clone();
+    // ONE reader is served (the check reads the file once): its open waits for a reader
+    let writer = std::thread::spawn(move || {
+        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&w_at) {
+            let _ = f.write_all(json);
+        }
+    });
+    let got = crate::schedule::schedule_file_passes_own_check(&fifo);
+    // a writer still waiting (the bounded check never read) is let go by a reader
+    let release = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&fifo).unwrap()
+    };
+    writer.join().unwrap();
+    drop(release);
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(!got, "a FIFO fails the check at once");
+}
