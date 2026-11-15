@@ -151,6 +151,53 @@ pub fn write_durable(path: &Path, bytes: &[u8]) -> Result<(), RepairError> {
 /// record): larger is never read, it is unreadable.
 pub const RECORD_READ_CAP: u64 = 16 * 1024 * 1024;
 
+/// Tests (RULINGS IE4 / IG1): the bytes each read of the engine took from each path, and a hook run
+/// right after a file was opened (to make it grow while it is read).
+#[cfg(test)]
+pub(crate) mod read_seam {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+    type Hook = Box<dyn FnMut(&Path)>;
+    thread_local! {
+        static READS: RefCell<Vec<(PathBuf, u64)>> = const { RefCell::new(Vec::new()) };
+        static AFTER_OPEN: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn count(p: &Path, n: u64) {
+        READS.with(|r| r.borrow_mut().push((p.to_path_buf(), n)));
+    }
+    /// The bytes this thread's reads took from `p` so far.
+    pub(crate) fn bytes_read_from(p: &Path) -> u64 {
+        READS.with(|r| r.borrow().iter().filter(|(q, _)| q == p).map(|(_, n)| n).sum())
+    }
+    pub(crate) fn after_open(p: &Path) {
+        AFTER_OPEN.with(|h| {
+            if let Some(f) = h.borrow_mut().as_mut() {
+                f(p)
+            }
+        })
+    }
+    pub(crate) fn set_after_open(f: Option<Hook>) {
+        AFTER_OPEN.with(|h| *h.borrow_mut() = f);
+    }
+}
+
+/// The read seam's hook right after a file was opened — a no-op outside tests (callers in files whose
+/// source pins cut at the first test attribute call this instead of naming the seam).
+pub(crate) fn seam_after_open(p: &Path) {
+    #[cfg(test)]
+    read_seam::after_open(p);
+    #[cfg(not(test))]
+    let _ = p;
+}
+
+/// The read seam's count of the bytes one read took — a no-op outside tests.
+pub(crate) fn seam_count(p: &Path, n: u64) {
+    #[cfg(test)]
+    read_seam::count(p, n);
+    #[cfg(not(test))]
+    let _ = (p, n);
+}
+
 /// What [`read_record_bytes`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordRead {
@@ -194,9 +241,16 @@ pub fn read_record_bytes(p: &Path) -> RecordRead {
     if m.len() > RECORD_READ_CAP {
         return RecordRead::Unreadable(format!("{}: 크기 {}바이트가 한도 {}바이트를 넘음", p.display(), m.len(), RECORD_READ_CAP));
     }
+    #[cfg(test)]
+    read_seam::after_open(p);
     let mut buf = Vec::with_capacity(m.len() as usize);
-    match (&f).take(RECORD_READ_CAP + 1).read_to_end(&mut buf) {
+    let took = (&f).take(RECORD_READ_CAP + 1).read_to_end(&mut buf);
+    #[cfg(test)]
+    read_seam::count(p, buf.len() as u64);
+    match took {
         Ok(_) if buf.len() as u64 == m.len() => RecordRead::Bytes(buf),
+        // RULINGS IE4: a file that grew past the limit while it was read says the limit
+        Ok(_) if buf.len() as u64 > RECORD_READ_CAP => RecordRead::Unreadable(format!("{}: 읽는 동안 한도 {}바이트를 넘음", p.display(), RECORD_READ_CAP)),
         Ok(_) => RecordRead::Unreadable(format!("{}: 읽는 동안 크기가 바뀜({} → {})", p.display(), m.len(), buf.len())),
         Err(e) => RecordRead::Unreadable(format!("{}: {e}", p.display())),
     }

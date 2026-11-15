@@ -3499,3 +3499,155 @@ fn an_unlistable_root_and_a_row_without_probation_are_never_no_approval() {
     ledger::write_lane_in(&r.root, &row).unwrap();
     assert!(matches!(resolve_approved_copy_in(&r.root, &r.pack, &r.lane, "hooks/u.sh"), ApprovedCopy::Unknown(_)));
 }
+
+// ───────────────────────────── RULINGS IE4 / IG1 — the engine's one bound on what it reads ─────────────────────────────
+
+fn sparse_file(p: &Path, len: u64) {
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::File::create(p).unwrap().set_len(len).unwrap();
+}
+
+/// IG1: `TargetState::read` takes at most RECORD_READ_CAP + 1 bytes from ONE handle — a file of
+/// exactly the limit is read; one byte over is refused before any byte is read (the sentence names the
+/// limit); a file that grows while it is read (within the limit, or past it) is refused — never a state
+/// of a prefix — and never more than the limit + 1 bytes are taken. Without IG1 every case was hashed to
+/// its end.
+#[test]
+fn a_target_is_read_within_the_one_limit() {
+    use crate::repair::durable::{read_seam, RECORD_READ_CAP as CAP};
+    let r = rig("ig1read");
+    let at = r.pack.join("hooks/limit.sh");
+    sparse_file(&at, CAP);
+    assert!(matches!(TargetState::read(&at).unwrap(), TargetState::File { .. }), "exactly the limit is read");
+    assert_eq!(read_seam::bytes_read_from(&at), CAP);
+    let over = r.pack.join("hooks/over.sh");
+    sparse_file(&over, CAP + 1);
+    let e = format!("{:?}", TargetState::read(&over).expect_err("one byte over the limit"));
+    assert!(e.contains(&CAP.to_string()), "the sentence names the limit: {e}");
+    assert_eq!(read_seam::bytes_read_from(&over), 0, "refused before any byte is read");
+    for (tag, grow_to) in [("within", 100u64), ("past", CAP * 4)] {
+        let g = r.pack.join(format!("hooks/grow-{tag}.sh"));
+        sparse_file(&g, 10);
+        let target = g.clone();
+        read_seam::set_after_open(Some(Box::new(move |p: &Path| {
+            if p == target {
+                std::fs::OpenOptions::new().write(true).open(p).unwrap().set_len(grow_to).unwrap();
+            }
+        })));
+        let got = TargetState::read(&g);
+        read_seam::set_after_open(None);
+        assert!(got.is_err(), "{tag}: a file that grew while it was read gives no state: {got:?}");
+        assert!(read_seam::bytes_read_from(&g) <= CAP + 1, "{tag}: at most the limit + 1 bytes");
+    }
+}
+
+/// IE4: the vault's copy of a staged candidate is read through the same bound — one byte over the
+/// limit is refused before any byte is read (the limit named); a source that grows past the limit while
+/// it is copied is refused after at most the limit + 1 bytes; nothing is left as a slot. Without IE4 the
+/// copy read the whole file into memory.
+#[test]
+fn the_vault_copy_of_a_candidate_is_read_within_the_one_limit() {
+    use crate::repair::durable::{read_seam, RECORD_READ_CAP as CAP};
+    let r = rig("ie4vault");
+    let id = rid("R-17");
+    let over = r.base.join("cand/over.sh");
+    sparse_file(&over, CAP + 1);
+    let staged = Staged::FileFrom { source: over.clone(), mode: 0o644 };
+    let e = format!("{:?}", vault::build_slot(&r.root, &id, &r.lane, "hooks/over.sh", "t1", DepositKind::Displaced, &TargetState::Absent, &staged, 1.0, &r.pack).expect_err("over the limit"));
+    assert!(e.contains(&CAP.to_string()), "the limit is named: {e}");
+    assert_eq!(read_seam::bytes_read_from(&over), 0, "refused before any byte is read");
+    let grow = r.base.join("cand/grow.sh");
+    sparse_file(&grow, 10);
+    let target = grow.clone();
+    read_seam::set_after_open(Some(Box::new(move |p: &Path| {
+        if p == target {
+            std::fs::OpenOptions::new().write(true).open(p).unwrap().set_len(CAP * 4).unwrap();
+        }
+    })));
+    let staged = Staged::FileFrom { source: grow.clone(), mode: 0o644 };
+    let got = vault::build_slot(&r.root, &id, &r.lane, "hooks/grow.sh", "t2", DepositKind::Displaced, &TargetState::Absent, &staged, 1.0, &r.pack);
+    read_seam::set_after_open(None);
+    assert!(got.is_err(), "a source that grew past the limit is refused: {got:?}");
+    assert!(read_seam::bytes_read_from(&grow) <= CAP + 1);
+    assert!(ledger::list_slots_in(&r.root, &id).is_empty(), "no slot is left");
+}
+
+/// IE4 (codex T5b r6 M1) through the approved apply: the candidate was approved, THEN its working copy
+/// was replaced by a file over the limit — the apply is REFUSED before any byte of it is read, nothing
+/// is displaced, the pack-apply exclusion is free again, and neither the record nor its approval moved.
+/// Without IE4 the file was hashed to its end and copied whole under the exclusion before the
+/// fingerprint comparison declined it.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_approved_candidate_replaced_by_an_over_limit_file_is_refused_unread() {
+    use crate::repair::durable::{read_seam, RECORD_READ_CAP as CAP};
+    let r = rig("ie4cand");
+    let id = rid("R-17");
+    r.put("hooks/g.sh", b"PRE\n", 0o755);
+    let pre_img = ledger::copy_preimage_in(&r.root, &id, &r.lane, "hooks/g.sh", &r.pack.join("hooks/g.sh"), 1.0).unwrap();
+    let staging = ledger::staging_dir_in(&r.root, &id).join("hooks/g.sh");
+    std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
+    std::fs::write(&staging, b"CAND\n").unwrap();
+    let st = TargetState::read(&staging).unwrap();
+    let fp = crate::repair::types::fingerprint(&[("hooks/g.sh".into(), st.clone())]);
+    let mut rec = record(&r, &id, Classification::ProtectionRelated, vec![FileChange { rel: "hooks/g.sh".into(), kind: ChangeKind::Edit, pre: pre_img, post: st, diff: None }], RepairState::AwaitingApproval);
+    rec.approval = Some(approval(&fp));
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    // after the approval the working copy is replaced by a file over the limit
+    std::fs::remove_file(&staging).unwrap();
+    sparse_file(&staging, CAP + 1);
+    let before = read_seam::bytes_read_from(&staging);
+    let lock = r.base.join(".pack-apply.lock");
+    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let res = crate::pack_apply_lock::with_apply_lock(&lock, || {
+        apply_candidate_in(&env, &id, &[CandidateFile { rel: "hooks/g.sh".into(), staged: staging.clone(), mode: 0o644 }], &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock)
+    })
+    .unwrap();
+    let e = format!("{:?}", res.expect_err("the apply is refused"));
+    assert!(e.contains(&CAP.to_string()), "the limit is named: {e}");
+    assert_eq!(read_seam::bytes_read_from(&staging) - before, 0, "the working copy is never read");
+    assert_eq!(std::fs::read(r.pack.join("hooks/g.sh")).unwrap(), b"PRE\n", "nothing displaced");
+    assert_eq!(crate::pack_apply_lock::try_with_apply_lock(&lock, || ()).unwrap(), Some(()), "the exclusion is free");
+    let rec = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
+    assert_eq!(rec.state, RepairState::AwaitingApproval, "the record did not move");
+    assert!(rec.approval.is_some(), "the approval did not move");
+}
+
+/// IG1 through the approved apply: a LIVE target over the limit when the apply measures it (step 0)
+/// — the apply is refused without reading it, nothing is displaced, the exclusion is free, the record
+/// and its approval did not move. Without IG1 the live file was hashed to its end under the exclusion.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_live_target_over_the_limit_refuses_the_apply_unread() {
+    use crate::repair::durable::{read_seam, RECORD_READ_CAP as CAP};
+    let r = rig("ig1live");
+    let id = rid("R-17");
+    r.put("hooks/g.sh", b"PRE\n", 0o755);
+    let pre_img = ledger::copy_preimage_in(&r.root, &id, &r.lane, "hooks/g.sh", &r.pack.join("hooks/g.sh"), 1.0).unwrap();
+    let staging = ledger::staging_dir_in(&r.root, &id).join("hooks/g.sh");
+    std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
+    std::fs::write(&staging, b"CAND\n").unwrap();
+    let st = TargetState::read(&staging).unwrap();
+    let fp = crate::repair::types::fingerprint(&[("hooks/g.sh".into(), st.clone())]);
+    let mut rec = record(&r, &id, Classification::ProtectionRelated, vec![FileChange { rel: "hooks/g.sh".into(), kind: ChangeKind::Edit, pre: pre_img, post: st, diff: None }], RepairState::AwaitingApproval);
+    rec.approval = Some(approval(&fp));
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let live = r.pack.join("hooks/g.sh");
+    std::fs::OpenOptions::new().write(true).open(&live).unwrap().set_len(CAP + 1).unwrap();
+    let lock = r.base.join(".pack-apply.lock");
+    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let res = crate::pack_apply_lock::with_apply_lock(&lock, || {
+        apply_candidate_in(&env, &id, &[CandidateFile { rel: "hooks/g.sh".into(), staged: staging.clone(), mode: 0o644 }], &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock)
+    })
+    .unwrap();
+    let e = format!("{:?}", res.expect_err("the apply is refused"));
+    assert!(e.contains(&CAP.to_string()), "the limit is named: {e}");
+    assert_eq!(read_seam::bytes_read_from(&live), 0, "the live file is never read");
+    assert_eq!(std::fs::metadata(&live).unwrap().len(), CAP + 1, "nothing displaced");
+    assert_eq!(crate::pack_apply_lock::try_with_apply_lock(&lock, || ()).unwrap(), Some(()), "the exclusion is free");
+    let rec = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
+    assert_eq!(rec.state, RepairState::AwaitingApproval, "the record did not move");
+    assert!(rec.approval.is_some(), "the approval did not move");
+}

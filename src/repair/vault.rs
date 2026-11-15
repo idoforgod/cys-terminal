@@ -330,16 +330,16 @@ pub fn sweep_stale_temps(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Reads a regular file without following a link (the source of a staged copy is read ONCE).
+/// Reads a regular file without following a link (the source of a staged copy is read ONCE) —
+/// RULINGS IE4 / IG1: through the engine's one bounded reader (a non-blocking open that follows no
+/// link, a regular file only, at most RECORD_READ_CAP + 1 bytes from that one handle); over the
+/// limit, or a size that changed while it was read, is refused with the reason (the limit named).
 fn read_regular(p: &Path) -> Result<Vec<u8>, RepairError> {
-    let m = std::fs::symlink_metadata(p).map_err(|e| io(p, e))?;
-    if !m.file_type().is_file() {
-        return Err(RepairError::Precondition(format!(
-            "{}: 일반 파일이 아닙니다",
-            p.display()
-        )));
+    match super::durable::read_record_bytes(p) {
+        super::durable::RecordRead::Bytes(b) => Ok(b),
+        super::durable::RecordRead::NotFound => Err(io(p, std::io::Error::from(std::io::ErrorKind::NotFound))),
+        super::durable::RecordRead::Unreadable(why) => Err(RepairError::Precondition(why)),
     }
-    std::fs::read(p).map_err(|e| io(p, e))
 }
 
 /// RULINGS FI1 — the generation a slot's `meta/pre.json` records for its bytes: `Ok(Some(g))`;
