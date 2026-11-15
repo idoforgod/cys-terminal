@@ -1381,7 +1381,8 @@ pub(crate) fn wait_helper(child: std::process::Child, request_id: &str, nonce: &
     wait_helper_for(child, Duration::from_secs(HELPER_KILL_SECS), request_id, nonce)
 }
 
-/// [`wait_helper`] with an explicit limit: past it the child is killed and reaped — not approved.
+/// [`wait_helper`] with an explicit limit: past it the child is killed and reaped — not approved;
+/// a success seen at or past the limit is not approved either (RULINGS KQ1: expiry wins).
 ///
 /// RULINGS JW1 (HL3 (ii)): the helper's standard output is read without blocking, with a size bound,
 /// inside the same limit; the answer is "approved" ONLY on exit 0 AND an output read to its end that
@@ -1389,12 +1390,25 @@ pub(crate) fn wait_helper(child: std::process::Child, request_id: &str, nonce: &
 /// malformed one, another request's id or nonce, an over-long output, an output still open at the
 /// limit, a pipe that could not be read — "not approved", whatever the exit code.
 pub(crate) fn wait_helper_for(
-    mut child: std::process::Child,
+    child: std::process::Child,
     limit: Duration,
     request_id: &str,
     nonce: &str,
 ) -> bool {
     let started = std::time::Instant::now();
+    wait_helper_clocked(child, limit, request_id, nonce, &mut || started.elapsed())
+}
+
+/// [`wait_helper_for`] over a given reading of the time since the wait began — RULINGS KQ1: the one
+/// seam a test needs to put a helper's completion on either side of the limit (production passes the
+/// monotonic [`std::time::Instant`]; the kill's grace below keeps its own).
+fn wait_helper_clocked(
+    mut child: std::process::Child,
+    limit: Duration,
+    request_id: &str,
+    nonce: &str,
+    elapsed: &mut dyn FnMut() -> Duration,
+) -> bool {
     let mut out = child.stdout.take();
     #[cfg(unix)]
     let readable = out.as_ref().is_some_and(|o| {
@@ -1425,8 +1439,13 @@ pub(crate) fn wait_helper_for(
                 Err(_) => break,
             }
         }
+        // RULINGS KQ1 — expiry wins over success: the deadline is read AFTER this turn's look at the
+        // helper and before any answer, so a success the waiter sees at or past the limit (the helper
+        // done while the waiter slept across it) is "not approved", whatever the helper printed
+        let expired = elapsed() >= limit;
         if let (Some(success), Some(read_whole)) = (exited, output) {
-            return success
+            return !expired
+                && success
                 && read_whole
                 && buf == helper_success_record(request_id, nonce).as_bytes();
         }
@@ -1434,7 +1453,7 @@ pub(crate) fn wait_helper_for(
             // no answer can come any more: the helper is ended at once (below) — not approved
             break;
         }
-        if started.elapsed() >= limit {
+        if expired {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
