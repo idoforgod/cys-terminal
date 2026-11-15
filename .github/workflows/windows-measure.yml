@@ -1,0 +1,175 @@
+name: windows-measure (TW1 · release-1 Windows record)
+
+# Purpose (release 0.15.0, self-repair; impl RULINGS CW7 and EQ1-EQ6): MEASURE on GitHub's real Windows runner a real
+#   update of the released v0.14.56 to the build of this commit (and a following transition), and write a row-by-row
+#   record (tw1-record.json / tw1-record.md) in which a probe that did not run can never count as a pass.
+#   - The installer under test is the artifact of the windows-build run at THIS commit, fetched through the REST API
+#     (nothing is built twice; windows-build.yml is not edited). The only thing built here is the following-version
+#     pair cys.exe + cysd.exe.
+#   - Nothing is published: no release, no tag, no secret. The only cache written is the following-version build's.
+#   - The verdict of every row is computed by scripts/windows-measure/tw1_record.py from recorded observations.
+#   - The job is red on any MEASURED-FAIL (after every probe ran) or a failed set-up / identity of the installation.
+#     NOT-MEASURABLE-HERE, NOT-MEASURED and findings never turn it red; they are counted in the summary line.
+# Triggers: a measurement branch, the release-candidate branch (measured without changing this file), or a manual
+#   dispatch with the windows-build run id. Both branch patterns also match windows-build's `fix/**`.
+
+on:
+  push:
+    branches: ['fix/tw1-measure-**', 'fix/*-candidate']
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'windows-build run id at this commit (optional; found automatically when empty)'
+        required: false
+        default: ''
+      phase:
+        description: '1 = without seats; 2 = with the seat-driven legs'
+        required: false
+        default: '1'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: windows-measure-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wait-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 85
+    outputs:
+      found: ${{ steps.find.outputs.found }}
+      run_id: ${{ steps.find.outputs.run_id }}
+      conclusion: ${{ steps.find.outputs.conclusion }}
+      reason: ${{ steps.find.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find the windows-build run at this commit (waits until it completes)
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TW1_RUN_ID_INPUT: ${{ inputs.build_run_id }}
+        run: python3 scripts/windows-measure/tw1_main.py find-build --sha "$GITHUB_SHA" --wait-minutes 78 --out "$GITHUB_OUTPUT"
+
+  tnv-build:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: tw1-following-version
+      - name: Prepare the following version (job workspace only, never committed)
+        shell: pwsh
+        run: python -X utf8 scripts/windows-measure/tnv_prepare.py --root . --record tnv-prepare.json
+      - name: Build cys.exe and cysd.exe of the following version
+        shell: bash
+        run: cargo build --release --bin cys --bin cysd
+      - name: Upload the following-version pair
+        uses: actions/upload-artifact@v4
+        with:
+          name: tw1-tnv-binaries
+          path: |
+            target/release/cys.exe
+            target/release/cysd.exe
+            tnv-prepare.json
+          retention-days: 14
+          if-no-files-found: error
+
+  # RULINGS HV4 (T9 = a release condition): T9's own journal-protocol tests (src/pack.rs, names t9_ / m15_da_ / m15_da2_;
+  #   none is cfg(unix)) and the pack-update verb's complete command with a test-signed pack (src/bin/cys.rs tests;
+  #   the shipped CLI trusts only its embedded keyring) on a real Windows runner. Skipped - and recorded as absent -
+  #   while T9 is not in the tree. No cache (EQ6).
+  t9-libtests:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Is T9's journal protocol in this tree
+        id: detect
+        shell: bash
+        run: |
+          mkdir -p t9-out
+          if grep -q 'fn t9_r2_two_starters_exactly_one_admitted' src/pack.rs; then
+            echo present > t9-out/t9-present.txt
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo absent > t9-out/t9-present.txt
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: T9 protocol tests (library)
+        if: steps.detect.outputs.present == 'true'
+        shell: bash
+        run: |
+          rc=0
+          cargo test --lib -- t9_ m15_da_ m15_da2_ > t9-out/t9-libtests.log 2>&1 || rc=$?
+          echo "TW1-CARGO-EXIT=$rc" >> t9-out/t9-libtests.log
+      - name: Pack-update verb, complete command, test-signed pack (binary tests)
+        if: steps.detect.outputs.present == 'true'
+        shell: bash
+        run: |
+          rc=0
+          cargo test --bin cys -- pack_update_ b428_u9_ > t9-out/t9-verbtests.log 2>&1 || rc=$?
+          echo "TW1-CARGO-EXIT=$rc" >> t9-out/t9-verbtests.log
+      - name: Upload the T9 test logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tw1-t9-libtests
+          path: t9-out
+          retention-days: 14
+          if-no-files-found: warn
+
+  measure:
+    needs: [wait-build, tnv-build, t9-libtests]
+    if: ${{ !cancelled() }}
+    runs-on: windows-latest
+    timeout-minutes: 130
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Driver self-test (a driver whose own rules fail measures nothing)
+        shell: pwsh
+        run: python -X utf8 scripts/tests/windows_measure_selftest.py
+      # The installer under test (artifact cys-windows-x64-nsis of the windows-build run at this commit) and the
+      # following-version pair (artifact tw1-tnv-binaries of this run) are fetched by the driver through the REST API
+      # (stage S0). actions/download-artifact is not used: scripts/tests/test_c8_ci_consumer.py keeps an allow-list of
+      # actions and this unit edits no existing file.
+      - name: Measure (stages, probes, record)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TW1_BUILD_RUN_ID: ${{ needs.wait-build.outputs.run_id }}
+          TW1_BUILD_CONCLUSION: ${{ needs.wait-build.outputs.conclusion }}
+          TW1_BUILD_REASON: ${{ needs.wait-build.outputs.reason }}
+          TW1_TNV_RESULT: ${{ needs.tnv-build.result }}
+          TW1_T9_RESULT: ${{ needs.t9-libtests.result }}
+          TW1_PHASE: ${{ inputs.phase || '1' }}
+        run: python -X utf8 scripts/windows-measure/tw1_main.py run --work "$env:RUNNER_TEMP\tw1" --out "$env:RUNNER_TEMP\tw1-record" --phase $env:TW1_PHASE
+      - name: Stop everything this run started (always)
+        if: always()
+        shell: pwsh
+        run: python -X utf8 scripts/windows-measure/tw1_main.py cleanup --work "$env:RUNNER_TEMP\tw1" --out "$env:RUNNER_TEMP\tw1-record"
+      - name: Upload the record (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tw1-record
+          path: ${{ runner.temp }}/tw1-record
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Conclusion (red on MEASURED-FAIL or a failed set-up)
+        if: always()
+        shell: pwsh
+        run: python -X utf8 scripts/windows-measure/tw1_main.py conclude --out "$env:RUNNER_TEMP\tw1-record"
