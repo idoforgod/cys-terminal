@@ -2218,12 +2218,26 @@ def _merge_ticket_lines(repair, lane_key=None):
     files = [f.get("rel") for f in (v.get("files") or [])
              if isinstance(f, dict) and isinstance(f.get("rel"), str) and not str(f.get("kind", "")).startswith("hook")
              and not (isinstance(f.get("kind"), dict) and "hook_unregister" in f.get("kind"))]
-    if trigger is None or not files:
+    # RULINGS IG6: the repair's HOOK targets are kept (`--unregister-hook EVENT:SCRIPT`) — a hook-only repair's
+    # conflict is merged through them; a hook entry that cannot be read gives no ticket
+    hooks = []
+    for f in (v.get("files") or []):
+        kind = f.get("kind") if isinstance(f, dict) else None
+        if isinstance(kind, dict) and "hook_unregister" in kind:
+            h = kind.get("hook_unregister")
+            ev, sc = (h.get("event"), h.get("script")) if isinstance(h, dict) else (None, None)
+            if not (isinstance(ev, str) and ev and isinstance(sc, str) and sc):
+                return None, "%s 의 훅 대상을 읽지 못했습니다" % repair
+            hooks.append("%s:%s" % (ev, sc))
+    if trigger is None or not (files or hooks):
         return None, "%s 의 계기나 파일 대상을 읽지 못했습니다" % repair
     import shlex
     fl = " ".join(shlex.quote(x) for x in files)
+    targets = " ".join((["--files " + fl] if files else []) + ["--unregister-hook " + shlex.quote(h) for h in hooks])
     reason = _merge_reason_line(v, lane_key)
     if v.get("classification") in ("boot_critical", "protection_related"):
+        if not files:
+            return None, "%s 의 파일 대상을 읽지 못했습니다" % repair
         return [
             "병합 티켓 — %s(기동 필수·보호장치): 이 부서의 수리로 맞춘다(합치기 모드는 이 경로에 없다 · RULINGS R1/T1)" % repair,
         ] + ([reason] if reason else []) + [
@@ -2234,7 +2248,7 @@ def _merge_ticket_lines(repair, lane_key=None):
     return [
         "병합 티켓 — %s: 이 부서의 충돌을 이 부서 워커가 합친다(H8)" % repair,
     ] + ([reason] if reason else []) + [
-        "  1) cys repair begin --files %s --joins %s --trigger %s" % (fl, repair, trigger),
+        "  1) cys repair begin %s --joins %s --trigger %s" % (targets, repair, trigger),
         "  2) 이 부서의 살아 있는 파일에 %s 의 바꿈을 합친다(바꾸거나, 지금 내용이 맞으면 그대로 둔다)" % repair,
         "  3) cys repair recheck %s" % repair,
     ], None
