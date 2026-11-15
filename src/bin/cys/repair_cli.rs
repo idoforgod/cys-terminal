@@ -902,17 +902,23 @@ fn t4_print(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, v: &Value
 /// assignment gate — reads the ledger and the lane's job state, sends nothing, starts nothing; exit 0
 /// OPEN, 95 HELD (flagged interpretation 19), 2 a lane key that is not one. The JSON also carries the
 /// one summary line of lanes left in 충돌 (HH7 — a pull; the delegation tool prints it).
+/// RULINGS IK1: every key `lane::lane_key` can produce is accepted — a department's key is its socket
+/// path with only `/` `\` `:` replaced, so it holds the HOME folder's name (Korean letters, spaces);
+/// only what cannot be a key is refused (`gate_lane_key_ok`).
+fn gate_lane_key_ok(lane: &str) -> bool {
+    !lane.is_empty()
+        && lane != "."
+        && lane != ".."
+        && !lane.chars().any(|c| matches!(c, '/' | '\\' | ':' | '\0') || c.is_control())
+}
+
 fn gate_local(lane: &str, json_out: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     gate_local_in(lane, json_out, out, err, &cys::repair::paths::repairs_root(), &cys::lane::registry_path())
 }
 
 fn gate_local_in(lane: &str, json_out: bool, out: &mut dyn Write, err: &mut dyn Write, root: &std::path::Path, registry: &std::path::Path) -> i32 {
-    let valid = !lane.is_empty()
-        && lane != "."
-        && lane != ".."
-        && lane.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
-    if !valid {
-        let _ = writeln!(err, "cys repair gate: 레인 키가 아닙니다: {lane:?} (영문·숫자·. _ - 만)");
+    if !gate_lane_key_ok(lane) {
+        let _ = writeln!(err, "cys repair gate: 레인 키가 아닙니다: {lane:?} (비어 있거나 `.`·`..`이거나 경로 구분자·제어 문자를 담았습니다)");
         return 2;
     }
     let key = cys::repair::types::LaneKey(lane.to_string());
@@ -2043,7 +2049,9 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(gate_local_in("base", false, &mut out, &mut Vec::new(), &root, &registry), 95);
         assert!(String::from_utf8(out).unwrap().starts_with("작업 배정 관문: 보류 (base)"));
-        for bad in ["", "..", "a/b", "a b"] {
+        // RULINGS IK1 — REWRITTEN: the old list ["", "..", "a/b", "a b"] pinned the over-strict check
+        // ("a b" → 2); a key with a space is a key the product makes (a HOME with a space)
+        for bad in ["", ".", "..", "a/b", "a\\b", "c:x", "a\0b", "a\nb", "a\u{7f}b"] {
             let (mut out, mut err) = (Vec::new(), Vec::new());
             assert_eq!(gate_local_in(bad, true, &mut out, &mut err, &root, &registry), 2, "{bad:?}");
             assert!(out.is_empty());
@@ -2051,6 +2059,43 @@ mod tests {
         // through the dispatcher with an rpc that refuses everything: no request is ever sent
         let cmd = parse(&["gate", "--lane", "base", "--json"]).unwrap();
         assert!(is_local(&cmd));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// RULINGS IK1 (blocking — queue blocking): every key `lane::lane_key` makes for a department whose
+    /// HOME holds Korean letters or a space is accepted — OPEN with an empty ledger, through the verb's
+    /// parser and its body; the JSON names the key unchanged.
+    #[test]
+    fn gate_accepts_every_lane_key_the_product_makes() {
+        let base = std::env::temp_dir().join(format!("cys-cli-gate-ik1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let root = base.join("repairs");
+        let registry = base.join("depts.json");
+        // a HOME with Korean letters, with spaces, with both; and a Windows-shaped socket path (homes
+        // built under the rig — no real home path in the source)
+        let users = base.join("Users");
+        let sock_of = |home: &str, dept: &str| users.join(home).join(".local").join("state").join(format!("cys-dept-{dept}")).join("cys.sock");
+        let socks = [
+            sock_of("홍길동", "sales"),
+            sock_of("Gil Dong Kim", "sales"),
+            sock_of("홍 길동", "영업 1팀"),
+            std::path::PathBuf::from(["C:", "Users", "홍길동", "AppData", "Local", "cys", "cys-dept-sales", "cys.sock"].join("\\")),
+        ];
+        for sock in &socks {
+            let key = cys::lane::lane_key(sock);
+            assert!(gate_lane_key_ok(&key), "{key:?}");
+            let cmd = parse(&["gate", "--lane", &key, "--json"]).unwrap();
+            assert!(is_local(&cmd));
+            let mut out = Vec::new();
+            assert_eq!(gate_local_in(&key, true, &mut out, &mut Vec::new(), &root, &registry), 0, "{key:?}");
+            let v: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!((v["verdict"].as_str(), v["lane"].as_str()), (Some("open"), Some(key.as_str())));
+        }
+        // the long-path form (head + hash) is a key too
+        let long = users.join("홍길동").join("깊은 폴더/".repeat(30)).join("cys-dept-x").join("cys.sock");
+        let key = cys::lane::lane_key(&long);
+        assert_eq!(gate_local_in(&key, true, &mut Vec::new(), &mut Vec::new(), &root, &registry), 0, "{key:?}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
