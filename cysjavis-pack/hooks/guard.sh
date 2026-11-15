@@ -1083,22 +1083,6 @@ def _ledger_text_places(text):
                 i = v.find(sp, i + 1)
     return out
 
-def ledger_word_places(word, bases):
-    """The places one shell word reaches: its own text searched for a root's spelling (an `of=` / `--x=` prefix
-    included), and the word — and the value after its first `=` — as a path from each base (relative words; links)."""
-    out = [pl for pl in _ledger_text_places(word)]
-    cands = [word] + ([word.split("=", 1)[1]] if "=" in word else [])
-    for c in cands:
-        if not c:
-            continue
-        for b in bases:
-            pl = ledger_place(c, b)
-            if pl is not None and pl not in out:
-                out.append(pl)
-            if os.path.isabs(c) or c.startswith(("~", "$HOME", "${HOME}")):
-                break
-    return out
-
 def _ledger_tokens(n):
     """STRICT's tokenization (quotes kept together, punctuation split); None when it cannot be told."""
     try:
@@ -1108,150 +1092,85 @@ def _ledger_tokens(n):
     except ValueError:
         return None
 
+LEDGER_NOT_LITERAL = re.compile(r"[$`*?\[]")
+
 def _ledger_bases(cmds, cwd):
-    """The call's working directory and every directory the command itself changes to (`cd`, `pushd` — each target,
-    resolved from every base found before it). Bounded."""
+    """The call's working directory and every directory the command changes to by a `cd` / `pushd` target NAMED
+    LITERALLY in it (no `$`, back-quote or glob — RULINGS IJ5), each resolved from every base before it; at most 16."""
     bases = [cwd or os.getcwd()]
     for prog, args in cmds:
         if prog not in ("cd", "pushd"):
             continue
         ops = [x for x in args if not x.startswith("-") and x not in REDIRECTS]
-        target = ops[0] if ops else os.environ.get("HOME", "")
-        if not target:
+        if not ops or LEDGER_NOT_LITERAL.search(ops[0]):
             continue
         for b in list(bases):
-            nb = _ledger_abs(target, b)
-            if nb not in bases:
+            nb = _ledger_abs(ops[0], b)
+            if nb not in bases and len(bases) < 16:
                 bases.append(nb)
-        if len(bases) > 16:
-            break
     return bases
 
-def _ledger_coarse_write(n):
-    """A write form anywhere in the text (the coarse judgment: a redirection, a writer program, `sed -i`)."""
-    toks = n.split()
-    progs = set()
-    for seg in l_segments(n):
-        p, a = l_cmd_word(seg)
-        progs.add(p)
-        if p == "sed" and any(x == "-i" or x.startswith("-i") for x in a):
-            return True
-    return (">" in n) or bool(progs & LEDGER_WRITERS)
+def _ledger_named(n, cwd):
+    """The ledger places outside the working copy that a command NAMES (RULINGS IJ1 / IJ5): a root's spelling anywhere in
+    its text (an operand, an assignment, a quoted string), and every word — and the value after its first `=` — as a path
+    from the call's cwd and from each literally named `cd` / `pushd` target. Returns (places, tokens or None, bases)."""
+    places = [pl for pl in _ledger_text_places(n) if pl != "staging"]
+    toks = _ledger_tokens(n)
+    nl = norm_loose(n)
+    loose = nl.split() + norm_loose_slash(n).split()        # the coarse words too: a path inside `$(…)` stays a word
+    if toks is not None:
+        words, cmds = list(toks) + loose, extract_commands(toks)
+    else:
+        words, cmds = loose, [l_cmd_word(seg) for seg in l_segments(nl)]
+    bases = _ledger_bases(cmds, cwd)
+    for w in words:
+        for c in [w] + ([w.split("=", 1)[1]] if "=" in w else []):
+            if not c:
+                continue
+            for b in bases:
+                pl = ledger_place(c, b)
+                if pl is not None and pl != "staging" and pl not in places:
+                    places.append(pl)
+                if os.path.isabs(c) or c.startswith(("~", "$HOME", "${HOME}")):
+                    break
+    return places, toks, bases
 
-LEDGER_COPY = {"cp", "mv", "install", "ln"}
-LEDGER_VALUE_OPTS = {"cp": {"-S"}, "mv": {"-S"}, "ln": {"-S"}, "install": {"-m", "-o", "-g", "-S", "-f", "-B"}}
-LEDGER_IN_REDIRECTS = {"<", "<<", "<<<", "<&"}
-
-def _ledger_segment(words):
-    """One segment's words split into its operands and its output redirections [(operator, target)]. A digit word right
-    before a redirection operator is that operator's descriptor (`2>`), not an operand."""
-    ops, outs = [], []
-    i = 0
-    while i < len(words):
-        w = words[i]
-        if w in REDIRECTS or w in LEDGER_IN_REDIRECTS or w == "<>":
-            if ops and ops[-1].isdigit():
-                ops.pop()
-            tgt = words[i + 1] if i + 1 < len(words) else ""
-            if w in REDIRECTS or w == "<>":
-                outs.append((w, tgt))
-            i += 2
-            continue
-        ops.append(w)
-        i += 1
-    return ops, outs
-
-def _ledger_copy_dest(prog, ops):
-    """(destinations, sources, known) of a copy-family call: `-t DIR` / `--target-directory` or the last operand; every
-    operand of `install -d`. Not known when the destination cannot be told."""
-    vals = LEDGER_VALUE_OPTS.get(prog, set())
-    target, operands, only_dirs, i, opts_done = None, [], False, 0, False
-    while i < len(ops):
-        o = ops[i]
-        if not opts_done and o == "--":
-            opts_done = True
-        elif not opts_done and o.startswith("--target-directory"):
-            if "=" in o:
-                target = o.split("=", 1)[1]
-            elif i + 1 < len(ops):
-                target = ops[i + 1]; i += 1
-        elif not opts_done and o.startswith("-t") and prog != "install":
-            if len(o) > 2:
-                target = o[2:]
-            elif i + 1 < len(ops):
-                target = ops[i + 1]; i += 1
-        elif not opts_done and o.startswith("-") and len(o) > 1:
-            if prog == "install" and o == "-d":
-                only_dirs = True
-            if o in vals and i + 1 < len(ops):
-                i += 1
-        else:
-            operands.append(o)
-        i += 1
-    if only_dirs:
-        return operands, [], bool(operands)
-    if target is not None:
-        return [target], operands, True
-    if len(operands) >= 2:
-        return [operands[-1]], operands[:-1], True
-    return [], operands, False
+def _ledger_harmless_sink(op, tgt, bases):
+    """RULINGS IJ2: a redirection target that cannot be a write of the ledger — /dev/null, a descriptor duplicate
+    (`&1`, `&2`, `2>&1`, `>&-`), or a literal path (no `$`, back-quote, glob) that resolves outside every root from the
+    cwd and every literal `cd` target."""
+    if tgt == "/dev/null":
+        return True
+    if op == ">&" and (tgt.isdigit() or tgt == "-"):
+        return True
+    if tgt in ("&1", "&2", "&-"):
+        return True
+    if not tgt or LEDGER_NOT_LITERAL.search(tgt) or _ledger_text_places(tgt):
+        return False
+    return all(ledger_place(tgt, b) is None for b in bases)
 
 def ledger_shell_write(command, cwd):
-    """The store a shell command writes into, or None (RULINGS ID1 · ID3).
-    Words: STRICT's tokens; a word's place is judged as the shell reaches it (from every directory the command changes
-    to; a root's spelling found in the word's own text). A read is not a write: an output redirection counts only when
-    ITS target is a ledger place outside the working copy (`2>/dev/null`, `2>&1`, a temp file are not); a writer counts
-    only for the operands of its own segment; for cp / mv / install / ln only the destination is written (`-t DIR` or the
-    last operand), and mv also writes (removes) its source; tee / dd / truncate / patch / editors / sed -i / rm / rmdir /
-    chmod / chown stay coarse within their segment. A command that cannot be told — unbalanced quotes, a command or
-    process substitution, a ledger place named in the text that no word carries, a copy whose destination cannot be told
-    — keeps the coarse judgment (a ledger place named and a write form → refused)."""
+    """The store a shell command writes into, or None — RULINGS IJ1 / IJ2, ONE coarse rule.
+    (a) The command NAMES a ledger place outside the working copy (`_ledger_named`), and (b) any segment's program is a
+    writer (the round-1 set, or `sed -i`) → refused; no operand is interpreted (a copy OUT is refused too — the coarse
+    judgment's cost). With no writer, the command's redirections are writes unless EVERY redirection target is a harmless
+    sink (`_ledger_harmless_sink`); a command whose tokens cannot be told is refused if it has a `>` at all."""
     n = norm_base(command)
-    named = [pl for pl in _ledger_text_places(n) if pl != "staging"]
-    if not named and not LEDGER_ROOTS:
+    named, toks, bases = _ledger_named(n, cwd)
+    if not named:
         return None
-    toks = _ledger_tokens(n)
-    cannot_tell = toks is None or bool(re.search(r"\$\(|\x60|<\(|>\(", n))
-    if not cannot_tell:
-        carried = set()
-        for w in toks:
-            carried.update(_ledger_text_places(w))
-        cannot_tell = any(pl not in carried for pl in named)
-    if cannot_tell:
-        return named[0] if named and _ledger_coarse_write(n) else None
-    cmds = extract_commands(toks)
-    bases = _ledger_bases(cmds, cwd)
-
-    def outside(words):
-        for w in words:
-            for pl in ledger_word_places(w, bases):
-                if pl != "staging":
-                    return pl
-        return None
-
-    for prog, args in cmds:
-        words = [prog] + list(args) if prog in REDIRECTS or prog in LEDGER_IN_REDIRECTS else list(args)
-        ops, outs = _ledger_segment(words)
-        for op, tgt in outs:
-            if op in (">&", "<>") and (tgt.isdigit() or tgt == "-"):
-                continue                       # a descriptor copy (2>&1), not a file
-            pl = outside([tgt]) if tgt else None
-            if pl:
-                return pl
-        if prog in LEDGER_COPY:
-            dests, srcs, known = _ledger_copy_dest(prog, ops)
-            if not known:
-                pl = outside(ops)
-                if pl:
-                    return pl
-                continue
-            pl = outside(dests) or (outside(srcs) if prog == "mv" else None)
-            if pl:
-                return pl
-        elif prog in LEDGER_WRITERS or (prog == "sed" and any(x == "-i" or x.startswith("-i") for x in ops)):
-            pl = outside(ops)
-            if pl:
-                return pl
+    nl = norm_loose(n)
+    for seg in l_segments(nl):
+        p, a = l_cmd_word(seg)
+        if p in LEDGER_WRITERS or (p == "sed" and any(x == "-i" or x.startswith("-i") for x in a)):
+            return named[0]
+    if toks is None:
+        return named[0] if ">" in n else None
+    for k, t in enumerate(toks):
+        if t in REDIRECTS or t == "<>":
+            tgt = toks[k + 1] if k + 1 < len(toks) else ""
+            if not _ledger_harmless_sink(t, tgt, bases):
+                return named[0]
     return None
 
 # ================= 메인 =================

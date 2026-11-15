@@ -512,9 +512,10 @@ def main():
         check("12 공백이 든 장부 자리의 작업 사본 → 통과", p.returncode == 0,
               "" if p.returncode == 0 else "rc=%d %r" % (p.returncode, p.stderr[-200:]))
 
-        # 13 — RULINGS ID3 (T4e round 2): a read is not a write — a redirection counts only when ITS target is a ledger place
-        #      outside the working copy; a writer counts only for the operands of its own segment; for cp / mv / install / ln
-        #      only the destination is written (mv also writes its source)
+        # 13 — RULINGS IJ1 / IJ2 (T4e round 3): ONE coarse rule — a command that NAMES a ledger place outside the working copy
+        #      and has ANY writer program in any segment is refused (no operand is interpreted; a copy OUT is refused too —
+        #      the coarse judgment's cost, minor #156); with no writer, its redirections are writes unless every target is a
+        #      harmless sink (/dev/null, &1 / &2, a literal path that resolves outside every ledger root)
         out = os.path.join(root, "out")
         os.makedirs(out, exist_ok=True)
         tmpf = os.path.join(out, "t.json")
@@ -525,14 +526,14 @@ def main():
                 ("head > 임시 파일", "head -n 3 %s > %s" % (os.path.join(ledger, "tombstones", "base.json"),
                                                         os.path.join(out, "head.txt")), None),
                 ("cat > 임시 파일", "cat %s > %s" % (os.path.join(ledger, "grant.json"), os.path.join(out, "copy.json")), None),
-                ("밖으로 cp", "cp %s %s" % (os.path.join(ledger, "grant.json"), os.path.join(out, "g.json")), None),
-                ("밖으로 cp -r", "cp -r %s %s" % (os.path.join(ledger, "R-3"), os.path.join(out, "r3")), None),
                 ("따옴표 글 안의 언급", 'echo "the ledger %s is written by the daemon" > %s'
                  % (os.path.join(ledger, "grant.json"), os.path.join(out, "note.txt")), None),
                 ("cd 뒤 ls 2>/dev/null", "cd %s && ls -la 2>/dev/null" % ledger, None),
                 ("cd 뒤 cat 2>&1 | head", "cd %s && cat record.json 2>&1 | head" % os.path.join(ledger, "R-3"), None),
                 ("공백 자리 cat 2>/dev/null", 'cat "%s/grant.json" 2>/dev/null' % sl, sguard),
-                ("공백 자리 밖으로 cp", 'cp "%s/grant.json" %s' % (sl, os.path.join(out, "s.json")), sguard)):
+                ("공백 자리 cat > 임시 파일", 'cat "%s/grant.json" > %s' % (sl, os.path.join(out, "s.json")), sguard),
+                ("cat >> /tmp 임시 파일", "cat %s >> %s" % (os.path.join(ledger, "grant.json"), os.path.join(out, "acc.txt")),
+                 None)):
             p, _ = run({"command": cmd}, tool="Bash", rc=0, guard=guard)
             check("13 읽기는 쓰기가 아니다 — 통과: %s" % label, p.returncode == 0,
                   "" if p.returncode == 0 else "rc=%d %r" % (p.returncode, p.stderr[-200:]))
@@ -558,51 +559,96 @@ def main():
                 if not ledger_refused(p, "cys repair"):
                     bad.append("%s rc=%d %r" % (how, p.returncode, p.stderr[-160:]))
             check("13 쓰기는 막힌다: %s (곧은 자리 · 공백 자리 · cd 뒤)" % label, not bad, "; ".join(bad))
+        for label, cmd, guard in (
+                ("밖으로 cp", "cp %s %s" % (os.path.join(ledger, "grant.json"), os.path.join(out, "g.json")), None),
+                ("밖으로 cp -r", "cp -r %s %s" % (os.path.join(ledger, "R-3"), os.path.join(out, "r3")), None),
+                ("공백 자리 밖으로 cp", 'cp "%s/grant.json" %s' % (sl, os.path.join(out, "s.json")), sguard)):
+            p, _ = run({"command": cmd}, tool="Bash", rc=0, guard=guard)
+            ok = ledger_refused(p, "cys repair")
+            check("13 장부 밖으로의 복사도 막힌다(굵은 판정의 대가 — minor #156, 읽기는 cat): %s" % label, ok,
+                  "" if ok else "rc=%d %r" % (p.returncode, p.stderr[-200:]))
 
-        # 14 — RULINGS ID2 (T4e round 2): the degraded backstop (no interpreter · a parser that crashes) keeps the ledger rule
-        #      in pure shell — and NEVER refuses a call that does not name the ledger (fatal class 4)
+        # 14 — RULINGS IJ4 (T4e round 3): the degraded backstop protects the ledger exactly as far as it protects the rule
+        #      documents. With jq (no interpreter · a crashing interpreter): a WRITING tool's path and the coarse shell form are
+        #      refused, a Read never is; without jq the released backstop reads no field and protects nothing — the rule
+        #      documents included (GAPS G22). In every mode it never refuses a call that does not name the ledger (fatal 4).
         crash = os.path.join(root, "bin-crash", "python-crash")
         os.makedirs(os.path.dirname(crash))
         with open(crash, "w") as f:
             f.write("#!/bin/sh\nexit 1\n")
         os.chmod(crash, 0o755)
-        # and a third: no interpreter on a PATH that has neither jq nor grep (the backstop's rule is pure shell)
-        bare = os.path.join(root, "bin-bare")
+        bare = os.path.join(root, "bin-bare")     # no interpreter on a PATH that has no jq
         os.makedirs(bare)
-        for t in ("sh", "tr", "sed", "mktemp", "cat", "rm", "dirname", "basename", "head", "uname"):
+        for t in ("sh", "tr", "sed", "grep", "mktemp", "cat", "rm", "dirname", "basename", "head", "uname"):
             w = shutil.which(t)
             if w:
                 os.symlink(w, os.path.join(bare, t))
-        degraded = (("인터프리터 없음", {"GUARD_FORCE_NOPY": "1"}), ("판정기 크래시", {"CYS_PY": crash}),
-                    ("인터프리터·jq·grep 없음", {"GUARD_FORCE_NOPY": "1", "PATH": bare}))
+        with_jq = (("인터프리터 없음", {"GUARD_FORCE_NOPY": "1"}), ("판정기 크래시", {"CYS_PY": crash}))
+        no_jq = ("인터프리터·jq 없음", {"GUARD_FORCE_NOPY": "1", "PATH": bare})
         tok_path = os.path.join(ledger, "owner-tokens", "%s.json" % sha)
-        for mode, extra in degraded:
+        dotted = os.path.join(ledger, "..", "repairs", "owner-tokens", "%s.json" % sha)
+        for mode, extra in with_jq:
             bad = []
             for label, tool, ti in (
                     ("주인 지시 표 Write", "Write", {"file_path": tok_path, "content": "{}"}),
                     ("grant.json Write", "Write", {"file_path": os.path.join(ledger, "grant.json"), "content": "{}"}),
                     ("NotebookEdit", "NotebookEdit", {"notebook_path": os.path.join(ledger, "grant.json"), "new_source": "x"}),
+                    ("점 성분으로 되돌아온 Write", "Write", {"file_path": dotted, "content": "{}"}),
                     ("리다이렉트", "Bash", {"command": "echo on > %s" % os.path.join(ledger, "grant.json")}),
                     ("cp 안으로", "Bash", {"command": "cp %s %s" % (tmpf, tok_path)}),
+                    ("점 성분으로 되돌아온 cp", "Bash", {"command": "cp %s %s" % (tmpf, dotted)}),
                     ("공백 자리 리다이렉트", "Bash", {"command": 'echo on > "%s/grant.json"' % sl})):
                 p, _ = run(ti, tool=tool, rc=0, extra=extra, guard=sguard if "공백" in label else None)
                 if not (p.returncode == 2 and "수리 장부" in p.stderr and "cys repair" in p.stderr and "백스톱" in p.stderr):
                     bad.append("%s rc=%d %r" % (label, p.returncode, p.stderr[-160:]))
-            check("14 %s 백스톱도 장부 쓰기를 막는다" % mode, not bad, "; ".join(bad))
+            check("14 %s(jq 있음) 백스톱도 장부 쓰기를 막는다" % mode, not bad, "; ".join(bad))
+        for mode, extra in with_jq + (no_jq,):
             bad = []
             for label, tool, ti in (
                     ("작업 사본 Write", "Write", {"file_path": os.path.join(ledger, "R-1", "staging", "x.md"), "content": "x"}),
+                    ("장부의 Read", "Read", {"file_path": os.path.join(ledger, "grant.json")}),
+                    ("주인 지시 표의 Read", "Read", {"file_path": tok_path}),
                     ("무관한 Write", "Write", {"file_path": os.path.join(out, "a.txt"), "content": "x"}),
                     ("무관한 리다이렉트", "Bash", {"command": "echo x > %s" % os.path.join(out, "b.txt")}),
                     ("ls", "Bash", {"command": "ls -la"}),
                     ("cat", "Bash", {"command": "cat /etc/hosts"}),
                     ("무관한 cp", "Bash", {"command": "cp %s %s" % (tmpf, os.path.join(out, "c.json"))}),
                     ("grep 2>/dev/null", "Bash", {"command": "grep -r foo . 2>/dev/null | head"}),
-                    ("장부 읽기", "Bash", {"command": "cat %s" % os.path.join(ledger, "grant.json")})):
+                    ("장부 읽기", "Bash", {"command": "cat %s" % os.path.join(ledger, "grant.json")}),
+                    ("장부 읽기 2>/dev/null", "Bash", {"command": "ls %s 2>/dev/null" % os.path.join(ledger, "R-3")}),
+                    ("장부 읽기 2>&1 | head", "Bash", {"command": "cat %s 2>&1 | head" % os.path.join(ledger, "grant.json")}),
+                    ("장부 읽기 > 임시 파일", "Bash", {"command": "cat %s > %s" % (os.path.join(ledger, "grant.json"),
+                                                                               os.path.join(out, "y.txt"))})):
                 p, _ = run(ti, tool=tool, rc=0, extra=extra)
                 if p.returncode != 0:
                     bad.append("%s rc=%d %r" % (label, p.returncode, p.stderr[-160:]))
-            check("14 %s 백스톱은 장부를 쓰지 않는 호출을 막지 않는다(치명 4)" % mode, not bad, "; ".join(bad))
+            check("14 %s 백스톱은 장부를 쓰지 않는 호출을 막지 않는다(Read 포함 · 치명 4)" % mode, not bad, "; ".join(bad))
+        mode, extra = no_jq
+        bad = []
+        for label, ti in (("규칙 문서 Write", {"file_path": soul, "content": "x"}),
+                          ("장부 Write", {"file_path": tok_path, "content": "{}"})):
+            p, _ = run(ti, tool="Write", rc=0, extra=extra)
+            if p.returncode != 0:
+                bad.append("%s rc=%d %r" % (label, p.returncode, p.stderr[-160:]))
+        check("14 %s: 출시된 백스톱은 필드를 읽지 못해 규칙 문서도 장부도 지키지 않는다(같은 정도 — GAPS G22)" % mode,
+              not bad, "; ".join(bad))
+
+        # 15 — RULINGS IJ (T4e round 3): reviewer1's sequences of round 2, each refused with the ledger sentence
+        for label, cmd, guard in (
+                ("변수에 담은 복사 대상", "dst='%s/owner-tokens/%s.json'; cp %s \"$dst\"" % (ledger, sha, tmpf), None),
+                ("변수에 담은 리다이렉트 대상", "dst='%s/grant.json'; echo on > \"$dst\"" % ledger, None),
+                ("작업 사본 cd + 명령 치환", "cd '%s' && cp %s \"$(printf ../../owner-tokens/%s.json)\""
+                 % (os.path.join(ledger, "R-1", "staging"), tmpf, sha), None),
+                ("install -t", "install -t '%s/owner-tokens' %s" % (ledger, tmpf), None),
+                ("공백 자리 install -t", 'install -t "%s/owner-tokens" %s' % (sl, tmpf), sguard),
+                ("점 성분으로 되돌아온 리다이렉트", "echo on > %s" % os.path.join(ledger, "..", "repairs", "grant.json"), None),
+                ("점 성분으로 되돌아온 cp", "cp %s %s" % (tmpf, dotted), None)):
+            p, _ = run({"command": cmd}, tool="Bash", rc=0, guard=guard)
+            ok = ledger_refused(p, "cys repair")
+            check("15 %s → 차단" % label, ok, "" if ok else "rc=%d %r" % (p.returncode, p.stderr[-200:]))
+        p, _ = run({"file_path": dotted, "content": "{}"}, tool="Write", rc=0)
+        ok = ledger_refused(p, "cys repair owner-token ask --path")
+        check("15 점 성분으로 되돌아온 Write → 차단", ok, "" if ok else "rc=%d %r" % (p.returncode, p.stderr[-200:]))
 
         # 10 — RULINGS FZ2: every stub this test started is gone at its end
         left = [pid for pid in stub_pids if not gone_soon(pid)]
