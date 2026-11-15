@@ -1306,6 +1306,14 @@ fn decide_pending(
         // completed door operations) → the probation bundle, as if the write had not been interrupted
         match own_apply_evidence(env, rec, live, bound) {
             Ok(Some(at)) => {
+                // IQ3: the row this lane's uninterrupted apply would have written — R's committed result
+                // as `applied` (what T6's `revert_in` / `revertible_here` return), no merge state — BEFORE
+                // the check, so every later path (pass, fail, time-out) acts on a RETURNABLE row
+                row.applied = rec.committed.clone();
+                row.merge_base.clear();
+                row.merge_lock = None;
+                row.conflict_live.clear();
+                row.approval_ref = None;
                 let (version, pro) = bound.row_fields();
                 row.probation = Some(ledger::Probation {
                     pack_generation: version,
