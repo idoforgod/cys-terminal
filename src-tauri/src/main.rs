@@ -12192,6 +12192,46 @@ exit 0
         assert_eq!(decide_pending_update(false, Some("0.12.51"), "0.12.51", true), Skip, "동일 버전=Skip(prior_state 무관)");
     }
 
+    /// ★(0.15.0 · S5-PINS 6/9) appendix A-1 #19 / A-2 #13 "업데이트 뒤 팩 반영 실패 시 표지 유지·좌석 복원 보류"
+    /// (H-09-A2-13-01 · H-10-A1-19-01 · RULINGS HN3 · stage-5 map H2 "Nothing pins the app's `!pack_ok` withholding
+    /// branch"): when `cys init-pack` did not succeed after an update — a non-zero exit, or the sidecar could not be
+    /// started at all (`unwrap_or(false)`) — the app shows the existing notice and RETURNS: no seat restore, the
+    /// pending-restore marker and the version stamp kept (the next start retries). Only after a successful init-pack are
+    /// the marker removed, the stamp advanced and the seats restored, in that order. `maybe_apply_pending_update` takes
+    /// the AppHandle (no unit seam), so this is a source pin in the form of its neighbours (`prod` before the test module,
+    /// the fn cut at its closing brace) — this test's own needles are outside `prod`.
+    #[test]
+    fn pending_update_withholds_seat_restore_and_keeps_marker_when_init_pack_fails() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let s = prod.find("fn maybe_apply_pending_update(").expect("maybe_apply_pending_update 소실");
+        let f = &prod[s..s + prod[s..].find("\n}\n").expect("fn 끝")];
+        // ① the verdict is init-pack's exit status; a sidecar that cannot be started counts as failed (fail-closed)
+        let call = f.find("sealed_sidecar_cys(&[\"init-pack\", \"--no-install-hook\"])").expect("업데이트 팩 반영(init-pack) 호출 소실");
+        let ok = f.find("let pack_ok = init_cmd").expect("init-pack 성공 판정 소실");
+        assert!(call < ok, "판정은 init-pack 호출 뒤");
+        let verdict = &f[ok..ok + f[ok..].find(';').expect("판정 끝")];
+        for want in [".status()", ".map(|s| s.success())", ".unwrap_or(false)"] {
+            assert!(verdict.contains(want), "init-pack 판정이 바뀌었다(`{want}` 없음): {verdict}");
+        }
+        // ② the withholding branch: the existing notice, then return — nothing restored, nothing cleared, nothing written
+        let b = f.find("if !pack_ok {").expect("팩 반영 실패 시 보류 분기 소실");
+        let end = b + f[b..].find("\n        return;\n    }\n").expect("보류 분기가 return 으로 끝나지 않는다 — 실패해도 복원으로 흘러간다");
+        let branch = &f[b..end];
+        assert!(branch.contains("app.emit(") && branch.contains("\"update-error\""), "보류 분기가 기존 알림을 내지 않는다");
+        for forbidden in ["spawn_org_restore(", "run_sidecar_restore", "run_restore(", "remove_file(", "std::fs::write(", "fs::rename("] {
+            assert!(!branch.contains(forbidden), "팩 반영 실패 분기에 `{forbidden}` — 좌석 복원 보류·표지 유지가 깨진다");
+        }
+        // ③ only after the branch: marker removed → stamp advanced → seats restored; nowhere else in the fn
+        let after = &f[end..];
+        let rm = after.find("std::fs::remove_file(&marker)").expect("성공 뒤 마커 제거 소실");
+        let st = after.find("std::fs::write(&stamp_path, current)").expect("성공 뒤 스탬프 전진 소실");
+        let rs = after.find("spawn_org_restore(app.clone())").expect("성공 뒤 조직 복원 소실");
+        assert!(rm < st && st < rs, "성공 뒤 순서: 마커 제거 → 스탬프 전진 → 복원");
+        assert_eq!(f.matches("spawn_org_restore(").count(), 1, "복원 호출은 성공 경로 한 곳");
+        assert_eq!(f.matches("remove_file(").count(), 1, "마커 제거는 성공 경로 한 곳");
+    }
+
     // ── ★(0.14.43 · J2) 업데이트 미설치 알림 — 시도 기록 · 재시작 뒤 1회 판정 · 스마트 앱 컨트롤 ──────────────────
     //
     // 윈도우에서 설치기가 스마트 앱 컨트롤에 막혀도 인앱 업데이트는 침묵했다(플러그인이 설치기를 띄운 뒤 곧바로 앱을 끝낸다).
