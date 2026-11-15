@@ -155,26 +155,46 @@ pub fn in_force(rec: &RepairRecord) -> bool {
     matches!(rec.state, RepairState::Probation | RepairState::InUse)
 }
 
-/// RULINGS R7: a repair made in ANOTHER lane with `resolves` is lane-local — no row here, not in this
-/// lane's catch-up set, never propagated.
-pub fn concerns_lane(rec: &RepairRecord, lane: &LaneKey) -> bool {
-    rec.resolves.is_none() || rec.origin_lane == *lane
+/// A repair that concerns its ORIGIN lane only: RULINGS R7 — one made with `resolves`; RULINGS KF2 — a
+/// RULE-DOCUMENT repair (the record's class, which `begin` sets from the daemon's ONE definition,
+/// `rule_document_name`, for every repair naming a rule document — C10 refuses to mix one with any other
+/// file or hook): in 0.15.0 the owner's order names the document in one seat of one lane, and it does
+/// not travel further. `status` and the gate use the same predicate.
+pub fn lane_local(rec: &RepairRecord) -> bool {
+    rec.resolves.is_some() || rec.classification == Classification::RuleDocument
 }
 
-/// Every in-force repair that concerns `lane` (R7), in id order. `Err` names the first member that
+/// RULINGS R7 / KF2: a lane-local repair made in ANOTHER lane — no decision here, not in this lane's
+/// catch-up set or gate, never propagated, never a merge ticket (a rule-document repair gets ONE
+/// informational row here — `note_rule_document`).
+pub fn concerns_lane(rec: &RepairRecord, lane: &LaneKey) -> bool {
+    !lane_local(rec) || rec.origin_lane == *lane
+}
+
+/// Every in-force repair that concerns `lane` (R7 / KF2), in id order. `Err` names the first member that
 /// could not be read (FG1: an unreadable listing or record is never "no repair").
 pub fn in_force_for_lane(root: &Path, lane: &LaneKey) -> Result<Vec<RepairRecord>, String> {
+    in_force_split(root, lane).map(|(mine, _)| mine)
+}
+
+/// One listing of the in-force repairs, split for `lane`: those that concern it, and the RULE-DOCUMENT
+/// repairs of other lanes (KF2: each gets its informational row here).
+fn in_force_split(root: &Path, lane: &LaneKey) -> Result<(Vec<RepairRecord>, Vec<RepairRecord>), String> {
     let ids = ledger::list_ids_checked_in(root).map_err(|e| format!("수리 장부 목록을 읽을 수 없습니다({e:?})"))?;
-    let mut out = Vec::new();
+    let (mut mine, mut docs) = (Vec::new(), Vec::new());
     for id in ids {
         match ledger::read_record_in(root, &id) {
-            Ok(Some(rec)) if in_force(&rec) && concerns_lane(&rec, lane) => out.push(rec),
+            Ok(Some(rec)) if in_force(&rec) && concerns_lane(&rec, lane) => mine.push(rec),
+            Ok(Some(rec)) if in_force(&rec) && rec.classification == Classification::RuleDocument => docs.push(rec),
             Ok(_) => {}
             Err(e) => return Err(format!("{}: 수리 기록을 읽을 수 없습니다({e:?})", id.as_str())),
         }
     }
-    Ok(out)
+    Ok((mine, docs))
 }
+
+/// RULINGS KF2 — the sentence of a rule-document repair's row in a lane that did not make it.
+pub const RULE_DOCUMENT_ELSEWHERE: &str = "규칙 문서 수리 — 고친 부서에서만 적용됩니다. 이 부서에는 이 부서의 주인 지시로 적용하세요";
 
 fn is_approval_class(c: Classification) -> bool {
     matches!(c, Classification::BootCritical | Classification::ProtectionRelated)
@@ -686,13 +706,18 @@ fn tick_body(env: &LaneEnv<'_>, pass: PassOutcome, judged: &Stamp, report: &mut 
         report.lines.push(format!("팩 식별 확인을 이번 차례에 하지 못했습니다 — {why}"));
         return Ok(());
     }
-    let recs = match in_force_for_lane(root, lane) {
+    let (recs, rule_docs) = match in_force_split(root, lane) {
         Ok(r) => r,
         Err(why) => {
             report.lines.push(why);
             return Ok(());
         }
     };
+    // KF2: a rule-document repair of another lane — its ONE informational row (written once per state;
+    // never a decision, never a write to the pack, not in this lane's gate or catch-up)
+    for rec in &rule_docs {
+        note_rule_document(env, rec, report);
+    }
     // EJ1: the binding of every apply this tick is born here, once
     let bound = Bound::now(env.op.pack);
     let mut complete = true;
@@ -743,6 +768,43 @@ fn tick_body(env: &LaneEnv<'_>, pass: PassOutcome, judged: &Stamp, report: &mut 
         }
     }
     Ok(())
+}
+
+/// RULINGS KF2 — the informational row of a RULE-DOCUMENT repair made in another lane: 대기, nothing
+/// applied, its reason `RULE_DOCUMENT_ELSEWHERE` — written once (absent, or a row of another state that
+/// applied nothing), compare-and-write under the per-repair mutex, logged once. It holds no gate and no
+/// catch-up (the repair does not concern this lane — `concerns_lane`). An OLDER row that applied the
+/// document here (an apply recorded, or an open probation) is left as it is: T6's probation and
+/// `revert` act on it as before.
+fn note_rule_document(env: &LaneEnv<'_>, rec: &RepairRecord, report: &mut TickReport) {
+    let stored = match ledger::read_lane_in(env.op.root, &rec.id, env.op.lane) {
+        Ok(s) => s,
+        Err(e) => {
+            report.lines.push(format!("{}: 이 부서의 행을 읽을 수 없습니다 — {e:?}", rec.id.as_str()));
+            return;
+        }
+    };
+    if let Some(r) = &stored {
+        let said = r.state == LaneState::Pending && r.reason == RULE_DOCUMENT_ELSEWHERE;
+        let applied_here = !r.applied.is_empty() || r.probation.as_ref().is_some_and(|p| p.closed.is_none());
+        if said || applied_here {
+            return;
+        }
+    }
+    let mut row = match &stored {
+        Some(r) => r.clone(),
+        None => new_row(&rec.id, env.op.lane, env.op.now),
+    };
+    row.state = LaneState::Pending;
+    row.merge_lock = None;
+    row.conflict_live.clear();
+    row.reason = RULE_DOCUMENT_ELSEWHERE.to_string();
+    row.updated_at = env.op.now;
+    match write_row_if(env, stored.as_ref(), &row) {
+        Ok(true) => report.rows.push((rec.id.clone(), LaneState::Pending, RULE_DOCUMENT_ELSEWHERE.to_string())),
+        Ok(false) => {} // another writer meanwhile — the next tick says it
+        Err(e) => report.lines.push(format!("{}: 규칙 문서 수리의 안내 행을 쓰지 못했습니다 — {e:?}", rec.id.as_str())),
+    }
 }
 
 /// A new 대기 row of this lane (K1 — created by this lane's daemon only).
@@ -1119,7 +1181,18 @@ fn decide(env: &LaneEnv<'_>, rec: &RepairRecord, bound: &Bound, report: &mut Tic
     }
     let live = match live_states(env.op.pack, rec) {
         Ok(l) => l,
-        Err(why) => return finish(env, rec, stored.as_ref(), row, LaneState::Conflict, &why, &stamp0, report),
+        Err(why) => {
+            // RULINGS KF1 — the SAME observation is published once (an approval-class row in a receiving
+            // lane never takes the general 충돌 early return above): the stored 충돌 row of THIS repair,
+            // unchanged by this decision, already carries exactly this sentence — the target, its measured
+            // length and the engine's limit (or the read failure). That sentence is the key: never a hash
+            // (JH1), and a different length or another target is a different observation, evaluated again.
+            let said: String = why.chars().take(400).collect();
+            if row.state == LaneState::Conflict && stored.as_ref() == Some(&row) && row.reason == said {
+                return Ok(Some(LaneState::Conflict));
+            }
+            return finish(env, rec, stored.as_ref(), row, LaneState::Conflict, &why, &stamp0, report);
+        }
     };
     // IV1 — THE stamp of this decision: the record, the generation and instance, every target's state as
     // read just now; every later write for it is checked against THIS, never against a fresh reading

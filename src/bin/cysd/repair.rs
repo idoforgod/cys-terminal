@@ -1356,8 +1356,9 @@ mod ledger_verbs {
         let (rows, broken) = ledger::lane_rows_in(&ctx.root, &rec.id);
         let mut map = serde_json::Map::new();
         let in_force = matches!(rec.state, RepairState::Probation | RepairState::InUse);
-        // R7: a `resolves` repair is lane-local — its own lane only.
-        let registered = if rec.resolves.is_some() {
+        // R7: a `resolves` repair is lane-local — its own lane only; RULINGS KF2 (T7b): so is a
+        // rule-document repair (the propagation's one predicate)
+        let registered = if cys::repair::propagate::lane_local(rec) {
             RegisteredLanes::Known(vec![rec.origin_lane.clone()])
         } else {
             ledger::registered_lanes_from(&ctx.registry)
@@ -1401,6 +1402,11 @@ mod ledger_verbs {
             ),
         };
         for r in &rows {
+            // RULINGS KF2 (T7b): a lane-local repair's row in ANOTHER lane (a rule-document repair's
+            // informational row) is not a lane of its propagation — shown in `lane_rows` with its reason
+            if cys::repair::propagate::lane_local(rec) && r.lane != rec.origin_lane {
+                continue;
+            }
             map.entry(r.lane.0.clone())
                 .or_insert_with(|| json!(lane_label(r.state)));
         }
