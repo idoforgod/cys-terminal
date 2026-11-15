@@ -8184,4 +8184,24 @@ mod repair_job_schedule_tests {
             assert!(!again, "{variant}: a second ensure changes nothing");
         }
     }
+
+    /// I-F4-19 (design §4-9 "예약기의 일반 시간 초과 동작은 바꾸지 않는다" · RULINGS HN3 · stage-5 map I: NONE): the
+    /// scheduler's command deadline stays 600 s, report-only, on the ONE command execution path — `fire_command`, which
+    /// every `action: "command"` job (the appended `repair-probation-tick` too) goes through. Pinned without waiting:
+    /// a source pin of the call site and its value, in the form of `job_result_ledger_is_memory_only_and_never_gates_firing`
+    /// (the fn body is cut out of the production text, so this test's own needles cannot satisfy it).
+    #[test]
+    fn command_deadline_stays_600s_on_the_one_command_path() {
+        let src = include_str!("schedule.rs");
+        let at = src.find("\nasync fn fire_command(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {").expect("fire_command 소실");
+        let end = at + 1 + src[at + 1..].find("\n}\n").expect("fire_command 끝");
+        let body = &src[at..end];
+        assert_eq!(body.matches("tokio::time::timeout(").count(), 1, "the command path has exactly one deadline");
+        assert!(
+            body.contains("tokio::time::timeout(Duration::from_secs(600), c.output())"),
+            "the scheduler's command deadline is no longer 600 s around the command's output"
+        );
+        assert!(body.contains(".map_err(|_| \"command timed out (600s)\".to_string())?"), "the deadline's report changed");
+        assert_eq!(src.matches("\"command\" => fire_command(&daemon, &job).await,").count(), 1, "every command job reaches fire_command");
+    }
 }
