@@ -244,7 +244,9 @@ class TicketGate(unittest.TestCase):
         with path_with(self.stub(GATE_HELD, 95, status)):
             rc, out, err = run_tp(merge="R-7")
         self.assertEqual(rc, 0, err)
-        self.assertIn("  1) cys repair begin --files bin/a.py 'bin/b c.py' --joins R-7 --trigger update", out)
+        # RULINGS IG6 — REWRITTEN: the repair's hook target is kept. Old expectation, quoted:
+        # "  1) cys repair begin --files bin/a.py 'bin/b c.py' --joins R-7 --trigger update" (the hook dropped)
+        self.assertIn("  1) cys repair begin --files bin/a.py 'bin/b c.py' --unregister-hook Stop:x.sh --joins R-7 --trigger update", out)
         self.assertIn("  3) cys repair recheck R-7", out)
         self.assertNotIn("owner-order", out, "never a made-up trigger")
         status.update(classification="boot_critical", trigger="owner_order")
@@ -278,6 +280,23 @@ class TicketGate(unittest.TestCase):
         head = [i for i, ln in enumerate(lines) if ln.startswith("병합 티켓 — R-7")][0]
         self.assertTrue(lines[head + 1].startswith("  까닭("), "the reason follows the head line")
 
+    # RULINGS IG6: a HOOK-ONLY repair (a hook unregistration and no file) gets its merge ticket — the hook target
+    # and R's trigger kept, `begin --unregister-hook … --joins R` and `recheck R` printed (no `--files`)
+    def test_a_hook_only_repair_gets_its_merge_ticket(self):
+        status = {"repair": "R-8", "trigger": "grant", "classification": "general",
+                  "files": [{"rel": "settings:Stop:x.sh", "kind": {"hook_unregister": {"event": "Stop", "script": "x.sh"}}},
+                            {"rel": "settings:PreToolUse:y z.sh", "kind": {"hook_unregister": {"event": "PreToolUse", "script": "y z.sh"}}}]}
+        with path_with(self.stub(GATE_HELD, 95, status)):
+            rc, out, err = run_tp(merge="R-8")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("  1) cys repair begin --unregister-hook Stop:x.sh --unregister-hook 'PreToolUse:y z.sh' --joins R-8 --trigger grant", out)
+        self.assertIn("  3) cys repair recheck R-8", out)
+        self.assertNotIn("--files", out)
+        bad = dict(status, files=[{"rel": "settings:Stop:x.sh", "kind": {"hook_unregister": {"event": "", "script": "x.sh"}}}])
+        with path_with(self.stub(GATE_HELD, 95, bad)):
+            rc, out, err = run_tp(merge="R-8")
+        self.assertEqual((rc, out), (2, ""), "a hook target that cannot be read gives no ticket")
+
     # T-9 (the real CLI): the merge lines parse with the built `cys` when it is there (exit ≠ 2 = not a
     # usage error; no daemon is started — `cys repair` never autostarts, the socket points nowhere)
     def test_merge_lines_are_accepted_by_the_real_cli(self):
@@ -287,6 +306,8 @@ class TicketGate(unittest.TestCase):
             self.skipTest("the built cys binary is not available here (CARGO_TARGET_DIR/debug/cys)")
         env = dict(os.environ, HOME=self.tmp, CYS_SOCKET=os.path.join(self.tmp, "no.sock"), CYS_NO_AUTOSTART="1")
         for line in ["repair begin --files bin/a.py bin/b.py --joins R-7 --trigger update",
+                     "repair begin --files bin/a.py --unregister-hook Stop:x.sh --joins R-7 --trigger update",
+                     "repair begin --unregister-hook Stop:x.sh --joins R-7 --trigger update",  # IG6: hook-only
                      "repair begin --files bin/a.py --trigger owner-order --resolves R-7",
                      "repair recheck R-7"]:
             r = subprocess.run([exe] + line.split(), capture_output=True, text=True, env=env, timeout=60)

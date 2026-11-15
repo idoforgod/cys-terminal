@@ -363,3 +363,89 @@ fn status_of_a_repair_shows_each_rows_reason() {
     let rows = v["lane_rows"].as_array().unwrap();
     assert!(rows.iter().any(|x| x["lane"] == "base" && x["reason"] == row.reason.as_str()), "{v}");
 }
+
+/// RULINGS IG6 — a HOOK-ONLY repair's conflict is resolvable through the merge ticket's lines: `begin
+/// --unregister-hook EVENT:SCRIPT --joins R` (no `--files`) takes this lane's merge lock through T3's
+/// `begin_joins`, and `recheck R` runs the lane's hook step and ends 검증됨.
+#[test]
+fn a_hook_only_repairs_conflict_is_merged_through_unregister_hook_joins() {
+    let r = rig("hook-merge");
+    let id = RepairId::parse("R-1").unwrap();
+    std::fs::create_dir_all(ledger::repair_dir_in(&r.root, &id)).unwrap();
+    let rec = RepairRecord {
+        schema: 1,
+        id: id.clone(),
+        created_at: 1.0,
+        trigger: cys::repair::types::Trigger::Update,
+        symptom: String::new(),
+        cause: String::new(),
+        classification: Classification::General,
+        files: vec![ledger::FileChange {
+            rel: "settings:Stop:x.sh".into(),
+            kind: ledger::ChangeKind::HookUnregister { event: "Stop".into(), script: "x.sh".into() },
+            pre: ledger::PreImage::Absent,
+            post: TargetState::Absent,
+            diff: None,
+        }],
+        worker_record: None,
+        verify: None,
+        audit: None,
+        audit_due_at: None,
+        approval: None,
+        owner_token_sha256: None,
+        attempt: 1,
+        methods: Vec::new(),
+        resubmits: Vec::new(),
+        pending_request: None,
+        lock: None,
+        state: RepairState::Probation,
+        intake_signatures: Vec::new(),
+        owner_original: false,
+        origin_lane: LaneKey("dept-x".into()),
+        resolves: None,
+        committed: Vec::new(),
+        fixer_seats: Vec::new(),
+        checks: Vec::new(),
+        reapplies: None,
+    };
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let row = ledger::LaneRecord {
+        schema: 1,
+        repair: id.clone(),
+        lane: r.lane.clone(),
+        state: LaneState::Conflict,
+        probation: None,
+        merge: None,
+        merge_history: Vec::new(),
+        approval_ref: None,
+        conflict_live: Vec::new(),
+        applied: Vec::new(),
+        applied_history: Vec::new(),
+        merge_base: Vec::new(),
+        merge_lock: None,
+        merge_attempt: 0,
+        reason: "훅 등록 해제를 이 부서에서 마치지 못했습니다 — (시험)".into(),
+        updated_at: T0,
+    };
+    ledger::write_lane_in(&r.root, &row).unwrap();
+    let w = seat(3, "worker");
+    // the merge ticket's line 1, as `task-prompt --merge R-1` prints it for a hook-only repair
+    r.call(T0, &w, "begin", json!({"trigger": "update", "unregister_hook": ["Stop:x.sh"], "joins": "R-1"})).unwrap();
+    let locked = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+    assert!(locked.merge_lock.is_some(), "begin_joins took this lane's merge lock");
+    // line 3: `recheck` — the lane's hook step (a double here) then 검증됨
+    let steps = std::cell::Cell::new(0u32);
+    let hook = |_: &RepairId, _: &LaneKey, step: cys::repair::apply::HookStep| -> Result<cys::repair::apply::ReconcileReport, RepairError> {
+        assert!(matches!(step, cys::repair::apply::HookStep::Unregister));
+        steps.set(steps.get() + 1);
+        Ok(cys::repair::apply::ReconcileReport { hooks: Vec::new() })
+    };
+    let mut ctx = r.ctx(T0 + 1.0);
+    ctx.hook_step = &hook;
+    let v = handle_with(&ctx, &w, "recheck", &json!({"repair": "R-1"})).unwrap();
+    assert_eq!(v["lane_state"], "verified", "{v}");
+    assert_eq!(steps.get(), 1, "the lane's own hook step ran");
+    let done = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+    assert_eq!(done.state, LaneState::Verified);
+    assert!(done.merge_lock.is_none() && done.merge.is_some());
+}
