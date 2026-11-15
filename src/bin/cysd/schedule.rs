@@ -639,19 +639,22 @@ fn canonicalize_schedule_file(path: &std::path::Path, root: &mut serde_json::Val
 /// `schedule.json` 자리에 놓을 수 있었다(부분 JSON → 손상 격리 → 빈 스케줄 → 전 builtin 침묵).
 /// 이름 분리는 torn 파일을 막고, **쓰기 순서**는 [`ScheduleFileLock`] 이 직렬화한다.
 fn write_schedule_atomic(path: &std::path::Path, root: &serde_json::Value) -> bool {
-    let Ok(body) = serde_json::to_string_pretty(root) else {
-        return false;
-    };
+    try_write_schedule_atomic(path, root).is_ok()
+}
+
+/// The same write with its I/O error (★0.15.0 WS1 · KN minor (b): the restore's failure report names its reason).
+fn try_write_schedule_atomic(path: &std::path::Path, root: &serde_json::Value) -> std::io::Result<()> {
+    let body = serde_json::to_string_pretty(root).map_err(std::io::Error::other)?;
     let tmp = schedule_tmp_path(path);
-    if std::fs::write(&tmp, body).is_err() {
+    if let Err(e) = std::fs::write(&tmp, body) {
         let _ = std::fs::remove_file(&tmp);
-        return false;
+        return Err(e);
     }
-    if std::fs::rename(&tmp, path).is_err() {
+    if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        return false;
+        return Err(e);
     }
-    true
+    Ok(())
 }
 
 /// writer 별로 다른 임시 파일 — `schedule.json.<pid>.<nonce>.tmp`(같은 디렉터리 = 같은 볼륨 → rename 원자).
@@ -805,6 +808,55 @@ impl ScheduleRefusal {
     fn named(reason: &'static str) -> Self { Self { reason, io_kind: None, raw_os_error: None } }
     fn read(error: std::io::Error) -> Self {
         Self { reason: "read_failed", io_kind: Some(error.kind()), raw_os_error: error.raw_os_error() }
+    }
+    fn write(error: std::io::Error) -> Self {
+        Self { reason: "write_failed", io_kind: Some(error.kind()), raw_os_error: error.raw_os_error() }
+    }
+}
+
+/// ★0.15.0 (WS1 · KN minor (b)): the restore of a fixed job whose write keeps failing is reported when the failure
+/// starts and when its reason changes — not at every tick while it lasts — and once when it heals (a restore written,
+/// or nothing left to put back). Per schedule file; the state lives in this process only. On a healthy tick this is one
+/// atomic load.
+fn note_restore_fixed(path: &std::path::Path, outcome: Result<(), ScheduleRefusal>) {
+    type Reason = (&'static str, Option<std::io::ErrorKind>, Option<i32>);
+    static FAILING: std::sync::Mutex<Vec<(PathBuf, Reason)>> = std::sync::Mutex::new(Vec::new());
+    static ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    match outcome {
+        Ok(()) => {
+            if !ANY.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let Ok(mut failing) = FAILING.lock() else { return };
+            let before = failing.len();
+            failing.retain(|(p, _)| p != path);
+            if failing.len() != before {
+                eprintln!("[cysd] schedule: 내장 자가치유 작업을 되살리는 schedule.json 쓰기가 다시 된다(restore_fixed 정상화 · {})", path.display());
+            }
+            ANY.store(!failing.is_empty(), std::sync::atomic::Ordering::Relaxed);
+        }
+        Err(error) => {
+            let reason: Reason = (error.reason, error.io_kind, error.raw_os_error);
+            let Ok(mut failing) = FAILING.lock() else {
+                report_schedule_refusal("restore_fixed", &error);
+                return;
+            };
+            let new = match failing.iter_mut().find(|(p, _)| p == path) {
+                Some((_, r)) if *r == reason => false,
+                Some((_, r)) => {
+                    *r = reason;
+                    true
+                }
+                None => {
+                    failing.push((path.to_path_buf(), reason));
+                    true
+                }
+            };
+            ANY.store(true, std::sync::atomic::Ordering::Relaxed);
+            if new {
+                report_schedule_refusal("restore_fixed", &error);
+            }
+        }
     }
 }
 fn report_schedule_refusal(operation: &str, error: &ScheduleRefusal) {
@@ -1158,23 +1210,20 @@ fn load_jobs_at_access(path: &std::path::Path, mode: LoadMode, read: &ScheduleRe
         //   neither at once nor twice because of this).
         let restored = restore_fixed_builtin_jobs(&mut root);
         if restored.is_empty() {
+            note_restore_fixed(path, Ok(())); // nothing left to put back: a failure that was reported is over
             if let Err(error) = canonicalize_schedule_file(path, &mut root) { report_schedule_refusal("canonicalize", &error); }
         } else if read(path).ok() != *seen.borrow() {
             eprintln!("[cysd] schedule: 내장 자가치유 작업 {restored:?} 을 되살리려고 읽은 뒤 다른 쓰기가 schedule.json 을 저장했다 — 이번 틱은 쓰지 않고 다음 틱이 새 내용으로 다시 판단한다(RULINGS KN2)");
         } else {
-            let written = match canonicalize_schedule_file(path, &mut root) {
-                Ok(true) => true,
-                Ok(false) => write_schedule_atomic(path, &root),
-                Err(error) => {
-                    report_schedule_refusal("canonicalize", &error);
-                    false
-                }
+            let outcome = match canonicalize_schedule_file(path, &mut root) {
+                Ok(true) => Ok(()),
+                Ok(false) => try_write_schedule_atomic(path, &root).map_err(ScheduleRefusal::write),
+                Err(error) => Err(error),
             };
-            if written {
+            if outcome.is_ok() {
                 eprintln!("[cysd] schedule: 내장 자가치유 작업 {restored:?} 이 유효한 schedule.json 에서 빠졌거나 바뀌어 있어 코드 정의 그대로 되살렸다(RULINGS JX1 — 발화 시각은 그 작업의 기록 그대로)");
-            } else {
-                report_schedule_refusal("restore_fixed", &ScheduleRefusal::named("write_failed"));
             }
+            note_restore_fixed(path, outcome);
         }
     }
     jobs_of(&root)
@@ -8636,6 +8685,60 @@ mod repair_job_schedule_tests {
         assert_eq!(others, saved, "C16's file kept whole, in order");
         let mine: Vec<&serde_json::Value> = after.iter().filter(|j| j["id"] == REPAIR_JOB_ID).collect();
         assert_eq!(mine, vec![&def()], "the repair job back whole, once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The owned child of `ws1_a_failing_restore_write_is_reported_when_it_starts_and_when_it_heals`: three ticks whose
+    /// restore write fails (the folder refuses new files while the tick holds the lock), then two ordinary ticks.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "owned subprocess fixture, run by ws1_a_failing_restore_write_is_reported_when_it_starts_and_when_it_heals"]
+    fn ws1_fixture_failing_restore_ticks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = PathBuf::from(std::env::var_os("WS1_FIXTURE_DIR").expect("the fixture's folder"));
+        let path = dir.join("schedule.json");
+        let refusing = |p: &std::path::Path| {
+            let lock = ScheduleFileLock::acquire(p);
+            std::fs::set_permissions(p.parent().unwrap(), std::fs::Permissions::from_mode(0o555)).unwrap();
+            lock
+        };
+        for _ in 0..3 {
+            let _ = load_jobs_at_access(&path, LoadMode::HotReload, &|p| std::fs::read(p), &refusing);
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir(ScheduleFileLock::lock_dir_for(&path));
+        }
+        for _ in 0..2 {
+            let _ = load_jobs_at(&path, LoadMode::HotReload);
+        }
+        println!("WS1_FIXTURE_DONE");
+    }
+
+    /// WS1 · KN minor (b) — a restore whose write keeps failing is reported when the failure starts (and when its reason
+    /// changes), not at every tick, and once when it heals. The report state is process-wide, so the ticks run in an owned
+    /// child process of this test binary and its output is counted.
+    #[cfg(unix)]
+    #[test]
+    fn ws1_a_failing_restore_write_is_reported_when_it_starts_and_when_it_heals() {
+        let dir = ws1_dir("report");
+        let path = dir.join("schedule.json");
+        ws1_replace(&path, &json!({"jobs": ws1_released()}));
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "schedule::repair_job_schedule_tests::ws1_fixture_failing_restore_ticks",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("WS1_FIXTURE_DIR", &dir)
+            .output()
+            .unwrap();
+        let log = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && log.contains("WS1_FIXTURE_DONE"), "the fixture did not run to its end: {log}");
+        assert_eq!(log.matches("operation=restore_fixed").count(), 1, "reported at every failing tick, not when the failure started: {log}");
+        assert_eq!(log.matches("restore_fixed 정상화").count(), 1, "the heal is not reported once: {log}");
+        let mine: Vec<serde_json::Value> = ws1_jobs(&path).into_iter().filter(|j| j["id"] == REPAIR_JOB_ID).collect();
+        assert_eq!(mine, vec![def()], "the job is back after the heal");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
