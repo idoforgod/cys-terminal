@@ -2202,6 +2202,58 @@ class DurableOutbox(Rig):
         self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), self.BUDGET,
                          "같은 보류의 알림이 입구마다 새 예산으로 올라갔다")
 
+    def deliver_now(self):
+        """다른 보통 실행 하나의 배달(ceo_outbox_deliver 그대로 — 스텁 cys · 같은 알림함)."""
+        funcs = "".join(extract_shell_function(_slurp(DEPT, encoding="utf-8"), f)
+                        for f in ("ceo_notice_once", "ceo_outbox_deliver"))
+        r = subprocess.run(["bash", "-c", 'CYS=cys\nCEO_OUTBOX="$1"\nCEO_NOTICE_RETRIES=2\n_CEO_DELIVERED=0\n_CEO_TRIED="|"\n'
+                            + funcs + 'ceo_outbox_deliver\n', DEPT, self.outbox()],
+                           capture_output=True, text=True, encoding="utf-8", env=self.env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_a_producer_paused_between_its_observations_cannot_restart_a_budget(self):
+        """codex WC1-r1 M1(RULINGS KE1): 같은 보류 알림 K 가 두 번 못 올라가 K.notice.2 로 있다. 쓰는 쪽(ceo_py)이 K 를 처음 살펴본
+        직후 멈춘 사이 다른 보통 실행이 세 번째 시도를 하고 피드가 받아 sent/ 로 옮긴다(받는 쪽은 닫는다). 쓰는 쪽이 이어 가면 — 종전에는
+        sent/ 를 먼저 보고(없음) 알림함을 나중에 봐서(이미 옮겨져 없음) 새 K.notice 를 썼고, 배달이 그것을 .1 로 네 번째 올렸다.
+        이제 옮겨 가는 방향으로(알림함 먼저, sent/ 마지막) 살피므로 어느 순간에 멈춰도 K 를 놓치지 않는다 — 많아야 세 번."""
+        self.barrier()
+        title = "CEO 지침 교체 기록 확인 필요"
+        _write(self.pushfail, "1\n")
+        for _ in range(2):
+            self.tick()
+        self.assertEqual(self.pushes(title), 2, "시험 전제: 두 번 못 올라갔다")
+        os.unlink(self.pushfail)
+        ns = ceo_py_module()
+        paused = []
+        for name in ("fs_kind", "fs_list", "fs_read"):
+            orig = ns[name]
+
+            def look(path, *a, _orig=orig, **kw):
+                r = _orig(path, *a, **kw)
+                base = os.path.basename(str(path))
+                if not paused and ".notice" in base and os.path.abspath(self.outbox()) in os.path.abspath(str(path)):
+                    paused.append(base)         # 쓰는 쪽의 K 에 대한 첫 관찰 바로 뒤 — 여기서 '멈춘다'
+                    self.deliver_now()          # 다른 실행: 세 번째 시도 · 피드가 받는다 · sent/ 로
+                return r
+            ns[name] = look
+        self.assertEqual(ns["do_recover"]([self.p("MASTER_DIRECTIVE.md"), ""]), 0)
+        self.assertTrue(paused, "시험 무효: 쓰는 쪽이 K 를 살펴보지 않았다")
+        self.assertEqual(self.pushes(title), 3, "시험 전제: 다른 실행의 세 번째 시도가 올라갔다")
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(self.pushes(title), 3, "쓰는 쪽이 새 예산으로 K 를 다시 놓아 네 번째로 올라갔다(codex WC1-r1 M1)")
+
+    def test_a_plain_notice_whose_key_is_already_in_sent_is_not_pushed(self):
+        """RULINGS KE1(c): 배달은 첫 시도 전에 sent/ 에 같은 키가 있으면 받힌 것으로 본다 — 올리지 않고 <키>.notice.done 으로 둔다."""
+        self.seed()
+        key = "f" * 32
+        self.put_notice(key, self.TITLE_A)
+        os.makedirs(os.path.join(self.outbox(), "sent"))
+        _write(os.path.join(self.outbox(), "sent", key + ".notice"), "%s\n앞서 받힌 같은 알림\n" % self.TITLE_A)
+        self.tick()
+        self.assertEqual(self.pushes(self.TITLE_A), 0, "sent/ 에 이미 있는 키를 또 올렸다")
+        self.assertEqual([n for n, _t in self.notice_forms(key)], [key + ".notice.done"])
+
     def test_delivery_never_holds_the_composition_or_a_launch(self):
         """sent/ 를 쓸 수 없고 올리기도 실패해도 배달은 관문이 아니다 — 부서 켜기는 0 으로 끝나고 조립은 이루어진다."""
         self.seed()
