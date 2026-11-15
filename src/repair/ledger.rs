@@ -1004,8 +1004,8 @@ pub fn copy_preimage_in(
     live: &Path,
     now: f64,
 ) -> Result<PreImage, RepairError> {
-    // T6b · RULINGS IW1: a file longer than the engine's read limit is not recorded — `begin` refuses it
-    let state = TargetState::read(live)?.recordable(live)?;
+    // T6b · RULINGS IW1 / JH1: a file longer than the engine's read limit has no state — `begin` is refused
+    let state = TargetState::read(live)?;
     if state == TargetState::Absent {
         return Ok(PreImage::Absent);
     }
@@ -1135,8 +1135,7 @@ pub fn populate_staging_in(
     std::fs::create_dir(&tmp).map_err(|e| io(&tmp, e))?;
     let fill = || -> Result<(), RepairError> {
         for (rel, live) in targets {
-            // T6b · RULINGS IW1: a file longer than the engine's read limit is not copied or recorded
-            match TargetState::read(live)?.recordable(live)? {
+            match TargetState::read(live)? {
                 TargetState::Absent => continue,
                 TargetState::Link { target } => {
                     let dst = tmp.join(rel);

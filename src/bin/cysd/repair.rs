@@ -1170,11 +1170,9 @@ mod ledger_verbs {
         rels.dedup();
         let mut out = Vec::new();
         for rel in rels {
-            // T6b · RULINGS IW1: a file longer than the engine's read limit is never recorded
-            let p = live_path(ctx, rel);
             out.push((
                 rel.to_string(),
-                TargetState::read(&p).and_then(|s| s.recordable(&p)).map_err(VerbError::from)?,
+                TargetState::read(&live_path(ctx, rel)).map_err(VerbError::from)?,
             ));
         }
         Ok(out)
@@ -2344,9 +2342,7 @@ mod ledger_verbs {
     ) -> Result<Vec<(String, TargetState)>, VerbError> {
         rels.iter()
             .map(|rel| -> Result<(String, TargetState), VerbError> {
-                // T6b · RULINGS IW1: a file longer than the engine's read limit is never recorded
-                let p = live_path(ctx, rel);
-                Ok((rel.clone(), TargetState::read(&p)?.recordable(&p)?))
+                Ok((rel.clone(), TargetState::read(&live_path(ctx, rel))?))
             })
             .collect()
     }
