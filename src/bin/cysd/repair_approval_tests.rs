@@ -846,6 +846,65 @@ fn helper_timeout_is_killed_and_not_approval() {
     assert_eq!(HELPER_INVALIDATE_SECS, 110);
 }
 
+/// RULINGS KQ1 — expiry wins over success: a helper that completes (its valid record, the end of its
+/// output, exit 0) while the waiter sleeps across the limit is NOT approved when the waiter sees it at
+/// or past the limit (the reviewer's sequence: the clock read at limit − 10 ms, the helper done during
+/// the 20 ms pause, the next turn at the limit or past it). The ORDER is controlled, not timed: the
+/// stand-in completes only when released, and the release happens inside the waiter's first reading
+/// of the clock (`wait_helper_clocked`'s seam), which then waits — blocking, not polling — until the
+/// stand-in has ended (not reaped). The control: the same completion seen just BEFORE the limit is the
+/// one approval. (The old loop returned the success before it read the clock again: approved.)
+#[cfg(unix)]
+#[test]
+fn a_success_seen_at_or_past_the_limit_is_not_approval() {
+    use cys::SpawnPolicy;
+    use std::io::Write;
+    let (rid, nonce) = ("rq-00aa", "00112233445566778899aabbccddeeff");
+    let limit = Duration::from_secs(HELPER_KILL_SECS);
+    let script = "read go; printf 'CYS-AUTH-OK v1 request=%s nonce=%s\\n' \"$1\" \"$CYS_REPAIR_AUTH_NONCE\"; exit 0";
+    let run = |seen_at: Duration| -> bool {
+        let mut child = bind_helper(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", script, "sh", rid])
+                .stdin(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null()),
+            nonce,
+        )
+        .spawn_policy(cys::ChildLifetime::Attached)
+        .spawn()
+        .unwrap();
+        let pid = child.id();
+        let mut release = child.stdin.take();
+        let mut readings = 0u32;
+        let mut clock = || -> Duration {
+            readings += 1;
+            if let Some(mut go) = release.take() {
+                go.write_all(b"go\n").unwrap();
+                drop(go);
+                // SAFETY: waitid(2) on this test's own child, WEXITED | WNOWAIT: blocks until it has
+                // ended and leaves it for the waiter to reap; `info` is zeroed and never read
+                unsafe {
+                    let mut info: libc::siginfo_t = std::mem::zeroed();
+                    while libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) != 0 {
+                        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINTR));
+                    }
+                }
+                return limit - Duration::from_millis(10);
+            }
+            seen_at
+        };
+        let approved = wait_helper_clocked(child, limit, rid, nonce, &mut clock);
+        assert!(readings >= 1, "the waiter never read the clock");
+        approved
+    };
+    assert!(!run(limit + Duration::from_millis(10)), "a success seen 10 ms past the limit approved");
+    assert!(!run(limit), "a success seen AT the limit approved");
+    assert!(
+        run(limit - Duration::from_millis(5)),
+        "control: the same completion seen just before the limit is the one approval"
+    );
+}
+
 /// RULINGS I3: validity by timestamp — a helper result at 29:59 is consumed; at 30:00 and at 30:01 it
 /// is not an approval (nothing applied), whatever the stored state says.
 #[test]
