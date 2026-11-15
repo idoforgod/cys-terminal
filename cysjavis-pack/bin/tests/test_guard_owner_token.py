@@ -502,6 +502,53 @@ def main():
         check("12 공백이 든 장부 자리의 작업 사본 → 통과", p.returncode == 0,
               "" if p.returncode == 0 else "rc=%d %r" % (p.returncode, p.stderr[-200:]))
 
+        # 13 — RULINGS ID3 (T4e round 2): a read is not a write — a redirection counts only when ITS target is a ledger place
+        #      outside the working copy; a writer counts only for the operands of its own segment; for cp / mv / install / ln
+        #      only the destination is written (mv also writes its source)
+        out = os.path.join(root, "out")
+        os.makedirs(out, exist_ok=True)
+        tmpf = os.path.join(out, "t.json")
+        for label, cmd, guard in (
+                ("ls 2>/dev/null", "ls %s 2>/dev/null" % os.path.join(ledger, "R-3"), None),
+                ("cat 2>&1 | head", "cat %s 2>&1 | head -5" % os.path.join(ledger, "grant.json"), None),
+                ("grep -r 2>/dev/null | wc", "grep -r tok %s 2>/dev/null | wc -l" % os.path.join(ledger, "owner-tokens"), None),
+                ("head > 임시 파일", "head -n 3 %s > %s" % (os.path.join(ledger, "tombstones", "base.json"),
+                                                        os.path.join(out, "head.txt")), None),
+                ("cat > 임시 파일", "cat %s > %s" % (os.path.join(ledger, "grant.json"), os.path.join(out, "copy.json")), None),
+                ("밖으로 cp", "cp %s %s" % (os.path.join(ledger, "grant.json"), os.path.join(out, "g.json")), None),
+                ("밖으로 cp -r", "cp -r %s %s" % (os.path.join(ledger, "R-3"), os.path.join(out, "r3")), None),
+                ("따옴표 글 안의 언급", 'echo "the ledger %s is written by the daemon" > %s'
+                 % (os.path.join(ledger, "grant.json"), os.path.join(out, "note.txt")), None),
+                ("cd 뒤 ls 2>/dev/null", "cd %s && ls -la 2>/dev/null" % ledger, None),
+                ("cd 뒤 cat 2>&1 | head", "cd %s && cat record.json 2>&1 | head" % os.path.join(ledger, "R-3"), None),
+                ("공백 자리 cat 2>/dev/null", 'cat "%s/grant.json" 2>/dev/null' % sl, sguard),
+                ("공백 자리 밖으로 cp", 'cp "%s/grant.json" %s' % (sl, os.path.join(out, "s.json")), sguard)):
+            p, _ = run({"command": cmd}, tool="Bash", rc=0, guard=guard)
+            check("13 읽기는 쓰기가 아니다 — 통과: %s" % label, p.returncode == 0,
+                  "" if p.returncode == 0 else "rc=%d %r" % (p.returncode, p.stderr[-200:]))
+        for label, plain, spaced, after_cd in (
+                (">", "echo on > %s/grant.json" % ledger, 'echo on > "%s/grant.json"' % sl,
+                 "cd %s && echo on > grant.json" % ledger),
+                (">>", "echo on >> %s/grant.json" % ledger, 'echo on >> "%s/grant.json"' % sl,
+                 "cd %s && echo on >> grant.json" % ledger),
+                ("안으로 cp", "cp %s %s/owner-tokens/x.json" % (tmpf, ledger), 'cp %s "%s/owner-tokens/x.json"' % (tmpf, sl),
+                 "cd %s/owner-tokens && cp %s x.json" % (ledger, tmpf)),
+                ("cp -t 안으로", "cp -t %s/owner-tokens %s" % (ledger, tmpf), 'cp -t "%s/owner-tokens" %s' % (sl, tmpf),
+                 "cd %s && cp -t owner-tokens %s" % (ledger, tmpf)),
+                ("tee 안으로", "echo x | tee %s/grant.json" % ledger, 'echo x | tee "%s/grant.json"' % sl,
+                 "cd %s && echo x | tee grant.json" % ledger),
+                ("mv 밖으로(원본을 지운다)", "mv %s/grant.json %s" % (ledger, tmpf), 'mv "%s/grant.json" %s' % (sl, tmpf),
+                 "cd %s && mv grant.json %s" % (ledger, tmpf)),
+                ("읽고 장부 안으로 리다이렉트", "cat %s/grant.json > %s/grant-copy.json" % (ledger, ledger),
+                 'cat "%s/grant.json" > "%s/grant-copy.json"' % (sl, sl),
+                 "cd %s && cat grant.json > grant-copy.json" % ledger)):
+            bad = []
+            for how, cmd, guard in (("곧은 자리", plain, None), ("공백 자리", spaced, sguard), ("cd 뒤", after_cd, None)):
+                p, _ = run({"command": cmd}, tool="Bash", rc=0, guard=guard)
+                if not ledger_refused(p, "cys repair"):
+                    bad.append("%s rc=%d %r" % (how, p.returncode, p.stderr[-160:]))
+            check("13 쓰기는 막힌다: %s (곧은 자리 · 공백 자리 · cd 뒤)" % label, not bad, "; ".join(bad))
+
         # 10 — RULINGS FZ2: every stub this test started is gone at its end
         left = [pid for pid in stub_pids if not gone_soon(pid)]
         check("10 테스트가 띄운 스텁 %d개가 끝에 모두 사라졌다" % len(stub_pids), not left, "" if not left else repr(left))
