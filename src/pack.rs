@@ -14036,7 +14036,9 @@ mod tests {
 
     type M15daState = std::collections::BTreeMap<String, (String, u32)>;
 
-    /// Every file under `root` → (text, mode). Mode is 0 off Unix.
+    /// Every file under `root` → (text, mode). Mode is 0 off Unix. ★T9w (RULINGS IY a): the key is the path below
+    /// `root` spelled with `/` on EVERY platform (components joined by `/`), so a literal such as `bin/selfheal.sh`
+    /// names the same file on Windows as on Unix.
     fn m15da_state(root: &Path) -> M15daState {
         fn walk(base: &Path, dir: &Path, out: &mut M15daState) {
             if let Ok(rd) = std::fs::read_dir(dir) {
@@ -14045,7 +14047,13 @@ mod tests {
                     if p.is_dir() {
                         walk(base, &p, out);
                     } else if let Ok(bytes) = std::fs::read(&p) {
-                        let rel = p.strip_prefix(base).unwrap().to_string_lossy().into_owned();
+                        let rel = p
+                            .strip_prefix(base)
+                            .unwrap()
+                            .components()
+                            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join("/");
                         let mode = current_mode(&p).unwrap_or(0);
                         out.insert(rel, (String::from_utf8_lossy(&bytes).into_owned(), mode));
                     }
