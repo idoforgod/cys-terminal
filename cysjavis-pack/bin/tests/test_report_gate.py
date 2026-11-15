@@ -2307,5 +2307,244 @@ class ApprovalWaitingLine(unittest.TestCase):
         self.assertEqual(sent, [])
 
 
+# ── RULINGS KX1 (whole-diff review pass 2, WD2-F1 M1 · fatal class 1) — the approval-waiting line (T5b) gets the SAME
+#    accounting as the open-defect line through ONE shared routine: an attempt recorded before the send and never taken
+#    back, at most 1 + OPEN_DEFECT_RETRY_MAX per set, unknown is not absent, a state that is not a state gives the
+#    current set up. The two lines keep separate state files and separate budgets. WF1's tests above are unchanged.
+class ApprovalWaitingLineBudget(unittest.TestCase):
+    """Stand-in runner (the decisive tests with the REAL wake queue are in ApprovalWaitingLineRealQueue)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="gate-approval-kx1-")
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+        self.gate_dir = os.path.join(self.tmp, "gate")
+
+    def run_once(self, cards, runner=None):
+        r = runner or FakeRunner(report_ok=False, err="collector absent")
+        clk = Clock(1_000_000.0)
+        g = G.Gate(self.gate_dir, r, cycle_minutes=5, now_epoch_fn=clk.now_epoch, now_iso_fn=clk.now_iso,
+                   approval_source=lambda: (True, "base", list(cards)))
+        self.assertEqual(g.run(shadow=False), 0, "the gate never stops (fail-open)")
+        return [e for e in r.enqueues if e[1] == G.APPROVAL_TASK]
+
+    def state_doc(self):
+        with open(os.path.join(self.gate_dir, G.APPROVAL_STATE_FILE), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_kx1_failed_enqueues_stop_at_the_budget_and_the_state_says_so(self):
+        total = 0
+        for _ in range(JT1_RETRY_MAX + 5):
+            total += len(self.run_once(["R-1"], FakeRunner(report_ok=False, err="collector absent", enqueue_rc=1)))
+        self.assertEqual(total, 1 + JT1_RETRY_MAX)
+        doc = self.state_doc()
+        self.assertEqual((doc["key"], doc["attempts"], doc["budget"], doc["delivered"]),
+                         (G.approval_wake("base", ["R-1"])[1], 1 + JT1_RETRY_MAX, 1 + JT1_RETRY_MAX, False))
+
+    def test_kx1_clean_acceptance_is_recorded_and_zero_clears_the_memory(self):
+        self.assertEqual(len(self.run_once(["R-1"])), 1)
+        self.assertEqual((self.state_doc()["attempts"], self.state_doc()["delivered"]), (1, True))
+        self.assertEqual(self.run_once(["R-1"]), [])
+        self.assertEqual(self.run_once([]), [])
+        self.assertIsNone(self.state_doc()["key"], "the set going to zero clears the memory")
+        self.assertEqual(len(self.run_once(["R-1"])), 1, "the same set waiting again is a change")
+
+    def test_kx1_a_state_that_cannot_be_written_sends_nothing(self):
+        real = G._write_json_atomic
+
+        def refuse(path, obj):
+            if os.path.basename(path) == G.APPROVAL_STATE_FILE:
+                raise OSError("refused by the test")
+            return real(path, obj)
+        G._write_json_atomic = refuse
+        self.addCleanup(setattr, G, "_write_json_atomic", real)
+        for _ in range(3):
+            self.assertEqual(self.run_once(["R-1"]), [])
+
+    def test_kx1_a_state_that_is_not_a_state_gives_the_current_set_up(self):
+        os.makedirs(self.gate_dir)
+        with open(os.path.join(self.gate_dir, G.APPROVAL_STATE_FILE), "wb") as f:
+            f.write(b"[" * 100000 + b"]" * 100000)
+        for _ in range(3):
+            self.assertEqual(self.run_once(["R-1"]), [])
+        doc = self.state_doc()
+        self.assertEqual((doc["key"], doc["attempts"], doc["delivered"]),
+                         (G.approval_wake("base", ["R-1"])[1], 1 + JT1_RETRY_MAX, False))
+        self.assertTrue(doc.get("gave_up"))
+        self.assertEqual(len(self.run_once(["R-1", "R-2"])), 1, "a changed set gets its line")
+
+    def test_kx1_one_routine_for_both_lines(self):
+        """KX1: no second copy of the accounting — both lines hand their own state file, task, wake and count to the
+        same routine."""
+        seen = []
+        real = G.Gate._summary_line
+
+        def spy(gate, state_file, task, wake, count):
+            seen.append((state_file, task, wake[1] if wake else None, count))
+            return real(gate, state_file, task, wake, count)
+        G.Gate._summary_line = spy
+        self.addCleanup(setattr, G.Gate, "_summary_line", real)
+        r = FakeRunner(report_ok=False, err="collector absent")
+        clk = Clock(1_000_000.0)
+        g = G.Gate(self.gate_dir, r, cycle_minutes=5, now_epoch_fn=clk.now_epoch, now_iso_fn=clk.now_iso,
+                   defect_source=lambda: (True, "base", ["aa"]), approval_source=lambda: (True, "base", ["R-1"]))
+        self.assertEqual(g.run(shadow=False), 0)
+        self.assertEqual(seen, [(G.OPEN_DEFECT_STATE_FILE, G.OPEN_DEFECT_TASK, G.open_defect_wake(["aa"])[1], 1),
+                                (G.APPROVAL_STATE_FILE, G.APPROVAL_TASK, G.approval_wake("base", ["R-1"])[1], 1)])
+
+
+#   The stub `cys` of this class writes the whole message of each send, so each line's deliveries are counted by its
+#   task name (a drain that finds both lines pending folds them into ONE send that names both).
+_STUB_CYS_TASKS = "#!/bin/sh\nprintf 'CALL %s\\n' \"$(printf '%s ' \"$@\" | tr '\\n' ' ')\" >> \"$MOCK_CALLS\"\necho 'QUEUED (depth 1)'\nexit 0\n"
+
+
+@unittest.skipIf(os.name == "nt", "shell stub for `cys`")
+class ApprovalWaitingLineRealQueue(unittest.TestCase):
+    CARDS = ["R-1"]
+    SIGS = ["aa", "bb"]
+    runner = OpenDefectLineRealQueue.runner
+    drain = OpenDefectLineRealQueue.drain
+    pending = OpenDefectLineRealQueue.pending
+    audit_unwritable = OpenDefectLineRealQueue.audit_unwritable
+
+    def setUp(self):
+        OpenDefectLineRealQueue.setUp(self)
+        with open(os.path.join(self.tmp, "stub-bin", "cys"), "w", encoding="utf-8") as f:
+            f.write(_STUB_CYS_TASKS)
+
+    def tick(self, cards=None, sigs=None, runner=None):
+        """One report run; the approval set is the same unless given; the open-defect line runs too when `sigs` is
+        given. It must return 0 and finish its own work."""
+        self.clock += 300
+        cards = list(self.CARDS if cards is None else cards)
+        defects = None if sigs is None else (lambda: (True, "base", list(sigs)))
+        g = G.Gate(self.state, runner or self.runner(), cycle_minutes=5, now_epoch_fn=lambda: self.clock,
+                   now_iso_fn=lambda: "2026-11-15T20:00:00+0900", defect_source=defects,
+                   approval_source=lambda: (True, "base", cards))
+        self.assertEqual(g.run(shadow=False), 0, "the gate never stops (fail-open)")
+        with open(os.path.join(self.state, "counters.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f).get("failopen_streak"), 0, "the gate's own run reached its end")
+
+    def delivered(self, task):
+        try:
+            with open(self.calls, encoding="utf-8") as f:
+                return sum(line.count("task=%s " % task) for line in f if line.startswith("CALL send"))
+        except FileNotFoundError:
+            return 0
+
+    def state_doc(self, name=G.APPROVAL_STATE_FILE):
+        with open(os.path.join(self.state, name), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_kx1_audit_unwritable_and_an_independent_drain_stop_at_the_bound(self):
+        """RULINGS KX1 — the decisive sequence for the approval line: red on fb75a072 (the old key written back on a
+        non-zero answer, so every tick sent the same line again); now at most 1 + N."""
+        self.audit_unwritable()
+        seen = []
+        for _ in range(12):
+            self.tick()
+            self.drain()
+            seen.append(self.delivered(G.APPROVAL_TASK))
+        self.assertGreater(seen[-1], 0, "precondition: the entry was saved although the tool failed")
+        self.assertLessEqual(seen[-1], 1 + JT1_RETRY_MAX, "approval deliveries after each tick: %s" % seen)
+        self.assertEqual(seen[-1], 1 + JT1_RETRY_MAX, seen)
+        doc = self.state_doc()
+        self.assertEqual((doc["attempts"], doc["delivered"]), (1 + JT1_RETRY_MAX, False))
+
+    def test_kx1_an_enqueue_killed_at_its_time_out_after_the_save_is_bounded(self):
+        slow = os.path.join(self.tmp, "slow-bin")
+        os.makedirs(slow)
+        with open(os.path.join(slow, "javis_wakeup.py"), "w", encoding="utf-8") as f:
+            f.write(_SLOW_WAKEUP % (BIN, WAKEUP))
+        seen = []
+        for _ in range(JT1_RETRY_MAX + 4):
+            self.tick(runner=self.runner(pack_bin=slow, timeout=4))
+            self.drain()
+            seen.append(self.delivered(G.APPROVAL_TASK))
+        self.assertGreater(seen[-1], 0, "precondition: the entry was saved before the kill")
+        self.assertLessEqual(seen[-1], 1 + JT1_RETRY_MAX, "approval deliveries after each tick: %s" % seen)
+
+    def test_kx1_a_changed_set_gets_a_new_budget(self):
+        self.audit_unwritable()
+        for _ in range(6):
+            self.tick(cards=["R-1"])
+            self.drain()
+        self.assertEqual(self.delivered(G.APPROVAL_TASK), 1 + JT1_RETRY_MAX)
+        for _ in range(6):
+            self.tick(cards=["R-1", "R-2"])
+            self.drain()
+        self.assertEqual(self.delivered(G.APPROVAL_TASK), 2 * (1 + JT1_RETRY_MAX))
+
+    def test_kx1_the_set_going_to_zero_clears_the_memory(self):
+        self.tick()
+        self.drain()
+        self.assertEqual(self.delivered(G.APPROVAL_TASK), 1)
+        self.tick(cards=[])
+        self.assertIsNone(self.state_doc()["key"])
+        self.tick()
+        self.drain()
+        self.assertEqual(self.delivered(G.APPROVAL_TASK), 2, "the same set waiting again after zero is a change")
+
+    def test_kx1_unwritable_state_sends_nothing_and_the_other_line_goes_out(self):
+        os.makedirs(os.path.join(self.state, G.APPROVAL_STATE_FILE))      # a folder: neither read nor replaced
+        for _ in range(5):
+            self.tick(sigs=self.SIGS)
+            self.drain()
+        self.assertEqual(self.delivered(G.APPROVAL_TASK), 0)
+        self.assertEqual(self.delivered(G.OPEN_DEFECT_TASK), 1, "the other line went out in the same run")
+
+    def test_kx1_a_state_that_exists_but_cannot_be_read_gives_no_line_and_is_not_touched(self):
+        self.audit_unwritable()
+        self.tick()
+        self.drain()
+        self.assertEqual(self.delivered(G.APPROVAL_TASK), 1)
+        path = os.path.join(self.state, G.APPROVAL_STATE_FILE)
+        with open(path, "rb") as f:
+            before = f.read()
+        os.chmod(path, 0)
+        self.addCleanup(lambda: os.path.exists(path) and os.chmod(path, 0o644))
+        try:
+            open(path, "rb").close()
+            self.skipTest("this user can read a mode-0 file (root)")
+        except OSError:
+            pass
+        for _ in range(3):
+            self.tick(sigs=self.SIGS)
+            self.drain()
+        self.assertEqual(self.delivered(G.APPROVAL_TASK), 1, "unknown is not absent: no approval line")
+        self.assertEqual(self.delivered(G.OPEN_DEFECT_TASK), 1 + JT1_RETRY_MAX, "the other line still went out")
+        os.chmod(path, 0o644)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), before, "the unreadable state was not touched")
+
+    def test_kx1_a_state_that_is_not_a_state_gives_the_current_set_up(self):
+        with open(os.path.join(self.state, G.APPROVAL_STATE_FILE), "w", encoding="utf-8") as f:
+            f.write("{\"key\": ")
+        for _ in range(4):
+            self.tick()
+            self.drain()
+        self.assertEqual((self.delivered(G.APPROVAL_TASK), self.pending()), (0, []))
+        self.assertIn("not JSON", self.state_doc()["gave_up"])
+        self.tick(cards=["R-1", "R-9"])
+        self.drain()
+        self.assertEqual(self.delivered(G.APPROVAL_TASK), 1, "a changed set gets its line")
+
+    def test_kx1_two_lines_keep_separate_state_files_and_budgets(self):
+        """One line's exhausted budget never silences the other: the open-defect line uses its budget first, then the
+        approval line gets its own three; each line's state file holds its own key."""
+        self.audit_unwritable()
+        for _ in range(5):
+            self.tick(cards=[], sigs=self.SIGS)
+            self.drain()
+        self.assertEqual((self.delivered(G.OPEN_DEFECT_TASK), self.delivered(G.APPROVAL_TASK)), (1 + JT1_RETRY_MAX, 0))
+        seen = []
+        for _ in range(6):
+            self.tick(sigs=self.SIGS)
+            self.drain()
+            seen.append((self.delivered(G.OPEN_DEFECT_TASK), self.delivered(G.APPROVAL_TASK)))
+        self.assertEqual(seen[-1], (1 + JT1_RETRY_MAX, 1 + JT1_RETRY_MAX), seen)
+        self.assertEqual(self.state_doc(G.OPEN_DEFECT_STATE_FILE)["key"], G.open_defect_wake(self.SIGS)[1])
+        self.assertEqual(self.state_doc()["key"], G.approval_wake("base", self.CARDS)[1])
+
+
 if __name__ == "__main__":
     unittest.main()
