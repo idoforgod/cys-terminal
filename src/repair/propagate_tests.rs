@@ -1302,6 +1302,53 @@ fn a_record_changed_between_two_targets_publishes_a_visible_conflict() {
     }
 }
 
+/// RULINGS IQ1 — a check made outside the lock is published only for the state it checked: an
+/// "update" placed by a seam between the live check and the publication (inside the check call, after
+/// the states were taken) → nothing published as 검증됨 and the catch-up NOT recorded; the row stays
+/// as it was, with the reason. Three updates: a target that was passed over as "already at the
+/// result" changed; the pack generation changed; on the "already there" path, the checked file changed.
+#[test]
+fn a_check_is_published_only_for_the_state_it_checked() {
+    for update in ["at-result-target", "generation", "already-there"] {
+        let r = rig(&format!("iq1-{update}"));
+        let id = rid("R-1");
+        if update == "already-there" {
+            committed_in_hq(&r, &id, Classification::General, "bin/b.py", Some((b"old-b\n", 0o644)), Some((b"new-b\n", 0o644)));
+            r.put(DEPT, "bin/b.py", b"new-b\n", 0o644);
+        } else {
+            committed_many_in_hq(&r, &id, &[("bin/a.py", b"old-a\n", b"new-a\n"), ("bin/b.py", b"old-b\n", b"new-b\n")]);
+            r.put(DEPT, "bin/a.py", b"new-a\n", 0o644); // already at R's result: passed over by the door
+            r.put(DEPT, "bin/b.py", b"old-b\n", 0o644);
+        }
+        let d = doubles();
+        {
+            let (dept, update) = (r.dept.clone(), update.to_string());
+            *d.during_check.borrow_mut() = Some(Box::new(move |root: &Path| {
+                if root != dept.as_path() {
+                    return; // the copy-check on the scratch copy
+                }
+                match update.as_str() {
+                    "at-result-target" => std::fs::write(dept.join("bin/a.py"), b"updated-a\n").unwrap(),
+                    "generation" => std::fs::write(dept.join(".pack-version"), "0.15.1\n").unwrap(),
+                    _ => std::fs::write(dept.join("bin/b.py"), b"updated-b\n").unwrap(),
+                }
+            }));
+        }
+        let t = tick(&r, DEPT, &d, &fid(1));
+        assert!(!t.catchup_completed, "{update}: {t:?}");
+        assert!(!r.job(DEPT).initial_catchup_complete, "{update}: the catch-up is not recorded");
+        assert!(t.left.iter().any(|(i, why)| *i == id && why == STATES_CHANGED), "{update}: {t:?}");
+        match r.row(&id, DEPT) {
+            Some(row) => {
+                assert_ne!(row.state, LaneState::Verified, "{update}");
+                assert_eq!(row.state, LaneState::Applied, "{update}: the door's row stays");
+                assert_eq!(row.reason, STATES_CHANGED, "{update}: the reason kept on the row");
+            }
+            None => assert_eq!(update, "already-there", "only the already-there path has no row to keep"),
+        }
+    }
+}
+
 /// RULINGS IK3 — NO LOCK ACROSS A CHECK: while this lane's copy-check and its live check run (a check
 /// child "parked" by the seam), the machine-wide pack-apply lock is free — a `try` of it succeeds and
 /// ANOTHER lane's tick runs its pass (which needs the lock) to its end. (On the old shape the whole tick
