@@ -3651,3 +3651,41 @@ fn a_live_target_over_the_limit_refuses_the_apply_unread() {
     assert_eq!(rec.state, RepairState::AwaitingApproval, "the record did not move");
     assert!(rec.approval.is_some(), "the approval did not move");
 }
+
+// ───────────────────────────── RULINGS IL2 — what reaches another department ─────────────────────────────
+
+/// IL2: the sentence about another department is true for the CLASS of the repair (0.15.0 has no
+/// identical propagation of an approved repair — RULINGS II): a boot-critical or protection-related
+/// repair reaches another department only through that department's own repair, both signatures and
+/// the owner's final approval there; any other repair is carried there by that department's daemon,
+/// and a department whose file differs keeps its bytes and shows 충돌. The approved apply's refusal in
+/// another department says so. Before IL2 it said "(다른 부서는 전파)".
+#[test]
+fn the_sentence_about_other_departments_is_true_for_each_class() {
+    let approval_form = "기동 필수·보호장치 관련 수리는 다른 부서에 저절로 전해지지 않습니다 — 다른 부서에는 그 부서 자신의 수리(cys repair begin … --resolves R-7)와 두 리뷰어의 서명, 그 부서에서의 주인 최종 승인으로만 들어갑니다";
+    let carried_form = "이 수리는 각 부서의 데몬이 그 부서에 전파합니다 — 파일이 다른 부서는 제 바이트를 그대로 두고 그 수리를 충돌로 보입니다";
+    for c in [Classification::BootCritical, Classification::ProtectionRelated] {
+        assert_eq!(reach_of_other_departments(c, "R-7"), approval_form, "{c:?}");
+    }
+    for c in [Classification::General, Classification::RuleDocument, Classification::DaemonSource] {
+        assert_eq!(reach_of_other_departments(c, "R-7"), carried_form, "{c:?}");
+    }
+    // the approved apply asked in another department
+    let r = rig("il2apply");
+    let id = rid("R-7");
+    r.put("hooks/g.sh", b"PRE\n", 0o755);
+    let pre_img = ledger::copy_preimage_in(&r.root, &id, &r.lane, "hooks/g.sh", &r.pack.join("hooks/g.sh"), 1.0).unwrap();
+    let staging = ledger::staging_dir_in(&r.root, &id).join("hooks/g.sh");
+    std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
+    std::fs::write(&staging, b"CAND\n").unwrap();
+    let st = TargetState::read(&staging).unwrap();
+    let fp = crate::repair::types::fingerprint(&[("hooks/g.sh".into(), st.clone())]);
+    let mut rec = record(&r, &id, Classification::BootCritical, vec![FileChange { rel: "hooks/g.sh".into(), kind: ChangeKind::Edit, pre: pre_img, post: st, diff: None }], RepairState::AwaitingApproval);
+    rec.approval = Some(approval(&fp));
+    rec.origin_lane = LaneKey("dept-2".into());
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let e = format!("{:?}", apply_candidate_in(&env, &id, &[CandidateFile { rel: "hooks/g.sh".into(), staged: staging, mode: 0o644 }], &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).expect_err("another department"));
+    assert!(e.contains(approval_form), "{e}");
+    assert!(!e.contains("다른 부서는 전파"), "{e}");
+}
