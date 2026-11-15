@@ -750,6 +750,66 @@ fn a_slot_holds(r: &Rig, id: &RepairId, bytes: &[u8]) -> bool {
     ledger::list_slots_in(&r.root, id).iter().any(|s| walk(&s.dir, bytes))
 }
 
+/// RULINGS IG7 — THE ONE POSITIVE PATH of HJ1 (a), with REAL approved-apply evidence of T6 (the helper
+/// T6's own F9 tests use): a boot-critical R committed in HQ is 충돌 in the department (never applied);
+/// the department's OWN R′ with `resolves: R` is approved and applied there through T6's
+/// `apply_candidate_in`; the next tick finds every live target an approved copy of R′ (F9), runs R's
+/// check on the live files and writes 검증됨 with the merge record pointing to R′ — the gate OPENS.
+/// Variants (each on its own rig): one piece of the evidence removed (the deposit's sealed copy
+/// altered), the live check failing, R′ reverted — each stays 충돌.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_approval_class_row_is_verified_only_through_the_lanes_own_approved_repair() {
+    for variant in ["positive", "evidence-removed", "check-fails", "resolving-repair-reverted"] {
+        let r = rig(&format!("ig7-{variant}"));
+        let id = rid("R-1");
+        let rel = "hooks/b.sh";
+        committed_in_hq(&r, &id, Classification::BootCritical, rel, Some((b"PRE\n", 0o755)), Some((b"HQ\n", 0o755)));
+        r.put(DEPT, rel, b"PRE\n", 0o755);
+        let d = doubles();
+        d.class.set(Classification::BootCritical);
+        tick(&r, DEPT, &d, &fid(1));
+        assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Conflict, "{variant}: never applied here");
+        assert!(matches!(gate_verdict_in(&r.root, &lane(DEPT)), GateVerdict::Held(HoldCause::AwaitingFinalApproval { .. })));
+        // the department's OWN repair R′ (resolves R), approved and applied in this lane by T6's engine
+        let t6 = crate::repair::apply::tests::Rig { base: r.base.join("t6"), root: r.root.clone(), pack: r.dept.clone(), lane: lane(DEPT), src: r.base.join("t6").join("src") };
+        std::fs::create_dir_all(&t6.src).unwrap();
+        let rp = rid("R-2");
+        let mut prime = crate::repair::apply::tests::approved_and_applied(&t6, &rp, rel, b"PRE\n", b"DEPT-APPROVED\n");
+        prime.resolves = Some(id.clone());
+        ledger::write_record_in(&r.root, &prime).unwrap();
+        assert!(in_force(&prime), "{variant}: R′ applied and in force");
+        match variant {
+            "evidence-removed" => {
+                let op = r.ops(&rp).into_iter().find(|o| o.kind == "apply").unwrap();
+                let slot = crate::repair::vault::Slot::at(op.slot.as_ref().unwrap(), rel);
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(slot.sealed(), std::fs::Permissions::from_mode(0o644)).unwrap();
+                std::fs::write(slot.sealed(), b"TAMPERED").unwrap();
+            }
+            "check-fails" => d.pass.set(false),
+            "resolving-repair-reverted" => {
+                prime.state = RepairState::Reverted;
+                ledger::write_record_in(&r.root, &prime).unwrap();
+            }
+            _ => {}
+        }
+        tick(&r, DEPT, &d, &fid(1));
+        let row = r.row(&id, DEPT).unwrap();
+        if variant == "positive" {
+            assert_eq!(row.state, LaneState::Verified, "{}", row.reason);
+            assert_eq!(row.merge.as_ref().and_then(|m| m.via_repair.clone()), Some(rp.clone()));
+            assert_eq!(gate_verdict_in(&r.root, &lane(DEPT)), GateVerdict::Open);
+            assert_eq!(std::fs::read(r.dept.join(rel)).unwrap(), b"DEPT-APPROVED\n", "the daemon wrote nothing of R");
+        } else {
+            assert_eq!(row.state, LaneState::Conflict, "{variant}");
+            assert!(row.merge.as_ref().and_then(|m| m.via_repair.clone()).is_none(), "{variant}");
+            assert!(matches!(gate_verdict_in(&r.root, &lane(DEPT)), GateVerdict::Held(_)), "{variant}");
+        }
+        assert!(r.ops(&id).iter().all(|o| o.lane_key != lane(DEPT)), "{variant}: no operation of R in this lane");
+    }
+}
+
 /// RULINGS IG2 — a verified row of a deleting repair implies this lane's tombstone: a stop between the
 /// deletion's door operation and its tombstone; after ONE restart the target is absent ("already at the
 /// result") and the row is 검증됨 WITH the tombstone — so an update does not put the vendor file back
