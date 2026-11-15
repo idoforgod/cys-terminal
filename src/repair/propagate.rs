@@ -1352,9 +1352,9 @@ enum DoorEnd {
     /// Nothing written: the lock was held, or the record changed before the first operation, or the
     /// generation moved (Superseded) — the row stays as it was; `bool` = write a NEW 대기 row.
     Left(String, bool),
-    /// RULINGS IG5 — the record changed AFTER some targets were applied (the targets named): no further
-    /// target, nothing published. The rule for this case is the master's (open point of IG5).
-    ChangedMidway(Vec<String>),
+    /// RULINGS IG5 + IO1 — the record changed AFTER some targets were applied: no further target, the row
+    /// already PUBLISHED as 충돌 (inside this lock) with its reason; nothing put back.
+    ChangedMidway(String),
 }
 
 /// This lane's own scratch folder for the copy-check (removed on every exit; a leftover of a dead
@@ -1700,9 +1700,9 @@ fn apply_general(
             }
             return Ok(None);
         }
-        DoorEnd::ChangedMidway(done) => {
-            report.left.push((rec.id.clone(), format!("{RECORD_CHANGED} — 단, 이미 바꾼 대상이 있습니다: {} (나머지 대상은 바꾸지 않았고 행은 그대로입니다)", done.join(", "))));
-            return Ok(None);
+        DoorEnd::ChangedMidway(why) => {
+            report.rows.push((rec.id.clone(), LaneState::Conflict, why));
+            return Ok(Some(LaneState::Conflict));
         }
     };
     let applied_row = row.clone();
@@ -1740,14 +1740,21 @@ fn door_phase(
     scratch: &Scratch,
 ) -> Result<DoorEnd, RepairError> {
     let mut done: Vec<String> = Vec::new();
-    let changed = |done: &Vec<String>| if done.is_empty() { DoorEnd::Left(RECORD_CHANGED.to_string(), false) } else { DoorEnd::ChangedMidway(done.clone()) };
+    // IO1: changed before the first write → nothing written; changed MIDWAY → the 충돌 row published now
+    let changed = |done: &Vec<String>| -> Result<DoorEnd, RepairError> {
+        if done.is_empty() {
+            Ok(DoorEnd::Left(RECORD_CHANGED.to_string(), false))
+        } else {
+            changed_midway(env, stored, row, rec, done)
+        }
+    };
     // rule one per target through T6's engine; the binding was born at the tick's start (EJ1)
     for (rel, pos) in positions {
         if *pos == Position::AtResult {
             continue;
         }
         if !record_unchanged(env, rec) {
-            return Ok(changed(&done));
+            return changed(&done);
         }
         let result = match result_state(rec, rel) {
             Ok(r) => r,
@@ -1794,15 +1801,15 @@ fn door_phase(
     }
     if ledger::hook_lines(rec).next().is_some() {
         if !record_unchanged(env, rec) {
-            return Ok(changed(&done));
+            return changed(&done);
         }
         if let Some(why) = hook_step(env, rec) {
             return Ok(DoorEnd::Conflict(why));
         }
-        done.push("hook lines".into());
+        done.push("훅 등록 해제".into());
     }
     if !record_unchanged(env, rec) {
-        return Ok(changed(&done));
+        return changed(&done);
     }
     // IG2: an applied row of a deleting repair implies this lane's tombstones
     if let Err(why) = ensure_tombstones(env, rec) {
@@ -1832,6 +1839,32 @@ fn door_phase(
         return Ok(DoorEnd::Left("적용한 뒤 다른 작성자가 행을 바꿔 다음 차례에 검사합니다".into(), false));
     }
     Ok(DoorEnd::Applied(row))
+}
+
+/// RULINGS IO1 — the record changed BETWEEN two targets of this lane's apply (a writer that takes no
+/// pack-apply lock — T3's `commit` superseding an older repair — or Windows): no undo in 0.15.0. The
+/// remaining targets are not applied and the row is PUBLISHED NOW as 충돌 — called inside the door
+/// phase's lock, so without asking the record to be unchanged (the row describes what THIS lane did,
+/// not what R is now) — with the reason naming the targets already changed and the live states
+/// (`conflict_live`). Nothing is put back, nothing further is written; the lane's worker merges it.
+fn changed_midway(env: &LaneEnv<'_>, stored: Option<&LaneRecord>, row: &LaneRecord, rec: &RepairRecord, done: &[String]) -> Result<DoorEnd, RepairError> {
+    let why = format!(
+        "이 부서에 적용하는 도중 수리 기록이 바뀌었습니다(대체·다시 확정·되돌림) — 이미 바꾼 대상: {} · 나머지 대상은 바꾸지 않았고 아무것도 되돌리지 않았습니다 — 이 부서의 워커가 합칩니다(cys repair status {})",
+        done.join(", "),
+        rec.id.as_str()
+    );
+    let mut row = row.clone();
+    row.state = LaneState::Conflict;
+    row.reason = why.chars().take(400).collect();
+    row.conflict_live = match live_states(env.op.pack, rec) {
+        Ok(l) => canon_list(&l),
+        Err(e) => vec![("?".into(), e)], // shown as it is: the state could not be read
+    };
+    row.updated_at = env.op.now;
+    if !write_row_if(env, stored, &row)? {
+        return Ok(DoorEnd::Left("다른 작성자가 이 행을 바꿔 다음 차례에 다시 봅니다".into(), false));
+    }
+    Ok(DoorEnd::ChangedMidway(why))
 }
 
 fn same_bytes(prev: Option<&LaneRecord>, rel: &str, result: &TargetState) -> bool {
