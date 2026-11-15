@@ -608,6 +608,25 @@ fn status_still_shows_a_completed_hook_operation_after_a_commit_that_follows_an_
     assert!(ops.iter().any(|o| o["lane"] == "base" && o["op"] == op.as_str() && o["text"] == format!("훅 등록 해제(작업 {op}: Stop:x.sh)")), "{v}");
 }
 
+/// RULINGS JL1 (a) — a repair with more operation records than the display read takes: `status` ANSWERS
+/// (every other field as always), with `hook_ops` empty and the sentence "확인할 수 없습니다 — 작업 기록이
+/// 많습니다"; nothing else fails.
+#[test]
+fn status_answers_when_a_repair_has_more_records_than_the_display_read_takes() {
+    let r = rig("jl-many");
+    let id = RepairId::parse("R-1").unwrap();
+    hook_only_in_force(&r, &id);
+    for k in 0..=cys::repair::propagate::DISPLAY_RECORDS_MAX {
+        hook_op_record(&r, &id, "base", &format!("20000101T000000{k:06}Z-hook-unregister-1-{k}"), true);
+    }
+    let v = status_hook_ops(&r, "R-1");
+    assert_eq!(v["repair"], "R-1", "{v}");
+    assert!(v["files"].as_array().is_some_and(|f| f.len() == 1) && v["lane_rows"].is_array(), "{v}");
+    assert_eq!(v["hook_ops"], json!([]), "{v}");
+    let why = v["hook_ops_unreadable"].as_str().unwrap_or_default();
+    assert!(why.starts_with("완료한 훅 작업을 확인할 수 없습니다 — 작업 기록이 많습니다"), "{v}");
+}
+
 /// RULINGS JI1 — an operation record that cannot be read: `status` says it cannot tell ("확인할 수
 /// 없습니다", with the cause), never an empty list as if no hook operation had been completed.
 #[test]

@@ -2241,21 +2241,92 @@ impl CompletedHookOp {
     }
 }
 
-/// RULINGS JI1 — the hook operations each lane COMPLETED for R (finished, outcome `applied`), read from
-/// R's operation records through T6's bounded reader (`wal::list_checked_in`): `Err(why)` when any record
-/// or the folder cannot be read — the caller says "확인할 수 없습니다", never "none". Shown by `status`,
-/// the merge ticket and `recheck`'s answer; no decision reads it.
+/// RULINGS JL1 (a) — the display read stops at this many operation records of one repair: a repair holds
+/// a few door and hook operations per lane (tens of records); 256 leaves room for many lanes and many
+/// re-checks and keeps the read to milliseconds, far inside the time the merge ticket gives `status`.
+pub const DISPLAY_RECORDS_MAX: usize = 256;
+/// RULINGS JL1 (a) — … and at this many bytes in total (by the size each entry reports before it is
+/// read): a record is about 1 KiB; 4 MiB = 256 records of 16 KiB. The per-file limit stays the bounded
+/// reader's own (`durable::RECORD_READ_CAP`).
+pub const DISPLAY_BYTES_MAX: u64 = 4 * 1024 * 1024;
+/// The cause the display read gives when it stops at its bound (JL1 (a)) — nothing else fails.
+pub const TOO_MANY_RECORDS: &str = "작업 기록이 많습니다";
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only (JL1): the operation records the display reads have parsed (a seam counts them).
+    pub(crate) static DISPLAY_RECORD_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Test-only (JL1 (c)): runs right before `recheck`'s answer reads its operation record.
+    pub(crate) static BEFORE_ANSWER_READ: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// One operation record through T6's bounded reader (GK5 — no link, a regular file, at most
+/// `RECORD_READ_CAP` bytes): `Ok(None)` = absent.
+fn read_op_bounded(p: &Path) -> Result<Option<super::wal::OpRecord>, String> {
+    #[cfg(test)]
+    DISPLAY_RECORD_READS.with(|c| c.set(c.get() + 1));
+    match durable::read_record_bytes(p) {
+        RecordRead::Bytes(b) => serde_json::from_slice(&b).map(Some).map_err(|e| format!("{}: {e}", p.display())),
+        RecordRead::NotFound => Ok(None),
+        RecordRead::Unreadable(why) => Err(why),
+    }
+}
+
+/// A record that is a COMPLETED hook operation (form `hook`, kind `hook-unregister` / `hook-reregister`,
+/// finished, outcome `applied`), as shown.
+fn completed_hook_op(o: super::wal::OpRecord) -> Option<CompletedHookOp> {
+    let done = o.form == "hook" && matches!(o.kind.as_str(), "hook-unregister" | "hook-reregister") && o.finished && o.outcome.as_deref() == Some("applied");
+    if !done {
+        return None;
+    }
+    Some(CompletedHookOp { lane: o.lane_key.clone(), kind: o.kind.clone(), lines: o.hooks.iter().map(|h| format!("{}:{}", h.event, h.script)).collect(), op: o.op })
+}
+
+/// RULINGS JI1 + JL1 (a) — the hook operations each lane COMPLETED for R, for DISPLAY (`status`, the
+/// merge ticket): R's operation records read one by one through the bounded reader, only the completed
+/// hook operations kept; the read stops at `DISPLAY_RECORDS_MAX` records or `DISPLAY_BYTES_MAX` bytes —
+/// `Err(TOO_MANY_RECORDS …)`. `Err(why)` also when the folder or any record cannot be read: the caller says
+/// "확인할 수 없습니다", never "none". It holds no lock; no decision reads it.
 pub fn completed_hook_ops_in(root: &Path, id: &RepairId) -> Result<Vec<CompletedHookOp>, String> {
-    Ok(super::wal::list_checked_in(root, id)?
-        .into_iter()
-        .filter(|o| o.form == "hook" && matches!(o.kind.as_str(), "hook-unregister" | "hook-reregister") && o.finished && o.outcome.as_deref() == Some("applied"))
-        .map(|o| CompletedHookOp {
-            lane: o.lane_key.clone(),
-            kind: o.kind.clone(),
-            lines: o.hooks.iter().map(|h| format!("{}:{}", h.event, h.script)).collect(),
-            op: o.op,
-        })
-        .collect())
+    let dir = super::wal::ops_dir_in(root, id);
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // no record yet — only with the repair's own folder readable (FG1: absence on evidence)
+            let up = ledger::repair_dir_in(root, id);
+            return match std::fs::read_dir(&up) {
+                Ok(_) => Ok(Vec::new()),
+                Err(e2) => Err(format!("{}: 없음, 그러나 {}를 읽을 수 없음 — {e2}", dir.display(), up.display())),
+            };
+        }
+        Err(e) => return Err(format!("{}: 목록을 읽을 수 없음 — {e}", dir.display())),
+    };
+    let (mut records, mut bytes) = (0usize, 0u64);
+    let mut out = Vec::new();
+    for entry in rd {
+        let entry = entry.map_err(|e| format!("{}: 항목을 읽을 수 없음 — {e}", dir.display()))?;
+        let p = entry.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let len = entry.metadata().map_err(|e| format!("{}: {e}", p.display()))?.len();
+        records += 1;
+        bytes = bytes.saturating_add(len);
+        if records > DISPLAY_RECORDS_MAX || bytes > DISPLAY_BYTES_MAX {
+            return Err(format!("{TOO_MANY_RECORDS}({DISPLAY_RECORDS_MAX}건·{DISPLAY_BYTES_MAX}바이트까지만 읽습니다)"));
+        }
+        if let Some(o) = read_op_bounded(&p)?.and_then(completed_hook_op) {
+            out.push(o);
+        }
+    }
+    out.sort_by(|a, b| a.op.cmp(&b.op));
+    Ok(out)
+}
+
+/// RULINGS JL1 (b) — the ONE operation record of the operation `recheck` just ran, by its id, through the
+/// bounded reader (nothing is listed): `Ok(None)` = not a completed hook operation of this lane.
+fn completed_hook_op_in(root: &Path, id: &RepairId, lane: &LaneKey, op: &str) -> Result<Option<CompletedHookOp>, String> {
+    Ok(read_op_bounded(&super::wal::op_path_in(root, id, op))?.and_then(completed_hook_op).filter(|o| o.lane == *lane))
 }
 
 /// The sentence a reader shows when the operation records cannot be read (JI1).
@@ -2273,9 +2344,9 @@ pub struct Rechecked {
 }
 
 /// RULINGS JD2 / JI1 — the sentence of `recheck`'s answer naming what the call changed: the row (검증됨,
-/// or 충돌 with a new reason), the hook operation the call completed — READ from its operation record
-/// (`completed_hook_ops_in`, the reader `status` and the merge ticket use) — and a deleting repair's
-/// tombstones.
+/// or 충돌 with a new reason), the hook operation the call completed — READ from that ONE operation record
+/// by its id through the bounded reader (JL1 (b)), after the guard was released (JL1 (c)) — and a
+/// deleting repair's tombstones.
 fn recheck_changed(env: &LaneEnv<'_>, rec: &RepairRecord, verified: bool, hook_op: Option<&str>) -> String {
     let mut parts = vec![if verified {
         "이 부서의 행('충돌' → '검증됨', 합친 기록을 남기고 합치기 잠금을 풂)".to_string()
@@ -2283,11 +2354,15 @@ fn recheck_changed(env: &LaneEnv<'_>, rec: &RepairRecord, verified: bool, hook_o
         "이 부서의 행('충돌' 그대로, 사유와 살아 있는 상태를 새로 적음)".to_string()
     }];
     if let Some(op) = hook_op {
-        parts.push(match completed_hook_ops_in(env.op.root, &rec.id) {
-            Ok(ops) => match ops.iter().find(|o| o.op == op && o.lane == *env.op.lane) {
-                Some(o) => format!("이 부서의 {}", o.text()),
-                None => format!("이 부서의 훅 작업(작업 {op}): {}", hook_ops_unreadable("그 동작 기록에 완료가 없습니다")),
-            },
+        #[cfg(test)]
+        BEFORE_ANSWER_READ.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f();
+            }
+        });
+        parts.push(match completed_hook_op_in(env.op.root, &rec.id, env.op.lane, op) {
+            Ok(Some(o)) => format!("이 부서의 {}", o.text()),
+            Ok(None) => format!("이 부서의 훅 작업(작업 {op}): {}", hook_ops_unreadable("그 동작 기록에 완료가 없습니다")),
             Err(why) => format!("이 부서의 훅 작업(작업 {op}): {}", hook_ops_unreadable(&why)),
         });
     }
@@ -2329,7 +2404,7 @@ pub fn recheck_lane_in(
     if !in_force(&rec) || !concerns_lane(&rec, lane) {
         return Err(RepairError::Precondition(format!("{}: 이 부서에 적용할 수리가 아닙니다('{}')", id.as_str(), rec.state.label_ko())));
     }
-    let Some(_guard) = super::guard::RepairGuard::try_take(root, id) else {
+    let Some(guard) = super::guard::RepairGuard::try_take(root, id) else {
         return Err(RepairError::Locked(format!("{}: {}", id.as_str(), super::guard::BUSY)));
     };
     let stored = ledger::read_lane_in(root, id, lane)?
@@ -2405,7 +2480,11 @@ pub fn recheck_lane_in(
             // IQ1 + IQ2 + IV4: the checked publication (the stamp measured again; a deleting repair's
             // tombstones in the same unit as the 검증됨 row)
             match publish(env, &rec, Some(&stored), &row, Publication::checked(&stamp, true))? {
-                Published::Written => Ok(Rechecked { state: LaneState::Verified, changed: recheck_changed(env, &rec, true, hook_op.as_deref()) }),
+                Published::Written => {
+                    // JL1 (c): the answer's read holds nothing — the guard is released first
+                    drop(guard);
+                    Ok(Rechecked { state: LaneState::Verified, changed: recheck_changed(env, &rec, true, hook_op.as_deref()) })
+                }
                 other => Err(refused(other)),
             }
         }
@@ -2414,11 +2493,14 @@ pub fn recheck_lane_in(
             row.reason = format!("합친 뒤의 다시 검사 실패 — {why}").chars().take(400).collect();
             row.updated_at = env.op.now;
             match publish(env, &rec, Some(&stored), &row, Publication::checked(&stamp, false))? {
-                Published::Written => Err(RepairError::CheckFailed(format!(
-                    "{}: 이 부서의 살아 있는 파일에서 검사가 실패해 '충돌'로 남습니다 — {why} · {}",
-                    id.as_str(),
-                    recheck_changed(env, &rec, false, hook_op.as_deref())
-                ))),
+                Published::Written => {
+                    drop(guard);
+                    Err(RepairError::CheckFailed(format!(
+                        "{}: 이 부서의 살아 있는 파일에서 검사가 실패해 '충돌'로 남습니다 — {why} · {}",
+                        id.as_str(),
+                        recheck_changed(env, &rec, false, hook_op.as_deref())
+                    )))
+                }
                 other => Err(refused(other)),
             }
         }
