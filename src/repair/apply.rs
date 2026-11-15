@@ -4086,6 +4086,15 @@ pub fn run_registrar(pack: &Path, dry_run: bool) -> Result<String, RepairError> 
     run_bounded(cmd, RECONCILE_DEADLINE)
 }
 
+/// RULINGS LH2 — the pipes [`run_bounded_exit`] reads: stdin null, stdout and stderr piped (the same
+/// three `run_registrar` sets on its own command). The rehearsal's check children take them from here, so
+/// that `rehearsal.rs` itself configures and reads no child's standard output (RULINGS GA1).
+pub fn bounded_pipes(cmd: &mut std::process::Command) {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+}
+
 /// RULINGS LH2 — what [`run_bounded_exit`] saw of a child that ended within its deadline with nothing
 /// left behind (every pipe read to its end, nothing dropped, no member of its group alive, no problem
 /// met): its exit status, its standard output, the kept bytes of its standard error. The registrar's
