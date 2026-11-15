@@ -75,6 +75,8 @@ impl Rig {
             hook_step: &cys::repair::apply::hook_lines_step,
             claim: &cys::repair::grant::try_claim_autonomous_start,
             prompts: &self.prompts,
+            // batch 7 (T4e · RULINGS HP2): the product's pause — not in force in this rig
+            product_pause: &|| false,
         }
     }
     fn call(&self, now: f64, who: &Caller, sub: &str, p: Value) -> Result<Value, VerbError> {
