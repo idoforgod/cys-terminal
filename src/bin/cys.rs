@@ -49613,7 +49613,6 @@ mod tests {
     /// vendor file the update DID replace is put back. Driven through the library's hidden test seam (RULINGS KA4).
     /// Red on base8: the roll-back wrote the backup's schedule back and the job was gone.
     #[test]
-    #[ignore = "WJ1 red on base8's roll-back — un-ignored with the fix"]
     fn wj1_schedule_job_added_after_the_backup_survives_the_rollback() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let s0 = "{\n  \"jobs\": [\n    {\n      \"id\": \"base-only-job\",\n      \"action\": \"command\",\n      \"command\": \"true\",\n      \"every_minutes\": 60\n    }\n  ]\n}\n";
