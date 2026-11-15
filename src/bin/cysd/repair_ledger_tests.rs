@@ -4673,3 +4673,115 @@ fn eg1_a_failed_lookup_refuses_like_same() {
         "two existing files with two identities are different"
     );
 }
+
+/// WW1 (RULINGS JV1): does the volume that holds `dir` give one file to two spellings that differ by
+/// letter case? Measured on the test's own temporary volume (written through one spelling, read
+/// through the other) — never assumed from the platform.
+fn ww1_case_blind_volume(dir: &Path) -> bool {
+    let lower = dir.join("ww1-case-probe.txt");
+    let _ = std::fs::write(&lower, b"ww1\n");
+    let same = std::fs::read(dir.join("WW1-CASE-PROBE.TXT")).is_ok_and(|b| b == b"ww1\n");
+    let _ = std::fs::remove_file(&lower);
+    same
+}
+
+/// WW1 (RULINGS JV1 · whole-diff review WD-WIN): a repair that names an EXISTING file in another
+/// letter case on a volume that does not distinguish case enters the ledger under the name the file
+/// system gives that file. Through the real verbs: `begin` with `BIN/A.py` → the seat deletes it under
+/// its own spelling → record / verify / commit → the record, the tombstone and the CLI's JSON
+/// (`cys repair tombstones --json` prints `TombstoneFile` — `src/bin/cys/repair_cli.rs`
+/// `tombstones_local_in`) carry `bin/a.py`; the install's exact look-up then keeps the file absent with
+/// the verdict naming the repair (and the preflight's exact `tombstoned_file("bin/a.py")` finds it).
+/// A case-sensitive temporary volume has no case alias of an existing file — skipped with the reason.
+#[test]
+fn ww1_an_existing_target_enters_the_ledger_under_its_on_disk_name() {
+    let r = rig("ww1");
+    if !ww1_case_blind_volume(&r.pack) {
+        eprintln!(
+            "SKIPPED ww1_an_existing_target_enters_the_ledger_under_its_on_disk_name: the temporary volume distinguishes letter case — no case alias of an existing file exists there"
+        );
+        return;
+    }
+    let w = seat(3, "worker");
+    let id = r
+        .call(T0, &w, "begin", json!({"trigger": "owner_order", "files": ["BIN/A.py"]}))
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // the seat deletes it under the spelling it typed
+    std::fs::remove_file(r.pack.join("BIN/A.py")).unwrap();
+    assert!(!r.pack.join("bin/a.py").exists());
+    r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "delete it"})).unwrap();
+    r.call(
+        T0 + 2.0,
+        &seat(7, "reviewer-codex"),
+        "attest_verify",
+        json!({"repair": id, "verdict": "pass", "note": "gone is right"}),
+    )
+    .unwrap();
+    r.call(T0 + 3.0, &w, "commit", json!({"repair": id})).unwrap();
+    // every fact of the chain, measured first and asserted together (a red shows all of them)
+    let rels: Vec<String> = r.record_of(&id).files.iter().map(|f| f.rel.clone()).collect();
+    let ts = cys::repair::tombstones::load_in(&r.root, &r.lane).unwrap();
+    let tomb: Vec<(String, String)> = ts.iter().map(|t| (t.rel.clone(), t.repair.as_str().to_string())).collect();
+    // what `cys repair tombstones --json` prints (the preflight's `lane_tombstones` reads exactly this)
+    let printed = serde_json::to_string(&cys::repair::tombstones::TombstoneFile {
+        schema: cys::repair::REPAIR_SCHEMA,
+        lane: r.lane.clone(),
+        tombstones: ts.clone(),
+    })
+    .unwrap();
+    // the install's look-up is exact (vendor spelling)
+    let src = cys::pack::UpdateSources::none().with_tombstones(ts);
+    let facts = cys::pack::UpdateFacts {
+        tombstoned: src.tombstone_for("bin/a.py").map(str::to_string),
+        ..Default::default()
+    };
+    let verdict = cys::pack::decide_file_action_with(
+        "bin/a.py",
+        "print('a')\n",
+        false,
+        None,
+        None,
+        false,
+        cys::pack::PackScope::Base,
+        None,
+        &facts,
+    );
+    assert_eq!(
+        (rels, tomb, printed.contains("\"rel\":\"bin/a.py\""), verdict),
+        (
+            vec!["bin/a.py".to_string()],
+            vec![("bin/a.py".to_string(), id.clone())],
+            true,
+            cys::pack::FileAction::KeepAbsent { repair: id.clone() }
+        ),
+        "record rels · tombstone · the CLI's JSON names the vendor spelling · the install's verdict — {printed}"
+    );
+}
+
+/// WW1 (RULINGS JV1) controls through `begin` (every volume): the real spelling is recorded unchanged;
+/// an absent target keeps the typed spelling (also its folder part); a link in the chain is still
+/// refused by the door's own rule (AW3 (b)) — nothing that is refused today is accepted, nothing that
+/// is accepted today is refused.
+#[test]
+fn ww1_controls_through_begin() {
+    let w = seat(3, "worker");
+    let rels_of = |r: &Rig, files: &[&str]| -> Result<Vec<String>, VerbError> {
+        let v = r.call(T0, &w, "begin", json!({"trigger": "owner_order", "files": files}))?;
+        let id = v["repair"].as_str().unwrap().to_string();
+        Ok(r.record_of(&id).files.iter().map(|f| f.rel.clone()).collect())
+    };
+    let r = rig("ww1c1");
+    assert_eq!(rels_of(&r, &["bin/a.py"]).unwrap(), ["bin/a.py"], "the real spelling is unchanged");
+    let r = rig("ww1c2");
+    assert_eq!(rels_of(&r, &["BIN/New.py"]).unwrap(), ["BIN/New.py"], "an absent target keeps the typed spelling");
+    #[cfg(unix)]
+    {
+        let r = rig("ww1c3");
+        std::os::unix::fs::symlink(r.pack.join("bin"), r.pack.join("lnk")).unwrap();
+        assert!(rels_of(&r, &["lnk/A.py"]).is_err(), "a link in the chain is still refused by the door");
+        assert!(rels_of(&r, &["lnk/a.py"]).is_err());
+    }
+}
