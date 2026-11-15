@@ -579,7 +579,8 @@ fn print_ok(out: &mut dyn Write, verb: &str, v: &Value, json_out: bool) {
                 },
                 _ => format!(" · 전파 완료 판정 불가({})", s(v, "propagation_note")),
             }
-        ),
+        )
+        .and_then(|_| lane_reason_lines(out, v)),
         "status" => writeln!(
             out,
             "레인 {} — 수리 {}건 · 열린 결함 {}건{}",
@@ -693,6 +694,17 @@ fn t6_request(cmd: &RepairCmd) -> Option<(&'static str, Value)> {
 /// T6 · RULINGS GK3 / GV3 (CCR-T6-2 — the status rendering only): the owner notices closed "not
 /// confirmed" (handed out three times without their receiver's confirmation) and a notice state the
 /// daemon could not read are printed in the ordinary output of `cys repair status`.
+/// RULINGS IK2 (T7b): one line per department row that carries a reason — `  <레인>: <상태> — <까닭>`.
+fn lane_reason_lines(out: &mut dyn Write, v: &Value) -> std::io::Result<()> {
+    for row in v.get("lane_rows").and_then(|x| x.as_array()).into_iter().flatten() {
+        let reason = s(row, "reason");
+        if !reason.is_empty() {
+            writeln!(out, "  {}: {} — {reason}", s(row, "lane"), s(row, "state_label"))?;
+        }
+    }
+    Ok(())
+}
+
 fn status_notice_lines(out: &mut dyn Write, v: &Value) -> std::io::Result<()> {
     match v.get("notices_not_confirmed") {
         Some(Value::Array(keys)) if !keys.is_empty() => {
@@ -2060,6 +2072,20 @@ mod tests {
         let cmd = parse(&["gate", "--lane", "base", "--json"]).unwrap();
         assert!(is_local(&cmd));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// RULINGS IK2: the readable `status <R>` prints one line per department row that carries a reason.
+    #[test]
+    fn status_prints_each_rows_reason() {
+        let v = json!({"repair": "R-3", "state_label": "시험 기간", "classification_label": "일반", "attempt": 1, "max_rounds": 3,
+                       "lanes": {"base": "검증됨", "dept-a": "충돌"}, "propagation_complete": false,
+                       "lane_rows": [{"lane": "base", "state_label": "검증됨", "reason": ""},
+                                     {"lane": "dept-a", "state_label": "충돌", "reason": "사본 검사 실패 — 살아 있는 파일은 바꾸지 않았습니다"}]});
+        let mut out = Vec::new();
+        print_ok(&mut out, "status", &v, false);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\n  dept-a: 충돌 — 사본 검사 실패 — 살아 있는 파일은 바꾸지 않았습니다\n"), "{text}");
+        assert!(!text.contains("  base:"), "{text}");
     }
 
     /// RULINGS IK1 (blocking — queue blocking): every key `lane::lane_key` makes for a department whose

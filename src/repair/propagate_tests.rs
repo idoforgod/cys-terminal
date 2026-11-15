@@ -206,6 +206,7 @@ fn committed_in_hq(r: &Rig, id: &RepairId, class: Classification, rel: &str, pre
         merge_base: Vec::new(),
         merge_lock: None,
         merge_attempt: 0,
+        reason: String::new(),
         updated_at: T0 - 5.0,
     };
     ledger::write_lane_durable_in(&r.root, &row).unwrap();
@@ -1010,6 +1011,39 @@ fn no_committed_copy_is_a_conflict_with_the_true_reason() {
     let row = r.row(&id, DEPT).unwrap();
     assert_eq!(row.state, LaneState::Conflict);
     assert!(t.rows.iter().any(|(_, _, why)| why.contains("결과 사본")), "{t:?}");
+    // RULINGS IK2: the true reason is KEPT on the row (status and the merge ticket show it)
+    assert!(row.reason.contains("결과 사본") && row.reason.contains("바이트를 마련하지 못했습니다"), "{}", row.reason);
+}
+
+/// RULINGS IK2 — the reviewer's sequence: a department's copy-check TIMES OUT (or cannot run); the row
+/// is 충돌 and its reason — kept on the row — says that R's bytes never arrived (the live file is
+/// untouched), so the worker's merge ticket and `status` say it; a row left 대기 by a persistent cause
+/// keeps that cause too, and a passing cause (the lock held) is not written.
+#[test]
+fn a_rows_reason_is_kept_on_the_row() {
+    let r = rig("ik2");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    let d = doubles();
+    d.pass.set(false); // the copy-check fails (a timeout or "cannot run" takes the same path with its own words)
+    tick(&r, DEPT, &d, &fid(1));
+    let row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Conflict);
+    assert!(row.reason.starts_with("사본 검사 실패 — 살아 있는 파일은 바꾸지 않았습니다"), "{}", row.reason);
+    assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"old\n");
+    // a 대기 row left by a cause that persists (the generation cannot be read) keeps it
+    let r2 = rig("ik2b");
+    committed_in_hq(&r2, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r2.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    std::fs::remove_file(r2.dept.join(".pack-version")).unwrap();
+    tick(&r2, DEPT, &doubles(), &fid(1));
+    let row = r2.row(&id, DEPT).unwrap();
+    assert_eq!((row.state, row.reason.as_str()), (LaneState::Pending, "팩 세대를 알 수 없어 이번 차례에는 적용하지 않습니다"));
+    let before = std::fs::read(ledger::lane_path_in(&r2.root, &id, &lane(DEPT))).unwrap();
+    tick(&r2, DEPT, &doubles(), &fid(1));
+    assert_eq!(std::fs::read(ledger::lane_path_in(&r2.root, &id, &lane(DEPT))).unwrap(), before, "the same reason is not written again");
+    assert!(is_passing_cause(LOCK_BUSY_ROW) && !is_passing_cause(RECORD_CHANGED));
 }
 
 /// A mode-only change needs no foreign bytes: the lane's own bytes with the result's mode.

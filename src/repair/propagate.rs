@@ -668,6 +668,7 @@ fn tick_body(env: &LaneEnv<'_>, pass: PassOutcome, report: &mut TickReport) -> R
     let bound = Bound::now(env.op.pack);
     let mut complete = true;
     for rec in &recs {
+        let left_before = report.left.len();
         match decide(env, rec, &bound, report) {
             Ok(Some(st)) if matches!(st, LaneState::Applied | LaneState::Verified) => {}
             Ok(_) => complete = false,
@@ -676,6 +677,12 @@ fn tick_body(env: &LaneEnv<'_>, pass: PassOutcome, report: &mut TickReport) -> R
                 complete = false;
                 report.left.push((rec.id.clone(), format!("{e:?}")));
             }
+        }
+        // RULINGS IK2: why a row was left as it was is kept ON the row (a persistent cause — a
+        // generation that cannot be read, an error of the engine — would otherwise hold a lane with no
+        // visible reason); a passing cause (the lock held, another writer, the guard) is only logged
+        if let Some((_, why)) = report.left[left_before..].iter().rev().find(|(_, w)| !is_passing_cause(w)) {
+            note_reason(env, &rec.id, why);
         }
     }
     if complete {
@@ -709,6 +716,7 @@ fn new_row(id: &RepairId, lane: &LaneKey, now: f64) -> LaneRecord {
         merge_base: Vec::new(),
         merge_lock: None,
         merge_attempt: 0,
+        reason: String::new(),
         updated_at: now,
     }
 }
@@ -740,6 +748,25 @@ fn record_unchanged(env: &LaneEnv<'_>, rec: &RepairRecord) -> bool {
 pub const RECORD_CHANGED: &str = "이 결정 뒤에 수리 기록이 바뀌었습니다(되돌림·대체·다시 확정) — 이 부서에는 아무것도 쓰지 않았고 다음 차례에 새로 결정합니다";
 /// The sentence of a publication that found the pack-apply lock held (IK3).
 pub const LOCK_BUSY_ROW: &str = "다른 적용이나 업데이트가 팩 적용 잠금을 쥐고 있어 이 행은 다음 차례에 씁니다";
+
+/// A cause that passes by itself at a later tick (logged, not kept on the row — IK2).
+fn is_passing_cause(why: &str) -> bool {
+    why == LOCK_BUSY_ROW || why.starts_with("다른 작성자가") || why.contains(super::guard::BUSY) || why.starts_with("팩 적용 잠금을 확인할 수 없습니다")
+}
+
+/// RULINGS IK2 — keeps `why` as the reason of this lane's EXISTING row of `id` (only when it differs —
+/// one write per new reason, never one per tick). A row that cannot be read or written keeps its old
+/// reason (the job log still prints the new one).
+fn note_reason(env: &LaneEnv<'_>, id: &RepairId, why: &str) {
+    let why: String = why.chars().take(400).collect();
+    let _ = update_row(env.op.root, env.op.lane, id, env.locked, env.op.now, &|r| {
+        if r.reason == why {
+            return false;
+        }
+        r.reason = why.clone();
+        true
+    }); // a note only: the job log carries the reason whatever happens here
+}
 
 /// What a publication did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1012,6 +1039,7 @@ fn finish(
     report: &mut TickReport,
 ) -> Result<Option<LaneState>, RepairError> {
     row.state = state;
+    row.reason = why.chars().take(400).collect(); // IK2: the reason travels with the row
     if state == LaneState::Conflict && row.conflict_live.is_empty() {
         // R1: the live states at the conflict (display; an unreadable member leaves the list empty)
         if let Ok(l) = live_states(env.op.pack, rec) {
@@ -1246,8 +1274,10 @@ fn decide_pending(
         return finish(env, rec, stored, row, LaneState::Conflict, "이 부서에서 승인되어 적용된 수리의 내용이 지금 살아 있지 않습니다 — 다시 적용하려면 이 부서의 수리로 후보·리뷰어 두 서명·주인의 최종 승인을 거칩니다(cys repair status)", report);
     }
     if *bound == Bound::Unknown {
-        report.left.push((rec.id.clone(), "팩 세대를 알 수 없어 이번 차례에는 적용하지 않습니다".into()));
+        let why = "팩 세대를 알 수 없어 이번 차례에는 적용하지 않습니다";
+        report.left.push((rec.id.clone(), why.into()));
         if stored.is_none() {
+            row.reason = why.into();
             publish_row(env, rec, None, &row, report)?;
         }
         return Ok(None);
@@ -1662,8 +1692,10 @@ fn apply_general(
         DoorEnd::Applied(r) => r,
         DoorEnd::Conflict(why) => return finish(env, rec, stored, row, LaneState::Conflict, &why, report),
         DoorEnd::Left(why, new_row) => {
-            report.left.push((rec.id.clone(), why));
+            report.left.push((rec.id.clone(), why.clone()));
             if new_row && stored.is_none() {
+                let mut row = row;
+                row.reason = why.chars().take(400).collect();
                 publish_row(env, rec, None, &row, report)?;
             }
             return Ok(None);
@@ -1877,6 +1909,7 @@ pub fn recheck_lane_in(
             row.merge_lock = None;
             row.conflict_live.clear();
             row.probation = None;
+            row.reason = "합친 뒤 이 부서의 살아 있는 파일에서 검사 통과(recheck)".into();
             row.updated_at = env.op.now;
             if !write_row_if(env, Some(&stored), &row)? {
                 return Err(RepairError::Locked(format!("{}: 이 부서의 행이 그 사이 바뀌었습니다 — 다시 하세요", id.as_str())));
@@ -1885,6 +1918,7 @@ pub fn recheck_lane_in(
         }
         Err(why) => {
             row.conflict_live = canon_list(&live);
+            row.reason = format!("합친 뒤의 다시 검사 실패 — {why}").chars().take(400).collect();
             row.updated_at = env.op.now;
             write_row_if(env, Some(&stored), &row)?;
             Err(RepairError::CheckFailed(format!("{}: 이 부서의 살아 있는 파일에서 검사가 실패해 '충돌'로 남습니다 — {why}", id.as_str())))
