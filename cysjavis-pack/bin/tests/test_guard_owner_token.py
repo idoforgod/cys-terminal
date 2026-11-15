@@ -29,6 +29,16 @@
      MultiEdit · NotebookEdit · tee · cp · sed -i · >> · cd 뒤의 상대 경로 · 심링크 너머)도 시험한다. 좌석이 쓰는
      자리는 수리의 작업 사본 `R-<번호>/staging/`(U3) 하나뿐이라 그곳은 통과하고, 장부를 읽기만 하는 명령도 통과한다.
      장부의 자리는 훅의 환경 변수(CYS_LOCAL_DIR · CYS_PACK_DIR · HOME)로 옮겨지지 않는다.
+ 12  낱말의 자리는 셸이 닿는 대로 잰다(RULINGS ID1): 작업 사본으로 cd 한 뒤 ../../ 로 빠져나온 복사 · pushd · cd 두 번 ·
+     cd 뒤 상대 리다이렉트는 막히고, 공백이 든 장부 자리(이 훅을 "<tmp>/space home/pack/hooks/" 에 복사)도 Write ·
+     > · >> · cp · tee · mv · sed -i · 역슬래시로 띄운 공백 · cd 뒤 ../../ 로 막히며, 그 자리의 작업 사본은 통과한다.
+ 13  읽기는 쓰기가 아니다(RULINGS ID3): 장부를 읽는 ls · cat · grep · head 에 2>/dev/null · 2>&1 · 파이프 · 임시 파일로의
+     리다이렉트, 장부 밖으로의 복사, 따옴표 글 안의 언급은 통과하고(cd 뒤와 공백 자리에서도), 장부 안으로의 > · >> ·
+     복사 · cp -t · tee · 장부 밖으로의 mv(원본을 지운다) · 읽어서 장부 안으로의 리다이렉트는 곧은 자리 · 공백 자리 ·
+     cd 뒤 모두 막힌다.
+ 14  강등된 백스톱(RULINGS ID2 — 인터프리터 없음 · 판정기 크래시 · 인터프리터와 jq 와 grep 이 다 없음)도 장부 쓰기를
+     막고, 장부를 쓰지 않는 호출(작업 사본 · 무관한 Write · 무관한 리다이렉트 · ls · cat · cp · grep · 장부 읽기)은
+     결코 막지 않는다(치명 4).
 밀폐: 가짜 `cys` 스텁(PATH 선두) · 임시 디렉터리의 진짜 unix 소켓 파일 · GUARD_TEST_MODE 로 자율주행 깃발을
 임시 경로에 둔다 · HOME 임시. 데몬·라이브 팩 무접촉.
 시간(RULINGS FV1 · FZ3): 어떤 경과 시간도 한도와 비교하지 않는다 — 한도에 대한 판정은 가드가 밝힌 값만 읽는다.
@@ -548,6 +558,51 @@ def main():
                 if not ledger_refused(p, "cys repair"):
                     bad.append("%s rc=%d %r" % (how, p.returncode, p.stderr[-160:]))
             check("13 쓰기는 막힌다: %s (곧은 자리 · 공백 자리 · cd 뒤)" % label, not bad, "; ".join(bad))
+
+        # 14 — RULINGS ID2 (T4e round 2): the degraded backstop (no interpreter · a parser that crashes) keeps the ledger rule
+        #      in pure shell — and NEVER refuses a call that does not name the ledger (fatal class 4)
+        crash = os.path.join(root, "bin-crash", "python-crash")
+        os.makedirs(os.path.dirname(crash))
+        with open(crash, "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(crash, 0o755)
+        # and a third: no interpreter on a PATH that has neither jq nor grep (the backstop's rule is pure shell)
+        bare = os.path.join(root, "bin-bare")
+        os.makedirs(bare)
+        for t in ("sh", "tr", "sed", "mktemp", "cat", "rm", "dirname", "basename", "head", "uname"):
+            w = shutil.which(t)
+            if w:
+                os.symlink(w, os.path.join(bare, t))
+        degraded = (("인터프리터 없음", {"GUARD_FORCE_NOPY": "1"}), ("판정기 크래시", {"CYS_PY": crash}),
+                    ("인터프리터·jq·grep 없음", {"GUARD_FORCE_NOPY": "1", "PATH": bare}))
+        tok_path = os.path.join(ledger, "owner-tokens", "%s.json" % sha)
+        for mode, extra in degraded:
+            bad = []
+            for label, tool, ti in (
+                    ("주인 지시 표 Write", "Write", {"file_path": tok_path, "content": "{}"}),
+                    ("grant.json Write", "Write", {"file_path": os.path.join(ledger, "grant.json"), "content": "{}"}),
+                    ("NotebookEdit", "NotebookEdit", {"notebook_path": os.path.join(ledger, "grant.json"), "new_source": "x"}),
+                    ("리다이렉트", "Bash", {"command": "echo on > %s" % os.path.join(ledger, "grant.json")}),
+                    ("cp 안으로", "Bash", {"command": "cp %s %s" % (tmpf, tok_path)}),
+                    ("공백 자리 리다이렉트", "Bash", {"command": 'echo on > "%s/grant.json"' % sl})):
+                p, _ = run(ti, tool=tool, rc=0, extra=extra, guard=sguard if "공백" in label else None)
+                if not (p.returncode == 2 and "수리 장부" in p.stderr and "cys repair" in p.stderr and "백스톱" in p.stderr):
+                    bad.append("%s rc=%d %r" % (label, p.returncode, p.stderr[-160:]))
+            check("14 %s 백스톱도 장부 쓰기를 막는다" % mode, not bad, "; ".join(bad))
+            bad = []
+            for label, tool, ti in (
+                    ("작업 사본 Write", "Write", {"file_path": os.path.join(ledger, "R-1", "staging", "x.md"), "content": "x"}),
+                    ("무관한 Write", "Write", {"file_path": os.path.join(out, "a.txt"), "content": "x"}),
+                    ("무관한 리다이렉트", "Bash", {"command": "echo x > %s" % os.path.join(out, "b.txt")}),
+                    ("ls", "Bash", {"command": "ls -la"}),
+                    ("cat", "Bash", {"command": "cat /etc/hosts"}),
+                    ("무관한 cp", "Bash", {"command": "cp %s %s" % (tmpf, os.path.join(out, "c.json"))}),
+                    ("grep 2>/dev/null", "Bash", {"command": "grep -r foo . 2>/dev/null | head"}),
+                    ("장부 읽기", "Bash", {"command": "cat %s" % os.path.join(ledger, "grant.json")})):
+                p, _ = run(ti, tool=tool, rc=0, extra=extra)
+                if p.returncode != 0:
+                    bad.append("%s rc=%d %r" % (label, p.returncode, p.stderr[-160:]))
+            check("14 %s 백스톱은 장부를 쓰지 않는 호출을 막지 않는다(치명 4)" % mode, not bad, "; ".join(bad))
 
         # 10 — RULINGS FZ2: every stub this test started is gone at its end
         left = [pid for pid in stub_pids if not gone_soon(pid)]

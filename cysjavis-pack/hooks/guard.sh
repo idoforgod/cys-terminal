@@ -1380,11 +1380,87 @@ if [ "$GUARD_ACTIVE" != "1" ] && [ -f "$CONST_TOKEN" ] && [ ! -L "$CONST_TOKEN" 
   fi
 fi
 
+# ★RULINGS ID2 (T4e): 수리 장부 규칙은 강등된 백스톱에서도 순수 셸로 지킨다(규칙 문서처럼). 장부의 자리는 위에서 이 훅의
+#   자리로 구한 GUARD_LEDGER_ROOTS 그대로다. 파일 도구의 경로가 장부 아래이고 `R-<n>/staging/` 이 아니면 막고, 셸 명령의
+#   글에 장부의 자리가 적혀 있고(작업 사본만이 아니고) 백스톱이 보는 쓰기 형태가 있으면 막는다. 장부의 자리를 가리키지
+#   않는 호출은 결코 막지 않는다(치명 4: 모든 것을 막는 강등된 가드는 모든 좌석을 죽인다).
+ledger_rest_is_ledger() {
+  local rest="${1#/}" re='^r-[0-9]+/staging(/|$)'
+  case "$rest" in ..|../*) return 1 ;; esac
+  if [[ $rest =~ $re ]] && [[ $rest != *..* ]]; then return 1; fi
+  return 0
+}
+ledger_backstop_spellings() {
+  local r sp home t
+  home="$(printf '%s' "${HOME:-}" | tr 'A-Z\\' 'a-z/')"; home="${home%/}"
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    sp="$(printf '%s' "$r" | tr 'A-Z\\' 'a-z/')"; sp="${sp%/}"
+    [ -n "$sp" ] || continue
+    printf '%s\n' "$sp"
+    if [ -n "$home" ]; then
+      case "$sp" in "$home"/*) t="${sp#"$home"}"; printf '%s\n' "~$t" "\$home$t" "\${home}$t" ;; esac
+    fi
+  done <<EOF_LEDGER_ROOTS
+$GUARD_LEDGER_ROOTS
+EOF_LEDGER_ROOTS
+}
+ledger_backstop() {
+  local fp="$1" nb="$2" cmd="$3" sps sp p lp s c seg named="" first
+  [ -n "$GUARD_LEDGER_ROOTS" ] || return 0
+  sps="$(ledger_backstop_spellings)"
+  first="$(printf '%s\n' "$GUARD_LEDGER_ROOTS" | sed -n '1p')"
+  local msg="백스톱: 수리 장부(${first})는 데몬이 \`cys repair …\` 동사로만 쓴다 — 좌석이 파일 도구나 셸 쓰기로 장부를 쓰는 것은 역할과 상관없이 막는다(좌석이 쓰는 자리는 수리의 작업 사본 \`R-<번호>/staging/\` 하나)."
+  for p in "$fp" "$nb"; do
+    [ -n "$p" ] || continue
+    lp="$(printf '%s' "$p" | tr 'A-Z\\' 'a-z/')"
+    while IFS= read -r sp; do
+      [ -n "$sp" ] || continue
+      case "$lp" in "$sp"|"$sp"/*) ledger_rest_is_ledger "${lp#"$sp"}" && emit_deny "$msg" ;; esac
+    done <<EOF_LEDGER_SPS
+$sps
+EOF_LEDGER_SPS
+  done
+  [ -n "$cmd" ] || return 0
+  local lc; lc="$(printf '%s' "$cmd" | tr 'A-Z\\' 'a-z/')"
+  while IFS= read -r sp; do
+    [ -n "$sp" ] || continue
+    s="$lc"
+    while [[ "$s" == *"$sp"* ]]; do
+      s="${s#*"$sp"}"
+      c="${s:0:1}"
+      case "$c" in
+        ""|/|" "|$'\t'|$'\n'|'"'|"'"|';'|'&'|'|'|'<'|'>'|'('|')')
+          seg="${s%%[[:space:]]*}"; seg="${seg%%[\"\';\&\|\<\>\(\)]*}"
+          if ledger_rest_is_ledger "$seg"; then named=1; break 2; fi ;;
+      esac
+    done
+  done <<EOF_LEDGER_SPS
+$sps
+EOF_LEDGER_SPS
+  [ -n "$named" ] || return 0
+  local wre='>|(^|[[:space:];&|(])(tee|cp|dd|mv|install|ln|truncate|patch|vim|vi|nano|emacs|ex|rm|rmdir|chmod|chown)([[:space:]]|$)|(^|[[:space:];&|(])sed[[:space:]].*-i'
+  if [[ $lc =~ $wre ]]; then
+    emit_deny "$msg"
+  fi
+  return 0
+}
+
 run_loose_backstop() {
   printf '%s\n' "AUTOPILOT GUARD: python3 미가용 → bash 백스톱(LOOSE degraded) 모드" >&2
-  local cmd fp low
-  cmd="$(printf '%s' "$INPUT" | jq -r '.tool_input.command // ""' 2>/dev/null)"
-  fp="$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // ""' 2>/dev/null)"
+  local cmd fp low nb
+  if command -v jq >/dev/null 2>&1; then
+    cmd="$(printf '%s' "$INPUT" | jq -r '.tool_input.command // ""' 2>/dev/null)"
+    fp="$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // ""' 2>/dev/null)"
+    nb="$(printf '%s' "$INPUT" | jq -r '.tool_input.notebook_path // ""' 2>/dev/null)"
+  else
+    # ★RULINGS ID2: jq 없이도 장부 규칙이 서도록 경로·명령을 글에서 거칠게 뽑는다(이 둘은 장부 판정에만 쓴다)
+    cmd="$(printf '%s' "$INPUT" | sed -n 's/.*"command"[[:space:]]*:[[:space:]]*"\(.*\)".*/\1/p' | sed -n '1p')"
+    fp="$(printf '%s' "$INPUT" | sed -n 's/.*"file_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')"
+    nb="$(printf '%s' "$INPUT" | sed -n 's/.*"notebook_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')"
+  fi
+  ledger_backstop "$fp" "$nb" "$cmd"
+  if ! command -v jq >/dev/null 2>&1; then cmd=""; fp=""; fi
   low="$(printf '%s' "$cmd" | tr 'A-Z' 'a-z' | tr -s ' \t' ' ')"
   case "$low" in
     *"git push"*|*"git remote set-url"*|*"git remote remove"*|*"gh release create"*|*"gh pr create"*|*"scp "*)
