@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 pub const REPAIR_JOB_ID: &str = "repair-probation-tick";
 
 /// ★0.15.0 (WS1 · RULINGS KN1): the built-in scheduled jobs NO writer may remove or change (RULINGS AW7 / AY7) — the
-/// ONE definition of "fixed", by the job's id; a field in the user-writable `schedule.json` never decides it. The daemon
+/// ONE definition of "fixed", by the job's id; a field in the user-writable schedule file never decides it. The daemon
 /// restores these jobs whole at its start and at every tick that holds the schedule's lock (`cysd/schedule.rs`); the
 /// CLI's `schedule remove` refuses them (`cys.rs::remove_schedule_job`). Today exactly the repair job; a later safety
 /// job joins by its id here.
