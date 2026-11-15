@@ -1274,6 +1274,13 @@ fn own_apply_evidence(env: &LaneEnv<'_>, rec: &RepairRecord, live: &[(String, Ta
         if op.lane_key != *env.op.lane || !op.finished || op.outcome.as_deref() != Some("applied") || op.pack_generation.as_ref() != Some(gen) {
             continue;
         }
+        // JA1 / IG3: THIS lane's completed hook unit for R (also one T6's recovery completed after a
+        // stop) is evidence that this lane applied R — its row gets the probation bundle (the return of
+        // a hook repair is the re-registration T6's revert does)
+        if op.kind == "hook-unregister" && ledger::hook_lines(rec).next().is_some() {
+            at = Some(at.map_or(op.updated_at, |a| a.max(op.updated_at)));
+            continue;
+        }
         if op.kind != "propagate" {
             continue;
         }
@@ -1427,6 +1434,19 @@ fn decide_pending(
         if let Some(why) = unit.conflict {
             return finish(env, rec, stored, row, LaneState::Conflict, &why, stamp, report);
         }
+        // JA1: a hook unit that began writing has left its trace on the row (its new `stored`)
+        let traced = unit.traced.clone();
+        let stored = match &traced {
+            Some(t) => Some(t),
+            None => stored,
+        };
+        if let Some(t) = &traced {
+            row = t.clone();
+        }
+        if unit.failed {
+            report.rows.push((rec.id.clone(), LaneState::Conflict, unit.trace.clone().unwrap_or_default()));
+            return Ok(Some(LaneState::Conflict));
+        }
         row.merge = None;
         // IG3: "already there" because THIS lane applied R and stopped before its row (evidence: its own
         // completed door operations) → the probation bundle, as if the write had not been interrupted
@@ -1457,7 +1477,15 @@ fn decide_pending(
                 return Ok(None);
             }
         }
-        return check_live(env, stored, row, rec, None, stamp, report);
+        let out = check_live(env, stored, row, rec, None, stamp, report)?;
+        if out.is_none() {
+            // JA1: the row keeps the hook unit's trace — the reason says it and why nothing more was written
+            if let Some(trace) = &unit.trace {
+                let then = report.left.iter().rev().find(|(i, _)| *i == rec.id).map(|(_, w)| w.clone()).unwrap_or_default();
+                report.left.push((rec.id.clone(), after_trace(trace, &then)));
+            }
+        }
+        return Ok(out);
     }
     // interpretation 35: a kept merge result OF THE CURRENT RESULT (the row's recorded base is the
     // record's current result — never after a re-commit, P2 / interpretation 41) that is live again is
@@ -1530,17 +1558,55 @@ fn stamp_guard<'s>(env: &'s LaneEnv<'_>, rec: &'s RepairRecord, stamp: &'s Stamp
     move || stamp.holds(env, rec, true).map_err(str::to_string)
 }
 
-/// What `locked_hook_step` did: `conflict` = the unit failed (the caller publishes 충돌, validated).
+/// RULINGS JA1 — a hook unit that BEGAN its durable writes leaves its trace on the lane's row, whether
+/// or not R is still what the decision saw: called inside the unit's own lock, with no stamp (it
+/// records what THIS lane changed). The row keeps its state (a new one is 대기), or becomes 충돌 when the
+/// unit could not finish; its reason is the trace. Returns the row as written.
+fn record_hook_trace(env: &LaneEnv<'_>, rec: &RepairRecord, stored: Option<&LaneRecord>, trace: &str, failed: bool) -> Result<Option<LaneRecord>, RepairError> {
+    let mut row = match stored {
+        Some(r) => r.clone(),
+        None => new_row(&rec.id, env.op.lane, env.op.now),
+    };
+    if failed {
+        row.state = LaneState::Conflict;
+        if let Ok(l) = live_states(env.op.pack, rec) {
+            row.conflict_live = canon_list(&l);
+        }
+    }
+    row.reason = trace.chars().take(400).collect();
+    row.updated_at = env.op.now;
+    Ok(if write_row_if(env, stored, &row)? { Some(row) } else { None })
+}
+
+/// JA1: the reason of a row that carries a hook unit's trace when the decision's row could not be
+/// published after it (true: the unit DID write — never "nothing was written").
+fn after_trace(trace: &str, then: &str) -> String {
+    let cause = if then == RECORD_CHANGED {
+        "수리 기록이 바뀌었습니다(되돌림·대체·다시 확정)".to_string()
+    } else if then == STATES_CHANGED {
+        "이 부서의 대상 파일·팩 세대·팩 식별 중 하나가 바뀌었습니다".to_string()
+    } else {
+        then.to_string()
+    };
+    format!("{trace} — 그 뒤 {cause} — 이 결정의 나머지는 쓰지 않았고 다음 차례에 새로 결정합니다")
+}
+
+/// What `locked_hook_step` did: `conflict` = the unit failed BEFORE writing (the caller publishes 충돌,
+/// validated); `trace` = the unit began writing — its trace, ALREADY on the row (`traced` = that row,
+/// the caller's new `stored`); `failed` = it began and did not finish (the row is already 충돌).
 #[derive(Default)]
 struct HookUnitDone {
     conflict: Option<String>,
+    trace: Option<String>,
+    traced: Option<LaneRecord>,
+    failed: bool,
 }
 
 /// The hook unit of the "already there" arm and of `recheck` (IZ1 (b)), inside the tried pack-apply
 /// lock: T6's hook step runs with the stamp guard (validated after its dry run, right before its first
 /// durable write); a unit that began writing leaves its trace on the row inside the SAME lock (JA1).
 /// `Err(why)` = not run (the lock held, the stamp changed before the unit's first write): nothing written.
-fn locked_hook_step(env: &LaneEnv<'_>, rec: &RepairRecord, stamp: &Stamp, _stored: Option<&LaneRecord>) -> Result<HookUnitDone, String> {
+fn locked_hook_step(env: &LaneEnv<'_>, rec: &RepairRecord, stamp: &Stamp, stored: Option<&LaneRecord>) -> Result<HookUnitDone, String> {
     if ledger::hook_lines(rec).next().is_none() {
         return Ok(HookUnitDone::default());
     }
@@ -1550,8 +1616,14 @@ fn locked_hook_step(env: &LaneEnv<'_>, rec: &RepairRecord, stamp: &Stamp, _store
             HookOutcome::Nothing => Ok(HookUnitDone::default()),
             HookOutcome::Refused(why) => Err(why),
             HookOutcome::FailedBefore(why) => Ok(HookUnitDone { conflict: Some(why), ..HookUnitDone::default() }),
-            HookOutcome::Done(_) => Ok(HookUnitDone::default()),
-            HookOutcome::FailedAfter(why) => Ok(HookUnitDone { conflict: Some(why) }),
+            HookOutcome::Done(trace) => {
+                let traced = record_hook_trace(env, rec, stored, &trace, false).map_err(|e| format!("{trace} — 그 흔적을 행에 남기지 못했습니다({e:?})"))?;
+                Ok(HookUnitDone { trace: Some(trace), traced, ..HookUnitDone::default() })
+            }
+            HookOutcome::FailedAfter(trace) => {
+                let traced = record_hook_trace(env, rec, stored, &trace, true).map_err(|e| format!("{trace} — 그 흔적을 행에 남기지 못했습니다({e:?})"))?;
+                Ok(HookUnitDone { trace: Some(trace), traced, failed: true, ..HookUnitDone::default() })
+            }
         }
     });
     match ran {
@@ -2064,7 +2136,12 @@ fn door_phase(
             HookOutcome::Refused(why) => return changed(&done, if why == RECORD_CHANGED { RECORD_CHANGED } else { STATES_CHANGED }),
             HookOutcome::FailedBefore(why) => return Ok(DoorEnd::Conflict(why)),
             HookOutcome::Done(trace) => done.push(trace),
-            HookOutcome::FailedAfter(why) => return Ok(DoorEnd::Conflict(why)),
+            HookOutcome::FailedAfter(trace) => {
+                // JA1: it began writing and did not finish — its trace (and every target this phase
+                // already changed) on the row NOW, inside this lock, whatever R is now
+                done.push(trace);
+                return changed_midway(env, stored, row, rec, &done, "훅 등록 해제를 마치지 못했습니다");
+            }
         }
     }
     if let Err(why) = stamp.holds(env, rec, true) {
@@ -2203,7 +2280,13 @@ pub fn recheck_lane_in(
     if let Some(why) = unit.conflict {
         return Err(RepairError::CheckFailed(why));
     }
+    let stored = unit.traced.clone().unwrap_or(stored);
+    if unit.failed {
+        // JA1: the caller's answer says what the row says
+        return Err(RepairError::CheckFailed(format!("{}: {}", id.as_str(), unit.trace.clone().unwrap_or_default())));
+    }
     let mut row = stored.clone();
+    let trace = unit.trace.clone();
     let refused = |p: Published| -> RepairError {
         let why = match p {
             Published::RecordChanged => RECORD_CHANGED.to_string(),
@@ -2213,7 +2296,11 @@ pub fn recheck_lane_in(
             Published::OtherWriter => "이 부서의 행이 그 사이 바뀌었습니다".to_string(),
             Published::Written => String::new(),
         };
-        RepairError::Locked(format!("{}: {why} — 아무것도 쓰지 않았습니다. 다시 하세요", id.as_str()))
+        // JA1: never "nothing was written" after a hook unit that wrote — the answer names its trace
+        match &trace {
+            Some(t) => RepairError::Locked(format!("{}: {} · 행은 그 흔적을 담고 있습니다. 다시 하세요", id.as_str(), after_trace(t, &why))),
+            None => RepairError::Locked(format!("{}: {why} — 아무것도 쓰지 않았습니다. 다시 하세요", id.as_str())),
+        }
     };
     match run_checks(env, &rec, env.op.pack, false) {
         Ok(_) => {
