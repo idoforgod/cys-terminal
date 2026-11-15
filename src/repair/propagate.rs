@@ -666,6 +666,8 @@ fn tick_body(env: &LaneEnv<'_>, pass: PassOutcome, report: &mut TickReport) -> R
     };
     // EJ1: the binding of every apply this tick is born here, once
     let bound = Bound::now(env.op.pack);
+    // IV3: the generation and instance this tick's completeness is judged on
+    let judged = Stamp::of_pack(env);
     let mut complete = true;
     for rec in &recs {
         let left_before = report.left.len();
@@ -686,14 +688,31 @@ fn tick_body(env: &LaneEnv<'_>, pass: PassOutcome, report: &mut TickReport) -> R
         }
     }
     if complete {
-        match read_job_state_checked(root, lane) {
-            FileRead::Value(mut st) if !st.initial_catchup_complete => {
-                st.initial_catchup_complete = true;
-                write_job_state(root, &st)?;
-                report.catchup_completed = true;
+        #[cfg(test)]
+        seam(&BEFORE_CATCHUP, env.op.pack);
+        // IV3: the catch-up record is written inside the tried lock, after the generation and instance
+        // its completeness was judged on were measured again (a difference → not recorded this tick)
+        let ran = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || -> Result<Option<String>, RepairError> {
+            if !judged.pack_holds(env.op.pack, true) {
+                return Ok(Some(format!("따라잡기 완료를 이번 차례에 적지 않습니다 — {STATES_CHANGED}")));
             }
-            FileRead::Value(_) => {}
-            other => report.lines.push(format!("따라잡기 완료를 적지 못했습니다 — 상태 파일 {other:?}")),
+            match read_job_state_checked(root, lane) {
+                FileRead::Value(mut st) if !st.initial_catchup_complete => {
+                    st.initial_catchup_complete = true;
+                    write_job_state(root, &st)?;
+                    Ok(None)
+                }
+                FileRead::Value(_) => Ok(Some(String::new())),
+                other => Ok(Some(format!("따라잡기 완료를 적지 못했습니다 — 상태 파일 {other:?}"))),
+            }
+        });
+        match ran {
+            Ok(Some(Ok(None))) => report.catchup_completed = true,
+            Ok(Some(Ok(Some(line)))) if line.is_empty() => {} // recorded before
+            Ok(Some(Ok(Some(line)))) => report.lines.push(line),
+            Ok(Some(Err(e))) => return Err(e),
+            Ok(None) => report.lines.push(format!("따라잡기 완료를 이번 차례에 적지 않습니다 — {LOCK_BUSY_ROW}")),
+            Err(why) => report.lines.push(format!("따라잡기 완료를 적지 못했습니다 — 팩 적용 잠금을 확인할 수 없습니다 — {why}")),
         }
     }
     Ok(())
@@ -755,47 +774,111 @@ fn is_passing_cause(why: &str) -> bool {
 }
 
 /// RULINGS IK2 — keeps `why` as the reason of this lane's EXISTING row of `id` (only when it differs —
-/// one write per new reason, never one per tick). A row that cannot be read or written keeps its old
-/// reason (the job log still prints the new one).
+/// one write per new reason, never one per tick). IV2: inside the tried pack-apply lock like every
+/// other row write; it is validated by NO stamp, by design — it records why the decision's own writes
+/// were dropped (a changed record, changed states), so it changes nothing but the reason text (no
+/// state, no applied result, no probation). A held lock or a row that cannot be read or written keeps
+/// the old reason (the job log still prints the new one).
 fn note_reason(env: &LaneEnv<'_>, id: &RepairId, why: &str) {
     let why: String = why.chars().take(400).collect();
-    let _ = update_row(env.op.root, env.op.lane, id, env.locked, env.op.now, &|r| {
-        if r.reason == why {
-            return false;
-        }
-        r.reason = why.clone();
-        true
+    let _ = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || {
+        update_row(env.op.root, env.op.lane, id, env.locked, env.op.now, &|r| {
+            if r.reason == why {
+                return false;
+            }
+            r.reason = why.clone();
+            true
+        })
     }); // a note only: the job log carries the reason whatever happens here
 }
 
 /// The sentence of a check result that is not published because what it was made on changed (IQ1).
 pub const STATES_CHANGED: &str = "검사한 뒤 이 부서의 대상 파일·팩 세대·팩 식별 중 하나가 바뀌어 이 검사 결과를 쓰지 않았습니다 — 다음 차례에 새로 결정합니다";
 
-/// RULINGS IQ1 — what a check made OUTSIDE the lock was made on: the measured state of EVERY target of R
-/// (those passed over as "already at the result" included), the pack generation and the pack instance.
-/// Taken right before the check; measured again inside the publication's lock.
+/// RULINGS IV1 — ONE STAMP PER DECISION, TAKEN ONCE, CHECKED AT EVERY WRITE. Fixed when the decision
+/// for a repair is made (the first reading of the record and of the lane's states): R's committed result
+/// (with "in force" read again from the record), the pack's generation and instance, and each target's
+/// measured state (`None` when the decision read no state). Nothing later re-bases it from a fresh
+/// reading; the ONLY change is by this lane's own door — after a door operation the target's state is
+/// what the door itself placed (`placed`). Every write for the decision begins, inside the tried
+/// pack-apply lock, with `holds`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Observed {
-    states: Result<Vec<(String, String)>, String>,
+pub struct Stamp {
+    committed: Vec<(String, String)>,
     generation: Option<PackGeneration>,
     instance: Option<String>,
+    states: Option<Vec<(String, String)>>,
 }
 
-impl Observed {
-    fn now(env: &LaneEnv<'_>, rec: &RepairRecord) -> Observed {
-        Observed {
-            states: live_states(env.op.pack, rec).map(|l| canon_list(&l)),
-            generation: apply::pack_generation_checked(env.op.pack).ok(),
-            instance: match read_pack_instance(env.op.pack) {
-                FileRead::Value(id) => Some(id),
-                _ => None,
-            },
+impl Stamp {
+    /// The pack's generation and instance as they are now.
+    fn pack_now(pack: &Path) -> (Option<PackGeneration>, Option<String>) {
+        let generation = apply::pack_generation_checked(pack).ok();
+        let instance = match read_pack_instance(pack) {
+            FileRead::Value(id) => Some(id),
+            _ => None,
+        };
+        (generation, instance)
+    }
+    /// The stamp of a decision on `rec` made on `live` (`None`: the decision read no state).
+    fn take(env: &LaneEnv<'_>, rec: &RepairRecord, live: Option<&[(String, TargetState)]>) -> Stamp {
+        let (generation, instance) = Stamp::pack_now(env.op.pack);
+        Stamp { committed: rec.committed.clone(), generation, instance, states: live.map(canon_list) }
+    }
+    /// The catch-up's stamp (IV3): the generation and instance the tick's completeness is judged on.
+    fn of_pack(env: &LaneEnv<'_>) -> Stamp {
+        let (generation, instance) = Stamp::pack_now(env.op.pack);
+        Stamp { committed: Vec::new(), generation, instance, states: None }
+    }
+    /// After a door operation of THIS lane: the target's state is what the door itself placed.
+    fn placed(&mut self, rel: &str, st: &TargetState) {
+        if let Some(e) = self.states.as_mut().and_then(|v| v.iter_mut().find(|(r, _)| r == rel)) {
+            e.1 = st.canon();
         }
     }
-    /// The same, and every part of it known (an unreadable part is never "unchanged").
-    fn holds_now(&self, env: &LaneEnv<'_>, rec: &RepairRecord) -> bool {
-        self.states.is_ok() && self.generation.is_some() && self.instance.is_some() && *self == Observed::now(env, rec)
+    /// The generation and instance measured again; `strict` = every part must also be KNOWN (a check's
+    /// result, a door operation, the catch-up — an unreadable part is never "unchanged").
+    fn pack_holds(&self, pack: &Path, strict: bool) -> bool {
+        if strict && (self.generation.is_none() || self.instance.is_none()) {
+            return false;
+        }
+        Stamp::pack_now(pack) == (self.generation.clone(), self.instance.clone())
     }
+    /// Inside the tried lock: the record (in force, the same committed result), the generation and
+    /// instance, and every target's state measured again. `Err` = why nothing is written.
+    fn holds(&self, env: &LaneEnv<'_>, rec: &RepairRecord, strict: bool) -> Result<(), &'static str> {
+        if !record_unchanged(env, rec) || rec.committed != self.committed {
+            return Err(RECORD_CHANGED);
+        }
+        if !self.pack_holds(env.op.pack, strict) {
+            return Err(STATES_CHANGED);
+        }
+        if let Some(states) = &self.states {
+            match live_states(env.op.pack, rec) {
+                Ok(l) if canon_list(&l) == *states => {}
+                _ => return Err(STATES_CHANGED),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only (IV1 / IV3): a seam run right after a decision's stamp was taken (the pack path), right
+    /// after the door phase released its lock, and right before the catch-up record.
+    pub(crate) static AFTER_DECISION: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static AFTER_DOOR_PHASE: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static BEFORE_CATCHUP: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn seam(which: &'static std::thread::LocalKey<std::cell::RefCell<Option<Box<dyn Fn(&Path)>>>>, pack: &Path) {
+    which.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f(pack);
+        }
+    });
 }
 
 /// What a publication did.
@@ -810,12 +893,23 @@ enum Published {
     NotWritten(String),
 }
 
-/// How a row is published: plain (`Plain`) or as the result of a check made outside the lock
-/// (`Checked` — IQ1: only for the state it checked; IQ2: with the tombstones of a deleting repair).
+/// How a row is published (IV1: ALWAYS against the decision's stamp): `checked` = the result of a check
+/// made outside the lock (IQ1 — every part of the stamp must be known and unchanged); `tombstones` = the
+/// tombstones of a deleting repair are completed in the same unit as the row (IQ2).
 #[derive(Clone, Copy)]
-enum Publication<'a> {
-    Plain,
-    Checked { seen: &'a Observed, tombstones: bool },
+struct Publication<'a> {
+    stamp: &'a Stamp,
+    checked: bool,
+    tombstones: bool,
+}
+
+impl<'a> Publication<'a> {
+    fn plain(stamp: &'a Stamp) -> Publication<'a> {
+        Publication { stamp, checked: false, tombstones: false }
+    }
+    fn checked(stamp: &'a Stamp, tombstones: bool) -> Publication<'a> {
+        Publication { stamp, checked: true, tombstones }
+    }
 }
 
 /// RULINGS IK3 + IG5 — a row decided OUTSIDE the lock is PUBLISHED inside it: the pack-apply lock is
@@ -823,19 +917,17 @@ enum Publication<'a> {
 /// only when no other writer changed it meanwhile. ★Never called while this thread holds the lock.
 fn publish(env: &LaneEnv<'_>, rec: &RepairRecord, stored: Option<&LaneRecord>, row: &LaneRecord, how: Publication<'_>) -> Result<Published, RepairError> {
     let ran = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || -> Result<Published, RepairError> {
-        if !record_unchanged(env, rec) {
-            return Ok(Published::RecordChanged);
+        // IV1: the decision's stamp measured AGAIN inside this lock — the record, the generation and
+        // instance, every target's state (IQ1 for a check's result: every part known)
+        match how.stamp.holds(env, rec, how.checked) {
+            Ok(()) => {}
+            Err(why) if why == RECORD_CHANGED => return Ok(Published::RecordChanged),
+            Err(_) => return Ok(Published::StatesChanged),
         }
-        if let Publication::Checked { seen, tombstones } = how {
-            // IQ1: measured AGAIN — the targets, the generation, the instance — inside this lock
-            if !seen.holds_now(env, rec) {
-                return Ok(Published::StatesChanged);
-            }
-            // IQ2: the tombstones of a deleting repair, in the same unit as the row (after both checks)
-            if tombstones {
-                if let Err(why) = ensure_tombstones(env, rec) {
-                    return Ok(Published::NotWritten(why));
-                }
+        // IQ2: the tombstones of a deleting repair, in the same unit as the row (after the stamp)
+        if how.tombstones {
+            if let Err(why) = ensure_tombstones(env, rec) {
+                return Ok(Published::NotWritten(why));
             }
         }
         Ok(if write_row_if(env, stored, row)? { Published::Written } else { Published::OtherWriter })
@@ -848,8 +940,8 @@ fn publish(env: &LaneEnv<'_>, rec: &RepairRecord, stored: Option<&LaneRecord>, r
 }
 
 /// `publish`, with the reason of a row NOT written put in the report (`left`); `true` = written.
-fn publish_row(env: &LaneEnv<'_>, rec: &RepairRecord, stored: Option<&LaneRecord>, row: &LaneRecord, report: &mut TickReport) -> Result<bool, RepairError> {
-    publish_row_as(env, rec, stored, row, Publication::Plain, report)
+fn publish_row(env: &LaneEnv<'_>, rec: &RepairRecord, stored: Option<&LaneRecord>, row: &LaneRecord, stamp: &Stamp, report: &mut TickReport) -> Result<bool, RepairError> {
+    publish_row_as(env, rec, stored, row, Publication::plain(stamp), report)
 }
 
 fn publish_row_as(env: &LaneEnv<'_>, rec: &RepairRecord, stored: Option<&LaneRecord>, row: &LaneRecord, how: Publication<'_>, report: &mut TickReport) -> Result<bool, RepairError> {
@@ -934,8 +1026,10 @@ fn decide(env: &LaneEnv<'_>, rec: &RepairRecord, bound: &Bound, report: &mut Tic
     // `되돌려짐 — …` on a row of the CURRENT result) while R is still in force: the lane does not hold R
     // — 충돌 for its worker (H8), never "검증됨" over files that were put back
     let closed_failed = row.probation.as_ref().and_then(|p| p.closed.as_deref()).is_some_and(|c| c.starts_with(apply::CLOSED_FAILED) || c.starts_with(apply::CLOSED_REVERTED));
+    // IV1: a decision taken from the record and the row only (no state read yet) has its stamp now
+    let stamp0 = Stamp::take(env, rec, None);
     if closed_failed && row.applied == rec.committed && row.state != LaneState::Conflict {
-        return finish(env, rec, stored.as_ref(), row, LaneState::Conflict, "이 부서의 시험 기간 재검사가 전파된 수리를 되돌렸거나 실패로 닫았습니다 — 이 부서의 워커가 맡습니다", report);
+        return finish(env, rec, stored.as_ref(), row, LaneState::Conflict, "이 부서의 시험 기간 재검사가 전파된 수리를 되돌렸거나 실패로 닫았습니다 — 이 부서의 워커가 맡습니다", &stamp0, report);
     }
     // P2: a row whose applied result is not the record's current result goes back to 대기; its
     // previous applied result is a valid pre-image — a merge row's bytes are not (interpretation 41)
@@ -978,21 +1072,26 @@ fn decide(env: &LaneEnv<'_>, rec: &RepairRecord, bound: &Bound, report: &mut Tic
     let receiving_approval = approval && rec.origin_lane != *lane;
     if !receiving_approval && row.state == LaneState::Conflict {
         // H8: a general conflict ends only through the lane worker's merge + `recheck` (no file read)
-        if stored.as_ref() != Some(&row) && !publish_row(env, rec, stored.as_ref(), &row, report)? {
+        if stored.as_ref() != Some(&row) && !publish_row(env, rec, stored.as_ref(), &row, &stamp0, report)? {
             return Ok(None);
         }
         return Ok(Some(LaneState::Conflict));
     }
     let live = match live_states(env.op.pack, rec) {
         Ok(l) => l,
-        Err(why) => return finish(env, rec, stored.as_ref(), row, LaneState::Conflict, &why, report),
+        Err(why) => return finish(env, rec, stored.as_ref(), row, LaneState::Conflict, &why, &stamp0, report),
     };
+    // IV1 — THE stamp of this decision: the record, the generation and instance, every target's state as
+    // read just now; every later write for it is checked against THIS, never against a fresh reading
+    let stamp = Stamp::take(env, rec, Some(&live));
+    #[cfg(test)]
+    seam(&AFTER_DECISION, env.op.pack);
     if receiving_approval {
-        return approval_row(env, stored.as_ref(), row, rec, &live, report);
+        return approval_row(env, stored.as_ref(), row, rec, &live, &stamp, report);
     }
     match row.state {
         LaneState::Verified => {
-            if !publish_row(env, rec, stored.as_ref(), &row, report)? {
+            if !publish_row(env, rec, stored.as_ref(), &row, &stamp, report)? {
                 return Ok(None);
             }
             return Ok(Some(LaneState::Verified));
@@ -1001,13 +1100,13 @@ fn decide(env: &LaneEnv<'_>, rec: &RepairRecord, bound: &Bound, report: &mut Tic
             // a stop between the apply and the lane's check: the check now, when every target still
             // holds what was applied
             if canon_list(&live) == *recorded_result(&row) || canon_list(&live) == row.applied {
-                return check_live(env, stored.as_ref(), row, rec, None, report);
+                return check_live(env, stored.as_ref(), row, rec, None, &stamp, report);
             }
             row.state = LaneState::Pending;
         }
         LaneState::Conflict | LaneState::Pending => {}
     }
-    decide_pending(env, stored.as_ref(), row, rec, &live, approval, prev_applied.as_ref(), prev_was_merge, bound, report)
+    decide_pending(env, stored.as_ref(), row, rec, &live, approval, prev_applied.as_ref(), prev_was_merge, bound, &stamp, report)
 }
 
 /// The sentence of an approval-class row in a lane that did not make the repair (O1(c) / P5 · HJ1):
@@ -1038,10 +1137,11 @@ fn approval_row(
     mut row: LaneRecord,
     rec: &RepairRecord,
     live: &[(String, TargetState)],
+    stamp: &Stamp,
     report: &mut TickReport,
 ) -> Result<Option<LaneState>, RepairError> {
     if row.state == LaneState::Verified {
-        if stored != Some(&row) && !publish_row(env, rec, stored, &row, report)? {
+        if stored != Some(&row) && !publish_row(env, rec, stored, &row, stamp, report)? {
             return Ok(None);
         }
         return Ok(Some(LaneState::Verified));
@@ -1079,15 +1179,16 @@ fn approval_row(
                 note: format!("이 부서의 승인된 수리 {} 로 맞춤", v.as_str()),
                 via_repair: Some(v),
             };
-            return check_live(env, stored, row, rec, Some(merge), report);
+            return check_live(env, stored, row, rec, Some(merge), stamp, report);
         }
     }
     row.conflict_live = now;
-    finish(env, rec, stored, row, LaneState::Conflict, &approval_conflict_text(rec), report)
+    finish(env, rec, stored, row, LaneState::Conflict, &approval_conflict_text(rec), stamp, report)
 }
 
 /// Publishes the row in `state` with `why` (a 충돌 records the live states — R1) — through `publish`
 /// (IK3 / IG5: the lock tried, the record read again; changed → nothing written).
+#[allow(clippy::too_many_arguments)]
 fn finish(
     env: &LaneEnv<'_>,
     rec: &RepairRecord,
@@ -1095,9 +1196,10 @@ fn finish(
     row: LaneRecord,
     state: LaneState,
     why: &str,
+    stamp: &Stamp,
     report: &mut TickReport,
 ) -> Result<Option<LaneState>, RepairError> {
-    finish_as(env, rec, stored, row, state, why, Publication::Plain, report)
+    finish_as(env, rec, stored, row, state, why, Publication::plain(stamp), report)
 }
 
 /// `finish` with the publication's kind (IQ1 / IQ2 for the result of a check made outside the lock).
@@ -1172,10 +1274,11 @@ fn check_live(
     mut row: LaneRecord,
     rec: &RepairRecord,
     merge: Option<MergeRecord>,
+    stamp: &Stamp,
     report: &mut TickReport,
 ) -> Result<Option<LaneState>, RepairError> {
-    // IQ1: what this check is made on — published only if it still holds inside the lock
-    let seen = Observed::now(env, rec);
+    // IQ1 / IV1: this check is attached to the decision's stamp — its result is published only if the
+    // stamp still holds inside the lock (never re-based on a fresh reading taken here)
     let timings = match run_checks(env, rec, env.op.pack, true) {
         Ok(t) => t,
         Err(why) => {
@@ -1184,7 +1287,7 @@ fn check_live(
             if let Some(p) = row.probation.as_mut().filter(|p| p.closed.is_none()) {
                 p.closed = Some(failed_closure(env, &why));
             }
-            return finish_as(env, rec, stored, row, LaneState::Conflict, &format!("이 부서의 검사 실패 — {why}"), Publication::Checked { seen: &seen, tombstones: false }, report);
+            return finish_as(env, rec, stored, row, LaneState::Conflict, &format!("이 부서의 검사 실패 — {why}"), Publication::checked(stamp, false), report);
         }
     };
     row.applied = rec.committed.clone();
@@ -1216,7 +1319,7 @@ fn check_live(
     }
     // IG2 + IQ2: the tombstones of a deleting repair are completed INSIDE the publication's lock, after
     // the record and the checked states were validated again — one unit with the 검증됨 row
-    finish_as(env, rec, stored, row, LaneState::Verified, "이 부서의 검사 통과", Publication::Checked { seen: &seen, tombstones: true }, report)
+    finish_as(env, rec, stored, row, LaneState::Verified, "이 부서의 검사 통과", Publication::checked(stamp, true), report)
 }
 
 /// R's recorded check of every FILE target whose result is a file, against `root` (the live pack, or
@@ -1258,17 +1361,18 @@ fn decide_pending(
     prev_applied: Option<&LaneRecord>,
     prev_was_merge: bool,
     bound: &Bound,
+    stamp: &Stamp,
     report: &mut TickReport,
 ) -> Result<Option<LaneState>, RepairError> {
     if let Some(why) = promoted_directive(env.op.pack, rec) {
-        return finish(env, rec, stored, row, LaneState::Conflict, &why, report);
+        return finish(env, rec, stored, row, LaneState::Conflict, &why, stamp, report);
     }
     // the position of every target
     let mut positions: Vec<(String, Position)> = Vec::new();
     for (rel, st) in live {
         let result = match result_state(rec, rel) {
             Ok(r) => r,
-            Err(why) => return finish(env, rec, stored, row, LaneState::Conflict, &why, report),
+            Err(why) => return finish(env, rec, stored, row, LaneState::Conflict, &why, stamp, report),
         };
         let pre = ledger::file_targets(rec).find(|f| f.rel == *rel).map(|f| f.pre.state());
         let prev = prev_applied.and_then(|p| p.applied.iter().find(|(r, _)| r == rel)).and_then(|(_, c)| apply::state_of_canon(c));
@@ -1293,9 +1397,9 @@ fn decide_pending(
     if all_result {
         // "already there" (I7(4) / J2): no file write; the hook lines (under the tried lock, the record
         // read again — IK3 / IG5), then this lane's own check (outside the lock)
-        match locked_hook_step(env, rec) {
+        match locked_hook_step(env, rec, stamp) {
             Ok(None) => {}
-            Ok(Some(why)) => return finish(env, rec, stored, row, LaneState::Conflict, &why, report),
+            Ok(Some(why)) => return finish(env, rec, stored, row, LaneState::Conflict, &why, stamp, report),
             Err(left) => {
                 report.left.push((rec.id.clone(), left));
                 return Ok(None);
@@ -1331,7 +1435,7 @@ fn decide_pending(
                 return Ok(None);
             }
         }
-        return check_live(env, stored, row, rec, None, report);
+        return check_live(env, stored, row, rec, None, stamp, report);
     }
     // interpretation 35: a kept merge result OF THE CURRENT RESULT (the row's recorded base is the
     // record's current result — never after a re-commit, P2 / interpretation 41) that is live again is
@@ -1339,7 +1443,7 @@ fn decide_pending(
     if prev_applied.is_none() && row.applied == rec.committed {
         if let Some(i) = row.merge_history.iter().rposition(|m| m.via_repair.is_none() && m.result == canon_list(live)) {
             let m = row.merge_history.remove(i);
-            return check_live(env, stored, row, rec, Some(m), report);
+            return check_live(env, stored, row, rec, Some(m), stamp, report);
         }
     }
     if positions.iter().any(|(_, p)| *p == Position::Other) {
@@ -1348,23 +1452,23 @@ fn decide_pending(
         } else {
             "이 부서의 파일이 수리 전 내용과도 수리 결과와도 다릅니다 — 이 부서의 워커가 합칩니다"
         };
-        return finish(env, rec, stored, row, LaneState::Conflict, why, report);
+        return finish(env, rec, stored, row, LaneState::Conflict, why, stamp, report);
     }
     if approval {
         // the ORIGIN's own approval-class row (receiving lanes never reach here — HJ1): its approved
         // bytes are not live any more; the daemon writes nothing without a new approval
-        return finish(env, rec, stored, row, LaneState::Conflict, "이 부서에서 승인되어 적용된 수리의 내용이 지금 살아 있지 않습니다 — 다시 적용하려면 이 부서의 수리로 후보·리뷰어 두 서명·주인의 최종 승인을 거칩니다(cys repair status)", report);
+        return finish(env, rec, stored, row, LaneState::Conflict, "이 부서에서 승인되어 적용된 수리의 내용이 지금 살아 있지 않습니다 — 다시 적용하려면 이 부서의 수리로 후보·리뷰어 두 서명·주인의 최종 승인을 거칩니다(cys repair status)", stamp, report);
     }
     if *bound == Bound::Unknown {
         let why = "팩 세대를 알 수 없어 이번 차례에는 적용하지 않습니다";
         report.left.push((rec.id.clone(), why.into()));
         if stored.is_none() {
             row.reason = why.into();
-            publish_row(env, rec, None, &row, report)?;
+            publish_row(env, rec, None, &row, stamp, report)?;
         }
         return Ok(None);
     }
-    apply_general(env, stored, row, rec, &positions, prev_applied, bound, report)
+    apply_general(env, stored, row, rec, &positions, prev_applied, bound, stamp, report)
 }
 
 /// The hook lines of a hook-unregistration repair in this lane (X1 / Y1): `None` = done (or none);
@@ -1382,14 +1486,14 @@ fn hook_step(env: &LaneEnv<'_>, rec: &RepairRecord) -> Option<String> {
 /// The hook step of a repair with hook lines, run under the TRIED pack-apply lock after the record was
 /// read again (IK3 / IG5): `Ok(None)` done (or nothing to do), `Ok(Some(why))` the step's error (→ 충돌),
 /// `Err(why)` not run this tick (the lock held, the record changed) — the row stays as it was.
-fn locked_hook_step(env: &LaneEnv<'_>, rec: &RepairRecord) -> Result<Option<String>, String> {
+fn locked_hook_step(env: &LaneEnv<'_>, rec: &RepairRecord, stamp: &Stamp) -> Result<Option<String>, String> {
     if ledger::hook_lines(rec).next().is_none() {
         return Ok(None);
     }
     let ran = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || {
-        if !record_unchanged(env, rec) {
-            return Err(RECORD_CHANGED.to_string());
-        }
+        // IV1: the hook step writes (the registrar, the lane's tombstones) only after the decision's
+        // stamp was measured again inside this lock
+        stamp.holds(env, rec, true).map_err(str::to_string)?;
         Ok(hook_step(env, rec))
     });
     match ran {
@@ -1717,6 +1821,7 @@ fn apply_general(
     positions: &[(String, Position)],
     prev_applied: Option<&LaneRecord>,
     bound: &Bound,
+    stamp: &Stamp,
     report: &mut TickReport,
 ) -> Result<Option<LaneState>, RepairError> {
     let pack = env.op.pack;
@@ -1726,7 +1831,7 @@ fn apply_general(
     for (rel, pos) in positions {
         let result = match result_state(rec, rel) {
             Ok(r) => r,
-            Err(why) => return finish(env, rec, stored, row, LaneState::Conflict, &why, report),
+            Err(why) => return finish(env, rec, stored, row, LaneState::Conflict, &why, stamp, report),
         };
         if !matches!(result, TargetState::File { .. }) {
             continue;
@@ -1753,17 +1858,20 @@ fn apply_general(
             }
         };
         if let Err(why) = got {
-            return finish(env, rec, stored, row, LaneState::Conflict, &format!("{rel}: 수리 결과의 바이트를 마련하지 못했습니다 — {why}"), report);
+            return finish(env, rec, stored, row, LaneState::Conflict, &format!("{rel}: 수리 결과의 바이트를 마련하지 못했습니다 — {why}"), stamp, report);
         }
     }
     // the copy-check runs OUTSIDE the pack-apply lock (IK3)
     if let Err(why) = run_checks(env, rec, &scratch.0, false) {
-        return finish(env, rec, stored, row, LaneState::Conflict, &format!("사본 검사 실패 — 살아 있는 파일은 바꾸지 않았습니다 · {why}"), report);
+        return finish(env, rec, stored, row, LaneState::Conflict, &format!("사본 검사 실패 — 살아 있는 파일은 바꾸지 않았습니다 · {why}"), stamp, report);
     }
     // IK3 + IG5: the door operations, the tombstones, the hook step and the 적용됨 row under ONE tried
     // lock; the record is read AGAIN before the first operation, before each further target and before
     // the row is written
-    let ran = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || door_phase(env, stored, &row, rec, positions, prev_applied, bound, &scratch));
+    // IV1: the door works on a copy of the decision's stamp; each of its operations updates it with
+    // what the door itself placed — that stamp is what the live check below is published against
+    let mut stamp = stamp.clone();
+    let ran = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || door_phase(env, stored, &row, rec, positions, prev_applied, bound, &scratch, &mut stamp));
     let end = match ran {
         Ok(Some(r)) => r?,
         Ok(None) => DoorEnd::Left(LOCK_BUSY_ROW.to_string(), false),
@@ -1772,13 +1880,13 @@ fn apply_general(
     drop(scratch);
     let mut row = match end {
         DoorEnd::Applied(r) => r,
-        DoorEnd::Conflict(why) => return finish(env, rec, stored, row, LaneState::Conflict, &why, report),
+        DoorEnd::Conflict(why) => return finish(env, rec, stored, row, LaneState::Conflict, &why, &stamp, report),
         DoorEnd::Left(why, new_row) => {
             report.left.push((rec.id.clone(), why.clone()));
             if new_row && stored.is_none() {
                 let mut row = row;
                 row.reason = why.chars().take(400).collect();
-                publish_row(env, rec, None, &row, report)?;
+                publish_row(env, rec, None, &row, &stamp, report)?;
             }
             return Ok(None);
         }
@@ -1787,15 +1895,15 @@ fn apply_general(
             return Ok(Some(LaneState::Conflict));
         }
     };
+    #[cfg(test)]
+    seam(&AFTER_DOOR_PHASE, env.op.pack);
     let applied_row = row.clone();
-    // IQ1: what the live check is made on (the door's targets and those already at the result)
-    let seen = Observed::now(env, rec);
     match run_checks(env, rec, pack, true) {
         Ok(timings) => {
             if let Some(p) = row.probation.as_mut() {
                 p.check_timings = timings;
             }
-            finish_as(env, rec, Some(&applied_row), row, LaneState::Verified, "적용 뒤 이 부서의 검사 통과", Publication::Checked { seen: &seen, tombstones: true }, report)
+            finish_as(env, rec, Some(&applied_row), row, LaneState::Verified, "적용 뒤 이 부서의 검사 통과", Publication::checked(&stamp, true), report)
         }
         Err(why) => {
             // the lane's own failure: T6's probation owes the return of THIS lane's operations
@@ -1803,7 +1911,7 @@ fn apply_general(
             if let Some(p) = row.probation.as_mut() {
                 p.closed = Some(failed_closure(env, &why));
             }
-            finish_as(env, rec, Some(&applied_row), row, LaneState::Conflict, &format!("적용 뒤 이 부서의 검사 실패 — {why}"), Publication::Checked { seen: &seen, tombstones: false }, report)
+            finish_as(env, rec, Some(&applied_row), row, LaneState::Conflict, &format!("적용 뒤 이 부서의 검사 실패 — {why}"), Publication::checked(&stamp, false), report)
         }
     }
 }
@@ -1822,14 +1930,16 @@ fn door_phase(
     prev_applied: Option<&LaneRecord>,
     bound: &Bound,
     scratch: &Scratch,
+    stamp: &mut Stamp,
 ) -> Result<DoorEnd, RepairError> {
     let mut done: Vec<String> = Vec::new();
-    // IO1: changed before the first write → nothing written; changed MIDWAY → the 충돌 row published now
-    let changed = |done: &Vec<String>| -> Result<DoorEnd, RepairError> {
+    // IV1 + IO1: the stamp measured again before every write; a difference before the first write →
+    // nothing written; MIDWAY → the 충돌 row published now (naming what this lane already changed)
+    let changed = |done: &Vec<String>, why: &'static str| -> Result<DoorEnd, RepairError> {
         if done.is_empty() {
-            Ok(DoorEnd::Left(RECORD_CHANGED.to_string(), false))
+            Ok(DoorEnd::Left(why.to_string(), false))
         } else {
-            changed_midway(env, stored, row, rec, done)
+            changed_midway(env, stored, row, rec, done, why)
         }
     };
     // rule one per target through T6's engine; the binding was born at the tick's start (EJ1)
@@ -1837,8 +1947,8 @@ fn door_phase(
         if *pos == Position::AtResult {
             continue;
         }
-        if !record_unchanged(env, rec) {
-            return changed(&done);
+        if let Err(why) = stamp.holds(env, rec, true) {
+            return changed(&done, why);
         }
         let result = match result_state(rec, rel) {
             Ok(r) => r,
@@ -1866,7 +1976,11 @@ fn door_phase(
             bound: bound.clone(),
         };
         match apply::run_op(&env.op, &spec)?.outcome {
-            ApplyOutcome::Applied => done.push(rel.clone()),
+            ApplyOutcome::Applied => {
+                // IV1: the stamp now holds what the door itself placed (never a read after the lock)
+                stamp.placed(rel, &result);
+                done.push(rel.clone());
+            }
             ApplyOutcome::Superseded(m) => return Ok(DoorEnd::Left(format!("{rel}: {m}"), true)),
             ApplyOutcome::Declined(m) => return Ok(DoorEnd::Conflict(format!("{rel}: {m}"))),
         }
@@ -1884,16 +1998,16 @@ fn door_phase(
         }
     }
     if ledger::hook_lines(rec).next().is_some() {
-        if !record_unchanged(env, rec) {
-            return changed(&done);
+        if let Err(why) = stamp.holds(env, rec, true) {
+            return changed(&done, why);
         }
         if let Some(why) = hook_step(env, rec) {
             return Ok(DoorEnd::Conflict(why));
         }
         done.push("훅 등록 해제".into());
     }
-    if !record_unchanged(env, rec) {
-        return changed(&done);
+    if let Err(why) = stamp.holds(env, rec, true) {
+        return changed(&done, why);
     }
     // IG2: an applied row of a deleting repair implies this lane's tombstones
     if let Err(why) = ensure_tombstones(env, rec) {
@@ -1931,9 +2045,10 @@ fn door_phase(
 /// phase's lock, so without asking the record to be unchanged (the row describes what THIS lane did,
 /// not what R is now) — with the reason naming the targets already changed and the live states
 /// (`conflict_live`). Nothing is put back, nothing further is written; the lane's worker merges it.
-fn changed_midway(env: &LaneEnv<'_>, stored: Option<&LaneRecord>, row: &LaneRecord, rec: &RepairRecord, done: &[String]) -> Result<DoorEnd, RepairError> {
+fn changed_midway(env: &LaneEnv<'_>, stored: Option<&LaneRecord>, row: &LaneRecord, rec: &RepairRecord, done: &[String], cause: &str) -> Result<DoorEnd, RepairError> {
+    let what = if cause == RECORD_CHANGED { "수리 기록이 바뀌었습니다(대체·다시 확정·되돌림)" } else { "이 부서의 대상 파일·팩 세대·팩 식별 중 하나가 바뀌었습니다" };
     let why = format!(
-        "이 부서에 적용하는 도중 수리 기록이 바뀌었습니다(대체·다시 확정·되돌림) — 이미 바꾼 대상: {} · 나머지 대상은 바꾸지 않았고 아무것도 되돌리지 않았습니다 — 이 부서의 워커가 합칩니다(cys repair status {})",
+        "이 부서에 적용하는 도중 {what} — 이미 바꾼 대상: {} · 나머지 대상은 바꾸지 않았고 아무것도 되돌리지 않았습니다 — 이 부서의 워커가 합칩니다(cys repair status {})",
         done.join(", "),
         rec.id.as_str()
     );
@@ -2007,10 +2122,29 @@ pub fn recheck_lane_in(
         }
     }
     let live = live_states(env.op.pack, &rec).map_err(RepairError::Precondition)?;
+    // RULINGS IV4 — the same stamp and the same publication as the tick: fixed now, at the decision
+    let stamp = Stamp::take(env, &rec, Some(&live));
+    #[cfg(test)]
+    seam(&AFTER_DECISION, env.op.pack);
     let mut row = stored.clone();
-    if let Some(why) = hook_step(env, &rec) {
-        return Err(RepairError::CheckFailed(why));
+    // the hook step (it writes the registrar's file and the lane's tombstones) inside the tried lock,
+    // after the stamp was measured again — never with no lock or before the record was read again
+    match locked_hook_step(env, &rec, &stamp) {
+        Ok(None) => {}
+        Ok(Some(why)) => return Err(RepairError::CheckFailed(why)),
+        Err(why) => return Err(RepairError::Locked(format!("{}: {why} — 다시 하세요", id.as_str()))),
     }
+    let refused = |p: Published| -> RepairError {
+        let why = match p {
+            Published::RecordChanged => RECORD_CHANGED.to_string(),
+            Published::StatesChanged => STATES_CHANGED.to_string(),
+            Published::LockBusy => LOCK_BUSY_ROW.to_string(),
+            Published::NotWritten(w) => w,
+            Published::OtherWriter => "이 부서의 행이 그 사이 바뀌었습니다".to_string(),
+            Published::Written => String::new(),
+        };
+        RepairError::Locked(format!("{}: {why} — 아무것도 쓰지 않았습니다. 다시 하세요", id.as_str()))
+    };
     match run_checks(env, &rec, env.op.pack, false) {
         Ok(_) => {
             let result = canon_list(&live);
@@ -2028,17 +2162,21 @@ pub fn recheck_lane_in(
             row.probation = None;
             row.reason = "합친 뒤 이 부서의 살아 있는 파일에서 검사 통과(recheck)".into();
             row.updated_at = env.op.now;
-            if !write_row_if(env, Some(&stored), &row)? {
-                return Err(RepairError::Locked(format!("{}: 이 부서의 행이 그 사이 바뀌었습니다 — 다시 하세요", id.as_str())));
+            // IQ1 + IQ2 + IV4: the checked publication (the stamp measured again; a deleting repair's
+            // tombstones in the same unit as the 검증됨 row)
+            match publish(env, &rec, Some(&stored), &row, Publication::checked(&stamp, true))? {
+                Published::Written => Ok(LaneState::Verified),
+                other => Err(refused(other)),
             }
-            Ok(LaneState::Verified)
         }
         Err(why) => {
             row.conflict_live = canon_list(&live);
             row.reason = format!("합친 뒤의 다시 검사 실패 — {why}").chars().take(400).collect();
             row.updated_at = env.op.now;
-            write_row_if(env, Some(&stored), &row)?;
-            Err(RepairError::CheckFailed(format!("{}: 이 부서의 살아 있는 파일에서 검사가 실패해 '충돌'로 남습니다 — {why}", id.as_str())))
+            match publish(env, &rec, Some(&stored), &row, Publication::checked(&stamp, false))? {
+                Published::Written => Err(RepairError::CheckFailed(format!("{}: 이 부서의 살아 있는 파일에서 검사가 실패해 '충돌'로 남습니다 — {why}", id.as_str()))),
+                other => Err(refused(other)),
+            }
         }
     }
 }

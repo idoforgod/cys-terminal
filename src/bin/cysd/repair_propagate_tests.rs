@@ -35,6 +35,9 @@ fn rig(tag: &str) -> Rig {
     let pack = base.join("pack");
     std::fs::create_dir_all(pack.join("bin")).unwrap();
     std::fs::write(pack.join(".pack-version"), "0.15.0\n").unwrap();
+    // the lane's pack instance (every lane's pack holds one after its first ready tick — I8); `recheck`
+    // validates it as part of its stamp (RULINGS IV4)
+    std::fs::write(pack.join(".repair-pack-id"), format!("{}\n", "ab".repeat(32))).unwrap();
     std::fs::write(pack.join("bin/a.py"), b"print('a')\n").unwrap();
     Rig {
         root: base.join("local").join("repairs"),
