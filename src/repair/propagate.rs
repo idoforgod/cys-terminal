@@ -10,7 +10,7 @@
 //! file goes through T6's engine (`apply::run_op` — the one door); the pass's only write inside a
 //! pack is the id file `<pack>/.repair-pack-id` (I8). Every comparison is of STATES (U2).
 
-use super::apply::{self, ApplyOutcome, Bound, CheckFn, HookStep, HookStepFn, OpEnv, OpSpec, Recorded, RepairLock, Source};
+use super::apply::{self, ApplyOutcome, Bound, CheckFn, HookStep, HookStepFn, OpEnv, OpSpec, Recorded, ReferenceFn, RepairLock, Source};
 use super::durable::{self, RecordRead};
 use super::ledger::{
     self, DirIdentity, GateVerdict, HoldCause, JobState, LaneRecord, MergeRecord, PackGeneration, RegisteredLanes,
@@ -589,6 +589,9 @@ pub type ClassifyFn<'a> = dyn Fn(&str) -> Result<Classification, RepairError> + 
 pub struct LaneEnv<'a> {
     pub op: OpEnv<'a>,
     pub check: &'a CheckFn<'a>,
+    /// RULINGS IG4 (P3 / D④): the built-in reference check of a kind — the SAME function T6's origin
+    /// apply and T6's job use (`apply::production_reference` in production).
+    pub reference: &'a ReferenceFn<'a>,
     pub classify: &'a ClassifyFn<'a>,
     pub locked: &'a RepairLock<'a>,
     pub hooks: &'a HookStepFn<'a>,
@@ -1069,7 +1072,7 @@ fn check_live(
     merge: Option<MergeRecord>,
     report: &mut TickReport,
 ) -> Result<Option<LaneState>, RepairError> {
-    let timings = match run_checks(env, rec, env.op.pack) {
+    let timings = match run_checks(env, rec, env.op.pack, true) {
         Ok(t) => t,
         Err(why) => {
             // IG3 / 11.4: a lane that applied R itself (an open probation bundle) owes the return of its
@@ -1116,7 +1119,7 @@ fn check_live(
 
 /// R's recorded check of every FILE target whose result is a file, against `root` (the live pack, or
 /// a copy). `Err` = a failure, a timeout or a check that could not run (never "passed").
-fn run_checks(env: &LaneEnv<'_>, rec: &RepairRecord, root: &Path) -> Result<Vec<ledger::CheckTiming>, String> {
+fn run_checks(env: &LaneEnv<'_>, rec: &RepairRecord, root: &Path, measure_reference: bool) -> Result<Vec<ledger::CheckTiming>, String> {
     let mut timings = Vec::new();
     for f in ledger::file_targets(rec) {
         if !matches!(result_state(rec, &f.rel)?, TargetState::File { .. }) {
@@ -1129,7 +1132,10 @@ fn run_checks(env: &LaneEnv<'_>, rec: &RepairRecord, root: &Path) -> Result<Vec<
                 rel: f.rel.clone(),
                 check_ms: out.ms,
                 reference_kind: apply::check_kind_of(&f.rel),
-                reference_ms: 0,
+                // RULINGS IG4 — the reference measured in THIS lane at its apply, exactly as T6's origin
+                // apply records it (`reference(check_kind_of(rel), deadline).ok()`, its `ms`; 0 when it
+                // could not run — T6's attribution then never blames, the conservative side)
+                reference_ms: if measure_reference { (env.reference)(apply::check_kind_of(&f.rel), deadline).ok().map(|x| x.ms).unwrap_or(0) } else { 0 },
             }),
             CheckResult::Fail(m) => return Err(format!("{}: {m}", f.rel)),
             CheckResult::Timeout => return Err(format!("{}: 검사 시간 초과", f.rel)),
@@ -1639,7 +1645,7 @@ fn apply_general(
         }
     }
     // the copy-check runs OUTSIDE the pack-apply lock (IK3)
-    if let Err(why) = run_checks(env, rec, &scratch.0) {
+    if let Err(why) = run_checks(env, rec, &scratch.0, false) {
         return finish(env, rec, stored, row, LaneState::Conflict, &format!("사본 검사 실패 — 살아 있는 파일은 바꾸지 않았습니다 · {why}"), report);
     }
     // IK3 + IG5: the door operations, the tombstones, the hook step and the 적용됨 row under ONE tried
@@ -1668,7 +1674,7 @@ fn apply_general(
         }
     };
     let applied_row = row.clone();
-    match run_checks(env, rec, pack) {
+    match run_checks(env, rec, pack, true) {
         Ok(timings) => {
             if let Some(p) = row.probation.as_mut() {
                 p.check_timings = timings;
@@ -1856,7 +1862,7 @@ pub fn recheck_lane_in(
     if let Some(why) = hook_step(env, &rec) {
         return Err(RepairError::CheckFailed(why));
     }
-    match run_checks(env, &rec, env.op.pack) {
+    match run_checks(env, &rec, env.op.pack, false) {
         Ok(_) => {
             let result = canon_list(&live);
             row.merge = Some(MergeRecord {
