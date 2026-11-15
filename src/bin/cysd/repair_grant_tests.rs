@@ -592,6 +592,100 @@ fn owner_token_by_registered_question() {
     );
 }
 
+// ─────────────── WA1 (RULINGS JV4): the CEO directive's template is a rule document ───────────────
+
+/// RULINGS JV4 (whole-diff review AUTH, finding M1): `cys-dept` composes the HQ master's
+/// `MASTER_DIRECTIVE.md` from the live header of `directives/CEO_TEMPLATE.md`, so a repair of the
+/// template is what a repair of `MASTER_DIRECTIVE.md` is — never a general repair, never without the
+/// owner. Under every spelling the rule-document tests use — the real spelling, other cases, the pack
+/// root, another folder (the BJ3 fold reduces to case for this name: no non-ASCII letter folds into
+/// `ceo_template.md`) — with the owner-order trigger and with the GRANT trigger switched on (M1's path:
+/// an autonomous general repair), alone and mixed with a general file, `begin` answers for the
+/// template exactly what it answers for the matching spelling of `MASTER_DIRECTIVE.md` (code and
+/// sentence, the name aside) and writes nothing. A hard link to the template under another name is
+/// refused naming it (DA1). An owner's prompt naming it names a rule document; with the owner's token
+/// for it the repair is a `RuleDocument` repair and `rule_doc_allowed` covers it for the holder only.
+#[test]
+fn wa1_the_ceo_template_is_a_rule_document() {
+    let r = rig("wa1");
+    std::fs::write(r.pack.join("directives/CEO_TEMPLATE.md"), b"# ceo template\n").unwrap();
+    r.grant_on(5);
+    let t = now0();
+    let w = seat(3, "worker");
+    let norm = |m: &str, spelled: &str| -> String {
+        m.replace(spelled, "<DOC>")
+            .replace("CEO_TEMPLATE.md", "<REAL>")
+            .replace("MASTER_DIRECTIVE.md", "<REAL>")
+            .replace("ceo_template.md", "<FOLD>")
+            .replace("master_directive.md", "<FOLD>")
+    };
+    for (tmpl, master_doc) in [
+        ("directives/CEO_TEMPLATE.md", "directives/MASTER_DIRECTIVE.md"),
+        ("directives/ceo_template.md", "directives/master_directive.md"),
+        ("directives/Ceo_Template.MD", "directives/Master_Directive.MD"),
+        ("CEO_TEMPLATE.md", "MASTER_DIRECTIVE.md"),
+        ("agents/CEO_TEMPLATE.md", "agents/MASTER_DIRECTIVE.md"),
+    ] {
+        for trigger in ["owner_order", "grant"] {
+            for mixed in [false, true] {
+                let files = |doc: &str| if mixed { json!(["bin/a.py", doc]) } else { json!([doc]) };
+                let et = r
+                    .call(t, &w, "begin", json!({"trigger": trigger, "files": files(tmpl)}))
+                    .expect_err("a GENERAL repair of the CEO template began");
+                let em = r
+                    .call(t, &w, "begin", json!({"trigger": trigger, "files": files(master_doc)}))
+                    .unwrap_err();
+                assert_eq!(
+                    (et.code.as_str(), norm(&et.message, tmpl)),
+                    (em.code.as_str(), norm(&em.message, master_doc)),
+                    "{tmpl} ({trigger}, mixed={mixed}) is not refused as {master_doc}: {} | {}",
+                    et.message,
+                    em.message
+                );
+                assert!(et.message.contains(tmpl), "the refusal names the file: {}", et.message);
+            }
+        }
+        // the ONE definition — also the re-check job's exclusion (`repair_job.rs`: never reverted
+        // automatically) and the owner-token path's check
+        assert_eq!(rule_document_name(tmpl).as_deref(), Some("ceo_template.md"), "{tmpl}");
+    }
+    assert!(r.ids().is_empty(), "a refused begin wrote a record");
+    assert_eq!(r.claims(), 0, "a refused grant begin took a claim");
+    // DA1: the template's other name (a hard link) is refused naming the template
+    std::fs::create_dir_all(r.pack.join("notes")).unwrap();
+    std::fs::hard_link(r.pack.join("directives/CEO_TEMPLATE.md"), r.pack.join("notes/t.txt")).unwrap();
+    let e = r
+        .call(t, &w, "begin", json!({"trigger": "owner_order", "files": ["notes/t.txt"]}))
+        .unwrap_err();
+    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    assert!(e.message.contains("directives/CEO_TEMPLATE.md"), "{}", e.message);
+    assert!(r.ids().is_empty());
+    std::fs::remove_file(r.pack.join("notes/t.txt")).unwrap();
+    // the owner's prompt names it; with the owner's token it is a rule-document repair
+    assert!(named_rule_docs("고쳐라 CEO_TEMPLATE.md").contains(&"ceo_template.md".to_string()));
+    let token = token_for(&r, "directives/CEO_TEMPLATE.md", t + 10.0);
+    let v = r
+        .call(
+            t + 12.0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["directives/CEO_TEMPLATE.md"], "owner_token": token}),
+        )
+        .unwrap();
+    assert_eq!(v["owner_token_bound"], true);
+    let id = v["repair"].as_str().unwrap().to_string();
+    assert_eq!(r.rec(&id).classification, Classification::RuleDocument);
+    let allowed = |who: &Caller, path: &str| {
+        r.call(t + 13.0, who, "rule_doc_allowed", json!({"path": path}))
+            .unwrap()["allowed"]
+            .as_bool()
+            .unwrap()
+    };
+    assert!(allowed(&w, "directives/CEO_TEMPLATE.md"));
+    assert!(!allowed(&seat(4, "worker-2"), "directives/CEO_TEMPLATE.md"), "another seat holds no lock");
+    assert!(!allowed(&w, "directives/MASTER_DIRECTIVE.md"), "the token covers the template only");
+}
+
 // ───────────────────────────── the rule-document branch of `begin` (C10 10.6) ─────────────────────────────
 
 /// With a valid token the worker starts the rule-document repair: classification `RuleDocument`, the
