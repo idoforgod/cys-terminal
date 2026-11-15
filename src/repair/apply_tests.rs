@@ -3137,7 +3137,7 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("propagate.rs", "committed_copy_slots_in", "conservative", 1, "HI2 / P6: a committed copy's metadata that cannot be parsed → the slot is kept (never removed on a doubt)"),
     ("propagate.rs", "committed_copy_in", "conservative", 2, "a slot whose metadata or bytes cannot be read is not R's committed copy → no bytes → the row 충돌 (nothing applied)"),
     ("propagate.rs", "conflict_summary_line_in", "display", 2, "HH7: the CEO's one summary line — display only; status and the gate read with three answers"),
-    ("propagate.rs", "finish", "display", 2, "R1: the live states shown with a 충돌 (an unreadable member leaves the list empty)"),
+    ("propagate.rs", "finish", "display", 1, "R1: the live states shown with a 충돌 (an unreadable member leaves the list empty; IK3 / IG5 pass the record in — the second site, a re-read of it, is gone)"),
     ("propagate.rs", "pack_instance_pass_in", "conservative", 2, "interpretation 31 / P5: an unreadable identity / generation skips its watch for this tick (never \"changed\")"),
     ("propagate.rs", "read_pack_instance", "not-a-read", 1, "the id line without its newline"),
     ("propagate.rs", "sweep_own_scratch", "conservative", 1, "nothing to sweep when the folder cannot be listed — retried at the next tick"),

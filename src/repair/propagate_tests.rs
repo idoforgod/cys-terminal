@@ -774,6 +774,63 @@ fn a_stop_between_the_deletion_and_its_tombstone_is_completed_at_the_next_tick()
     assert!(matches!(r.live(DEPT, "bin/gone.py"), TargetState::File { .. }), "control: without the tombstone the install restores it");
 }
 
+/// RULINGS IG3 (C11 11.4, 1.6) — a stop after the last door operation and before the 적용됨 row: at the
+/// next tick the lane is "already there", and THIS lane's own completed door operations (the write-ahead
+/// records at the present generation, results equal to the live states) show that it applied R — the
+/// row gets its probation bundle as if the write had not been interrupted (24-hour re-check, the return
+/// owed on a failure); the check's timing record is kept.
+#[test]
+fn a_stop_before_the_row_keeps_the_lanes_probation() {
+    let r = rig("ig3");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    STOP_AFTER_DOOR_OP.with(|c| c.set(true));
+    assert!(tick_with(&r, DEPT, &doubles(), &fid(1), &NoFaults, &|_| false).is_err());
+    assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"new\n", "the door operation was done");
+    assert!(r.row(&id, DEPT).is_none(), "the stop fell before the row");
+    let op = r.ops(&id).into_iter().find(|o| o.lane_key == lane(DEPT) && o.kind == "propagate").unwrap();
+    tick(&r, DEPT, &doubles(), &fid(1));
+    let row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Verified);
+    let p = row.probation.unwrap();
+    assert!(p.closed.is_none(), "an open probation (the 24-hour re-check)");
+    assert_eq!(p.applied_at, op.updated_at, "from the lane's own operation");
+    assert_eq!((p.expected, p.check_timings.len()), (row.applied, 1));
+    // the same stop, and the lane's check fails at the restart → 충돌 with the return OWED (as after an
+    // uninterrupted apply), never a bare 충돌 that T6's probation would skip
+    let r2 = rig("ig3b");
+    committed_in_hq(&r2, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r2.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    STOP_AFTER_DOOR_OP.with(|c| c.set(true));
+    assert!(tick_with(&r2, DEPT, &doubles(), &fid(1), &NoFaults, &|_| false).is_err());
+    let d = doubles();
+    d.pass.set(false);
+    tick(&r2, DEPT, &d, &fid(1));
+    let row = r2.row(&id, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Conflict);
+    let closed = row.probation.and_then(|p| p.closed).unwrap_or_default();
+    assert!(apply::closure_owes_return(&closed), "the exchange form owes the return: {closed}");
+}
+
+/// IG3: a lane that was at R's result WITHOUT having applied it (no operation of its own) gets no
+/// 24-hour re-check — nothing of its own was replaced — but its check's timing record is kept (a
+/// CLOSED bundle that T6's probation skips and that owes no report).
+#[test]
+fn a_lane_at_the_result_without_its_own_apply_keeps_the_timings_and_no_probation() {
+    let r = rig("ig3c");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/a.py", b"new\n", 0o644);
+    tick(&r, DEPT, &doubles(), &fid(1));
+    let row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Verified);
+    let p = row.probation.unwrap();
+    assert_eq!(p.closed.as_deref(), Some(NOTHING_REPLACED_HERE));
+    assert_eq!(p.check_timings.len(), 1);
+    assert!(!apply::closure_owes_return(NOTHING_REPLACED_HERE) && !apply::closure_owes_intake(NOTHING_REPLACED_HERE));
+}
+
 /// IG2: a lane that was at the deleting repair's result from the start gets the tombstone too.
 #[test]
 fn a_lane_already_at_a_deletions_result_gets_the_tombstone() {

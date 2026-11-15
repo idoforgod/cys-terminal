@@ -1023,6 +1023,42 @@ fn finish(
     Ok(Some(state))
 }
 
+/// The closure of a row whose lane had nothing of its own replaced (it already held R's result — RULINGS
+/// IG3): the timing record is kept, no 24-hour re-check (T6's probation skips a closed bundle), no report.
+pub const NOTHING_REPLACED_HERE: &str = "사용 중 — 이 부서는 이미 이 수리의 결과를 갖고 있었습니다(이 부서에서 바꾼 것이 없어 24시간 시험 기간이 없습니다)";
+
+/// The closure of a lane's failed check after THIS lane applied R (C11 11.4): on macOS the return of
+/// this lane's operations is owed to T6's probation; on Windows the automatic return is off.
+fn failed_closure(env: &LaneEnv<'_>, why: &str) -> String {
+    let closed = if env.op.form == ApplyForm::Exchange {
+        format!("{} — {} · 적용 뒤 이 부서의 검사 실패: {why}", apply::CLOSED_FAILED, apply::RETURN_OWED)
+    } else {
+        format!("{} — 적용 뒤 이 부서의 검사 실패(윈도우: 자동으로 되돌리지 않음): {why}", apply::CLOSED_FAILED)
+    };
+    closed.chars().take(400).collect()
+}
+
+/// RULINGS IG3 — evidence that THIS lane applied R's current result itself: a completed (`applied`)
+/// door operation of kind `propagate`, of this lane, for R, bound to the present generation, whose
+/// incoming state is R's committed state of that file AND the live state now (the write-ahead records
+/// of 1.13). `Ok(Some(at))` = the time of the latest such operation; `Ok(None)` = none; `Err` = the
+/// records cannot be read (nothing is decided on a partial log).
+fn own_apply_evidence(env: &LaneEnv<'_>, rec: &RepairRecord, live: &[(String, TargetState)], bound: &Bound) -> Result<Option<f64>, String> {
+    let Bound::Known(gen) = bound else { return Ok(None) };
+    let mut at: Option<f64> = None;
+    for op in super::wal::list_checked_in(env.op.root, &rec.id)? {
+        if op.lane_key != *env.op.lane || op.kind != "propagate" || !op.finished || op.outcome.as_deref() != Some("applied") || op.pack_generation.as_ref() != Some(gen) {
+            continue;
+        }
+        let committed = rec.committed.iter().find(|(r, _)| *r == op.rel).map(|(_, c)| c.as_str());
+        let live_now = live.iter().find(|(r, _)| *r == op.rel).map(|(_, st)| st.canon());
+        if committed == Some(op.incoming.as_str()) && live_now.as_deref() == Some(op.incoming.as_str()) {
+            at = Some(at.map_or(op.updated_at, |a| a.max(op.updated_at)));
+        }
+    }
+    Ok(at)
+}
+
 /// J2 / 11.4: R's check on the LIVE files of this lane → `검증됨` (with the merge record restored or
 /// given, `CheckTiming`s recorded — R5), else `충돌`.
 fn check_live(
@@ -1035,7 +1071,14 @@ fn check_live(
 ) -> Result<Option<LaneState>, RepairError> {
     let timings = match run_checks(env, rec, env.op.pack) {
         Ok(t) => t,
-        Err(why) => return finish(env, rec, stored, row, LaneState::Conflict, &format!("이 부서의 검사 실패 — {why}"), report),
+        Err(why) => {
+            // IG3 / 11.4: a lane that applied R itself (an open probation bundle) owes the return of its
+            // own operations, as after an uninterrupted apply
+            if let Some(p) = row.probation.as_mut().filter(|p| p.closed.is_none()) {
+                p.closed = Some(failed_closure(env, &why));
+            }
+            return finish(env, rec, stored, row, LaneState::Conflict, &format!("이 부서의 검사 실패 — {why}"), report);
+        }
     };
     // IG2: a verified row of a deleting repair implies this lane's tombstones (also "already there")
     if let Err(why) = ensure_tombstones(env, rec) {
@@ -1046,9 +1089,26 @@ fn check_live(
         row.merge = merge;
     }
     row.conflict_live.clear();
-    if let Some(p) = row.probation.as_mut() {
-        if p.check_timings.is_empty() {
-            p.check_timings = timings;
+    // R5 / IG3: the check's timing record is persisted in BOTH cases — in the open probation bundle of a
+    // lane that applied R itself, or in a CLOSED bundle of a lane that replaced nothing (no 24-hour
+    // re-check: there is nothing of its own to return to)
+    match row.probation.as_mut() {
+        Some(p) => {
+            if p.check_timings.is_empty() {
+                p.check_timings = timings;
+            }
+        }
+        None => {
+            let g = apply::pack_generation(env.op.pack);
+            row.probation = Some(ledger::Probation {
+                pack_generation: g.version,
+                pro_revision: g.pro_revision,
+                applied_at: env.op.now,
+                expected: rec.committed.clone(),
+                closed: Some(NOTHING_REPLACED_HERE.to_string()),
+                check_timings: timings,
+                check_timeouts: Vec::new(),
+            });
         }
     }
     finish(env, rec, stored, row, LaneState::Verified, "이 부서의 검사 통과", report)
@@ -1134,6 +1194,27 @@ fn decide_pending(
             }
         }
         row.merge = None;
+        // IG3: "already there" because THIS lane applied R and stopped before its row (evidence: its own
+        // completed door operations) → the probation bundle, as if the write had not been interrupted
+        match own_apply_evidence(env, rec, live, bound) {
+            Ok(Some(at)) => {
+                let (version, pro) = bound.row_fields();
+                row.probation = Some(ledger::Probation {
+                    pack_generation: version,
+                    pro_revision: pro,
+                    applied_at: at,
+                    expected: rec.committed.clone(),
+                    closed: None,
+                    check_timings: Vec::new(),
+                    check_timeouts: Vec::new(),
+                });
+            }
+            Ok(None) => row.probation = None,
+            Err(why) => {
+                report.left.push((rec.id.clone(), format!("이 부서의 동작 기록을 읽을 수 없어 이번 차례에는 결정하지 않습니다 — {why}")));
+                return Ok(None);
+            }
+        }
         return check_live(env, stored, row, rec, None, report);
     }
     // interpretation 35: a kept merge result OF THE CURRENT RESULT (the row's recorded base is the
@@ -1597,13 +1678,8 @@ fn apply_general(
         Err(why) => {
             // the lane's own failure: T6's probation owes the return of THIS lane's operations
             // (macOS); on Windows the automatic return is off — reported only
-            let closed = if env.op.form == ApplyForm::Exchange {
-                format!("{} — {} · 적용 뒤 이 부서의 검사 실패: {why}", apply::CLOSED_FAILED, apply::RETURN_OWED)
-            } else {
-                format!("{} — 적용 뒤 이 부서의 검사 실패(윈도우: 자동으로 되돌리지 않음): {why}", apply::CLOSED_FAILED)
-            };
             if let Some(p) = row.probation.as_mut() {
-                p.closed = Some(closed.chars().take(400).collect());
+                p.closed = Some(failed_closure(env, &why));
             }
             finish(env, rec, Some(&applied_row), row, LaneState::Conflict, &format!("적용 뒤 이 부서의 검사 실패 — {why}"), report)
         }
