@@ -78,6 +78,60 @@ pub fn normalize_rel(raw: &str) -> Result<String, RepairError> {
     Ok(parts.join("/"))
 }
 
+/// RULINGS JV1 (WW1): the name the file system gives an EXISTING target of a repair, when it differs
+/// from the typed rel (the output of [`normalize_rel`]) by letter case alone — so the ledger never holds
+/// a case alias of an existing file, and every reader that matches a ledger rel against the vendor's
+/// rel by exact string (the install's tombstone look-up, the preflight's `tombstoned_file`, `cys repair
+/// tombstones --json`) agrees by construction. The real spelling is read from the directory entries,
+/// one component at a time from the pack root: an entry spelled exactly as typed is kept; otherwise
+/// the ONLY entry equal to the typed component under `crate::pack::list_key`'s fold (one definition —
+/// no second fold) is taken. Directory entries rather than a canonical path: the same on every system
+/// (no `\\?\` prefix on Windows, no reliance on how `realpath` reports case on macOS), and a case alias
+/// of a folder is found too. The typed rel is kept EXACTLY as today when: the target (or any
+/// component) is absent; a component inside the pack is a link (a junction on Windows reports as one);
+/// two entries fold to the typed component (only on a volume that distinguishes case); the
+/// difference is more than case under the fold (e.g. a Unicode normal form); or the two spellings are
+/// not the same file on this volume (identity = volume + file id). Nothing is refused here.
+pub fn on_disk_rel(pack: &Path, rel: &str) -> String {
+    on_disk_case_alias(pack, rel).unwrap_or_else(|| rel.to_string())
+}
+
+/// [`on_disk_rel`]'s answer when it differs from the typed rel (None = keep the typed rel).
+fn on_disk_case_alias(pack: &Path, rel: &str) -> Option<String> {
+    let mut dir = pack.to_path_buf();
+    let mut real: Vec<String> = Vec::new();
+    for typed in rel.split('/') {
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .ok()?
+            .filter_map(|e| e.ok().and_then(|e| e.file_name().into_string().ok()))
+            .collect();
+        let name = entry_spelling(typed, &names)?;
+        dir = dir.join(&name);
+        if std::fs::symlink_metadata(&dir).ok()?.file_type().is_symlink() {
+            return None;
+        }
+        real.push(name);
+    }
+    let real = real.join("/");
+    if real == rel || crate::pack::list_key(&real) != crate::pack::list_key(rel) {
+        return None;
+    }
+    let typed_id = super::boot_critical::file_identity(&pack.join(rel))?;
+    (super::boot_critical::file_identity(&pack.join(&real))? == typed_id).then_some(real)
+}
+
+/// One path component: the entry spelled exactly as typed, else the ONLY entry that `list_key` folds
+/// to the same key; None = absent or ambiguous.
+fn entry_spelling(typed: &str, names: &[String]) -> Option<String> {
+    if names.iter().any(|n| n == typed) {
+        return Some(typed.to_string());
+    }
+    let key = crate::pack::list_key(typed);
+    let mut folded = names.iter().filter(|n| crate::pack::list_key(n) == key);
+    let only = folded.next()?;
+    folded.next().is_none().then(|| only.clone())
+}
+
 /// RULINGS AW3 (a): a path component in the Windows 8.3 short-name form — a `~` directly followed
 /// by an ASCII digit anywhere in the component.
 pub fn is_short_name_component(c: &str) -> bool {
@@ -624,6 +678,59 @@ mod tests {
             assert!(normalize_rel(bad).is_err(), "{bad:?} accepted");
         }
         assert!(normalize_rel(&"a".repeat(MAX_REL_BYTES + 1)).is_err());
+    }
+
+    /// WW1 (RULINGS JV1): does the volume that holds `dir` give one file to two spellings that differ
+    /// by letter case? Measured (written through one spelling, read through the other).
+    fn case_blind(dir: &std::path::Path) -> bool {
+        let _ = std::fs::write(dir.join("ww1-probe.txt"), b"ww1\n");
+        let same = std::fs::read(dir.join("WW1-PROBE.TXT")).is_ok_and(|b| b == b"ww1\n");
+        let _ = std::fs::remove_file(dir.join("ww1-probe.txt"));
+        same
+    }
+
+    /// WW1 (RULINGS JV1): the component rule alone (no file system) — exact first; else the ONE entry
+    /// that folds to it; two entries that fold to it (a case-sensitive volume holding both) → none;
+    /// a difference beyond case (a Unicode normal form) → none.
+    #[test]
+    fn ww1_entry_spelling_rule() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(entry_spelling("a.py", &names(&["a.py", "b.py"])).as_deref(), Some("a.py"));
+        assert_eq!(entry_spelling("A.PY", &names(&["a.py", "b.py"])).as_deref(), Some("a.py"));
+        assert_eq!(entry_spelling("A.py", &names(&["a.py", "A.py"])).as_deref(), Some("A.py"), "exact wins");
+        assert_eq!(entry_spelling("a.PY", &names(&["a.py", "A.py"])), None, "two files that differ by case are never merged");
+        assert_eq!(entry_spelling("c.py", &names(&["a.py"])), None, "absent");
+        assert_eq!(entry_spelling("\u{e9}.md", &names(&["e\u{301}.md"])), None, "a normal-form difference is not a case difference");
+    }
+
+    /// WW1 (RULINGS JV1) on this machine's temporary volume: an existing file named in another case
+    /// (file and folder) → its on-disk spelling, only where the volume is measured case-blind; the typed
+    /// rel is kept for an absent target, for the real spelling itself, for a link in the chain and for a
+    /// normal-form difference. On a case-sensitive volume every answer is the typed rel (an alias does not
+    /// exist there) — asserted too, so the test says which volume it ran on.
+    #[test]
+    fn ww1_on_disk_rel_takes_the_real_name_of_an_existing_file_only() {
+        let d = tmp(31);
+        std::fs::create_dir_all(d.join("bin")).unwrap();
+        std::fs::write(d.join("bin/a.py"), b"a\n").unwrap();
+        let blind = case_blind(&d);
+        eprintln!("ww1: the temporary volume is {}", if blind { "case-blind" } else { "case-sensitive" });
+        let expect = |typed: &str, real: &str| if blind { real.to_string() } else { typed.to_string() };
+        assert_eq!(on_disk_rel(&d, "bin/A.py"), expect("bin/A.py", "bin/a.py"));
+        assert_eq!(on_disk_rel(&d, "BIN/A.PY"), expect("BIN/A.PY", "bin/a.py"), "a folder alias too");
+        assert_eq!(on_disk_rel(&d, "bin/a.py"), "bin/a.py", "the real spelling is unchanged");
+        assert_eq!(on_disk_rel(&d, "bin/New.py"), "bin/New.py", "an absent target keeps the typed spelling");
+        assert_eq!(on_disk_rel(&d, "BIN/New.py"), "BIN/New.py", "absent target: nothing is taken from its folder either");
+        // a normal-form difference (NFC typed, NFD on disk) is not taken, whatever the volume does with it
+        std::fs::write(d.join("bin/e\u{301}.md"), b"e\n").unwrap();
+        assert_eq!(on_disk_rel(&d, "bin/\u{e9}.md"), "bin/\u{e9}.md");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(d.join("bin"), d.join("lnk")).unwrap();
+            assert_eq!(on_disk_rel(&d, "LNK/a.py"), "LNK/a.py", "a link in the chain keeps the typed spelling");
+            assert_eq!(on_disk_rel(&d, "lnk/A.py"), "lnk/A.py");
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// RULINGS AW3 (a): Windows short names are refused on every system; a `~` that is not followed

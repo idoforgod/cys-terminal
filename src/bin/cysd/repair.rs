@@ -1956,6 +1956,8 @@ mod ledger_verbs {
                 }));
             }
         }
+        // WW1 (RULINGS JV1): an existing target enters the ledger under the name the file system gives it.
+        let files: Vec<String> = files.iter().map(|r| intake::on_disk_rel(&ctx.pack_dir, r)).collect();
         // T4 (C10 10.6 · AD6 replaced · AW8): the rule-document branch — a rule document (any
         // spelling that folds to one, also through `--joins`) starts only with a valid owner token.
         if let Some(v) = begin_rule_document(ctx, caller, p, trigger, &files, &hooks, joins, resolves)? {
