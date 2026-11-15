@@ -1551,7 +1551,9 @@ mod tests {
 
     /// Every NOT-yet-implemented verb parses with its contract flags, prints the Korean sentence on
     /// stderr, writes nothing on stdout and exits 99; every verb parses; malformed calls are
-    /// refused by the parser.
+    /// refused by the parser. (T7b, at its rebase onto T5b: no verb is answered by the stub any more —
+    /// T5b's `submit` / `auth-helper` and T7b's `gate` / `recheck` have their bodies; the 99 branch
+    /// stays for a verb added without one.)
     #[test]
     fn stub_exit_99() {
         let calls: &[&[&str]] = &[
@@ -1758,7 +1760,8 @@ mod tests {
             );
         }
 
-        // A closed / failing stderr is not a panic and still exits 99.
+        // A closed / failing stderr is not a panic (T7b rewrite — was "… and still exits 99": no verb is
+        // answered by the stub any more; the old-daemon path keeps its exit below).
         struct Broken;
         impl Write for Broken {
             fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
@@ -1771,14 +1774,10 @@ mod tests {
                 Ok(())
             }
         }
-        // T5b (rewrite: was `submit` → 99, then `revert` → 99; both are daemon-backed now — on this
-        // base `recheck` (T7b) is the last verb still answered by the stub, and when T7b merges this
-        // check loses its last stub verb and is T7b's to retire)
-        let cmd = parse(&["recheck", "R-1"]).unwrap();
-        assert_eq!(
-            run_with(&cmd, &mut Vec::new(), &mut Broken, &old_daemon),
-            99
-        );
+        // T7b (rewrite at its rebase onto T5b — RETIRED: the stub's closed-stderr check used the last
+        // verb the stub answered — `submit`, then `revert`, then (T5b) `recheck R-1` → 99; with T7b's
+        // `recheck` no verb is answered by the stub, so that check has no subject left. A closed stderr
+        // stays pinned below on the old-daemon path (`list` → 93), and every verb's own exit above.)
         let cmd = parse(&["list"]).unwrap();
         assert_eq!(
             run_with(&cmd, &mut Vec::new(), &mut Broken, &old_daemon),
