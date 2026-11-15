@@ -4143,3 +4143,29 @@ fn the_sentence_about_other_departments_is_true_for_each_class() {
     assert!(e.contains(approval_form), "{e}");
     assert!(!e.contains("다른 부서는 전파"), "{e}");
 }
+
+/// S5-MUT part 1 · H-10-A1-19-01 (RULINGS JU): an approved copy is the approved copy only for the pack generation it was
+/// applied in — M10 never puts back an older generation's approved bytes. M10's own tests hold no approved copy at all
+/// (both take the "our original" path), so with BOTH generation checks removed — the row filter of
+/// `resolve_approved_copy_in` and f9_agreement's EJ1 — an older generation's copy became the put-back source and nothing
+/// was red. This fixture HOLDS one: approved and applied (the approved copy of its own generation — the control), then the
+/// pack moves to another generation; the same copy is no longer the approved copy and never `Approved`.
+#[test]
+fn an_approved_copy_of_an_older_generation_is_not_the_approved_copy() {
+    let r = rig("gen-older");
+    let id = rid("R-21");
+    let rel = "hooks/g.sh";
+    approved_and_applied(&r, &id, rel, b"PRE\n", b"APPROVED\n");
+    assert!(approved_copy_of_current_generation_in(&r.root, &r.pack, &r.lane, rel).unwrap(), "control: the approved copy of its own generation");
+    let before = pack_generation(&r.pack).version;
+    std::fs::write(r.pack.join(".pack-version"), "9.9.9-next\n").unwrap();
+    assert_ne!(pack_generation(&r.pack).version, before, "the fixture did not move the pack generation");
+    assert!(
+        !approved_copy_of_current_generation_in(&r.root, &r.pack, &r.lane, rel).unwrap(),
+        "an older generation's approved copy is taken as the approved copy"
+    );
+    assert!(
+        !matches!(resolve_approved_copy_in(&r.root, &r.pack, &r.lane, rel), ApprovedCopy::Approved { .. }),
+        "an older generation's approved copy resolves as Approved — M10 would put it back"
+    );
+}

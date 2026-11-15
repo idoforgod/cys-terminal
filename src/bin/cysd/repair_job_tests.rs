@@ -422,6 +422,59 @@ fn boot_install_and_journal_recovery_untouched() {
 /// sha256 of the boot block at the base 0422affa (= the tag's block, design main.rs 1344 / 1357–1377).
 const BOOT_BLOCK_SHA256: &str = "1e03bd1b901d13a46673dc3be52c93a40ce9c4a662598fd9c46bcdd35eb21fe3";
 
+/// The body of `async_main` (main.rs) — the daemon's start up to the accept loop that binds the socket.
+fn async_main_body() -> &'static str {
+    let src = include_str!("main.rs");
+    let after = src.split_once("\nasync fn async_main() {").expect("async_main").1;
+    &after[..after.find("\n}\n").expect("end of async_main")]
+}
+
+/// S5-MUT part 1 · H-09-A1-01-01 / H-09-A1-03-01 / H-09-A2-17-01 / I-F4-13 (RULINGS JU): the daemon's start reaches no
+/// repair ledger and takes no pack-apply lock — the ledger is reached only by the re-check job after readiness
+/// (`trigger_with`). A write-ahead recovery placed before the startup lock (a daemon that LOSES the lock would touch the
+/// shared ledger), a recovery or a ledger scan placed between the lock and the bind (the bind is delayed), and a pack-apply
+/// lock taken before the boot's journal recovery all stayed green: the hash above covers only the text from the journal
+/// recovery to `Daemon::new`, and the fd-limit pin orders four anchors. The whole of `async_main` runs before its last
+/// call, `accept_loop` (which binds).
+#[test]
+fn async_main_reaches_no_repair_ledger_and_takes_no_pack_apply_lock() {
+    let body = async_main_body();
+    let tail = &body[body.find("accept_loop(daemon, &socket_path").expect("accept_loop")..];
+    assert!(
+        tail.lines().skip(1).all(|l| {
+            let t = l.trim();
+            t.is_empty() || t.starts_with("//") || t.starts_with("#[cfg(") || t.starts_with("accept_loop(")
+        }),
+        "async_main does work after its accept loop — the census below would not cover the whole start"
+    );
+    let needles = ["cys::repair::", "crate::repair::", "repair_job::", "pack_apply_lock", "with_apply_lock"];
+    for needle in needles {
+        assert!(!body.contains(needle), "async_main reaches `{needle}` — repair-ledger work or the pack-apply lock in the daemon's start (H-09-A1-01-01 / H-09-A1-03-01 / H-09-A2-17-01 / I-F4-13)");
+    }
+    // positive control: these are the words by which daemon code reaches the ledger and the lock (the job uses them)
+    let job = include_str!("repair_job.rs");
+    for needle in ["cys::repair::", "pack_apply_lock"] {
+        assert!(job.contains(needle), "control: repair_job.rs no longer says `{needle}` — the census above would miss its new spelling");
+    }
+}
+
+/// S5-MUT part 1 · H-13-N1-01 (RULINGS JU): the daemon's start writes the delivery ledger's boot line — after
+/// `Daemon::new` (the line carries the incarnation) and before the accept loop — so a normal ledger is never empty and
+/// the owner-origin judgment can read "exists but 0 bytes" as damaged (fail closed). The tests of the function
+/// (`delivery::tests::epoch_marker_is_atomic_and_parseable`) and of the judgment call it themselves; the boot's CALL
+/// replaced by `Outcome::Recorded` stayed green.
+#[test]
+fn async_main_writes_the_delivery_boot_line_before_the_accept_loop() {
+    let body = async_main_body();
+    let new = body.find("let daemon = Daemon::new(socket_path.clone());").expect("Daemon::new");
+    let line = body
+        .find("delivery::write_boot_sentinel(&socket_path, daemon.started_at, &daemon.incarnation)")
+        .expect("the daemon's start no longer writes the delivery ledger's boot line");
+    let accept = body.find("accept_loop(daemon, &socket_path").expect("accept_loop");
+    assert!(new < line && line < accept, "the boot line is written outside Daemon::new .. accept_loop");
+    assert_eq!(body.matches("write_boot_sentinel(").count(), 1, "the boot line is written exactly once");
+}
+
 /// The job module and the trigger never write to a queue, an alert route or the event bus (F1).
 #[test]
 fn job_module_sends_nothing() {
