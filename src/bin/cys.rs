@@ -8265,7 +8265,7 @@ fn run_persona(action: PersonaAction) -> i32 {
 fn remove_schedule_job(arr: &mut Vec<Value>, id: &str) -> Result<(), String> {
     if cys::repair::probation::FIXED_BUILTIN_JOB_IDS.contains(&id) {
         return Err(format!(
-            "'{id}' 은 「스스로 해결」의 내장 작업이라 지우지 않습니다 — 지워도 데몬이 30초 안에 코드 정의 그대로 다시 넣습니다"
+            "'{id}' 은 지울 수 없는 내장 작업입니다 — 「스스로 해결」의 수리 재검사와 매시간 미승인 변경 점검을 이 작업이 돌립니다"
         ));
     }
     let before = arr.len();
@@ -49526,6 +49526,22 @@ mod tests {
             (SCHEDULE_LOCK_WAIT_MS / 1_000) < SCHEDULE_LOCK_STALE_SECS,
             "대기 상한이 부패 문턱보다 길면 정상 대기자가 상대의 산 잠금을 깬다"
         );
+    }
+
+    /// WS1 · KN minor (a): the refusal says, in one sentence, that the job cannot be removed and why — and promises no
+    /// time for its return (the daemon puts it back only at a tick that holds the schedule's lock and can write the file).
+    #[test]
+    fn ws1_the_refusal_says_the_job_cannot_be_removed_and_promises_no_time() {
+        let mut arr = vec![json!({"id": "repair-probation-tick", "every_minutes": 2, "action": "command",
+                                  "command": "CYS_NO_AUTOSTART=1 cys repair tick", "_builtin": "repair", "_builtin_version": 2,
+                                  "_builtin_fixed": true})];
+        let err = remove_schedule_job(&mut arr, "repair-probation-tick").expect_err("the fixed job was removed");
+        assert!(err.contains("repair-probation-tick"), "{err}");
+        assert!(err.contains("지울 수 없"), "the sentence does not say the job cannot be removed: {err}");
+        assert!(err.contains("수리 재검사"), "the sentence does not say why: {err}");
+        assert!(!err.contains("30초") && !err.contains("다시 넣"), "the sentence promises when it comes back: {err}");
+        assert_eq!(err.matches(['.', '!', '?']).count(), 0, "one sentence: {err}");
+        assert_eq!(arr.len(), 1, "a refused remove changed the jobs");
     }
 
     /// WS1 · RULINGS JX3 (b) as ruled by KN1 and KN minor (a): the daemon keeps a FIXED built-in job (today the self-repair
