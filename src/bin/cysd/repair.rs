@@ -1658,6 +1658,8 @@ mod ledger_verbs {
         if error.len() > intake::MAX_ERROR_BYTES * 4 {
             return Err(VerbError::invalid("`error` 가 너무 깁니다"));
         }
+        // WW1 (RULINGS KH2): a report enters the records under the same name as a repair of that file.
+        let file = &intake::normalize_rel(file).map_or_else(|_| file.to_string(), |r| intake::on_disk_rel(&ctx.pack_dir, &r));
         let rep = intake::parse_report(file, error)
             .map_err(|e| VerbError::invalid(VerbError::from(e).message))?;
         let key = (ctx.root.clone(), ctx.lane.0.clone());
@@ -2182,7 +2184,9 @@ mod ledger_verbs {
             let (defects, _) = intake::load_all_in(&ctx.root);
             let joined: Vec<intake::Defect> = defects
                 .into_iter()
-                .filter(|d| files.contains(&d.rel))
+                // WW1 (RULINGS KH2): also under the mapped spelling of the row's rel (a row recorded while the
+                // file was absent, or by a build without the map, still meets the repair of its file)
+                .filter(|d| files.contains(&d.rel) || files.contains(&intake::on_disk_rel(&ctx.pack_dir, &d.rel)))
                 .collect();
             // C1 1.2 "증상": the reported symptom(s) the repair takes in (the cause is the worker's record).
             let symptom = joined
