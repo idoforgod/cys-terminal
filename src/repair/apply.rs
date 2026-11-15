@@ -404,6 +404,13 @@ pub enum Bound {
     Unknown,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests (RULINGS IE1): scripted answers of [`Bound::now`], consumed in order — an interleaving
+    /// of marker reads made deterministic.
+    pub(crate) static BOUND_NOW_SCRIPT: std::cell::RefCell<std::collections::VecDeque<Bound>> = std::cell::RefCell::new(std::collections::VecDeque::new());
+}
+
 impl Bound {
     /// THE one reading of a generation value (EN3): the empty string and the literal `unknown` are
     /// Unknown; nothing else in the repair module compares the raw string.
@@ -419,6 +426,10 @@ impl Bound {
     }
     /// The pack's generation read at this moment (FG1: unreadable / inconsistent metadata → Unknown).
     pub fn now(pack: &Path) -> Bound {
+        #[cfg(test)]
+        if let Some(b) = BOUND_NOW_SCRIPT.with(|q| q.borrow_mut().pop_front()) {
+            return b;
+        }
         match pack_generation_checked(pack) {
             Ok(g) => Bound::of(Some(g)),
             Err(_) => Bound::Unknown,
