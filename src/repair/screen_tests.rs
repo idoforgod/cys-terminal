@@ -2097,11 +2097,38 @@ fn at4_capgate_deny_added_refused() {
 
 /// BH2 (b): the only cys a probe reaches is the screen's own stub on its own scratch socket —
 /// never the socket of the process running the screen.
+///
+/// RULINGS LF2 / LF3 — the test judges ITS OWN run. The screen keeps the answers this process already
+/// measured for the same input bytes, and an answer's text names the scratch socket of the run that
+/// measured it; the RELEASED copies are the same in every screen of this binary, so a screen another
+/// test ran first (the library's apply test runs the PRODUCTION screen, scratch = the account's cache
+/// folder) handed this test an answer naming THAT run's socket. Here the RELEASED copies (and the
+/// lane, kept equal to them) carry one comment line in `hooks/_lib.sh` — an input of guard.sh's device
+/// — that no other screen sees, so the probe judged below really runs in this screen.
+/// (Old expectation: the RELEASED copies as embedded; red on a normal home folder after the apply
+/// test — the harness suite `b8k-sock`, short home.)
 #[test]
 fn screen_never_reaches_a_real_socket() {
     let root = test_root("sock");
+    let own = replay::LaidSource::Bytes {
+        bytes: format!(
+            "{}\n# screen_never_reaches_a_real_socket: bytes no other screen sees ({})\n",
+            released("hooks/_lib.sh"),
+            replay::random_hex(8)
+        )
+        .into_bytes(),
+        mode: crate::repair::rehearsal::released_mode("hooks/_lib.sh"),
+    };
     let lane = lane_of(&root, &[]);
-    let c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-1"]), false);
+    replay::lay_out(&lane.join("hooks/_lib.sh"), &own).unwrap();
+    let mut c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-1"]), false);
+    c.released = Arc::new(move |rel: &str| {
+        if rel == "hooks/_lib.sh" {
+            Some(own.clone())
+        } else {
+            super::super::rehearsal::released_copy(rel)
+        }
+    });
     let rep = screen_with(&c, &candidate_of(&root, &[]), &lane, LONG).unwrap();
     let g1 = rep
         .probes
