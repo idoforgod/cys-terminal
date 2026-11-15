@@ -1613,9 +1613,10 @@ mod tests {
                 Ok(())
             }
         }
-        // T5b (rewrite: was `submit` → 99; `submit` is daemon-backed now — a verb still owned by
-        // another track keeps the stub's 99)
-        let cmd = parse(&["revert", "R-1"]).unwrap();
+        // T5b (rewrite: was `submit` → 99, then `revert` → 99; both are daemon-backed now — on this
+        // base `recheck` (T7b) is the last verb still answered by the stub, and when T7b merges this
+        // check loses its last stub verb and is T7b's to retire)
+        let cmd = parse(&["recheck", "R-1"]).unwrap();
         assert_eq!(
             run_with(&cmd, &mut Vec::new(), &mut Broken, &old_daemon),
             99
