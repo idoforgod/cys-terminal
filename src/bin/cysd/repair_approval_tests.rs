@@ -757,20 +757,91 @@ fn only_the_requests_success_record_approves() {
     assert!(cli.contains(&format!("\"{HELPER_NONCE_VAR}\"")));
 }
 
-/// A helper that never answers is killed and reaped at the limit and that is not an approval.
+/// RULINGS KJ1 — the deadline is tested through the PRODUCTION boundary (`bind_helper`, a real pipe):
+/// each stand-in ignores the limit and, left alone, WOULD end with this request's valid record and
+/// exit 0 (an approval) — so the verdict itself tells a wait that honours the limit from one that
+/// does not (RULINGS EZ1: no clock is asserted). (a) the record only after the limit; (b) the record,
+/// then a hang; (c) the record, then its standard output closed while it lives; (d) the record and
+/// exit 0 while a GRANDCHILD keeps the pipe open. Each: "not approved"; the direct child ended and
+/// was reaped (DR3 — a zombie would still answer signal 0); in (b)–(d) the stand-in reached the
+/// point after its record (a marker file — the shape was real, not killed early), and in (d) the
+/// grandchild still held the pipe when the wait returned and is ended by its exact pid (also on a failure).
+/// (Old expectation — this test's former body: a child spawned WITHOUT a piped output and
+/// `exec sleep 30`, `!wait_helper_for(child, 500 ms, …)`, `!pid_alive(pid)`; the boundary answered
+/// "no answer" at its first turn, so the deadline check was never reached and removing it left the
+/// test green.)
+#[cfg(unix)]
 #[test]
 fn helper_timeout_is_killed_and_not_approval() {
+    use cys::repair::replay::{pid_alive, process_identity};
     use cys::SpawnPolicy;
-    let child = std::process::Command::new("/bin/sh")
-        .args(["-c", "exec sleep 30"])
+    let (rid, nonce) = ("rq-00aa", "00112233445566778899aabbccddeeff");
+    let r = rig("kj1");
+    let gpid = r.dir.join("grandchild.pid");
+    /// Ends (d)'s grandchild by the exact pid it wrote, also when an assertion above fails first.
+    struct EndGrandchild(PathBuf);
+    impl Drop for EndGrandchild {
+        fn drop(&mut self) {
+            if let Some(g) = std::fs::read_to_string(&self.0).ok().and_then(|t| t.trim().parse::<i32>().ok()) {
+                // SAFETY: kill(2) of the grandchild this test started, by its exact pid
+                unsafe {
+                    libc::kill(g, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    let _end = EndGrandchild(gpid.clone());
+    let record = "printf 'CYS-AUTH-OK v1 request=%s nonce=%s\\n' \"$1\" \"$CYS_REPAIR_AUTH_NONCE\"";
+    let reached = |n: &str| r.dir.join(format!("reached-{n}"));
+    let shapes = [
+        (
+            "a",
+            "the record only after the limit",
+            "exec /usr/bin/perl -e 'select(undef, undef, undef, 3); print \"CYS-AUTH-OK v1 request=$ARGV[0] nonce=$ENV{CYS_REPAIR_AUTH_NONCE}\\n\"; exit 0' \"$1\"".to_string(),
+        ),
+        (
+            "b",
+            "the record, then a hang",
+            format!("{record}; : > '{}'; exec /bin/sleep 30", reached("b").display()),
+        ),
+        (
+            "c",
+            "the record, then the output closed while it lives",
+            format!("{record}; exec >&-; : > '{}'; exec /bin/sleep 30", reached("c").display()),
+        ),
+        (
+            "d",
+            "the record and exit 0, a grandchild holding the pipe",
+            format!(
+                "(exec /bin/sleep 30) & echo $! > '{}'; {record}; : > '{}'; exit 0",
+                gpid.display(),
+                reached("d").display()
+            ),
+        ),
+    ];
+    for (tag, name, script) in shapes {
+        let child = bind_helper(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script, "sh", rid])
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+            nonce,
+        )
         .spawn_policy(cys::ChildLifetime::Attached)
         .spawn()
         .unwrap();
-    let pid = child.id();
-    // RULINGS EZ1: no real-clock premise — a wait that ignored the limit would see the helper exit 0
-    // after its 30 s and call that an approval; the verdict below tells the two apart
-    assert!(!wait_helper_for(child, Duration::from_millis(500), "rq-00", "00112233445566778899aabbccddeeff"));
-    assert!(!cys::repair::replay::pid_alive(pid), "the helper survived");
+        let pid = child.id();
+        assert!(
+            !wait_helper_for(child, Duration::from_secs(1), rid, nonce),
+            "({tag}) {name}: approved"
+        );
+        assert!(!pid_alive(pid), "({tag}) {name}: the direct child {pid} was not ended and reaped");
+        if tag != "a" {
+            assert!(reached(tag).exists(), "premise ({tag}) {name}: the record was not written");
+        }
+    }
+    let g: u32 = std::fs::read_to_string(&gpid).unwrap().trim().parse().unwrap();
+    assert!(process_identity(g).is_some(), "premise (d): the grandchild held the pipe past the limit");
     assert_eq!(HELPER_KILL_SECS, 120);
     assert_eq!(HELPER_INVALIDATE_SECS, 110);
 }
