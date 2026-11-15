@@ -3961,7 +3961,19 @@ pub(crate) mod propagate_verbs {
         let locked = |rid: &RepairId, f: &mut dyn FnMut() -> Result<(), RepairError>| -> Result<(), RepairError> {
             ctx.locked(rid.as_str(), f)
         };
-        let hooks = |rid: &RepairId, lane: &cys::repair::types::LaneKey, step: cys::repair::apply::HookStep| (ctx.hook_step)(rid, lane, step);
+        // RULINGS IZ2: production runs T6's GUARDED hook unit (the stamp validated after its dry run, right
+        // before its first durable write); the test build runs the injected hook step behind the guard
+        #[cfg(not(test))]
+        let hooks = |rid: &RepairId, lane: &cys::repair::types::LaneKey, step: cys::repair::apply::HookStep, guard: &dyn Fn() -> Result<(), String>| {
+            cys::repair::apply::hook_lines_unit(rid, lane, step, guard)
+        };
+        #[cfg(test)]
+        let hooks = |rid: &RepairId, lane: &cys::repair::types::LaneKey, step: cys::repair::apply::HookStep, guard: &dyn Fn() -> Result<(), String>| -> Result<cys::repair::apply::HookUnitEnd, RepairError> {
+            if let Err(why) = guard() {
+                return Ok(cys::repair::apply::HookUnitEnd::Refused(why));
+            }
+            Ok(cys::repair::apply::HookUnitEnd::Ran { op: "test-hook-op".into(), lines: Vec::new(), result: (ctx.hook_step)(rid, lane, step) })
+        };
         let no_bytes = |_: &cys::repair::ledger::RepairRecord, rel: &str| -> Result<std::path::PathBuf, String> {
             Err(format!("{rel}: 다시 검사는 바이트를 들이지 않습니다"))
         };
@@ -4025,7 +4037,7 @@ pub(crate) mod propagate_verbs {
             reference: &cys::repair::apply::production_reference,
             classify: &classify,
             locked: &locked,
-            hooks: &cys::repair::apply::hook_lines_step,
+            hooks: &cys::repair::apply::hook_lines_unit,
             result_bytes: &result_bytes,
             sources: &sources,
             apply_lock: &lock_file,

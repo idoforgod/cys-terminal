@@ -226,6 +226,9 @@ struct Doubles {
     vendor: std::cell::RefCell<Option<(String, String)>>,
     /// IG4: the reference check's duration (ms) this test's reference double reports.
     reference_ms: Cell<u64>,
+    /// IZ2 / JA1: a hook unit used INSTEAD of the default double (e.g. T6's real guarded unit with a
+    /// fake registrar).
+    unit: std::cell::RefCell<Option<Box<UnitDouble>>>,
     /// IK3 / IG5: runs inside every check call (the root it checks) — a seam that "parks" a check.
     during_check: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>>,
 }
@@ -242,8 +245,11 @@ fn doubles() -> Doubles {
         vendor: std::cell::RefCell::new(None),
         reference_ms: Cell::new(7),
         during_check: std::cell::RefCell::new(None),
+        unit: std::cell::RefCell::new(None),
     }
 }
+
+type UnitDouble = dyn Fn(&RepairId, &LaneKey, HookStep, &dyn Fn() -> Result<(), String>) -> Result<apply::HookUnitEnd, RepairError>;
 
 /// HH1: the sources the doubles name (the real embedded copies always; the previous-release table
 /// replaced by the one entry the test names).
@@ -271,10 +277,17 @@ fn tick_with(r: &Rig, which: &str, d: &Doubles, fresh: &str, faults: &dyn Faults
         Ok(CheckOutcome { result, ms: 1 })
     };
     let classify = |_: &str| -> Result<Classification, RepairError> { Ok(d.class.get()) };
-    let hooks = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> {
+    // the hook unit's double (IZ2): the guard first (a unit with no slow preparation), then the step
+    let hooks = |id: &RepairId, l: &LaneKey, step: HookStep, guard: &dyn Fn() -> Result<(), String>| -> Result<apply::HookUnitEnd, RepairError> {
+        if let Some(u) = d.unit.borrow().as_ref() {
+            return u(id, l, step, guard);
+        }
+        if let Err(why) = guard() {
+            return Ok(apply::HookUnitEnd::Refused(why));
+        }
         d.hook_calls.set(d.hook_calls.get() + 1);
         if d.hooks_ok.get() {
-            Ok(ReconcileReport { hooks: Vec::new() })
+            Ok(apply::HookUnitEnd::Ran { op: "op-test".into(), lines: vec!["Stop:x.sh".into()], result: Ok(ReconcileReport { hooks: Vec::new() }) })
         } else {
             Err(RepairError::Io("등록기가 실패했습니다(시험)".into()))
         }
@@ -1712,10 +1725,17 @@ fn recheck(r: &Rig, id: &RepairId, d: &Doubles, seat: u64, note: &str) -> Result
         Ok(CheckOutcome { result: if ok { CheckResult::Pass } else { CheckResult::Fail("x".into()) }, ms: 1 })
     };
     let classify = |_: &str| -> Result<Classification, RepairError> { Ok(d.class.get()) };
-    let hooks = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> {
+    // the hook unit's double (IZ2): the guard first (a unit with no slow preparation), then the step
+    let hooks = |id: &RepairId, l: &LaneKey, step: HookStep, guard: &dyn Fn() -> Result<(), String>| -> Result<apply::HookUnitEnd, RepairError> {
+        if let Some(u) = d.unit.borrow().as_ref() {
+            return u(id, l, step, guard);
+        }
+        if let Err(why) = guard() {
+            return Ok(apply::HookUnitEnd::Refused(why));
+        }
         d.hook_calls.set(d.hook_calls.get() + 1);
         if d.hooks_ok.get() {
-            Ok(ReconcileReport { hooks: Vec::new() })
+            Ok(apply::HookUnitEnd::Ran { op: "op-test".into(), lines: vec!["Stop:x.sh".into()], result: Ok(ReconcileReport { hooks: Vec::new() }) })
         } else {
             Err(RepairError::Io("등록기가 실패했습니다(시험)".into()))
         }
@@ -2245,3 +2265,76 @@ fn recheck_uses_the_same_stamp_and_publication_as_the_tick() {
     assert_eq!(std::fs::read(crate::repair::tombstones::path_in(&r2.root, &lane(DEPT))).ok(), tombs_before, "no tombstone written");
     assert_eq!(r2.row(&id2, DEPT).unwrap().state, LaneState::Conflict, "nothing written");
 }
+
+// ───────────────────────────── RULINGS IZ2 / JA1 — the hook unit ─────────────────────────────
+
+/// A hook-only general repair made in HQ (Stop:x.sh unregistered), in probation.
+fn hook_repair_in_hq(r: &Rig, id: &RepairId) -> RepairRecord {
+    record(r, id, Classification::General, vec![FileChange { rel: "settings:Stop:x.sh".into(), kind: ChangeKind::HookUnregister { event: "Stop".into(), script: "x.sh".into() }, pre: PreImage::Absent, post: TargetState::Absent, diff: None }], Vec::new(), HQ)
+}
+
+/// A fake registrar's report for Stop:x.sh (the shape T6's dry-run measurement reads).
+fn registrar_report(settings: &Path, state: &str) -> String {
+    serde_json::json!({"hooks": [{"event": "Stop", "script": "x.sh", "lifeline": false, "desired": "unregistered",
+        "targets": [{"path": settings.to_string_lossy(), "state": state}]}], "errors": []}).to_string()
+}
+
+/// T6's REAL guarded hook unit over this rig's root and DEPT's pack with a fake registrar; `during_dry`
+/// runs inside the registrar's dry run, `during_real` inside its real run (the origin's daemon acting
+/// while this lane's unit waits).
+fn real_unit(r: &Rig, during_dry: Box<dyn Fn()>, during_real: Box<dyn Fn()>, calls: std::rc::Rc<std::cell::RefCell<Vec<bool>>>) -> Box<UnitDouble> {
+    let (root, pack, settings) = (r.root.clone(), r.dept.clone(), r.base.join("settings.json"));
+    Box::new(move |id: &RepairId, l: &LaneKey, step: HookStep, guard: &dyn Fn() -> Result<(), String>| {
+        let registrar = |_: &Path, dry: bool| -> Result<String, RepairError> {
+            calls.borrow_mut().push(dry);
+            if dry {
+                during_dry();
+                Ok(registrar_report(&settings, "registered"))
+            } else {
+                during_real();
+                Ok(registrar_report(&settings, "unregistered"))
+            }
+        };
+        apply::hook_lines_unit_in(&root, &pack, id, l, step, &registrar, T0, guard)
+    })
+}
+
+fn supersede(root: &Path, id: &RepairId) -> Box<dyn Fn()> {
+    let (root, id) = (root.to_path_buf(), id.clone());
+    Box::new(move || {
+        let mut rec = ledger::read_record_in(&root, &id).unwrap().unwrap();
+        if rec.state != RepairState::Superseded {
+            rec.state = RepairState::Superseded;
+            ledger::write_record_in(&root, &rec).unwrap();
+        }
+    })
+}
+
+/// RULINGS IZ2 — the hook unit validates AFTER the registrar's dry run (which may wait up to its
+/// deadline) and the settings measurement, right before its first durable write: R superseded at the
+/// origin DURING the dry run → no write-ahead record, no tombstone, no real run; `recheck` says nothing
+/// was written. (Validated before the dry run, the record, the tombstone and the real run happened.)
+#[test]
+fn the_hook_unit_validates_after_its_dry_run() {
+    let r = rig("iz2");
+    let id = rid("R-1");
+    hook_repair_in_hq(&r, &id);
+    let d0 = doubles();
+    d0.hooks_ok.set(false); // the first tick: the lane's hook step fails → 충돌 (for a recheck)
+    tick(&r, DEPT, &d0, &fid(1));
+    let mut row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Conflict);
+    row.merge_lock = Some(crate::repair::lock::new_lease(LockOwner { lane: lane(DEPT), seat: 5, incarnation: "inc".into() }, T0, None));
+    ledger::write_lane_durable_in(&r.root, &row).unwrap();
+    let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let d = doubles();
+    *d.unit.borrow_mut() = Some(real_unit(&r, supersede(&r.root, &id), Box::new(|| {}), calls.clone()));
+    match recheck(&r, &id, &d, 5, "") {
+        Err(RepairError::Locked(m)) => assert!(m.contains(RECORD_CHANGED) && m.contains("아무것도 쓰지 않았습니다"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(*calls.borrow(), vec![true], "the dry run only — no real run");
+    assert!(r.ops(&id).iter().all(|o| o.lane_key != lane(DEPT)), "no write-ahead record");
+    assert!(crate::repair::tombstones::load_in(&r.root, &lane(DEPT)).unwrap().is_empty(), "no tombstone");
+}
+
