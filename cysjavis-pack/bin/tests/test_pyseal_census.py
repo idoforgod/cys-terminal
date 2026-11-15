@@ -406,6 +406,15 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   (replay.rs `base_env` · screen.rs 의 훅 시험 env 두 곳 · rehearsal.rs 의 컴파일 검사는 `-B` 와 함께). 벗기지
     #   않고 거는 방향이다 — 예행이 깐 팩 사본에 `__pycache__` 가 남지 않는다(test_lane_redirect 와 같은 계급).
     "src/repair/rehearsal.rs",
+    # 2026-11-16 WY1 registration (0.15.0, RULINGS LH2 — 48 → 49 files). **Seal inspection result (registering IS
+    #   that declaration)**: NOT a new python entry point and NOT a product enforcement point; a Rust test module.
+    #   Its needles (3 lines) are ASSERTIONS that the seal is SET: `check_child_env` states
+    #   `PYTHONDONTWRITEBYTECODE=1`, and a real child of the non-unix check path sees exactly
+    #   `PYTHONDONTWRITEBYTECODE=1` + `CYS_NO_AUTOSTART=1`. Its one real Python spawn goes through the
+    #   product's `bounded_py_compile` (the sealed `python_command` factory, the seal restated after `env_clear`, `-B`),
+    #   and the test asserts no `__pycache__` next to the checked file. Its other "interpreters" are fake `/bin/sh`
+    #   scripts. No line strips the seal (same class as replay.rs / rehearsal.rs above).
+    "src/repair/rehearsal_tests.rs",
     "src/repair/replay.rs",
     "src/repair/screen.rs",
 )
