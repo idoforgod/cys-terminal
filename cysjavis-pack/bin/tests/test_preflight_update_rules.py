@@ -305,6 +305,40 @@ class LedgerKinds(Rig):
         self.run_check("c62_pack_heal_ledger", "C62")
         self.assertEqual(len([x for x in self.wakes(log) if "parked-merge" in x]), 3, "나이가 지난 표지는 치워지고 다시 알린다")
 
+    def test_parked_merge_fresh_set_is_one_wake_with_its_count_one_task_per_lane(self):
+        # S5-MUT part 1 · I-F1-05 (RULINGS JU 1): the parked set is ONE task per lane. test_parked_merge_task_one_key_per_parked_set
+        #   grows a set from one file to two — one task per FILE also gives exactly one NEW wake there, so it stayed green under
+        #   that mutation. Here a FRESH set of three parked files gives ONE wake whose text carries the count, and the scenario's
+        #   shape (several lanes, several files each) gives at most one task per lane.
+        log = self._wake_rig()
+        stub = os.path.join(self.pack, "bin", "javis_wakeup.py")
+        parked = {"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "version": "0.15.0", "ts": 1},
+                  "bin/c.py": {"kind": "user-kept", "side": "bin/c.py.new", "version": "0.15.0", "ts": 1},
+                  "hooks/d.sh": {"kind": "vendor-first", "side": "hooks/d.sh.user", "version": "0.15.0", "ts": 1}}
+        self.ledger(parked)
+        self.run_check("c62_pack_heal_ledger", "C62")
+        w = [x for x in self.wakes(log) if "parked-merge" in x]
+        self.assertEqual(len(w), 1, "a fresh set of three parked files is ONE task for its lane: %r" % w)
+        self.assertTrue(any("보관한 수정 3건(pack)" in a for a in w[0]), w[0])
+        # two more lanes (department packs), three parked files each
+        lanes = {"pack": self.pack}
+        for name in ("pack-dept-a", "pack-dept-b"):
+            lp = os.path.join(self.root, name)
+            os.makedirs(os.path.join(lp, "bin"), exist_ok=True)
+            shutil.copyfile(stub, os.path.join(lp, "bin", "javis_wakeup.py"))
+            with open(os.path.join(lp, ".merge-pending.json"), "w", encoding="utf-8") as f:
+                json.dump(parked, f)
+            lanes[name] = lp
+            with mock.patch.dict(os.environ, {"CYS_PACK_DIR": lp}):
+                self.run_check("c62_pack_heal_ledger", "C62")
+        w = [x for x in self.wakes(log) if "parked-merge" in x]
+        key = lambda a: a[a.index("--idempotency-key") + 1]  # noqa: E731
+        lane_of = lambda a: key(a)[len("parked-merge-"):].rsplit("-", 1)[0]  # noqa: E731 — the key is parked-merge-<lane>-<fp>
+        per_lane = {name: [x for x in w if lane_of(x) == name] for name in lanes}
+        self.assertEqual({n: len(v) for n, v in per_lane.items()}, {n: 1 for n in lanes},
+                         "at most one parked-merge task per lane (the scenario: 39 files / 11 lanes -> <= 11 tasks)")
+        self.assertEqual(len(w), len(lanes), w)
+
     def test_failed_enqueue_is_retried_not_recorded(self):
         # ★T2i(RULINGS GB1 — 기대가 바뀜): 도구가 실패를 알려도 시도 표지는 남는다 — 곧바로 다음 점검은 다시 적재하지 않고(방금의
         #   시도가 진행 중일 수 있다), 표지가 오래되면 번호를 매긴 다시 적재가 한 번 간다. '보냄'은 기록되지 않는다.

@@ -998,5 +998,36 @@ check("24e cd 뒤 좌석: 작업 폴더 고지는 1줄 · 만들어질 때의 �
       code == 0 and len(_cw) == 1 and _cw[0] == _CWD_FMT % env["CYS_CWD_BLOCKED"] and other not in _cw[0] and "pwd" not in _cw[0],
       repr(_cw)[:200])
 
+# S5-MUT part 1 · H-04-A1-24-01 (RULINGS JU 2): a NORMAL start pushes nothing. 20d checks "no cys send / cys feed push"
+#   in ONE fixture (the role directive missing); a push added to the normal path (the scenario: a 결함 N건 message per
+#   clear) stayed green. Here: every role and both sources (startup / clear) the fixtures above build, each with every
+#   claim answer, three starts per leg in one place — the stub's calls log holds no `cys send` and no `cys feed` line;
+#   and the role-less start of setup() the same.
+_legs25a = 0
+_pushes25a = []
+for _role in _R24:
+    for _clear in (False, True):
+        for _claim in _CLAIM:
+            tmp = tempfile.mkdtemp(prefix="hook-t25a-")
+            env, _pk = setup_long(tmp, False, "none", _claim, _role)
+            for _ in range(3):
+                run_hook_at(env, _role, _clear)
+            _legs25a += 1
+            _sent = [l for l in _calls(tmp).splitlines() if l.startswith("cys send") or l.startswith("cys feed")]
+            if _sent:
+                _pushes25a.append((_role, "clear" if _clear else "startup", _claim, _sent[:2]))
+            shutil.rmtree(tmp)
+tmp = tempfile.mkdtemp(prefix="hook-t25a-")
+env = setup(tmp, "ok")
+for _role in (None, "master", "worker", "cso", "reviewer-codex"):
+    run_hook(env, role=_role)
+_legs25a += 1
+_sent = [l for l in _calls(tmp).splitlines() if l.startswith("cys send") or l.startswith("cys feed")]
+if _sent:
+    _pushes25a.append(("setup()", "no payload", "ok", _sent[:2]))
+shutil.rmtree(tmp)
+check("25a 보통의 시작 %d 레그(역할 전부 × startup·clear × claim 응답 전부, 레그마다 3회 + 역할 없음): cys send · cys feed 호출 0" % _legs25a,
+      _legs25a >= 2 * len(_R24) * len(_CLAIM) + 1 and not _pushes25a, repr(_pushes25a[:3]))
+
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
 sys.exit(1 if fails else 0)

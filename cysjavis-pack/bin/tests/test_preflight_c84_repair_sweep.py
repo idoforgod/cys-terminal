@@ -9,9 +9,13 @@
     python3 cysjavis-pack/bin/tests/test_preflight_c84_repair_sweep.py
 """
 import inspect
+import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.dirname(TESTS_DIR)
@@ -74,6 +78,39 @@ class C84RepairSweep(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(rows[0]["status"], SKIP)
         self.assertNotIn("unmeasured", rows[0])
+
+    def test_the_sweep_writes_no_settings_file(self):
+        # S5-MUT part 1 · H-10-A1-32-01 (RULINGS JU): the sweep is a REQUEST to the daemon — the check itself writes no
+        #   Claude settings file (a write there would bypass the settings writer's lock). The tests above fake the CLI and
+        #   look only at the call list, so an unlocked read-modify-write of ~/.claude/settings.json added to the check
+        #   stayed green. Here: a private HOME holding a settings file; after the check (with and without notices) the
+        #   settings folder holds exactly the same bytes.
+        home = tempfile.mkdtemp(prefix="c84-home-")
+        self.addCleanup(shutil.rmtree, home, True)
+        cfg = os.path.join(home, ".claude")
+        os.makedirs(cfg)
+        with open(os.path.join(cfg, "settings.json"), "w", encoding="utf-8") as f:
+            json.dump({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}, "theme": "auto"},
+                      f, indent=2)
+
+        def snapshot():
+            out = {}
+            for d, _, files in os.walk(cfg):
+                for n in files:
+                    with open(os.path.join(d, n), "rb") as f:
+                        out[os.path.relpath(os.path.join(d, n), cfg)] = f.read()
+            return out
+
+        before = snapshot()
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
+        env["HOME"] = home
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(os.path.expanduser("~"), home)
+            for reply in ({"tick": "started", "notices": []},
+                          {"tick": "started", "notices": [{"key": "k1", "rel": "hooks/x.sh", "note": "n", "kind": "kept"}]}):
+                rows, calls = self.run_check("fix", reply)
+                self.assertTrue(calls, "the sweep was requested")
+                self.assertEqual(snapshot(), before, "the check wrote into the Claude settings folder")
 
     def test_registered_once_before_the_last_fixed_slots(self):
         src = inspect.getsource(pf.Preflight.run)
