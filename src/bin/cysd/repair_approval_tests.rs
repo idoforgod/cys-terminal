@@ -158,6 +158,8 @@ fn record(id: &RepairId, lane: &LaneKey) -> RepairRecord {
         owner_original: false,
         origin_lane: lane.clone(),
         resolves: None,
+        // T6 (AQ5; the field arrived with the rebase onto preview/batch6)
+        reapplies: None,
         committed: vec![],
         fixer_seats: vec![WORKER],
         checks: vec![],
