@@ -3140,6 +3140,7 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("propagate.rs", "finish", "display", 1, "R1: the live states shown with a 충돌 (an unreadable member leaves the list empty; IK3 / IG5 pass the record in — the second site, a re-read of it, is gone)"),
     ("propagate.rs", "pack_instance_pass_in", "conservative", 2, "interpretation 31 / P5: an unreadable identity / generation skips its watch for this tick (never \"changed\")"),
     ("propagate.rs", "read_pack_instance", "not-a-read", 1, "the id line without its newline"),
+    ("propagate.rs", "run_checks", "conservative", 2, "IG4: the reference recorded exactly as T6's origin apply records it — one that cannot run is 0, and T6's attribution never blames a timeout on a 0"),
     ("propagate.rs", "sweep_own_scratch", "conservative", 1, "nothing to sweep when the folder cannot be listed — retried at the next tick"),
     ("reapply_claim.rs", "claim_in", "not-a-read", 1, "no claim yet → the first"),
     ("reapply_claim.rs", "numbers", "not-a-read", 1, "a name that is not <k>.json is not a claim"),

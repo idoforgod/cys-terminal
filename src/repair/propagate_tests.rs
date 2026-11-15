@@ -223,6 +223,8 @@ struct Doubles {
     form: Cell<ApplyForm>,
     /// HH1: (rel, content hash) this test's previous-release table knows (`with_prev_vendor`).
     vendor: std::cell::RefCell<Option<(String, String)>>,
+    /// IG4: the reference check's duration (ms) this test's reference double reports.
+    reference_ms: Cell<u64>,
     /// IK3 / IG5: runs inside every check call (the root it checks) — a seam that "parks" a check.
     during_check: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>>,
 }
@@ -237,6 +239,7 @@ fn doubles() -> Doubles {
         class: Cell::new(Classification::General),
         form: Cell::new(ApplyForm::Exchange),
         vendor: std::cell::RefCell::new(None),
+        reference_ms: Cell::new(7),
         during_check: std::cell::RefCell::new(None),
     }
 }
@@ -284,6 +287,7 @@ fn tick_with(r: &Rig, which: &str, d: &Doubles, fresh: &str, faults: &dyn Faults
     let env = LaneEnv {
         op: OpEnv { root: &r.root, pack: &pack, lane: &l, now: T0, form: d.form.get(), faults, own_check: &|_, _| None },
         check: &check,
+        reference: &|_, _| Ok(CheckOutcome { result: CheckResult::Pass, ms: d.reference_ms.get() }),
         classify: &classify,
         locked: &apply::no_repair_lock,
         hooks: &hooks,
@@ -813,6 +817,59 @@ fn a_stop_before_the_row_keeps_the_lanes_probation() {
     assert!(apply::closure_owes_return(&closed), "the exchange form owes the return: {closed}");
 }
 
+/// RULINGS IG4 (P3 / D④) — the reference measurement is taken in the RECEIVING lane at its apply (the
+/// same function T6's origin apply uses), so T6's load-corrected verdict exists there: the control (the
+/// lane's pre-image) passes, the repaired check times out twice, the reference is normal → a FAILURE is
+/// attributed → T6's automatic return of THIS lane's operation. (With `reference_ms` 0, T6 never blames
+/// a timeout — the old propagation recorded 0 for every target.)
+#[cfg(target_os = "macos")]
+#[test]
+fn a_receiving_lanes_repeated_timeout_is_attributed_with_its_own_reference() {
+    use crate::repair::probation::{run_tick, JobEnv};
+    let r = rig("ig4");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    let d = doubles();
+    d.reference_ms.set(100);
+    tick(&r, DEPT, &d, &fid(1));
+    let row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Verified);
+    let timing = row.probation.as_ref().unwrap().check_timings[0].clone();
+    assert_eq!((timing.reference_ms, timing.reference_kind), (100, apply::check_kind_of("bin/a.py")), "measured in this lane");
+    // T6's 24-hour re-check in THIS lane
+    let dept = r.dept.clone();
+    let check = move |_: &str, root: &Path, _: Duration| -> Result<CheckOutcome, RepairError> {
+        if root == dept.as_path() {
+            Ok(CheckOutcome { result: CheckResult::Timeout, ms: 60_000 }) // the repaired file, twice
+        } else {
+            Ok(CheckOutcome { result: CheckResult::Pass, ms: 5 }) // the control on the pre-image copy
+        }
+    };
+    let reference = |_: crate::repair::boot_critical::CheckKind, _: Duration| -> Result<CheckOutcome, RepairError> { Ok(CheckOutcome { result: CheckResult::Pass, ms: 100 }) };
+    let hooks = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> { Ok(ReconcileReport { hooks: Vec::new() }) };
+    let registrar = |_: &Path, _: bool| -> Result<String, RepairError> { Ok("{\"hooks\": []}".into()) };
+    let l = lane(DEPT);
+    let lock = r.base.join(".pack-apply.lock");
+    let job = JobEnv {
+        op: OpEnv { root: &r.root, pack: &r.dept, lane: &l, now: T0 + 700.0, form: ApplyForm::Exchange, faults: &NoFaults, own_check: &|_, _| None },
+        incarnation: "inc-ig4",
+        check: &check,
+        reference: &reference,
+        hooks: &hooks,
+        registrar: &registrar,
+        locked: &apply::no_repair_lock,
+        excluded: &|_| false,
+        original: &|_| None,
+        intake: &|_, _| true,
+        apply_lock: &lock,
+    };
+    let rep = run_tick(&job, false).unwrap();
+    assert_eq!(rep.reverted, vec![id.clone()], "{rep:?}");
+    assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"old\n", "this lane's operation returned");
+    assert_eq!(std::fs::read(r.hq.join("bin/a.py")).unwrap(), b"new\n", "never another lane's file");
+}
+
 /// IG3: a lane that was at R's result WITHOUT having applied it (no operation of its own) gets no
 /// 24-hour re-check — nothing of its own was replaced — but its check's timing record is kept (a
 /// CLOSED bundle that T6's probation skips and that owes no report).
@@ -1309,6 +1366,7 @@ fn recheck(r: &Rig, id: &RepairId, d: &Doubles, seat: u64, note: &str) -> Result
     let env = LaneEnv {
         op: OpEnv { root: &r.root, pack: &r.dept, lane: &l, now: T0, form: ApplyForm::Exchange, faults: &NoFaults, own_check: &|_, _| None },
         check: &check,
+        reference: &|_, _| Ok(CheckOutcome { result: CheckResult::Pass, ms: d.reference_ms.get() }),
         classify: &classify,
         locked: &apply::no_repair_lock,
         hooks: &hooks,
