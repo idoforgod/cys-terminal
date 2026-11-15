@@ -1738,6 +1738,404 @@ class OpenDefectLine(unittest.TestCase):
         pending = os.listdir(os.path.join(root, "_round", "wakeups", "pending"))
         self.assertEqual(len([f for f in pending if f.endswith(".json")]), 1, pending)
 
+    # ── RULINGS JT1 (whole-diff review F1-01 · fatal class 1) — an attempt is recorded BEFORE it is made and never taken
+    #    back; one key is enqueued at most 1 + N times (N = JT1_RETRY_MAX, stated); "delivered" and "budget used" are
+    #    readable in the state file. These use the stand-in runner; the decisive tests with the REAL wake queue are in
+    #    OpenDefectLineRealQueue below.
+    def state_doc(self):
+        with open(os.path.join(self.tmp, "gate", G.OPEN_DEFECT_STATE_FILE), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_jt1_budget_is_one_constant_of_the_module(self):
+        self.assertEqual(G.OPEN_DEFECT_RETRY_MAX, JT1_RETRY_MAX)
+
+    def test_jt1_failed_enqueues_stop_at_the_budget_and_the_state_says_so(self):
+        gate_dir = os.path.join(self.tmp, "gate")
+        total = 0
+        for _ in range(JT1_RETRY_MAX + 5):
+            bad = FakeRunner(report_ok=False, err="collector absent", enqueue_rc=1)
+            self.assertEqual(_defect_gate(gate_dir, bad, lambda: (True, "base", ["aa"])).run(shadow=False), 0)
+            total += len(_defect_wakes(bad))
+            self.assertNotIn("master", bad.drains, "a failed enqueue is not drained by the gate")
+        self.assertEqual(total, 1 + JT1_RETRY_MAX)
+        doc = self.state_doc()
+        self.assertEqual((doc["key"], doc["attempts"], doc["budget"], doc["delivered"]),
+                         (G.open_defect_wake(["aa"])[1], 1 + JT1_RETRY_MAX, 1 + JT1_RETRY_MAX, False),
+                         "budget used and not delivered must be readable in the state file")
+
+    def test_jt1_clean_acceptance_is_recorded_as_delivered(self):
+        self.assertEqual(len(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"])))), 1)
+        doc = self.state_doc()
+        self.assertEqual((doc["attempts"], doc["delivered"]), (1, True))
+        for _ in range(3):
+            self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"]))), [])
+
+    def test_jt1_an_enqueue_that_raises_uses_its_attempt_and_the_gate_goes_on(self):
+        gate_dir = os.path.join(self.tmp, "gate")
+
+        class Raising(FakeRunner):
+            def enqueue(self, *a, **kw):
+                super().enqueue(*a, **kw)
+                raise RuntimeError("the tool blew up after the store")
+        total = 0
+        for _ in range(JT1_RETRY_MAX + 4):
+            r = Raising(report_ok=False, err="collector absent")
+            self.assertEqual(_defect_gate(gate_dir, r, lambda: (True, "base", ["aa"])).run(shadow=False), 0,
+                             "the gate never stops (fail-open)")
+            total += len(_defect_wakes(r))
+        self.assertEqual(total, 1 + JT1_RETRY_MAX)
+
+    def test_jt1_a_state_written_before_the_count_existed_stays_silent(self):
+        """A state document without an attempt count (written by the AD5 form) remembered its key as done: it stays
+        silent for that key (an unreadable count is never read as budget left)."""
+        gate_dir = os.path.join(self.tmp, "gate")
+        os.makedirs(gate_dir)
+        with open(os.path.join(gate_dir, G.OPEN_DEFECT_STATE_FILE), "w", encoding="utf-8") as f:
+            json.dump({"key": G.open_defect_wake(["aa"])[1], "count": 1, "at": 1}, f)
+        self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"]))), [])
+        self.assertEqual(len(_defect_wakes(self.run_once(lambda: (True, "base", ["aa", "bb"])))), 1,
+                         "a changed set is a new key with a new budget")
+
+
+    # ── RULINGS JZ1 — the bound holds when the state cannot be READ: absent (proven) = no previous key; exists but
+    #    unreadable = no line in this run, the file untouched; read but not a state = the CURRENT set is given up
+    #    (attempts = budget, delivered false, `gave_up` says why) and a later CHANGED set starts fresh.
+    def _unreadable(self, path):
+        os.chmod(path, 0)
+        self.addCleanup(lambda: os.path.exists(path) and os.chmod(path, 0o644))
+        try:
+            open(path, "rb").close()
+        except OSError:
+            return
+        self.skipTest("this user can read a mode-0 file (root)")
+
+    @unittest.skipIf(os.name == "nt", "POSIX file mode")
+    def test_jz1_unreadable_state_sends_nothing_and_is_not_touched(self):
+        gate_dir = os.path.join(self.tmp, "gate")
+        bad = FakeRunner(report_ok=False, err="collector absent", enqueue_rc=1)
+        _defect_gate(gate_dir, bad, lambda: (True, "base", ["aa"])).run(shadow=False)
+        self.assertEqual(self.state_doc()["attempts"], 1)
+        path = os.path.join(gate_dir, G.OPEN_DEFECT_STATE_FILE)
+        with open(path, "rb") as f:
+            before = f.read()
+        self._unreadable(path)
+        for _ in range(3):
+            self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"]))), [],
+                             "a state that exists but cannot be read gives no budget")
+        os.chmod(path, 0o644)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), before, "the unreadable state is not touched")
+        self.assertEqual(len(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"])))), 1,
+                         "readable again: the next attempt of the same budget")
+        self.assertEqual(self.state_doc()["attempts"], 2)
+
+    def test_jz1_a_state_that_is_not_a_state_gives_the_current_set_up(self):
+        key = G.open_defect_wake(["aa"])[1]
+        cases = {
+            "not JSON": b"{\"key\": ",
+            "not JSON (bytes)": b"\xff\xfe\x00",
+            "not an object": b"[]",
+            "key is not a string or null": json.dumps({"attempts": 1}).encode(),
+            "key is a number": json.dumps({"key": 5, "attempts": 1}).encode(),
+            "attempts is not a count": json.dumps({"key": key, "attempts": "1"}).encode(),
+            "attempts is negative": json.dumps({"key": key, "attempts": -1, "delivered": False}).encode(),
+            "attempts is a boolean": json.dumps({"key": key, "attempts": True}).encode(),
+        }
+        for label, raw in cases.items():
+            with self.subTest(label):
+                gate_dir = os.path.join(self.tmp, "gate")
+                __import__("shutil").rmtree(gate_dir, True)
+                os.makedirs(gate_dir)
+                with open(os.path.join(gate_dir, G.OPEN_DEFECT_STATE_FILE), "wb") as f:
+                    f.write(raw)
+                for _ in range(3):
+                    self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"]))), [])
+                doc = self.state_doc()
+                self.assertEqual((doc["key"], doc["attempts"], doc["budget"], doc["delivered"]),
+                                 (key, 1 + JT1_RETRY_MAX, 1 + JT1_RETRY_MAX, False))
+                self.assertTrue(isinstance(doc.get("gave_up"), str) and doc["gave_up"], doc)
+                self.assertEqual(len(_defect_wakes(self.run_once(lambda: (True, "base", ["aa", "bb"])))), 1,
+                                 "a changed set gets its new budget")
+
+    def test_jz1_an_invalid_state_with_no_open_defects_is_reset(self):
+        gate_dir = os.path.join(self.tmp, "gate")
+        os.makedirs(gate_dir)
+        with open(os.path.join(gate_dir, G.OPEN_DEFECT_STATE_FILE), "w", encoding="utf-8") as f:
+            f.write("garbage")
+        self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", []))), [])
+        self.assertIsNone(self.state_doc()["key"])
+        self.assertEqual(len(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"])))), 1,
+                         "a set that opens after none is a change")
+
+    def test_ak6_a_state_that_cannot_be_written_sends_nothing(self):
+        """RULINGS AK6's first half with a READABLE (absent) state: the write before the enqueue fails → no line."""
+        real = G._write_json_atomic
+
+        def refuse(path, obj):
+            if os.path.basename(path) == G.OPEN_DEFECT_STATE_FILE:
+                raise OSError("refused by the test")
+            return real(path, obj)
+        G._write_json_atomic = refuse
+        self.addCleanup(setattr, G, "_write_json_atomic", real)
+        for _ in range(3):
+            self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"]))), [])
+
+    def test_kd1_bytes_no_parser_turns_into_a_state_give_the_current_set_up(self):
+        """RULINGS KD1 — REAL bytes (no mocked parser): an array nested beyond the interpreter's recursion limit makes the
+        JSON parser raise RecursionError, not ValueError. On 821ab6b2 that escaped to the line's outer handler: no
+        given-up record, so every later run met the same bytes and stayed silent, also for a changed or emptied set."""
+        nested = b"[" * 100000 + b"]" * 100000
+        gate_dir = os.path.join(self.tmp, "gate")
+        path = os.path.join(gate_dir, G.OPEN_DEFECT_STATE_FILE)
+        os.makedirs(gate_dir)
+        with open(path, "wb") as f:
+            f.write(nested)
+        self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"]))), [])
+        doc = self.state_doc()
+        self.assertEqual((doc["key"], doc["attempts"], doc["delivered"]),
+                         (G.open_defect_wake(["aa"])[1], 1 + JT1_RETRY_MAX, False))
+        self.assertIn("RecursionError", doc["gave_up"], "the reason says what was raised")
+        self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"]))), [])
+        self.assertEqual(len(_defect_wakes(self.run_once(lambda: (True, "base", ["aa", "bb"])))), 1,
+                         "a changed set afterwards gets its line")
+        with open(path, "wb") as f:
+            f.write(nested)
+        self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", []))), [])
+        self.assertIsNone(self.state_doc()["key"], "an emptied set resets the file")
+
+# ── RULINGS JT1 (F1-01) with the REAL wake queue — `G.Runner`'s own `enqueue` / `drain` run `javis_wakeup.py` with
+#    JAVIS_ROOT = the gate's state folder (as `main()` wires it); the send is stubbed at the `cys` boundary (a fake `cys`
+#    first on PATH that writes one line per call — as test_wakeup_durable_receipt.py does), the liveness probe is pinned
+#    to "alive", and the pause mark is looked up in a private pack folder. Only the gate's other inputs stay offline.
+JT1_RETRY_MAX = 2          # RULINGS JT1 — N, stated: one set of open defects is enqueued at most 1 + N times
+WAKEUP = os.path.join(BIN, "javis_wakeup.py")
+_STUB_CYS = "#!/bin/sh\nprintf 'CALL %s %s\\n' \"$1\" \"$2\" >> \"$MOCK_CALLS\"\necho 'QUEUED (depth 1)'\nexit 0\n"
+_SLOW_WAKEUP = """import runpy, sys, time
+sys.path.insert(0, %r)
+code = 0
+try:
+    runpy.run_path(%r, run_name="__main__")
+except SystemExit as e:
+    code = e.code
+if sys.argv[1:2] == ["enqueue"]:
+    sys.stdout.flush()
+    time.sleep(120)          # the entry is saved; the caller's time-out kills this process
+sys.exit(code)
+"""
+
+
+class _RealQueueRunner(G.Runner):
+    def collect_report(self):
+        return False, None, "collector absent"
+
+    def emit(self, evt_type, fields, surface="auto"):
+        return 0, "", ""
+
+    def poll_events(self, after_seq, names, timeout=0):
+        return True, [], after_seq
+
+    def task_snapshot(self):
+        return False, None, "no tasks"
+
+    def send_queued(self, to, body):
+        return 0
+
+
+@unittest.skipIf(os.name == "nt", "shell stub for `cys`")
+class OpenDefectLineRealQueue(unittest.TestCase):
+    SIGS = ["aa", "bb"]
+
+    def setUp(self):
+        import shutil
+        self.tmp = tempfile.mkdtemp(prefix="gate-defects-rq-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.state = os.path.join(self.tmp, "gate")
+        os.makedirs(os.path.join(self.state, "_round"))
+        stub = os.path.join(self.tmp, "stub-bin")
+        os.makedirs(stub)
+        with open(os.path.join(stub, "cys"), "w", encoding="utf-8") as f:
+            f.write(_STUB_CYS)
+        os.chmod(os.path.join(stub, "cys"), 0o755)
+        self.calls = os.path.join(self.tmp, "cys-calls.log")
+        self.env = dict(os.environ, JAVIS_ROOT=self.state, JAVIS_WAKEUP_LIVENESS="alive", MOCK_CALLS=self.calls,
+                        CYS_PACK_DIR=os.path.join(self.tmp, "pack"),
+                        PATH=stub + os.pathsep + os.environ.get("PATH", ""))
+        self.clock = 1_000_000.0
+
+    def runner(self, pack_bin=BIN, timeout=30):
+        r = _RealQueueRunner(pack_bin, self.state, timeout=timeout)
+        r.wk_env = dict(self.env)
+        return r
+
+    def tick(self, sigs=None, runner=None):
+        """One report run on the same open set; it must return 0 and finish its own work (counters written with
+        no fail-open streak) whatever the line did."""
+        self.clock += 300
+        sigs = list(sigs or self.SIGS)
+        g = G.Gate(self.state, runner or self.runner(), cycle_minutes=5, now_epoch_fn=lambda: self.clock,
+                   now_iso_fn=lambda: "2026-11-15T12:00:00+0900", defect_source=lambda: (True, "base", sigs))
+        self.assertEqual(g.run(shadow=False), 0, "the gate never stops (fail-open)")
+        with open(os.path.join(self.state, "counters.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f).get("failopen_streak"), 0, "the gate's own run reached its end")
+
+    def drain(self):
+        """An independent drain of the same target (the approval tick drains per target)."""
+        subprocess.run([sys.executable, WAKEUP, "drain", "--deliver", "--target", "master"], env=self.env,
+                       capture_output=True, text=True, timeout=60)
+
+    def sends(self):
+        try:
+            with open(self.calls, encoding="utf-8") as f:
+                return sum(1 for line in f if line.startswith("CALL send"))
+        except FileNotFoundError:
+            return 0
+
+    def pending(self):
+        d = os.path.join(self.state, "_round", "wakeups", "pending")
+        return sorted(n for n in os.listdir(d) if n.endswith(".json")) if os.path.isdir(d) else []
+
+    def audit_unwritable(self):
+        #   the queue's audit file is a folder: entries can be saved (pending stays writable), the audit line cannot
+        os.makedirs(os.path.join(self.state, "_round", "wakeups", "queue.jsonl"))
+
+    def state_doc(self):
+        with open(os.path.join(self.state, G.OPEN_DEFECT_STATE_FILE), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_jt1_audit_unwritable_and_an_independent_drain_stop_at_the_bound(self):
+        """RULINGS JT1 / F1-01 — the decisive sequence: the enqueue tool saves the entry and exits non-zero (its audit
+        line fails); another drain sends and removes the entry; the next report run sees the same open set. On 021b9bf4
+        the gate wrote its old key back and the stub received the line at EVERY tick; now at most 1 + N times."""
+        self.audit_unwritable()
+        seen = []
+        for _ in range(12):
+            self.tick()
+            self.drain()
+            seen.append(self.sends())
+        self.assertGreater(self.sends(), 0, "precondition: the entry was saved although the tool failed")
+        self.assertLessEqual(self.sends(), 1 + JT1_RETRY_MAX, "sends after each tick: %s" % seen)
+        self.assertEqual(self.sends(), 1 + JT1_RETRY_MAX, "every attempt reached the stub: %s" % seen)
+        doc = self.state_doc()
+        self.assertEqual((doc["attempts"], doc["delivered"]), (1 + JT1_RETRY_MAX, False),
+                         "budget used, never cleanly accepted — readable in the state file")
+
+    def test_jt1_an_enqueue_killed_at_its_time_out_after_the_save_is_bounded(self):
+        slow = os.path.join(self.tmp, "slow-bin")
+        os.makedirs(slow)
+        with open(os.path.join(slow, "javis_wakeup.py"), "w", encoding="utf-8") as f:
+            f.write(_SLOW_WAKEUP % (BIN, WAKEUP))
+        seen = []
+        for _ in range(JT1_RETRY_MAX + 4):
+            self.tick(runner=self.runner(pack_bin=slow, timeout=4))
+            self.drain()
+            seen.append(self.sends())
+        self.assertGreater(self.sends(), 0, "precondition: the entry was saved before the kill")
+        self.assertLessEqual(self.sends(), 1 + JT1_RETRY_MAX, "sends after each tick: %s" % seen)
+        self.assertFalse(self.state_doc()["delivered"])
+
+    def test_jt1_a_proven_non_acceptance_is_retried_within_the_bound(self):
+        wk = os.path.join(self.state, "_round", "wakeups")
+        os.makedirs(wk)
+        with open(os.path.join(wk, "pending"), "w", encoding="utf-8") as f:
+            f.write("not a folder")                     # the queue cannot save anything: nothing is taken
+        self.tick()
+        self.drain()
+        self.assertEqual((self.sends(), self.pending()), (0, []))
+        self.assertEqual(self.state_doc()["attempts"], 1)
+        os.remove(os.path.join(wk, "pending"))
+        for _ in range(5):
+            self.tick()
+            self.drain()
+        self.assertEqual(self.sends(), 1, "retried once the queue takes it, then silent")
+        doc = self.state_doc()
+        self.assertEqual((doc["attempts"], doc["delivered"]), (2, True))
+
+    def test_jt1_a_changed_set_gets_a_new_budget(self):
+        self.audit_unwritable()
+        for _ in range(6):
+            self.tick(sigs=["aa"])
+            self.drain()
+        self.assertEqual(self.sends(), 1 + JT1_RETRY_MAX)
+        for _ in range(6):
+            self.tick(sigs=["aa", "bb"])
+            self.drain()
+        self.assertEqual(self.sends(), 2 * (1 + JT1_RETRY_MAX))
+        self.assertEqual(self.state_doc()["key"], G.open_defect_wake(["aa", "bb"])[1])
+
+    def test_jt1_state_unwritable_sends_nothing(self):
+        """RULINGS AK6's first half, unchanged — with the real queue and an independent drain."""
+        os.makedirs(os.path.join(self.state, G.OPEN_DEFECT_STATE_FILE))
+        for _ in range(10):
+            self.tick()
+            self.drain()
+        self.assertEqual((self.sends(), self.pending()), (0, []))
+
+
+    def test_jz1_a_failed_read_after_the_budget_is_used_sends_no_further_line(self):
+        """RULINGS JZ1 — red on 09b52531: the budget used (audit unwritable, independent drain), then ONE tick whose read
+        of the state fails while its write would work; 09b52531 read that as "no previous key", wrote attempts 1 and
+        sent the same set three more times."""
+        self.audit_unwritable()
+        for _ in range(1 + JT1_RETRY_MAX + 1):
+            self.tick()
+            self.drain()
+        self.assertEqual(self.sends(), 1 + JT1_RETRY_MAX)
+        path = os.path.join(self.state, G.OPEN_DEFECT_STATE_FILE)
+        with open(path, "rb") as f:
+            before = f.read()
+        os.chmod(path, 0)
+        self.addCleanup(lambda: os.path.exists(path) and os.chmod(path, 0o644))
+        try:
+            open(path, "rb").close()
+            self.skipTest("this user can read a mode-0 file (root)")
+        except OSError:
+            pass
+        self.tick()
+        self.drain()
+        os.chmod(path, 0o644)
+        seen = [self.sends()]
+        for _ in range(5):
+            self.tick()
+            self.drain()
+            seen.append(self.sends())
+        self.assertEqual(self.sends(), 1 + JT1_RETRY_MAX, "sends after the failed read and each later tick: %s" % seen)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), before, "the state was neither replaced nor restarted")
+
+    def test_jz1_an_invalid_state_sends_nothing_for_the_current_set(self):
+        with open(os.path.join(self.state, G.OPEN_DEFECT_STATE_FILE), "w", encoding="utf-8") as f:
+            f.write("{\"key\": ")
+        for _ in range(4):
+            self.tick()
+            self.drain()
+        self.assertEqual((self.sends(), self.pending()), (0, []))
+        doc = self.state_doc()
+        self.assertEqual((doc["attempts"], doc["delivered"]), (1 + JT1_RETRY_MAX, False))
+        self.assertIn("not JSON", doc["gave_up"])
+        self.tick(sigs=["aa", "bb", "cc"])
+        self.drain()
+        self.assertEqual(self.sends(), 1, "a changed set gets its new budget")
+
+    def test_jz1_an_absent_state_still_sends_its_first_line(self):
+        self.assertFalse(os.path.exists(os.path.join(self.state, G.OPEN_DEFECT_STATE_FILE)))
+        self.tick()
+        self.drain()
+        self.assertEqual(self.sends(), 1)
+        doc = self.state_doc()
+        self.assertEqual((doc["attempts"], doc["delivered"]), (1, True))
+
+    def test_kd1_a_deeply_nested_state_gives_a_changed_set_one_bounded_send(self):
+        with open(os.path.join(self.state, G.OPEN_DEFECT_STATE_FILE), "wb") as f:
+            f.write(b"[" * 100000 + b"]" * 100000)
+        for _ in range(3):
+            self.tick()
+            self.drain()
+        self.assertEqual((self.sends(), self.pending()), (0, []), "nothing for the set met with invalid bytes")
+        self.assertIn("RecursionError", self.state_doc()["gave_up"])
+        for _ in range(4):
+            self.tick(sigs=["aa", "bb", "cc"])
+            self.drain()
+        self.assertEqual(self.sends(), 1, "the changed set: one send, then silent")
 
 class CollectOpenDefects(unittest.TestCase):
     """`cys repair list --json` parsing with a fake `cys` (bounded, CYS_NO_AUTOSTART=1, distinct signatures — G4)."""
