@@ -1064,6 +1064,22 @@ def ledger_deny(place):
 
 _LEDGER_STOP = set(" \t\n\"'`;&|<>()")
 
+def _ledger_lex(path):
+    """Lexical dot-component normalisation of a '/'-separated path (RULINGS IJ3): `.` dropped, `x/..` folded."""
+    lead = "/" if path.startswith("/") else ""
+    out = []
+    for part in path.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if out and out[-1] != "..":
+                out.pop()
+            elif not lead:
+                out.append("..")
+            continue
+        out.append(part)
+    return lead + "/".join(out)
+
 def _ledger_text_places(text):
     """The ledger places a text names by a root's spelling (case-folded, both slash forms) — no splitting on white space:
     the component after the spelling decides. Staging is reported as "staging"."""
@@ -1077,7 +1093,11 @@ def _ledger_text_places(text):
                     j = end
                     while j < len(v) and v[j] not in _LEDGER_STOP:
                         j += 1
-                    pl = _ledger_rest_place(v[end:j])
+                    # RULINGS IJ3: the dot components of the WHOLE path are folded before the place is judged
+                    path, spn = _ledger_lex(v[i:j]), _ledger_lex(sp)
+                    pl = None
+                    if path == spn or path.startswith(spn.rstrip("/") + "/"):
+                        pl = _ledger_rest_place(path[len(spn):])
                     if pl is not None and pl not in out:
                         out.append(pl)
                 i = v.find(sp, i + 1)
@@ -1304,9 +1324,11 @@ fi
 #   글에 장부의 자리가 적혀 있고(작업 사본만이 아니고) 백스톱이 보는 쓰기 형태가 있으면 막는다. 장부의 자리를 가리키지
 #   않는 호출은 결코 막지 않는다(치명 4: 모든 것을 막는 강등된 가드는 모든 좌석을 죽인다).
 ledger_rest_is_ledger() {
-  local rest="${1#/}" re='^r-[0-9]+/staging(/|$)'
-  case "$rest" in ..|../*) return 1 ;; esac
-  if [[ $rest =~ $re ]] && [[ $rest != *..* ]]; then return 1; fi
+  # RULINGS IJ3: the shell cannot normalise dot components here — the root's spelling followed by anything that holds a
+  #   `..` component IS a ledger place (the working-copy exception does not apply to it)
+  local rest="${1#/}" re='^r-[0-9]+/staging(/|$)' dd='(^|/)\.\.(/|$)'
+  if [[ $rest =~ $dd ]]; then return 0; fi
+  if [[ $rest =~ $re ]]; then return 1; fi
   return 0
 }
 ledger_backstop_spellings() {
