@@ -87,6 +87,7 @@ impl Rig {
             hook_step: &cys::repair::apply::hook_lines_step,
             claim: &cys::repair::grant::try_claim_autonomous_start,
             prompts: &self.prompts,
+            product_pause: &|| false,
         }
     }
     fn call(&self, now: f64, who: &Caller, sub: &str, p: Value) -> Result<Value, VerbError> {
