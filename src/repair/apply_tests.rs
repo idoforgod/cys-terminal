@@ -3106,7 +3106,7 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("types.rs", "lane_pack_roots", "outside", 2, "another track's file, not changed by T6"),
     ("types.rs", "link_count", "outside", 2, "another track's file, not changed by T6"),
     ("types.rs", "link_target_refusal", "outside", 2, "another track's file, not changed by T6"),
-    ("types.rs", "read", "conservative", 1, "T6b IW1: the length of a file found over the limit while it is read cannot be re-read → the bytes already counted (more than the limit); the state is over the limit either way"),
+    ("types.rs", "observe", "conservative", 1, "T6b IW1 / JH1: the length of a file found over the limit while it is read cannot be re-read → the bytes already counted (more than the limit); the observation is over the limit either way"),
     ("types.rs", "repair_number", "outside", 1, "another track's file, not changed by T6"),
     ("vault.rs", "basename", "not-a-read", 1, "a path's last part"),
     ("vault.rs", "build_slot", "not-a-read", 1, "the clock"),
@@ -3510,17 +3510,17 @@ fn sparse_file(p: &Path, len: u64) {
     std::fs::File::create(p).unwrap().set_len(len).unwrap();
 }
 
-/// IG1 / IW1: `TargetState::read` takes at most RECORD_READ_CAP + 1 bytes from ONE handle — a file of
-/// exactly the limit is read; a file one byte over the limit is a MEASURED state (IW1: "over the
-/// limit", the limit and its length in its canon, equal to no recorded state) with no byte of it read;
-/// a file that grows past the limit while it is read is the same state after at most the limit + 1
-/// bytes; a file whose size changes within the limit while it is read gives no state (an error — read
-/// again later). Before IW1 the two over-limit cases were errors (old expectations:
-/// `TargetState::read(&over).expect_err("one byte over the limit")` naming the limit, and
-/// `got.is_err()` for both growth cases).
+/// IG1 / IW1 / JH1: the measurement takes at most RECORD_READ_CAP + 1 bytes from ONE handle — a file
+/// of exactly the limit is read; a file one byte over the limit has NO state: `TargetState::observe`
+/// measures it as `Observed::OverLimit` (its length) with no byte of it read, and `TargetState::read`
+/// answers an error naming the limit; a file that grows past the limit while it is read is the same
+/// observation after at most the limit + 1 bytes; a size that changes within the limit while it is read
+/// gives no answer at all (an error). Before JH1 (old expectation, round 3): `TargetState::read(&over)`
+/// gave a STATE (`st.is_over_limit()`, its canon naming the limit) — a value a hash field could hold.
 #[test]
 fn a_target_is_read_within_the_one_limit() {
     use crate::repair::durable::{read_seam, RECORD_READ_CAP as CAP};
+    use crate::repair::types::Observed;
     let r = rig("ig1read");
     let at = r.pack.join("hooks/limit.sh");
     sparse_file(&at, CAP);
@@ -3528,9 +3528,9 @@ fn a_target_is_read_within_the_one_limit() {
     assert_eq!(read_seam::bytes_read_from(&at), CAP);
     let over = r.pack.join("hooks/over.sh");
     sparse_file(&over, CAP + 1);
-    let st = TargetState::read(&over).expect("a measured state");
-    assert!(st.is_over_limit(), "{st:?}");
-    assert!(st.canon().contains(&CAP.to_string()) && st.canon().contains(&(CAP + 1).to_string()), "the limit and the length are said: {}", st.canon());
+    assert_eq!(TargetState::observe(&over).unwrap(), Observed::OverLimit { len: CAP + 1 }, "measured, no state");
+    let e = format!("{:?}", TargetState::read(&over).expect_err("no state to read"));
+    assert!(e.contains(&CAP.to_string()), "the limit is named: {e}");
     assert_eq!(read_seam::bytes_read_from(&over), 0, "no byte of it is read");
     for (tag, grow_to) in [("within", 100u64), ("past", CAP * 4)] {
         let g = r.pack.join(format!("hooks/grow-{tag}.sh"));
@@ -3541,11 +3541,11 @@ fn a_target_is_read_within_the_one_limit() {
                 std::fs::OpenOptions::new().write(true).open(p).unwrap().set_len(grow_to).unwrap();
             }
         })));
-        let got = TargetState::read(&g);
+        let got = TargetState::observe(&g);
         read_seam::set_after_open(None);
         match tag {
-            "within" => assert!(got.is_err(), "{tag}: a size changed within the limit gives no state: {got:?}"),
-            _ => assert!(got.as_ref().is_ok_and(|s| s.is_over_limit()), "{tag}: grown past the limit — the measured state: {got:?}"),
+            "within" => assert!(got.is_err(), "{tag}: a size changed within the limit gives no answer: {got:?}"),
+            _ => assert!(matches!(got, Ok(Observed::OverLimit { .. })), "{tag}: grown past the limit — measured over it: {got:?}"),
         }
         assert!(read_seam::bytes_read_from(&g) <= CAP + 1, "{tag}: at most the limit + 1 bytes");
     }

@@ -508,12 +508,13 @@ fn door(env: &OpEnv<'_>, binding: &Binding, live: &Path, act: DoorAct<'_>) -> Re
     // GK2: the live path holds EXACTLY the recorded state at this moment, or nothing is touched —
     // GV1: another writer's bytes are a CONFLICT (declined), never "superseded"
     if let Some(expected) = act.expected() {
-        let now = TargetState::read(live)?;
-        if now != *expected.state() {
+        // JH1: an over-limit file is measured, never a state — it is not the recorded state
+        let now = TargetState::observe(live)?;
+        if !now.is(expected.state()) {
             return Err(RepairError::Declined(format!(
                 "{}: 살아 있는 것이 기록된 상태가 아닙니다(지금 {} · 기록 {}) — 다른 작성자의 바이트를 그대로 둡니다",
                 live.display(),
-                now.canon(),
+                now.describe(),
                 expected.canon()
             )));
         }
@@ -761,15 +762,16 @@ fn run_op_depth(env: &OpEnv<'_>, spec: &OpSpec, depth: u8) -> Result<OpDone, Rep
         Err(e) => return Err(e),
     }
     // step 0 — the live entry is the expected one, the pack generation the bound one
-    let now_state = TargetState::read(&live)?;
-    if now_state != spec.expected {
-        // GV1: the live file is not the recorded state — another writer's bytes: a CONFLICT
+    let now_state = TargetState::observe(&live)?;
+    if !now_state.is(&spec.expected) {
+        // GV1: the live file is not the recorded state — another writer's bytes: a CONFLICT (JH1: an
+        // over-limit file is one)
         return Ok(done(
             ApplyOutcome::Declined(format!(
                 "{}: 살아 있는 파일이 기대한 상태가 아닙니다(기대 {} · 지금 {}) — 아무것도 바꾸지 않았습니다",
                 spec.rel,
                 spec.expected.canon(),
-                now_state.canon()
+                now_state.describe()
             )),
             None,
         ));
@@ -916,12 +918,12 @@ fn step4(
         // CT3 — the outcome reported is the outcome measured: what is NOW live must be the state
         // this operation was to put live; otherwise it is another writer's (GK2, below)
         let incoming = canon_req(&rec.incoming, &rec.rel)?;
-        let live_now = TargetState::read(live)?;
-        if live_now != incoming {
+        let live_now = TargetState::observe(live)?;
+        if !live_now.is(&incoming) {
             let mut note = format!(
                 "{}: 들인 뒤 살아 있는 것이 들일 상태가 아닙니다(지금 {} ≠ 들일 {})",
                 spec.rel,
-                live_now.canon(),
+                live_now.describe(),
                 incoming.canon()
             );
             // RULINGS GK2: the exchange is atomic — a difference from what this operation placed is
@@ -1093,7 +1095,7 @@ fn after_seal_move_in(
         };
         if (env.own_check)(&spec.rel, &holder) == Some(false) {
             note.push_str(" · 그 파일 자신의 검사를 통과하지 못해 되살리지 않았습니다");
-        } else if TargetState::read(live)? == TargetState::Absent {
+        } else if TargetState::observe(live)?.is(&TargetState::Absent) {
             let relive = OpSpec {
                 id: spec.id.clone(),
                 rel: spec.rel.clone(),
@@ -1125,14 +1127,14 @@ fn after_seal_move_in(
 fn verify_placed(env: &OpEnv<'_>, rec: &OpRecord, live: &Path) -> Result<Option<String>, RepairError> {
     let _ = env;
     let incoming = canon_req(&rec.incoming, &rec.rel)?;
-    let live_now = TargetState::read(live)?;
-    if live_now == incoming {
+    let live_now = TargetState::observe(live)?;
+    if live_now.is(&incoming) {
         return Ok(None);
     }
     let mut note = format!(
         "{}: 놓은 뒤 살아 있는 것이 들일 상태가 아닙니다(지금 {} ≠ 들일 {})",
         rec.rel,
-        live_now.canon(),
+        live_now.describe(),
         incoming.canon()
     );
     // RULINGS GK2: another writer's bytes after OUR placement stay live (conflict)
@@ -2006,10 +2008,10 @@ fn recover_one_revert(
     for t in &ri.targets {
         let pre = parse_canon(&t.pre).ok_or_else(|| RepairError::Corrupt(format!("{}: 되돌리기 의도의 상태를 읽을 수 없습니다", t.rel)))?;
         let applied = parse_canon(&t.applied).ok_or_else(|| RepairError::Corrupt(format!("{}: 되돌리기 의도의 상태를 읽을 수 없습니다", t.rel)))?;
-        let live_now = TargetState::read(&env.pack.join(&t.rel))?;
-        let outcome = if live_now == pre {
+        let live_now = TargetState::observe(&env.pack.join(&t.rel))?;
+        let outcome = if live_now.is(&pre) {
             ApplyOutcome::Applied // restored before the crash
-        } else if live_now == applied {
+        } else if live_now.is(&applied) {
             let (_, holder) = pre_image_for(env.root, rec, env.lane, &t.rel)?;
             run_op(
                 env,
@@ -2135,8 +2137,8 @@ pub fn revert_in(
         }
         // GV1: in the same generation, a live file that is not what the row records the apply left
         // is ANOTHER writer's — a CONFLICT: the bytes stay, the row 충돌, its report owed (FG3)
-        let live_now = TargetState::read(&env.pack.join(rel))?;
-        if live_now != expected {
+        let live_now = TargetState::observe(&env.pack.join(rel))?;
+        if !live_now.is(&expected) {
             return Ok(close_conflict(
                 env,
                 &rec,
@@ -3284,8 +3286,8 @@ pub fn apply_candidate_in(
             .find(|x| x.rel == *rel)
             .map(|x| x.pre.state())
             .unwrap_or(TargetState::Absent);
-        let live_now = TargetState::read(&env.pack.join(rel))?;
-        if live_now != pre {
+        let live_now = TargetState::observe(&env.pack.join(rel))?;
+        if !live_now.is(&pre) {
             return decline(format!(
                 "{rel}: 살아 있는 파일이 수리를 시작할 때와 다릅니다(그 사이 되돌리기·업데이트·다른 작성자) — 승인은 무효가 되었습니다"
             ));
@@ -3408,10 +3410,15 @@ pub fn apply_candidate_in(
     }
     // Q3: the live states reproduce the approved fingerprint
     let mut live_states = Vec::new();
+    let mut over_limit = false;
     for (rel, _) in &slots {
-        live_states.push((rel.clone(), TargetState::read(&env.pack.join(rel))?));
+        // JH1: an over-limit file has no state — the live states then cannot reproduce the fingerprint
+        match TargetState::observe(&env.pack.join(rel))? {
+            super::types::Observed::State(s) => live_states.push((rel.clone(), s)),
+            super::types::Observed::OverLimit { .. } => over_limit = true,
+        }
     }
-    if super::types::fingerprint(&live_states) != approval.fingerprint_sha256 {
+    if over_limit || super::types::fingerprint(&live_states) != approval.fingerprint_sha256 {
         if let Some(r) = undo_then("적용 뒤 살아 있는 파일이 승인된 지문과 다릅니다", results.clone())? {
             return Ok(r);
         }
@@ -3555,7 +3562,7 @@ fn exchange_prepared(
         }
         Err(e) => return Ok(done(ApplyOutcome::Declined(format!("{e:?}")), None)),
     }
-    if TargetState::read(&live)? != spec.expected {
+    if !TargetState::observe(&live)?.is(&spec.expected) {
         return Ok(done(
             ApplyOutcome::Superseded(format!("{}: 살아 있는 파일이 기대한 상태가 아닙니다", spec.rel)),
             None,
@@ -3627,7 +3634,7 @@ fn undo_applied(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord) -> Resu
 fn undo_applied_with(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord, _only_ours: bool) -> Result<Vec<(String, String)>, RepairError> {
     let mut left = Vec::new();
     for spec in applied.iter().rev() {
-        if TargetState::read(&env.pack.join(&spec.rel))? == spec.expected {
+        if TargetState::observe(&env.pack.join(&spec.rel))?.is(&spec.expected) {
             continue; // nothing of this target was changed (its pre-image is live)
         }
         // RULINGS GK2: the state THIS apply's own operation record says it placed — the only state
@@ -3648,12 +3655,12 @@ fn undo_applied_with(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord, _o
                 continue;
             }
         };
-        let live_now = TargetState::read(&env.pack.join(&spec.rel))?;
-        if live_now == pre {
+        let live_now = TargetState::observe(&env.pack.join(&spec.rel))?;
+        if live_now.is(&pre) {
             continue; // already the pre-image (e.g. undone by the operation's own CT3 check)
         }
-        if live_now != placed {
-            left.push((spec.rel.clone(), format!("살아 있는 것이 이 적용이 놓은 것이 아닙니다({}) — 다른 작성자의 바이트를 그대로 둠(충돌)", live_now.canon())));
+        if !live_now.is(&placed) {
+            left.push((spec.rel.clone(), format!("살아 있는 것이 이 적용이 놓은 것이 아닙니다({}) — 다른 작성자의 바이트를 그대로 둠(충돌)", live_now.describe())));
             continue;
         }
         let back = OpSpec {
@@ -3697,9 +3704,9 @@ fn mark_incomplete_apply(
 ) -> Result<(), RepairError> {
     let mut applied_now: Vec<(String, String)> = Vec::new();
     for spec in plan {
-        let live_now = TargetState::read(&env.pack.join(&spec.rel))?;
-        if live_now == spec.incoming && spec.incoming != spec.expected {
-            applied_now.push((spec.rel.clone(), live_now.canon()));
+        let live_now = TargetState::observe(&env.pack.join(&spec.rel))?;
+        if live_now.is(&spec.incoming) && spec.incoming != spec.expected {
+            applied_now.push((spec.rel.clone(), spec.incoming.canon()));
         }
     }
     let (gen_version, gen_pro) = plan.first().map(|s| s.bound.clone()).unwrap_or(Bound::Unknown).row_fields();

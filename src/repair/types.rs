@@ -225,49 +225,63 @@ pub enum TargetState {
     },
 }
 
-/// RULINGS IW1 — the reserved `sha256` prefix of a regular file LONGER than the engine's read limit:
-/// `over-limit-<limit>:<length>`. Such a state is MEASURED (its length exceeds the limit) and equals
-/// no recorded state — the ledger records no state of such a file (`recordable`); a real sha256 is
-/// 64 lowercase hex digits and never starts with this prefix.
-pub const OVER_LIMIT_MARK: &str = "over-limit-";
+/// RULINGS JH1 — what ONE bounded measurement of a target found: its STATE, or a regular file LONGER
+/// than the engine's read limit. The second is a measured difference (IW1), NOT a state: it has no
+/// hash, no canon and no serialized form, so no recorded field — a sealed copy's hash, a row's
+/// applied state, a probation's expected state, a record's committed result, a fingerprint, an
+/// identity — can hold it: the compiler forbids it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Observed {
+    State(TargetState),
+    OverLimit { len: u64 },
+}
+
+impl Observed {
+    /// Whether the observation IS this state (an over-limit file is no state at all).
+    pub fn is(&self, st: &TargetState) -> bool {
+        matches!(self, Observed::State(s) if s == st)
+    }
+
+    /// The observation for a sentence: a state's canon, or the length and the limit.
+    pub fn describe(&self) -> String {
+        match self {
+            Observed::State(s) => s.canon(),
+            Observed::OverLimit { len } => format!(
+                "엔진의 읽기 한도 {}바이트를 넘는 파일({len}바이트)",
+                super::durable::RECORD_READ_CAP
+            ),
+        }
+    }
+}
 
 impl TargetState {
-    /// RULINGS IW1 — the measured state of a regular file longer than the limit (see
-    /// [`OVER_LIMIT_MARK`]); its canon names the limit and the length.
-    pub fn over_limit(len: u64, mode: u32) -> TargetState {
-        TargetState::File {
-            sha256: format!("{OVER_LIMIT_MARK}{}:{len}", super::durable::RECORD_READ_CAP),
-            mode,
-        }
-    }
-
-    /// Whether this is the measured state of a file longer than the limit (IW1).
-    pub fn is_over_limit(&self) -> bool {
-        matches!(self, TargetState::File { sha256, .. } if sha256.starts_with(OVER_LIMIT_MARK))
-    }
-
-    /// RULINGS IW1 — a state the ledger may RECORD (a pre-image at `begin`, a committed result): the
-    /// state of a file longer than the limit is refused, the limit named (a pack file longer than the
-    /// limit cannot be repaired — the pack's largest is 1.27 MB).
-    pub fn recordable(self, path: &Path) -> Result<TargetState, RepairError> {
-        if self.is_over_limit() {
-            return Err(RepairError::Precondition(format!(
-                "{}: 크기가 엔진의 읽기 한도 {}바이트를 넘는 파일은 수리하지 않습니다(그 상태를 기록하지 않습니다)",
-                path.display(),
-                super::durable::RECORD_READ_CAP
-            )));
-        }
-        Ok(self)
-    }
-
     /// Reads a target's state with `lstat` semantics — a symbolic link is reported as a link and
     /// never followed. A regular file is opened without following links and re-checked through
     /// its open handle, so a swap between the `lstat` and the open cannot make this read follow a
     /// link. A missing path is `Absent`; a directory or any other kind of entry is refused.
+    ///
+    /// RULINGS JH1 — a regular file longer than the engine's read limit has no state: `read` answers
+    /// an error naming the limit; the operations that must go on past it (several targets, a
+    /// conflict) measure through [`TargetState::observe`].
     pub fn read(path: &Path) -> Result<TargetState, RepairError> {
+        match Self::observe(path)? {
+            Observed::State(s) => Ok(s),
+            Observed::OverLimit { len } => Err(RepairError::Precondition(format!(
+                "{}: 크기 {len}바이트가 엔진의 읽기 한도 {}바이트를 넘어 상태를 매기지 않습니다",
+                path.display(),
+                super::durable::RECORD_READ_CAP
+            ))),
+        }
+    }
+
+    /// RULINGS IE4 / IG1 / JH1 — THE bounded measurement behind [`TargetState::read`]: at most
+    /// RECORD_READ_CAP + 1 bytes from ONE handle; a regular file longer than the limit (at the open,
+    /// or found while it is read) is `Observed::OverLimit` (a measured difference, never a state of a
+    /// prefix); a size that changed within the limit while it was read is an error (read again later).
+    pub fn observe(path: &Path) -> Result<Observed, RepairError> {
         let meta = match std::fs::symlink_metadata(path) {
             Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(TargetState::Absent),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Observed::State(TargetState::Absent)),
             Err(e) => return Err(RepairError::Io(format!("{}: {e}", path.display()))),
         };
         let kind = meta.file_type();
@@ -280,7 +294,7 @@ impl TargetState {
                     path.display()
                 ))
             })?;
-            return Ok(TargetState::Link { target });
+            return Ok(Observed::State(TargetState::Link { target }));
         }
         if !kind.is_file() {
             return Err(RepairError::Precondition(format!(
@@ -299,14 +313,9 @@ impl TargetState {
                 path.display()
             )));
         }
-        // RULINGS IE4 / IG1 — the engine's ONE bound, for every caller (a candidate and a live file
-        // alike): at most RECORD_READ_CAP + 1 bytes from this ONE handle; never a state computed from
-        // a prefix. RULINGS IW1 — a regular file LONGER than the limit (at the open, or found while
-        // it is read) is a MEASURED state (`over_limit`, equal to no recorded state), not a read
-        // failure; a size that changed within the limit while it was read is an error (re-read later)
         let cap = super::durable::RECORD_READ_CAP;
         if opened.len() > cap {
-            return Ok(TargetState::over_limit(opened.len(), permission_bits(&opened)));
+            return Ok(Observed::OverLimit { len: opened.len() });
         }
         super::durable::seam_after_open(path);
         let mut hasher = Sha256::new();
@@ -326,7 +335,7 @@ impl TargetState {
         super::durable::seam_count(path, total);
         if total > cap {
             let len = file.metadata().map(|m| m.len()).unwrap_or(total).max(total);
-            return Ok(TargetState::over_limit(len, permission_bits(&opened)));
+            return Ok(Observed::OverLimit { len });
         }
         if total != opened.len() {
             return Err(RepairError::Precondition(format!(
@@ -335,10 +344,10 @@ impl TargetState {
                 opened.len()
             )));
         }
-        Ok(TargetState::File {
+        Ok(Observed::State(TargetState::File {
             sha256: hex(&hasher.finalize()),
             mode: permission_bits(&opened),
-        })
+        }))
     }
 
     /// `absent` | `file:<sha256>:<mode as 4 octal digits>` | `link:<target>` (RULINGS U2).
