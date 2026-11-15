@@ -20,7 +20,8 @@ struct Rig {
     root: PathBuf,
     pack: PathBuf,
     registry: PathBuf,
-    mutexes: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    // RULINGS JW2: shared, so that a send seam can probe the repair locks (try-lock)
+    mutexes: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     prompts: Mutex<HashMap<u64, crate::repair::PromptOrigin>>,
     lane: LaneKey,
 }
@@ -45,7 +46,7 @@ fn rig(tag: &str) -> Rig {
         root: dir.join("local").join("repairs"),
         pack,
         registry: dir.join("depts.json"),
-        mutexes: Mutex::new(HashMap::new()),
+        mutexes: Arc::new(Mutex::new(HashMap::new())),
         prompts: Mutex::new(HashMap::new()),
         lane: LaneKey("base".into()),
         dir,
@@ -217,6 +218,10 @@ struct Rec {
     /// RULINGS EL5: the test double of the seam (None = NotConsumed)
     consumed_answer: Mutex<Option<cys::repair::consumed::ApprovalUse>>,
     seen_during_apply: Mutex<Vec<ReqState>>,
+    /// RULINGS JW2: probed at every send to the master — (the approval table free, the repair's lock
+    /// free) by try-lock — and what it saw
+    send_probe: Mutex<Option<Box<dyn Fn() -> (bool, bool) + Send + Sync>>>,
+    sends_free: Mutex<Vec<(bool, bool)>>,
 }
 
 impl Effects for Rec {
@@ -224,6 +229,9 @@ impl Effects for Rec {
         self.delivered.lock().unwrap().push((seat, text));
     }
     fn tell_master(&self, text: String) {
+        if let Some(p) = self.send_probe.lock().unwrap().as_ref() {
+            self.sends_free.lock().unwrap().push(p());
+        }
         self.master.lock().unwrap().push(text);
     }
     fn point_master(&self, text: String) {
@@ -1222,14 +1230,22 @@ fn check_comparison_writes_the_row_and_points_once() {
     assert_eq!(check_consequence(rel, &noted, &ledger, &point), Some(crate::repair::Filed::New));
     assert_eq!(pointed.lock().unwrap().len(), 1, "a noted difference is no pointer");
     assert_eq!(check_consequence(rel, &Comparison::Clean, &ledger, &point), None);
-    // the production consequence has no helper thread and keeps nothing in memory
+    // the production consequence writes its row on the calling thread and keeps nothing in memory;
+    // RULINGS JW2 (old expectation: `!body.contains("spawn_thread")`): only the POINTER goes out on a
+    // thread of its own (no lock across a send), with no synchronous fallback
     let src = include_str!("repair_approval.rs");
     let body = src
         .split("pub(crate) fn comparison_consequence(")
         .nth(1)
         .and_then(|b| b.split("\n}\n").next())
         .unwrap();
-    assert!(!body.contains("spawn_thread") && !body.contains("static "), "{body}");
+    assert!(!body.contains("static "), "{body}");
+    assert!(body.contains("&|f, l| crate::repair::file_intake(daemon, f, l)"), "{body}");
+    let pointer = &body[body.find("&|text|").unwrap()..];
+    assert!(
+        pointer.contains("spawn_thread(") && pointer.matches("point_master_now(").count() == 1,
+        "{pointer}"
+    );
     // the pointer is one attempt: no retrying delivery, no loop
     let pm = src
         .split("fn point_master_now(")
@@ -1474,6 +1490,55 @@ fn submit_before_restart_reconciliation_counts_the_old_expiry() {
     assert_eq!(eff.master.lock().unwrap().len(), 1, "the one line, once");
     sweep(&r.ctx(now + 1.0), &t, &eff);
     assert_eq!(eff.master.lock().unwrap().len(), 1, "never a second line");
+}
+
+/// RULINGS JW2 — no lock across a send: the stale request's FINAL expiry, settled by a `submit` after a
+/// restart (the budget used up), with the thread spawn failing (so the production effect would send
+/// synchronously, right where it is called): at the moment of the send the approval table and the
+/// repair's lock are BOTH free (probed by try-lock from the send seam). (The old `submit` called
+/// `tell_master` inside both locks.)
+#[test]
+fn the_budget_notice_is_sent_after_both_locks_are_released() {
+    let r = rig("jw2");
+    let id = r.signed_repair();
+    let eff = effects();
+    let t = Mutex::new(ApprovalTable::default());
+    pending(&r, &t, &eff, T0);
+    drop(t);
+    // E1 … E3 counted as in the CZ2 sequence, then a restart while S3 is pending
+    let t = Mutex::new(ApprovalTable::default());
+    let mut now = T0 + 1801.0;
+    pending(&r, &t, &eff, now);
+    sweep(&r.ctx(now + 1.0), &t, &eff);
+    now += 2.0;
+    for _ in 0..2 {
+        now += 1801.0;
+        sweep(&r.ctx(now), &t, &eff);
+        now += 1.0;
+        pending(&r, &t, &eff, now);
+    }
+    assert_eq!(r.rec(&id).resubmits, vec![(fp_of(&r, &id), 3)]);
+    assert!(eff.master.lock().unwrap().is_empty());
+    drop(t);
+    let t = Arc::new(Mutex::new(ApprovalTable::default()));
+    let (probe_table, probe_locks) = (t.clone(), r.mutexes.clone());
+    *eff.send_probe.lock().unwrap() = Some(Box::new(move || {
+        let table_free = probe_table.try_lock().is_ok();
+        let repair_free = probe_locks
+            .lock()
+            .unwrap()
+            .get("R-1")
+            .map_or(true, |m| m.try_lock().is_ok());
+        (table_free, repair_free)
+    }));
+    FAIL_SPAWN_FOR_TEST.with(|f| f.set(true));
+    now += 1801.0;
+    let e = submit(&r.ctx(now), &worker(), &json!({"repair": "R-1"}), &t, &eff, Ok(())).unwrap_err();
+    FAIL_SPAWN_FOR_TEST.with(|f| f.set(false));
+    assert!(e.message.contains("만료"), "{}", e.message);
+    assert_eq!(r.rec(&id).resubmits, vec![(fp_of(&r, &id), 4)]);
+    assert_eq!(eff.master.lock().unwrap().len(), 1, "the one line");
+    assert_eq!(*eff.sends_free.lock().unwrap(), vec![(true, true)], "a lock was held across the send");
 }
 
 /// RULINGS DF5 (joins CZ2): a durable `approval: approved` a crash left between its write and the
