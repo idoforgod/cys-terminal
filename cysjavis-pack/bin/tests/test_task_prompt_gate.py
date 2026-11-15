@@ -306,6 +306,13 @@ class TicketGate(unittest.TestCase):
             rc, out, err = run_tp(merge="R-9", surface="dept-a/surface:5")
         self.assertEqual(rc, 0, err)
         self.assertIn("  완료한 훅 작업을 확인할 수 없습니다 — R-9/ops: 목록을 읽을 수 없음", out.splitlines())
+        # RULINGS JL1 (a): more records than the display read takes → the ticket is still produced, with that line
+        status["hook_ops_unreadable"] = "완료한 훅 작업을 확인할 수 없습니다 — 작업 기록이 많습니다(256건·4194304바이트까지만 읽습니다)"
+        with path_with(self.stub(GATE_HELD, 95, status)):
+            rc, out, err = run_tp(merge="R-9", surface="dept-a/surface:5")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("  완료한 훅 작업을 확인할 수 없습니다 — 작업 기록이 많습니다(256건·4194304바이트까지만 읽습니다)", out.splitlines())
+        self.assertIn("  3) cys repair recheck R-9", out)
 
     # RULINGS IG6: a HOOK-ONLY repair (a hook unregistration and no file) gets its merge ticket — the hook target
     # and R's trigger kept, `begin --unregister-hook … --joins R` and `recheck R` printed (no `--files`)

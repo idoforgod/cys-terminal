@@ -2600,6 +2600,70 @@ fn a_stop_before_any_trace_on_a_conflict_row_is_shown_after_recovery() {
     assert_eq!(shown(&r, &id), vec![format!("훅 등록 해제(작업 {}: Stop:x.sh)", op.op)]);
 }
 
+/// A completed hook operation record of DEPT for R (a stand-in for an OLDER operation), `n` of them.
+fn older_hook_records(r: &Rig, id: &RepairId, n: usize) {
+    for k in 0..n {
+        let op = crate::repair::wal::OpRecord {
+            schema: 1, op: format!("20000101T000000{k:06}Z-hook-unregister-1-{k}"), repair: id.clone(), lane_key: lane(DEPT),
+            kind: "hook-unregister".into(), form: "hook".into(), rel: String::new(), pre_existed: false,
+            expected: String::new(), incoming: String::new(), pack_generation: None, slot: None, slot_identity: None,
+            live_identity: None, incoming_copy: None, incoming_copy_identity: None, step: "done".into(),
+            hooks: vec![crate::repair::wal::HookLine { event: "Stop".into(), script: "x.sh".into(), targets: Vec::new() }],
+            finished: true, outcome: Some("applied".into()), note: String::new(), created_at: 1.0, updated_at: 1.0, notice: None,
+        };
+        crate::repair::wal::write_in(&r.root, &op).unwrap();
+    }
+}
+
+/// RULINGS JL1 (a) — the display read stops at its bound: exactly `DISPLAY_RECORDS_MAX` records are shown;
+/// one more → "작업 기록이 많습니다" after at most that many records were read (a seam counts them); a total
+/// over `DISPLAY_BYTES_MAX` (by the sizes the entries report — the big one is never read) → the same.
+#[test]
+fn the_display_read_stops_at_its_bound() {
+    let r = rig("jl1a");
+    let id = rid("R-1");
+    hook_repair_in_hq(&r, &id);
+    older_hook_records(&r, &id, DISPLAY_RECORDS_MAX);
+    assert_eq!(completed_hook_ops_in(&r.root, &id).unwrap().len(), DISPLAY_RECORDS_MAX);
+    older_hook_records(&r, &id, DISPLAY_RECORDS_MAX + 1);
+    DISPLAY_RECORD_READS.with(|c| c.set(0));
+    let why = completed_hook_ops_in(&r.root, &id).unwrap_err();
+    assert!(why.starts_with(TOO_MANY_RECORDS), "{why}");
+    assert!(DISPLAY_RECORD_READS.with(|c| c.get()) <= DISPLAY_RECORDS_MAX as u32);
+    let r2 = rig("jl1b");
+    hook_repair_in_hq(&r2, &id);
+    older_hook_records(&r2, &id, 1);
+    let big = crate::repair::wal::ops_dir_in(&r2.root, &id).join("big.json");
+    std::fs::write(&big, vec![b' '; DISPLAY_BYTES_MAX as usize + 1]).unwrap();
+    let why = completed_hook_ops_in(&r2.root, &id).unwrap_err();
+    assert!(why.starts_with(TOO_MANY_RECORDS), "{why}");
+}
+
+/// RULINGS JL1 (b) + (c) — `recheck`'s answer reads ONE record (the operation it ran, by its id) with many
+/// older records of R present, and the per-repair guard is FREE when it reads.
+#[test]
+fn recheck_reads_its_one_record_with_the_guard_free() {
+    let id = rid("R-1");
+    let (r, d) = conflicted_edit_and_hook("jl1c", &id);
+    older_hook_records(&r, &id, DISPLAY_RECORDS_MAX + 44);
+    let guard_free = std::rc::Rc::new(Cell::new(None));
+    let (root, gid, seen) = (r.root.clone(), id.clone(), guard_free.clone());
+    BEFORE_ANSWER_READ.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move || {
+            seen.set(Some(crate::repair::guard::RepairGuard::try_take(&root, &gid).is_some()));
+        }))
+    });
+    DISPLAY_RECORD_READS.with(|c| c.set(0));
+    let got = recheck_answer(&r, &id, &d, 5, "합침");
+    let reads = DISPLAY_RECORD_READS.with(|c| c.get());
+    BEFORE_ANSWER_READ.with(|h| *h.borrow_mut() = None);
+    let a = got.unwrap();
+    assert_eq!(reads, 1, "one record read for the answer");
+    assert_eq!(guard_free.get(), Some(true), "the guard was released before the answer's read");
+    let op = r.ops(&id).into_iter().find(|o| o.lane_key == lane(DEPT) && o.created_at > 1.0 && o.kind == "hook-unregister").expect("the operation this call ran");
+    assert!(a.changed.ends_with(&format!(", 이 부서의 훅 등록 해제(작업 {}: Stop:x.sh)", op.op)), "{}", a.changed);
+}
+
 /// JD2 — `recheck`'s answer says what the call changed, in one sentence: the row (검증됨, or 충돌 with
 /// a new reason), the hook operation it completed, a deleting repair's tombstones.
 #[test]
