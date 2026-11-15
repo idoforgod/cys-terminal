@@ -8480,6 +8480,12 @@ impl KeptFolder {
         }
         let mut text = line.to_string();
         text.push('\n');
+        // ★WJ1 KO1 (RULINGS KO): every append starts on a line of its own — an earlier append that failed after part of a
+        //   line left a tail without a newline; the newline goes first, in the same durable append (a reader skips the
+        //   unparseable tail and keeps every other line).
+        if !kept_log_ends_clean(&p) {
+            text.insert(0, '\n');
+        }
         let fresh = !p.exists();
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -8497,6 +8503,30 @@ impl KeptFolder {
             }
         }
         Ok(())
+    }
+
+    /// The closing line of a completed roll-back pass (★WJ1 KO2): what THIS pass left / preserved / moved, or — when it did
+    /// none of that but the kept record of this journal already holds lines (an earlier pass died before its line) — one
+    /// line naming the kept record. None = nothing was ever kept for this journal.
+    fn closing_line(&self, left: &[&str], preserved: &[&str], displaced: &[&str]) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if !left.is_empty() {
+            parts.push(format!("업데이트의 백업 뒤에 바뀐 {}개는 그대로 두었습니다({})", left.len(), left.join(", ")));
+        }
+        if !preserved.is_empty() {
+            parts.push(format!("살아 있던 내용을 먼저 보관하고 되돌린 {}개({})", preserved.len(), preserved.join(", ")));
+        }
+        if !displaced.is_empty() {
+            parts.push(format!("파일이 아닌 항목을 옮겨 둔 {}개({})", displaced.len(), displaced.join(", ")));
+        }
+        let log = self.dir.join("kept.log");
+        if parts.is_empty() {
+            if !std::fs::metadata(&log).is_ok_and(|m| m.len() > 0) {
+                return None;
+            }
+            parts.push("앞선 복구가 보관한 항목이 있습니다".to_string());
+        }
+        Some(format!("[pack-journal] 되돌리기: {} — 업데이트의 사본과 기록: {}", parts.join(" · "), log.display()))
     }
 
     /// KB3 / the older rule: the live bytes, kept before the entry is undone.
@@ -8655,25 +8685,22 @@ fn rollback_journal(held: &Path, restored: &mut dyn FnMut(usize) -> bool) -> Res
             return Ok(false);
         }
     }
-    // ★WJ1: say so ONCE (the durable record is `kept.log`).
-    let mut parts: Vec<String> = Vec::new();
-    if !left.is_empty() {
-        parts.push(format!("업데이트의 백업 뒤에 바뀐 {}개는 그대로 두었습니다({})", left.len(), left.join(", ")));
-    }
-    if !preserved.is_empty() {
-        parts.push(format!("살아 있던 내용을 먼저 보관하고 되돌린 {}개({})", preserved.len(), preserved.join(", ")));
-    }
-    if !displaced.is_empty() {
-        parts.push(format!("파일이 아닌 항목을 옮겨 둔 {}개({})", displaced.len(), displaced.join(", ")));
-    }
-    if !parts.is_empty() {
-        eprintln!(
-            "[pack-journal] 되돌리기: {} — 업데이트의 사본과 기록: {}",
-            parts.join(" · "),
-            kept.dir.join("kept.log").display()
-        );
+    // ★WJ1: say so ONCE per completed pass (the durable record is `kept.log`); ★KO2: also when only an earlier pass kept.
+    if let Some(line) = kept.closing_line(&left, &preserved, &displaced) {
+        eprintln!("{line}");
     }
     Ok(true)
+}
+
+/// ★WJ1 KO1: does `kept.log` end on a line boundary (absent, empty, or its last byte a newline)? Read with the start-path
+/// reader (the roll-back runs before the daemon listens — bounded, never blocking, regular files only: EC5). A file it
+/// cannot read counts as NOT clean (a leading newline is then written — at worst an empty line, which a reader skips).
+fn kept_log_ends_clean(p: &Path) -> bool {
+    match read_start_meta(p) {
+        StartRead::Missing => true,
+        StartRead::Bytes(b) => b.last().is_none_or(|c| *c == b'\n'),
+        StartRead::Unreadable(_) => false,
+    }
 }
 
 /// ★T2i(RULINGS FP2): 저널 메타 파일의 텍스트 — 시작 경로의 판독기로(없음 · 판독 불가 · UTF-8 아님 = Err, 종전 읽기 오류와 같은 갈래).
@@ -14385,8 +14412,10 @@ mod tests {
         let set: std::collections::BTreeSet<String> =
             files.iter().map(|(r, _, _)| (*r).to_string()).collect();
         let jd = t9_write_journal("2.0.0", &set).expect("write_journal");
+        // ★WJ1: the partial apply is the UPDATE's write, so it is announced as the update's writes are (RULINGS JV2 — an
+        //   unannounced write is someone else's and is left). Was: `write_atomic(&pd.join(rel), b"PARTIAL-APPLY")`.
         for (rel, _, _) in &files {
-            write_atomic(&pd.join(rel), b"PARTIAL-APPLY").unwrap();
+            wj1_update_write(&jd, &pd, rel, b"PARTIAL-APPLY");
         }
         let rolled = rollback_and_settle_own(&jd);
         let post = fingerprint_dir_with_modes(&pd);
@@ -14424,7 +14453,8 @@ mod tests {
         let set: std::collections::BTreeSet<String> =
             ["bin/plain.sh"].iter().map(|s| (*s).to_string()).collect();
         let jd = t9_write_journal("2.0.0", &set).expect("write_journal");
-        write_atomic(&pd.join("bin/plain.sh"), b"#!/bin/sh\necho partial\n").unwrap();
+        // ★WJ1: the update's own partial write, announced as the update's writes are. Was: `write_atomic(&pd.join("bin/plain.sh"), …)`.
+        wj1_update_write(&jd, &pd, "bin/plain.sh", b"#!/bin/sh\necho partial\n");
         m15_set_mode(&pd.join("bin/plain.sh"), 0o755);
         let rolled = rollback_and_settle_own(&jd);
         let bytes = std::fs::read_to_string(pd.join("bin/plain.sh")).unwrap();
@@ -14466,9 +14496,10 @@ mod tests {
             .collect();
         let jd = t9_write_journal("2.0.0", &set).expect("write_journal");
         // crash mid-apply: both files rewritten 0644, one new file created, marker still 1.0.0
-        write_atomic(&pd.join("bin/cys-dept"), b"#!/bin/bash\necho partial\n").unwrap();
-        write_atomic(&pd.join("README.md"), b"PARTIAL").unwrap();
-        write_atomic(&pd.join("new.txt"), b"ORPHAN-NEW").unwrap();
+        // ★WJ1: the update's own writes, announced as the update's writes are (was three plain `write_atomic`s).
+        wj1_update_write(&jd, &pd, "bin/cys-dept", b"#!/bin/bash\necho partial\n");
+        wj1_update_write(&jd, &pd, "README.md", b"PARTIAL");
+        wj1_update_write(&jd, &pd, "new.txt", b"ORPHAN-NEW");
         let _ = &jd;
         t9_writers_gone();
 
@@ -15366,6 +15397,15 @@ mod tests {
             }
             std::fs::write(&ip, v.to_string()).unwrap();
         }
+    }
+
+    /// ★WJ1: the update's own write as the update now makes it — announced in its journal's placement log first, then written.
+    /// The tests that model a partial apply by hand use it; an unannounced write is, by RULINGS JV2, someone else's (left).
+    /// (Its callers are the unix-only mode tests, like [`t9_write_journal`]'s.)
+    #[cfg(unix)]
+    fn wj1_update_write(own: &Path, pd: &Path, rel: &str, bytes: &[u8]) {
+        PlacementLog::new(pd, own, None).announce(rel, Some(bytes)).unwrap();
+        write_atomic(&pd.join(rel), bytes).unwrap();
     }
 
     /// `write_journal` as the transaction calls it, into an admitted slot entry of THIS process
@@ -16733,6 +16773,72 @@ mod tests {
         assert_eq!(second, Ok(true));
         assert!(m15da_diff(&pre, &after).is_empty(), "{:?}", m15da_diff(&pre, &after));
         assert!(contents.iter().any(|c| c == u), "U kept by the completing recovery");
+    }
+
+    /// ★WJ1 KO2: a completed pass that kept nothing itself still names the kept record once when an earlier pass (that died
+    /// before its line) kept items for this journal; nothing kept ever → no line.
+    #[test]
+    fn wj1_ko2_closing_line_names_an_earlier_pass_s_kept_record() {
+        let root = m15da_root("wj1-ko2");
+        let kept = KeptFolder { dir: root.join("kept").join("0123456789abcdef"), apply_id: String::new() };
+        let none = kept.closing_line(&[], &[], &[]);
+        kept.record(serde_json::json!({ "rel": ".install-manifest.json", "kind": "live-preserved" })).unwrap();
+        let earlier = kept.closing_line(&[], &[], &[]);
+        let this_pass = kept.closing_line(&["README.md"], &[], &[]);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(none, None);
+        assert!(earlier.as_deref().is_some_and(|l| l.contains("앞선 복구가 보관한 항목") && l.contains("kept.log")), "{earlier:?}");
+        assert!(this_pass.as_deref().is_some_and(|l| l.contains("README.md") && !l.contains("앞선 복구")), "{this_pass:?}");
+    }
+
+    /// ★WJ1 KO1 (RULINGS KO — KB1's record line must be valid by itself): an earlier recovery's append to `kept.log` failed
+    /// after PART of a line (a partial JSON tail, no newline). The next recovery preserves the live bytes of a record name:
+    /// when its entry is done — the record line is written BEFORE the restore — `kept.log` holds a line that parses as THIS
+    /// item's record, the earlier complete line is intact, and the partial tail stays a line of its own (a reader skips it).
+    /// Red on a4ca8f5a: the new JSON was appended right behind the partial tail — no line parsed as the item's record.
+    #[test]
+    fn wj1_ko1_kept_log_append_after_a_partial_tail_starts_on_a_line_of_its_own() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (root, pd, pre, _env) = t9r2_lane("wj1-ko1");
+        let _ = t9r2_stopped_apply(TxStep::VersionWritten);
+        t9_writers_gone();
+        let (name, _) = t9_slot_entry(&pack_journal_dir()).expect("the crashed journal");
+        let id = name.rsplit('.').next().unwrap_or_default().to_string();
+        let entries: Vec<String> = wj1_own_journal()
+            .and_then(|j| std::fs::read_to_string(j.join("index.json")).ok())
+            .and_then(|s| serde_json::from_str::<JournalIndex>(&s).ok())
+            .map(|ix| ix.entries.into_iter().map(|e| e.rel).collect())
+            .unwrap_or_default();
+        let at = entries.iter().position(|r| r == INSTALL_MANIFEST).expect("the record is an entry") + 1;
+        // what an earlier recovery left: one complete line, then a write that failed after part of a line
+        let kept_dir = pack_journal_dir().join(KEPT_DIR).join(&id);
+        std::fs::create_dir_all(&kept_dir).unwrap();
+        let earlier = "{\"rel\":\"README.md\",\"kind\":\"left\",\"backup_item\":null,\"live\":\"absent\"}";
+        let partial = "{\"rel\":\".install-manifest.json\",\"kind\":\"live-pres";
+        std::fs::write(kept_dir.join("kept.log"), format!("{earlier}\n{partial}")).unwrap();
+        let u = "{\"U\":\"a pack verb's record\"}";
+        std::fs::write(pd.join(INSTALL_MANIFEST), u).unwrap();
+        // the recovery stops right after the record's entry (its line was written before its restore)
+        let first = t9r2_recover(&mut || true, &mut || true, &mut |n| n < at, &mut || true);
+        let text = std::fs::read_to_string(kept_dir.join("kept.log")).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        let valid_for_item = lines.iter().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).any(|v| {
+            v["rel"] == INSTALL_MANIFEST && v["kind"] == "live-preserved" && v["sha256"] == sha256_hex(u.as_bytes())
+        });
+        let earlier_intact = lines.first() == Some(&earlier);
+        let partial_alone = lines.contains(&partial);
+        // the next recovery completes
+        t9_relabel(&pack_journal_dir(), "1");
+        let second = recover_pack_journal();
+        let after = m15da_state(&pd);
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(first, Err(RECOVERY_STOPPED.to_string()));
+        assert!(valid_for_item, "no line of kept.log parses as the preserved item's record:\n{text}");
+        assert!(earlier_intact, "the earlier complete line must stay intact:\n{text}");
+        assert!(partial_alone, "the partial tail must stay a line of its own:\n{text}");
+        assert_eq!(second, Ok(true));
+        assert!(m15da_diff(&pre, &after).is_empty(), "{:?}", m15da_diff(&pre, &after));
     }
 
     /// ★WJ1 (RULINGS KB4 — minor #185): the MEASURED number of announced changes (= extra durable writes) of one apply of the
