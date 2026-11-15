@@ -1998,6 +1998,7 @@ const WRITE_SITES: &[(&str, &str, usize, &str, &str)] = &[
     ("hook_step", "(env.hooks)(", 1, "unit (b)", "inside T6's hook step — its write-ahead record, tombstone and registrar run are classified by T6's own write census"),
     ("note_reason", "update_row(", 1, "the reason note", "inside the tried lock; the reason text only (IK2); validated by no stamp by design"),
     ("publish", "write_row_if(", 1, "unit (c)", "every row the tick and `recheck` publish, after the stamp held (IV1 / IQ1)"),
+    ("record_hook_trace", "write_row_if(", 1, "unit (b)", "JA1: the trace of a hook unit that BEGAN writing — inside the unit's own lock, no stamp (it records what THIS lane changed)"),
     ("replace_pack_instance", ".create_new(true)", 1, "the instance pass", "I8 step 3: the new id created NEW"),
     ("replace_pack_instance", ".write(true)", 1, "the instance pass", "the same open"),
     ("replace_pack_instance", "remove_file(", 1, "the instance pass", "I8 step 3: a different / malformed id unlinked"),
@@ -2338,3 +2339,158 @@ fn the_hook_unit_validates_after_its_dry_run() {
     assert!(crate::repair::tombstones::load_in(&r.root, &lane(DEPT)).unwrap().is_empty(), "no tombstone");
 }
 
+/// RULINGS JA1 — a hook unit that BEGAN to write leaves its trace on the row, on every call path:
+/// (1) `recheck`: the unit validates, writes its record; the origin supersedes R during the real run;
+/// the tombstone and the un-registration complete; the publication after it is refused → the row's
+/// reason names the operation, and the verb's answer says the same (never "nothing was written");
+/// (2) the tick's "already there" arm: the same → the row carries the trace (a new 대기 row) and the
+/// reason says why nothing more was written.
+#[test]
+fn a_hook_unit_that_began_leaves_its_trace_on_the_row() {
+    // (1) recheck
+    let r = rig("ja1a");
+    let id = rid("R-1");
+    hook_repair_in_hq(&r, &id);
+    let d0 = doubles();
+    d0.hooks_ok.set(false);
+    tick(&r, DEPT, &d0, &fid(1));
+    let mut row = r.row(&id, DEPT).unwrap();
+    row.merge_lock = Some(crate::repair::lock::new_lease(LockOwner { lane: lane(DEPT), seat: 5, incarnation: "inc".into() }, T0, None));
+    ledger::write_lane_durable_in(&r.root, &row).unwrap();
+    let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let d = doubles();
+    *d.unit.borrow_mut() = Some(real_unit(&r, Box::new(|| {}), supersede(&r.root, &id), calls.clone()));
+    let m = match recheck(&r, &id, &d, 5, "") {
+        Err(RepairError::Locked(m)) => m,
+        other => panic!("{other:?}"),
+    };
+    assert!(m.contains("이 부서의 훅 등록을 해제했습니다(작업 ") && m.contains("Stop:x.sh") && !m.contains("아무것도 쓰지 않았습니다"), "{m}");
+    assert_eq!(*calls.borrow(), vec![true, false], "the unit ran to its end");
+    let op = r.ops(&id).into_iter().find(|o| o.lane_key == lane(DEPT) && o.kind == "hook-unregister").expect("its write-ahead record");
+    assert!(op.finished);
+    assert!(crate::repair::tombstones::load_in(&r.root, &lane(DEPT)).unwrap().iter().any(|t| t.rel == "settings:Stop:x.sh"));
+    let row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Conflict, "the row keeps its state");
+    assert!(row.reason.contains(&format!("작업 {}", op.op)) && row.reason.contains("Stop:x.sh"), "{}", row.reason);
+    // (2) the tick
+    let r2 = rig("ja1b");
+    let id2 = rid("R-2");
+    hook_repair_in_hq(&r2, &id2);
+    let calls2 = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let d2 = doubles();
+    *d2.unit.borrow_mut() = Some(real_unit(&r2, Box::new(|| {}), supersede(&r2.root, &id2), calls2.clone()));
+    let t = tick(&r2, DEPT, &d2, &fid(1));
+    assert_eq!(*calls2.borrow(), vec![true, false]);
+    let row2 = r2.row(&id2, DEPT).expect("the trace is on a row");
+    assert_ne!(row2.state, LaneState::Verified, "{t:?}");
+    assert!(row2.reason.starts_with("이 부서의 훅 등록을 해제했습니다(작업 ") && row2.reason.contains("그 뒤 수리 기록이 바뀌었습니다"), "{}", row2.reason);
+}
+
+/// JA1 in the door phase: a mixed repair (an edit + a hook) whose hook unit began and did not finish
+/// (the registrar's real run fails) → the row is 충돌 NOW, naming the edited file and the hook
+/// operation (IO1's exception publication), whatever R is now.
+#[test]
+fn a_hook_unit_that_failed_after_it_began_is_reported_in_the_door_phase() {
+    let r = rig("ja1c");
+    let id = rid("R-1");
+    let mut rec = committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    rec.files.push(FileChange { rel: "settings:Stop:x.sh".into(), kind: ChangeKind::HookUnregister { event: "Stop".into(), script: "x.sh".into() }, pre: PreImage::Absent, post: TargetState::Absent, diff: None });
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    let d = doubles();
+    *d.unit.borrow_mut() = Some(Box::new(|_: &RepairId, _: &LaneKey, _: HookStep, guard: &dyn Fn() -> Result<(), String>| {
+        guard().map_err(RepairError::Precondition)?;
+        Ok(apply::HookUnitEnd::Ran { op: "op-ja1c".into(), lines: vec!["Stop:x.sh".into()], result: Err(RepairError::CheckTimeout("등록기가 시한 안에 끝나지 않았습니다(시험)".into())) })
+    }));
+    tick(&r, DEPT, &d, &fid(1));
+    let row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Conflict);
+    assert!(row.reason.contains("bin/a.py") && row.reason.contains("작업 op-ja1c") && row.reason.contains("마치지 못했습니다"), "{}", row.reason);
+    assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"new\n", "what was changed stays (no undo — IO1)");
+}
+
+/// JA1 — a hook unit INTERRUPTED after its write-ahead record (a stop): T6's recovery completes the hook
+/// operation from its record, and the next tick's evidence path (IG3: this lane's own completed
+/// operations for R) writes the row WITH its probation bundle — not the closed "nothing replaced here".
+/// (The tick runs the hook unit once more — un-registration is idempotent — and its operation is
+/// evidence too.)
+#[test]
+fn an_interrupted_hook_unit_is_completed_by_recovery_and_its_row_has_a_probation() {
+    let r = rig("ja1d");
+    let id = rid("R-1");
+    hook_repair_in_hq(&r, &id);
+    // the stop: an unfinished hook record of THIS lane for R, written by hand as T6's own test does
+    let op = crate::repair::wal::OpRecord {
+        schema: 1, op: crate::repair::wal::new_op_id(T0 - 1.0, "hook-unregister"), repair: id.clone(), lane_key: lane(DEPT),
+        kind: "hook-unregister".into(), form: "hook".into(), rel: String::new(), pre_existed: false,
+        expected: String::new(), incoming: String::new(), pack_generation: Some(apply::pack_generation(&r.dept)), slot: None, slot_identity: None,
+        live_identity: None, incoming_copy: None, incoming_copy_identity: None, step: "recorded".into(),
+        hooks: vec![crate::repair::wal::HookLine { event: "Stop".into(), script: "x.sh".into(), targets: Vec::new() }],
+        finished: false, outcome: None, note: String::new(), created_at: T0 - 1.0, updated_at: T0 - 1.0, notice: None,
+    };
+    crate::repair::wal::write_in(&r.root, &op).unwrap();
+    // T6's recovery completes it (the job runs it before the propagation)
+    let settings = r.base.join("settings.json");
+    let ok = |_: &Path, _: bool| -> Result<String, RepairError> { Ok(registrar_report(&settings, "unregistered")) };
+    assert_eq!(apply::resume_hook_steps_in(&r.root, &r.dept, &lane(DEPT), &ok, &apply::no_repair_lock, T0), 1);
+    let done = crate::repair::wal::list_in(&r.root, &id).0.into_iter().find(|o| o.op == op.op).unwrap();
+    assert!(done.finished && done.outcome.as_deref() == Some("applied"), "{done:?}");
+    // the next tick
+    let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let d = doubles();
+    *d.unit.borrow_mut() = Some(real_unit(&r, Box::new(|| {}), Box::new(|| {}), calls.clone()));
+    tick(&r, DEPT, &d, &fid(1));
+    let row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Verified, "{}", row.reason);
+    let p = row.probation.unwrap();
+    assert!(p.closed.is_none(), "an OPEN probation — the lane applied R itself: {:?}", p.closed);
+}
+
+// ───────────────────────────── RULINGS JA2 / JA3 — what a row and the catch-up mean ─────────────────────────────
+
+/// JA2 (a meaning, stated): a published 검증됨 row records the observation made right before it; a
+/// target edited by another writer afterwards is not measured again while the generation and instance
+/// stay — the row stays 검증됨; at a generation change the verify-only pass demotes it (and the lane's
+/// next decision is a 충돌 for the foreign bytes).
+#[test]
+fn a_row_records_its_observation_until_the_generation_changes() {
+    let r = rig("ja2");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/a.py", b"new\n", 0o644);
+    tick(&r, DEPT, &doubles(), &fid(1));
+    assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Verified);
+    std::fs::write(r.dept.join("bin/a.py"), b"edited by someone\n").unwrap();
+    tick(&r, DEPT, &doubles(), &fid(1));
+    assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Verified, "not measured again: same generation and instance");
+    std::fs::write(r.dept.join(".pack-version"), "0.15.1\n").unwrap();
+    let t = tick(&r, DEPT, &doubles(), &fid(1));
+    assert!(matches!(t.pass, Some(PassOutcome::VerifyOnly { demoted: 1 })), "{t:?}");
+    assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Conflict, "the edit is now the lane's 충돌");
+}
+
+/// JA3 (a meaning, stated): the catch-up is the first processing of the repairs observed for this
+/// pack instance; a re-commit after it does not cancel it — the gate stays OPEN, the row is demoted by
+/// P2 and decided anew.
+#[test]
+fn a_recommit_after_the_catchup_leaves_the_gate_open_and_demotes_the_row() {
+    let r = rig("ja3");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    tick(&r, DEPT, &doubles(), &fid(1));
+    assert_eq!(gate_verdict_in(&r.root, &lane(DEPT)), GateVerdict::Open);
+    // R committed again with another result (the HQ file and its sealed copy)
+    r.put(HQ, "bin/a.py", b"newer\n", 0o644);
+    let mut rec = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
+    let st = TargetState::read(&r.hq.join("bin/a.py")).unwrap();
+    seal_committed_copy_in(&r.root, &id, &lane(HQ), "bin/a.py", &r.hq.join("bin/a.py"), T0).unwrap();
+    rec.committed = vec![("bin/a.py".into(), st.canon())];
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    assert_eq!(gate_verdict_in(&r.root, &lane(DEPT)), GateVerdict::Open, "the catch-up is not cancelled");
+    tick(&r, DEPT, &doubles(), &fid(1));
+    let row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.applied, rec.committed, "P2: demoted and decided anew — the new result applied");
+    assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"newer\n");
+    assert_eq!(gate_verdict_in(&r.root, &lane(DEPT)), GateVerdict::Open);
+}
