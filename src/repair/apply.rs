@@ -41,6 +41,24 @@ pub enum ApplyOutcome {
     Declined(String),
 }
 
+/// RULINGS KX2 — the approval's lifetime as the approved apply asks it: INSIDE the pack-apply lock,
+/// after every check that precedes the first durable intent, immediately before that intent, with
+/// the caller's clock read AT THAT MOMENT (the closure reads it — never [`OpEnv::now`], which was
+/// read before the wait for the lock). `true` = still inside the lifetime.
+pub type LifetimeFn<'a> = dyn Fn() -> bool + 'a;
+
+/// How an approved apply that asked about its approval's lifetime ended (RULINGS KX2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Bounded<T> {
+    /// Inside the lifetime when asked: the apply ran to its end, as before (applied, declined or
+    /// superseded).
+    Ran(T),
+    /// The lifetime had ended when asked: NOTHING was written — no intent, no exchange, the live
+    /// files and the staged candidate untouched, the approval in the record left as it was (the
+    /// caller settles the request as an expiry; this is not a declined apply).
+    Expired,
+}
+
 /// Who asks for a revert (C3: human, a worker on a master's ticket, the daemon in-process — never
 /// the master).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3154,18 +3172,42 @@ pub fn apply_candidate_in(
     reference: &ReferenceFn<'_>,
     locked: &RepairLock<'_>,
 ) -> Result<ApplyReport, RepairError> {
+    match apply_candidate_in_until(env, id, files, screen, check, reference, locked, &|| true)? {
+        Bounded::Ran(report) => Ok(report),
+        // a lifetime that never ends is never over
+        Bounded::Expired => Err(RepairError::Precondition(format!(
+            "{}: 적용 시한이 지났습니다",
+            id.as_str()
+        ))),
+    }
+}
+
+/// [`apply_candidate_in`] for an approval with a lifetime (RULINGS KX2): `still_valid` is asked
+/// once, after every check that precedes the first durable intent and immediately before it; a
+/// lifetime over → [`Bounded::Expired`] with nothing written. The CALLER holds the pack-apply lock.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_candidate_in_until(
+    env: &OpEnv<'_>,
+    id: &RepairId,
+    files: &[CandidateFile],
+    screen: &ScreenStepFn<'_>,
+    check: &CheckFn<'_>,
+    reference: &ReferenceFn<'_>,
+    locked: &RepairLock<'_>,
+    still_valid: &LifetimeFn<'_>,
+) -> Result<Bounded<ApplyReport>, RepairError> {
     // EJ4: the repair's ONE guard for the whole apply (tried; held → busy, never waited for)
     let Some(_guard) = super::guard::RepairGuard::try_take(env.root, id) else {
         return Err(RepairError::Locked(format!("{}: {}", id.as_str(), super::guard::BUSY)));
     };
     let rec = ledger::read_record_in(env.root, id)?
         .ok_or_else(|| RepairError::Precondition(format!("{}: 그런 수리가 없습니다", id.as_str())))?;
-    let decline = |why: String| -> Result<ApplyReport, RepairError> {
+    let decline = |why: String| -> Result<Bounded<ApplyReport>, RepairError> {
         void_approval(env, id, &why, locked)?;
-        Ok(ApplyReport {
+        Ok(Bounded::Ran(ApplyReport {
             outcome: ApplyOutcome::Declined(why),
             files: Vec::new(),
-        })
+        }))
     };
     if !is_approval_class(rec.classification) {
         return Err(RepairError::Precondition(format!(
@@ -3388,6 +3430,12 @@ pub fn apply_candidate_in(
         created_at: env.now,
         updated_at: env.now,
     };
+    // RULINGS KX2: the approval's lifetime asked once more — inside the pack-apply lock, after every
+    // check above, immediately before the first durable intent, with the caller's clock read NOW (the
+    // wait for the lock may have outlasted it): over → nothing written, the caller settles an expiry
+    if !still_valid() {
+        return Ok(Bounded::Expired);
+    }
     if let Err(e) = write_intent(env.root, &intent) {
         return decline(format!("{}: 적용 의도를 기록할 수 없어 아무것도 바꾸지 않았습니다 — {e:?}", id.as_str()));
     }
@@ -3462,7 +3510,7 @@ pub fn apply_candidate_in(
     if let Some(why) = failed {
         // put back what this apply already changed (rule one), then decline
         if let Some(r) = undo_then(&why, results.clone())? {
-            return Ok(r);
+            return Ok(Bounded::Ran(r));
         }
         mark_undone(&why)?;
         return decline(format!("{}: 적용이 끝까지 가지 못해 바꾼 것을 되돌렸습니다 — {why}", id.as_str()));
@@ -3479,7 +3527,7 @@ pub fn apply_candidate_in(
     }
     if over_limit || super::types::fingerprint(&live_states) != approval.fingerprint_sha256 {
         if let Some(r) = undo_then("적용 뒤 살아 있는 파일이 승인된 지문과 다릅니다", results.clone())? {
-            return Ok(r);
+            return Ok(Bounded::Ran(r));
         }
         mark_undone("적용 뒤 살아 있는 파일이 승인된 지문과 다릅니다")?;
         return decline(format!(
@@ -3509,16 +3557,16 @@ pub fn apply_candidate_in(
                     _ => "검사 시간 초과(적용 때의 시간 초과는 실패)".to_string(),
                 };
                 if let Some(r) = undo_then(&format!("{rel}: 적용 직후 검사 실패 — {why}"), results.clone())? {
-                    return Ok(r);
+                    return Ok(Bounded::Ran(r));
                 }
                 mark_undone(&format!("{rel}: 적용 직후 검사 실패 — {why}"))?;
                 mark_reverted_after_apply_check(env, id, &format!("{rel}: {why}"), locked)?;
-                return Ok(ApplyReport {
+                return Ok(Bounded::Ran(ApplyReport {
                     outcome: ApplyOutcome::Declined(format!(
                         "{rel}: 적용 직후 그 파일의 검사가 실패해 이 수리 한 건을 되돌렸습니다 — {why}"
                     )),
                     files: results,
-                });
+                }));
             }
         }
     }
@@ -3596,10 +3644,10 @@ pub fn apply_candidate_in(
     }
     set_intent_state(env.root, &mut intent, "applied", "", env.now)?;
     supersede_older_in(env.root, env.lane, &rec, locked)?;
-    Ok(ApplyReport {
+    Ok(Bounded::Ran(ApplyReport {
         outcome: ApplyOutcome::Applied,
         files: results,
-    })
+    }))
 }
 
 /// The exchange of a slot that was ALREADY built and fingerprinted (the approved apply — R2/Q3:
@@ -3910,13 +3958,15 @@ fn supersede_older_in(
     Ok(done_ids)
 }
 
-/// The approved apply (T0 entry point; T5b's approve path calls it — or [`apply_candidate_in`]
-/// with the daemon's mutex). Takes the pack-apply lock.
+/// The approved apply (T0 entry point; T5b's approve path calls it). Takes the pack-apply lock.
+/// RULINGS KX2: `still_valid` is the approval's lifetime, asked inside the lock right before the
+/// first durable intent ([`apply_candidate_locked`]).
 pub fn apply_candidate(
     id: &RepairId,
     lane: &LaneKey,
     files: &[CandidateFile],
-) -> Result<ApplyOutcome, RepairError> {
+    still_valid: &LifetimeFn<'_>,
+) -> Result<Bounded<ApplyOutcome>, RepairError> {
     let root = super::paths::repairs_root();
     let pack = crate::pack::pack_dir();
     let env = OpEnv {
@@ -3929,18 +3979,46 @@ pub fn apply_candidate(
         own_check: &|_, _| None,
     };
     let screen = production_screen_step(&root);
-    let lock = crate::pack_apply_lock::pack_apply_lock_path_for(&pack);
+    apply_candidate_locked(
+        &env,
+        id,
+        files,
+        &screen,
+        &production_check,
+        &production_reference,
+        still_valid,
+    )
+}
+
+/// The lock + apply of [`apply_candidate`] over a given environment and checks: the pack-apply lock
+/// of `env.pack` (`pack_apply_lock_path_for` — one file for every pack under the same parent; a
+/// BLOCKING `flock`, unbounded — minor #209), then [`apply_candidate_in_until`]. Production passes
+/// its live paths and checks; a test passes its own and goes through the same lock.
+pub fn apply_candidate_locked(
+    env: &OpEnv<'_>,
+    id: &RepairId,
+    files: &[CandidateFile],
+    screen: &ScreenStepFn<'_>,
+    check: &CheckFn<'_>,
+    reference: &ReferenceFn<'_>,
+    still_valid: &LifetimeFn<'_>,
+) -> Result<Bounded<ApplyOutcome>, RepairError> {
+    let lock = crate::pack_apply_lock::pack_apply_lock_path_for(env.pack);
     crate::pack_apply_lock::with_apply_lock(&lock, || {
-        apply_candidate_in(
-            &env,
+        apply_candidate_in_until(
+            env,
             id,
             files,
-            &screen,
-            &production_check,
-            &production_reference,
+            screen,
+            check,
+            reference,
             &no_repair_lock,
+            still_valid,
         )
-        .map(|r| r.outcome)
+        .map(|b| match b {
+            Bounded::Ran(r) => Bounded::Ran(r.outcome),
+            Bounded::Expired => Bounded::Expired,
+        })
     })
     .map_err(RepairError::Io)?
 }
