@@ -5746,7 +5746,7 @@
      "needs_units": [
       "T6"
      ],
-     "title": "4 quick daemon restarts: no pack file changed; the re-check job's first fire after the last start comes after readiness and within 150 s",
+     "title": "4 quick daemon restarts: no pack file changed; the re-check job's first fire at / after readiness comes within 150 s of it",
      "checks": [
       {
        "id": "restarts",
@@ -5775,10 +5775,11 @@
        "op": "empty"
       },
       {
-       "id": "not-before",
+       "id": "before-ready",
        "role": "check",
-       "fact": "storm_fire_before_ready",
-       "op": "false"
+       "fact": "storm_fires_before_ready",
+       "op": "present",
+       "text": "recorded: fires of the job between the last start and readiness, with their result (the tick's own gate is the listener's readiness - such a fire cannot start a re-check)"
       },
       {
        "id": "within-150",

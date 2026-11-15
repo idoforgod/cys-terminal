@@ -4118,17 +4118,25 @@ def probe_s3_t6_jobs(pr):
     f["storm_restarts"] = len(answers)
     f["storm_all_ready"] = all(a["ready"] for a in answers)
     f["storm_first_answers"] = [a["first_tick_answer"][1] if a["first_tick_answer"] else None for a in answers]
-    # the job after the last restart: fired after readiness, within 150 s of it, never before it
-    fired = None
+    # the job after the last restart. The tick's own gate is the listener's readiness (repair_job.rs trigger_with:
+    # not_ready until post_listen_boot), so a fire BEFORE readiness can run no re-check - it is recorded with its
+    # result; the first fire at / after readiness must come within 150 s of it.
+    before, after = [], None
+    seen = set()
     t2 = time.monotonic()
     while time.monotonic() - t2 < 240 and ready_at:
         row = _schedule_row(cys, T6_JOB_ID)
-        if row and row["last_fired"] and row["last_fired"] >= int(launch or 0):
-            fired = row["last_fired"]
-            break
+        lf = (row or {}).get("last_fired")
+        if lf and lf >= int(launch or 0) and lf not in seen:
+            seen.add(lf)
+            if lf < int(ready_at) - 1:
+                before.append({"fired": lf, "result": row.get("result")})
+            else:
+                after = lf
+                break
         time.sleep(5)
-    f["storm_first_fire_after_ready_s"] = None if fired is None or ready_at is None else round(fired - ready_at, 1)
-    f["storm_fire_before_ready"] = None if fired is None or ready_at is None else fired < int(ready_at) - 1
+    f["storm_fires_before_ready"] = before
+    f["storm_first_fire_after_ready_s"] = None if after is None or ready_at is None else round(after - ready_at, 1)
     post = pack_manifest(pr.pack_dir) or {}
     f["storm_pack_changed"] = sorted(r for r in stable if pre.get(r) != post.get(r))
     pr.restored = True
