@@ -931,6 +931,58 @@ fn a_receiving_lanes_repeated_timeout_is_attributed_with_its_own_reference() {
     assert_eq!(std::fs::read(r.hq.join("bin/a.py")).unwrap(), b"new\n", "never another lane's file");
 }
 
+/// RULINGS IQ3 — the probation restored by IG3 is RETURNABLE: stop after the door operation and before
+/// the row → restart → the lane's check FAILS → the row is 충돌 "실패 — 되돌리기 남음" WITH R's result as
+/// `applied` (before: empty, and T6's `revert_in` refused it — `revertible_here`) → T6's REAL `run_tick`
+/// in this lane takes the owed return: the lane's original bytes come back and the return ends as done
+/// (`되돌려짐 — 데몬(자동)`), not as a closure string that stays owed or is settled as failed.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_restored_probation_is_returned_by_t6s_tick() {
+    use crate::repair::probation::{run_tick, JobEnv};
+    let r = rig("iq3");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    STOP_AFTER_DOOR_OP.with(|c| c.set(true));
+    assert!(tick_with(&r, DEPT, &doubles(), &fid(1), &NoFaults, &|_| false).is_err());
+    assert!(r.row(&id, DEPT).is_none(), "the stop fell before the row");
+    let d = doubles();
+    d.pass.set(false);
+    tick(&r, DEPT, &d, &fid(1));
+    let row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Conflict);
+    assert_eq!(row.applied, ledger::read_record_in(&r.root, &id).unwrap().unwrap().committed, "returnable: what was applied is on the row");
+    assert!(apply::closure_owes_return(row.probation.as_ref().and_then(|p| p.closed.as_deref()).unwrap_or("")));
+    assert!(apply::revertible_here(&ledger::read_record_in(&r.root, &id).unwrap().unwrap(), &row, &lane(DEPT)));
+    // T6's job in THIS lane
+    let check = |_: &str, _: &Path, _: Duration| -> Result<CheckOutcome, RepairError> { Ok(CheckOutcome { result: CheckResult::Pass, ms: 5 }) };
+    let reference = |_: crate::repair::boot_critical::CheckKind, _: Duration| -> Result<CheckOutcome, RepairError> { Ok(CheckOutcome { result: CheckResult::Pass, ms: 100 }) };
+    let hooks = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> { Ok(ReconcileReport { hooks: Vec::new() }) };
+    let registrar = |_: &Path, _: bool| -> Result<String, RepairError> { Ok("{\"hooks\": []}".into()) };
+    let l = lane(DEPT);
+    let lock = r.base.join(".pack-apply.lock");
+    let job = JobEnv {
+        op: OpEnv { root: &r.root, pack: &r.dept, lane: &l, now: T0 + 60.0, form: ApplyForm::Exchange, faults: &NoFaults, own_check: &|_, _| None },
+        incarnation: "inc-iq3",
+        check: &check,
+        reference: &reference,
+        hooks: &hooks,
+        registrar: &registrar,
+        locked: &apply::no_repair_lock,
+        excluded: &|_| false,
+        original: &|_| None,
+        intake: &|_, _| true,
+        apply_lock: &lock,
+    };
+    let rep = run_tick(&job, false).unwrap();
+    assert_eq!(rep.reverted, vec![id.clone()], "{rep:?}");
+    assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"old\n", "the lane's original bytes are back");
+    assert_eq!(std::fs::read(r.hq.join("bin/a.py")).unwrap(), b"new\n", "never another lane's file");
+    let closed = r.row(&id, DEPT).unwrap().probation.and_then(|p| p.closed).unwrap_or_default();
+    assert_eq!(closed, format!("{} — {}", apply::CLOSED_REVERTED, apply::BY_DAEMON_AUTO), "the owed return ended as DONE");
+}
+
 /// IG3: a lane that was at R's result WITHOUT having applied it (no operation of its own) gets no
 /// 24-hour re-check — nothing of its own was replaced — but its check's timing record is kept (a
 /// CLOSED bundle that T6's probation skips and that owes no report).
