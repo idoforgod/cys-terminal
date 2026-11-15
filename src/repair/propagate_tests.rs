@@ -207,7 +207,6 @@ fn committed_in_hq(r: &Rig, id: &RepairId, class: Classification, rel: &str, pre
         merge_lock: None,
         merge_attempt: 0,
         reason: String::new(),
-        hook_ops: Vec::new(),
         updated_at: T0 - 5.0,
     };
     ledger::write_lane_durable_in(&r.root, &row).unwrap();
@@ -2450,11 +2449,17 @@ fn an_interrupted_hook_unit_is_completed_by_recovery_and_its_row_has_a_probation
     assert_eq!(row.state, LaneState::Verified, "{}", row.reason);
     let p = row.probation.unwrap();
     assert!(p.closed.is_none(), "an OPEN probation — the lane applied R itself: {:?}", p.closed);
-    // JD2 (added): the operation the recovery completed is in the row's content
-    assert!(row.hook_ops.iter().any(|h| h.op == op.op && h.lines == vec!["Stop:x.sh".to_string()]), "{:?}", row.hook_ops);
+    // JD2 (added in round 6 as `row.hook_ops` contains the operation) / JI1 (rewritten — the field is gone):
+    // the ONE source, the lane's operation records, shows the operation the recovery completed
+    assert!(shown(&r, &id).contains(&format!("훅 등록 해제(작업 {}: Stop:x.sh)", op.op)), "{:?}", shown(&r, &id));
 }
 
-// ───────────────────────────── RULINGS JD2 — the row's content records the hook operation ─────────────────────────────
+// ───────────────────────────── RULINGS JD2 / JI1 — what a lane's hook unit did, READ from its record ─────────────────────────────
+// Round 6 pinned a row field (`assert_eq!(row.hook_ops, …)` on each path below); RULINGS JI1 removed it — the
+// trace is READ from the lane's write-ahead operation records (`completed_hook_ops_in`). Each test keeps its
+// path and now asserts that the one source shows the operation (and, where the call answers, that the answer
+// names it). Round 6's third door case (a tombstone failure after the unit — `DoorEnd::Conflict` carrying the
+// field) tested code JI1 removed; the record shows that operation like any other.
 
 /// A mixed repair made in HQ: the edit of bin/a.py (old → new) and the un-registration of Stop:x.sh.
 fn edit_and_hook_in_hq(r: &Rig, id: &RepairId) -> RepairRecord {
@@ -2464,59 +2469,67 @@ fn edit_and_hook_in_hq(r: &Rig, id: &RepairId) -> RepairRecord {
     rec
 }
 
-/// The hook operation the default hook double reports.
-fn op_test_hooks() -> Vec<HookOpDone> {
-    vec![HookOpDone { op: "op-test".into(), lines: vec!["Stop:x.sh".into()] }]
+/// The hook operations the one source shows for THIS lane (their sentences).
+fn shown(r: &Rig, id: &RepairId) -> Vec<String> {
+    completed_hook_ops_in(&r.root, id).unwrap().into_iter().filter(|o| o.lane == lane(DEPT)).map(|o| o.text()).collect()
 }
 
-/// THIS lane's completed hook operation for R (its write-ahead record) as the row records it.
-fn own_hook_op(r: &Rig, id: &RepairId) -> HookOpDone {
+/// THIS lane's completed hook operation for R, worded as the one source words it.
+fn own_op_text(r: &Rig, id: &RepairId) -> String {
     let op = r.ops(id).into_iter().find(|o| o.lane_key == lane(DEPT) && o.kind == "hook-unregister" && o.finished).expect("its write-ahead record");
-    HookOpDone { op: op.op, lines: vec!["Stop:x.sh".into()] }
+    format!("훅 등록 해제(작업 {}: Stop:x.sh)", op.op)
 }
 
-/// JD2 (i) — `recheck` whose hook unit completed and whose check PASSES: the 검증됨 row carries the
-/// hook operation in its content (`hook_ops`); its reason is the newer event's sentence (JD1).
-#[test]
-fn a_passing_recheck_keeps_the_hook_operation_in_the_rows_content() {
-    let r = rig("jd2a");
-    let id = rid("R-1");
-    edit_and_hook_in_hq(&r, &id);
+/// The edit-and-hook repair in conflict in DEPT (its own bytes), the merge lock held by seat 5, and T6's
+/// REAL unit as the hook step of the next call.
+fn conflicted_edit_and_hook(tag: &str, id: &RepairId) -> (Rig, Doubles) {
+    let r = rig(tag);
+    edit_and_hook_in_hq(&r, id);
     r.put(DEPT, "bin/a.py", b"mine\n", 0o644);
     tick(&r, DEPT, &doubles(), &fid(1));
-    conflicted_with_lock(&r, &id, b"mine\n");
+    conflicted_with_lock(&r, id, b"mine\n");
     let d = doubles();
-    assert_eq!(recheck(&r, &id, &d, 5, "합침").unwrap(), LaneState::Verified);
-    assert_eq!(d.hook_calls.get(), 1, "the hook unit ran in this call");
+    *d.unit.borrow_mut() = Some(real_unit(&r, Box::new(|| {}), Box::new(|| {}), std::rc::Rc::new(std::cell::RefCell::new(Vec::new()))));
+    (r, d)
+}
+
+/// JD2 (i) / JI1 — `recheck` whose hook unit completed and whose check PASSES: the one source shows the
+/// operation for this lane; the answer names it; the row's reason is the newer event's sentence (JD1).
+#[test]
+fn a_passing_recheck_shows_the_completed_hook_operation() {
+    let id = rid("R-1");
+    let (r, d) = conflicted_edit_and_hook("jd2a", &id);
+    let a = recheck_answer(&r, &id, &d, 5, "합침").unwrap();
+    assert_eq!(a.state, LaneState::Verified);
+    let op = own_op_text(&r, &id);
+    assert_eq!(shown(&r, &id), vec![op.clone()]);
+    assert!(a.changed.ends_with(&format!(", 이 부서의 {op}")), "{}", a.changed);
     let row = r.row(&id, DEPT).unwrap();
-    assert_eq!(row.state, LaneState::Verified);
-    assert_eq!(row.hook_ops, op_test_hooks(), "the row's content records the hook operation");
     assert!(row.reason.starts_with("합친 뒤 이 부서의 살아 있는 파일에서 검사 통과"), "{}", row.reason);
 }
 
-/// JD2 (ii) — the same with the check FAILING: the 충돌 row (published) carries the hook operation.
+/// JD2 (ii) / JI1 — the same with the check FAILING: the one source shows it; the failure's sentence names it.
 #[test]
-fn a_failing_recheck_keeps_the_hook_operation_in_the_rows_content() {
-    let r = rig("jd2b");
+fn a_failing_recheck_shows_the_completed_hook_operation() {
     let id = rid("R-1");
-    edit_and_hook_in_hq(&r, &id);
-    r.put(DEPT, "bin/a.py", b"mine\n", 0o644);
-    tick(&r, DEPT, &doubles(), &fid(1));
-    conflicted_with_lock(&r, &id, b"mine\n");
-    let d = doubles();
+    let (r, d) = conflicted_edit_and_hook("jd2b", &id);
     d.pass.set(false);
-    assert!(matches!(recheck(&r, &id, &d, 5, ""), Err(RepairError::CheckFailed(_))));
-    assert_eq!(d.hook_calls.get(), 1);
+    let m = match recheck_answer(&r, &id, &d, 5, "") {
+        Err(RepairError::CheckFailed(m)) => m,
+        other => panic!("{other:?}"),
+    };
+    let op = own_op_text(&r, &id);
+    assert_eq!(shown(&r, &id), vec![op.clone()]);
+    assert!(m.ends_with(&format!(", 이 부서의 {op}")), "{m}");
     let row = r.row(&id, DEPT).unwrap();
     assert_eq!(row.state, LaneState::Conflict);
-    assert_eq!(row.hook_ops, op_test_hooks(), "the row's content records the hook operation");
     assert!(row.reason.starts_with("합친 뒤의 다시 검사 실패"), "{}", row.reason);
 }
 
-/// JD2 (iii) — the tick's "already there" arm with T6's real unit: the row carries the operation ONCE
-/// (the unit's own, which is also the evidence's — IG3), with its open probation bundle.
+/// JD2 (iii) / JI1 — the tick's "already there" arm with T6's real unit: the one source shows the operation
+/// once; the row is 검증됨 with its open probation bundle (IG3).
 #[test]
-fn the_already_there_arm_keeps_the_hook_operation_in_the_rows_content() {
+fn the_already_there_arm_shows_the_completed_hook_operation() {
     let r = rig("jd2c");
     let id = rid("R-1");
     hook_repair_in_hq(&r, &id);
@@ -2527,60 +2540,64 @@ fn the_already_there_arm_keeps_the_hook_operation_in_the_rows_content() {
     assert_eq!(*calls.borrow(), vec![true, false]);
     let row = r.row(&id, DEPT).unwrap();
     assert_eq!(row.state, LaneState::Verified, "{}", row.reason);
-    assert_eq!(row.hook_ops, vec![own_hook_op(&r, &id)]);
+    assert_eq!(shown(&r, &id), vec![own_op_text(&r, &id)]);
     assert!(row.probation.as_ref().is_some_and(|p| p.closed.is_none()), "the return is owed on this row");
 }
 
-/// JD2 (iv) — the ordinary door path: (1) applied and checked → the 검증됨 row carries the hook
-/// operation with its open probation bundle; (2) the record changed after the completed hook unit →
-/// the 충돌 row published at once (IO1) carries it; (3) this lane's tombstone could not be written
-/// after it → the 충돌 row carries it.
+/// JD2 (iv) / JI1 — the ordinary door path: (1) applied and checked → 검증됨 with its open probation, the
+/// one source shows the operation; (2) the record changed after the completed hook unit → the 충돌 row
+/// published at once (IO1) names it in its reason, and the one source shows it.
 #[test]
-fn the_door_path_keeps_the_hook_operation_in_the_rows_content() {
+fn the_door_path_shows_the_completed_hook_operation() {
     let id = rid("R-1");
-    // (1)
-    let r = rig("jd2d");
-    edit_and_hook_in_hq(&r, &id);
-    r.put(DEPT, "bin/a.py", b"old\n", 0o644);
-    let d = doubles();
-    tick(&r, DEPT, &d, &fid(1));
-    assert_eq!(d.hook_calls.get(), 1);
-    let row = r.row(&id, DEPT).unwrap();
-    assert_eq!(row.state, LaneState::Verified, "{}", row.reason);
-    assert_eq!(row.hook_ops, op_test_hooks());
-    assert!(row.probation.as_ref().is_some_and(|p| p.closed.is_none()));
-    // (2)
-    let r2 = rig("jd2e");
-    edit_and_hook_in_hq(&r2, &id);
-    r2.put(DEPT, "bin/a.py", b"old\n", 0o644);
-    let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let d2 = doubles();
-    *d2.unit.borrow_mut() = Some(real_unit(&r2, Box::new(|| {}), supersede(&r2.root, &id), calls.clone()));
-    tick(&r2, DEPT, &d2, &fid(1));
-    assert_eq!(*calls.borrow(), vec![true, false]);
-    let row2 = r2.row(&id, DEPT).unwrap();
-    assert_eq!(row2.state, LaneState::Conflict);
-    assert!(row2.reason.contains("bin/a.py") && row2.reason.contains("이 부서의 훅 등록을 해제했습니다"), "{}", row2.reason);
-    assert_eq!(row2.hook_ops, vec![own_hook_op(&r2, &id)]);
-    // (3) a deleting target already at its result; the lane's tombstone file cannot be written
-    let r3 = rig("jd2f");
-    let mut rec = edit_and_hook_in_hq(&r3, &id);
-    r3.put(HQ, "bin/b.py", b"gone\n", 0o644);
-    let live = r3.hq.join("bin/b.py");
-    let pre = ledger::copy_preimage_in(&r3.root, &id, &lane(HQ), "bin/b.py", &live, T0 - 10.0).unwrap();
-    std::fs::remove_file(&live).unwrap();
-    rec.files.push(FileChange { rel: "bin/b.py".into(), kind: ChangeKind::Delete, pre, post: TargetState::Absent, diff: None });
-    rec.committed.push(("bin/b.py".into(), TargetState::Absent.canon()));
-    ledger::write_record_in(&r3.root, &rec).unwrap();
-    r3.put(DEPT, "bin/a.py", b"old\n", 0o644);
-    std::fs::create_dir_all(crate::repair::tombstones::path_in(&r3.root, &lane(DEPT))).unwrap();
-    let d3 = doubles();
-    tick(&r3, DEPT, &d3, &fid(1));
-    assert_eq!(d3.hook_calls.get(), 1);
-    let row3 = r3.row(&id, DEPT).unwrap();
-    assert_eq!(row3.state, LaneState::Conflict);
-    assert!(row3.reason.contains("bin/b.py"), "{}", row3.reason);
-    assert_eq!(row3.hook_ops, op_test_hooks());
+    for midway in [false, true] {
+        let r = rig(if midway { "jd2e" } else { "jd2d" });
+        edit_and_hook_in_hq(&r, &id);
+        r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let d = doubles();
+        let during_real: Box<dyn Fn()> = if midway { supersede(&r.root, &id) } else { Box::new(|| {}) };
+        *d.unit.borrow_mut() = Some(real_unit(&r, Box::new(|| {}), during_real, calls.clone()));
+        tick(&r, DEPT, &d, &fid(1));
+        assert_eq!(*calls.borrow(), vec![true, false]);
+        let row = r.row(&id, DEPT).unwrap();
+        let op = own_op_text(&r, &id);
+        assert_eq!(shown(&r, &id), vec![op.clone()]);
+        if midway {
+            assert_eq!(row.state, LaneState::Conflict);
+            assert!(row.reason.contains("bin/a.py") && row.reason.contains("이 부서의 훅 등록을 해제했습니다"), "{}", row.reason);
+        } else {
+            assert_eq!(row.state, LaneState::Verified, "{}", row.reason);
+            assert!(row.probation.as_ref().is_some_and(|p| p.closed.is_none()));
+        }
+    }
+}
+
+/// RULINGS JI (M1) — R in force, this lane's EXISTING 충돌 row with a valid merge lease; the hook unit of a
+/// `recheck` wrote its write-ahead record and the daemon stopped before any trace; T6's recovery completes
+/// it and writes no row; the next tick returns early for the conflict row (the row as it was) — the one
+/// source shows the completed operation for this lane.
+#[test]
+fn a_stop_before_any_trace_on_a_conflict_row_is_shown_after_recovery() {
+    let id = rid("R-1");
+    let (r, _) = conflicted_edit_and_hook("ji-m1", &id);
+    let op = crate::repair::wal::OpRecord {
+        schema: 1, op: crate::repair::wal::new_op_id(T0 - 1.0, "hook-unregister"), repair: id.clone(), lane_key: lane(DEPT),
+        kind: "hook-unregister".into(), form: "hook".into(), rel: String::new(), pre_existed: false,
+        expected: String::new(), incoming: String::new(), pack_generation: Some(apply::pack_generation(&r.dept)), slot: None, slot_identity: None,
+        live_identity: None, incoming_copy: None, incoming_copy_identity: None, step: "recorded".into(),
+        hooks: vec![crate::repair::wal::HookLine { event: "Stop".into(), script: "x.sh".into(), targets: Vec::new() }],
+        finished: false, outcome: None, note: String::new(), created_at: T0 - 1.0, updated_at: T0 - 1.0, notice: None,
+    };
+    crate::repair::wal::write_in(&r.root, &op).unwrap();
+    let before = r.row(&id, DEPT).unwrap();
+    assert!(shown(&r, &id).is_empty(), "not completed yet");
+    let settings = r.base.join("settings.json");
+    let ok = |_: &Path, _: bool| -> Result<String, RepairError> { Ok(registrar_report(&settings, "unregistered")) };
+    assert_eq!(apply::resume_hook_steps_in(&r.root, &r.dept, &lane(DEPT), &ok, &apply::no_repair_lock, T0), 1);
+    tick(&r, DEPT, &doubles(), &fid(1));
+    assert_eq!(r.row(&id, DEPT).unwrap(), before, "the conflict row as it was (the tick returns early for it)");
+    assert_eq!(shown(&r, &id), vec![format!("훅 등록 해제(작업 {}: Stop:x.sh)", op.op)]);
 }
 
 /// JD2 — `recheck`'s answer says what the call changed, in one sentence: the row (검증됨, or 충돌 with
@@ -2597,17 +2614,13 @@ fn recheck_answers_what_the_call_changed() {
     let a = recheck_answer(&r, &id, &doubles(), 5, "").unwrap();
     assert_eq!(a.state, LaneState::Verified);
     assert_eq!(a.changed, "이 호출이 바꾼 것: 이 부서의 행('충돌' → '검증됨', 합친 기록을 남기고 합치기 잠금을 풂)");
-    // an edit and a hook: passing, then failing
+    // an edit and a hook (T6's real unit — JI1: the clause is READ from its operation record): passing, then failing
     for pass in [true, false] {
-        let r = rig(if pass { "jd2h" } else { "jd2i" });
-        edit_and_hook_in_hq(&r, &id);
-        r.put(DEPT, "bin/a.py", b"mine\n", 0o644);
-        tick(&r, DEPT, &doubles(), &fid(1));
-        conflicted_with_lock(&r, &id, b"mine\n");
-        let d = doubles();
+        let (r, d) = conflicted_edit_and_hook(if pass { "jd2h" } else { "jd2i" }, &id);
         d.pass.set(pass);
-        let hook = "이 부서의 훅 등록 해제(작업 op-test: Stop:x.sh)";
-        match recheck_answer(&r, &id, &d, 5, "") {
+        let got = recheck_answer(&r, &id, &d, 5, "");
+        let hook = format!("이 부서의 {}", own_op_text(&r, &id));
+        match got {
             Ok(a) => {
                 assert!(pass);
                 assert_eq!(a.changed, format!("이 호출이 바꾼 것: 이 부서의 행('충돌' → '검증됨', 합친 기록을 남기고 합치기 잠금을 풂), {hook}"));

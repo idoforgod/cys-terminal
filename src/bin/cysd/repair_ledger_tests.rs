@@ -1253,7 +1253,6 @@ fn boot_critical_joins_refused_resolves_accepted() {
         merge_lock: None,
         merge_attempt: 0,
         reason: String::new(),
-        hook_ops: Vec::new(),
         updated_at: T0,
     };
     ledger::write_lane_in(&r.root, &row).unwrap();
@@ -3654,7 +3653,6 @@ fn bj2_joins_checks_every_file_of_the_joined_repair() {
         merge_lock: None,
         merge_attempt: 0,
         reason: String::new(),
-        hook_ops: Vec::new(),
         updated_at: T0,
     };
     ledger::write_lane_in(&r.root, &row).unwrap();

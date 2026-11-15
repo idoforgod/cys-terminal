@@ -2198,10 +2198,24 @@ def _merge_reason_line(v, lane_key):
     return None
 
 
+def _merge_hook_ops_line(v, lane_key):
+    """RULINGS JI1: 그 부서가 이 수리에 대해 **마친** 훅 작업 한 줄 — 데몬이 동작 기록에서 읽은 것(하나의 출처).
+    기록을 읽지 못했으면 그 문장("확인할 수 없습니다")을, 마친 것이 없으면 None."""
+    unreadable = v.get("hook_ops_unreadable")
+    if isinstance(unreadable, str) and unreadable.strip():
+        return "  " + unreadable.strip()
+    texts = [o.get("text") for o in (v.get("hook_ops") or [])
+             if isinstance(o, dict) and lane_key is not None and o.get("lane") == lane_key and isinstance(o.get("text"), str)]
+    if texts:
+        return "  이 부서가 마친 훅 작업: " + " · ".join(texts)
+    return None
+
+
 def _merge_ticket_lines(repair, lane_key=None):
     """E-4-11/12 · AU6 · AR4: 그 부서 워커가 **그대로** 실행할 수리 명령 줄 — `--files`(R 의 파일 대상 전부)와
     `--trigger`(R 자신의 계기)를 늘 싣는다. 일반 경로 = `--joins` + `recheck`(H8), 기동 필수·보호장치 경로 =
-    그 부서의 수리 `--resolves`(R1 / T1 · HJ1). IK2: 그 부서 행의 까닭을 머리 다음 줄에 싣는다."""
+    그 부서의 수리 `--resolves`(R1 / T1 · HJ1). IK2: 그 부서 행의 까닭을 머리 다음 줄에 싣는다. JI1: 그 부서가 마친
+    훅 작업(동작 기록에서 읽은 것)을 그 다음 줄에 싣는다."""
     if not re.fullmatch(_REPAIR_ID, repair or ""):
         return None, "--merge 값이 수리 번호(R-<숫자>)가 아닙니다: %r" % repair
     cys = shutil.which("cys")
@@ -2235,19 +2249,21 @@ def _merge_ticket_lines(repair, lane_key=None):
     fl = " ".join(shlex.quote(x) for x in files)
     targets = " ".join((["--files " + fl] if files else []) + ["--unregister-hook " + shlex.quote(h) for h in hooks])
     reason = _merge_reason_line(v, lane_key)
+    hook_ops = _merge_hook_ops_line(v, lane_key)
+    head_extra = [x for x in (reason, hook_ops) if x]
     if v.get("classification") in ("boot_critical", "protection_related"):
         if not files:
             return None, "%s 의 파일 대상을 읽지 못했습니다" % repair
         return [
             "병합 티켓 — %s(기동 필수·보호장치): 이 부서의 수리로 맞춘다(합치기 모드는 이 경로에 없다 · RULINGS R1/T1)" % repair,
-        ] + ([reason] if reason else []) + [
+        ] + head_extra + [
             "  1) cys repair begin --files %s --trigger %s --resolves %s" % (fl, trigger, repair),
             "  2) 작업 사본에 후보를 만든 뒤: cys repair record <새 수리 번호> --note \"<무엇을 맞췄는지>\"",
             "  3) 리뷰어1·리뷰어2 서명 뒤: cys repair submit <새 수리 번호>  (주인의 최종 승인은 이 부서의 승인 탭)",
         ], None
     return [
         "병합 티켓 — %s: 이 부서의 충돌을 이 부서 워커가 합친다(H8)" % repair,
-    ] + ([reason] if reason else []) + [
+    ] + head_extra + [
         "  1) cys repair begin %s --joins %s --trigger %s" % (targets, repair, trigger),
         "  2) 이 부서의 살아 있는 파일에 %s 의 바꿈을 합친다(바꾸거나, 지금 내용이 맞으면 그대로 둔다)" % repair,
         "  3) cys repair recheck %s" % repair,
