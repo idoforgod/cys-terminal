@@ -520,6 +520,7 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
                 merge_base: Vec::new(),
                 merge_lock: None,
                 merge_attempt: 0,
+                reason: String::new(),
                 updated_at: env.op.now,
             };
             let rootb = root.to_path_buf();

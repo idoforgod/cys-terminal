@@ -286,6 +286,17 @@ fn run_job(daemon: &Arc<Daemon>, force_sweep: bool) {
                     r.catchup_completed
                 );
             }
+            // RULINGS IK2: each row's reason and the lines of a skipped pass — bounded, one line per
+            // row per tick (a row this tick did not decide or leave prints nothing)
+            for (id, state, why) in &r.rows {
+                eprintln!("[cysd] repair propagation: {} → {} — {why}", id.as_str(), state.label_ko());
+            }
+            for (id, why) in &r.left {
+                eprintln!("[cysd] repair propagation: {} 그대로 — {why}", id.as_str());
+            }
+            for line in &r.lines {
+                eprintln!("[cysd] repair propagation: {line}");
+            }
         }
         Err(e) => eprintln!("[cysd] repair propagation: 이 부서의 전파는 이번 차례에 멈췄습니다 — {e:?}"),
     }

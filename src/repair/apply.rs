@@ -3078,6 +3078,7 @@ fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &Repair
                     merge_base: previous.as_ref().map(|p| p.merge_base.clone()).unwrap_or_default(),
                     merge_lock: previous.as_ref().and_then(|p| p.merge_lock.clone()),
                     merge_attempt: previous.as_ref().map(|p| p.merge_attempt).unwrap_or(0),
+                    reason: String::new(),
                     updated_at: now,
                 },
             )?;
@@ -3570,6 +3571,7 @@ pub fn apply_candidate_in(
             merge_base: Vec::new(),
             merge_lock: None,
             merge_attempt: 0,
+            reason: String::new(),
             updated_at: now,
         };
         ledger::write_lane_durable_in(&root, &row)?;
@@ -3800,6 +3802,7 @@ fn mark_incomplete_apply(
             merge_base: Vec::new(),
             merge_lock: None,
             merge_attempt: 0,
+            reason: String::new(),
             updated_at: now,
         };
         ledger::write_lane_durable_in(&root, &row)?;

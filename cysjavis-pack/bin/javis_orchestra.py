@@ -2188,10 +2188,20 @@ def _owner_token_line(token, path):
 _TRIGGER_CLI = {"owner_order": "owner-order", "grant": "grant", "update": "update"}
 
 
-def _merge_ticket_lines(repair):
+def _merge_reason_line(v, lane_key):
+    """RULINGS IK2: 그 부서 행에 남은 까닭 한 줄(없으면 None) — 워커가 바이트가 오지 않았는지·검사가 실패했는지를 안다."""
+    for row in (v.get("lane_rows") or []):
+        if isinstance(row, dict) and lane_key is not None and row.get("lane") == lane_key:
+            reason = row.get("reason")
+            if isinstance(reason, str) and reason.strip():
+                return "  까닭(이 부서의 행 · %s): %s" % (row.get("state_label") or row.get("state") or "?", reason.strip())
+    return None
+
+
+def _merge_ticket_lines(repair, lane_key=None):
     """E-4-11/12 · AU6 · AR4: 그 부서 워커가 **그대로** 실행할 수리 명령 줄 — `--files`(R 의 파일 대상 전부)와
     `--trigger`(R 자신의 계기)를 늘 싣는다. 일반 경로 = `--joins` + `recheck`(H8), 기동 필수·보호장치 경로 =
-    그 부서의 수리 `--resolves`(R1 / T1 · HJ1)."""
+    그 부서의 수리 `--resolves`(R1 / T1 · HJ1). IK2: 그 부서 행의 까닭을 머리 다음 줄에 싣는다."""
     if not re.fullmatch(_REPAIR_ID, repair or ""):
         return None, "--merge 값이 수리 번호(R-<숫자>)가 아닙니다: %r" % repair
     cys = shutil.which("cys")
@@ -2212,15 +2222,18 @@ def _merge_ticket_lines(repair):
         return None, "%s 의 계기나 파일 대상을 읽지 못했습니다" % repair
     import shlex
     fl = " ".join(shlex.quote(x) for x in files)
+    reason = _merge_reason_line(v, lane_key)
     if v.get("classification") in ("boot_critical", "protection_related"):
         return [
             "병합 티켓 — %s(기동 필수·보호장치): 이 부서의 수리로 맞춘다(합치기 모드는 이 경로에 없다 · RULINGS R1/T1)" % repair,
+        ] + ([reason] if reason else []) + [
             "  1) cys repair begin --files %s --trigger %s --resolves %s" % (fl, trigger, repair),
             "  2) 작업 사본에 후보를 만든 뒤: cys repair record <새 수리 번호> --note \"<무엇을 맞췄는지>\"",
             "  3) 리뷰어1·리뷰어2 서명 뒤: cys repair submit <새 수리 번호>  (주인의 최종 승인은 이 부서의 승인 탭)",
         ], None
     return [
         "병합 티켓 — %s: 이 부서의 충돌을 이 부서 워커가 합친다(H8)" % repair,
+    ] + ([reason] if reason else []) + [
         "  1) cys repair begin --files %s --joins %s --trigger %s" % (fl, repair, trigger),
         "  2) 이 부서의 살아 있는 파일에 %s 의 바꿈을 합친다(바꾸거나, 지금 내용이 맞으면 그대로 둔다)" % repair,
         "  3) cys repair recheck %s" % repair,
@@ -2243,13 +2256,14 @@ def _ticket_gate(prefix, args, lane_token):
             print("[%s] %s — 티켓 미출력" % (prefix, why), file=sys.stderr)
             return 2, []
         extra.append(line)
+    key, key_why = _gate_lane_key(lane_token)
     if merge:
-        lines, why = _merge_ticket_lines(merge)
+        lines, why = _merge_ticket_lines(merge, key)
         if lines is None:
             print("[%s] %s — 티켓 미출력" % (prefix, why), file=sys.stderr)
             return 2, []
         extra.extend(lines)
-    key, why = _gate_lane_key(lane_token)
+    why = key_why
     if key is None:
         verdict, reply, why = "unknown", None, why
     else:
