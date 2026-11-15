@@ -4195,8 +4195,9 @@ def _tick_settled(pr, limit_s=180):
 
 def probe_s3_repair_flow(pr):
     """G16.product (the revert half), G15 (no false revert), I-AUTOOFF and R-T0-TS through the product's verbs from
-    seats: per repair begin, the live edit, record, submit, reviewer1's attest-verify, commit. Only once commit applies
-    a repair (T5b in the tree) do the legs after it run - repair 1 (the CG file): a restart storm in probation, the
+    seats: per repair begin, the live edit, record, reviewer1's attest-verify, commit (a general file: no approval
+    channel). Only once commit applies a repair (T5b in the tree) do the legs after it run - repair 1 (the CG file):
+    a restart storm in probation, the
     revert with the target held; repair 2 (another unedited general file): a failing re-check (automatic return OFF on
     Windows), a reparse point at the target. A new daemon incarnation makes T6's probation re-check due at once (C7 7.2),
     so each re-check follows a restart; the seats die with the daemon and are made again. At d00f4075 commit stops at
@@ -4229,7 +4230,8 @@ def probe_s3_repair_flow(pr):
         return all(state["seats"].values())
 
     def commit_one(n, rel):
-        """begin -> live edit -> record -> submit -> attest-verify -> commit for one file. -> (rid, live, pre, edited)."""
+        """begin -> live edit -> record -> attest-verify -> commit for one GENERAL file (no `submit`: that is the owner's
+        approval channel for boot-critical / protection files - T5b). -> (rid, live, pre, edited)."""
         px = "" if n == "1" else "r2_"
         live = os.path.join(pr.pack_dir, *rel.split("/"))
         pre = read_bytes(live) or b""
@@ -4246,7 +4248,6 @@ def probe_s3_repair_flow(pr):
         f["flow_%sedited_sha" % px] = sha256_bytes(edited)
         steps = []
         for name, role, args in ((px + "record", "worker", ["repair", "record", rid, "--note", "tw1 flow", "--json"]),
-                                 (px + "submit", "worker", ["repair", "submit", rid, "--json"]),
                                  (px + "attest", "reviewer-codex", ["repair", "attest-verify", rid, "--verdict", "pass", "--note", "tw1"]),
                                  (px + "commit", "worker", ["repair", "commit", rid, "--json"])):
             steps.append(name)
