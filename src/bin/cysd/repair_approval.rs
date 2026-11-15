@@ -166,13 +166,16 @@ pub(crate) trait Effects: Send + Sync {
         nonce: &str,
         reason: &str,
     ) -> std::io::Result<std::process::Child>;
-    /// The apply of an approved candidate (T6 — `apply::apply_candidate`).
+    /// The apply of an approved candidate (T6 — `apply::apply_candidate`). RULINGS KX2: `still_valid`
+    /// is the request's lifetime, asked by the apply inside the pack-apply lock right before its first
+    /// durable intent (a clock read at that moment).
     fn apply(
         &self,
         id: &RepairId,
         lane: &LaneKey,
         files: &[cys::repair::apply::CandidateFile],
-    ) -> Result<cys::repair::apply::ApplyOutcome, RepairError>;
+        still_valid: &cys::repair::apply::LifetimeFn<'_>,
+    ) -> Result<cys::repair::apply::Bounded<cys::repair::apply::ApplyOutcome>, RepairError>;
     /// Step 3: the rehearsal re-run and the protection screen (`Err` = returned to the worker).
     fn step3(&self, s3: &Step3Input) -> Result<Step3Ok, Step3Err>;
     /// Files one intake row (a lane finding of the screen, a comparison's finding) — the ledger's
@@ -297,6 +300,11 @@ thread_local! {
     /// `submit` — a reader made slow by a test double (no real time).
     pub(crate) static BEFORE_CANDIDATE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    /// Test seam of RULINGS KX2: when set, THIS thread's consumption clock in `finish_verification`
+    /// reads this shared value (seconds, `f64` bits) instead of the context's time — another thread of
+    /// the test (the holder of the pack-apply lock) moves it while the apply waits.
+    pub(crate) static CONSUMPTION_CLOCK_FOR_TEST: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicU64>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn write(ctx: &Ctx<'_>, rec: &RepairRecord) -> Result<(), VerbError> {
@@ -1498,7 +1506,13 @@ pub(crate) fn finish_verification(
     // the clock of this consumption: the context's "now" advanced by the monotonic time spent here
     // (the apply's own expiry check below reads it again — I3 "again at apply")
     let started = std::time::Instant::now();
-    let now = |ctx: &Ctx<'_>| ctx.now + started.elapsed().as_secs_f64();
+    let now = |ctx: &Ctx<'_>| {
+        #[cfg(test)]
+        if let Some(t) = CONSUMPTION_CLOCK_FOR_TEST.with(|c| c.borrow().clone()) {
+            return f64::from_bits(t.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        ctx.now + started.elapsed().as_secs_f64()
+    };
     let repair = {
         let tbl = table.lock().unwrap_or_else(|e| e.into_inner());
         match tbl.find(rid) {
@@ -1647,8 +1661,23 @@ pub(crate) fn finish_verification(
             },
         })
         .collect();
-    match eff.apply(&id, &ctx.lane, &files) {
-        Ok(cys::repair::apply::ApplyOutcome::Applied) => settle_owned(
+    // RULINGS KX2: the apply asks the request's lifetime again INSIDE the pack-apply lock, right before
+    // its first durable intent, with this clock read at that moment (the same side as the check
+    // above: at or past `expires_at` is over) — the wait for the lock can outlast the request
+    let still_valid = || now(ctx) < req.expires_at;
+    match eff.apply(&id, &ctx.lane, &files, &still_valid) {
+        // over when asked: nothing was written — the request ends exactly as the check above ends it
+        Ok(cys::repair::apply::Bounded::Expired) => settle_owned(
+            ctx,
+            table,
+            eff,
+            &req,
+            ReqState::Expired,
+            "적용 잠금을 기다리는 사이에 30분이 지났습니다 — 적용하지 않았습니다".into(),
+            RepairState::AwaitingApproval,
+            RecApproval::Clear,
+        ),
+        Ok(cys::repair::apply::Bounded::Ran(cys::repair::apply::ApplyOutcome::Applied)) => settle_owned(
             ctx,
             table,
             eff,
@@ -1660,8 +1689,8 @@ pub(crate) fn finish_verification(
         ),
         // AY5: a declined apply — in the origin the approval is void and the repair returns to
         // `진행 중`; the table says so (DE4)
-        Ok(cys::repair::apply::ApplyOutcome::Declined(why))
-        | Ok(cys::repair::apply::ApplyOutcome::Superseded(why)) => settle_owned(
+        Ok(cys::repair::apply::Bounded::Ran(cys::repair::apply::ApplyOutcome::Declined(why)))
+        | Ok(cys::repair::apply::Bounded::Ran(cys::repair::apply::ApplyOutcome::Superseded(why))) => settle_owned(
             ctx,
             table,
             eff,
@@ -2030,8 +2059,9 @@ impl Effects for DaemonEffects {
         id: &RepairId,
         lane: &LaneKey,
         files: &[cys::repair::apply::CandidateFile],
-    ) -> Result<cys::repair::apply::ApplyOutcome, RepairError> {
-        cys::repair::apply::apply_candidate(id, lane, files)
+        still_valid: &cys::repair::apply::LifetimeFn<'_>,
+    ) -> Result<cys::repair::apply::Bounded<cys::repair::apply::ApplyOutcome>, RepairError> {
+        cys::repair::apply::apply_candidate(id, lane, files, still_valid)
     }
 
     fn step3(&self, s3: &Step3Input) -> Result<Step3Ok, Step3Err> {
