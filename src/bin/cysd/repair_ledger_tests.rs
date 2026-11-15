@@ -3722,11 +3722,15 @@ fn bj3_folded_spellings_of_protected_names_refused() {
                 json!({"trigger": "owner_order", "files": [rel]}),
             )
             .unwrap_err();
-        // T4: refused by the rule-document branch (no owner token), naming the real file (BJ3)
+        // T4: refused by the rule-document branch (no owner token), naming the real file (BJ3).
+        // WW1 (RULINGS JV1): an EXISTING file's alias enters the engine under the file system's name,
+        // so the branch already sees the real name and names it. Old expectation (before JV1):
+        // `e.message.contains(&format!("(= {real})"))` — the typed alias beside the real name.
         assert_eq!(e.code, "repair_precondition", "{rel}");
         assert!(e.message.contains("주인 지시 표"), "{rel}: {}", e.message);
+        let on_disk = cys::repair::intake::on_disk_rel(&r.pack, rel);
         assert!(
-            e.message.contains(&format!("(= {real})")),
+            e.message.contains(&format!("(= {real})")) || (on_disk != rel && e.message.contains(&on_disk)),
             "{rel}: {}",
             e.message
         );
@@ -4080,7 +4084,16 @@ fn da4_one_open_repair_per_file_not_per_spelling() {
             json!({"trigger": "owner_order", "files": ["notes/ITEM.txt"]}),
         )
         .unwrap_err();
-    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    // WW1 (RULINGS JV1): on a volume that does not distinguish case the alias enters as `notes/item.txt`
+    // — the same target set as the open repair — so it is refused at the pick-up (the open repair holds a
+    // live lock), naming that repair. Old expectation (before JV1): `e.code == "repair_precondition"` (the
+    // open-overlap refusal), with the message naming `a`. Still one open repair per FILE.
+    let expected = if cys::repair::intake::on_disk_rel(&r.pack, "notes/ITEM.txt") == "notes/item.txt" {
+        "repair_locked"
+    } else {
+        "repair_precondition"
+    };
+    assert_eq!(e.code, expected, "{}", e.message);
     assert!(e.message.contains(&a), "{}", e.message);
     // a file that does not exist yet: the folded name decides
     let a2 = r
@@ -4858,4 +4871,47 @@ fn ww1_kh2_a_report_and_a_repair_of_the_same_file_meet() {
         .call(T0, &w, "begin", json!({"trigger": "owner_order", "files": ["bin/a.py"]}))
         .unwrap();
     assert_eq!(begun2["intake_signatures"], json!([rep.signature]), "an alias row meets the repair of its file");
+}
+
+/// WW1 (RULINGS KM2): what the `report` map itself does — the verb's answer and the stored intake row
+/// carry `bin/a.py` for `report --file BIN/A.py` (this fails when only the report map is removed); and
+/// the automatic rows meet their repair through the commit in both directions: an alias row with a
+/// repair begun under the real name, and a real-name row with a repair begun under the alias.
+#[test]
+fn ww1_km2_the_report_map_and_both_directions_of_the_join() {
+    let r = rig("ww1km2");
+    if !ww1_case_blind_volume(&r.pack) {
+        eprintln!("SKIPPED ww1_km2_…: the temporary volume distinguishes letter case");
+        return;
+    }
+    let w = seat(3, "worker");
+    let a = r.call(T0, &w, "report", json!({"file": "BIN/A.py", "error": "ValueError: bad"})).unwrap();
+    let (rows, _) = cys::repair::intake::load_all_in(&r.root);
+    assert_eq!(
+        (a["rel"].clone(), rows.iter().map(|d| d.rel.as_str()).collect::<Vec<_>>()),
+        (json!("bin/a.py"), vec!["bin/a.py"]),
+        "the report's answer and its stored row carry the file system's name"
+    );
+    // the automatic rows (written straight through the intake writer, as the detector does), both ways
+    let commit_open = |row_rel: &str, begin_rel: &str, tag: &str| -> (Value, Value) {
+        let r = rig(tag);
+        let rep = cys::repair::intake::parse_report(row_rel, "KeyError: 'k'").unwrap();
+        cys::repair::intake::record_in(&r.root, &r.lane, &rep, "detector", T0, 0, false, "KeyError: 'k'").unwrap();
+        let id = r.call(T0, &w, "begin", json!({"trigger": "owner_order", "files": [begin_rel]})).unwrap()["repair"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::fs::write(r.pack.join("bin/a.py"), b"print('fixed')\n").unwrap();
+        r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "fix"})).unwrap();
+        r.call(T0 + 2.0, &seat(7, "reviewer-codex"), "attest_verify", json!({"repair": id, "verdict": "pass", "note": "ok"}))
+            .unwrap();
+        r.call(T0 + 3.0, &w, "commit", json!({"repair": id})).unwrap();
+        let l = r.call(T0 + 4.0, &human(), "list", json!({})).unwrap();
+        let row = l["defects"].as_array().unwrap().iter().find(|d| d["signature"] == json!(rep.signature)).cloned().unwrap();
+        (row["joined"].clone(), row["open"].clone())
+    };
+    let alias_row = commit_open("BIN/A.py", "bin/a.py", "ww1km2a");
+    let real_row = commit_open("bin/a.py", "BIN/A.py", "ww1km2b");
+    assert_eq!(alias_row, (json!("R-1"), json!(false)), "an alias row meets a repair begun under the real name");
+    assert_eq!(real_row, (json!("R-1"), json!(false)), "a real-name row meets a repair begun under the alias");
 }
