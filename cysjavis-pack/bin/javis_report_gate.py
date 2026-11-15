@@ -1944,9 +1944,9 @@ OPEN_DEFECT_RETRY_MAX = 2
 
 
 def _parse_open_defect_state(raw):
-    """RULINGS JT1 / JZ1 — (key, attempts, delivered, invalid) from the bytes of `open_defects.json`. `invalid` names why
-    the bytes are not a state of this gate (the other three are then None, None, False). `attempts` None with a key =
-    the form written before JT1 (a key without a count — that key was done)."""
+    """RULINGS JT1 / JZ1 / KX1 — (key, attempts, delivered, invalid) from the bytes of a summary line's state file.
+    `invalid` names why the bytes are not a state of this gate (the other three are then None, None, False). `attempts`
+    None with a key = the form written before JT1 (a key without a count — that key was done)."""
     try:
         doc = json.loads(raw.decode("utf-8"))
     except Exception as e:                                 # noqa: BLE001 — RULINGS KD1: ANY failure to parse = invalid
@@ -2011,6 +2011,8 @@ def open_defect_wake(sigs):
 #   대기 집합이 **바뀔 때만** 간다(멱등 키 = 대기 수리 번호 집합의 지문 · 마지막 배달 키는 게이트 상태
 #   `repair_approvals.json`), 0건이 되면 기억을 지운다, `cys` 부재·구형·실패·시간 초과 = 아무것도 보내지 않고 기억도
 #   그대로, shadow = 배달 0. 장부는 `cys repair list --json`(데몬 읽기 · CYS_NO_AUTOSTART=1 · 시간 상한)으로만 읽는다.
+#   ★RULINGS KX1: the enqueue accounting is the open-defect line's (one routine, `Gate._summary_line`) — attempt recorded
+#   before the send and never taken back, 1 + OPEN_DEFECT_RETRY_MAX per set, unknown is not absent — with this file.
 APPROVAL_TASK = "repair-approval-waiting"
 APPROVAL_STATE_FILE = "repair_approvals.json"
 
@@ -2294,104 +2296,83 @@ class Gate:
                         return 0
                 except Exception:                          # noqa: BLE001 — 상태를 읽지 못함 = 오늘 그대로
                     pass
-            state_path = os.path.join(self.state_dir, OPEN_DEFECT_STATE_FILE)
-            #   ★RULINGS JZ1: only "does not exist" is "no previous key"; any other read failure = the budget is
-            #     unknown → no line in this run and the file is not touched (the next run reads again).
-            try:
-                with open(state_path, "rb") as f:
-                    raw = f.read()
-            except FileNotFoundError:
-                raw = None
-            except OSError:
-                return 0
-            last, attempts, delivered, invalid = (None, None, False, None) if raw is None \
-                else _parse_open_defect_state(raw)
-            wake = open_defect_wake(sigs)
-            if wake is None:
-                if last is not None or invalid is not None:   # 0건 — 다음에 열리는 집합은 변화다
-                    _write_json_atomic(state_path, {"key": None, "count": 0, "at": self.now_epoch_fn()})
-                return 0
-            body, idem = wake
-            budget = 1 + OPEN_DEFECT_RETRY_MAX
-            if invalid is not None:
-                #   ★RULINGS JZ1: read, but not a state — not transient (every write here is atomic): the CURRENT set is
-                #     given up (no line for it, never a restarted count); a later changed set gets its own budget.
-                try:
-                    _write_json_atomic(state_path, {"key": idem, "count": len(sigs), "at": self.now_epoch_fn(),
-                                                    "attempts": budget, "budget": budget, "delivered": False,
-                                                    "gave_up": "the state file held no valid state (%s)" % invalid})
-                except (OSError, TypeError, ValueError):
-                    pass
-                return 0
-            if idem == last:
-                #   The same open set: silent once the queue took it cleanly, once its budget is used, and for a state
-                #   written before the count existed (a key without `attempts` — that key was done).
-                if delivered or attempts is None or attempts >= budget:
-                    return 0
-                attempt = attempts + 1
-            else:
-                attempt = 1                                # a changed set is a new key with a new budget (AD5)
-            #   ★RULINGS AK6 + JT1: the attempt is recorded BEFORE it is made — a state file that cannot be written means
-            #     no line at all — and it is never taken back, whatever the enqueue answers (this adds no lock).
-            rec = {"key": idem, "count": len(sigs), "at": self.now_epoch_fn(),
-                   "attempts": attempt, "budget": budget, "delivered": False}
-            try:
-                _write_json_atomic(state_path, rec)
-            except (OSError, TypeError, ValueError):
-                return 0
-            rc, _wid = self._enqueue("master", OPEN_DEFECT_TASK, body, idem, SEV_INFO)
-            if rc != 0:
-                return 0                                   # the attempt stays counted; a later run retries only within the budget
-            rec["delivered"] = True
-            try:
-                _write_json_atomic(state_path, rec)
-            except (OSError, TypeError, ValueError):
-                pass                                       # unrecorded: a later run may enqueue again, still within the budget
-            self.runner.drain("master")
-            return 1
+            #   ★RULINGS KX1: the accounting is the ONE shared routine below (the approval-waiting line uses it too).
+            return self._summary_line(OPEN_DEFECT_STATE_FILE, OPEN_DEFECT_TASK, open_defect_wake(sigs), len(sigs))
         except Exception:                                  # noqa: BLE001 — 부가 줄은 게이트를 멈추지 않는다
             return 0
+
+    def _summary_line(self, state_file, task, wake, count):
+        """★RULINGS JT1 / JZ1 / KD1 / KX1 — the ONE accounting of a summary line to the master. The open-defect line and
+        the approval-waiting line hand it their own state file, task, wake ((body, key), or None for an empty set) and
+        count; each line has its own state file and its own budget of 1 + OPEN_DEFECT_RETRY_MAX enqueues per key.
+        Returns the lines enqueued (0 or 1); an exception goes to the caller's fail-open handler."""
+        state_path = os.path.join(self.state_dir, state_file)
+        #   ★RULINGS JZ1: only "does not exist" is "no previous key"; any other read failure = the budget is
+        #     unknown → no line in this run and the file is not touched (the next run reads again).
+        try:
+            with open(state_path, "rb") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            raw = None
+        except OSError:
+            return 0
+        last, attempts, delivered, invalid = (None, None, False, None) if raw is None \
+            else _parse_open_defect_state(raw)
+        if wake is None:
+            if last is not None or invalid is not None:   # 0건 — 다음에 열리는 집합은 변화다
+                _write_json_atomic(state_path, {"key": None, "count": 0, "at": self.now_epoch_fn()})
+            return 0
+        body, idem = wake
+        budget = 1 + OPEN_DEFECT_RETRY_MAX
+        if invalid is not None:
+            #   ★RULINGS JZ1: read, but not a state — not transient (every write here is atomic): the CURRENT set is
+            #     given up (no line for it, never a restarted count); a later changed set gets its own budget.
+            try:
+                _write_json_atomic(state_path, {"key": idem, "count": count, "at": self.now_epoch_fn(),
+                                                "attempts": budget, "budget": budget, "delivered": False,
+                                                "gave_up": "the state file held no valid state (%s)" % invalid})
+            except (OSError, TypeError, ValueError):
+                pass
+            return 0
+        if idem == last:
+            #   The same set: silent once the queue took it cleanly, once its budget is used, and for a state
+            #   written before the count existed (a key without `attempts` — that key was done).
+            if delivered or attempts is None or attempts >= budget:
+                return 0
+            attempt = attempts + 1
+        else:
+            attempt = 1                                    # a changed set is a new key with a new budget (AD5)
+        #   ★RULINGS AK6 + JT1: the attempt is recorded BEFORE it is made — a state file that cannot be written means
+        #     no line at all — and it is never taken back, whatever the enqueue answers (this adds no lock).
+        rec = {"key": idem, "count": count, "at": self.now_epoch_fn(),
+               "attempts": attempt, "budget": budget, "delivered": False}
+        try:
+            _write_json_atomic(state_path, rec)
+        except (OSError, TypeError, ValueError):
+            return 0
+        rc, _wid = self._enqueue("master", task, body, idem, SEV_INFO)
+        if rc != 0:
+            return 0                                       # the attempt stays counted; a later run retries only within the budget
+        rec["delivered"] = True
+        try:
+            _write_json_atomic(state_path, rec)
+        except (OSError, TypeError, ValueError):
+            pass                                           # unrecorded: a later run may enqueue again, still within the budget
+        self.runner.drain("master")
+        return 1
 
     def _approval_line(self, shadow):
         """「스스로 해결」(T5b) — 이 부서의 '승인 대기' 집합이 **지난 배달 뒤 바뀌었을 때만** master 에게 한 줄(주인님께
         승인 탭을 열어 달라고 한 번 알리라는 안내). 판정·대장·카운터에는 손대지 않고, 어떤 실패도 게이트를 멈추지 않는다.
-        반환 = 넣은 줄 수."""
+        반환 = 넣은 줄 수. ★RULINGS KX1: 넣기는 열린 결함 줄과 **같은 루틴**(`_summary_line`)이 센다 — 시도는 넣기 전에
+        기록되고 거둬들이지 않으며, 한 집합은 많아야 1 + OPEN_DEFECT_RETRY_MAX 번(상태 파일·예산은 이 줄의 것)."""
         if shadow or self.approval_source is None:
             return 0
         try:
             ok, lane, ids = self.approval_source()
             if not ok:
                 return 0
-            state_path = os.path.join(self.state_dir, APPROVAL_STATE_FILE)
-            last = None
-            try:
-                with open(state_path, encoding="utf-8") as f:
-                    doc = json.load(f)
-                if isinstance(doc, dict) and isinstance(doc.get("key"), str):
-                    last = doc["key"]
-            except (OSError, ValueError):
-                last = None
-            wake = approval_wake(lane, ids)
-            if wake is None:
-                if last is not None:
-                    _write_json_atomic(state_path, {"key": None, "count": 0, "at": self.now_epoch_fn()})
-                return 0
-            body, idem = wake
-            if idem == last:
-                return 0
-            try:
-                _write_json_atomic(state_path, {"key": idem, "count": len(ids), "at": self.now_epoch_fn()})
-            except (OSError, TypeError, ValueError):
-                return 0
-            rc, _wid = self._enqueue("master", APPROVAL_TASK, body, idem, SEV_INFO)
-            if rc != 0:
-                try:
-                    _write_json_atomic(state_path, {"key": last, "count": None, "at": self.now_epoch_fn()})
-                except (OSError, TypeError, ValueError):
-                    pass
-                return 0
-            self.runner.drain("master")
-            return 1
+            return self._summary_line(APPROVAL_STATE_FILE, APPROVAL_TASK, approval_wake(lane, ids), len(ids))
         except Exception:                                  # noqa: BLE001 — 부가 줄은 게이트를 멈추지 않는다
             return 0
 
