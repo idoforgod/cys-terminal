@@ -2039,3 +2039,67 @@ fn the_approved_holder_is_hashed_within_the_one_limit() {
     drop(release);
     assert_eq!(got, None, "a FIFO holder: no hash, at once");
 }
+
+/// RULINGS HH5 + HI3 (written by T7b under the seam): T6's tick reads and writes the job state
+/// through the ONE three-valued reader (`propagate::read_job_state_checked`, GK5's bounded reader).
+/// An UNREADABLE state is left as it is: its bytes after the tick equal those before (a fresh state
+/// written over it — the old `unwrap_or(fresh)` — would clear the recorded catch-up, and an OPEN gate
+/// would turn HELD, against I7 / O5); while unreadable the gate answers HELD with that cause; readable
+/// again, the recorded catch-up is there and the gate is OPEN. A FIFO in its place is refused at once
+/// (the old plain read waited for a writer for ever) and stays; a malformed state stays too (the
+/// pack-instance pass alone decides what it means — O5).
+#[cfg(unix)]
+#[test]
+fn an_unreadable_job_state_is_left_byte_identical_by_the_tick() {
+    use crate::repair::ledger::{GateVerdict, HoldCause};
+    use crate::repair::propagate::{gate_verdict_in, job_state_path_in};
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    let r = rig("hh5");
+    committed_general(&r, &rid("R-1"), "hooks/a.sh", Some(b"A0\n"), Some(b"A1\n"));
+    let id = "ab".repeat(32);
+    std::fs::write(r.pack.join(".repair-pack-id"), format!("{id}\n")).unwrap();
+    let st = JobState {
+        schema: 1,
+        lane: r.lane.clone(),
+        last_incarnation: "inc-1".into(),
+        last_probation_check: NOW - 1.0,
+        last_sweep: NOW - 1.0,
+        initial_catchup_complete: true,
+        pack_instance: Some(id),
+        pack_dir: Some(r.pack.clone()),
+        pack_dir_identity: None,
+        pack_generation: None,
+    };
+    let p = job_state_path_in(&r.root, &r.lane);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    crate::repair::durable::write_json_durable(&p, &st).unwrap();
+    assert_eq!(gate_verdict_in(&r.root, &r.lane), GateVerdict::Open, "the recorded catch-up");
+    let before = std::fs::read(&p).unwrap();
+    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    let tick = || run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    // (1) a read error (mode 000)
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&p).is_err() {
+        assert!(matches!(gate_verdict_in(&r.root, &r.lane), GateVerdict::Held(HoldCause::StateUnreadable(_))), "HELD with that cause");
+        tick();
+        assert!(matches!(gate_verdict_in(&r.root, &r.lane), GateVerdict::Held(HoldCause::StateUnreadable(_))));
+    } // else: a privilege that ignores the mode — the read error cannot be built here; (2) and (3) still run
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(std::fs::read(&p).unwrap(), before, "the tick wrote nothing over the unreadable state");
+    assert_eq!(gate_verdict_in(&r.root, &r.lane), GateVerdict::Open, "readable again: the recorded catch-up");
+    // (2) a FIFO in its place: refused at once, left in place
+    std::fs::rename(&p, r.base.join("kept.job.json")).unwrap();
+    let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    tick();
+    assert!(std::fs::symlink_metadata(&p).unwrap().file_type().is_fifo(), "the FIFO was not replaced");
+    assert!(matches!(gate_verdict_in(&r.root, &r.lane), GateVerdict::Held(HoldCause::StateUnreadable(_))));
+    std::fs::remove_file(&p).unwrap();
+    std::fs::rename(r.base.join("kept.job.json"), &p).unwrap();
+    assert_eq!(gate_verdict_in(&r.root, &r.lane), GateVerdict::Open);
+    // (3) malformed bytes: left as they are
+    std::fs::write(&p, b"{ not json").unwrap();
+    tick();
+    assert_eq!(std::fs::read(&p).unwrap(), b"{ not json");
+}

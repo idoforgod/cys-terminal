@@ -579,7 +579,9 @@ fn print_ok(out: &mut dyn Write, verb: &str, v: &Value, json_out: bool) {
                 },
                 _ => format!(" · 전파 완료 판정 불가({})", s(v, "propagation_note")),
             }
-        ),
+        )
+        .and_then(|_| lane_reason_lines(out, v))
+        .and_then(|_| lane_hook_op_lines(out, v)),
         "status" => writeln!(
             out,
             "레인 {} — 수리 {}건 · 열린 결함 {}건{}",
@@ -693,6 +695,31 @@ fn t6_request(cmd: &RepairCmd) -> Option<(&'static str, Value)> {
 /// T6 · RULINGS GK3 / GV3 (CCR-T6-2 — the status rendering only): the owner notices closed "not
 /// confirmed" (handed out three times without their receiver's confirmation) and a notice state the
 /// daemon could not read are printed in the ordinary output of `cys repair status`.
+/// RULINGS IK2 (T7b): one line per department row that carries a reason — `  <레인>: <상태> — <까닭>`.
+fn lane_reason_lines(out: &mut dyn Write, v: &Value) -> std::io::Result<()> {
+    for row in v.get("lane_rows").and_then(|x| x.as_array()).into_iter().flatten() {
+        let reason = s(row, "reason");
+        if !reason.is_empty() {
+            writeln!(out, "  {}: {} — {reason}", s(row, "lane"), s(row, "state_label"))?;
+        }
+    }
+    Ok(())
+}
+
+/// RULINGS JI1 (T7b): one line per hook operation a lane COMPLETED for the repair, as the daemon read
+/// it from the operation records — `  <레인>: 완료한 훅 작업 — <작업>`; records it could not read → its
+/// sentence ("확인할 수 없습니다"), never nothing.
+fn lane_hook_op_lines(out: &mut dyn Write, v: &Value) -> std::io::Result<()> {
+    let unreadable = s(v, "hook_ops_unreadable");
+    if !unreadable.is_empty() {
+        writeln!(out, "  {unreadable}")?;
+    }
+    for op in v.get("hook_ops").and_then(|x| x.as_array()).into_iter().flatten() {
+        writeln!(out, "  {}: 완료한 훅 작업 — {}", s(op, "lane"), s(op, "text"))?;
+    }
+    Ok(())
+}
+
 fn status_notice_lines(out: &mut dyn Write, v: &Value) -> std::io::Result<()> {
     match v.get("notices_not_confirmed") {
         Some(Value::Array(keys)) if !keys.is_empty() => {
@@ -898,6 +925,70 @@ fn t4_print(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, v: &Value
 /// O-C1-8: `cys repair tombstones [--json]` — a LOCAL read of this lane's tombstone file (no daemon);
 /// the lane is the caller's socket (`CYS_SOCKET`, as `lane_key` does). An unreadable file → the
 /// sentence on stderr and exit 95, nothing on stdout (a reader then behaves as today: no tombstones).
+/// `cys repair gate --lane <lane_key> [--json]` (T7b · RULINGS I1 / I7 / I8 / P5 · HH7): the LOCAL
+/// assignment gate — reads the ledger and the lane's job state, sends nothing, starts nothing; exit 0
+/// OPEN, 95 HELD (flagged interpretation 19), 2 a lane key that is not one. The JSON also carries the
+/// one summary line of lanes left in 충돌 (HH7 — a pull; the delegation tool prints it).
+/// RULINGS IK1: every key `lane::lane_key` can produce is accepted — a department's key is its socket
+/// path with only `/` `\` `:` replaced, so it holds the HOME folder's name (Korean letters, spaces);
+/// only what cannot be a key is refused (`gate_lane_key_ok`).
+fn gate_lane_key_ok(lane: &str) -> bool {
+    !lane.is_empty()
+        && lane != "."
+        && lane != ".."
+        && !lane.chars().any(|c| matches!(c, '/' | '\\' | ':' | '\0') || c.is_control())
+}
+
+fn gate_local(lane: &str, json_out: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    gate_local_in(lane, json_out, out, err, &cys::repair::paths::repairs_root(), &cys::lane::registry_path())
+}
+
+fn gate_local_in(lane: &str, json_out: bool, out: &mut dyn Write, err: &mut dyn Write, root: &std::path::Path, registry: &std::path::Path) -> i32 {
+    if !gate_lane_key_ok(lane) {
+        let _ = writeln!(err, "cys repair gate: 레인 키가 아닙니다: {lane:?} (비어 있거나 `.`·`..`이거나 경로 구분자·제어 문자를 담았습니다)");
+        return 2;
+    }
+    let key = cys::repair::types::LaneKey(lane.to_string());
+    let verdict = cys::repair::propagate::gate_verdict_in(root, &key);
+    let summary = cys::repair::propagate::conflict_summary_line_in(root, registry);
+    let (open, cause) = match &verdict {
+        cys::repair::ledger::GateVerdict::Open => (true, None),
+        cys::repair::ledger::GateVerdict::Held(c) => (false, Some(c)),
+    };
+    if json_out {
+        let cause_json = cause.map(|c| {
+            let (pending, conflict, rows) = match c {
+                cys::repair::ledger::HoldCause::Pending { pending, conflict } => (Some(*pending), Some(*conflict), None),
+                cys::repair::ledger::HoldCause::AwaitingFinalApproval { rows } => (None, None, Some(*rows)),
+                _ => (None, None, None),
+            };
+            json!({"kind": cys::repair::propagate::hold_kind(c), "text": cys::repair::propagate::hold_text(c), "pending": pending, "conflict": conflict, "rows": rows})
+        });
+        let _ = writeln!(
+            out,
+            "{}",
+            json!({"lane": lane, "verdict": if open { "open" } else { "held" }, "cause": cause_json, "conflict_summary": summary})
+        );
+    } else {
+        match cause {
+            None => {
+                let _ = writeln!(out, "작업 배정 관문: 열림 ({lane})");
+            }
+            Some(c) => {
+                let _ = writeln!(out, "작업 배정 관문: 보류 ({lane}) — {}", cys::repair::propagate::hold_text(c));
+            }
+        }
+        if let Some(line) = &summary {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+    if open {
+        0
+    } else {
+        cys::repair::types::EXIT_REPAIR_PRECONDITION
+    }
+}
+
 fn tombstones_local(out: &mut dyn Write, err: &mut dyn Write, json_out: bool) -> i32 {
     let lane = cys::repair::types::LaneKey::of_socket(&super::socket_path());
     tombstones_local_in(
@@ -1003,7 +1094,32 @@ fn run_with(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, rpc: Rpc<
             Err(e) => fail(err, &e),
         };
     }
-    // The verbs whose bodies belong to other tracks (T7b gate/recheck).
+    // T7b — the LOCAL assignment gate (I1: no daemon request) and the daemon's `recheck` (H8).
+    if let RepairCmd::Gate { lane, json } = cmd {
+        return gate_local(lane, *json, out, err);
+    }
+    if let RepairCmd::Recheck { repair } = cmd {
+        return match rpc("repair.recheck", json!({"repair": repair})) {
+            Ok(v) => {
+                let _ = writeln!(
+                    out,
+                    "{}: 이 부서({})에서 다시 검사 — {}",
+                    s(&v, "repair"),
+                    s(&v, "lane"),
+                    s(&v, "lane_state_label")
+                );
+                // RULINGS JD2: what the call changed, on a line of its own
+                let changed = s(&v, "changed");
+                if !changed.is_empty() {
+                    let _ = writeln!(out, "  {changed}");
+                }
+                0
+            }
+            Err(e) => fail(err, &e),
+        };
+    }
+    // The verbs whose bodies belong to other tracks (T5b's submit / auth-helper and T7b's gate / recheck
+    // have theirs above).
     let _ = writeln!(
         err,
         "{}: cys repair {}",
@@ -1435,7 +1551,9 @@ mod tests {
 
     /// Every NOT-yet-implemented verb parses with its contract flags, prints the Korean sentence on
     /// stderr, writes nothing on stdout and exits 99; every verb parses; malformed calls are
-    /// refused by the parser.
+    /// refused by the parser. (T7b, at its rebase onto T5b: no verb is answered by the stub any more —
+    /// T5b's `submit` / `auth-helper` and T7b's `gate` / `recheck` have their bodies; the 99 branch
+    /// stays for a verb added without one.)
     #[test]
     fn stub_exit_99() {
         let calls: &[&[&str]] = &[
@@ -1542,6 +1660,9 @@ mod tests {
             "tick",
             // T5b (rewrite: `submit` left the stub set — was "exit 99"; an old daemon → 93 like T3's)
             "submit",
+            // T7b (rewrite: `recheck` left the stub set — an old daemon → 93 like the others; the old
+            // expectation was exit 99 with the not-implemented sentence)
+            "recheck",
         ];
         let mut covered: Vec<&str> = Vec::new();
         for argv in calls {
@@ -1552,8 +1673,10 @@ mod tests {
             if !covered.contains(&name) {
                 covered.push(name);
             }
-            if name == "tombstones" || name == "boot-critical" {
-                continue; // local verbs: their own tests pin them (T5a: boot_critical_* below)
+            if name == "tombstones" || name == "boot-critical" || name == "gate" {
+                // local verbs: their own tests pin them (T5a: boot_critical_* below; T7b: gate_* —
+                // rewrite: the old expectation for `gate` was exit 99 with the not-implemented sentence)
+                continue;
             }
             if name == "rules" {
                 // T1a: the local `rules` prints the block (byte-exact in
@@ -1637,7 +1760,8 @@ mod tests {
             );
         }
 
-        // A closed / failing stderr is not a panic and still exits 99.
+        // A closed / failing stderr is not a panic (T7b rewrite — was "… and still exits 99": no verb is
+        // answered by the stub any more; the old-daemon path keeps its exit below).
         struct Broken;
         impl Write for Broken {
             fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
@@ -1650,14 +1774,10 @@ mod tests {
                 Ok(())
             }
         }
-        // T5b (rewrite: was `submit` → 99, then `revert` → 99; both are daemon-backed now — on this
-        // base `recheck` (T7b) is the last verb still answered by the stub, and when T7b merges this
-        // check loses its last stub verb and is T7b's to retire)
-        let cmd = parse(&["recheck", "R-1"]).unwrap();
-        assert_eq!(
-            run_with(&cmd, &mut Vec::new(), &mut Broken, &old_daemon),
-            99
-        );
+        // T7b (rewrite at its rebase onto T5b — RETIRED: the stub's closed-stderr check used the last
+        // verb the stub answered — `submit`, then `revert`, then (T5b) `recheck R-1` → 99; with T7b's
+        // `recheck` no verb is answered by the stub, so that check has no subject left. A closed stderr
+        // stays pinned below on the old-daemon path (`list` → 93), and every verb's own exit above.)
         let cmd = parse(&["list"]).unwrap();
         assert_eq!(
             run_with(&cmd, &mut Vec::new(), &mut Broken, &old_daemon),
@@ -1930,6 +2050,143 @@ mod tests {
         let src = include_str!("repair_cli.rs");
         let prod = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
         assert!(prod.contains("super::AUTOSTART.store(false"));
+    }
+
+    /// T7b · RULINGS I1 (flagged interpretation 19): `cys repair gate --lane <key> [--json]` is LOCAL — it
+    /// sends no request (`run_local`'s rpc fails every call) — and answers exit 0 OPEN, 95 HELD (here: a
+    /// ledger member that cannot be read holds — never "open on error"), 2 for a lane key that is not
+    /// one; the JSON carries the verdict, the cause and the summary line.
+    #[test]
+    fn gate_local_exit_codes_and_json() {
+        let base = std::env::temp_dir().join(format!("cys-cli-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // the repairs root's PARENT exists (as `~/.cys/local` does): an absent root is "no repair" only
+        // on that positive evidence (FG1) — with no readable parent the gate answers HELD
+        std::fs::create_dir_all(&base).unwrap();
+        let root = base.join("repairs");
+        let registry = base.join("depts.json");
+        let mut out = Vec::new();
+        assert_eq!(gate_local_in("base", true, &mut out, &mut Vec::new(), &root, &registry), 0);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["verdict"], "open");
+        assert!(v["cause"].is_null());
+        std::fs::create_dir_all(root.join("R-1")).unwrap();
+        std::fs::write(root.join("R-1").join("record.json"), b"{ broken").unwrap();
+        let mut out = Vec::new();
+        assert_eq!(gate_local_in("base", true, &mut out, &mut Vec::new(), &root, &registry), 95);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["verdict"], "held");
+        assert_eq!(v["cause"]["kind"], "state_unreadable");
+        let mut out = Vec::new();
+        assert_eq!(gate_local_in("base", false, &mut out, &mut Vec::new(), &root, &registry), 95);
+        assert!(String::from_utf8(out).unwrap().starts_with("작업 배정 관문: 보류 (base)"));
+        // RULINGS IK1 — REWRITTEN: the old list ["", "..", "a/b", "a b"] pinned the over-strict check
+        // ("a b" → 2); a key with a space is a key the product makes (a HOME with a space)
+        for bad in ["", ".", "..", "a/b", "a\\b", "c:x", "a\0b", "a\nb", "a\u{7f}b"] {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(gate_local_in(bad, true, &mut out, &mut err, &root, &registry), 2, "{bad:?}");
+            assert!(out.is_empty());
+        }
+        // through the dispatcher with an rpc that refuses everything: no request is ever sent
+        let cmd = parse(&["gate", "--lane", "base", "--json"]).unwrap();
+        assert!(is_local(&cmd));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// RULINGS IK2: the readable `status <R>` prints one line per department row that carries a reason.
+    #[test]
+    fn status_prints_each_rows_reason() {
+        let v = json!({"repair": "R-3", "state_label": "시험 기간", "classification_label": "일반", "attempt": 1, "max_rounds": 3,
+                       "lanes": {"base": "검증됨", "dept-a": "충돌"}, "propagation_complete": false,
+                       "lane_rows": [{"lane": "base", "state_label": "검증됨", "reason": ""},
+                                     {"lane": "dept-a", "state_label": "충돌", "reason": "사본 검사 실패 — 살아 있는 파일은 바꾸지 않았습니다"}]});
+        let mut out = Vec::new();
+        print_ok(&mut out, "status", &v, false);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\n  dept-a: 충돌 — 사본 검사 실패 — 살아 있는 파일은 바꾸지 않았습니다\n"), "{text}");
+        assert!(!text.contains("  base:"), "{text}");
+    }
+
+    /// RULINGS JI1: the readable `status <R>` prints one line per hook operation a lane completed (read by
+    /// the daemon from the operation records), and the daemon's sentence when it could not read them.
+    #[test]
+    fn status_prints_each_lanes_completed_hook_operations() {
+        let base = json!({"repair": "R-3", "state_label": "시험 기간", "classification_label": "일반", "attempt": 1, "max_rounds": 3,
+                          "lanes": {"base": "검증됨", "dept-a": "충돌"}, "propagation_complete": false, "lane_rows": []});
+        let mut v = base.clone();
+        v["hook_ops"] = json!([{"lane": "dept-a", "op": "op-9", "kind": "hook-unregister", "lines": ["Stop:x.sh"], "text": "훅 등록 해제(작업 op-9: Stop:x.sh)"}]);
+        let mut out = Vec::new();
+        print_ok(&mut out, "status", &v, false);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\n  dept-a: 완료한 훅 작업 — 훅 등록 해제(작업 op-9: Stop:x.sh)\n"), "{text}");
+        let mut v = base;
+        v["hook_ops"] = json!([]);
+        v["hook_ops_unreadable"] = json!("완료한 훅 작업을 확인할 수 없습니다 — R-3/ops: 목록을 읽을 수 없음");
+        let mut out = Vec::new();
+        print_ok(&mut out, "status", &v, false);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\n  완료한 훅 작업을 확인할 수 없습니다 — R-3/ops: 목록을 읽을 수 없음\n"), "{text}");
+    }
+
+    /// RULINGS JD2 / JF (CCR-JD2b): `cys repair recheck R` prints the daemon's sentence of what the call
+    /// changed on a line of its own, after the state line; an answer without it (an older daemon) prints
+    /// the state line only.
+    #[test]
+    fn recheck_prints_what_the_call_changed_on_its_own_line() {
+        let cmd = parse(&["recheck", "R-1"]).unwrap();
+        let changed = "이 호출이 바꾼 것: 이 부서의 행('충돌' → '검증됨', 합친 기록을 남기고 합치기 잠금을 풂), 이 부서의 훅 등록 해제(작업 op-1: Stop:x.sh)";
+        let rpc = |m: &str, p: Value| -> Result<Value, String> {
+            assert_eq!(m, "repair.recheck");
+            assert_eq!(p["repair"], "R-1");
+            Ok(json!({"repair": "R-1", "lane": "dept-a", "lane_state": "verified", "lane_state_label": "검증됨", "changed": changed}))
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(run_with(&cmd, &mut out, &mut err, &rpc), 0);
+        assert!(err.is_empty());
+        assert_eq!(String::from_utf8(out).unwrap(), format!("R-1: 이 부서(dept-a)에서 다시 검사 — 검증됨\n  {changed}\n"));
+        let older = |_: &str, _: Value| -> Result<Value, String> {
+            Ok(json!({"repair": "R-1", "lane": "dept-a", "lane_state": "verified", "lane_state_label": "검증됨"}))
+        };
+        let mut out = Vec::new();
+        assert_eq!(run_with(&cmd, &mut out, &mut Vec::new(), &older), 0);
+        assert_eq!(String::from_utf8(out).unwrap(), "R-1: 이 부서(dept-a)에서 다시 검사 — 검증됨\n");
+    }
+
+    /// RULINGS IK1 (blocking — queue blocking): every key `lane::lane_key` makes for a department whose
+    /// HOME holds Korean letters or a space is accepted — OPEN with an empty ledger, through the verb's
+    /// parser and its body; the JSON names the key unchanged.
+    #[test]
+    fn gate_accepts_every_lane_key_the_product_makes() {
+        let base = std::env::temp_dir().join(format!("cys-cli-gate-ik1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let root = base.join("repairs");
+        let registry = base.join("depts.json");
+        // a HOME with Korean letters, with spaces, with both; and a Windows-shaped socket path (homes
+        // built under the rig — no real home path in the source)
+        let users = base.join("Users");
+        let sock_of = |home: &str, dept: &str| users.join(home).join(".local").join("state").join(format!("cys-dept-{dept}")).join("cys.sock");
+        let socks = [
+            sock_of("홍길동", "sales"),
+            sock_of("Gil Dong Kim", "sales"),
+            sock_of("홍 길동", "영업 1팀"),
+            std::path::PathBuf::from(["C:", "Users", "홍길동", "AppData", "Local", "cys", "cys-dept-sales", "cys.sock"].join("\\")),
+        ];
+        for sock in &socks {
+            let key = cys::lane::lane_key(sock);
+            assert!(gate_lane_key_ok(&key), "{key:?}");
+            let cmd = parse(&["gate", "--lane", &key, "--json"]).unwrap();
+            assert!(is_local(&cmd));
+            let mut out = Vec::new();
+            assert_eq!(gate_local_in(&key, true, &mut out, &mut Vec::new(), &root, &registry), 0, "{key:?}");
+            let v: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!((v["verdict"].as_str(), v["lane"].as_str()), (Some("open"), Some(key.as_str())));
+        }
+        // the long-path form (head + hash) is a key too
+        let long = users.join("홍길동").join("깊은 폴더/".repeat(30)).join("cys-dept-x").join("cys.sock");
+        let key = cys::lane::lane_key(&long);
+        assert_eq!(gate_local_in(&key, true, &mut Vec::new(), &mut Vec::new(), &root, &registry), 0, "{key:?}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// O-C1-8: the local tombstone reader prints the struct's JSON (field order fixed) for the
