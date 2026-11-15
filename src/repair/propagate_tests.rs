@@ -1952,58 +1952,61 @@ fn the_id_file_survives_the_per_file_install_and_its_prune() {
     assert_eq!(gate_verdict_in(&r.root, &lane(DEPT)), GateVerdict::Open, "the gate unchanged");
 }
 
-// ───────────────────────────── RULINGS IV2 — the census of propagate.rs's write sites ─────────────────────────────
+// ───────────────────────────── RULINGS IV2 / IZ4 — the census of the propagation's writes ─────────────────────────────
 
-/// Every call in `propagate.rs`'s production text that writes something durable, per function — rows,
-/// the lane's tombstone file (also through the hook step), the job state and the catch-up record, the
-/// pack's id file, door operations, the committed copy and the lane's own scratch. Each row says
-/// whether the tried pack-apply lock is held there and which stamp is validated first (or why none
-/// applies). A new write site without a row fails `every_write_site_of_the_propagation_is_listed`.
-/// (fn, callee, count, lock, stamp, why)
-const WRITE_SITES: &[(&str, &str, usize, &str, &str, &str)] = &[
-    ("changed_midway", "write_row_if(", 1, "held (door phase)", "none — RULINGS IO1", "the visible 충돌 of a change between two targets: it describes what THIS lane did, not what R now is"),
-    ("copy_checked", "create_dir_all(", 1, "none", "none", "the lane's own scratch for the copy-check (11.2): not shared, not the pack, removed on every exit"),
-    ("copy_checked", "write_new(", 1, "none", "none", "as above"),
-    ("copy_checked_bytes_of", "create_dir_all(", 1, "none", "none", "as above"),
-    ("copy_checked_bytes_of", "write_new(", 1, "none", "none", "as above"),
-    ("door_phase", "ensure_tombstones(", 1, "held (door phase)", "decision (`holds` strict, then updated by `placed`)", "IG2: the tombstones of the applied row, after the stamp held"),
-    ("door_phase", "hook_step(", 1, "held (door phase)", "decision (strict)", "the hook step (registrar + the lane's tombstones) after the stamp held"),
-    ("door_phase", "record_in(", 1, "held (door phase)", "decision (strict) — before the operation", "B1: a deletion's tombstone right after its own door operation"),
-    ("door_phase", "run_op(", 1, "held (door phase)", "decision (strict) — before each target", "rule one through T6's door (which re-verifies the target and the generation itself)"),
-    ("door_phase", "write_row_if(", 1, "held (door phase)", "decision (strict) — after the last target", "the 적용됨 row"),
-    ("drop", "remove_dir_all(", 1, "none", "none", "`Scratch::drop`: the lane's own scratch, removed"),
-    ("ensure_tombstones", "record_in(", 1, "via its callers", "via its callers", "called only from `door_phase` and `publish`, both held and stamped"),
-    ("full_reset", "replace_pack_instance(", 1, "held (the pass)", "the pass's own reading, inside the same lock", "I8 step 3: read and written in ONE tried lock — no unlocked gap"),
-    ("full_reset", "update_row(", 1, "held (the pass)", "the pass's own reading", "I8 step 2: rows back to 대기"),
-    ("full_reset", "write_job_state(", 2, "held (the pass)", "the pass's own reading", "I8 steps 1 and 4"),
-    ("hook_step", "(env.hooks)(", 1, "via its callers", "via its callers", "called only from `door_phase` and `locked_hook_step`, both held and stamped"),
-    ("locked_hook_step", "hook_step(", 1, "held", "decision (strict)", "the \"already there\" arm and `recheck` (IV4)"),
-    ("note_reason", "update_row(", 1, "held", "none — by design", "IK2: the reason why a decision's writes were dropped; changes the reason text only"),
-    ("publish", "ensure_tombstones(", 1, "held", "decision (strict for a check's result)", "IQ2: one unit with the 검증됨 row"),
-    ("publish", "write_row_if(", 1, "held", "decision (strict for a check's result)", "every row the tick and `recheck` publish (IK3 / IG5 / IQ1 / IV1 / IV4)"),
-    ("replace_pack_instance", "remove_file(", 1, "via full_reset (held)", "the pass's own reading", "I8: the old id unlinked"),
-    ("replace_pack_instance", "write_all(", 1, "via full_reset (held)", "the pass's own reading", "I8: the new id created NEW"),
-    ("seal_committed_copy_in", "create_dir(", 2, "none (R's vault, not a pack)", "none — the commit validates it", "HI2 / HJ2: at the ORIGIN's commit; the copy's hash and mode are compared with the verified states under the per-repair mutex before the record is published"),
-    ("seal_committed_copy_in", "create_dir_all(", 1, "none (R's vault)", "none — as above", "as above"),
-    ("seal_committed_copy_in", "write_new(", 2, "none (R's vault)", "none — as above", "as above"),
-    ("sweep_own_scratch", "remove_dir_all(", 1, "none", "none", "a dead process's scratch of THIS lane, by its exact name"),
-    ("tick_body", "write_job_state(", 1, "held", "the tick's catch-up stamp (generation + instance, strict) — IV3", "the catch-up record"),
-    ("update_row", "write_lane_durable_in(", 1, "via its callers", "via its callers", "the primitive of `full_reset`, `verify_only`, `note_reason`"),
-    ("verify_only", "update_row(", 1, "held (the pass)", "the pass's own reading", "L5 (a): rows back to 대기"),
-    ("verify_only", "write_job_state(", 1, "held (the pass)", "the pass's own reading", "the recorded directory / generation"),
-    ("write_job_state", "write_json_durable(", 1, "via its callers", "via its callers", "the primitive of `tick_body`, `full_reset`, `verify_only`"),
-    ("write_row_if", "write_lane_durable_in(", 1, "via its callers", "via its callers", "the primitive of `publish`, `door_phase`, `changed_midway` (compare-and-write under the per-repair mutex)"),
+/// Every write PRIMITIVE and every allowed writer's boundary in `propagate.rs`'s production text (and
+/// in its verbs, `cysd/repair.rs` `propagate_verbs`, which hold none), per function, each classified:
+/// the four write units of a REPAIR DECISION (RULINGS IZ1 / JA4) — (a) a door operation + the
+/// tombstone of the deletion it made, (b) the hook unit (inside T6's hook step), (c) a row's
+/// publication + its tombstone completion, (d) the catch-up record — or a write with its own row and
+/// contract: the instance pass, the reason note, IO1's exception publication, the committed copy, the
+/// lane's own scratch, a wrapper's own boundary. A new primitive or boundary without a row fails
+/// `every_write_site_of_the_propagation_is_listed`. (fn, primitive / boundary, count, unit, why)
+const WRITE_SITES: &[(&str, &str, usize, &str, &str)] = &[
+    ("changed_midway", "write_row_if(", 1, "IO1 exception publication", "inside the door phase's lock; reports what this lane already changed — not validated against R (IO1)"),
+    ("copy_checked", "create_dir_all(", 1, "the lane's own scratch", "the copy-check's scratch: not shared, not the pack, removed on every exit"),
+    ("copy_checked", "write_new(", 1, "the lane's own scratch", "as above"),
+    ("copy_checked_bytes_of", "create_dir_all(", 1, "the lane's own scratch", "as above"),
+    ("copy_checked_bytes_of", "write_new(", 1, "the lane's own scratch", "as above"),
+    ("door_phase", "record_in(", 1, "unit (a)", "the tombstone of the deletion the door operation just made — one fact with it"),
+    ("door_phase", "run_op(", 1, "unit (a)", "the door operation (T6's door re-verifies the target and the generation at the act); the stamp validated once before it"),
+    ("door_phase", "write_row_if(", 1, "unit (c)", "the 적용됨 row, after the stamp held, inside the door phase's lock"),
+    ("drop", "remove_dir_all(", 1, "the lane's own scratch", "`Scratch::drop`"),
+    ("ensure_tombstones", "record_in(", 1, "unit (c)", "the tombstone completion of a row's publication (IQ2) — called from `publish` and the door phase's 적용됨 row"),
+    ("full_reset", "update_row(", 1, "the instance pass", "I8 step 2 — the pass reads and writes inside ONE tried lock"),
+    ("full_reset", "write_job_state(", 2, "the instance pass", "I8 steps 1 and 4"),
+    ("hook_step", "(env.hooks)(", 1, "unit (b)", "inside T6's hook step — its write-ahead record, tombstone and registrar run are classified by T6's own write census"),
+    ("note_reason", "update_row(", 1, "the reason note", "inside the tried lock; the reason text only (IK2); validated by no stamp by design"),
+    ("publish", "write_row_if(", 1, "unit (c)", "every row the tick and `recheck` publish, after the stamp held (IV1 / IQ1)"),
+    ("replace_pack_instance", ".create_new(true)", 1, "the instance pass", "I8 step 3: the new id created NEW"),
+    ("replace_pack_instance", ".write(true)", 1, "the instance pass", "the same open"),
+    ("replace_pack_instance", "remove_file(", 1, "the instance pass", "I8 step 3: a different / malformed id unlinked"),
+    ("replace_pack_instance", "write_all(", 1, "the instance pass", "the id line"),
+    ("seal_committed_copy_in", "create_dir(", 2, "the committed copy", "at the ORIGIN's commit, in R's vault (not a pack); HJ2 validates the copy against the verified states before the record is published"),
+    ("seal_committed_copy_in", "create_dir_all(", 1, "the committed copy", "as above"),
+    ("seal_committed_copy_in", "write_new(", 2, "the committed copy", "as above"),
+    ("sweep_own_scratch", "remove_dir_all(", 1, "the lane's own scratch", "a dead process's scratch of THIS lane, by its exact name"),
+    ("tick_body", "write_job_state(", 1, "unit (d)", "the catch-up record — the pass's generation and instance measured again inside the lock (IZ3)"),
+    ("update_row", "write_lane_durable_in(", 1, "a wrapper's boundary", "the row primitive of the instance pass and the reason note"),
+    ("verify_only", "update_row(", 1, "the instance pass", "L5 (a): rows back to 대기"),
+    ("verify_only", "write_job_state(", 1, "the instance pass", "the recorded directory / generation"),
+    ("write_job_state", "write_json_durable(", 1, "a wrapper's boundary", "the job-state primitive of the instance pass and unit (d)"),
+    ("write_row_if", "write_lane_durable_in(", 1, "a wrapper's boundary", "the row primitive of units (c), IO1's publication (compare-and-write under the per-repair mutex)"),
 ];
 
-/// The callees that write something durable (the census's vocabulary).
-const WRITE_CALLEES: &[&str] = &[
-    "write_row_if(", "update_row(", "write_lane_durable_in(", "write_job_state(", "record_in(", "ensure_tombstones(", "hook_step(", "(env.hooks)(",
-    "run_op(", "replace_pack_instance(", "write_new(", "create_dir_all(", "create_dir(", "remove_dir_all(", "remove_file(", "write_all(",
-    "write_json_durable(", "rename(",
+/// The PRIMITIVES a durable write would use (`std::fs::write`, `File::create`, `OpenOptions` in write /
+/// create / truncate / append mode, copy, rename, remove, create_dir, set_permissions, links) and the
+/// allowed writers' boundaries (the census's vocabulary).
+const WRITE_VOCABULARY: &[&str] = &[
+    "fs::write(", "File::create(", ".write(true)", ".create(true)", ".create_new(true)", ".append(true)", ".truncate(true)", "fs::copy(", "rename(",
+    "remove_file(", "remove_dir(", "remove_dir_all(", "create_dir(", "create_dir_all(", "set_permissions(", "hard_link(", "symlink(",
+    "write_row_if(", "update_row(", "write_lane_durable_in(", "write_job_state(", "write_json_durable(", "write_durable(", "record_in(",
+    "remove_for_repair_in(", "run_op(", "(env.hooks)(", "write_new(", "write_all(", "write_in(",
 ];
 
-/// (fn, callee) → count over a production text; a line belongs to the last `fn` above it; comment
-/// lines and the declaration's own name are skipped.
+/// (fn, word) → count over a production text; a line belongs to the last `fn` above it; comment lines
+/// and the declaration's own name are skipped; a word that starts with a letter counts only when it is
+/// not the tail of a longer identifier.
 fn write_sites_of(prod: &str) -> std::collections::BTreeMap<(String, String), usize> {
     let mut m = std::collections::BTreeMap::new();
     let mut cur = "<module>".to_string();
@@ -2025,26 +2028,26 @@ fn write_sites_of(prod: &str) -> std::collections::BTreeMap<(String, String), us
                 None => continue,
             }
         }
-        for c in WRITE_CALLEES {
+        for w in WRITE_VOCABULARY {
             let n = body
-                .match_indices(c)
-                .filter(|(i, _)| !c.starts_with(|x: char| x.is_ascii_alphabetic()) || !body[..*i].chars().last().is_some_and(|p| p.is_ascii_alphanumeric() || p == '_'))
+                .match_indices(w)
+                .filter(|(i, _)| !w.starts_with(|x: char| x.is_ascii_alphabetic()) || !body[..*i].chars().last().is_some_and(|p| p.is_ascii_alphanumeric() || p == '_'))
                 .count();
             if n > 0 {
-                *m.entry((cur.clone(), c.to_string())).or_insert(0) += n;
+                *m.entry((cur.clone(), w.to_string())).or_insert(0) += n;
             }
         }
     }
     m
 }
 
-fn write_site_violations(prod: &str) -> Vec<String> {
+fn write_site_violations(prod: &str, verbs: &str) -> Vec<String> {
     let counts = write_sites_of(prod);
     let mut v = Vec::new();
-    for ((f, c), n) in &counts {
-        match WRITE_SITES.iter().find(|r| r.0 == f && r.1 == c) {
-            None => v.push(format!("{f}: {n} × {c} — a write site with no row (lock? stamp?)")),
-            Some(r) if r.2 != *n => v.push(format!("{f}: {n} × {c}, the census lists {} — classify the new one", r.2)),
+    for ((f, w), n) in &counts {
+        match WRITE_SITES.iter().find(|r| r.0 == f && r.1 == w) {
+            None => v.push(format!("{f}: {n} × {w} — a write with no row (which unit? which stamp?)")),
+            Some(r) if r.2 != *n => v.push(format!("{f}: {n} × {w}, the census lists {} — classify the new one", r.2)),
             Some(_) => {}
         }
     }
@@ -2052,6 +2055,10 @@ fn write_site_violations(prod: &str) -> Vec<String> {
         if !counts.contains_key(&(r.0.to_string(), r.1.to_string())) {
             v.push(format!("{}: {} listed but not found — remove the row", r.0, r.1));
         }
+    }
+    // the verbs write nothing themselves (they call `recheck_lane_in` / `propagation_tick_in`)
+    for ((f, w), n) in write_sites_of(verbs) {
+        v.push(format!("propagate_verbs::{f}: {n} × {w} — the verbs hold no write of their own"));
     }
     v
 }
@@ -2061,19 +2068,32 @@ fn propagate_production_text() -> String {
     src[..src.find("#[cfg(test)]\n#[path").unwrap_or(src.len())].to_string()
 }
 
-/// RULINGS IV2 — every write site of the propagation is listed with its lock and its stamp; a new one
-/// without a row (or a changed count) fails. Mutation controls: a new write in a new function, and one
-/// more row write in a listed function, are both caught.
+fn propagate_verbs_text() -> String {
+    let src = include_str!("../bin/cysd/repair.rs");
+    let a = src.find("pub(crate) mod propagate_verbs {").expect("the verbs module");
+    let b = src[a..].find("\nmod apply_verbs {").map(|o| a + o).expect("its end");
+    src[a..b].to_string()
+}
+
+/// RULINGS IV2 / IZ4 — every write primitive and writer boundary of the propagation is listed with its
+/// unit; the census CAN fail: mutation controls — a new `std::fs::write` in a new function, a new
+/// `OpenOptions … create`, one more row write in a listed function, a write inside the verbs — each
+/// turns it red.
 #[test]
 fn every_write_site_of_the_propagation_is_listed() {
     let prod = propagate_production_text();
-    let v = write_site_violations(&prod);
+    let verbs = propagate_verbs_text();
+    let v = write_site_violations(&prod, &verbs);
     assert!(v.is_empty(), "{v:#?}");
-    assert!(!write_site_violations(&format!("{prod}\nfn census_mutant(env: &LaneEnv<'_>, r: &LaneRecord) {{ let _ = write_row_if(env, None, r); }}\n")).is_empty());
-    let more = prod.replacen("fn note_reason(env: &LaneEnv<'_>, id: &RepairId, why: &str) {", "fn note_reason(env: &LaneEnv<'_>, id: &RepairId, why: &str) {\n    let _ = write_job_state(env.op.root, &fresh_job_state(env.op.lane));", 1);
+    let with = |code: &str| format!("{prod}\nfn census_mutant(p: &Path) {{\n    {code}\n}}\n");
+    assert!(!write_site_violations(&with("std::fs::write(p, b\"x\").unwrap();"), &verbs).is_empty(), "a new std::fs::write");
+    assert!(!write_site_violations(&with("let _ = std::fs::OpenOptions::new().append(true).create(true).open(p);"), &verbs).is_empty(), "a new OpenOptions … create");
+    assert!(!write_site_violations(&with("let _ = std::fs::File::create(p);"), &verbs).is_empty(), "a new File::create");
+    let more = prod.replacen("fn note_reason(env: &LaneEnv<'_>, id: &RepairId, why: &str) {", "fn note_reason(env: &LaneEnv<'_>, id: &RepairId, why: &str) {\n    let _ = std::fs::write(env.op.root.join(\"x\"), why);", 1);
     assert_ne!(more, prod, "the mutation applied");
-    assert!(!write_site_violations(&more).is_empty(), "one more write in a listed function");
-    assert!(WRITE_SITES.iter().all(|r| !r.3.is_empty() && !r.4.is_empty() && !r.5.is_empty()), "every row says lock, stamp and why");
+    assert!(!write_site_violations(&more, &verbs).is_empty(), "one more write in a listed function");
+    assert!(!write_site_violations(&prod, &format!("{verbs}\nfn v(p: &Path) {{ let _ = std::fs::write(p, b\"x\"); }}")).is_empty(), "a write inside the verbs");
+    assert!(WRITE_SITES.iter().all(|r| !r.3.is_empty() && !r.4.is_empty()), "every row names its unit and why");
 }
 
 // ───────────────────────────── RULINGS IV1 / IV3 / IV4 — the stamp at every write ─────────────────────────────
