@@ -400,7 +400,8 @@ pub(crate) fn submit(
     let mut found: Option<(String, String)> = None;
     let finding = &mut found;
     // RULINGS JW2: under the locks only the settlement and "a notice is due" are decided; the notice
-    // is sent after BOTH locks (the repair's and the approval table's) are released, on every path
+    // is sent after BOTH locks (the repair's and the approval table's) are released, on every path —
+    // and (KJ2) it is due only after the settlement's write succeeded
     let mut notice: Option<String> = None;
     let notice_due = &mut notice;
     let out = ctx.locked(id.as_str(), || {
@@ -464,10 +465,13 @@ pub(crate) fn submit(
         match reconcile_stale_pending(ctx.now, &tbl, id.as_str(), &mut rec, &consumed) {
             Reconciled::Nothing => {}
             Reconciled::Settled(count) => {
+                // RULINGS KJ2: the notice is due only once the settlement is SAVED — a failed write
+                // returns here with nothing due (the disk keeps the old count; a later submit settles
+                // again and sends it then, once)
+                write(ctx, &rec)?;
                 if count == Some(MAX_RESUBMITS + 1) {
                     *notice_due = Some(budget_line(id.as_str(), &ctx.lane.0));
                 }
-                write(ctx, &rec)?;
             }
             Reconciled::Unknown(why) => {
                 *finding = unknown_finding(&mut tbl, id.as_str(), &rec, &why);
