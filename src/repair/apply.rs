@@ -1644,6 +1644,19 @@ pub fn no_repair_lock(
 pub type HookStepFn<'a> =
     dyn Fn(&RepairId, &LaneKey, HookStep) -> Result<ReconcileReport, RepairError> + 'a;
 
+/// RULINGS IL2 — what is TRUE in release 0.15.0 about repair `id` reaching a department other than
+/// the one that made it, decided by the class of the repair (unit T7d is not built — RULINGS II /
+/// IL1): a boot-critical or protection-related repair reaches another department ONLY through that
+/// department's own repair; any other repair is carried there by that department's daemon, and a
+/// department whose file differs keeps its bytes and shows the repair 충돌.
+pub fn reach_of_other_departments(class: Classification, id: &str) -> String {
+    if is_approval_class(class) {
+        format!("기동 필수·보호장치 관련 수리는 다른 부서에 저절로 전해지지 않습니다 — 다른 부서에는 그 부서 자신의 수리(cys repair begin … --resolves {id})와 두 리뷰어의 서명, 그 부서에서의 주인 최종 승인으로만 들어갑니다")
+    } else {
+        "이 수리는 각 부서의 데몬이 그 부서에 전파합니다 — 파일이 다른 부서는 제 바이트를 그대로 두고 그 수리를 충돌로 보입니다".to_string()
+    }
+}
+
 fn is_approval_class(c: Classification) -> bool {
     matches!(c, Classification::BootCritical | Classification::ProtectionRelated)
 }
@@ -3094,8 +3107,9 @@ pub fn apply_candidate_in(
     };
     if rec.origin_lane != *env.lane {
         return Err(RepairError::Precondition(format!(
-            "{}: 승인된 적용은 처음 고친 부서에서만 합니다(다른 부서는 전파)",
-            id.as_str()
+            "{}: 승인된 적용은 처음 고친 부서에서만 합니다 — {}",
+            id.as_str(),
+            reach_of_other_departments(rec.classification, id.as_str())
         )));
     }
     if matches!(rec.state, RepairState::Probation | RepairState::InUse | RepairState::Reverted | RepairState::Superseded | RepairState::UpstreamFixed) {
