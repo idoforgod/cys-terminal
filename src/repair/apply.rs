@@ -1753,6 +1753,26 @@ pub fn closure_not_revertible(closed: &str) -> bool {
     closed.starts_with(&format!("{NOT_REVERTIBLE} — "))
 }
 
+/// RULINGS HS1 (b) — a GENERAL repair's probation that an update ended (the pack generation moved on)
+/// while EVERY target still held the repaired bytes: the probation is over (no check, no automatic
+/// return any more — after an update the recorded pre-image is not what a return should restore) and
+/// the repair stays in force, 사용 중, with this sentence.
+pub const UPDATE_KEPT_SENTENCE: &str = "업데이트 뒤에도 수리한 내용이 그대로 있습니다 — 시험 기간은 업데이트로 끝났고 자동 되돌리기는 하지 않습니다";
+
+/// The closure HS1 (b) writes.
+pub fn update_kept_closure() -> String {
+    format!("사용 중 — {UPDATE_KEPT_SENTENCE}")
+}
+
+/// RULINGS HS1 (a) — the update wrote one of the targets (vendor-first, a merge): 대체됨, nothing put
+/// back, the record superseded; the closure names the files the update wrote.
+pub const UPDATE_WROTE_SENTENCE: &str = "업데이트가 수리한 파일을 바꿨습니다";
+
+/// The closure HS1 (a) writes.
+pub fn update_wrote_closure(rels: &[String]) -> String {
+    format!("대체됨 — {UPDATE_WROTE_SENTENCE}({}) — 아무것도 되돌리지 않습니다(새 버전 우선)", rels.join(", "))
+}
+
 /// RULINGS FI1 — whether `rec`'s pre-images were taken in a generation other than the pack's NOW:
 /// any pre-image slot whose recorded generation is absent (Unknown), unreadable, or different from
 /// the generation read now (itself Unknown → true). A record without a pre-image slot → false.

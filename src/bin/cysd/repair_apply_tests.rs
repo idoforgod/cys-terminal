@@ -662,3 +662,82 @@ fn a_commit_in_its_hook_phase_excludes_the_start_pass() {
         commit.join().unwrap().unwrap();
     });
 }
+
+// ───────────────────────────── RULINGS HS — an update inside a general repair's probation ─────────────────────────────
+
+/// The job's probation pass over the rig (the daemon's job with test doubles; after an update no
+/// check and no reference check may run).
+fn run_probation(r: &Rig, now: f64) -> cys::repair::probation::TickReport {
+    let never = |_: &str, _: &Path, _: std::time::Duration| -> Result<cys::repair::apply::CheckOutcome, RepairError> { panic!("no check after an update") };
+    let reference = |_: CheckKind, _: std::time::Duration| -> Result<cys::repair::apply::CheckOutcome, RepairError> { panic!("no reference check after an update") };
+    let hooks = |_: &RepairId, _: &LaneKey, _: cys::repair::apply::HookStep| -> Result<cys::repair::apply::ReconcileReport, RepairError> {
+        Ok(cys::repair::apply::ReconcileReport { hooks: Vec::new() })
+    };
+    let registrar = |_: &Path, _: bool| -> Result<String, RepairError> { Ok("{\"hooks\": []}".into()) };
+    let lock = r.base.join(".pack-apply.lock");
+    let env = cys::repair::probation::JobEnv {
+        op: cys::repair::apply::OpEnv {
+            root: &r.root,
+            pack: &r.pack,
+            lane: &r.lane,
+            now,
+            form: cys::repair::platform::ApplyForm::Exchange,
+            faults: &cys::repair::apply::NoFaults,
+            own_check: &|_, _| None,
+        },
+        incarnation: "inc-2",
+        check: &never,
+        reference: &reference,
+        hooks: &hooks,
+        registrar: &registrar,
+        locked: &cys::repair::apply::no_repair_lock,
+        excluded: &|_| true,
+        original: &|_| None,
+        intake: &|_, _| true,
+        apply_lock: &lock,
+    };
+    cys::repair::probation::run_tick(&env, false).unwrap()
+}
+
+/// Two committed general repairs, then an update inside their probation: a new pack generation that
+/// keeps `bin/a.py` (the first repair's bytes survive — HS1 (b)) and writes `hooks/h.sh` (the
+/// second's — HS1 (a)); then the job's probation pass. Returns (kept, wrote).
+fn an_update_inside_two_probations(r: &Rig) -> (String, String) {
+    let kept = committed(r, "bin/a.py", b"print('fixed')\n");
+    let wrote = committed(r, "hooks/h.sh", b"#!/bin/sh\necho fixed\n");
+    std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
+    std::fs::write(r.pack.join("hooks/h.sh"), b"#!/bin/sh\necho vendor\n").unwrap();
+    let _ = run_probation(r, T0 + 60.0);
+    (kept, wrote)
+}
+
+/// RULINGS HS1 through the daemon's verbs: the repair whose bytes survived the update is in force
+/// (사용 중) in `list`, and `cleanup` refuses its vault slots (a repair in use still depends on them);
+/// the one whose file the update wrote is superseded and its slots may go (as before HS1). Without
+/// HS1 both were superseded and both vaults were offered to `cleanup`.
+#[test]
+fn an_update_that_kept_the_bytes_leaves_the_repair_in_force_with_its_vault() {
+    let r = rig("hs1verbs");
+    let (kept, wrote) = an_update_inside_two_probations(&r);
+    let l = r.call(T0 + 61.0, &human(), "list", json!({})).unwrap();
+    let state_of = |id: &str| l["repairs"].as_array().unwrap().iter().find(|s| s["repair"] == id).map(|s| s["state"].clone());
+    assert_eq!(state_of(&kept), Some(json!("in_use")), "{l}");
+    assert_eq!(state_of(&wrote), Some(json!("superseded")), "{l}");
+    let kept_id = RepairId::parse(&kept).unwrap();
+    let slots = ledger::list_slots_in(&r.root, &kept_id);
+    assert!(!slots.is_empty());
+    // every slot it has is one a repair in force depends on (P6 — the verb's own match)
+    let needed = cys::repair::apply::slots_needed_in_force_in(&r.root, &kept_id).unwrap();
+    for s in &slots {
+        assert!(needed.iter().any(|n| n == &s.dir || s.dir.starts_with(n) || n.starts_with(&s.dir)), "{} not needed: {needed:?}", s.dir.display());
+    }
+    // the verb removes nothing of it (in this rig the verb reads the product root for the needed
+    // slots, cannot, and refuses every slot — the refusal path of an in-force repair)
+    match r.call(T0 + 62.0, &human(), "cleanup", json!({"repair": kept})) {
+        Ok(c) => assert!(c["removed"].as_array().is_some_and(|a| a.is_empty()), "nothing of a repair in use is removed: {c}"),
+        Err(e) => assert_eq!(e.code, "repair_precondition", "{}", e.message),
+    }
+    assert_eq!(ledger::list_slots_in(&r.root, &kept_id).len(), slots.len(), "nothing of a repair in use is removed");
+    let c = r.call(T0 + 63.0, &human(), "cleanup", json!({"repair": wrote})).unwrap();
+    assert!(c["removed"].as_array().is_some_and(|a| !a.is_empty()), "a superseded repair's slots may go: {c}");
+}
