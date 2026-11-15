@@ -2023,6 +2023,9 @@ mod tests {
     fn gate_local_exit_codes_and_json() {
         let base = std::env::temp_dir().join(format!("cys-cli-gate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
+        // the repairs root's PARENT exists (as `~/.cys/local` does): an absent root is "no repair" only
+        // on that positive evidence (FG1) — with no readable parent the gate answers HELD
+        std::fs::create_dir_all(&base).unwrap();
         let root = base.join("repairs");
         let registry = base.join("depts.json");
         let mut out = Vec::new();
