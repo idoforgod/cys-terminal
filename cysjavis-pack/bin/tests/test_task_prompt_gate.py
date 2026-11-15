@@ -314,6 +314,46 @@ class TicketGate(unittest.TestCase):
         self.assertIn("  완료한 훅 작업을 확인할 수 없습니다 — 작업 기록이 많습니다(256건·4194304바이트까지만 읽습니다)", out.splitlines())
         self.assertIn("  3) cys repair recheck R-9", out)
 
+    # RULINGS KI1 (KF2): a repair that does not propagate to the asking lane — a rule-document repair made in another
+    # lane — gets NO ticket line: refused before any line with the sentence of that lane's informational row (and the
+    # way that is open: the lane's own owner order); before that row exists, with the same meaning. The daemon's own
+    # answer is read from `status` (the lanes of its propagation), the class is not re-derived here. Control: a repair
+    # whose propagation includes the lane still gets its ticket.
+    def test_merge_ticket_is_refused_for_a_repair_that_does_not_reach_the_lane(self):
+        sock = os.path.join(self.tmp, "state", "cys-dept-dept-a", "cys.sock")
+        with open(os.environ["CYS_DEPTS_JSON"], "w", encoding="utf-8") as f:
+            json.dump({"depts": {"dept-a": {"socket": sock}}}, f)
+        import javis_lane
+        key = javis_lane.lane_key(sock)
+        said = "규칙 문서 수리 — 고친 부서에서만 적용됩니다. 이 부서에는 이 부서의 주인 지시로 적용하세요"
+        status = {"repair": "R-11", "trigger": "owner_order", "classification": "rule_document",
+                  "files": [{"rel": "directives/WORKER_DIRECTIVE.md", "kind": "edit"}],
+                  "lanes": {"base": "검증됨"}, "propagation_complete": True,
+                  "lane_rows": [{"lane": "base", "state_label": "검증됨", "reason": ""},
+                                {"lane": key, "state_label": "대기", "reason": said}]}
+        with path_with(self.stub(GATE_HELD, 95, status)):
+            rc, out, err = run_tp(merge="R-11", surface="dept-a/surface:5")
+        self.assertNotEqual(rc, 0, out)
+        self.assertNotIn("병합 티켓", out)
+        self.assertNotIn("--joins", out)
+        self.assertIn("병합 티켓을 내지 않습니다 — R-11: " + said, err)
+        # before the lane's informational row exists: refused with the same meaning
+        status["lane_rows"] = [{"lane": "base", "state_label": "검증됨", "reason": ""}]
+        with path_with(self.stub(GATE_HELD, 95, status)):
+            rc, out, err = run_tp(merge="R-11", surface="dept-a/surface:5")
+        self.assertNotEqual(rc, 0, out)
+        self.assertNotIn("--joins", out)
+        self.assertIn("이 부서(%s)에 전파되지 않습니다" % key, err)
+        self.assertIn("이 부서의 주인 지시로", err)
+        # control: the lane IS in the propagation → the ticket as before
+        status.update({"classification": "general", "trigger": "update", "files": [{"rel": "bin/a.py", "kind": "edit"}],
+                       "lanes": {"base": "검증됨", key: "충돌"}, "propagation_complete": False,
+                       "lane_rows": [{"lane": key, "state_label": "충돌", "reason": "x"}]})
+        with path_with(self.stub(GATE_HELD, 95, status)):
+            rc, out, err = run_tp(merge="R-11", surface="dept-a/surface:5")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("  1) cys repair begin --files bin/a.py --joins R-11 --trigger update", out)
+
     # RULINGS IG6: a HOOK-ONLY repair (a hook unregistration and no file) gets its merge ticket — the hook target
     # and R's trigger kept, `begin --unregister-hook … --joins R` and `recheck R` printed (no `--files`)
     def test_a_hook_only_repair_gets_its_merge_ticket(self):
