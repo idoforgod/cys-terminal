@@ -3464,7 +3464,10 @@ mod ledger_verbs {
             };
             json!({"lane": l.owner.lane.0, "seat": l.owner.seat, "expires_at": l.expires_at, "claim": l.claim, "view": view})
         });
-        Ok(reply(
+        // T6b · RULINGS HS2: a probation an update ended is named by its closure (a true sentence —
+        // never "다른 수리로 대체됨" when no other repair replaced it)
+        let update_sentence = cys::repair::apply::update_closure_sentence(&rec, rows.iter().find(|r| r.lane == rec.origin_lane));
+        let mut v = reply(
             ctx,
             &rec,
             json!({
@@ -3491,7 +3494,11 @@ mod ledger_verbs {
                 "staging": if is_approval_class(rec.classification) || staging.exists() { json!(staging) } else { Value::Null },
                 "intake_signatures": rec.intake_signatures,
             }),
-        ))
+        );
+        if let Some(sentence) = update_sentence {
+            v["state_label"] = json!(sentence);
+        }
+        Ok(v)
     }
 
     // ─────────────────────────────── cleanup / revert lane condition (WORK) ───────────────────────────────
@@ -3902,11 +3909,13 @@ mod apply_verbs {
             {
                 return Err(VerbError::new(
                     cys::repair::types::ERR_PRECONDITION,
+                    // T6b · RULINGS IL2: what is true for the class of that repair (its record is at hand)
                     format!(
-                        "{r}: 이미 {o} 가 {r} 의 수정본을 다시 입히고 있습니다(상태: {s}) — 두 번 입히지 않습니다. 그 수리가 적용되면 전파로 이 부서에도 닿습니다",
+                        "{r}: 이미 {o} 가 {r} 의 수정본을 다시 입히고 있습니다(상태: {s}) — 두 번 입히지 않습니다. {reach}",
                         r = r_id.as_str(),
                         o = o.id.as_str(),
-                        s = o.state.label_ko()
+                        s = o.state.label_ko(),
+                        reach = cys::repair::apply::reach_of_other_departments(o.classification, o.id.as_str())
                     ),
                 ));
             }
@@ -3959,20 +3968,23 @@ mod apply_verbs {
         let refused = match cys::repair::reapply_claim::claim_in(&ctx.root, &r_id, &ctx.lane, &new_id, ctx.now, &holder_of) {
             Ok(_) => None,
             Err(cys::repair::reapply_claim::ClaimRefused::Held { holder }) => {
-                let s = ledger::read_record_in(&ctx.root, &holder)
-                    .ok()
-                    .flatten()
-                    .map(|o| o.state.label_ko())
-                    .unwrap_or("확인할 수 없음");
+                // T6b · RULINGS IL2: the holder's record (read here already for its state) gives its
+                // class; when it cannot be read, R's own class (the edit it re-applies) is the one at hand
+                let held = ledger::read_record_in(&ctx.root, &holder).ok().flatten();
+                let s = held.as_ref().map(|o| o.state.label_ko()).unwrap_or("확인할 수 없음");
+                let class = held.as_ref().map(|o| o.classification).unwrap_or(r.classification);
                 Some(format!(
-                    "{r}: 이미 {o} 가 {r} 의 수정본을 다시 입히고 있습니다(상태: {s}) — 두 번 입히지 않습니다. 그 수리가 적용되면 전파로 이 부서에도 닿습니다",
+                    "{r}: 이미 {o} 가 {r} 의 수정본을 다시 입히고 있습니다(상태: {s}) — 두 번 입히지 않습니다. {reach}",
                     r = r_id.as_str(),
-                    o = holder.as_str()
+                    o = holder.as_str(),
+                    reach = cys::repair::apply::reach_of_other_departments(class, holder.as_str())
                 ))
             }
+            // T6b · RULINGS IL2: the winner is not at hand — R's own class (the edit it re-applies) is
             Err(cys::repair::reapply_claim::ClaimRefused::LostRace) | Err(cys::repair::reapply_claim::ClaimRefused::ClosedAfterPlacement { .. }) => Some(format!(
-                "{r}: 다른 부서가 방금 {r} 의 수정본을 다시 입히기 시작했습니다 — 두 번 입히지 않습니다. 그 수리가 적용되면 전파로 이 부서에도 닿습니다",
-                r = r_id.as_str()
+                "{r}: 다른 부서가 방금 {r} 의 수정본을 다시 입히기 시작했습니다 — 두 번 입히지 않습니다. {reach}",
+                r = r_id.as_str(),
+                reach = cys::repair::apply::reach_of_other_departments(r.classification, "<그 수리 번호 — cys repair status>")
             )),
             Err(cys::repair::reapply_claim::ClaimRefused::Io(e)) => Some(format!("{}: 다시 입히기 주장을 남기지 못했습니다 — {e}", r_id.as_str())),
         };

@@ -118,30 +118,152 @@ fn windows_recheck_failure_reports_only() {
 
 /// The binding (design §4-9 "자동 복귀가 무엇에 묶이는가", F1 SA:61): an update inside probation
 /// wrote the vendor's bytes (vendor-first) → live ≠ expected → the probation closes `대체됨` and the
-/// job NEVER restores the old bytes, even though the old repair's check would now fail; the same for
-/// a pack-generation change.
+/// job NEVER restores the old bytes, even though the old repair's check would now fail. RULINGS HS1
+/// (b) — the second arm: the update changed the pack generation and the repaired bytes SURVIVED → the
+/// probation ends (no check, no automatic return) and the repair STAYS IN FORCE as 사용 중. RULINGS HN3
+/// (stage 5, H-SEQ-04 (b)) — the generation is the version label AND the pro channel's revision: an
+/// update that changes ONLY the revision (the label stays) is a generation change for both of HS1's
+/// cases — (b) the bytes survived → 사용 중; (a) the update wrote the file → 대체됨 naming it.
 #[test]
 fn update_inside_probation_never_restores_old_bytes() {
-    for gen_change in [false, true] {
-        let r = rig("update");
-        let a = rid("R-4");
-        committed_general(&r, &a, "hooks/s.sh", Some(b"OLD\n"), Some(b"REPAIRED\n"));
-        if gen_change {
-            std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
-        } else {
-            r.put("hooks/s.sh", b"VENDOR-NEW\n", 0o755);
-        }
-        let fail = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Fail("would fail".into()), 5);
-        let d = Doubles { check: &fail, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
-        let lock = r.base.join(".pack-apply.lock");
-        let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
-        assert!(rep.reverted.is_empty(), "never reverted");
-        assert_eq!(rep.superseded, vec![a.clone()]);
-        let want: &[u8] = if gen_change { b"REPAIRED\n" } else { b"VENDOR-NEW\n" };
-        assert_eq!(std::fs::read(r.pack.join("hooks/s.sh")).unwrap(), want);
-        let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
-        assert!(row.probation.unwrap().closed.unwrap().starts_with("대체됨"));
+    // (update, the update wrote the file): "vendor" — the same generation; "label" — `.pack-version`
+    // changes; "revision" — only `.pack-state.json`'s `pro_revision` changes. Every arm runs and every
+    // failing arm is named (one arm's failure never hides the next one's)
+    let failed: Vec<String> = [("vendor", true), ("label", false), ("revision", false), ("revision", true)]
+        .into_iter()
+        .filter(|(update, wrote)| std::panic::catch_unwind(|| update_arm(update, *wrote)).is_err())
+        .map(|(update, wrote)| format!("{update}/{wrote}"))
+        .collect();
+    assert!(failed.is_empty(), "failing arms: {failed:?}");
+}
+
+fn update_arm(update: &str, wrote: bool) {
+    let r = rig("update");
+    let a = rid("R-4");
+    if update == "revision" {
+        std::fs::write(r.pack.join(".pack-state.json"), r#"{"channel": "pro", "base_version": "0.15.0", "pro_revision": 1}"#).unwrap();
     }
+    committed_general(&r, &a, "hooks/s.sh", Some(b"OLD\n"), Some(b"REPAIRED\n"));
+    match update {
+        "label" => std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap(),
+        "revision" => std::fs::write(r.pack.join(".pack-state.json"), r#"{"channel": "pro", "base_version": "0.15.0", "pro_revision": 2}"#).unwrap(),
+        _ => {}
+    }
+    if wrote {
+        r.put("hooks/s.sh", b"VENDOR-NEW\n", 0o755);
+    }
+    let fail = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Fail("would fail".into()), 5);
+    let d = Doubles { check: &fail, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    assert!(rep.reverted.is_empty(), "{update}/{wrote}: never reverted");
+    let want: &[u8] = if wrote { b"VENDOR-NEW\n" } else { b"REPAIRED\n" };
+    assert_eq!(std::fs::read(r.pack.join("hooks/s.sh")).unwrap(), want, "{update}/{wrote}");
+    let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
+    let closed = row.probation.unwrap().closed.unwrap();
+    let state = ledger::read_record_in(&r.root, &a).unwrap().unwrap().state;
+    match (update, wrote) {
+        ("vendor", _) => {
+            assert_eq!(rep.superseded, vec![a.clone()]);
+            assert!(closed.starts_with("대체됨"));
+        }
+        (_, false) => {
+            // RULINGS HS1 (b) — the old expectation of the label arm was `assert_eq!(rep.superseded,
+            // vec![a.clone()])` and `row.probation.unwrap().closed.unwrap().starts_with("대체됨")`
+            // (the record left the in-force set although its bytes were live)
+            assert!(rep.superseded.is_empty(), "{update}: {:?}", rep.superseded);
+            assert_eq!(rep.ended, vec![a.clone()], "{update}");
+            assert_eq!(
+                closed,
+                "사용 중 — 업데이트 뒤에도 수리한 내용이 그대로 있습니다 — 시험 기간은 업데이트로 끝났고 자동 되돌리기는 하지 않습니다",
+                "{update}"
+            );
+            assert_eq!(state, RepairState::InUse, "{update}: still in force");
+        }
+        (_, true) => {
+            assert_eq!(rep.superseded, vec![a.clone()], "{update}");
+            assert_eq!(closed, "대체됨 — 업데이트가 수리한 파일을 바꿨습니다(hooks/s.sh) — 아무것도 되돌리지 않습니다(새 버전 우선)", "{update}");
+            assert_eq!(state, RepairState::Superseded, "{update}");
+        }
+    }
+}
+
+/// RULINGS HS1 (a): a repair of TWO files; the update changes the pack generation and writes ONE of
+/// them (the other keeps the repaired bytes) → the probation closes 대체됨 naming the file the update
+/// wrote, no check runs, nothing is put back, the record is superseded. Without HS1 the closure said
+/// only that the generation had changed ("대체됨 — 팩 세대가 적용 때와 다르거나 …").
+#[test]
+fn an_update_that_wrote_one_target_supersedes_the_repair() {
+    let r = rig("hs1a");
+    let a = rid("R-4");
+    let mut rec = committed_general(&r, &a, "hooks/m1.sh", Some(b"OLD1\n"), Some(b"REPAIRED1\n"));
+    r.put("hooks/m2.sh", b"OLD2\n", 0o755);
+    let pre2 = ledger::copy_preimage_in(&r.root, &a, &r.lane, "hooks/m2.sh", &r.pack.join("hooks/m2.sh"), 1.0).unwrap();
+    let post2 = r.put("hooks/m2.sh", b"REPAIRED2\n", 0o755);
+    rec.files.push(crate::repair::ledger::FileChange { rel: "hooks/m2.sh".into(), kind: crate::repair::ledger::ChangeKind::Edit, pre: pre2, post: post2.clone(), diff: None });
+    rec.committed.push(("hooks/m2.sh".into(), post2.canon()));
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    lane_row(&r, &a, rec.committed.clone(), Vec::new());
+    // the update: a new generation; it writes m2 and keeps m1
+    std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
+    r.put("hooks/m2.sh", b"VENDOR2\n", 0o755);
+    let never = |_: &str, _: &Path, _: Duration| -> Result<CheckOutcome, RepairError> { panic!("no check after an update") };
+    let d = Doubles { check: &never, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    assert!(rep.reverted.is_empty(), "never reverted");
+    assert_eq!(rep.superseded, vec![a.clone()]);
+    assert_eq!(std::fs::read(r.pack.join("hooks/m1.sh")).unwrap(), b"REPAIRED1\n");
+    assert_eq!(std::fs::read(r.pack.join("hooks/m2.sh")).unwrap(), b"VENDOR2\n", "nothing put back");
+    let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
+    assert_eq!(closed, "대체됨 — 업데이트가 수리한 파일을 바꿨습니다(hooks/m2.sh) — 아무것도 되돌리지 않습니다(새 버전 우선)");
+    assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::Superseded);
+}
+
+/// RULINGS HS1 in a lane that is NOT the repair's origin (its row has its own probation, bound to the
+/// generation it applied in). Case (b) there: the row's probation closes with the same true sentence;
+/// the row keeps its state (검증됨) and its applied result; the record is not touched by that lane (the
+/// origin decides the record — here it is still in its probation until the origin's own pass, which
+/// then makes it 사용 중). Case (a) there: the row closes 대체됨 naming the file; the record is not
+/// touched by that lane either. Without HS1 both rows closed "대체됨 — 팩 세대가 …".
+#[test]
+fn an_update_in_another_lane_closes_that_lanes_probation_by_the_same_rule() {
+    let r = rig("hs1lanes");
+    let kept = rid("R-4");
+    let wrote = rid("R-5");
+    committed_general(&r, &kept, "hooks/k.sh", Some(b"OLDK\n"), Some(b"REPAIREDK\n"));
+    committed_general(&r, &wrote, "hooks/w.sh", Some(b"OLDW\n"), Some(b"REPAIREDW\n"));
+    let other = LaneKey("dept-2".into());
+    for id in [&kept, &wrote] {
+        let mut row = ledger::read_lane_in(&r.root, id, &r.lane).unwrap().unwrap();
+        row.lane = other.clone();
+        ledger::write_lane_in(&r.root, &row).unwrap();
+    }
+    std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
+    r.put("hooks/w.sh", b"VENDORW\n", 0o755);
+    let never = |_: &str, _: &Path, _: Duration| -> Result<CheckOutcome, RepairError> { panic!("no check after an update") };
+    let d = Doubles { check: &never, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    let mut env = job(&r, &d, ApplyForm::Exchange, NOW, &lock);
+    env.op.lane = &other;
+    let _ = run_tick(&env, false).unwrap();
+    let row = ledger::read_lane_in(&r.root, &kept, &other).unwrap().unwrap();
+    assert_eq!(
+        row.probation.as_ref().unwrap().closed.as_deref(),
+        Some("사용 중 — 업데이트 뒤에도 수리한 내용이 그대로 있습니다 — 시험 기간은 업데이트로 끝났고 자동 되돌리기는 하지 않습니다")
+    );
+    assert_eq!(row.state, crate::repair::types::LaneState::Verified, "the lane keeps its state");
+    assert_eq!(ledger::read_record_in(&r.root, &kept).unwrap().unwrap().state, RepairState::Probation, "another lane never decides the record");
+    let row = ledger::read_lane_in(&r.root, &wrote, &other).unwrap().unwrap();
+    assert_eq!(
+        row.probation.as_ref().unwrap().closed.as_deref(),
+        Some("대체됨 — 업데이트가 수리한 파일을 바꿨습니다(hooks/w.sh) — 아무것도 되돌리지 않습니다(새 버전 우선)")
+    );
+    assert_eq!(ledger::read_record_in(&r.root, &wrote).unwrap().unwrap().state, RepairState::Probation, "another lane never decides the record");
+    // the origin's own pass then decides the records
+    let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 700.0, &lock), false).unwrap();
+    assert_eq!(ledger::read_record_in(&r.root, &kept).unwrap().unwrap().state, RepairState::InUse);
+    assert_eq!(ledger::read_record_in(&r.root, &wrote).unwrap().unwrap().state, RepairState::Superseded);
 }
 
 /// Only repaired files are re-checked (A 1-4 — no full per-boot sweep): an unrelated broken file in
@@ -438,23 +560,40 @@ fn m10_hang_attribution() {
 
 // ───────────────────────────── RULINGS CT10 — supersession before expiry; clock steps ─────────────────────────────
 
-/// CT10: at (or past) the 24-hour boundary a probation whose generation changed — or whose live file
-/// is not the applied state — closes 대체됨, never 사용 중 (a sleeping machine / a forward clock step).
-/// Without CT10 the 24-hour close came first.
+/// CT10: at (or past) the 24-hour boundary the binding is judged BEFORE the 24-hour close (a sleeping
+/// machine / a forward clock step): a probation whose generation changed and whose file the update
+/// wrote — or whose live file is not the applied state — closes 대체됨, never 사용 중. RULINGS HS1 (b):
+/// when the generation changed and the repaired bytes SURVIVED, the probation is ended by the update
+/// (its own sentence, the repair in force) — never by the 24-hour close. Without CT10 the 24-hour
+/// close came first.
 #[cfg(target_os = "macos")]
 #[test]
 fn supersession_is_checked_before_the_24_hour_close() {
-    let r = rig("ct10expiry");
-    let a = rid("R-1");
-    committed_general(&r, &a, "hooks/s.sh", Some(b"PRE\n"), Some(b"POST\n"));
-    std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
-    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
-    let lock = r.base.join(".pack-apply.lock");
-    let later = NOW + 3.0 * 86_400.0;
-    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, later, &lock), false).unwrap();
-    assert!(rep.superseded.contains(&a) && !rep.ended.contains(&a), "{rep:?}");
-    let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
-    assert!(row.probation.unwrap().closed.unwrap().starts_with("대체됨"));
+    for wrote in [true, false] {
+        let r = rig("ct10expiry");
+        let a = rid("R-1");
+        committed_general(&r, &a, "hooks/s.sh", Some(b"PRE\n"), Some(b"POST\n"));
+        std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
+        if wrote {
+            r.put("hooks/s.sh", b"VENDOR\n", 0o755);
+        }
+        let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
+        let lock = r.base.join(".pack-apply.lock");
+        let later = NOW + 3.0 * 86_400.0;
+        let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, later, &lock), false).unwrap();
+        let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
+        if wrote {
+            assert!(rep.superseded.contains(&a) && !rep.ended.contains(&a), "{rep:?}");
+            assert!(closed.starts_with("대체됨"), "{closed}");
+        } else {
+            // RULINGS HS1 (b) — the old expectation (the bytes had survived the update) was
+            // `assert!(rep.superseded.contains(&a) && !rep.ended.contains(&a))` and a closure that
+            // `starts_with("대체됨")`
+            assert!(rep.ended.contains(&a) && !rep.superseded.contains(&a), "{rep:?}");
+            assert_eq!(closed, "사용 중 — 업데이트 뒤에도 수리한 내용이 그대로 있습니다 — 시험 기간은 업데이트로 끝났고 자동 되돌리기는 하지 않습니다");
+            assert!(!closed.contains("24시간"), "never the 24-hour close: {closed}");
+        }
+    }
 }
 
 /// CT10: a BACKWARD clock step never postpones a due check beyond one interval — the work is due at
@@ -1796,4 +1935,107 @@ fn the_notice_book_answers_unreadable_for_a_fifo_and_serves_the_next_request() {
     // nothing was lost: the notice is still due and goes out now
     let due = hand_out_due_notices_in(&r.root, &lane).unwrap();
     assert_eq!(due.iter().map(|d| d.key.as_str()).collect::<Vec<_>>(), vec!["f:hooks/x.sh:ab:kept"]);
+}
+
+// ───────────────────────────── RULINGS IE1 — one observation of the generation ─────────────────────────────
+
+/// IE1 (codex T6b r1 M1): the pack's present generation is observed ONCE and that one value decides.
+/// The marker read answers "unknown" and a second read would answer the row's own generation (no
+/// update happened): the outcome is the one of an unknown generation (대체됨, EJ1 / EN3) — never HS1's
+/// "the update kept the bytes". Without IE1 the second read entered HS1 and the probation ended 사용 중
+/// with its automatic return disarmed.
+#[test]
+fn one_observation_of_the_generation_decides() {
+    let r = rig("ie1");
+    let a = rid("R-4");
+    committed_general(&r, &a, "hooks/s.sh", Some(b"OLD\n"), Some(b"REPAIRED\n"));
+    let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
+    let rec = ledger::read_record_in(&r.root, &a).unwrap().unwrap();
+    let mine = crate::repair::apply::Bound::from_row(row.probation.as_ref().unwrap());
+    assert!(mine.known().is_some());
+    crate::repair::apply::BOUND_NOW_SCRIPT.with(|q| q.borrow_mut().extend([crate::repair::apply::Bound::Unknown, mine.clone()]));
+    let never = |_: &str, _: &Path, _: Duration| -> Result<CheckOutcome, RepairError> { panic!("no check") };
+    let d = Doubles { check: &never, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    let env = job(&r, &d, ApplyForm::Exchange, NOW, &lock);
+    let mut report = TickReport::default();
+    let done = recheck_one(&env, &rec, &row, &mut report);
+    crate::repair::apply::BOUND_NOW_SCRIPT.with(|q| q.borrow_mut().clear());
+    done.unwrap();
+    let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
+    assert!(closed.starts_with("대체됨 — 팩 세대가 적용 때와 다르거나 알 수 없습니다"), "{closed}");
+    assert!(report.ended.is_empty(), "{report:?}");
+    assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::Superseded);
+}
+
+// ───────────────────────────── RULINGS IE4 / IG1 — the engine's one bound on what it reads ─────────────────────────────
+
+/// IG1 / IW1: a LIVE target over the engine's read limit at the probation re-check is ANOTHER writer's
+/// bytes (a measured difference): the probation closes 대체됨 without reading it, no check runs, nothing
+/// is moved, the record is superseded. Before IW1 (old expectation): nothing closed, the record still
+/// `Probation`, a fault line naming the limit (retried every tick).
+#[test]
+fn a_live_target_over_the_limit_is_never_read_by_the_recheck() {
+    use crate::repair::durable::{read_seam, RECORD_READ_CAP as CAP};
+    let r = rig("ig1recheck");
+    let a = rid("R-4");
+    committed_general(&r, &a, "hooks/s.sh", Some(b"OLD\n"), Some(b"REPAIRED\n"));
+    let live = r.pack.join("hooks/s.sh");
+    std::fs::OpenOptions::new().write(true).open(&live).unwrap().set_len(CAP + 1).unwrap();
+    let before = read_seam::bytes_read_from(&live);
+    let never = |_: &str, _: &Path, _: Duration| -> Result<CheckOutcome, RepairError> { panic!("no check") };
+    let d = Doubles { check: &never, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    assert_eq!(read_seam::bytes_read_from(&live) - before, 0, "the live file is never read");
+    assert_eq!(rep.superseded, vec![a.clone()], "{rep:?}");
+    let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
+    assert!(closed.starts_with("대체됨"), "{closed}");
+    assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::Superseded);
+    assert!(rep.reverted.is_empty() && rep.ended.is_empty(), "{rep:?}");
+    assert_eq!(std::fs::metadata(&live).unwrap().len(), CAP + 1, "nothing moved");
+}
+
+/// IW2: M10's read of the approved holder made INSIDE the pack-apply exclusion goes through the
+/// bounded path — a FIFO (a writer offering bytes to every reader) or a file over the limit gives no
+/// hash at once (no put-back), never a wait or a whole read. Without IW2 it was `std::fs::read`.
+#[cfg(unix)]
+#[test]
+fn the_approved_holder_is_hashed_within_the_one_limit() {
+    use crate::repair::durable::RECORD_READ_CAP as CAP;
+    use std::io::Write;
+    let r = rig("iw2holder");
+    let small = r.base.join("holder/small");
+    std::fs::create_dir_all(small.parent().unwrap()).unwrap();
+    std::fs::write(&small, b"APPROVED\n").unwrap();
+    assert_eq!(holder_sha(&small), Some(sha_hex(b"APPROVED\n")));
+    let big = r.base.join("holder/big");
+    std::fs::File::create(&big).unwrap().set_len(CAP + 1).unwrap();
+    assert_eq!(holder_sha(&big), None, "over the limit: no hash");
+    let fifo = r.base.join("holder/fifo");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (w_stop, w_at) = (std::sync::Arc::clone(&stop), fifo.clone());
+    let writer = std::thread::spawn(move || {
+        use std::os::unix::fs::FileTypeExt;
+        while !w_stop.load(std::sync::atomic::Ordering::SeqCst) && std::fs::symlink_metadata(&w_at).is_ok_and(|m| m.file_type().is_fifo()) {
+            match std::fs::OpenOptions::new().write(true).open(&w_at) {
+                Ok(mut f) => {
+                    let _ = f.write_all(b"APPROVED\n");
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let got = holder_sha(&fifo);
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let release = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&fifo).unwrap()
+    };
+    writer.join().unwrap();
+    drop(release);
+    assert_eq!(got, None, "a FIFO holder: no hash, at once");
 }
