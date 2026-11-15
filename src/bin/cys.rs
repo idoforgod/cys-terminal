@@ -42325,6 +42325,120 @@ mod tests {
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
     }
 
+    /// ★(0.15.0 · S5-PINS · RULINGS JE2) H-11cha-N1-01 — the revive command's dry run (its list mode: one
+    /// `adopt_list_line` per legacy `.user`, the same call that picks `--all`'s targets) against the REAL revive.
+    /// The real command is the authority (it refuses, fail-closed); the list overstates in two classes — recorded as
+    /// minor #172 and NOT pinned here (a wrong word is not pinned as right):
+    ///   · the six classes where they agree go through `cys pack-adopt --all --yes`: no skip reason ⇔ revived (live bytes =
+    ///     the `.user` copy, ledger `adopted`); a skip reason ⇔ untouched;
+    ///   · B (vendor advanced past the recorded base) through the single-file form: refused without `--merge-after` (its
+    ///     sentence, nothing changed), revived with it;
+    ///   · F (the live file edited again after the heal): the REAL refusal ("디스크본이 vendor 본도 소스본도 아님 … 수동
+    ///     병합 후 재시도") and nothing changed — whatever the list says about it.
+    #[test]
+    fn m11_pack_adopt_dry_run_matches_the_real_revive_and_the_real_refusals_hold() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, _, _, _env) = t4_system_fixture("m11dryreal");
+        let sources = cys::pack::UpdateSources::for_live_pack(&td);
+        let mut plain = cys::pack::PACK_ALL
+            .iter()
+            .filter(|(r, _)| cys::pack::ownership_name_scoped(r, &td) == "system" && *r != "trusted-keys.json" && !sources.is_listed(r))
+            .map(|(r, e)| (r.to_string(), e.to_string()));
+        let (listed, listed_embed) = cys::pack::PACK_ALL
+            .iter()
+            .find(|(r, _)| sources.is_listed(r))
+            .map(|(r, e)| (r.to_string(), e.to_string()))
+            .expect("a listed (boot-critical / protection) pack file");
+        // (case, rel, live bytes or None = absent, `.user` bytes, manifest+pristine base or None, ledger kind)
+        let mut cases: Vec<(&str, String, Option<Vec<u8>>, Vec<u8>, Option<String>, &str)> = Vec::new();
+        let mut add = |name: &'static str, live: Option<&str>, user: &[u8], base: Option<&str>, kind: &'static str| {
+            let (r, e) = plain.next().expect("enough unlisted system pack files");
+            let live = Some(live.map(str::to_string).unwrap_or_else(|| e.clone()).into_bytes());
+            cases.push((name, r, live, user.to_vec(), Some(base.map(str::to_string).unwrap_or(e)), kind));
+        };
+        add("A healed, vendor unchanged since the heal", None, b"MY FIX A\n", None, "healed");
+        add("B healed, vendor advanced past the recorded base", None, b"MY FIX B\n", Some("OLDER RELEASE BYTES B\n"), "healed");
+        add("C healed, the owner chose the vendor copy (audit pack-heal)", None, b"MY FIX C\n", None, "healed");
+        add("D healed, the backup is not UTF-8 (CP949)", None, &[0xC7u8, 0xD1, 0x0A], None, "healed");
+        add("F healed, the live file was edited again after the heal", Some("EDITED AFTER THE HEAL F\n"), b"MY FIX F\n", None, "healed");
+        add("G conflicted, vendor unchanged", None, b"MY FIX G\n", None, "conflicted");
+        cases.push(("E healed, a listed (boot-critical) file", listed, Some(listed_embed.clone().into_bytes()), b"MY FIX E\n".to_vec(), Some(listed_embed), "healed"));
+        cases.push(("H healed, not in the embedded pack (custom)", "custom-notes/S5PINS.md".into(), None, b"MY NOTES H\n".to_vec(), None, "healed"));
+        let mut ledger = serde_json::Map::new();
+        for (name, rel, live, user, base, kind) in &cases {
+            let target = td.join(rel);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            if let Some(l) = live {
+                std::fs::write(&target, l).unwrap();
+            }
+            std::fs::write(td.join(format!("{rel}.user")), user).unwrap();
+            if let Some(b) = base {
+                t4_manifest_set(&td, rel, b);
+                t4_pristine_set(&td, rel, b);
+            }
+            if name.starts_with('C') {
+                cys::pack::append_merge_audit(&td, &serde_json::json!({"file": rel, "action": "pack-heal", "flags": []})).unwrap();
+            }
+            ledger.insert(rel.clone(), serde_json::json!({"kind": kind, "side": format!("{rel}.user"), "version": "0.14.56", "ts": 0}));
+        }
+        cys::pack::save_merge_pending(&td, &ledger).unwrap();
+        let case = |p: char| cases.iter().find(|c| c.0.starts_with(p)).unwrap().clone();
+        // what "nothing changed" means for one file: live bytes, the `.user` copy and the ledger row as set up
+        let unchanged = |c: &(&str, String, Option<Vec<u8>>, Vec<u8>, Option<String>, &str)| {
+            std::fs::read(td.join(&c.1)).ok() == c.2
+                && std::fs::read(td.join(format!("{}.user", c.1))).ok().as_deref() == Some(&c.3[..])
+                && t4_ledger_kind(&td, &c.1).as_deref() == Some(c.5)
+        };
+        // the dry run, taken before anything runs: exactly what the list mode prints for each file
+        let dry: Vec<(String, Option<&'static str>)> = cases.iter().map(|c| adopt_list_line(&td, &c.1, &sources)).collect();
+
+        // ① the real revive pass over all eight: the six agreeing classes revive / stay exactly as the dry run says
+        let rc = run_pack_adopt_with(None, true, None, false, true, &sources);
+        assert_eq!(rc, 1, "B and F are refused inside `--all` (fail-closed), so the pass reports a failure");
+        for (c, (line, skip)) in cases.iter().zip(&dry) {
+            if c.0.starts_with('B') || c.0.starts_with('F') {
+                assert!(unchanged(c), "{}: the real `--all` must leave it untouched", c.0);
+                continue;
+            }
+            let now = std::fs::read(td.join(&c.1)).ok();
+            let revived = now.as_deref() == Some(&c.3[..]) && t4_ledger_kind(&td, &c.1).as_deref() == Some("adopted");
+            if skip.is_none() {
+                assert!(revived, "{} ({}): dry run «{line}» said revive, the real `--all` did not", c.0, c.1);
+            } else {
+                assert!(unchanged(c), "{} ({}): dry run «{line}» ({skip:?}) said skip, the real `--all` changed it", c.0, c.1);
+            }
+        }
+        // ② F — the real single-file refusal, and nothing changed (minor #172: the list's word for F is not pinned)
+        let f = case('F');
+        let err = adopt_one(&td, &f.1, None, false, true, &sources).expect_err("F must be refused by the real command");
+        assert!(
+            err.contains("디스크본이 vendor 본도 소스본도 아님") && err.contains("수동 병합 후 재시도"),
+            "F: the real refusal changed: {err}"
+        );
+        assert!(unchanged(&f), "F: a refused revive changed something");
+        // ③ B — the single-file form: refused without `--merge-after` (its sentence, nothing changed), revived with it
+        let b = case('B');
+        let err = adopt_one(&td, &b.1, None, false, true, &sources).expect_err("B without --merge-after must be refused");
+        assert!(err.contains("vendor 전진 검출") && err.contains("--merge-after"), "B: the refusal changed: {err}");
+        assert!(unchanged(&b), "B: a refused revive changed something");
+        assert_eq!(run_pack_adopt_with(Some(b.1.clone()), false, None, true, true, &sources), 0, "B with --merge-after is revived");
+        let kind = t4_ledger_kind(&td, &b.1);
+        assert!(matches!(kind.as_deref(), Some("merged") | Some("user-kept")), "B after --merge-after: {kind:?}");
+        if kind.as_deref() == Some("user-kept") {
+            assert_eq!(std::fs::read(td.join(&b.1)).unwrap(), b.3, "B user-kept: the revived copy is live");
+        }
+        let b_target = td.join(&b.1);
+        let b_name = b_target.file_name().unwrap().to_string_lossy().into_owned();
+        let adopted: Vec<Vec<u8>> = std::fs::read_dir(b_target.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{b_name}.user.adopted-")))
+            .map(|e| std::fs::read(e.path()).unwrap())
+            .collect();
+        assert_eq!(adopted, vec![b.3.clone()], "B: the revived `.user` copy is kept as `<rel>.user.adopted-<ts>`");
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
     /// ★0.15.0 M11 아 + RULINGS AC1: pack-rollback 은 이 레인의 업데이트 전 스냅샷이 있으면 그것을 원천으로 쓰고, 기록 해시로
     /// 검증한 뒤에만 쓴다. system 파일은 그 항목이 **출시본**일 때만 되돌린다(부록 A-2 #12 — 사용자 수정본은 강행으로도
     /// 거부), vendor-first 기록이 있는 파일은 언제나 거부한다(규칙 나 — 다시 입히기는 수리 흐름 · ★T2g: RULINGS CR1 이 CL1 (a) 를
