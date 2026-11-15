@@ -335,6 +335,52 @@ fn py_compile(file: &Path, rel: &str, deadline: Duration) -> Result<CheckResult,
     Ok(outcome_result(&o, rel, "파이썬 컴파일 검사"))
 }
 
+/// RULINGS LH2 — the programs a check child runs where the replay runner is not built (Windows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckProgram {
+    /// the interpreter of the compile check
+    Python,
+    /// the shell of the syntax check of a script whose first line does not name bash
+    Sh,
+    /// the shell of the syntax check of a script whose first line names bash
+    Bash,
+}
+
+/// RULINGS LH1 / LH2 — where the check finds `prog` for a daemon whose binary lies in `exe_dir`, on
+/// `os` (the `std::env::consts::OS` spelling): a PURE function of those two inputs (one stat), so that
+/// a test on any host drives the Windows answer with a temporary folder. `Ok` = a regular file is
+/// there; `Err` = a sentence naming what was looked for.
+pub fn bundled_check_program_for(
+    exe_dir: &Path,
+    os: &str,
+    prog: CheckProgram,
+) -> Result<PathBuf, String> {
+    // the lookup the check stands on today, made a function of its inputs: the interpreter is a file
+    // named `python3` in the Windows arm of `runtime_bin_dirs` (`bundled_python3_path`), the shells
+    // are `/bin/sh` / `/bin/bash` on every platform (`sh_syntax`)
+    let found = match prog {
+        CheckProgram::Python if os == "windows" => {
+            let rt = exe_dir.join("runtime");
+            [
+                rt.join("python"),
+                rt.join("git").join("cmd"),
+                rt.join("git").join("usr").join("bin"),
+                rt.join("node"),
+            ]
+            .into_iter()
+            .map(|d| d.join("python3"))
+            .find(|p| p.is_file())
+        }
+        CheckProgram::Python => None,
+        CheckProgram::Sh => Some(PathBuf::from("/bin/sh")).filter(|p| p.is_file()),
+        CheckProgram::Bash => Some(PathBuf::from("/bin/bash")).filter(|p| p.is_file()),
+    };
+    match found {
+        Some(p) => Ok(p),
+        None => Err(format!("{prog:?}: 찾지 못했습니다")),
+    }
+}
+
 enum Exec<'a> {
     SelfTest(&'a str),
     Hook(&'a str),
