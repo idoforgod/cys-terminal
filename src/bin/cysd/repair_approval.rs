@@ -2121,7 +2121,11 @@ pub(crate) fn spawn_helper(
     use cys::SpawnPolicy;
     // a bounded child the daemon keeps hold of (killed + reaped at 120 s); on Windows no console
     // window; the rival-daemon autostart sealed (a `cys` child never starts a daemon — flood ①);
-    // RULINGS JW1: bound to its request (the nonce in its environment, its output piped)
+    // RULINGS JW1: bound to its request (the nonce in its environment, its output piped).
+    // RULINGS LF1: the window policy is in the builder's own chain from `Command::new` (the released
+    // spawn census reads that chain; a builder handed to a function is no shape it reads). Same
+    // child: `spawn_policy(Attached)` sets only the Windows creation flags, `bind_helper` only the
+    // nonce variable and the piped output — neither touches what the other sets.
     bind_helper(
         std::process::Command::new(crate::state::sibling_cli_path())
             .args([
@@ -2139,10 +2143,10 @@ pub(crate) fn spawn_helper(
             .env_remove("AITERM_SURFACE_ID")
             .env_remove("CYS_SURFACE_ROLE")
             .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()),
+            .stderr(std::process::Stdio::null())
+            .spawn_policy(cys::ChildLifetime::Attached),
         nonce,
     )
-    .spawn_policy(cys::ChildLifetime::Attached)
     .no_autostart()
     .spawn()
 }
@@ -2160,14 +2164,15 @@ pub(crate) fn spawn_helper(
 ) -> std::io::Result<std::process::Child> {
     use cys::SpawnPolicy;
     let rig = std::env::var("CYS_REPAIR_TEST_AUTH_ANSWER").unwrap_or_default();
+    // RULINGS LF1: the window policy in the builder's own chain, as in the production spawn above
     bind_helper(
         std::process::Command::new("/bin/sh")
             .args(["-c", TEST_AUTH_SCRIPT, "sh", &rig, request_id])
             .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()),
+            .stderr(std::process::Stdio::null())
+            .spawn_policy(cys::ChildLifetime::Attached),
         nonce,
     )
-    .spawn_policy(cys::ChildLifetime::Attached)
     .spawn()
 }
 

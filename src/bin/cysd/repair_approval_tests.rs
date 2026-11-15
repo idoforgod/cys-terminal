@@ -274,13 +274,14 @@ impl Effects for Rec {
                     0 => "printf 'CYS-AUTH-OK v1 request=%s nonce=%s\\n' \"$1\" \"$CYS_REPAIR_AUTH_NONCE\"; exit 0".to_string(),
                     c => format!("exit {c}"),
                 };
+                // RULINGS LF1: the window policy in the builder's own chain (the census reads it)
                 bind_helper(
                     std::process::Command::new("/bin/sh")
                         .args(["-c", &script, "sh", request_id])
-                        .stdin(std::process::Stdio::null()),
+                        .stdin(std::process::Stdio::null())
+                        .spawn_policy(cys::ChildLifetime::Attached),
                     nonce,
                 )
-                .spawn_policy(cys::ChildLifetime::Attached)
                 .spawn()
             }
         }
@@ -742,14 +743,15 @@ fn only_the_requests_success_record_approves() {
     use cys::SpawnPolicy;
     let (rid, nonce) = ("rq-00aa", "00112233445566778899aabbccddeeff");
     let run = |script: &str| -> bool {
+        // RULINGS LF1: the window policy in the builder's own chain (the census reads it)
         let child = bind_helper(
             std::process::Command::new("/bin/sh")
                 .args(["-c", script, "sh", rid])
                 .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null()),
+                .stderr(std::process::Stdio::null())
+                .spawn_policy(cys::ChildLifetime::Attached),
             nonce,
         )
-        .spawn_policy(cys::ChildLifetime::Attached)
         .spawn()
         .unwrap();
         wait_helper_for(child, Duration::from_secs(20), rid, nonce)
