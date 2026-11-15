@@ -572,7 +572,11 @@ fn print_ok(out: &mut dyn Write, verb: &str, v: &Value, json_out: bool) {
             lanes_line(v),
             match v.get("propagation_complete") {
                 Some(Value::Bool(true)) => " · 전파 완료".to_string(),
-                Some(Value::Bool(false)) => " · 전파 미완".to_string(),
+                // T6b · RULINGS HS2: why it is not complete (a repair not in force) is said
+                Some(Value::Bool(false)) => match v.get("propagation_note").and_then(|n| n.as_str()).filter(|n| !n.is_empty()) {
+                    Some(n) => format!(" · 전파 미완({n})"),
+                    None => " · 전파 미완".to_string(),
+                },
                 _ => format!(" · 전파 완료 판정 불가({})", s(v, "propagation_note")),
             }
         ),
@@ -1449,6 +1453,24 @@ mod tests {
         let mut none = base;
         none["notices_not_confirmed"] = json!([]);
         assert!(!render(none).contains("알림"), "nothing printed when there is none");
+    }
+
+    /// RULINGS HS2: a repair that is not in force prints WHY its propagation is not complete (the
+    /// daemon's `propagation_note`) — never a bare "전파 미완" that reads as pending; the state sentence
+    /// is the daemon's `state_label` as given. Without HS2 the note was dropped.
+    #[test]
+    fn status_says_why_the_propagation_of_a_repair_not_in_force_is_not_complete() {
+        let label = "대체됨 — 업데이트가 수리한 파일을 바꿨습니다(hooks/h.sh) — 아무것도 되돌리지 않습니다(새 버전 우선)";
+        let answer = json!({"repair": "R-2", "state": "superseded", "state_label": label, "classification_label": "일반",
+            "attempt": 1, "max_rounds": 3, "lanes": {"base": "검증됨"}, "propagation_complete": false,
+            "propagation_note": "사용 중인 수리가 아님"});
+        let rpc = move |_m: &str, _p: Value| -> Result<Value, String> { Ok(answer.clone()) };
+        let cmd = parse(&["status", "R-2"]).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(run_with(&cmd, &mut out, &mut Vec::new(), &rpc), 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with(&format!("R-2: {label} · 일반")), "{text}");
+        assert!(text.contains("· 전파 미완(사용 중인 수리가 아님)"), "{text}");
     }
 
     /// RULINGS DA6: `cys repair status <R>` names a corrupt record in its normal output (not only

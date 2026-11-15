@@ -1773,6 +1773,16 @@ pub fn update_wrote_closure(rels: &[String]) -> String {
     format!("대체됨 — {UPDATE_WROTE_SENTENCE}({}) — 아무것도 되돌리지 않습니다(새 버전 우선)", rels.join(", "))
 }
 
+/// RULINGS HS2 — the sentence `status` shows for a repair whose probation an update ended: the origin
+/// lane's closure when it is one of HS1's two AND the record holds the state that closure set (사용 중
+/// / superseded); `None` otherwise (the state's own label stands).
+pub fn update_closure_sentence(rec: &RepairRecord, origin_row: Option<&ledger::LaneRecord>) -> Option<String> {
+    let closed = origin_row?.probation.as_ref()?.closed.as_deref()?;
+    let kept = closed == update_kept_closure() && rec.state == RepairState::InUse;
+    let wrote = closed.starts_with(&format!("대체됨 — {UPDATE_WROTE_SENTENCE}(")) && rec.state == RepairState::Superseded;
+    (kept || wrote).then(|| closed.to_string())
+}
+
 /// RULINGS FI1 — whether `rec`'s pre-images were taken in a generation other than the pack's NOW:
 /// any pre-image slot whose recorded generation is absent (Unknown), unreadable, or different from
 /// the generation read now (itself Unknown → true). A record without a pre-image slot → false.
