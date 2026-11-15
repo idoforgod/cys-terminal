@@ -715,6 +715,7 @@ pub(crate) fn lane_row(r: &Rig, id: &RepairId, applied: Vec<(String, String)>, t
             merge_base: Vec::new(),
             merge_lock: None,
             merge_attempt: 0,
+            reason: String::new(),
             updated_at: 1.0,
         },
     )
@@ -2809,7 +2810,10 @@ const CENSUS_WRITE_CALLS: &[&str] = &[
     "atomic_write_bytes", "clonefile", "renamex_np", "copy_file_new", "copy_link_new", "create_new_with", "write_all", "set_len",
 ];
 const CENSUS_WRITE_LITERALS: &[&str] = &[".create_new(true)", ".create(true)"];
-const CENSUS_WRITE_CLASSES: &[&str] = &["door", "vault", "staging", "ledger"];
+// T7b (RULINGS HH9): one class of ONE row added — `pack-instance-id`, the pack-instance pass's only
+// write in the pack (I8 step 3: `<pack>/.repair-pack-id`; its own bookkeeping, not pack content). The
+// old list, quoted: ["door", "vault", "staging", "ledger"].
+const CENSUS_WRITE_CLASSES: &[&str] = &["door", "vault", "staging", "ledger", "pack-instance-id"];
 /// FG1: every site that can turn a read error into a value.
 const CENSUS_READ_LITERALS: &[&str] = &[".unwrap_or_default()", ".ok()", ".unwrap_or(", ".unwrap_or_else(", ".exists()", "let Ok(", ".is_ok()", ".is_ok_and(", "Err(_) =>"];
 const CENSUS_READ_CLASSES: &[&str] = &["evidence", "reported", "conservative", "not-a-read", "display", "test", "outside"];
@@ -2907,7 +2911,9 @@ fn the_read_census_catches_a_new_collapse() {
     assert!(!read_census(&one_line).is_empty(), "a one-line read collapse");
 }
 
-const CENSUS_MODULE_FILES: &[&str] = &["apply.rs", "boot_critical.rs", "boot_critical_derive.rs", "consumed.rs", "durable.rs", "exchange.rs", "grant.rs", "guard.rs", "intake.rs", "ledger.rs", "lock.rs", "mod.rs", "owner_origin.rs", "paths.rs", "platform.rs", "probation.rs", "reapply_claim.rs", "rehearsal.rs", "replay.rs", "roles.rs", "rules.rs", "screen.rs", "screen_corpus.rs", "tombstones.rs", "types.rs", "vault.rs", "wal.rs"];
+// T7b (RULINGS HH9): `propagate.rs` added — the old list, quoted, ended "… "probation.rs",
+// "reapply_claim.rs", …" (27 files with T5b's `replay.rs` / `screen_corpus.rs`; now 28).
+const CENSUS_MODULE_FILES: &[&str] = &["apply.rs", "boot_critical.rs", "boot_critical_derive.rs", "consumed.rs", "durable.rs", "exchange.rs", "grant.rs", "guard.rs", "intake.rs", "ledger.rs", "lock.rs", "mod.rs", "owner_origin.rs", "paths.rs", "platform.rs", "probation.rs", "propagate.rs", "reapply_claim.rs", "rehearsal.rs", "replay.rs", "roles.rs", "rules.rs", "screen.rs", "screen_corpus.rs", "tombstones.rs", "types.rs", "vault.rs", "wal.rs"];
 const WRITE_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("apply.rs", "door", "door", 4, "the ONE door: exchange / place / move out / make parents"),
     ("apply.rs", "drop", "staging", 4, "the screen's view of the slots' bytes (apply_candidate_in), removed on every exit"),
@@ -2951,6 +2957,14 @@ const WRITE_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("probation.rs", "save_findings", "ledger", 1, "the findings view (durable)"),
     ("probation.rs", "scratch_pre_image", "staging", 5, "our own scratch copy for the O3 control"),
     ("probation.rs", "write_job_state", "ledger", 1, "the job state (durable)"),
+    // T7b (RULINGS HH9) — the propagation's writes
+    ("propagate.rs", "copy_checked", "staging", 1, "the lane's own scratch copy for the copy-check (11.2), removed on every exit"),
+    ("propagate.rs", "copy_checked_bytes_of", "staging", 1, "the lane's own scratch copy for the copy-check (11.2), removed on every exit"),
+    ("propagate.rs", "drop", "staging", 1, "the scratch folder removed on every exit"),
+    ("propagate.rs", "replace_pack_instance", "pack-instance-id", 4, "I8 step (3): a different / malformed id unlinked, the new id created NEW, flushed — the pass's only write in the pack"),
+    ("propagate.rs", "seal_committed_copy_in", "vault", 3, "HI2 / HJ2: the committed copy's fresh slot in R's vault"),
+    ("propagate.rs", "sweep_own_scratch", "staging", 1, "a dead process's scratch of THIS lane, by its exact name"),
+    ("propagate.rs", "write_job_state", "ledger", 1, "the lane's job state (durable)"),
     ("reapply_claim.rs", "claim_in", "ledger", 1, "the claims folder of a parked edit"),
     ("rehearsal.rs", "copy_dir", "staging", 1, "T5b: the rehearsal's own scratch copy of the pack layout"),
     ("rehearsal.rs", "run_in_copy", "staging", 3, "T5b: the rehearsal's own scratch copy, laid out and removed"),
@@ -3011,6 +3025,7 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("apply.rs", "read_revert_intent_in", "test", 2, "read by tests only; decisions use read_revert_intent_checked_in"),
     ("apply.rs", "reconcile_hook_registrations_with", "reported", 1, "a hook not in the report → neither state → Err"),
     ("apply.rs", "recover_one_intent", "not-a-read", 4, "fields of the previous row, read with ? before (None = no row on evidence)"),
+    ("apply.rs", "released", "conservative", 2, "T7b (HH1): a link in the parent chain / an unreadable live file → not known vendor content → the deletion is 충돌, nothing moved"),
     ("apply.rs", "resolve_approved_copy_in", "reported", 1, "FI2: an unreadable intent → LedgerUnreadable (EN4: suspended, reported)"),
     ("apply.rs", "resume_hook_steps_report_in", "not-a-read", 1, "a literal id"),
     ("apply.rs", "resume_hook_steps_report_in", "display", 1, "a message part"),
@@ -3109,12 +3124,30 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("probation.rs", "m10_sweep_full", "display", 1, "a link's target in a finding"),
     ("probation.rs", "m10_sweep_full", "conservative", 3, "approved bytes unreadable → not recognised (the check runs) / no runner → nothing decided / no source → nothing put back"),
     ("probation.rs", "probation_pass", "display", 1, "the report's path"),
-    ("probation.rs", "read_job_state_in", "conservative", 4, "an unreadable job state = none: every pass due (more work, never less); it holds no duty"),
+    // T7b (RULINGS HH5): `read_job_state_in` / `write_job_state` read through ONE three-valued reader
+    // (`propagate::read_job_state_checked`) and have no default site any more. The old rows, quoted:
+    // ("probation.rs", "read_job_state_in", "conservative", 4, "an unreadable job state = none: every
+    // pass due (more work, never less); it holds no duty") and ("probation.rs", "write_job_state",
+    // "conservative", 1, "as read_job_state_in").
     ("probation.rs", "recheck_one", "display", 1, "the fault point's path"),
     ("probation.rs", "save_findings", "conservative", 1, "unreadable acknowledgements → the view keeps the notice untold (told again, never lost)"),
     ("probation.rs", "start_time_pass", "not-a-read", 1, "a row read with three answers (None = absent on evidence)"),
     ("probation.rs", "start_time_pass", "display", 1, "a message part"),
-    ("probation.rs", "write_job_state", "conservative", 1, "as read_job_state_in"),
+    // T7b (RULINGS HH9) — the propagation's read defaults
+    ("propagate.rs", "apply_general", "not-a-read", 1, "the scratch name's clock part (a name, not a read)"),
+    ("propagate.rs", "committed_copy_slots_in", "conservative", 1, "HI2 / P6: a committed copy's metadata that cannot be parsed → the slot is kept (never removed on a doubt)"),
+    ("propagate.rs", "committed_copy_in", "conservative", 2, "a slot whose metadata or bytes cannot be read is not R's committed copy → no bytes → the row 충돌 (nothing applied)"),
+    ("propagate.rs", "conflict_summary_line_in", "display", 2, "HH7: the CEO's one summary line — display only; status and the gate read with three answers"),
+    ("propagate.rs", "decide_pending", "display", 2, "JA1: the trace text / the last reason of the report — empty when there is none (a sentence, not a read)"),
+    ("propagate.rs", "finish_as", "display", 1, "R1: the live states shown with a 충돌 (an unreadable member leaves the list empty; IK3 / IG5 pass the record in — the second site, a re-read of it, is gone; IQ1 renamed `finish` → `finish_as`)"),
+    ("propagate.rs", "pack_now", "conservative", 1, "IV1 (`Stamp::pack_now`): an unreadable generation is None — a strict `holds` never calls a None unchanged (nothing written); IQ1's `Observed` is replaced by the stamp"),
+    ("propagate.rs", "publish", "not-a-read", 1, "IV1: the stamp's own answer — every reason other than a changed record is 'states changed' (nothing written either way)"),
+    ("propagate.rs", "pack_instance_pass_used", "conservative", 2, "interpretation 31 / P5: an unreadable identity / generation skips its watch for this tick (never \"changed\"; IZ3 renamed `pack_instance_pass_in` → `pack_instance_pass_used`)"),
+    ("propagate.rs", "read_pack_instance", "not-a-read", 1, "the id line without its newline"),
+    ("propagate.rs", "recheck_lane_in", "not-a-read", 2, "JA1: the row the hook unit wrote, else the stored one already read; the trace text for the answer"),
+    ("propagate.rs", "record_hook_trace", "display", 1, "JA1: the live states shown with a hook unit's 충돌 (an unreadable member leaves the list empty)"),
+    ("propagate.rs", "run_checks", "conservative", 2, "IG4: the reference recorded exactly as T6's origin apply records it — one that cannot run is 0, and T6's attribution never blames a timeout on a 0"),
+    ("propagate.rs", "sweep_own_scratch", "conservative", 1, "nothing to sweep when the folder cannot be listed — retried at the next tick"),
     ("reapply_claim.rs", "claim_in", "not-a-read", 1, "no claim yet → the first"),
     ("reapply_claim.rs", "numbers", "not-a-read", 1, "a name that is not <k>.json is not a claim"),
     ("reapply_claim.rs", "read_claim_in", "conservative", 2, "an unreadable claim is held (claim_in)"),
@@ -3502,6 +3535,7 @@ fn forward_completion_rebuilds_an_existing_row() {
         merge_base: Vec::new(),
         merge_lock: None,
         merge_attempt: 0,
+        reason: String::new(),
         updated_at: 1.0,
     }).unwrap();
     let stop = StopOn { rel: "hooks/a1.sh", point: Point::AfterRecordCommit, fired: Cell::new(false) };

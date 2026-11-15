@@ -50,14 +50,16 @@ pub fn job_state_path_in(root: &Path, lane: &LaneKey) -> PathBuf {
     root.join("lanes").join(format!("{}.job.json", lane.0))
 }
 
-/// The lane's job state (`None` = never written or unreadable — treated as "nothing recorded").
+/// The lane's job state (`None` = never written or unreadable — treated as "nothing recorded": every
+/// pass due, more work never less). RULINGS HH5 — read through the ONE three-valued bounded reader of
+/// the job state (`propagate::read_job_state_checked`, GK5's reader — the gate reads the same file
+/// with it); this answer folds "absent" and "unreadable" for the due decision only — the WRITER below
+/// tells them apart.
 pub fn read_job_state_in(root: &Path, lane: &LaneKey) -> Option<JobState> {
-    let b = std::fs::read(job_state_path_in(root, lane)).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&b).ok()?;
-    if v.get("schema").and_then(|s| s.as_u64()).unwrap_or(u64::MAX) > u64::from(super::REPAIR_SCHEMA) {
-        return None;
+    match super::propagate::read_job_state_checked(root, lane) {
+        super::propagate::FileRead::Value(st) => Some(st),
+        _ => None,
     }
-    serde_json::from_value(v).ok()
 }
 
 /// What a tick has to do.
@@ -92,19 +94,29 @@ pub fn due(state: Option<&JobState>, incarnation: &str, now: f64) -> Due {
     }
 }
 
+/// RULINGS HH5 — the writer reads through the same three-valued reader: ABSENT → a fresh state;
+/// UNREADABLE (a read error, a parse error, a newer schema, another lane's state) → it writes NOTHING.
+/// A fresh state written over an unreadable one would clear the recorded catch-up
+/// (`initial_catchup_complete`) and the pack-instance fields — an OPEN gate would turn HELD (I7, O5).
+/// Skipping the write only re-derives the due-times (every pass due again: more work, never less);
+/// the pack-instance pass alone decides what a malformed state means (O5: "different" → full reset).
 fn write_job_state(root: &Path, lane: &LaneKey, incarnation: &str, now: f64, d: &Due) -> Result<(), RepairError> {
-    let mut st = read_job_state_in(root, lane).unwrap_or(JobState {
-        schema: super::REPAIR_SCHEMA,
-        lane: lane.clone(),
-        last_incarnation: String::new(),
-        last_probation_check: 0.0,
-        last_sweep: 0.0,
-        initial_catchup_complete: false,
-        pack_instance: None,
-        pack_dir: None,
-        pack_dir_identity: None,
-        pack_generation: None,
-    });
+    let mut st = match super::propagate::read_job_state_checked(root, lane) {
+        super::propagate::FileRead::Value(st) => st,
+        super::propagate::FileRead::Absent => JobState {
+            schema: super::REPAIR_SCHEMA,
+            lane: lane.clone(),
+            last_incarnation: String::new(),
+            last_probation_check: 0.0,
+            last_sweep: 0.0,
+            initial_catchup_complete: false,
+            pack_instance: None,
+            pack_dir: None,
+            pack_dir_identity: None,
+            pack_generation: None,
+        },
+        super::propagate::FileRead::Malformed(_) | super::propagate::FileRead::ReadError(_) => return Ok(()),
+    };
     st.schema = super::REPAIR_SCHEMA;
     st.last_incarnation = incarnation.to_string();
     if d.probation {
@@ -508,6 +520,7 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
                 merge_base: Vec::new(),
                 merge_lock: None,
                 merge_attempt: 0,
+                reason: String::new(),
                 updated_at: env.op.now,
             };
             let rootb = root.to_path_buf();

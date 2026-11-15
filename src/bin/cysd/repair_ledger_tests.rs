@@ -1252,6 +1252,7 @@ fn boot_critical_joins_refused_resolves_accepted() {
         merge_base: vec![],
         merge_lock: None,
         merge_attempt: 0,
+        reason: String::new(),
         updated_at: T0,
     };
     ledger::write_lane_in(&r.root, &row).unwrap();
@@ -1714,12 +1715,16 @@ fn commit_is_bounded_and_never_unchecked() {
 
 /// Cleanup: refused while not terminal, refused for an in-force repair while T6 cannot say which
 /// slots it needs, allowed for a reverted repair; a worker of a lane without a row is refused.
+/// REWRITTEN by T7b (RULINGS HI2 / HJ2): `commit` now seals the committed bytes into a SECOND slot of
+/// R's vault (kind `committed-copy`), so a committed general repair holds two slots — the begin
+/// pre-image and the committed copy. T3's old expectations, quoted: `list_slots_in(..).len() == 1`
+/// after the commit and in the in-force branch, and `out["removed"].len() == 1` at the end.
 #[test]
 fn cleanup_rules() {
     let r = rig("cleanup");
     let id = committed_general(&r);
     let rid = RepairId::parse(&id).unwrap();
-    assert_eq!(ledger::list_slots_in(&r.root, &rid).len(), 1);
+    assert_eq!(ledger::list_slots_in(&r.root, &rid).len(), 2, "the pre-image and the committed copy (old: 1)");
     // 시험 기간 = not terminal
     assert_eq!(
         r.call(T0 + 5.0, &human(), "cleanup", json!({"repair": id}))
@@ -1736,7 +1741,7 @@ fn cleanup_rules() {
             .call(T0 + 5.0, &human(), "cleanup", json!({"repair": id}))
             .unwrap_err();
         assert!(e.message.contains("확인할 수 없습니다"), "{}", e.message);
-        assert_eq!(ledger::list_slots_in(&r.root, &rid).len(), 1);
+        assert_eq!(ledger::list_slots_in(&r.root, &rid).len(), 2, "nothing removed (old: 1)");
     }
     // 되돌려짐: all slots may go — but not with an unfinished operation record
     rec.state = RepairState::Reverted;
@@ -1793,7 +1798,7 @@ fn cleanup_rules() {
             json!({"repair": id}),
         )
         .unwrap();
-    assert_eq!(out["removed"].as_array().unwrap().len(), 1);
+    assert_eq!(out["removed"].as_array().unwrap().len(), 2, "both slots of a reverted repair (old: 1)");
     assert!(ledger::list_slots_in(&r.root, &rid).is_empty());
     assert!(
         r.root.join(&id).join("record.json").is_file(),
@@ -3647,6 +3652,7 @@ fn bj2_joins_checks_every_file_of_the_joined_repair() {
         merge_base: vec![],
         merge_lock: None,
         merge_attempt: 0,
+        reason: String::new(),
         updated_at: T0,
     };
     ledger::write_lane_in(&r.root, &row).unwrap();

@@ -2,7 +2,9 @@
 //! H3, F9, R2, R5/P6, X1, Y1, Y2). Bodies of T6: rule one (the ONE engine every daemon write of a live
 //! pack file goes through), the approved apply, revert, recovery of interrupted operations, F9's
 //! triple, R2's origin triple, P6's needed slots and the hook step. `propagate`, `catchup_status` and
-//! `recheck_lane` are T7b's (stubs here).
+//! `recheck_lane` are T7b's: `catchup_status` delegates to `propagate::catchup_status_in`; `propagate`
+//! and `recheck_lane` stay stubs with no caller (their work needs the daemon's environment —
+//! `propagate::propagation_tick_in` on the job thread, `propagate::recheck_lane_in` behind the verb).
 //!
 //! RULE ONE (owner decision 29, C2 2.4): on macOS every change this mechanism makes to a live pack
 //! file is an atomic EXCHANGE of the live entry with a FRESH vault slot (or, where nothing live is
@@ -198,6 +200,24 @@ pub mod recorded {
         /// An apply intent's recorded pre-state of its target.
         pub fn pre_by_intent(t: &IntentTarget) -> Result<Recorded, RepairError> {
             super::canon_req(&t.pre, &t.rel).map(Recorded)
+        }
+        /// RULINGS HH1 (written by T7b under the seam — contract C11 11.3, design 4-14 "알려진 원본 판과
+        /// 바이트까지 같을 때만"): the live entry of `rel` when its bytes are a KNOWN VENDOR VERSION.
+        /// ONE read of the live entry (`propagate::read_pack_file_bounded`: no link followed, a
+        /// regular file per its open handle, size-capped); `Some` only when those bytes pass
+        /// `cys::pack::released_bytes` (the one definition — BO3 / BV2: this binary's embedded copy or
+        /// the compiled previous-release table); the mode comes from that same read. The door
+        /// re-verifies the live state at the act, as for every `Recorded` (GK2).
+        pub fn released(pack: &std::path::Path, rel: &str, sources: &crate::pack::UpdateSources) -> Option<Recorded> {
+            // no link in the parent chain (the door's own precondition — the read never leaves the pack)
+            super::super::types::parent_chain_link(pack, rel).ok()?;
+            let (bytes, mode) = super::super::propagate::read_pack_file_bounded(&pack.join(rel)).ok()?;
+            crate::pack::released_bytes(pack, rel, &bytes, sources).then(|| {
+                Recorded(TargetState::File {
+                    sha256: super::super::propagate::sha256_hex(&bytes),
+                    mode,
+                })
+            })
         }
         /// M10 only (F9 / M10 — the one deliberate replacement of bytes the engine did not place): the
         /// state the scan sampled, revalidated under the pack-apply lock right before the put-back and
@@ -2449,7 +2469,8 @@ pub fn revert_repair(
     .map_err(RepairError::Io)?
 }
 
-/// Stub in T0 (body: T7b).
+/// Stub in T0 (T7b: no caller — the per-lane apply runs only on the daemon's job thread with the
+/// daemon's environment, `propagate::propagation_tick_in`).
 pub fn propagate(id: &RepairId, lane: &LaneKey) -> Result<LaneState, RepairError> {
     let _ = (id, lane);
     Err(RepairError::NotImplemented("apply::propagate"))
@@ -2463,13 +2484,14 @@ pub struct CatchupStatus {
     pub conflict: u32,
 }
 
-/// Stub in T0 (body: T7b).
+/// The lane's catch-up fields from the process-wide repairs root (body: T7b —
+/// `propagate::catchup_status_in`; T3's `status` reads its own root through that one, RULINGS HH6).
 pub fn catchup_status(lane: &LaneKey) -> Result<CatchupStatus, RepairError> {
-    let _ = lane;
-    Err(RepairError::NotImplemented("apply::catchup_status"))
+    super::propagate::catchup_status_in(&super::paths::repairs_root(), lane)
 }
 
-/// The `recheck` verb's lane re-evaluation (RULINGS H5). Stub in T0 (body: T7b).
+/// The `recheck` verb's lane re-evaluation (RULINGS H5). Stub in T0 (T7b: no caller — the verb runs
+/// `propagate::recheck_lane_in` with the caller's seat, its merge lock and the daemon's check).
 pub fn recheck_lane(id: &RepairId, lane: &LaneKey) -> Result<LaneState, RepairError> {
     let _ = (id, lane);
     Err(RepairError::NotImplemented("apply::recheck_lane"))
@@ -2822,6 +2844,8 @@ pub fn slots_needed_in_force_in(root: &Path, id: &RepairId) -> Result<Vec<PathBu
                 }
             }
         }
+        // RULINGS HI2 (T7b): the copies sealed at the commit — every lane takes R's bytes from them
+        out.extend(super::propagate::committed_copy_slots_in(root, &rec));
     }
     out.sort();
     out.dedup();
@@ -3054,6 +3078,7 @@ fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &Repair
                     merge_base: previous.as_ref().map(|p| p.merge_base.clone()).unwrap_or_default(),
                     merge_lock: previous.as_ref().and_then(|p| p.merge_lock.clone()),
                     merge_attempt: previous.as_ref().map(|p| p.merge_attempt).unwrap_or(0),
+                    reason: String::new(),
                     updated_at: now,
                 },
             )?;
@@ -3546,6 +3571,7 @@ pub fn apply_candidate_in(
             merge_base: Vec::new(),
             merge_lock: None,
             merge_attempt: 0,
+            reason: String::new(),
             updated_at: now,
         };
         ledger::write_lane_durable_in(&root, &row)?;
@@ -3776,6 +3802,7 @@ fn mark_incomplete_apply(
             merge_base: Vec::new(),
             merge_lock: None,
             merge_attempt: 0,
+            reason: String::new(),
             updated_at: now,
         };
         ledger::write_lane_durable_in(&root, &row)?;
@@ -4557,6 +4584,40 @@ pub fn hook_lines_step_in(
     registrar: &RegistrarFn<'_>,
     now: f64,
 ) -> Result<ReconcileReport, RepairError> {
+    match hook_lines_unit_in(root, pack, id, lane, step, registrar, now, &|| Ok(()))? {
+        HookUnitEnd::Nothing => Ok(ReconcileReport { hooks: Vec::new() }),
+        HookUnitEnd::Refused(why) => Err(RepairError::Precondition(why)), // never with the open guard
+        HookUnitEnd::Ran { result, .. } => result,
+    }
+}
+
+/// How one hook unit ended (RULINGS IZ2 / JA1 — the seam T7b's propagation calls).
+#[derive(Debug)]
+pub enum HookUnitEnd {
+    /// R names no hook line: nothing to do.
+    Nothing,
+    /// The guard refused right before the unit's first durable write: NOTHING was written.
+    Refused(String),
+    /// The unit BEGAN its durable writes — its write-ahead record `op` is written; `lines` are the
+    /// hook lines it set out to change (`EVENT:SCRIPT`); `result` is how its writes ended.
+    Ran { op: String, lines: Vec<String>, result: Result<ReconcileReport, RepairError> },
+}
+
+/// [`hook_lines_step_in`] with a GUARD (RULINGS IZ1 / IZ2): `guard` runs after every slow or waiting
+/// preparation of the unit — the registrar's dry run and the settings measurement — and IMMEDIATELY
+/// before its first durable write (the write-ahead record); a refusal writes nothing. After the record
+/// the unit writes without further validation (IZ1's line); an `Err` here means nothing was written.
+#[allow(clippy::too_many_arguments)]
+pub fn hook_lines_unit_in(
+    root: &Path,
+    pack: &Path,
+    id: &RepairId,
+    lane: &LaneKey,
+    step: HookStep,
+    registrar: &RegistrarFn<'_>,
+    now: f64,
+    guard: &dyn Fn() -> Result<(), String>,
+) -> Result<HookUnitEnd, RepairError> {
     let rec = ledger::read_record_in(root, id)?
         .ok_or_else(|| RepairError::Precondition(format!("{}: 그런 수리가 없습니다", id.as_str())))?;
     let named: Vec<(String, String)> = ledger::hook_lines(&rec)
@@ -4566,7 +4627,7 @@ pub fn hook_lines_step_in(
         })
         .collect();
     if named.is_empty() {
-        return Ok(ReconcileReport { hooks: Vec::new() });
+        return Ok(HookUnitEnd::Nothing);
     }
     // (i) the record first, with the targets of a dry run (matcher / timeout as found). CT3: a dry
     // run that cannot be measured DECLINES before anything is recorded or changed (the caller marks
@@ -4623,8 +4684,15 @@ pub fn hook_lines_step_in(
         updated_at: now,
         notice: None,
     };
+    // IZ1 / IZ2: the unit's ONE validation — after the dry run and the settings measurement, right
+    // before its first durable write
+    if let Err(why) = guard() {
+        return Ok(HookUnitEnd::Refused(why));
+    }
     wal::write_in(root, &op)?;
-    finish_hook_op(root, pack, &rec, &mut op, registrar, now)
+    let op_id = op.op.clone();
+    let result = finish_hook_op(root, pack, &rec, &mut op, registrar, now);
+    Ok(HookUnitEnd::Ran { op: op_id, lines: named.iter().map(|(e, sc)| format!("{e}:{sc}")).collect(), result })
 }
 
 fn finish_hook_op(
@@ -4755,6 +4823,16 @@ pub fn mark_lane_conflict(root: &Path, id: &RepairId, lane: &LaneKey, now: f64, 
 }
 
 /// RULINGS Y1: the ONE hook step (operation record first, tombstone, reconcile, record finished).
+/// [`hook_lines_unit_in`] over this process's repairs root and pack, with the production registrar.
+pub fn hook_lines_unit(
+    id: &RepairId,
+    lane: &LaneKey,
+    step: HookStep,
+    guard: &dyn Fn() -> Result<(), String>,
+) -> Result<HookUnitEnd, RepairError> {
+    hook_lines_unit_in(&super::paths::repairs_root(), &crate::pack::pack_dir(), id, lane, step, &run_registrar, ledger::now_epoch(), guard)
+}
+
 pub fn hook_lines_step(
     id: &RepairId,
     lane: &LaneKey,

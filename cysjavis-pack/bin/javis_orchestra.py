@@ -2077,6 +2077,272 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None, 
     return "\n".join(lines)
 
 
+# ── 0.15.0 「스스로 해결」 track T7b — 작업 배정 관문(RULINGS I1 · I7 · I8 · Q4 · K6 · HH7) ──
+# 일반 작업 티켓은 **그 티켓이 향하는 레인**의 관문(`cys repair gate --lane <key> --json` · 데몬에 묻지 않는 로컬
+# 판독)이 열려 있을 때만 나간다. 수리 티켓(`--repair` · `--merge` · `--owner-token`)은 언제나 나가고, 팀 편성은
+# 이 도구를 거치지 않으므로 막히지 않는다. 판독 자체를 할 수 없으면(cys 부재·시간 초과·형식 밖 답) 일반 티켓을
+# 보류하고 까닭을 말한다(I1 (5) — 시간이 지났다고 열리지 않는다). 이 도구는 티켓을 내지 큐에 아무것도 보내지
+# 않는다(F1). 티켓을 짓는 모든 진입점은 `_ticket_gate` 를 부른다(Q4 · census: tests/test_task_prompt_gate.py).
+REPAIR_GATE_TIMEOUT_S = 20
+REPAIR_GATE_HELD_RC = 95
+REPAIR_SUMMARY_STATE = "orchestra-repair-summary.json"
+_REPAIR_ID = r"R-[1-9][0-9]{0,9}"
+
+
+def _repair_registry_path():
+    return os.environ.get("CYS_DEPTS_JSON") or os.path.join(os.path.expanduser("~"), ".cys", "depts.json")
+
+
+def _gate_lane_key(lane_token):
+    """티켓이 **향하는** 레인의 키 → `(key, None)` 또는 `(None, 사유)`. `lane_token` 이 None 이면 발부자 자신의
+    레인(이 좌석의 CYS_SOCKET), `base` 면 본부, 부서 이름이면 부서 등록부(depts.json)의 그 부서 소켓의 레인 키
+    (`javis_lane.lane_key` — Rust `lane::lane_key` 의 파이썬 쌍)."""
+    try:
+        import javis_lane
+    except Exception as e:                       # noqa: BLE001 — 판독 불가 = 보류 사유
+        return None, "javis_lane 을 불러올 수 없음(%s)" % e
+    own, _why = _issuer_lane()
+    if lane_token is None or lane_token == own:
+        return javis_lane.lane_key(), None
+    if lane_token == BASE_LANE:
+        return BASE_LANE, None
+    try:
+        with open(_repair_registry_path(), encoding="utf-8-sig") as f:
+            reg = json.load(f)
+        sock = reg["depts"][lane_token]["socket"]
+    except Exception as e:                       # noqa: BLE001
+        return None, "부서 등록부에서 '%s' 의 소켓을 찾을 수 없음(%s)" % (lane_token, e)
+    if not isinstance(sock, str) or not sock.strip():
+        return None, "부서 등록부의 '%s' 소켓이 비어 있음" % lane_token
+    return javis_lane.lane_key(sock), None
+
+
+def _repair_gate(lane_key):
+    """`cys repair gate --lane <key> --json` → `("open"|"held"|"unknown", 답, 사유)`. 시간 상한이 있고 셸을 쓰지
+    않는다. exit 0 + verdict open → 열림, exit 95 + verdict held → 보류, 그 밖은 모두 판독 불가."""
+    cys = shutil.which("cys")
+    if not cys:
+        return "unknown", None, "cys 명령을 찾을 수 없음"
+    try:
+        r = subprocess.run([cys, "repair", "gate", "--lane", lane_key, "--json"], capture_output=True,
+                           timeout=REPAIR_GATE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return "unknown", None, "%d초 안에 답이 없음" % REPAIR_GATE_TIMEOUT_S
+    except Exception as e:                       # noqa: BLE001
+        return "unknown", None, "실행할 수 없음(%s)" % e
+    try:
+        v = json.loads(r.stdout.decode("utf-8", "replace"))
+    except Exception:                            # noqa: BLE001
+        v = None
+    verdict = v.get("verdict") if isinstance(v, dict) else None
+    if r.returncode == 0 and verdict == "open":
+        return "open", v, ""
+    if r.returncode == REPAIR_GATE_HELD_RC and verdict == "held":
+        return "held", v, ""
+    tail = r.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or [""]
+    return "unknown", None, "exit %d · %s" % (r.returncode, tail[0][:200])
+
+
+def _summary_told(line):
+    """HH7: 같은 요약 줄은 한 번만 — 표식은 이 도구 자신의 상태 파일(수리 장부 밖). 쓸 수 없으면 다음에 다시 낸다."""
+    key = hashlib.sha256(line.encode("utf-8")).hexdigest()[:16]
+    path = os.path.join(pack_dir(), "state", REPAIR_SUMMARY_STATE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            told = json.load(f).get("told", [])
+    except Exception:                            # noqa: BLE001 — 없음·손상 = 아직 말하지 않음(한 번 더 말할 뿐)
+        told = []
+    if not isinstance(told, list):
+        told = []
+    if key in told:
+        return True
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = "%s.tmp.%d" % (path, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"told": (told + [key])[-50:]}, f)
+        os.replace(tmp, path)
+    except Exception:                            # noqa: BLE001 — 표식 실패 = 다음 호출에 다시 낸다(HH7)
+        pass
+    return False
+
+
+def _owner_token_line(token, path):
+    """T4 의 넘겨준 문구(task-prompt `--owner-token`): 정확히 한 줄 `주인 지시 표: <ot-…> (규칙 문서 <path>)`.
+    경로는 `--owner-token-path` 또는 수리 장부의 표 기록(`repairs/owner-tokens/<sha256(표)>.json` 의 paths[0])."""
+    if not re.fullmatch(r"ot-[A-Za-z0-9]{26}", token or ""):
+        return None, "주인 지시 표의 형식이 아닙니다(ot- 뒤 26자): %r" % token
+    if not path:
+        local = os.environ.get("CYS_LOCAL_DIR") or os.path.join(os.path.dirname(os.path.abspath(pack_dir())), "local")
+        rec = os.path.join(local, "repairs", "owner-tokens", hashlib.sha256(token.encode("utf-8")).hexdigest() + ".json")
+        try:
+            with open(rec, encoding="utf-8") as f:
+                path = (json.load(f).get("paths") or [None])[0]
+        except Exception as e:                   # noqa: BLE001
+            return None, "주인 지시 표의 규칙 문서를 찾을 수 없습니다(--owner-token-path 로 넘기세요): %s" % e
+    if not isinstance(path, str) or not path or "\n" in path:
+        return None, "주인 지시 표의 규칙 문서 경로가 없습니다(--owner-token-path)"
+    return "주인 지시 표: %s (규칙 문서 %s)" % (token, path), None
+
+
+_TRIGGER_CLI = {"owner_order": "owner-order", "grant": "grant", "update": "update"}
+
+
+def _merge_reason_line(v, lane_key):
+    """RULINGS IK2: 그 부서 행에 남은 까닭 한 줄(없으면 None) — 워커가 바이트가 오지 않았는지·검사가 실패했는지를 안다."""
+    for row in (v.get("lane_rows") or []):
+        if isinstance(row, dict) and lane_key is not None and row.get("lane") == lane_key:
+            reason = row.get("reason")
+            if isinstance(reason, str) and reason.strip():
+                return "  까닭(이 부서의 행 · %s): %s" % (row.get("state_label") or row.get("state") or "?", reason.strip())
+    return None
+
+
+def _merge_hook_ops_line(v, lane_key):
+    """RULINGS JI1: 그 부서가 이 수리에 대해 **마친** 훅 작업 한 줄 — 데몬이 동작 기록에서 읽은 것(하나의 출처).
+    기록을 읽지 못했으면 그 문장("확인할 수 없습니다")을, 마친 것이 없으면 None."""
+    unreadable = v.get("hook_ops_unreadable")
+    if isinstance(unreadable, str) and unreadable.strip():
+        return "  " + unreadable.strip()
+    texts = [o.get("text") for o in (v.get("hook_ops") or [])
+             if isinstance(o, dict) and lane_key is not None and o.get("lane") == lane_key and isinstance(o.get("text"), str)]
+    if texts:
+        return "  이 부서가 마친 훅 작업: " + " · ".join(texts)
+    return None
+
+
+def _not_propagated_here(v, repair, lane_key):
+    """RULINGS KI1 (KF2): 묻는 부서에 전파되지 않는 수리(규칙 문서 수리 · resolves 수리)면 그 까닭 한 줄, 아니면 None.
+    분류를 여기서 다시 가리지 않는다 — 데몬의 `status` 가 이미 준 답을 읽는다: 그 수리의 전파 부서 목록(`lanes` —
+    데몬이 부서 등록부를 읽어 `propagation_complete` 를 판정했을 때만)에 묻는 부서가 없거나, 그 부서의 안내 행이
+    있으면 전파 대상이 아니다. 문장은 그 안내 행의 것을 그대로 쓴다(아직 행이 없으면 같은 뜻의 한 줄)."""
+    if lane_key is None:
+        return None
+    row = next((x for x in (v.get("lane_rows") or []) if isinstance(x, dict) and x.get("lane") == lane_key), None)
+    lanes = v.get("lanes")
+    outside = isinstance(v.get("propagation_complete"), bool) and isinstance(lanes, dict) and lane_key not in lanes
+    if not outside:
+        return None
+    reason = row.get("reason") if isinstance(row, dict) else None
+    if isinstance(reason, str) and reason.strip():
+        return "%s: %s" % (repair, reason.strip())
+    return ("%s: 이 수리는 이 부서(%s)에 전파되지 않습니다(전파 부서: %s) — 이 부서에 필요하면 이 부서의 주인 지시로 "
+            "이 부서의 수리를 시작하세요" % (repair, lane_key, ", ".join(sorted(lanes)) or "-"))
+
+
+def _merge_ticket_lines(repair, lane_key=None):
+    """E-4-11/12 · AU6 · AR4: 그 부서 워커가 **그대로** 실행할 수리 명령 줄 — `--files`(R 의 파일 대상 전부)와
+    `--trigger`(R 자신의 계기)를 늘 싣는다. 일반 경로 = `--joins` + `recheck`(H8), 기동 필수·보호장치 경로 =
+    그 부서의 수리 `--resolves`(R1 / T1 · HJ1). IK2: 그 부서 행의 까닭을 머리 다음 줄에 싣는다. JI1: 그 부서가 마친
+    훅 작업(동작 기록에서 읽은 것)을 그 다음 줄에 싣는다."""
+    if not re.fullmatch(_REPAIR_ID, repair or ""):
+        return None, "--merge 값이 수리 번호(R-<숫자>)가 아닙니다: %r" % repair
+    cys = shutil.which("cys")
+    if not cys:
+        return None, "cys 명령을 찾을 수 없어 %s 의 기록을 읽지 못했습니다" % repair
+    try:
+        r = subprocess.run([cys, "repair", "status", repair, "--json"], capture_output=True, timeout=REPAIR_GATE_TIMEOUT_S)
+        v = json.loads(r.stdout.decode("utf-8", "replace")) if r.returncode == 0 else None
+    except Exception as e:                       # noqa: BLE001
+        return None, "%s 의 기록을 읽지 못했습니다(%s)" % (repair, e)
+    if not isinstance(v, dict):
+        return None, "%s 의 기록을 읽지 못했습니다(exit %s)" % (repair, getattr(r, "returncode", "?"))
+    # RULINGS KI1: a repair that does not propagate to this lane gets no ticket line at all
+    outside = _not_propagated_here(v, repair, lane_key)
+    if outside:
+        return None, "병합 티켓을 내지 않습니다 — " + outside
+    trigger = _TRIGGER_CLI.get(v.get("trigger"))
+    files = [f.get("rel") for f in (v.get("files") or [])
+             if isinstance(f, dict) and isinstance(f.get("rel"), str) and not str(f.get("kind", "")).startswith("hook")
+             and not (isinstance(f.get("kind"), dict) and "hook_unregister" in f.get("kind"))]
+    # RULINGS IG6: the repair's HOOK targets are kept (`--unregister-hook EVENT:SCRIPT`) — a hook-only repair's
+    # conflict is merged through them; a hook entry that cannot be read gives no ticket
+    hooks = []
+    for f in (v.get("files") or []):
+        kind = f.get("kind") if isinstance(f, dict) else None
+        if isinstance(kind, dict) and "hook_unregister" in kind:
+            h = kind.get("hook_unregister")
+            ev, sc = (h.get("event"), h.get("script")) if isinstance(h, dict) else (None, None)
+            if not (isinstance(ev, str) and ev and isinstance(sc, str) and sc):
+                return None, "%s 의 훅 대상을 읽지 못했습니다" % repair
+            hooks.append("%s:%s" % (ev, sc))
+    if trigger is None or not (files or hooks):
+        return None, "%s 의 계기나 파일 대상을 읽지 못했습니다" % repair
+    import shlex
+    fl = " ".join(shlex.quote(x) for x in files)
+    targets = " ".join((["--files " + fl] if files else []) + ["--unregister-hook " + shlex.quote(h) for h in hooks])
+    reason = _merge_reason_line(v, lane_key)
+    hook_ops = _merge_hook_ops_line(v, lane_key)
+    head_extra = [x for x in (reason, hook_ops) if x]
+    if v.get("classification") in ("boot_critical", "protection_related"):
+        if not files:
+            return None, "%s 의 파일 대상을 읽지 못했습니다" % repair
+        return [
+            "병합 티켓 — %s(기동 필수·보호장치): 이 부서의 수리로 맞춘다(합치기 모드는 이 경로에 없다 · RULINGS R1/T1)" % repair,
+        ] + head_extra + [
+            "  1) cys repair begin --files %s --trigger %s --resolves %s" % (fl, trigger, repair),
+            "  2) 작업 사본에 후보를 만든 뒤: cys repair record <새 수리 번호> --note \"<무엇을 맞췄는지>\"",
+            "  3) 리뷰어1·리뷰어2 서명 뒤: cys repair submit <새 수리 번호>  (주인의 최종 승인은 이 부서의 승인 탭)",
+        ], None
+    return [
+        "병합 티켓 — %s: 이 부서의 충돌을 이 부서 워커가 합친다(H8)" % repair,
+    ] + head_extra + [
+        "  1) cys repair begin %s --joins %s --trigger %s" % (targets, repair, trigger),
+        "  2) 이 부서의 살아 있는 파일에 %s 의 바꿈을 합친다(바꾸거나, 지금 내용이 맞으면 그대로 둔다)" % repair,
+        "  3) cys repair recheck %s" % repair,
+    ], None
+
+
+def _ticket_gate(prefix, args, lane_token):
+    """THE one gate of every ticket builder (Q4 · K6): `(rc, 티켓에 덧붙일 줄들)` — rc 가 None 이 아니면 티켓을 내지
+    않는다(이미 stderr 에 까닭을 썼다). 관문 결과·HQ 요약(HH7)·주인 지시 표 한 줄·병합 명령이 이 한 함수에서 나온다."""
+    merge = getattr(args, "merge", None)
+    token = getattr(args, "owner_token", None)
+    repair_ticket = bool(getattr(args, "repair", None) or merge or token)
+    if getattr(args, "repair", None) and not re.fullmatch(_REPAIR_ID, args.repair):
+        print("[%s] --repair 는 수리 번호(R-<숫자>)만 허용: %r" % (prefix, args.repair), file=sys.stderr)
+        return 2, []
+    extra = []
+    if token:
+        line, why = _owner_token_line(token, getattr(args, "owner_token_path", None))
+        if line is None:
+            print("[%s] %s — 티켓 미출력" % (prefix, why), file=sys.stderr)
+            return 2, []
+        extra.append(line)
+    key, key_why = _gate_lane_key(lane_token)
+    if merge:
+        lines, why = _merge_ticket_lines(merge, key)
+        if lines is None:
+            print("[%s] %s — 티켓 미출력" % (prefix, why), file=sys.stderr)
+            return 2, []
+        extra.extend(lines)
+    why = key_why
+    if key is None:
+        verdict, reply, why = "unknown", None, why
+    else:
+        verdict, reply, why = _repair_gate(key)
+    if verdict == "open":
+        print("[%s] 작업 배정 관문: 열림 (%s)" % (prefix, key), file=sys.stderr)
+    elif verdict == "held":
+        cause = ((reply or {}).get("cause") or {}).get("text") or "?"
+        if not repair_ticket:
+            print("[%s] 작업 배정 관문: 보류 (%s) — %s · 일반 작업 티켓은 내지 않는다(수리 티켓 --repair/--merge 와 "
+                  "팀 편성은 막지 않는다) — 티켓 미출력" % (prefix, key, cause), file=sys.stderr)
+            return 1, []
+        print("[%s] 작업 배정 관문: 보류 (%s) — 수리 티켓이라 낸다 · %s" % (prefix, key, cause), file=sys.stderr)
+    else:
+        if not repair_ticket:
+            print("[%s] 작업 배정 관문을 확인할 수 없어 일반 작업 티켓을 보류한다(%s) — 티켓 미출력 · 수리 티켓"
+                  "(--repair/--merge)은 낸다" % (prefix, why), file=sys.stderr)
+            return 1, []
+        print("[%s] 작업 배정 관문을 확인할 수 없음(%s) — 수리 티켓이라 낸다" % (prefix, why), file=sys.stderr)
+    summary = (reply or {}).get("conflict_summary")
+    own, _w = _issuer_lane()
+    if isinstance(summary, str) and summary and own == BASE_LANE and not _summary_told(summary):
+        print("[%s] %s" % (prefix, summary), file=sys.stderr)
+    return None, extra
+
+
 def cmd_task_prompt(args):
     # 역할명은 kebab-case만 — 오류 메시지·launch 안내 명령에 그대로 보간되므로 위생 처리(주입 차단).
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.to):
@@ -2211,12 +2477,17 @@ def cmd_task_prompt(args):
         print("[task-prompt] 장부 task id 미지정 — 티켓의 <id>/<task-id> 플레이스홀더를 워커가 "
               "스스로 치환해야 한다(javis_task.py create 로 등재 후 --task-id 전달 권장 · PREP #10)",
               file=sys.stderr)
-    print(build_task_ticket(args.task, args.scope, success, args.to, rules=rules,
-                            output_format=getattr(args, "output_format", None),
-                            prereq_block=prereq, dont=getattr(args, "dont", None),
-                            tier_hint=getattr(args, "tier", None),
-                            probes=_split_csv(getattr(args, "probes", None)),
-                            task_id=task_id, liveness_note=liveness_note, recipient=recipient))
+    # ★0.15.0 T7b: 작업 배정 관문 — 이 티켓이 향하는 레인(`--surface <lane>/…` 의 레인, 없으면 발부자 레인)
+    gate_rc, extra = _ticket_gate("task-prompt", args, lane)
+    if gate_rc is not None:
+        return gate_rc
+    ticket = build_task_ticket(args.task, args.scope, success, args.to, rules=rules,
+                               output_format=getattr(args, "output_format", None),
+                               prereq_block=prereq, dont=getattr(args, "dont", None),
+                               tier_hint=getattr(args, "tier", None),
+                               probes=_split_csv(getattr(args, "probes", None)),
+                               task_id=task_id, liveness_note=liveness_note, recipient=recipient)
+    print(ticket if not extra else ticket + "\n" + "\n".join(extra))
     return 0
 
 
@@ -2252,6 +2523,10 @@ def cmd_phase_plan(args):
         _split_csv(getattr(args, "requires_skills", None)),
         _split_csv(getattr(args, "related_memory", None)),
         os.path.join(pack_dir(), "memory"))
+    # ★0.15.0 T7b (Q4): phase-plan 도 티켓을 짓는다 — 같은 관문(발부자 레인 · 수리 티켓은 --repair)
+    gate_rc, extra = _ticket_gate("phase-plan", args, None)
+    if gate_rc is not None:
+        return gate_rc
     n = len(phases)
     tickets = []
     index = {"task": args.task, "scope": args.scope, "phases": []}
@@ -2283,6 +2558,7 @@ def cmd_phase_plan(args):
         blocks.append("")
         blocks.append("════════ %s · %s ════════" % (pid, name))
         blocks.append(ticket)
+    blocks.extend(extra)
     print("\n".join(blocks))
     return 0
 
@@ -6150,6 +6426,14 @@ def main():
                     help="장부(javis_task.py) 태스크 id — 지정 시 티켓의 E1·P3 플레이스홀더"
                          "(<id>·<task-id>)를 실 id 로 확정하고 증거 경로도 그 id 로 박는다(PREP #10). "
                          "미지정 시 티켓은 종전과 byte-동일이고 stderr 로 1줄 고지한다.")
+    tp.add_argument("--repair", default=None,
+                    help="수리 티켓(R-<숫자>) — 작업 배정 관문이 보류여도 낸다(0.15.0 · RULINGS H3/I1). 일반 작업에는 쓰지 마라")
+    tp.add_argument("--merge", default=None,
+                    help="병합 티켓(R-<숫자>) — 이 부서의 충돌을 맞출 수리 명령 줄(--files·--trigger 포함)을 티켓에 싣는다(H8 · R1)")
+    tp.add_argument("--owner-token", dest="owner_token", default=None,
+                    help="주인 지시 표(ot-…) — 티켓에 '주인 지시 표: <ot-…> (규칙 문서 <경로>)' 한 줄을 싣는다(C10 · 수리 티켓)")
+    tp.add_argument("--owner-token-path", dest="owner_token_path", default=None,
+                    help="주인 지시 표의 규칙 문서 경로(생략 시 수리 장부의 표 기록에서 읽는다)")
     tp.add_argument("--no-survival-gate", action="store_true",
                     help="생존 게이트 생략(D5 일회용 fresh 경로 — 워커 surface가 실행 시점에 생성될 때만). "
                          "평시 위임엔 쓰지 마라(상시 워커 생존 확인이 안전).")
@@ -6168,6 +6452,8 @@ def main():
     pp.add_argument("--dont", default=None,
                     help="무접촉(do-not-touch) — 각 Phase 티켓에 음의 경계 주입(외과적 변경·"
                          "4대 행동지침③). 미지정 시 티켓 byte-동일")
+    pp.add_argument("--repair", default=None,
+                    help="수리 티켓(R-<숫자>) — 작업 배정 관문이 보류여도 낸다(0.15.0 · RULINGS H3/I1/Q4)")
 
     ri = sub.add_parser("round-init"); ri.add_argument("--task", required=True)
     rl = sub.add_parser(
