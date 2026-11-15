@@ -170,6 +170,16 @@ class TestC68(Base):
         # report 모드 = 관찰만(큐 적재는 --fix 전용) — 가역 부작용 0 계약.
         self.assertIn("관찰만", detail)
 
+    def test_c68_result_line_keeps_the_direct_merge_prohibition(self):
+        """S5-MUT part 1 · H-06-N2-01 (RULINGS JU 3): C68's result line delegates the review AND forbids the direct merge —
+        "워커에 `cys pack-merge` 검토 위임(직접 병합 금지)" (byte-identical to v0.14.56). No test held the prohibition in
+        C68's own text; dropping "(직접 병합 금지)" stayed green. (The wake C68 queues — reason "… 검토 위임 필요" — never
+        carried the prohibition, in v0.14.56 either: only the result line is pinned here.)"""
+        self.ledger({"hooks/x.sh": {"kind": "conflicted", "ts": self.old()}})
+        st, detail = self.c68()
+        self.assertEqual(st, WARN, detail)
+        self.assertIn("master: 워커에 `cys pack-merge` 검토 위임(직접 병합 금지)", detail)
+
     def test_conflicted_at_rest_exempt(self):
         """state=at-rest 가 붙은 conflicted(revert-merge 등 보존 상태)는 기한 제외."""
         self.ledger({
