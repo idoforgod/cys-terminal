@@ -18,7 +18,7 @@ use super::ledger::{
 };
 use super::platform::ApplyForm;
 use super::rehearsal::CheckResult;
-use super::types::{Classification, LaneKey, LaneState, RepairError, RepairId, RepairState, TargetState};
+use super::types::{Classification, LaneKey, LaneState, Observed, RepairError, RepairId, RepairState, TargetState};
 use std::path::{Path, PathBuf};
 
 // ───────────────────────────── reads with their answers (FG1 · GK5 · O5) ─────────────────────────────
@@ -391,8 +391,15 @@ fn recorded_result(row: &LaneRecord) -> &[(String, String)] {
     }
 }
 
+/// A target's live canon (the verify-only pass, L5 (a)). JH1: a file over the engine's read limit has no
+/// canon — `Err` with its sentence: it differs from every recorded result (the row goes back to 대기 and
+/// the next decision makes it a 충돌 naming the limit).
 fn live_canon(pack: &Path, rel: &str) -> Result<String, String> {
-    TargetState::read(&pack.join(rel)).map(|s| s.canon()).map_err(|e| format!("{rel}: {e:?}"))
+    match TargetState::observe(&pack.join(rel)) {
+        Ok(Observed::State(st)) => Ok(st.canon()),
+        Ok(over) => Err(over_limit_sentence(rel, &over)),
+        Err(e) => Err(format!("{rel}: {e:?}")),
+    }
 }
 
 /// Re-reads a row under the per-repair mutex and writes `f`'s change durably (FG4) — nothing when
@@ -997,16 +1004,32 @@ fn result_state(rec: &RepairRecord, rel: &str) -> Result<TargetState, String> {
     apply::state_of_canon(canon).ok_or_else(|| format!("{rel}: 확정된 상태를 읽을 수 없습니다({canon})"))
 }
 
-/// The live states of R's file targets in this lane, `(rel, state)` in rel order.
+/// The live states of R's file targets in this lane, `(rel, state)` in rel order — each measured by
+/// the engine's ONE bounded read (`TargetState::observe`: at most the limit + 1 bytes from one handle,
+/// none at all for a file whose length at the open is over it — RULINGS IE4 / IG1).
+/// RULINGS IG1 + JH1 — a regular file longer than the engine's read limit is a MEASURED DIFFERENCE
+/// (`Observed::OverLimit`): different from R's pre-image, from its result and from every recorded state
+/// — never a state, never a hash, never a verified row. It ends this repair's decision with the sentence
+/// naming the limit (`Err` → the caller's 충돌 row, or "nothing written" where a stamp is measured
+/// again); an `Err` that is not that sentence is a real read failure.
 fn live_states(pack: &Path, rec: &RepairRecord) -> Result<Vec<(String, TargetState)>, String> {
     let mut rels: Vec<&str> = ledger::file_targets(rec).map(|f| f.rel.as_str()).collect();
     rels.sort_unstable();
     rels.dedup();
     let mut out = Vec::new();
     for rel in rels {
-        out.push((rel.to_string(), TargetState::read(&pack.join(rel)).map_err(|e| format!("{rel}: 읽을 수 없습니다({e:?})"))?));
+        match TargetState::observe(&pack.join(rel)) {
+            Ok(Observed::State(st)) => out.push((rel.to_string(), st)),
+            Ok(over @ Observed::OverLimit { .. }) => return Err(over_limit_sentence(rel, &over)),
+            Err(e) => return Err(format!("{rel}: 읽을 수 없습니다({e:?})")),
+        }
     }
     Ok(out)
+}
+
+/// RULINGS IG1 / JH1 — the row sentence for a target over the engine's read limit (the limit named).
+fn over_limit_sentence(rel: &str, over: &Observed) -> String {
+    format!("{rel}: {} — 수리 전 내용과도 수리 결과와도 다른 파일로 잽니다(상태로 매기지 않습니다) — 이 부서의 워커가 합칩니다", over.describe())
 }
 
 fn canon_list(states: &[(String, TargetState)]) -> Vec<(String, String)> {
@@ -1646,9 +1669,12 @@ fn ensure_tombstones(env: &LaneEnv<'_>, rec: &RepairRecord) -> Result<(), String
         if f.pre == ledger::PreImage::Absent || result_state(rec, &f.rel)? != TargetState::Absent {
             continue;
         }
-        let live = TargetState::read(&env.op.pack.join(&f.rel)).map_err(|e| format!("{}: 읽을 수 없습니다 — {e:?}", f.rel))?;
-        if live != TargetState::Absent {
-            continue;
+        // JH1: a file over the engine's read limit is PRESENT (a measured difference) — not at the
+        // deletion's result, so no tombstone
+        match TargetState::observe(&env.op.pack.join(&f.rel)) {
+            Ok(Observed::State(TargetState::Absent)) => {}
+            Ok(_) => continue,
+            Err(e) => return Err(format!("{}: 읽을 수 없습니다 — {e:?}", f.rel)),
         }
         let t = super::tombstones::Tombstone { rel: f.rel.clone(), kind: super::tombstones::TombstoneKind::File, repair: rec.id.clone() };
         super::tombstones::record_in(env.op.root, env.op.lane, &t).map_err(|e| format!("{}: 삭제 표식(묘비) 기록 실패 — {e:?}", f.rel))?;

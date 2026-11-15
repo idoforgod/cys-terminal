@@ -2454,6 +2454,58 @@ fn an_interrupted_hook_unit_is_completed_by_recovery_and_its_row_has_a_probation
     assert!(shown(&r, &id).contains(&format!("훅 등록 해제(작업 {}: Stop:x.sh)", op.op)), "{:?}", shown(&r, &id));
 }
 
+// ───────────────────────────── RULINGS IG1 + JH1 — a target over the engine's read limit ─────────────────────────────
+
+/// RULINGS IG1 (with T6b's engine — JH1): a LIVE target over the engine's read limit in this lane ends THAT
+/// repair's turn of the tick — a 충돌 row whose reason names the limit as a MEASURED difference (no state,
+/// no hash, nothing of it recorded, never a verified row) — without one byte of it read (the engine's
+/// read seam counts the bytes); the tick goes on to the next repair (applied and verified), and T6's job
+/// runs after it (it takes R's guard and its pack-apply lock and answers, nothing deferred).
+#[test]
+fn a_target_over_the_limit_ends_its_repairs_turn_and_the_next_job_runs() {
+    use crate::repair::durable::{read_seam, RECORD_READ_CAP as CAP};
+    let r = rig("ig1");
+    let (a, b) = (rid("R-1"), rid("R-2"));
+    committed_in_hq(&r, &a, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    committed_in_hq(&r, &b, Classification::General, "bin/b.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/b.py", b"old\n", 0o644);
+    r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    let live = r.dept.join("bin/a.py");
+    std::fs::OpenOptions::new().write(true).open(&live).unwrap().set_len(CAP + 1).unwrap();
+    let before = read_seam::bytes_read_from(&live);
+    let t = tick(&r, DEPT, &doubles(), &fid(1));
+    assert_eq!(read_seam::bytes_read_from(&live) - before, 0, "the live file is never read");
+    let row = r.row(&a, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Conflict, "{t:?}");
+    assert!(row.reason.starts_with("bin/a.py: 엔진의 읽기 한도") && row.reason.contains(&CAP.to_string()) && row.reason.contains("다른 파일로 잽니다"), "{}", row.reason);
+    assert!(!row.reason.contains("읽을 수 없습니다"), "a measured difference, not a read failure: {}", row.reason);
+    assert!(row.applied.is_empty() && row.conflict_live.is_empty() && row.probation.is_none(), "nothing of it recorded as a state: {row:?}");
+    assert_eq!(std::fs::metadata(&live).unwrap().len(), CAP + 1, "nothing moved");
+    assert_eq!(r.row(&b, DEPT).unwrap().state, LaneState::Verified, "the tick went on to the next repair");
+    // T6's job after it: R's guard is free and its tick answers (nothing deferred, nothing held)
+    assert!(crate::repair::guard::RepairGuard::try_take(&r.root, &a).is_some());
+    let l = lane(DEPT);
+    let lock_file = r.base.join(".pack-apply.lock");
+    let hooks = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> { Ok(ReconcileReport { hooks: Vec::new() }) };
+    let registrar = |_: &Path, _: bool| -> Result<String, RepairError> { Ok(String::new()) };
+    let pass = |_: &str, _: &Path, _: Duration| -> Result<CheckOutcome, RepairError> { Ok(CheckOutcome { result: CheckResult::Pass, ms: 1 }) };
+    let job = crate::repair::probation::JobEnv {
+        op: OpEnv { root: &r.root, pack: &r.dept, lane: &l, now: T0, form: ApplyForm::Exchange, faults: &NoFaults, own_check: &|_, _| None },
+        incarnation: "inc",
+        check: &pass,
+        reference: &|_, _| Ok(CheckOutcome { result: CheckResult::Pass, ms: 1 }),
+        hooks: &hooks,
+        registrar: &registrar,
+        locked: &apply::no_repair_lock,
+        excluded: &|_| false,
+        original: &|_| None,
+        intake: &|_, _| true,
+        apply_lock: &lock_file,
+    };
+    let rep = crate::repair::probation::run_tick(&job, false).unwrap();
+    assert!(!rep.deferred_probation && !rep.deferred_sweep, "{rep:?}");
+}
+
 // ───────────────────────────── RULINGS JD2 / JI1 — what a lane's hook unit did, READ from its record ─────────────────────────────
 // Round 6 pinned a row field (`assert_eq!(row.hook_ops, …)` on each path below); RULINGS JI1 removed it — the
 // trace is READ from the lane's write-ahead operation records (`completed_hook_ops_in`). Each test keeps its
