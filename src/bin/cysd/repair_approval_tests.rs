@@ -222,7 +222,22 @@ struct Rec {
     /// free) by try-lock — and what it saw
     send_probe: Mutex<Option<Box<dyn Fn() -> (bool, bool) + Send + Sync>>>,
     sends_free: Mutex<Vec<(bool, bool)>>,
+    /// RULINGS KX2: when set, the apply goes to the ENGINE (`apply::apply_candidate_locked` — the
+    /// production lock + apply) over the rig's paths instead of the scripted answer
+    engine: Mutex<Option<EngineApply>>,
+    /// every bus event with its payload (`events` keeps the names)
+    payloads: Mutex<Vec<(String, Value)>>,
 }
+
+type EngineApply = Box<
+    dyn Fn(
+            &RepairId,
+            &[cys::repair::apply::CandidateFile],
+            &cys::repair::apply::LifetimeFn<'_>,
+        ) -> Result<cys::repair::apply::Bounded<cys::repair::apply::ApplyOutcome>, RepairError>
+        + Send
+        + Sync,
+>;
 
 impl Effects for Rec {
     fn deliver(&self, seat: u64, text: String) {
@@ -237,8 +252,9 @@ impl Effects for Rec {
     fn point_master(&self, text: String) {
         self.master.lock().unwrap().push(text);
     }
-    fn publish(&self, name: &str, _payload: Value) {
+    fn publish(&self, name: &str, payload: Value) {
         self.events.lock().unwrap().push(name.to_string());
+        self.payloads.lock().unwrap().push((name.to_string(), payload));
     }
     fn spawn_helper(
         &self,
@@ -271,10 +287,14 @@ impl Effects for Rec {
     }
     fn apply(
         &self,
-        _id: &RepairId,
+        id: &RepairId,
         _lane: &LaneKey,
         files: &[cys::repair::apply::CandidateFile],
-    ) -> Result<cys::repair::apply::ApplyOutcome, RepairError> {
+        still_valid: &cys::repair::apply::LifetimeFn<'_>,
+    ) -> Result<cys::repair::apply::Bounded<cys::repair::apply::ApplyOutcome>, RepairError> {
+        if let Some(engine) = self.engine.lock().unwrap().as_ref() {
+            return engine(id, files, still_valid);
+        }
         self.applied
             .lock()
             .unwrap()
@@ -283,12 +303,13 @@ impl Effects for Rec {
             let st = t.lock().unwrap().find(&rid).map(|r| r.state);
             self.seen_during_apply.lock().unwrap().extend(st);
         }
-        Ok(self
-            .apply_answer
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or(cys::repair::apply::ApplyOutcome::Applied))
+        Ok(cys::repair::apply::Bounded::Ran(
+            self.apply_answer
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(cys::repair::apply::ApplyOutcome::Applied),
+        ))
     }
     fn step3(&self, _s3: &Step3Input) -> Result<Step3Ok, Step3Err> {
         if let Some(e) = self.step3_err.lock().unwrap().clone() {
@@ -923,6 +944,193 @@ fn result_at_29_59_30_00_30_01() {
         );
         assert_eq!(state_of(&t, &rid) == ReqState::Approved, approved);
     }
+}
+
+/// What one KX2 case left behind.
+#[cfg(target_os = "macos")]
+struct Kx2Seen {
+    state: ReqState,
+    rec_state: RepairState,
+    approval: Option<ApprovalResult>,
+    intent: Option<String>,
+    live: (Vec<u8>, (u64, u64)),
+    live_before: (Vec<u8>, (u64, u64)),
+    staged: (Vec<u8>, (u64, u64), TargetState),
+    staged_before: (Vec<u8>, (u64, u64), TargetState),
+    resolved: Vec<Value>,
+}
+
+/// One approval through the production lock + apply (`apply::apply_candidate_locked`: the blocking
+/// `flock` of `pack_apply_lock_path_for(pack)`, then the engine) over the rig's own repairs root and
+/// pack, the protection screen and the file's own check passing. `hold` = another holder (a thread of
+/// this test) holds the REAL lock on the file a SIBLING pack under the same parent names — the same
+/// file. The owner's result is consumed at T0 + 20 s (inside the lifetime); the approving thread then
+/// says it enters the apply; `during_wait` (from `expires_at`) is where the holder moves the injected
+/// consumption clock BEFORE it releases the lock — so the clock moves after every check before the
+/// apply and before the apply can pass the lock.
+#[cfg(target_os = "macos")]
+fn kx2_case(tag: &str, hold: bool, during_wait: Option<fn(f64) -> f64>) -> Kx2Seen {
+    use cys::repair::apply as engine;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::AtomicU64;
+    let r = rig(tag);
+    let id = r.signed_repair();
+    // the engine's own preconditions: a known pack generation and the live file's pre-image as
+    // `begin` records it
+    std::fs::write(r.pack.join(".pack-version"), "0.15.0\n").unwrap();
+    let live = r.pack.join("hooks/h.sh");
+    let pre = ledger::copy_preimage_in(&r.root, &id, &r.lane, "hooks/h.sh", &live, T0).unwrap();
+    let mut rec = r.rec(&id);
+    rec.files[0].pre = pre;
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let t = Mutex::new(ApprovalTable::default());
+    let eff = Arc::new(effects());
+    let rid = pending(&r, &t, &eff, T0);
+    let entering: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>> = Arc::new(Mutex::new(None));
+    {
+        let (root, pack, lane, entering) = (r.root.clone(), r.pack.clone(), r.lane.clone(), entering.clone());
+        *eff.engine.lock().unwrap() = Some(Box::new(move |id, files, still_valid| {
+            if let Some(tx) = entering.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let env = engine::OpEnv {
+                root: &root,
+                pack: &pack,
+                lane: &lane,
+                now: T0 + 20.0,
+                form: cys::repair::platform::ApplyForm::Exchange,
+                faults: &engine::NoFaults,
+                own_check: &|_, _| None,
+            };
+            let pass = |_: &str, _: &Path, _: Duration| -> Result<engine::CheckOutcome, RepairError> {
+                Ok(engine::CheckOutcome { result: cys::repair::rehearsal::CheckResult::Pass, ms: 1 })
+            };
+            let pass_reference = |_: cys::repair::boot_critical::CheckKind, _: Duration| -> Result<engine::CheckOutcome, RepairError> {
+                Ok(engine::CheckOutcome { result: cys::repair::rehearsal::CheckResult::Pass, ms: 1 })
+            };
+            engine::apply_candidate_locked(&env, id, files, &|_, _, _| Ok(()), &pass, &pass_reference, still_valid)
+        }));
+    }
+    // the owner clicks and the helper answers with this request's record
+    let children: Mutex<Vec<(String, std::process::Child)>> = Mutex::new(Vec::new());
+    let eff_dyn: Arc<dyn Effects> = eff.clone();
+    approval_start(&r.ctx(T0 + 10.0), &json!({"request_id": rid}), &t, &eff_dyn, &|_r, n, c| {
+        children.lock().unwrap().push((n, c))
+    })
+    .unwrap();
+    let (nonce, child) = children.lock().unwrap().pop().expect("the helper was spawned");
+    assert!(wait_helper(child, &rid, &nonce), "premise: the helper's record approves");
+    let expires_at = t.lock().unwrap().find(&rid).unwrap().expires_at;
+    let clock = Arc::new(AtomicU64::new((T0 + 20.0).to_bits()));
+    CONSUMPTION_CLOCK_FOR_TEST.with(|c| *c.borrow_mut() = Some(clock.clone()));
+    // the holder: the REAL lock, through the file a sibling pack under the same parent names
+    let sibling = r.pack.parent().unwrap().join("pack-dept-x");
+    let lock_file = cys::pack_apply_lock::pack_apply_lock_path_for(&sibling);
+    assert_eq!(lock_file, cys::pack_apply_lock::pack_apply_lock_path_for(&r.pack), "premise: one lock file");
+    let holder = hold.then(|| {
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (enter_tx, enter_rx) = std::sync::mpsc::channel::<()>();
+        *entering.lock().unwrap() = Some(enter_tx);
+        let clock = clock.clone();
+        let h = std::thread::spawn(move || {
+            cys::pack_apply_lock::with_apply_lock(&lock_file, || {
+                held_tx.send(()).unwrap();
+                // the approving thread has passed every check before the apply and enters it; the
+                // clock moves while the lock is still held
+                if enter_rx.recv().is_ok() {
+                    if let Some(to) = during_wait {
+                        clock.store(to(expires_at).to_bits(), std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            })
+            .unwrap();
+        });
+        held_rx.recv().unwrap();
+        h
+    });
+    let id_of = |p: &Path| {
+        let m = std::fs::symlink_metadata(p).unwrap();
+        (m.dev(), m.ino())
+    };
+    let staged_path = r.staged(&id);
+    let live_before = (std::fs::read(&live).unwrap(), id_of(&live));
+    let staged_before = (
+        std::fs::read(&staged_path).unwrap(),
+        id_of(&staged_path),
+        TargetState::read(&staged_path).unwrap(),
+    );
+    let res = finish_verification(&r.ctx(T0 + 20.0), &t, eff.as_ref(), &rid, &nonce, true);
+    // a path that never entered the apply must not leave the holder waiting
+    entering.lock().unwrap().take();
+    if let Some(h) = holder {
+        h.join().unwrap();
+    }
+    CONSUMPTION_CLOCK_FOR_TEST.with(|c| *c.borrow_mut() = None);
+    assert!(res.is_ok(), "{tag}: {res:?}");
+    let rec = r.rec(&id);
+    let seen = Kx2Seen {
+        state: state_of(&t, &rid),
+        rec_state: rec.state,
+        approval: rec.approval,
+        intent: engine::read_intent_in(&r.root, &id, &r.lane).map(|i| i.state),
+        live: (std::fs::read(&live).unwrap(), id_of(&live)),
+        live_before,
+        staged: (
+            std::fs::read(&staged_path).unwrap(),
+            id_of(&staged_path),
+            TargetState::read(&staged_path).unwrap(),
+        ),
+        staged_before,
+        resolved: eff
+            .payloads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n == "repair.approval.resolved")
+            .map(|(_, p)| p["state"].clone())
+            .collect(),
+    };
+    seen
+}
+
+/// RULINGS KX2 (whole-diff review pass 2, slice AUTH, M1; I3 / contract 5.5 "again at apply") — an
+/// approval that waited for the SHARED pack-apply lock past its request's expiry applies NOTHING:
+/// no apply intent, the live file's bytes and identity unchanged, the staged candidate untouched, and
+/// the request ends exactly as the check before the apply ends it — `Expired`, the repair back to
+/// 승인 대기, the approved record cleared (not `Voided`, not 진행 중) — with one resolved event saying
+/// expired. Controls: the lock free → applied; the lock waited for with the clock still inside →
+/// applied; the boundary — one tick before `expires_at` applied, AT `expires_at` expired (the side
+/// of the check before the apply, `now >= expires_at`). (Old behaviour, fb75a072: nothing between
+/// the lock and the first durable intent asked the lifetime — case (a) wrote its intent and
+/// exchanged the live file.)
+#[cfg(target_os = "macos")]
+#[test]
+fn an_approval_that_waited_for_the_pack_apply_lock_past_its_expiry_applies_nothing() {
+    let expired = |tag: &str, s: &Kx2Seen| {
+        assert_eq!(s.state, ReqState::Expired, "{tag}: the request");
+        assert_eq!(s.rec_state, RepairState::AwaitingApproval, "{tag}: the repair back to 승인 대기");
+        assert_eq!(s.approval, None, "{tag}: the approved record cleared");
+        assert_eq!(s.intent, None, "{tag}: an apply intent was written");
+        assert_eq!(s.live, s.live_before, "{tag}: the live file's bytes or identity changed");
+        assert_eq!(s.staged, s.staged_before, "{tag}: the staged candidate changed");
+        assert_eq!(s.resolved, vec![json!("expired")], "{tag}: the one resolved event");
+    };
+    let applied = |tag: &str, s: &Kx2Seen| {
+        assert_eq!(s.state, ReqState::Approved, "{tag}: the request");
+        assert_eq!(s.intent.as_deref(), Some("applied"), "{tag}: the apply intent");
+        assert_eq!(s.live.0, s.staged_before.0, "{tag}: the candidate is live");
+        assert_ne!(s.live.1, s.live_before.1, "{tag}: the live entry was exchanged");
+        assert_eq!(s.resolved, vec![json!("approved")], "{tag}: the one resolved event");
+    };
+    // (a) the clock passes the expiry while the apply waits for another holder's lock
+    expired("a", &kx2_case("kx2-a", true, Some(|e| e + 10.0)));
+    // (b) the lock free → applied exactly as before
+    applied("b", &kx2_case("kx2-b", false, None));
+    // (c) the lock waited for, the clock still inside the lifetime
+    applied("c", &kx2_case("kx2-c", true, Some(|e| e - 60.0)));
+    // (d) the boundary instants
+    applied("d-tick", &kx2_case("kx2-d1", true, Some(|e| f64::from_bits(e.to_bits() - 1))));
+    expired("d-at", &kx2_case("kx2-d2", true, Some(|e| e)));
 }
 
 /// RULINGS I3: a result consumed late from a helper started before the deadline → not approved.
