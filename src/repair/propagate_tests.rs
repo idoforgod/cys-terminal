@@ -2928,3 +2928,173 @@ fn a_recommit_after_the_catchup_leaves_the_gate_open_and_demotes_the_row() {
     assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"newer\n");
     assert_eq!(gate_verdict_in(&r.root, &lane(DEPT)), GateVerdict::Open);
 }
+
+// ───────────────────────────── RULINGS LA (unit WP1) — an OPEN probation bundle is T6's ─────────────────────────────
+
+/// T6's probation tick in `which` at `now` — the repaired files' check failing (`fails`) or passing.
+fn t6_tick(r: &Rig, which: &str, now: f64, fails: bool) -> crate::repair::probation::TickReport {
+    use crate::repair::probation::{run_tick, JobEnv};
+    let check = move |rel: &str, _: &Path, _: Duration| -> Result<CheckOutcome, RepairError> {
+        Ok(CheckOutcome { result: if fails { CheckResult::Fail(format!("{rel}: 검사 실패(시험)")) } else { CheckResult::Pass }, ms: 5 })
+    };
+    let reference = |_: crate::repair::boot_critical::CheckKind, _: Duration| -> Result<CheckOutcome, RepairError> { Ok(CheckOutcome { result: CheckResult::Pass, ms: 100 }) };
+    let hooks = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> { Ok(ReconcileReport { hooks: Vec::new() }) };
+    let registrar = |_: &Path, _: bool| -> Result<String, RepairError> { Ok("{\"hooks\": []}".into()) };
+    let l = lane(which);
+    let lock = r.base.join(".pack-apply.lock");
+    let job = JobEnv {
+        op: OpEnv { root: &r.root, pack: r.pack(which), lane: &l, now, form: ApplyForm::Exchange, faults: &NoFaults, own_check: &|_, _| None },
+        incarnation: "inc-wp1",
+        check: &check,
+        reference: &reference,
+        hooks: &hooks,
+        registrar: &registrar,
+        locked: &apply::no_repair_lock,
+        excluded: &|_| false,
+        original: &|_| None,
+        intake: &|_, _| true,
+        apply_lock: &lock,
+    };
+    run_tick(&job, false).unwrap()
+}
+
+/// A boot-critical repair approved and applied in HQ (its origin) by T6's REAL approved apply
+/// (`apply_candidate_in`, the helper T6's own tests use): the row T6 writes — 검증됨, an OPEN bundle.
+fn approved_in_hq(r: &Rig, id: &RepairId, rel: &str) -> RepairRecord {
+    let t6 = crate::repair::apply::tests::Rig { base: r.base.join("t6-hq"), root: r.root.clone(), pack: r.hq.clone(), lane: lane(HQ), src: r.base.join("t6-hq").join("src") };
+    std::fs::create_dir_all(&t6.src).unwrap();
+    let rec = crate::repair::apply::tests::approved_and_applied(&t6, id, rel, b"#!/bin/sh\nPRE\n", b"#!/bin/sh\nAPPROVED\n");
+    let row = r.row(id, HQ).unwrap();
+    assert_eq!(row.state, LaneState::Verified);
+    assert!(row.probation.as_ref().is_some_and(|p| p.closed.is_none() && p.applied_at == T0), "T6 wrote an OPEN bundle: {:?}", row.probation);
+    rec
+}
+
+/// The row's open bundle, as T6 wrote it at T0, is still there — not closed, not re-stamped.
+fn assert_open_bundle_kept(r: &Rig, id: &RepairId, which: &str, what: &str) {
+    let row = r.row(id, which).unwrap();
+    let p = row.probation.as_ref().unwrap_or_else(|| panic!("{what}: the bundle was dropped"));
+    assert!(p.closed.is_none(), "{what}: the open bundle was closed: {:?}", p.closed);
+    assert_eq!(p.applied_at, T0, "{what}: the bundle was re-stamped");
+}
+
+/// LA (1) — the rig's sequence: an approved boot-critical repair applied in HQ, then HQ's FIRST propagation
+/// tick (no job state → the full reset): T6's open bundle stays OPEN with its applied_at; the gate is
+/// open; and when the check then fails, T6's probation returns the repair (the live file is the
+/// pre-image again, the record says 되돌려짐).
+#[cfg(target_os = "macos")]
+#[test]
+fn wp1_an_approved_origin_rows_open_bundle_survives_the_first_tick_and_is_returned() {
+    let r = rig("wp1-1");
+    let id = rid("R-1");
+    let rel = "hooks/x.sh";
+    approved_in_hq(&r, &id, rel);
+    TICK_NOW.with(|n| n.set(T0 + 60.0));
+    tick(&r, HQ, &doubles(), &fid(1));
+    TICK_NOW.with(|n| n.set(T0));
+    assert_open_bundle_kept(&r, &id, HQ, "the first tick");
+    assert_eq!(gate_verdict_in(&r.root, &lane(HQ)), GateVerdict::Open, "the lane caught up");
+    let rep = t6_tick(&r, HQ, T0 + 600.0, true);
+    assert_eq!(rep.reverted, vec![id.clone()], "{rep:?}");
+    assert_eq!(std::fs::read(r.hq.join(rel)).unwrap(), b"#!/bin/sh\nPRE\n", "the pre-image is back");
+    assert_eq!(ledger::read_record_in(&r.root, &id).unwrap().unwrap().state, RepairState::Reverted);
+}
+
+/// LA (3) — the later exposure: HQ caught up BEFORE the approved apply (job state and instance
+/// recorded); the apply; an ordinary tick keeps the bundle (the unchanged 검증됨 row); then the pack
+/// instance changes with the bytes KEPT (the id file differs → the full reset): the bundle stays OPEN,
+/// and a failing check is returned.
+#[cfg(target_os = "macos")]
+#[test]
+fn wp1_an_open_bundle_survives_a_pack_instance_change_with_the_bytes_kept() {
+    let r = rig("wp1-3");
+    let id = rid("R-1");
+    let rel = "hooks/x.sh";
+    tick(&r, HQ, &doubles(), &fid(1));
+    assert_eq!(gate_verdict_in(&r.root, &lane(HQ)), GateVerdict::Open, "caught up before the apply");
+    approved_in_hq(&r, &id, rel);
+    TICK_NOW.with(|n| n.set(T0 + 60.0));
+    tick(&r, HQ, &doubles(), &fid(1));
+    assert_open_bundle_kept(&r, &id, HQ, "an ordinary tick");
+    // the pack instance changes; every byte of the pack stays
+    std::fs::write(r.hq.join(".repair-pack-id"), format!("{}\n", fid(7))).unwrap();
+    TICK_NOW.with(|n| n.set(T0 + 120.0));
+    let t = tick(&r, HQ, &doubles(), &fid(2));
+    TICK_NOW.with(|n| n.set(T0));
+    assert!(matches!(t.pass, Some(PassOutcome::Reset { .. })), "{t:?}");
+    assert_open_bundle_kept(&r, &id, HQ, "the reset of an instance change");
+    let rep = t6_tick(&r, HQ, T0 + 600.0, true);
+    assert_eq!(rep.reverted, vec![id.clone()], "{rep:?}");
+    assert_eq!(std::fs::read(r.hq.join(rel)).unwrap(), b"#!/bin/sh\nPRE\n");
+}
+
+/// LA (4) — a RECEIVING lane's row that the propagation applied (its door phase: 검증됨 with an OPEN
+/// bundle) through an instance change: the row is left as it is — not demoted, not re-checked, not
+/// rewritten (its bytes stay) — and T6 returns a failing repair there.
+#[cfg(target_os = "macos")]
+#[test]
+fn wp1_a_receiving_lanes_open_bundle_is_left_to_t6_through_a_reset() {
+    let r = rig("wp1-4");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    tick(&r, DEPT, &doubles(), &fid(1));
+    assert_open_bundle_kept(&r, &id, DEPT, "the door phase's own row");
+    let path = ledger::lane_path_in(&r.root, &id, &lane(DEPT));
+    let before = std::fs::read(&path).unwrap();
+    std::fs::write(r.dept.join(".repair-pack-id"), format!("{}\n", fid(7))).unwrap();
+    let d = doubles();
+    TICK_NOW.with(|n| n.set(T0 + 120.0));
+    let t = tick(&r, DEPT, &d, &fid(2));
+    TICK_NOW.with(|n| n.set(T0));
+    assert!(matches!(t.pass, Some(PassOutcome::Reset { .. })), "{t:?}");
+    assert_eq!(std::fs::read(&path).unwrap(), before, "the row is left as it is: {:?}", r.row(&id, DEPT));
+    assert_eq!(d.checks.get(), 0, "no check by the propagation");
+    let rep = t6_tick(&r, DEPT, T0 + 600.0, true);
+    assert_eq!(rep.reverted, vec![id.clone()], "{rep:?}");
+    assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"old\n");
+}
+
+/// LA — CONTROLS (today's rules for a row WITHOUT an open bundle): (a) a row whose bundle T6 already
+/// CLOSED and (b) a row without a bundle go through a reset to 대기 and are decided anew (the check runs,
+/// the row is rewritten, 검증됨); (c) a lane that really had the result without applying it gets the
+/// closed NOTHING_REPLACED_HERE bundle.
+#[cfg(target_os = "macos")]
+#[test]
+fn wp1_controls_rows_without_an_open_bundle_follow_todays_rules() {
+    // (a) a closed bundle (the 24-hour probation over)
+    let r = rig("wp1-c1");
+    let id = rid("R-1");
+    approved_in_hq(&r, &id, "hooks/x.sh");
+    let mut row = r.row(&id, HQ).unwrap();
+    row.probation.as_mut().unwrap().closed = Some("사용 중 — 24시간 시험 기간을 마쳤습니다".into());
+    ledger::write_lane_durable_in(&r.root, &row).unwrap();
+    let d = doubles();
+    TICK_NOW.with(|n| n.set(T0 + 60.0));
+    tick(&r, HQ, &d, &fid(1));
+    TICK_NOW.with(|n| n.set(T0));
+    let after = r.row(&id, HQ).unwrap();
+    assert_eq!(after.state, LaneState::Verified);
+    assert!(d.checks.get() > 0, "decided anew: the check ran");
+    assert_eq!(after.updated_at, T0 + 60.0, "rewritten by the decision");
+    assert!(after.probation.as_ref().is_some_and(|p| p.closed.is_some()), "{:?}", after.probation);
+    // (b) no bundle at all
+    let r = rig("wp1-c2");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/a.py", b"new\n", 0o644);
+    let rec = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
+    let mut row = new_row(&id, &lane(DEPT), T0 - 10.0);
+    row.state = LaneState::Verified;
+    row.applied = rec.committed.clone();
+    ledger::write_lane_durable_in(&r.root, &row).unwrap();
+    let d = doubles();
+    TICK_NOW.with(|n| n.set(T0 + 60.0));
+    tick(&r, DEPT, &d, &fid(1));
+    TICK_NOW.with(|n| n.set(T0));
+    let after = r.row(&id, DEPT).unwrap();
+    assert_eq!(after.state, LaneState::Verified);
+    assert!(d.checks.get() > 0, "decided anew");
+    // (c) the lane really had the result and replaced nothing
+    assert_eq!(after.probation.as_ref().and_then(|p| p.closed.as_deref()), Some(NOTHING_REPLACED_HERE));
+}
