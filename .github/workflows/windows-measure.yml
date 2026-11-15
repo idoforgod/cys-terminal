@@ -157,6 +157,22 @@ jobs:
           TW1_T9_RESULT: ${{ needs.t9-libtests.result }}
           TW1_PHASE: ${{ inputs.phase || '1' }}
         run: python -X utf8 scripts/windows-measure/tw1_main.py run --work "$env:RUNNER_TEMP\tw1" --out "$env:RUNNER_TEMP\tw1-record" --phase $env:TW1_PHASE
+      # TW2 (RULINGS LH6): two runners were lost near the end of the measurement with no record (pushes 5c, 7a). The
+      #   record folder is copied - every file redacted with the clean-up's mapping, a file that is not UTF-8 text
+      #   left out - and uploaded BEFORE the clean-up stops anything. The copy lacks what still-running processes write
+      #   after it and the clean-up's report (listed in early-copy.json); tw1-record below stays the full record.
+      - name: Copy the record, redacted, before anything is stopped (always)
+        if: always()
+        shell: pwsh
+        run: python -X utf8 scripts/windows-measure/tw1_main.py early-copy --work "$env:RUNNER_TEMP\tw1" --out "$env:RUNNER_TEMP\tw1-record" --dest "$env:RUNNER_TEMP\tw1-record-early"
+      - name: Upload the early copy of the record (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tw1-record-early
+          path: ${{ runner.temp }}/tw1-record-early
+          retention-days: 14
+          if-no-files-found: warn
       - name: Stop everything this run started (always)
         if: always()
         shell: pwsh

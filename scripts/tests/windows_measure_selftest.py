@@ -19,7 +19,7 @@ What it pins (the rules of the record - plan impl/plans/TW1.md 3.7, each by a te
   W  the workflow file: triggers, permissions, time limits, pins, retention, concurrency, no secret, cleanup always();
   K  (TW2, RULINGS LH6) a kill by a REMEMBERED pid acts only while that pid still names the process that was recorded
      (creation time + image); a tree is walked only from a verified root and only to children not older than their
-     parent; every successful stop closes the pid's registration.
+     parent; every successful stop closes the pid's registration; the early copy of the record is redacted.
 
 Standard library only. Run: python3 scripts/tests/windows_measure_selftest.py
 """
@@ -502,6 +502,105 @@ class PrivacyTests(unittest.TestCase):
         self.assertNotIn("ghs_secretvalue", json.dumps(snap))
         for name in ("GITHUB_REPOSITORY", "GITHUB_ACTOR", "USERPROFILE", "USERNAME", "GH_TOKEN"):
             self.assertNotIn(name, R.ENV_VALUE_ALLOW)
+
+    # ── TW2 (RULINGS LH6 + EQ6 / HC6): the early copy of the record, made BEFORE the clean-up stops anything ──
+    NEEDLES = ("someone", "someowner", "someactor", "somerepo")
+
+    def _all_bytes_under(self, root):
+        out = b""
+        for dp, _dns, fns in os.walk(root):
+            for fn in fns:
+                with open(os.path.join(dp, fn), "rb") as fh:
+                    out += fn.encode("utf-8") + b"\n" + fh.read() + b"\n"
+        return out
+
+    def test_the_early_copy_is_redacted_in_every_form(self):
+        """The same forms as test_paths_and_names_are_replaced_in_every_form, written as the files a run leaves in
+        the record folder (a JSON observation, a probe log, a daemon's raw output in a nested evidence folder)."""
+        import tempfile
+        import tw1_main as M
+        mp = R.redaction_map(self.ENV)
+        obj = {"a": "X:\\profiles\\someone\\AppData\\Local\\cys\\cys.exe", "b": "x:/PROFILES/SOMEONE/.cys/pack",
+               "c": ["https://example/someowner/somerepo/releases", "by someactor"],
+               "d": json.dumps({"p": "X:\\profiles\\someone\\x"}), "k\\profiles\\someone": 1}
+        with tempfile.TemporaryDirectory() as d:
+            src, dest = os.path.join(d, "tw1-record"), os.path.join(d, "tw1-record-early")
+            os.makedirs(os.path.join(src, "evidence", "s2_update"))
+            os.makedirs(os.path.join(src, "logs"))
+            with open(os.path.join(src, "tw1-record.json"), "w", encoding="utf-8") as fh:
+                json.dump(obj, fh)
+            with open(os.path.join(src, "logs", "s2_update.log"), "w", encoding="utf-8", newline="") as fh:
+                fh.write("run as someone in X:\\profiles\\someone\r\nSOMEONE again\r\n")
+            with open(os.path.join(src, "evidence", "s2_update", "new-cysd.out"), "wb") as fh:
+                fh.write("데몬 X:/profiles/someone/.cys/pack 시작\n".encode("utf-8"))
+            sm = M.redacted_copy(src, dest, mp)
+            self.assertEqual((sm["copied"], sm["redacted"]), (3, 3), sm)
+            blob = self._all_bytes_under(dest).lower()
+            for needle in self.NEEDLES:
+                self.assertNotIn(needle.encode("utf-8"), blob, needle)
+            self.assertIn(b"%userprofile%", blob)
+            with open(os.path.join(dest, "logs", "s2_update.log"), "rb") as fh:
+                self.assertIn(b"\r\n", fh.read())          # line endings kept: a copy, not a rewrite
+            with open(os.path.join(src, "logs", "s2_update.log"), encoding="utf-8") as fh:
+                self.assertIn("someone", fh.read())         # the source is not touched (the clean-up redacts it later)
+
+    def test_the_early_copy_leaves_out_what_it_cannot_redact(self):
+        """A file that is not UTF-8 text cannot be redacted as text: it is LEFT OUT of the early copy (named in the
+        summary), never copied as it is. A file still being written may end in half a character: that tail is dropped
+        and the rest is redacted. No mapping, or a destination inside the record folder: nothing is copied."""
+        import tempfile
+        import tw1_main as M
+        mp = R.redaction_map(self.ENV)
+        with tempfile.TemporaryDirectory() as d:
+            src, dest = os.path.join(d, "rec"), os.path.join(d, "early")
+            os.makedirs(os.path.join(src, "evidence"))
+            with open(os.path.join(src, "evidence", "holder-defender.out"), "wb") as fh:
+                fh.write(b"\xff\xfe s\x00someone X:\\profiles\\someone")          # UTF-16 / cp1252 text: not UTF-8
+            with open(os.path.join(src, "evidence", "busy-cysd.out"), "wb") as fh:
+                fh.write("pack at X:\\profiles\\someone\\.cys 완".encode("utf-8")[:-1])  # cut inside the last character
+            sm = M.redacted_copy(src, dest, mp)
+            self.assertEqual(sm["left_out_not_utf8"], [os.path.join("evidence", "holder-defender.out")])
+            self.assertEqual(sm["tail_dropped"], [os.path.join("evidence", "busy-cysd.out")])
+            self.assertFalse(os.path.exists(os.path.join(dest, "evidence", "holder-defender.out")))
+            with open(os.path.join(dest, "evidence", "busy-cysd.out"), encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "pack at %USERPROFILE%\\.cys ")
+            self.assertNotIn(b"someone", self._all_bytes_under(dest).lower())
+            for bad_mapping, bad_dest in (([], os.path.join(d, "early2")), (mp, os.path.join(src, "inside"))):
+                sm = M.redacted_copy(src, bad_dest, bad_mapping)
+                self.assertEqual(sm["copied"], 0)
+                self.assertTrue(sm.get("refused"), sm)
+                self.assertFalse(os.path.exists(os.path.join(bad_dest, "evidence")))
+
+    def test_the_early_copy_command_uses_the_clean_ups_mapping(self):
+        """`tw1_main.py early-copy` reads the mapping the run stored for the clean-up (ctx.json); it always exits 0
+        and writes early-copy.json (what was copied, what was left out, what the copy lacks) into the copy."""
+        import tempfile
+        from unittest import mock
+        import tw1_main as M
+        with tempfile.TemporaryDirectory() as d:
+            work, out, dest = os.path.join(d, "tw1"), os.path.join(d, "tw1-record"), os.path.join(d, "tw1-record-early")
+            os.makedirs(work)
+            os.makedirs(os.path.join(out, "logs"))
+            with open(os.path.join(work, "ctx.json"), "w", encoding="utf-8") as fh:
+                json.dump({"redaction": R.redaction_map(self.ENV)}, fh)
+            with open(os.path.join(out, "logs", "s0_env.log"), "w", encoding="utf-8") as fh:
+                fh.write("X:\\profiles\\someone by someactor\n")
+            with mock.patch.dict(os.environ, {}, clear=True):
+                rc = M.main(["early-copy", "--work", work, "--out", out, "--dest", dest])
+            self.assertEqual(rc, 0)
+            with open(os.path.join(dest, "early-copy.json"), encoding="utf-8") as fh:
+                note = json.load(fh)
+            self.assertEqual(note["copied"], 1)
+            self.assertTrue(note["lacks"])
+            blob = self._all_bytes_under(dest).lower()
+            self.assertNotIn(b"someone", blob)
+            self.assertNotIn(b"someactor", blob)
+            # no stored mapping and none in the environment: nothing is copied, still exit 0
+            os.remove(os.path.join(work, "ctx.json"))
+            dest2 = os.path.join(d, "early-2")
+            with mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(M.main(["early-copy", "--work", work, "--out", out, "--dest", dest2]), 0)
+            self.assertEqual(sorted(os.listdir(dest2)), ["early-copy.json"])
 
 
 class RecordTests(unittest.TestCase):
@@ -1457,6 +1556,15 @@ class WorkflowTests(unittest.TestCase):
         self.assertRegex(body, r"(?ms)- name: Upload the record.*?if: always\(\)")
         self.assertRegex(body, r"(?ms)- name: Conclusion.*?if: always\(\)")
         self.assertLess(body.index("Stop everything this run started"), body.index("Upload the record"))
+        # TW2 (RULINGS LH6): a redacted copy of the record is made and uploaded right after Measure, BEFORE the clean-up
+        self.assertRegex(body, r"(?ms)- name: Copy the record, redacted, before anything is stopped.*?if: always\(\)"
+                               r".*?tw1_main\.py early-copy --work .*? --out .*? --dest \"\$env:RUNNER_TEMP\\tw1-record-early\"")
+        self.assertRegex(body, r"(?ms)- name: Upload the early copy of the record.*?if: always\(\).*?name: tw1-record-early\n"
+                               r"\s+path: \$\{\{ runner\.temp \}\}/tw1-record-early\n")
+        self.assertLess(body.index("- name: Measure"), body.index("Copy the record, redacted"))
+        self.assertLess(body.index("Copy the record, redacted"), body.index("Upload the early copy of the record"))
+        self.assertLess(body.index("Upload the early copy of the record"), body.index("Stop everything this run started"))
+        self.assertEqual(re.findall(r"(?m)^\s+path: \$\{\{ runner\.temp \}\}/(\S+)$", body), ["tw1-record-early", "tw1-record"])
         self.assertLess(body.index("Upload the record"), body.index("- name: Conclusion"))
         self.assertIn("needs: [wait-build, tnv-build, t9-libtests]", body)
         self.assertIn("TW1_T9_RESULT: ${{ needs.t9-libtests.result }}", body)

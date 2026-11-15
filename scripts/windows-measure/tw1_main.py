@@ -5,13 +5,14 @@ Commands:
   find-build --sha SHA [--wait-minutes N] [--out FILE]   (ubuntu job) the windows-build run at this commit
   run --work DIR --out DIR [--phase 1|2]                 stages S0..; writes tw1-record.json / tw1-record.md
   probe ID --work DIR --out DIR                          one probe in its own process (called by run)
+  early-copy --work DIR --out DIR --dest DIR             a REDACTED copy of the record folder, before the clean-up
   cleanup --work DIR --out DIR                           stops every process the run started (always())
   conclude --out DIR                                     red (exit 1) on MEASURED-FAIL or a failed set-up
 
 Every probe runs in a child process with the time limit of matrix.json; on expiry its process tree is ended (the
 long-lived processes the run registered are kept for the always() cleanup) and its rows are NOT-MEASURED.
 TW2 (RULINGS LH6): a kill by a remembered pid acts only while the pid still names the process that was recorded
-(creation time + image, tw1_probes.plan_tree_kill).
+(creation time + image, tw1_probes.plan_tree_kill); the record is copied, redacted, before anything is stopped.
 Verdicts are computed by tw1_record from the recorded facts only. Standard library only.
 """
 
@@ -330,6 +331,91 @@ def cmd_cleanup(a):
     return 0
 
 
+# ───────────────────────────── early copy (TW2) ─────────────────────────────
+
+EARLY_COPY_LACKS = [
+    "what processes still running at the copy (registered daemons, holders, panes, a Defender scan) wrote into their "
+    "output files after this moment - their files are copied as they were then",
+    "the clean-up's report cleanup.json (what was stopped, 'pid reused' refusals, product processes left, the Defender "
+    "restore) - it exists only in the tw1-record artifact",
+    "a last character a running process had only half written (its bytes are dropped: listed in tail_dropped)",
+    "every file that is not UTF-8 text: it cannot be redacted as text, so it is left out (listed in left_out_not_utf8); "
+    "tw1-record keeps such a file as it is",
+    "the record itself when the Measure step did not reach its end: tw1-record.json / tw1-record.md and observations/ "
+    "are written only at the end of `run` (the probes' observations are kept in the work folder until then, which is "
+    "never uploaded)",
+]
+
+
+def redacted_copy(src, dest, mapping):
+    """TW2 (RULINGS LH6 + EQ6 / HC6): copy the record folder `src` to `dest`, every file redacted with the clean-up's
+    mapping and its rule (R.redact on UTF-8 text; the source is not touched). Stricter than the clean-up where a copy
+    must be: a file that is not UTF-8 text is LEFT OUT (never copied unredacted); a half-written last character of a
+    file still being written is dropped. Nothing is copied without a mapping or when one folder is inside the other.
+    -> summary"""
+    import codecs
+    sm = {"copied": 0, "redacted": 0, "tail_dropped": [], "left_out_not_utf8": [], "left_out_unreadable": []}
+    s_abs, d_abs = os.path.abspath(src), os.path.abspath(dest)
+    if not mapping:
+        sm["refused"] = "no redaction mapping: nothing is copied (the artifact is public)"
+        return sm
+    try:
+        nested = os.path.commonpath([s_abs, d_abs]) in (s_abs, d_abs)
+    except ValueError:  # two drives: separate by construction
+        nested = False
+    if nested:
+        sm["refused"] = "the copy and the record folder must be separate folders"
+        return sm
+    for dp, dns, fns in os.walk(s_abs):
+        dns.sort()
+        for fn in sorted(fns):
+            p = os.path.join(dp, fn)
+            rel = os.path.relpath(p, s_abs)
+            try:
+                with open(p, "rb") as fh:
+                    raw = fh.read()
+            except OSError:
+                sm["left_out_unreadable"].append(rel)
+                continue
+            try:
+                text = codecs.getincrementaldecoder("utf-8")("strict").decode(raw, final=False)
+            except UnicodeDecodeError:
+                sm["left_out_not_utf8"].append(rel)
+                continue
+            if len(text.encode("utf-8")) != len(raw):
+                sm["tail_dropped"].append(rel)
+            red = R.redact(text, mapping)
+            q = os.path.join(d_abs, R.redact(rel, mapping))
+            os.makedirs(os.path.dirname(q), exist_ok=True)
+            with open(q, "w", encoding="utf-8", newline="") as fh:
+                fh.write(red)
+            sm["copied"] += 1
+            sm["redacted"] += red != text
+    return sm
+
+
+def cmd_early_copy(a):
+    """The mapping is the one the run stored for the clean-up (ctx.json); when the run did not get to store it, the
+    same mapping is made from this step's environment (the same job, the same runner). Always exit 0: the clean-up,
+    the upload and the conclusion that follow must not depend on this copy."""
+    _reconf_stdout()
+    ctx = _load_json(os.path.join(a.work, "ctx.json"), {}) or {}
+    mapping = [tuple(x) for x in ctx.get("redaction", [])] or R.redaction_map(dict(os.environ))
+    try:
+        sm = redacted_copy(a.out, a.dest, mapping)
+    except Exception as e:  # noqa: BLE001 - recorded; every file written before this was redacted
+        sm = {"error": "%s: %s" % (type(e).__name__, e)}
+    sm.update(made_epoch=time.time(), mapping_from="ctx.json" if ctx.get("redaction") else "environment",
+              lacks=EARLY_COPY_LACKS)
+    try:
+        _dump_json(os.path.join(a.dest, "early-copy.json"), R.redact(sm, mapping))
+    except OSError as e:
+        sm["note_error"] = str(e)
+    print("[tw1] early copy: %s" % json.dumps(R.redact({k: v for k, v in sm.items() if k != "lacks"}, mapping)),
+          flush=True)
+    return 0
+
+
 def cmd_conclude(a):
     _reconf_stdout()
     rec = _load_json(os.path.join(a.out, "tw1-record.json"))
@@ -349,12 +435,14 @@ def main(argv=None):
     fb.add_argument("--sha", required=True)
     fb.add_argument("--wait-minutes", type=int, default=75)
     fb.add_argument("--out")
-    for name in ("run", "cleanup"):
+    for name in ("run", "cleanup", "early-copy"):
         p = sub.add_parser(name)
         p.add_argument("--work", required=True)
         p.add_argument("--out", required=True)
         if name == "run":
             p.add_argument("--phase", type=int, default=1, choices=(1, 2))
+        if name == "early-copy":
+            p.add_argument("--dest", required=True)
     p = sub.add_parser("probe")
     p.add_argument("id")
     p.add_argument("--work", required=True)
@@ -366,8 +454,11 @@ def main(argv=None):
         a.work = os.path.abspath(a.work)
         a.out = os.path.abspath(a.out)
         os.makedirs(a.out, exist_ok=True)
+    if a.cmd == "early-copy":  # the record folder is read, never created or changed here
+        a.work, a.out, a.dest = os.path.abspath(a.work), os.path.abspath(a.out), os.path.abspath(a.dest)
+        os.makedirs(a.dest, exist_ok=True)
     return {"find-build": cmd_find_build, "run": cmd_run, "probe": cmd_probe, "cleanup": cmd_cleanup,
-            "conclude": cmd_conclude}[a.cmd](a)
+            "early-copy": cmd_early_copy, "conclude": cmd_conclude}[a.cmd](a)
 
 
 if __name__ == "__main__":
