@@ -439,7 +439,9 @@ pub fn check_child_env(
 /// the environment cleared and restated ([`check_child_env`]); the console hidden and the child leading
 /// its own process group (`GroupScoped` — the registrar's grade on the same runner: a new process group
 /// and `CREATE_NO_WINDOW` on Windows, a new session on unix, so that the bounded runner can stop it at
-/// the deadline); no autostart of a rival daemon; stdin null, stdout and stderr piped to the runner.
+/// the deadline); no autostart of a rival daemon; the pipes the bounded runner reads, set by the runner's
+/// own module (`apply::bounded_pipes`) — this file configures and reads no child's standard output (the
+/// RULINGS GA1 census: only the judge reads a hook's output).
 fn prepare_check_child(cmd: &mut std::process::Command) {
     cmd.env_clear();
     for (k, v) in check_child_env(std::env::var_os("SystemRoot")) {
@@ -450,9 +452,7 @@ fn prepare_check_child(cmd: &mut std::process::Command) {
         cmd.spawn_policy(crate::ChildLifetime::GroupScoped)
             .no_autostart();
     }
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    super::apply::bounded_pipes(cmd);
 }
 
 /// RULINGS LH2 — ONE prepared check child run through the bounded runner of every apply
