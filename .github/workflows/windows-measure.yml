@@ -82,8 +82,53 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+  # RULINGS HV4 (T9 = a release condition): T9's own journal-protocol tests (src/pack.rs, names t9_ / m15_da_ / m15_da2_;
+  #   none is cfg(unix)) and the pack-update verb's complete command with a test-signed pack (src/bin/cys.rs tests;
+  #   the shipped CLI trusts only its embedded keyring) on a real Windows runner. Skipped - and recorded as absent -
+  #   while T9 is not in the tree. No cache (EQ6).
+  t9-libtests:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Is T9's journal protocol in this tree
+        id: detect
+        shell: bash
+        run: |
+          mkdir -p t9-out
+          if grep -q 'fn t9_r2_two_starters_exactly_one_admitted' src/pack.rs; then
+            echo present > t9-out/t9-present.txt
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo absent > t9-out/t9-present.txt
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: T9 protocol tests (library)
+        if: steps.detect.outputs.present == 'true'
+        shell: bash
+        run: |
+          rc=0
+          cargo test --lib -- t9_ m15_da_ m15_da2_ > t9-out/t9-libtests.log 2>&1 || rc=$?
+          echo "TW1-CARGO-EXIT=$rc" >> t9-out/t9-libtests.log
+      - name: Pack-update verb, complete command, test-signed pack (binary tests)
+        if: steps.detect.outputs.present == 'true'
+        shell: bash
+        run: |
+          rc=0
+          cargo test --bin cys -- pack_update_ b428_u9_ > t9-out/t9-verbtests.log 2>&1 || rc=$?
+          echo "TW1-CARGO-EXIT=$rc" >> t9-out/t9-verbtests.log
+      - name: Upload the T9 test logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tw1-t9-libtests
+          path: t9-out
+          retention-days: 14
+          if-no-files-found: warn
+
   measure:
-    needs: [wait-build, tnv-build]
+    needs: [wait-build, tnv-build, t9-libtests]
     if: ${{ !cancelled() }}
     runs-on: windows-latest
     timeout-minutes: 130
@@ -109,6 +154,7 @@ jobs:
           TW1_BUILD_CONCLUSION: ${{ needs.wait-build.outputs.conclusion }}
           TW1_BUILD_REASON: ${{ needs.wait-build.outputs.reason }}
           TW1_TNV_RESULT: ${{ needs.tnv-build.result }}
+          TW1_T9_RESULT: ${{ needs.t9-libtests.result }}
           TW1_PHASE: ${{ inputs.phase || '1' }}
         run: python -X utf8 scripts/windows-measure/tw1_main.py run --work "$env:RUNNER_TEMP\tw1" --out "$env:RUNNER_TEMP\tw1-record" --phase $env:TW1_PHASE
       - name: Stop everything this run started (always)

@@ -472,7 +472,10 @@
   "s3_eg2",
   "s3_clear_chain",
   "s3_cp949_tools",
+  "s3_t6_jobs",
+  "s3_repair_flow",
   "s7_primitives",
+  "s7_t9_libtests",
   "s5_checklist",
   "s6_variants",
   "s6_inplace",
@@ -615,13 +618,37 @@
    "read_only": false,
    "does": "WIN-14: every changed pack Python tool in a NEW console with code page 949, no UTF-8 mode; the console read back"
   },
+  "s3_t6_jobs": {
+   "stage": "S3",
+   "time_limit_s": 1500,
+   "requires_state": "updated",
+   "leaves_state": "same",
+   "read_only": false,
+   "does": "T6 (RULINGS HT2): the built-in job repair-probation-tick under the Windows scheduler and its command from a plain Git Bash; a restart storm (4 restarts) - pack files changed, the job's first fire after readiness"
+  },
+  "s3_repair_flow": {
+   "stage": "S3",
+   "time_limit_s": 1800,
+   "requires_state": "updated",
+   "leaves_state": "same",
+   "read_only": false,
+   "does": "a general repair through the product's verbs from a worker and a reviewer1 seat (begin, live edit, record, submit, attest-verify, commit); with T5b in the tree: a restart storm in probation, re-check (regular, failing, reparse point), revert with the target held"
+  },
   "s7_primitives": {
    "stage": "S7",
    "time_limit_s": 600,
    "requires_state": "any",
    "leaves_state": "same",
    "read_only": true,
-   "does": "OS primitives in a scratch folder with the installed bash / Python as holders: G06, G16.prim, EC2.prim, EC4.prim, T7C.prim, G09.flush, G09.kill"
+   "does": "OS primitives in a scratch folder with the installed bash / Python as holders: G06, G16.prim, EC2.prim, EC4.prim, T7C.prim, G09.flush, G09.kill, T9's directory moves"
+  },
+  "s7_t9_libtests": {
+   "stage": "S7",
+   "time_limit_s": 300,
+   "requires_state": "any",
+   "leaves_state": "same",
+   "read_only": true,
+   "does": "RULINGS HV4: reads the logs of this run's job t9-libtests (T9's protocol tests and the pack-update verb's complete command, cargo test on a Windows runner)"
   },
   "s6_variants": {
    "stage": "S6",
@@ -1462,69 +1489,302 @@
     {
      "id": "G02.P5",
      "probe": "s5_checklist",
-     "title": "checklist P5 - a 0-byte read-only cys.exe: the installer fails LOUDLY (exit 3 + the failure record); restored, a rerun succeeds",
+     "title": "checklist P5 - the gate's negative test: a 0-byte cys.exe the installer cannot replace (held by a read-share handle, as P6-a) - the installer fails LOUDLY (exit 3 + the failure record naming cys.exe unrecoverable and placement-refused); released, a rerun succeeds",
+     "why": "run 3: the checklist's own recipe (a read-only ACL on the 0-byte file) did not stop the installer (exit 0); the verdict now rests on a state proven to refuse the vacate rename (control), the ACL recipe is kept as a recorded reference (G02.P5ref)",
      "checks": [
       {
        "id": "base",
        "role": "complete",
-       "fact": "p5_base_ok",
+       "fact": "p5_lock_cand_base_ok",
        "op": "true"
       },
       {
-       "id": "acl",
+       "id": "held",
        "role": "complete",
-       "fact": "p5_acl_set",
+       "fact": "p5_lock_cand_state_set",
        "op": "true"
+      },
+      {
+       "id": "rename-refused",
+       "role": "control",
+       "fact": "p5_lock_cand_rename_refused",
+       "op": "true",
+       "text": "the planted state refuses a rename by the installing account - the vacate step (CYS_PLACE cys_pl_*) cannot move it aside"
       },
       {
        "id": "exit3",
        "role": "check",
-       "fact": "p5_exit",
+       "fact": "p5_lock_cand_exit",
        "op": "eq",
        "value": 3
       },
       {
        "id": "first-line",
        "role": "check",
-       "fact": "p5_first_line_ok",
+       "fact": "p5_lock_cand_first_line_ok",
        "op": "true",
        "text": "'cys installer: critical executable verification FAILED'"
       },
       {
        "id": "tokens",
        "role": "check",
-       "fact": "p5_four_tokens",
+       "fact": "p5_lock_cand_four_tokens",
        "op": "true",
        "text": "the four token lines (NSIS-CONTRACT 3)"
       },
       {
        "id": "unrecoverable",
        "role": "check",
-       "fact": "p5_unrecoverable_names_cys",
+       "fact": "p5_lock_cand_unrecoverable_names_cys",
        "op": "true"
       },
       {
        "id": "refused",
        "role": "check",
-       "fact": "p5_refused_names_cys",
+       "fact": "p5_lock_cand_refused_names_cys",
        "op": "true"
       },
       {
        "id": "recovery",
        "role": "check",
-       "fact": "p5_recovery_exit",
+       "fact": "p5_lock_cand_recovery_exit",
        "op": "eq",
        "value": 0
       },
       {
        "id": "recovery-new",
        "role": "check",
-       "fact": "p5_recovery_version_ok",
+       "fact": "p5_lock_cand_recovery_version_ok",
        "op": "true"
       }
      ],
      "class": "YES",
      "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "G02.P5ref",
+     "kind": "record",
+     "probe": "s5_checklist",
+     "title": "checklist P5 references: the checklist's own recipe (0-byte + read-only ACL) with the candidate and with the BASE installer; the lock recipe with the BASE installer - each with its rename control and cys.exe after the run",
+     "checks": [
+      {
+       "id": "acl-cand-base_ok",
+       "role": "complete",
+       "fact": "p5_acl_cand_base_ok",
+       "op": "true"
+      },
+      {
+       "id": "acl-cand-state_set",
+       "role": "complete",
+       "fact": "p5_acl_cand_state_set",
+       "op": "true"
+      },
+      {
+       "id": "acl-base-base_ok",
+       "role": "complete",
+       "fact": "p5_acl_base_base_ok",
+       "op": "true"
+      },
+      {
+       "id": "acl-base-state_set",
+       "role": "complete",
+       "fact": "p5_acl_base_state_set",
+       "op": "true"
+      },
+      {
+       "id": "lock-cand-base_ok",
+       "role": "complete",
+       "fact": "p5_lock_cand_base_ok",
+       "op": "true"
+      },
+      {
+       "id": "lock-cand-state_set",
+       "role": "complete",
+       "fact": "p5_lock_cand_state_set",
+       "op": "true"
+      },
+      {
+       "id": "lock-base-base_ok",
+       "role": "complete",
+       "fact": "p5_lock_base_base_ok",
+       "op": "true"
+      },
+      {
+       "id": "lock-base-state_set",
+       "role": "complete",
+       "fact": "p5_lock_base_state_set",
+       "op": "true"
+      },
+      {
+       "id": "acl-cand-rename_refused",
+       "role": "check",
+       "fact": "p5_acl_cand_rename_refused",
+       "op": "present"
+      },
+      {
+       "id": "acl-cand-exit",
+       "role": "check",
+       "fact": "p5_acl_cand_exit",
+       "op": "present"
+      },
+      {
+       "id": "acl-cand-cys_size_after",
+       "role": "check",
+       "fact": "p5_acl_cand_cys_size_after",
+       "op": "present"
+      },
+      {
+       "id": "acl-cand-cys_version_after",
+       "role": "check",
+       "fact": "p5_acl_cand_cys_version_after",
+       "op": "present"
+      },
+      {
+       "id": "acl-cand-replaced",
+       "role": "check",
+       "fact": "p5_acl_cand_replaced",
+       "op": "present"
+      },
+      {
+       "id": "acl-cand-recovery_exit",
+       "role": "check",
+       "fact": "p5_acl_cand_recovery_exit",
+       "op": "present"
+      },
+      {
+       "id": "acl-base-rename_refused",
+       "role": "check",
+       "fact": "p5_acl_base_rename_refused",
+       "op": "present"
+      },
+      {
+       "id": "acl-base-exit",
+       "role": "check",
+       "fact": "p5_acl_base_exit",
+       "op": "present"
+      },
+      {
+       "id": "acl-base-cys_size_after",
+       "role": "check",
+       "fact": "p5_acl_base_cys_size_after",
+       "op": "present"
+      },
+      {
+       "id": "acl-base-cys_version_after",
+       "role": "check",
+       "fact": "p5_acl_base_cys_version_after",
+       "op": "present"
+      },
+      {
+       "id": "acl-base-replaced",
+       "role": "check",
+       "fact": "p5_acl_base_replaced",
+       "op": "present"
+      },
+      {
+       "id": "acl-base-recovery_exit",
+       "role": "check",
+       "fact": "p5_acl_base_recovery_exit",
+       "op": "present"
+      },
+      {
+       "id": "lock-cand-rename_refused",
+       "role": "check",
+       "fact": "p5_lock_cand_rename_refused",
+       "op": "present"
+      },
+      {
+       "id": "lock-cand-exit",
+       "role": "check",
+       "fact": "p5_lock_cand_exit",
+       "op": "present"
+      },
+      {
+       "id": "lock-cand-cys_size_after",
+       "role": "check",
+       "fact": "p5_lock_cand_cys_size_after",
+       "op": "present"
+      },
+      {
+       "id": "lock-cand-cys_version_after",
+       "role": "check",
+       "fact": "p5_lock_cand_cys_version_after",
+       "op": "present"
+      },
+      {
+       "id": "lock-cand-replaced",
+       "role": "check",
+       "fact": "p5_lock_cand_replaced",
+       "op": "present"
+      },
+      {
+       "id": "lock-cand-recovery_exit",
+       "role": "check",
+       "fact": "p5_lock_cand_recovery_exit",
+       "op": "present"
+      },
+      {
+       "id": "lock-base-rename_refused",
+       "role": "check",
+       "fact": "p5_lock_base_rename_refused",
+       "op": "present"
+      },
+      {
+       "id": "lock-base-exit",
+       "role": "check",
+       "fact": "p5_lock_base_exit",
+       "op": "present"
+      },
+      {
+       "id": "lock-base-cys_size_after",
+       "role": "check",
+       "fact": "p5_lock_base_cys_size_after",
+       "op": "present"
+      },
+      {
+       "id": "lock-base-cys_version_after",
+       "role": "check",
+       "fact": "p5_lock_base_cys_version_after",
+       "op": "present"
+      },
+      {
+       "id": "lock-base-replaced",
+       "role": "check",
+       "fact": "p5_lock_base_replaced",
+       "op": "present"
+      },
+      {
+       "id": "lock-base-recovery_exit",
+       "role": "check",
+       "fact": "p5_lock_base_recovery_exit",
+       "op": "present"
+      },
+      {
+       "id": "acl-recipe-blocks",
+       "role": "assumption",
+       "fact": "p5_acl_cand_rename_refused",
+       "op": "true",
+       "assumption": "the checklist's P5 recipe (icacls /inheritance:r /grant:r USER:(R) on the 0-byte cys.exe) refuses the vacate rename, as the checklist states ('읽기전용 ACL 이 rename 대피를 거부')"
+      },
+      {
+       "id": "base-same-lock",
+       "role": "assumption",
+       "fact": "p5_lock_base_exit",
+       "op": "eq_fact",
+       "other": "p5_lock_cand_exit",
+       "assumption": "the base (v0.14.56) installer ends the lock recipe with the same exit code as the candidate (installer hooks identical)"
+      },
+      {
+       "id": "base-same-acl",
+       "role": "assumption",
+       "fact": "p5_acl_base_exit",
+       "op": "eq_fact",
+       "other": "p5_acl_cand_exit",
+       "assumption": "the base (v0.14.56) installer ends the checklist's recipe with the same exit code as the candidate"
+      }
+     ],
+     "class": "YES",
      "phase": 1
     },
     {
@@ -2539,9 +2799,1390 @@
    "group": "gate",
    "title": "cp949 console without UTF-8 mode, for every pack Python tool 0.15.0 changed (RULINGS HK2 (2) WIN-14)",
    "source": "design 8-2 #14 (line 1294); design line 865; WIN-16 WIN-14; RULINGS HK2 (2)",
-   "why": "the console leg is measured (a NEW console, code page 949, the output on the console itself, read back); the pipe leg is not: a pipe gets the system's ANSI code page, which a hosted runner cannot set to 949 without a reboot",
-   "expected": "no traceback, no mojibake, the documented exit codes; the 14 tools of the diff v0.14.56..the tree (no tool is new)",
+   "why": "the console leg is measured (a NEW console, code page 949, read back); the pipe leg forces the streams to cp949 strict inside the bundled interpreter (a hosted runner's ANSI code page is 1252 and cannot be set to 949 without a reboot, so open()'s default encoding is not the Korean one)",
+   "expected": "no traceback, no mojibake / encode error, the documented exit codes; the 14 tools of the diff v0.14.56..the tree (no tool is new)",
    "subrows": [
+    {
+     "id": "G14.env",
+     "kind": "record",
+     "probe": "s3_cp949_tools",
+     "title": "does the bundled embeddable runtime honour PYTHONIOENCODING and PYTHONUTF8 (its ._pth may make it ignore the environment)",
+     "checks": [
+      {
+       "id": "enc-ioencoding",
+       "role": "check",
+       "fact": "bundled_stdout_encoding_ioencoding",
+       "op": "present"
+      },
+      {
+       "id": "enc-utf8",
+       "role": "check",
+       "fact": "bundled_stdout_encoding_utf8",
+       "op": "present"
+      },
+      {
+       "id": "enc-none",
+       "role": "check",
+       "fact": "bundled_stdout_encoding_none",
+       "op": "present"
+      },
+      {
+       "id": "utf8-ioencoding",
+       "role": "check",
+       "fact": "bundled_utf8_mode_ioencoding",
+       "op": "present"
+      },
+      {
+       "id": "utf8-utf8",
+       "role": "check",
+       "fact": "bundled_utf8_mode_utf8",
+       "op": "present"
+      },
+      {
+       "id": "utf8-none",
+       "role": "check",
+       "fact": "bundled_utf8_mode_none",
+       "op": "present"
+      },
+      {
+       "id": "honours-ioencoding",
+       "role": "check",
+       "fact": "bundled_honours_pythonioencoding",
+       "op": "present"
+      },
+      {
+       "id": "honours-utf8",
+       "role": "assumption",
+       "fact": "bundled_honours_pythonutf8",
+       "op": "true",
+       "assumption": "the bundled runtime honours PYTHONUTF8=1 - the product's cp949 protection for panes, hooks, jobs and the app's spawns (src/lib.rs spawn_env_pairs 4)"
+      }
+     ],
+     "class": "YES",
+     "phase": 1
+    },
+    {
+     "id": "G14.javis_channel_watch.pipe",
+     "probe": "s3_cp949_tools",
+     "title": "javis_channel_watch with stdout / stderr as PIPES forced to cp949 strict, as the pane / agent shell / scheduler / app (PYTHONUTF8=1) starts it",
+     "checks": [
+      {
+       "id": "present",
+       "role": "complete",
+       "fact": "t14p_javis_channel_watch_present",
+       "op": "true"
+      },
+      {
+       "id": "launchers",
+       "role": "check",
+       "fact": "t14p_javis_channel_watch_launchers",
+       "op": "present",
+       "text": "recorded: how the product starts this tool"
+      },
+      {
+       "id": "static-symbols",
+       "role": "check",
+       "fact": "t14p_javis_channel_watch_non_cp949_chars",
+       "op": "present",
+       "text": "recorded: the characters in the tool's source that cp949 cannot encode"
+      },
+      {
+       "id": "help-rc",
+       "role": "check",
+       "fact": "t14p_javis_channel_watch_help_rc",
+       "op": "eq",
+       "value": 0,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "help-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_channel_watch_help_traceback",
+       "op": "false"
+      },
+      {
+       "id": "help-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_channel_watch_help_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "help-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_channel_watch_help_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "hangul-arg-rc",
+       "role": "check",
+       "fact": "t14p_javis_channel_watch_hangul-arg_rc",
+       "op": "eq",
+       "value": 2,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "hangul-arg-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_channel_watch_hangul-arg_traceback",
+       "op": "false"
+      },
+      {
+       "id": "hangul-arg-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_channel_watch_hangul-arg_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "hangul-arg-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_channel_watch_hangul-arg_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "G14.javis_compete.pipe",
+     "probe": "s3_cp949_tools",
+     "title": "javis_compete with stdout / stderr as PIPES forced to cp949 strict, as the pane / agent shell / scheduler / app (PYTHONUTF8=1) starts it",
+     "checks": [
+      {
+       "id": "present",
+       "role": "complete",
+       "fact": "t14p_javis_compete_present",
+       "op": "true"
+      },
+      {
+       "id": "launchers",
+       "role": "check",
+       "fact": "t14p_javis_compete_launchers",
+       "op": "present",
+       "text": "recorded: how the product starts this tool"
+      },
+      {
+       "id": "static-symbols",
+       "role": "check",
+       "fact": "t14p_javis_compete_non_cp949_chars",
+       "op": "present",
+       "text": "recorded: the characters in the tool's source that cp949 cannot encode"
+      },
+      {
+       "id": "help-rc",
+       "role": "check",
+       "fact": "t14p_javis_compete_help_rc",
+       "op": "eq",
+       "value": 0,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "help-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_compete_help_traceback",
+       "op": "false"
+      },
+      {
+       "id": "help-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_compete_help_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "help-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_compete_help_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "hangul-arg-rc",
+       "role": "check",
+       "fact": "t14p_javis_compete_hangul-arg_rc",
+       "op": "eq",
+       "value": 2,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "hangul-arg-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_compete_hangul-arg_traceback",
+       "op": "false"
+      },
+      {
+       "id": "hangul-arg-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_compete_hangul-arg_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "hangul-arg-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_compete_hangul-arg_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "G14.javis_orchestra.pipe",
+     "probe": "s3_cp949_tools",
+     "title": "javis_orchestra with stdout / stderr as PIPES forced to cp949 strict, as the pane / agent shell / scheduler / app (PYTHONUTF8=1) starts it",
+     "checks": [
+      {
+       "id": "present",
+       "role": "complete",
+       "fact": "t14p_javis_orchestra_present",
+       "op": "true"
+      },
+      {
+       "id": "launchers",
+       "role": "check",
+       "fact": "t14p_javis_orchestra_launchers",
+       "op": "present",
+       "text": "recorded: how the product starts this tool"
+      },
+      {
+       "id": "static-symbols",
+       "role": "check",
+       "fact": "t14p_javis_orchestra_non_cp949_chars",
+       "op": "present",
+       "text": "recorded: the characters in the tool's source that cp949 cannot encode"
+      },
+      {
+       "id": "help-rc",
+       "role": "check",
+       "fact": "t14p_javis_orchestra_help_rc",
+       "op": "eq",
+       "value": 0,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "help-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_orchestra_help_traceback",
+       "op": "false"
+      },
+      {
+       "id": "help-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_orchestra_help_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "help-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_orchestra_help_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "hangul-arg-rc",
+       "role": "check",
+       "fact": "t14p_javis_orchestra_hangul-arg_rc",
+       "op": "eq",
+       "value": 2,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "hangul-arg-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_orchestra_hangul-arg_traceback",
+       "op": "false"
+      },
+      {
+       "id": "hangul-arg-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_orchestra_hangul-arg_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "hangul-arg-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_orchestra_hangul-arg_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "G14.javis_org.pipe",
+     "probe": "s3_cp949_tools",
+     "title": "javis_org with stdout / stderr as PIPES forced to cp949 strict, as the pane / agent shell / scheduler / app (PYTHONUTF8=1) starts it",
+     "checks": [
+      {
+       "id": "present",
+       "role": "complete",
+       "fact": "t14p_javis_org_present",
+       "op": "true"
+      },
+      {
+       "id": "launchers",
+       "role": "check",
+       "fact": "t14p_javis_org_launchers",
+       "op": "present",
+       "text": "recorded: how the product starts this tool"
+      },
+      {
+       "id": "static-symbols",
+       "role": "check",
+       "fact": "t14p_javis_org_non_cp949_chars",
+       "op": "present",
+       "text": "recorded: the characters in the tool's source that cp949 cannot encode"
+      },
+      {
+       "id": "help-rc",
+       "role": "check",
+       "fact": "t14p_javis_org_help_rc",
+       "op": "eq",
+       "value": 0,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "help-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_org_help_traceback",
+       "op": "false"
+      },
+      {
+       "id": "help-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_org_help_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "help-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_org_help_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "hangul-arg-rc",
+       "role": "check",
+       "fact": "t14p_javis_org_hangul-arg_rc",
+       "op": "eq",
+       "value": 2,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "hangul-arg-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_org_hangul-arg_traceback",
+       "op": "false"
+      },
+      {
+       "id": "hangul-arg-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_org_hangul-arg_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "hangul-arg-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_org_hangul-arg_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "G14.javis_preflight.pipe",
+     "probe": "s3_cp949_tools",
+     "title": "javis_preflight with stdout / stderr as PIPES forced to cp949 strict, as the pane / agent shell / scheduler / app (PYTHONUTF8=1) starts it",
+     "checks": [
+      {
+       "id": "present",
+       "role": "complete",
+       "fact": "t14p_javis_preflight_present",
+       "op": "true"
+      },
+      {
+       "id": "launchers",
+       "role": "check",
+       "fact": "t14p_javis_preflight_launchers",
+       "op": "present",
+       "text": "recorded: how the product starts this tool"
+      },
+      {
+       "id": "static-symbols",
+       "role": "check",
+       "fact": "t14p_javis_preflight_non_cp949_chars",
+       "op": "present",
+       "text": "recorded: the characters in the tool's source that cp949 cannot encode"
+      },
+      {
+       "id": "help-rc",
+       "role": "check",
+       "fact": "t14p_javis_preflight_help_rc",
+       "op": "eq",
+       "value": 0,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "help-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_preflight_help_traceback",
+       "op": "false"
+      },
+      {
+       "id": "help-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_preflight_help_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "help-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_preflight_help_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "hangul-arg-rc",
+       "role": "check",
+       "fact": "t14p_javis_preflight_hangul-arg_rc",
+       "op": "eq",
+       "value": 2,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "hangul-arg-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_preflight_hangul-arg_traceback",
+       "op": "false"
+      },
+      {
+       "id": "hangul-arg-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_preflight_hangul-arg_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "hangul-arg-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_preflight_hangul-arg_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "G14.javis_report.pipe",
+     "probe": "s3_cp949_tools",
+     "title": "javis_report with stdout / stderr as PIPES forced to cp949 strict, as the pane / agent shell / scheduler / app (PYTHONUTF8=1) starts it",
+     "checks": [
+      {
+       "id": "present",
+       "role": "complete",
+       "fact": "t14p_javis_report_present",
+       "op": "true"
+      },
+      {
+       "id": "launchers",
+       "role": "check",
+       "fact": "t14p_javis_report_launchers",
+       "op": "present",
+       "text": "recorded: how the product starts this tool"
+      },
+      {
+       "id": "static-symbols",
+       "role": "check",
+       "fact": "t14p_javis_report_non_cp949_chars",
+       "op": "present",
+       "text": "recorded: the characters in the tool's source that cp949 cannot encode"
+      },
+      {
+       "id": "help-rc",
+       "role": "check",
+       "fact": "t14p_javis_report_help_rc",
+       "op": "eq",
+       "value": 0,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "help-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_report_help_traceback",
+       "op": "false"
+      },
+      {
+       "id": "help-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_report_help_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "help-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_report_help_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "hangul-arg-rc",
+       "role": "check",
+       "fact": "t14p_javis_report_hangul-arg_rc",
+       "op": "eq",
+       "value": 2,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "hangul-arg-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_report_hangul-arg_traceback",
+       "op": "false"
+      },
+      {
+       "id": "hangul-arg-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_report_hangul-arg_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "hangul-arg-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_report_hangul-arg_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "G14.javis_report_gate.pipe",
+     "probe": "s3_cp949_tools",
+     "title": "javis_report_gate with stdout / stderr as PIPES forced to cp949 strict, as the pane / agent shell / scheduler / app (PYTHONUTF8=1) starts it",
+     "checks": [
+      {
+       "id": "present",
+       "role": "complete",
+       "fact": "t14p_javis_report_gate_present",
+       "op": "true"
+      },
+      {
+       "id": "launchers",
+       "role": "check",
+       "fact": "t14p_javis_report_gate_launchers",
+       "op": "present",
+       "text": "recorded: how the product starts this tool"
+      },
+      {
+       "id": "static-symbols",
+       "role": "check",
+       "fact": "t14p_javis_report_gate_non_cp949_chars",
+       "op": "present",
+       "text": "recorded: the characters in the tool's source that cp949 cannot encode"
+      },
+      {
+       "id": "help-rc",
+       "role": "check",
+       "fact": "t14p_javis_report_gate_help_rc",
+       "op": "eq",
+       "value": 0,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "help-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_report_gate_help_traceback",
+       "op": "false"
+      },
+      {
+       "id": "help-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_report_gate_help_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "help-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_report_gate_help_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "hangul-arg-rc",
+       "role": "check",
+       "fact": "t14p_javis_report_gate_hangul-arg_rc",
+       "op": "eq",
+       "value": 2,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "hangul-arg-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_report_gate_hangul-arg_traceback",
+       "op": "false"
+      },
+      {
+       "id": "hangul-arg-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_report_gate_hangul-arg_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "hangul-arg-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_report_gate_hangul-arg_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "G14.javis_teamtoken.pipe",
+     "probe": "s3_cp949_tools",
+     "title": "javis_teamtoken with stdout / stderr as PIPES forced to cp949 strict, as the pane / agent shell (PYTHONUTF8=1) and the daemon's direct spawn (no PYTHONUTF8) starts it",
+     "checks": [
+      {
+       "id": "present",
+       "role": "complete",
+       "fact": "t14p_javis_teamtoken_present",
+       "op": "true"
+      },
+      {
+       "id": "launchers",
+       "role": "check",
+       "fact": "t14p_javis_teamtoken_launchers",
+       "op": "present",
+       "text": "recorded: how the product starts this tool"
+      },
+      {
+       "id": "static-symbols",
+       "role": "check",
+       "fact": "t14p_javis_teamtoken_non_cp949_chars",
+       "op": "present",
+       "text": "recorded: the characters in the tool's source that cp949 cannot encode"
+      },
+      {
+       "id": "help-rc",
+       "role": "check",
+       "fact": "t14p_javis_teamtoken_help_rc",
+       "op": "eq",
+       "value": 0,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "help-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_teamtoken_help_traceback",
+       "op": "false"
+      },
+      {
+       "id": "help-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_teamtoken_help_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "help-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_teamtoken_help_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "hangul-arg-rc",
+       "role": "check",
+       "fact": "t14p_javis_teamtoken_hangul-arg_rc",
+       "op": "eq",
+       "value": 2,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "hangul-arg-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_teamtoken_hangul-arg_traceback",
+       "op": "false"
+      },
+      {
+       "id": "hangul-arg-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_teamtoken_hangul-arg_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "hangul-arg-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_teamtoken_hangul-arg_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "daemon-help-rc",
+       "role": "check",
+       "fact": "t14pd_javis_teamtoken_help_rc",
+       "op": "eq",
+       "value": 0,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "daemon-help-no-traceback",
+       "role": "check",
+       "fact": "t14pd_javis_teamtoken_help_traceback",
+       "op": "false"
+      },
+      {
+       "id": "daemon-help-no-encode-error",
+       "role": "check",
+       "fact": "t14pd_javis_teamtoken_help_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "daemon-help-encodable",
+       "role": "assumption",
+       "fact": "t14pd_javis_teamtoken_help_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "daemon-hangul-arg-rc",
+       "role": "check",
+       "fact": "t14pd_javis_teamtoken_hangul-arg_rc",
+       "op": "eq",
+       "value": 2,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "daemon-hangul-arg-no-traceback",
+       "role": "check",
+       "fact": "t14pd_javis_teamtoken_hangul-arg_traceback",
+       "op": "false"
+      },
+      {
+       "id": "daemon-hangul-arg-no-encode-error",
+       "role": "check",
+       "fact": "t14pd_javis_teamtoken_hangul-arg_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "daemon-hangul-arg-encodable",
+       "role": "assumption",
+       "fact": "t14pd_javis_teamtoken_hangul-arg_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "G14.javis_vibecheck.pipe",
+     "probe": "s3_cp949_tools",
+     "title": "javis_vibecheck with stdout / stderr as PIPES forced to cp949 strict, as the pane / agent shell / scheduler / app (PYTHONUTF8=1) starts it",
+     "checks": [
+      {
+       "id": "present",
+       "role": "complete",
+       "fact": "t14p_javis_vibecheck_present",
+       "op": "true"
+      },
+      {
+       "id": "launchers",
+       "role": "check",
+       "fact": "t14p_javis_vibecheck_launchers",
+       "op": "present",
+       "text": "recorded: how the product starts this tool"
+      },
+      {
+       "id": "static-symbols",
+       "role": "check",
+       "fact": "t14p_javis_vibecheck_non_cp949_chars",
+       "op": "present",
+       "text": "recorded: the characters in the tool's source that cp949 cannot encode"
+      },
+      {
+       "id": "help-rc",
+       "role": "check",
+       "fact": "t14p_javis_vibecheck_help_rc",
+       "op": "eq",
+       "value": 0,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "help-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_vibecheck_help_traceback",
+       "op": "false"
+      },
+      {
+       "id": "help-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_vibecheck_help_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "help-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_vibecheck_help_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "hangul-arg-rc",
+       "role": "check",
+       "fact": "t14p_javis_vibecheck_hangul-arg_rc",
+       "op": "eq",
+       "value": 2,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "hangul-arg-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_vibecheck_hangul-arg_traceback",
+       "op": "false"
+      },
+      {
+       "id": "hangul-arg-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_vibecheck_hangul-arg_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "hangul-arg-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_vibecheck_hangul-arg_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "G14.javis_waiver.pipe",
+     "probe": "s3_cp949_tools",
+     "title": "javis_waiver with stdout / stderr as PIPES forced to cp949 strict, as the pane / agent shell / scheduler / app (PYTHONUTF8=1) starts it",
+     "checks": [
+      {
+       "id": "present",
+       "role": "complete",
+       "fact": "t14p_javis_waiver_present",
+       "op": "true"
+      },
+      {
+       "id": "launchers",
+       "role": "check",
+       "fact": "t14p_javis_waiver_launchers",
+       "op": "present",
+       "text": "recorded: how the product starts this tool"
+      },
+      {
+       "id": "static-symbols",
+       "role": "check",
+       "fact": "t14p_javis_waiver_non_cp949_chars",
+       "op": "present",
+       "text": "recorded: the characters in the tool's source that cp949 cannot encode"
+      },
+      {
+       "id": "help-rc",
+       "role": "check",
+       "fact": "t14p_javis_waiver_help_rc",
+       "op": "eq",
+       "value": 0,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "help-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_waiver_help_traceback",
+       "op": "false"
+      },
+      {
+       "id": "help-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_waiver_help_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "help-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_waiver_help_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "hangul-arg-rc",
+       "role": "check",
+       "fact": "t14p_javis_waiver_hangul-arg_rc",
+       "op": "eq",
+       "value": 2,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "hangul-arg-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_waiver_hangul-arg_traceback",
+       "op": "false"
+      },
+      {
+       "id": "hangul-arg-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_waiver_hangul-arg_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "hangul-arg-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_waiver_hangul-arg_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "G14.javis_bootstrap.pipe",
+     "probe": "s3_cp949_tools",
+     "title": "javis_bootstrap with stdout / stderr as PIPES forced to cp949 strict, as the pane / agent shell (PYTHONUTF8=1) and the daemon's direct spawn (no PYTHONUTF8) starts it",
+     "checks": [
+      {
+       "id": "present",
+       "role": "complete",
+       "fact": "t14p_javis_bootstrap_present",
+       "op": "true"
+      },
+      {
+       "id": "launchers",
+       "role": "check",
+       "fact": "t14p_javis_bootstrap_launchers",
+       "op": "present",
+       "text": "recorded: how the product starts this tool"
+      },
+      {
+       "id": "static-symbols",
+       "role": "check",
+       "fact": "t14p_javis_bootstrap_non_cp949_chars",
+       "op": "present",
+       "text": "recorded: the characters in the tool's source that cp949 cannot encode"
+      },
+      {
+       "id": "help-rc",
+       "role": "check",
+       "fact": "t14p_javis_bootstrap_help_rc",
+       "op": "eq",
+       "value": 64,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "help-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_bootstrap_help_traceback",
+       "op": "false"
+      },
+      {
+       "id": "help-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_bootstrap_help_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "help-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_bootstrap_help_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "hangul-arg-rc",
+       "role": "check",
+       "fact": "t14p_javis_bootstrap_hangul-arg_rc",
+       "op": "eq",
+       "value": 64,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "hangul-arg-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_bootstrap_hangul-arg_traceback",
+       "op": "false"
+      },
+      {
+       "id": "hangul-arg-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_bootstrap_hangul-arg_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "hangul-arg-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_bootstrap_hangul-arg_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "daemon-help-rc",
+       "role": "check",
+       "fact": "t14pd_javis_bootstrap_help_rc",
+       "op": "eq",
+       "value": 64,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "daemon-help-no-traceback",
+       "role": "check",
+       "fact": "t14pd_javis_bootstrap_help_traceback",
+       "op": "false"
+      },
+      {
+       "id": "daemon-help-no-encode-error",
+       "role": "check",
+       "fact": "t14pd_javis_bootstrap_help_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "daemon-help-encodable",
+       "role": "assumption",
+       "fact": "t14pd_javis_bootstrap_help_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "daemon-hangul-arg-rc",
+       "role": "check",
+       "fact": "t14pd_javis_bootstrap_hangul-arg_rc",
+       "op": "eq",
+       "value": 64,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "daemon-hangul-arg-no-traceback",
+       "role": "check",
+       "fact": "t14pd_javis_bootstrap_hangul-arg_traceback",
+       "op": "false"
+      },
+      {
+       "id": "daemon-hangul-arg-no-encode-error",
+       "role": "check",
+       "fact": "t14pd_javis_bootstrap_hangul-arg_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "daemon-hangul-arg-encodable",
+       "role": "assumption",
+       "fact": "t14pd_javis_bootstrap_hangul-arg_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "G14.javis_formation.pipe",
+     "probe": "s3_cp949_tools",
+     "title": "javis_formation with stdout / stderr as PIPES forced to cp949 strict, as the pane / agent shell / scheduler / app (PYTHONUTF8=1) starts it",
+     "checks": [
+      {
+       "id": "present",
+       "role": "complete",
+       "fact": "t14p_javis_formation_present",
+       "op": "true"
+      },
+      {
+       "id": "launchers",
+       "role": "check",
+       "fact": "t14p_javis_formation_launchers",
+       "op": "present",
+       "text": "recorded: how the product starts this tool"
+      },
+      {
+       "id": "static-symbols",
+       "role": "check",
+       "fact": "t14p_javis_formation_non_cp949_chars",
+       "op": "present",
+       "text": "recorded: the characters in the tool's source that cp949 cannot encode"
+      },
+      {
+       "id": "help-rc",
+       "role": "check",
+       "fact": "t14p_javis_formation_help_rc",
+       "op": "eq",
+       "value": 2,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "help-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_formation_help_traceback",
+       "op": "false"
+      },
+      {
+       "id": "help-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_formation_help_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "help-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_formation_help_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "hangul-arg-rc",
+       "role": "check",
+       "fact": "t14p_javis_formation_hangul-arg_rc",
+       "op": "eq",
+       "value": 2,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "hangul-arg-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_formation_hangul-arg_traceback",
+       "op": "false"
+      },
+      {
+       "id": "hangul-arg-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_formation_hangul-arg_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "hangul-arg-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_formation_hangul-arg_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "G14.javis_mission.pipe",
+     "probe": "s3_cp949_tools",
+     "title": "javis_mission with stdout / stderr as PIPES forced to cp949 strict, as the pane / agent shell / scheduler / app (PYTHONUTF8=1) starts it",
+     "checks": [
+      {
+       "id": "present",
+       "role": "complete",
+       "fact": "t14p_javis_mission_present",
+       "op": "true"
+      },
+      {
+       "id": "launchers",
+       "role": "check",
+       "fact": "t14p_javis_mission_launchers",
+       "op": "present",
+       "text": "recorded: how the product starts this tool"
+      },
+      {
+       "id": "static-symbols",
+       "role": "check",
+       "fact": "t14p_javis_mission_non_cp949_chars",
+       "op": "present",
+       "text": "recorded: the characters in the tool's source that cp949 cannot encode"
+      },
+      {
+       "id": "help-rc",
+       "role": "check",
+       "fact": "t14p_javis_mission_help_rc",
+       "op": "eq",
+       "value": 64,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "help-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_mission_help_traceback",
+       "op": "false"
+      },
+      {
+       "id": "help-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_mission_help_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "help-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_mission_help_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "hangul-arg-rc",
+       "role": "check",
+       "fact": "t14p_javis_mission_hangul-arg_rc",
+       "op": "eq",
+       "value": 64,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "hangul-arg-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_mission_hangul-arg_traceback",
+       "op": "false"
+      },
+      {
+       "id": "hangul-arg-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_mission_hangul-arg_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "hangul-arg-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_mission_hangul-arg_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "G14.javis_dept_schedule.pipe",
+     "probe": "s3_cp949_tools",
+     "title": "javis_dept_schedule with stdout / stderr as PIPES forced to cp949 strict, as the pane / agent shell / scheduler / app (PYTHONUTF8=1) starts it",
+     "checks": [
+      {
+       "id": "present",
+       "role": "complete",
+       "fact": "t14p_javis_dept_schedule_present",
+       "op": "true"
+      },
+      {
+       "id": "launchers",
+       "role": "check",
+       "fact": "t14p_javis_dept_schedule_launchers",
+       "op": "present",
+       "text": "recorded: how the product starts this tool"
+      },
+      {
+       "id": "static-symbols",
+       "role": "check",
+       "fact": "t14p_javis_dept_schedule_non_cp949_chars",
+       "op": "present",
+       "text": "recorded: the characters in the tool's source that cp949 cannot encode"
+      },
+      {
+       "id": "help-rc",
+       "role": "check",
+       "fact": "t14p_javis_dept_schedule_help_rc",
+       "op": "eq",
+       "value": 2,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "help-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_dept_schedule_help_traceback",
+       "op": "false"
+      },
+      {
+       "id": "help-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_dept_schedule_help_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "help-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_dept_schedule_help_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "hangul-path-rc",
+       "role": "check",
+       "fact": "t14p_javis_dept_schedule_hangul-path_rc",
+       "op": "eq",
+       "value": 0,
+       "text": "the documented exit code"
+      },
+      {
+       "id": "hangul-path-no-traceback",
+       "role": "check",
+       "fact": "t14p_javis_dept_schedule_hangul-path_traceback",
+       "op": "false"
+      },
+      {
+       "id": "hangul-path-no-encode-error",
+       "role": "check",
+       "fact": "t14p_javis_dept_schedule_hangul-path_encode_error",
+       "op": "false",
+       "text": "no UnicodeEncodeError for a Hangul argument / path or for the tool's own symbols"
+      },
+      {
+       "id": "hangul-path-encodable",
+       "role": "assumption",
+       "fact": "t14p_javis_dept_schedule_hangul-path_encode_error_char",
+       "op": "none",
+       "assumption": "the tool prints nothing cp949 cannot encode (a crash on such a character is a FINDING: tool + character)"
+      },
+      {
+       "id": "hangul-file",
+       "role": "check",
+       "fact": "t14p_javis_dept_schedule_hangul_file_written",
+       "op": "true"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
     {
      "id": "G14.javis_channel_watch",
      "probe": "s3_cp949_tools",
@@ -4094,15 +5735,114 @@
    "needs_units": [
     "T6"
    ],
-   "probe": null,
    "title": "restart storm: no false revert; re-check only after readiness",
-   "source": "design 8-2 #15 (line 1295); TESTPLAN_RULINGS OQ-D5; WIN-16 WIN-15",
-   "why": "the re-check job is T6",
-   "expected": "0 pack files changed; first re-check <= 150 s after readiness, none before",
+   "source": "design 8-2 #15 (line 1295); TESTPLAN_RULINGS OQ-D5; WIN-16 WIN-15; reports/T6-report.md",
+   "why": "the timing half needs only T6; the 'no false revert' half needs a repair in probation, i.e. a committed repair - commit needs T5b (rehearsal::run_check)",
+   "expected": "0 pack files changed; first re-check <= 150 s after readiness, none before; a repair in probation is not reverted",
+   "subrows": [
+    {
+     "id": "G15.timing",
+     "probe": "s3_t6_jobs",
+     "needs_units": [
+      "T6"
+     ],
+     "title": "4 quick daemon restarts: no pack file changed; the re-check job's first fire after the last start comes after readiness and within 150 s",
+     "checks": [
+      {
+       "id": "restarts",
+       "role": "complete",
+       "fact": "storm_restarts",
+       "op": "eq",
+       "value": 4
+      },
+      {
+       "id": "ready",
+       "role": "complete",
+       "fact": "storm_all_ready",
+       "op": "true"
+      },
+      {
+       "id": "answers",
+       "role": "check",
+       "fact": "storm_first_answers",
+       "op": "present",
+       "text": "recorded: what `cys repair tick` answered right after each launch"
+      },
+      {
+       "id": "nothing-changed",
+       "role": "check",
+       "fact": "storm_pack_changed",
+       "op": "empty"
+      },
+      {
+       "id": "not-before",
+       "role": "check",
+       "fact": "storm_fire_before_ready",
+       "op": "false"
+      },
+      {
+       "id": "within-150",
+       "role": "check",
+       "fact": "storm_first_fire_after_ready_s",
+       "op": "le",
+       "value": 150
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "G15.no-false-revert",
+     "probe": "s3_repair_flow",
+     "needs_units": [
+      "T6",
+      "T5b"
+     ],
+     "run_when_absent": true,
+     "title": "the same storm with a general repair in probation: the repaired file stays, the ledger does not say reverted",
+     "checks": [
+      {
+       "id": "committed",
+       "role": "complete",
+       "fact": "flow_committed",
+       "op": "true"
+      },
+      {
+       "id": "edited-in",
+       "role": "complete",
+       "fact": "flow_live_after_commit_is_edited",
+       "op": "true"
+      },
+      {
+       "id": "ready",
+       "role": "complete",
+       "fact": "flow_storm_all_ready",
+       "op": "true"
+      },
+      {
+       "id": "stays",
+       "role": "check",
+       "fact": "flow_storm_live_is_edited",
+       "op": "true"
+      },
+      {
+       "id": "not-reverted",
+       "role": "check",
+       "fact": "flow_storm_status_reverted",
+       "op": "false"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    }
+   ],
    "kind": "assert",
    "phase": 1,
    "checks": [],
-   "class": "WAIT"
+   "class": "PARTLY",
+   "probe": null
   },
   {
    "id": "G16",
@@ -4195,11 +5935,68 @@
      "id": "G16.product",
      "needs_units": [
       "T6",
+      "T5b"
+     ],
+     "probe": "s3_repair_flow",
+     "run_when_absent": true,
+     "title": "the revert half (T6, Windows form): a committed general repair reverted while a Python tool holds the target without delete sharing - stopped with nothing deleted, or success; released, the revert completes",
+     "checks": [
+      {
+       "id": "committed",
+       "role": "complete",
+       "fact": "flow_committed",
+       "op": "true"
+      },
+      {
+       "id": "held",
+       "role": "complete",
+       "fact": "revert_target_held",
+       "op": "true"
+      },
+      {
+       "id": "answered",
+       "role": "check",
+       "fact": "flow_revert_rc",
+       "op": "present"
+      },
+      {
+       "id": "nothing-deleted",
+       "role": "check",
+       "fact": "revert_held_nothing_deleted",
+       "op": "true"
+      },
+      {
+       "id": "stopped-or-success",
+       "role": "check",
+       "fact": "revert_held_outcome",
+       "op": "in",
+       "value": [
+        "success",
+        "stopped"
+       ],
+       "text": "design 4-9 Windows form: either the move succeeded (the pre-image is live) or it stopped with the repaired bytes still live - never a third state"
+      },
+      {
+       "id": "released",
+       "role": "check",
+       "fact": "revert_live_is_pre",
+       "op": "true",
+       "text": "after release the revert leaves the pre-image live"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "G16.propagation",
+     "needs_units": [
+      "T6",
       "T7b"
      ],
      "probe": null,
      "why": "probe not built yet; becomes measurable when the unit is merged",
-     "title": "the product's propagation and revert on held files",
+     "title": "the product's propagation onto held files (T7b)",
      "class": "WAIT",
      "kind": "assert",
      "phase": 1,
@@ -5708,17 +7505,52 @@
    "id": "I-AUTOOFF",
    "group": "8-1",
    "needs_units": [
-    "T6"
+    "T6",
+    "T5b"
    ],
-   "probe": null,
+   "probe": "s3_repair_flow",
+   "run_when_absent": true,
    "title": "automatic return stays off on Windows",
-   "source": "design 8-1 I; D (23); 4-16 line 983; WIN-16 WIN-16 (d)",
-   "why": "its consumers (re-check job, M10) are T6",
+   "source": "design 8-1 I; D (23); 4-16 line 983; WIN-16 WIN-16 (d); reports/T6-report.md (Windows: deposit-first, automatic return OFF)",
+   "why": "needs a repair in probation whose re-check fails: commit needs T5b",
    "expected": "no file changed; a ledger entry and a notice each",
+   "checks": [
+    {
+     "id": "committed",
+     "role": "complete",
+     "fact": "flow_r2_committed",
+     "op": "true"
+    },
+    {
+     "id": "failing-ticks",
+     "role": "check",
+     "fact": "flow_recheck_failing_ticks",
+     "op": "present",
+     "text": "recorded: the job's tick answers of the new incarnation (its probation re-check runs at once - C7 7.2)"
+    },
+    {
+     "id": "not-put-back",
+     "role": "check",
+     "fact": "autooff_live_still_broken",
+     "op": "true",
+     "text": "the failing re-check does not put the old bytes back on Windows (the broken bytes stay live)"
+    },
+    {
+     "id": "ledger",
+     "role": "check",
+     "fact": "autooff_status_answer",
+     "op": "present"
+    },
+    {
+     "id": "notice",
+     "role": "check",
+     "fact": "autooff_notice_present",
+     "op": "true"
+    }
+   ],
    "kind": "assert",
    "phase": 1,
-   "checks": [],
-   "class": "WAIT"
+   "class": "YES"
   },
   {
    "id": "DY1",
@@ -6356,17 +8188,69 @@
   {
    "id": "R-T0-TS",
    "group": "report",
+   "kind": "record",
    "needs_units": [
-    "T6"
+    "T6",
+    "T5b"
    ],
-   "probe": null,
+   "probe": "s3_repair_flow",
+   "run_when_absent": true,
    "title": "TargetState::read: reparse-point open and regular re-check through the handle",
    "source": "reports/T0-report.md:140",
-   "why": "the callers a probe can reach are T6's apply / revert",
-   "kind": "assert",
+   "why": "the callers a probe can reach are T6's probation re-check / revert of a committed repair: commit needs T5b",
+   "expected": "recorded: the regular re-check's answers and the repair's status after it; with a symbolic link at the target, the re-check's answers, whether the link is still there and the status",
+   "checks": [
+    {
+     "id": "committed",
+     "role": "complete",
+     "fact": "flow_committed",
+     "op": "true"
+    },
+    {
+     "id": "regular",
+     "role": "check",
+     "fact": "flow_recheck_regular_ticks",
+     "op": "present"
+    },
+    {
+     "id": "regular-status",
+     "role": "check",
+     "fact": "flow_status_after_storm_answer",
+     "op": "present"
+    },
+    {
+     "id": "r2",
+     "role": "complete",
+     "fact": "flow_r2_committed",
+     "op": "true"
+    },
+    {
+     "id": "reparse-made",
+     "role": "complete",
+     "fact": "reparse_created",
+     "op": "true"
+    },
+    {
+     "id": "reparse-answer",
+     "role": "check",
+     "fact": "flow_recheck_reparse_answer",
+     "op": "present"
+    },
+    {
+     "id": "reparse-link",
+     "role": "check",
+     "fact": "reparse_link_still_there",
+     "op": "present"
+    },
+    {
+     "id": "reparse-status",
+     "role": "check",
+     "fact": "flow_status_after_reparse_answer",
+     "op": "present"
+    }
+   ],
    "phase": 1,
-   "checks": [],
-   "class": "WAIT"
+   "class": "YES"
   },
   {
    "id": "R-T1B-CI",
@@ -6787,14 +8671,48 @@
    "needs_units": [
     "T6"
    ],
-   "probe": null,
+   "probe": "s3_t6_jobs",
    "title": "the job's command 'CYS_NO_AUTOSTART=1 cys repair tick' under the Windows scheduler",
    "source": "reports/T6-report.md:86",
-   "why": "the tick job is T6",
+   "expected": "the built-in job exists, fires under the Windows scheduler with result ok; its command line runs from a plain Git Bash",
+   "checks": [
+    {
+     "id": "job",
+     "role": "complete",
+     "fact": "tick_job_present",
+     "op": "true"
+    },
+    {
+     "id": "command",
+     "role": "check",
+     "fact": "tick_job_command",
+     "op": "contains",
+     "value": "cys repair tick"
+    },
+    {
+     "id": "fired",
+     "role": "check",
+     "fact": "tick_job_last_fired",
+     "op": "not_none"
+    },
+    {
+     "id": "result-ok",
+     "role": "check",
+     "fact": "tick_job_result",
+     "op": "eq",
+     "value": "ok"
+    },
+    {
+     "id": "bash",
+     "role": "check",
+     "fact": "tick_command_exit",
+     "op": "eq",
+     "value": 0
+    }
+   ],
    "kind": "assert",
    "phase": 1,
-   "checks": [],
-   "class": "WAIT"
+   "class": "YES"
   },
   {
    "id": "R-T7A-PARITY",
@@ -8384,15 +10302,216 @@
    "needs_units": [
     "T9"
    ],
-   "probe": null,
    "title": "taking a pack-update journal folder whose writer has exited (a rename of the folder) succeeds; with a file inside held open the take fails, nothing is touched, and the next entry takes it",
-   "source": "RULINGS HB5, HB2 (a)",
-   "why": "the journal's names and the verbs that take it come with the unit T9 (RULINGS HB2 (a)); the probe is written against them when T9 is merged",
+   "source": "RULINGS HB5, HB2 (a), HV4 (a release condition)",
+   "why": "RULINGS HV4: a release condition - 'feature absent' until T9 is in the measured tree",
    "expected": "take = success; with a held file: the take fails, nothing touched, the next entry takes it",
+   "subrows": [
+    {
+     "id": "T9-JOURNAL-TAKE.prim",
+     "probe": "s7_primitives",
+     "title": "the no-replace directory move T9's protocol uses (MoveFileExW, WRITE_THROUGH, no REPLACE) on folders: to a free name, onto an empty / a non-empty folder, with a file inside held without delete sharing, after release",
+     "checks": [
+      {
+       "id": "held",
+       "role": "complete",
+       "fact": "t9d_held",
+       "op": "true"
+      },
+      {
+       "id": "free",
+       "role": "control",
+       "fact": "t9d_free_ok",
+       "op": "true",
+       "text": "the call moves a folder to a free name"
+      },
+      {
+       "id": "onto-empty",
+       "role": "check",
+       "fact": "t9d_onto_empty_ok",
+       "op": "false",
+       "text": "never replaces, not even an empty folder (src/pack.rs t9_r2_admission... cfg(windows))"
+      },
+      {
+       "id": "onto-nonempty",
+       "role": "check",
+       "fact": "t9d_onto_nonempty_ok",
+       "op": "false"
+      },
+      {
+       "id": "nonempty-unchanged",
+       "role": "check",
+       "fact": "t9d_onto_nonempty_unchanged",
+       "op": "true"
+      },
+      {
+       "id": "held-refused",
+       "role": "check",
+       "fact": "t9d_held_ok",
+       "op": "false"
+      },
+      {
+       "id": "held-untouched",
+       "role": "check",
+       "fact": "t9d_held_nothing_touched",
+       "op": "true"
+      },
+      {
+       "id": "after-release",
+       "role": "check",
+       "fact": "t9d_after_release_ok",
+       "op": "true"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "T9-JOURNAL-TAKE.libtests",
+     "probe": "s7_t9_libtests",
+     "needs_units": [
+      "T9"
+     ],
+     "run_when_absent": true,
+     "title": "T9's own protocol tests on the Windows runner: cargo test --lib -- t9_ m15_da_ m15_da2_ (22 tests, none cfg(unix); the 6 cfg(unix) journal-mode tests of the module are not selected and are not compiled on Windows)",
+     "checks": [
+      {
+       "id": "artifact",
+       "role": "environment",
+       "fact": "t9lib_artifact_ok",
+       "op": "true",
+       "reason": "the job's artifact tw1-t9-libtests could not be read in this run"
+      },
+      {
+       "id": "in-tree",
+       "role": "complete",
+       "fact": "t9lib_tests_in_tree",
+       "op": "true"
+      },
+      {
+       "id": "log",
+       "role": "complete",
+       "fact": "t9lib_log_present",
+       "op": "true"
+      },
+      {
+       "id": "compiled",
+       "role": "complete",
+       "fact": "t9lib_compiled",
+       "op": "true"
+      },
+      {
+       "id": "all-ran",
+       "role": "complete",
+       "fact": "t9lib_expected_missing",
+       "op": "empty"
+      },
+      {
+       "id": "exit0",
+       "role": "check",
+       "fact": "t9lib_cargo_exit",
+       "op": "eq",
+       "value": 0
+      },
+      {
+       "id": "no-failed",
+       "role": "check",
+       "fact": "t9lib_failed_names",
+       "op": "empty"
+      },
+      {
+       "id": "all-ok",
+       "role": "check",
+       "fact": "t9lib_expected_all_ok",
+       "op": "true"
+      }
+     ],
+     "class": "YES",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "T9-JOURNAL-TAKE.verb",
+     "probe": "s7_t9_libtests",
+     "needs_units": [
+      "T9"
+     ],
+     "run_when_absent": true,
+     "why": "observed through the binary's own tests that run the complete command (src/bin/cys.rs run_pack_update -> pack_update_from_dir -> apply_pack_transactional) with a test-signed pack and a test keyring; see .shipped",
+     "title": "the pack-update verb's complete command with a test-signed pack reaches T9's admission and completes, on the Windows runner (cargo test --bin cys -- pack_update_ b428_u9_)",
+     "checks": [
+      {
+       "id": "artifact",
+       "role": "environment",
+       "fact": "t9lib_artifact_ok",
+       "op": "true",
+       "reason": "the job's artifact tw1-t9-libtests could not be read in this run"
+      },
+      {
+       "id": "in-tree",
+       "role": "complete",
+       "fact": "t9lib_tests_in_tree",
+       "op": "true"
+      },
+      {
+       "id": "log",
+       "role": "complete",
+       "fact": "t9verb_log_present",
+       "op": "true"
+      },
+      {
+       "id": "compiled",
+       "role": "complete",
+       "fact": "t9verb_compiled",
+       "op": "true"
+      },
+      {
+       "id": "all-ran",
+       "role": "complete",
+       "fact": "t9verb_expected_missing",
+       "op": "empty"
+      },
+      {
+       "id": "exit0",
+       "role": "check",
+       "fact": "t9verb_cargo_exit",
+       "op": "eq",
+       "value": 0
+      },
+      {
+       "id": "no-failed",
+       "role": "check",
+       "fact": "t9verb_failed_names",
+       "op": "empty"
+      },
+      {
+       "id": "all-ok",
+       "role": "check",
+       "fact": "t9verb_expected_all_ok",
+       "op": "true"
+      }
+     ],
+     "class": "PARTLY",
+     "kind": "assert",
+     "phase": 1
+    },
+    {
+     "id": "T9-JOURNAL-TAKE.shipped",
+     "probe": null,
+     "title": "the shipped cys.exe: cys pack-update --from <dir> with a pack this workflow signs",
+     "why": "the shipped binary verifies the manifest's minisign signature against its EMBEDDED keyring before anything is unpacked (src/bin/cys.rs Command::PackUpdate -> run_pack_update(.., &cys::packsig::embedded_keyring, ..); src/packsig.rs embedded_keyring = build.rs TRUSTED_KEYS_JSON from tauri.conf.json + cysjavis-pack/trusted-keys.json; 'no environment override'); no unsigned path exists. A pack it accepts needs the release key (a secret this workflow must not hold) or a build whose keyring carries a test key (a change to the measured build's trust anchor - not made without a ruling)",
+     "class": "NO",
+     "kind": "assert",
+     "phase": 1,
+     "checks": []
+    }
+   ],
    "kind": "assert",
    "phase": 1,
    "checks": [],
-   "class": "WAIT"
+   "class": "WAIT",
+   "probe": null
   }
  ]
 }

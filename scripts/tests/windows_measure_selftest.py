@@ -71,7 +71,9 @@ class MatrixTests(unittest.TestCase):
         # T5C-JUDGES, T5C-DANGLING, T5C-COMPGEN), +2 PARTLY (T5C-CP949, T2G-COPY), R-T3D-IDENT WAIT -> YES
         # push 3 (RULINGS HB5, HD2): +1 YES (T5C-HANGUL), +1 WAIT (T9-JOURNAL-TAKE)
         # RULINGS HK2 (2) / HL1: +1 PARTLY (I-CLEAR-CHAIN)
-        self.assertEqual(counts, {"YES": 32, "PARTLY": 26, "NO": 8, "WAIT": 11})
+        # push 4 (T6 in the tree from d00f4075): G15 WAIT -> PARTLY (timing now, no-false-revert with T5b);
+        # I-AUTOOFF, R-T0-TS, R-T6-TICKSHELL WAIT -> YES (driven now; the first two stop at commit until T5b)
+        self.assertEqual(counts, {"YES": 35, "PARTLY": 27, "NO": 8, "WAIT": 7})
 
     def test_every_required_row_exists_once(self):
         ids = [r["id"] for r, _ in R.iter_rows(load())]
@@ -116,7 +118,7 @@ class MatrixTests(unittest.TestCase):
 
     def test_wait_without_unit_is_refused(self):
         def mut(m):
-            r = next(r for r in m["rows"] if r["id"] == "G15")
+            r = next(r for r in m["rows"] if r["id"] == "T9-JOURNAL-TAKE")
             r.pop("needs_units")
         self.assertTrue(any("needs 'needs_units'" in x for x in self._errors_after(mut)))
 
@@ -883,12 +885,72 @@ class ReleaseBlockingRowTests(unittest.TestCase):
         self.assertEqual(len(sc), 14)
         names = {t["name"] for t in sc}
         g14 = {s["id"] for s in self._row("G14")["subrows"]}
-        self.assertEqual(g14, {"G14." + n for n in names})
+        self.assertEqual(g14, {"G14." + n for n in names} | {"G14.%s.pipe" % n for n in names} | {"G14.env"})
         doc = {t["name"]: {c[0]: c[2] for c in t["cases"]} for t in sc}
         self.assertEqual(doc["javis_preflight"], {"help": 0, "hangul-arg": 2})
         self.assertEqual(doc["javis_mission"], {"help": 64, "hangul-arg": 64})
         self.assertEqual(doc["javis_dept_schedule"], {"help": 2, "hangul-path": 0})
         self.assertNotIn([], [t["cases"] for t in sc])
+
+    def test_win14_pipe_form(self):
+        """Run 3 asked for the pipe form: cp949 strict streams; the documented exit codes; an encode error is a check
+        AND a finding naming the character; the daemon-spawned tools are measured without PYTHONUTF8 as well."""
+        import tw1_probes as P
+        for n in ("javis_teamtoken", "javis_bootstrap"):
+            self.assertIn(("t14pd", "the daemon's direct spawn (no PYTHONUTF8)", False), P.pipe_launchers(n))
+        self.assertEqual([x[0] for x in P.pipe_launchers("javis_report")], ["t14p"])
+        sub = next(s for s in self._row("G14")["subrows"] if s["id"] == "G14.javis_teamtoken.pipe")
+        ids = {c["id"] for c in sub["checks"]}
+        self.assertTrue({"help-rc", "hangul-arg-no-encode-error", "daemon-help-rc", "daemon-hangul-arg-encodable"} <= ids)
+        facts = {"t14p_javis_report_present": True, "t14p_javis_report_launchers": ["x"], "t14p_javis_report_non_cp949_chars": []}
+        for case, rc in (("help", 0), ("hangul-arg", 2)):
+            facts.update({"t14p_javis_report_%s_rc" % case: rc, "t14p_javis_report_%s_traceback" % case: False,
+                          "t14p_javis_report_%s_encode_error" % case: False, "t14p_javis_report_%s_encode_error_char" % case: None})
+        self.assertEqual(self._verdict("G14.javis_report.pipe", facts)["verdict"], R.PASS)
+        facts["t14p_javis_report_help_encode_error"] = True
+        facts["t14p_javis_report_help_encode_error_char"] = "\\u2713"
+        v = self._verdict("G14.javis_report.pipe", facts)
+        self.assertEqual(v["verdict"], R.FAIL)
+        self.assertTrue(any("2713" in str(x["observed"]) for x in v["findings"]), v["findings"])
+        self.assertIn('errors="strict"', P._CP949_PIPE_WRAPPER)
+
+    def test_p5_rests_on_a_state_that_blocks(self):
+        """Run 3: the checklist's ACL recipe did not stop the installer; the verdict needs the rename control."""
+        row = next(s for s in self._row("G02")["subrows"] if s["id"] == "G02.P5")
+        ctl = [c for c in row["checks"] if c["role"] == "control"]
+        self.assertEqual([c["fact"] for c in ctl], ["p5_lock_cand_rename_refused"])
+        ok = {"p5_lock_cand_base_ok": True, "p5_lock_cand_state_set": True, "p5_lock_cand_rename_refused": False}
+        v = self._verdict("G02.P5", ok)
+        self.assertEqual(v["verdict"], R.NM)
+        self.assertIn("control did not discriminate", v["reason"])
+        ref = next(s for s in self._row("G02")["subrows"] if s["id"] == "G02.P5ref")
+        self.assertEqual(ref["kind"], "record")
+        self.assertIn("p5_acl_base_exit", {c.get("fact") for c in ref["checks"]} | {c.get("other") for c in ref["checks"]})
+
+    def test_t6_rows_and_their_gates(self):
+        for rid, probe in (("R-T6-TICKSHELL", "s3_t6_jobs"), ("I-AUTOOFF", "s3_repair_flow"), ("R-T0-TS", "s3_repair_flow")):
+            self.assertEqual(self._row(rid)["probe"], probe)
+        self.assertEqual(self._row("I-AUTOOFF")["needs_units"], ["T6", "T5b"])
+        self.assertTrue(self._row("I-AUTOOFF").get("run_when_absent"))
+        subs = {s["id"]: s for s in self._row("G16")["subrows"]}
+        self.assertEqual(subs["G16.product"]["needs_units"], ["T6", "T5b"])
+        self.assertEqual(subs["G16.propagation"]["needs_units"], ["T6", "T7b"])
+        g15 = {s["id"]: s for s in self._row("G15")["subrows"]}
+        self.assertEqual(g15["G15.timing"]["needs_units"], ["T6"])
+        self.assertEqual(g15["G15.no-false-revert"]["needs_units"], ["T6", "T5b"])
+        m = load()
+        self.assertLess(m["order"].index("s3_t6_jobs"), m["order"].index("s3_repair_flow"))
+        self.assertLess(m["order"].index("s3_repair_flow"), m["order"].index("s5_checklist"))
+
+    def test_t9_rows(self):
+        subs = {s["id"]: s for s in self._row("T9-JOURNAL-TAKE")["subrows"]}
+        self.assertEqual(set(subs), {"T9-JOURNAL-TAKE.prim", "T9-JOURNAL-TAKE.libtests", "T9-JOURNAL-TAKE.verb",
+                                     "T9-JOURNAL-TAKE.shipped"})
+        self.assertNotIn("needs_units", subs["T9-JOURNAL-TAKE.prim"])
+        self.assertEqual(subs["T9-JOURNAL-TAKE.libtests"]["needs_units"], ["T9"])
+        self.assertEqual(subs["T9-JOURNAL-TAKE.shipped"]["class"], "NO")
+        import tw1_probes as P
+        self.assertEqual(len(P.T9_EXPECTED_TESTS), 22)
 
     def test_clear_chain_candidate_must_be_no_weaker(self):
         cases = {"missing": [None, False], "good1": ["T1", True], "good2": ["T2", True], "stale": ["T2", True],
@@ -977,7 +1039,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("${{ needs.", b)
 
     def test_every_job_has_a_time_limit(self):
-        self.assertEqual(set(self.jobs), {"wait-build", "tnv-build", "measure"})
+        self.assertEqual(set(self.jobs), {"wait-build", "tnv-build", "t9-libtests", "measure"})
         for name, body in self.jobs.items():
             self.assertRegex(body, r"(?m)^    timeout-minutes: \d+", name)
 
@@ -1012,7 +1074,38 @@ class WorkflowTests(unittest.TestCase):
         self.assertRegex(body, r"(?ms)- name: Conclusion.*?if: always\(\)")
         self.assertLess(body.index("Stop everything this run started"), body.index("Upload the record"))
         self.assertLess(body.index("Upload the record"), body.index("- name: Conclusion"))
-        self.assertIn("needs: [wait-build, tnv-build]", body)
+        self.assertIn("needs: [wait-build, tnv-build, t9-libtests]", body)
+        self.assertIn("TW1_T9_RESULT: ${{ needs.t9-libtests.result }}", body)
+
+    def test_t9_job_shape(self):
+        """RULINGS HV4: T9's protocol tests and the verb's complete command run on a Windows runner, only when T9 is in
+        the tree; the logs are uploaded always under the name the probe reads."""
+        import tw1_probes as P
+        body = self.jobs["t9-libtests"]
+        self.assertIn("runs-on: windows-latest", body)
+        self.assertIn("cargo test --lib -- %s >" % " ".join(P.T9_LIB_TEST_FILTERS), body)
+        self.assertIn("cargo test --bin cys -- %s >" % " ".join(P.T9_VERB_FILTERS), body)
+        self.assertEqual(body.count("if: steps.detect.outputs.present == 'true'"), 2)
+        self.assertRegex(body, r"(?ms)- name: Upload the T9 test logs.*?if: always\(\).*?name: tw1-t9-libtests")
+        with open(os.path.join(HERE, "..", "windows-measure", "tw1_probes.py"), encoding="utf-8") as fh:
+            self.assertIn('"tw1-t9-libtests"', fh.read())
+        for t in P.T9_EXPECTED_TESTS:
+            self.assertTrue(any(t.startswith(x) for x in P.T9_LIB_TEST_FILTERS), t)
+        for t in P.T9_UNIX_ONLY:
+            self.assertFalse(any(x in t for x in P.T9_LIB_TEST_FILTERS), t)
+
+    def test_cargo_log_summary(self):
+        import tw1_probes as P
+        log = ("running 3 tests\ntest pack::tests::t9_a ... ok\ntest pack::tests::t9_b ... FAILED\n"
+               "test pack::tests::m15_da_c ... ignored\n\ntest result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; "
+               "230 filtered out; finished in 1.00s\n\nTW1-CARGO-EXIT=101\n")
+        sm = P.cargo_log_summary(log)
+        self.assertEqual((sm["exit"], sm["passed"], sm["failed"], sm["ignored"]), (101, 1, 1, 1))
+        self.assertEqual(sm["ran"], {"t9_a": "ok", "t9_b": "FAILED", "m15_da_c": "ignored"})
+        self.assertTrue(sm["compiled"])
+        sm = P.cargo_log_summary("error[E0425]: cannot find value\nerror: could not compile `cys-terminal`\nTW1-CARGO-EXIT=101\n")
+        self.assertFalse(sm["compiled"])
+        self.assertIsNone(sm["passed"])
 
     def test_no_literal_account_or_release_url(self):
         self.assertNotRegex(self.text, r"github\.com/[A-Za-z0-9_.-]+/")

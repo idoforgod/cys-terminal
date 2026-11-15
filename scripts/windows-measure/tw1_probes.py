@@ -2083,6 +2083,55 @@ def probe_s7_primitives(pr):
         f["g04_%s_ms" % k] = round((time.monotonic() - t0) * 1000)
         f["g04_%s_files" % k] = n
         f["g04_%s_bytes" % k] = size
+    # ── T9 (RULINGS HV4 - a RELEASE CONDITION): every state change of T9's journal protocol is a DIRECTORY move through
+    #    the no-replace call (src/pack.rs windows_move_no_replace = MoveFileExW with MOVEFILE_WRITE_THROUGH, without
+    #    MOVEFILE_REPLACE_EXISTING) - measured so far on files only. The same call on folders: ──
+    td = os.path.join(root, "t9dir")
+    shutil.rmtree(td, ignore_errors=True)
+
+    def jdir(name, files=("index.json",)):
+        dd = os.path.join(td, name)
+        os.makedirs(dd, exist_ok=True)
+        for fn in files:
+            write_bytes(os.path.join(dd, fn), b"{}\n")
+        return dd
+
+    _WT = 0x8   # MOVEFILE_WRITE_THROUGH
+    a = jdir("j.1.a")
+    r = _move(a, os.path.join(td, "r.1.a"), _WT)
+    f["t9d_free_ok"], f["t9d_free_error"] = r["ok"], r["error"]
+    f["t9d_free_moved"] = os.path.isdir(os.path.join(td, "r.1.a")) and not os.path.exists(a)
+    b = jdir("j.2.b")
+    os.makedirs(os.path.join(td, "slot-empty"), exist_ok=True)
+    r = _move(b, os.path.join(td, "slot-empty"), _WT)
+    f["t9d_onto_empty_ok"], f["t9d_onto_empty_error"] = r["ok"], r["error"]
+    if r["ok"]:
+        _move(os.path.join(td, "slot-empty"), b, _WT)
+    jdir("slot-full")
+    r = _move(b, os.path.join(td, "slot-full"), _WT)
+    f["t9d_onto_nonempty_ok"], f["t9d_onto_nonempty_error"] = r["ok"], r["error"]
+    f["t9d_onto_nonempty_unchanged"] = os.path.isfile(os.path.join(b, "index.json")) and os.path.isfile(os.path.join(td, "slot-full", "index.json"))
+    # a file inside held open WITHOUT delete sharing (a scanner, an editor): the take must fail and touch nothing ...
+    c = jdir("j.3.c", ("index.json", "backup.bin"))
+    hcode = "import time\nf=open(r'%s','rb')\nprint('held', flush=True)\ntime.sleep(300)\n" % os.path.join(c, "backup.bin")
+    hout = os.path.join(pr.ev_dir, "t9d-holder.out")
+    hp = start_detached([py, "-B", "-c", hcode], env=clean_env(), stdout_path=hout)
+    pr.register_pid(hp, "t9d holder")
+    t0 = time.time()
+    while time.time() - t0 < 15 and not (read_text(hout) or "").startswith("held"):
+        time.sleep(0.5)
+    f["t9d_held"] = (read_text(hout) or "").startswith("held")
+    r = _move(c, os.path.join(td, "r.3.c"), _WT)
+    f["t9d_held_ok"], f["t9d_held_error"] = r["ok"], r["error"]
+    f["t9d_held_nothing_touched"] = (os.path.isfile(os.path.join(c, "backup.bin")) and os.path.isfile(os.path.join(c, "index.json"))
+                                     and not os.path.exists(os.path.join(td, "r.3.c")))
+    kill_tree(hp)
+    pr.unregister_pid(hp)
+    _wait_dead(hp, 10)
+    # ... and once the holder is gone the next entry takes it
+    r = _move(c, os.path.join(td, "r.3.c"), _WT)
+    f["t9d_after_release_ok"], f["t9d_after_release_error"] = r["ok"], r["error"]
+    shutil.rmtree(td, ignore_errors=True)
     # ── G06: a running Git Bash script / an imported Python module, renamed, rewritten in place, replaced ──
     d = os.path.join(root, "g06")
     os.makedirs(d, exist_ok=True)
@@ -3323,22 +3372,66 @@ while time.time() - t0 < limit:
         info = CSBI()
         if h and h != wt.HANDLE(-1).value and k.GetConsoleScreenBufferInfo(h, ctypes.byref(info)):
             w, rows = info.dwSize.X, info.dwCursorPosition.Y + 1
-            buf = ctypes.create_unicode_buffer(w * rows + 1)
+            buf = ctypes.create_unicode_buffer(w + 1)
             got = wt.DWORD(0)
-            if k.ReadConsoleOutputCharacterW(h, buf, w * rows, COORD(0, 0), ctypes.byref(got)):
-                raw = buf.value[:got.value]
-                text = "\n".join(raw[i:i + w].rstrip() for i in range(0, len(raw), w))
-                status = "read"
+            lines = []
+            for y in range(rows):   # row by row: a double-width (Hangul) cell returns fewer characters than the width
+                if k.ReadConsoleOutputCharacterW(h, buf, w, COORD(0, y), ctypes.byref(got)):
+                    lines.append(buf.value[:got.value].rstrip())
+            text = "\n".join(lines)
+            status = "read"
         if h and h != wt.HANDLE(-1).value:
             k.CloseHandle(h)
         k.FreeConsole()
-        if "TW1-END" in text:
+        if "TW1-END" in "".join(text.split()):
             status = "complete"
             break
     time.sleep(0.5)
-with open(out, "w", encoding="utf-8") as fh:
+with open(out, "w", encoding="utf-8", newline="") as fh:
     fh.write(status + "\n" + text)
 '''
+
+# The pipe form (what a Korean system gives a pipe): the tool's standard streams as cp949 with STRICT errors, set
+# inside the bundled interpreter (the runtime's ._pth may make it ignore PYTHONIOENCODING - recorded separately).
+_CP949_PIPE_WRAPPER = r"""import io, runpy, sys
+tool = sys.argv[1]
+sys.argv = [tool] + sys.argv[2:]
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="cp949", errors="strict", line_buffering=True)
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="cp949", errors="strict", line_buffering=True)
+runpy.run_path(tool, run_name="__main__")
+"""
+
+
+# How the product starts each changed tool (source reading at d00f4075 - INFERRED, not measured):
+#   * every tool: typed in a seat's pane or run by the agent's shell tool (a pipe) - the pane builder sets PYTHONUTF8=1
+#     (src/bin/cysd/state.rs pane spawn + cys::spawn_env_pairs); scheduled jobs (javis_channel_watch, javis_formation's
+#     department jobs) and the app's direct spawns (javis_orchestra check, javis_org destroy: src-tauri main.rs
+#     inject_runtime_path, output captured) set it too;
+#   * javis_teamtoken (src/bin/cysd/teamtoken.rs run_with: python_command + piped stdout/stderr) and javis_bootstrap
+#     (src/bin/cysd/boot_supervisor.rs: stdout/stderr appended to a log file) are started by the DAEMON, which sets
+#     only PYTHONDONTWRITEBYTECODE - no PYTHONUTF8 unless the daemon's own environment carries it (the app and
+#     `cys` start the daemon without it).
+PIPE_DAEMON_SPAWNED = ("javis_teamtoken", "javis_bootstrap")
+
+
+def pipe_launchers(name):
+    """[(fact prefix, launcher, sets PYTHONUTF8)] for the pipe form of one tool."""
+    out = [("t14p", "pane / agent shell / scheduler / app (PYTHONUTF8=1)", True)]
+    if name in PIPE_DAEMON_SPAWNED:
+        out.append(("t14pd", "the daemon's direct spawn (no PYTHONUTF8)", False))
+    return out
+
+
+def non_cp949_chars(text):
+    """The characters of `text` that cp949 cannot encode (a static list: what a tool COULD print)."""
+    out = set()
+    for ch in set(text or ""):
+        try:
+            ch.encode("cp949")
+        except UnicodeEncodeError:
+            out.add(ch)
+    return sorted(out)
+
 
 CREATE_NEW_CONSOLE = 0x00000010
 DETACHED_PROCESS = 0x00000008
@@ -3376,9 +3469,13 @@ def _console_run(pr, argv, tag, env, limit=90):
     pr.unregister_pid(con.pid)
     raw = read_text(outp) or ""
     status, _nl, text = raw.partition("\n")
-    m_rc = re.search(r"TW1-RC=(-?\d+)", text)
-    m_cp = re.search(r"TW1-CP=(\d+)", text)
-    res = {"status": status or "no-output", "text": text, "rc": int(m_rc.group(1)) if m_rc else None,
+    flat = "".join(text.split())         # markers are read with every space and line break removed (a wrap splits them)
+    m_rc = re.search(r"TW1-RC=(-?\d+)", flat)
+    m_cp = re.search(r"TW1-CP=(\d+)", flat)
+    status = status.strip() or "no-output"
+    if status == "read" and "TW1-END" in flat:
+        status = "complete"
+    res = {"status": status, "text": text, "flat": flat, "rc": int(m_rc.group(1)) if m_rc else None,
            "cp": int(m_cp.group(1)) if m_cp else None}
     pr.ev("cp949-console/%s.json" % tag, {"argv": argv, "status": res["status"], "rc": res["rc"], "cp": res["cp"],
                                           "text": text[-6000:]})
@@ -3397,7 +3494,7 @@ def probe_s3_cp949_tools(pr):
     ctl = _console_run(pr, [pr.bundled_python(), "-B", "-c", "print('제어 한글 출력 TW1')"], "control", env)
     f["console_status_control"] = ctl["status"]
     f["console_cp"] = ctl["cp"]
-    f["console_control_hangul_ok"] = "제어 한글 출력 TW1" in ctl["text"]
+    f["console_control_hangul_ok"] = "제어한글출력TW1" in ctl["flat"]
     scratch = os.path.join(pr.work, "cp949-console", "한글 일정")
     for spec in matrix()["scenario"]["cp949_tools"]:
         rel, name = spec["rel"], spec["name"]
@@ -3411,14 +3508,60 @@ def probe_s3_cp949_tools(pr):
             key = "t14_%s_%s" % (name, case)
             f[key + "_status"] = r["status"]
             f[key + "_rc"] = r["rc"]
-            f[key + "_traceback"] = "Traceback (most recent call last)" in r["text"]
+            f[key + "_traceback"] = "Traceback(mostrecentcalllast)" in r["flat"]
             f[key + "_mojibake"] = sum(r["text"].count(c) for c in MOJIBAKE_CHARS)
             f[key + "_hangul_chars"] = sum(1 for ch in r["text"] if "가" <= ch <= "힣")
-            f[key + "_echo_ok"] = (echo in r["text"]) if echo else None
+            f[key + "_echo_ok"] = (echo in r["flat"]) if echo else None
         if spec.get("writes_hangul_path"):
             target = os.path.join(scratch, "schedule.json")
             f["t14_%s_hangul_file_written" % name] = os.path.isfile(target)
     shutil.rmtree(os.path.join(pr.work, "cp949-console", "한글 일정"), ignore_errors=True)
+    # ── the PIPE form (run 3: the console form is kept; this is what the tools meet on a Korean system's pipe) ──
+    # Does the bundled runtime honour the variables at all? The product's shared spawn environment sets PYTHONUTF8=1
+    # for panes, hooks and scheduled jobs (src/lib.rs spawn_env_pairs; src/bin/cysd/state.rs pane builder).
+    show = "import sys; print(sys.stdout.encoding, sys.flags.utf8_mode)"
+    for k, extra in (("ioencoding", {"PYTHONIOENCODING": "cp949:strict"}), ("utf8", {"PYTHONUTF8": "1"}), ("none", {})):
+        r = run([pr.bundled_python(), "-B", "-c", show], 60, env=clean_env(extra))
+        pr.ev("cp949-pipe/env-%s.json" % k, r)
+        parts = r["out"].split()
+        f["bundled_stdout_encoding_" + k] = parts[0] if parts else None
+        f["bundled_utf8_mode_" + k] = parts[1] if len(parts) > 1 else None
+    f["bundled_honours_pythonioencoding"] = (f.get("bundled_stdout_encoding_ioencoding") or "").lower() in ("cp949", "ms949")
+    f["bundled_honours_pythonutf8"] = f.get("bundled_utf8_mode_utf8") == "1"
+    wrapper = os.path.join(pr.work, "cp949-pipe", "wrapper.py")
+    write_bytes(wrapper, _CP949_PIPE_WRAPPER.encode("utf-8"))
+    pscratch = os.path.join(pr.work, "cp949-pipe", "한글 일정")
+    for spec in matrix()["scenario"]["cp949_tools"]:
+        rel, name = spec["rel"], spec["name"]
+        tool = os.path.join(pr.pack_dir, *rel.split("/"))
+        f["t14p_%s_present" % name] = os.path.isfile(tool)
+        if not f["t14p_%s_present" % name]:
+            continue
+        f["t14p_%s_non_cp949_chars" % name] = non_cp949_chars(read_text(tool))[:40]
+        launchers = pipe_launchers(name)
+        f["t14p_%s_launchers" % name] = [lv[1] for lv in launchers]
+        for prefix, _who, utf8 in launchers:
+            penv = clean_env(dict({"PYTHONIOENCODING": "cp949:strict", "PYTHONDONTWRITEBYTECODE": "1"},
+                                  **({"PYTHONUTF8": "1"} if utf8 else {})))
+            for case, args, _rc, _echo in spec["cases"]:
+                args = [a.replace("{hangul_dir}", pscratch) for a in args]
+                r = run([pr.bundled_python(), "-B", wrapper, tool] + args, 120, env=penv)
+                pr.ev("cp949-pipe/%s-%s-%s.json" % (prefix, name, case),
+                      {"rc": r["code"], "timed_out": r["timed_out"], "utf8_mode_variable": utf8,
+                       "out_tail": r["out"][-3000:], "err_tail": r["err"][-3000:]})
+                key = "%s_%s_%s" % (prefix, name, case)
+                f[key + "_rc"] = r["code"]
+                f[key + "_traceback"] = "Traceback (most recent call last)" in r["err"]
+                m_enc = re.search(r"can't encode character '(\\[ux][0-9a-fA-F]+|.)'", r["err"])
+                f[key + "_encode_error"] = "UnicodeEncodeError" in r["err"]
+                f[key + "_encode_error_char"] = m_enc.group(1) if m_enc else None
+            if spec.get("writes_hangul_path"):
+                f["%s_%s_hangul_file_written" % (prefix, name)] = os.path.isfile(os.path.join(pscratch, "schedule.json"))
+                try:
+                    os.remove(os.path.join(pscratch, "schedule.json"))
+                except OSError:
+                    pass
+    shutil.rmtree(pscratch, ignore_errors=True)
     pr.restored = True
 
 
@@ -3605,32 +3748,63 @@ def probe_s5_checklist(pr):
     f["p6b_events_alive"] = alive(ep)
     kill_tree(ep)
     pr.unregister_pid(ep)
-    # P5 - the gate's negative test: a 0-byte read-only cys.exe -> a loud failure (exit 3 + the record); restored -> ok
-    f["p5_base_ok"] = _base_install(pr)
-    os.remove(cys_exe)
-    write_bytes(cys_exe, b"")
-    acl = run(["icacls", cys_exe, "/inheritance:r", "/grant:r", "%s:(R)" % os.environ.get("USERNAME", "")], 60)
-    f["p5_acl_set"] = acl["code"] == 0
-    r = pr.ev_cmd("p5-install.json", run([cand, "/S"], 900))
-    time.sleep(2)
-    f["p5_exit"] = r["code"]
-    ff = _failure_file(pr)
-    pr.ev("p5-failure-record.json", ff)
-    tok = (ff or {}).get("tokens") or {}
-    f["p5_first_line_ok"] = (ff or {}).get("first", "").startswith("cys installer: critical executable verification FAILED")
-    f["p5_four_tokens"] = bool(tok) and all(v is not None for v in tok.values())
-    f["p5_unrecoverable_names_cys"] = "cys.exe" in (tok.get("unrecoverable") or "")
-    f["p5_refused_names_cys"] = "cys.exe" in (tok.get("placement-refused") or "")
-    run(["icacls", cys_exe, "/reset"], 60)
-    for x in (cys_exe, pr.exe("cys-install-failure.txt")):
-        try:
-            os.remove(x)
-        except OSError:
-            pass
-    r = pr.ev_cmd("p5-recovery.json", run([cand, "/S"], 900))
-    time.sleep(2)
-    f["p5_recovery_exit"] = r["code"]
-    f["p5_recovery_version_ok"] = file_version(cys_exe) == want4
+    # P5 - the gate's negative test (run 3: the checklist's own recipe - a 0-byte file + a read-only ACL - ended in exit
+    # 0). Measured now for the candidate AND the base installer: (acl) the checklist's recipe with a control - can this
+    # account still rename the planted file - and what cys.exe is after the run; (lock) a state that cannot be replaced:
+    # the 0-byte cys.exe held by a read-share handle (as P6-a). Expected for a state that blocks: exit 3 + the record.
+    hold = os.path.join(pr.work, "s5", "hold.py")
+    write_bytes(hold, _HOLD_SHARE_READ.encode("utf-8"))
+    for inst_key, tag in (("candidate", "cand"), ("base", "base")):
+        inst = pr.ctx["installers"][inst_key]
+        inst4 = want4 if inst_key == "candidate" else base4
+        for recipe in ("acl", "lock"):
+            k = "p5_%s_%s" % (recipe, tag)
+            f[k + "_base_ok"] = _base_install(pr)
+            os.remove(cys_exe)
+            write_bytes(cys_exe, b"")
+            hp = None
+            if recipe == "acl":
+                acl = run(["icacls", cys_exe, "/inheritance:r", "/grant:r", "%s:(R)" % os.environ.get("USERNAME", "")], 60)
+                f[k + "_state_set"] = acl["code"] == 0
+            else:
+                hp = start_detached([sys.executable, "-I", "-B", hold, cys_exe], env=clean_env(),
+                                    stdout_path=os.path.join(pr.ev_dir, "%s-holder.out" % k))
+                pr.register_pid(hp, k + " holder")
+                time.sleep(3)
+                f[k + "_state_set"] = (read_text(os.path.join(pr.ev_dir, "%s-holder.out" % k)) or "").startswith("held")
+            # control: does the planted state refuse a rename by this account (the installer runs as this account)?
+            mv = _move(cys_exe, cys_exe + ".tw1-rename-probe")
+            f[k + "_rename_refused"] = not mv["ok"]
+            f[k + "_rename_error"] = mv["error"]
+            if mv["ok"]:
+                _move(cys_exe + ".tw1-rename-probe", cys_exe)
+            r = pr.ev_cmd("%s-install.json" % k, run([inst, "/S"], 900))
+            time.sleep(2)
+            f[k + "_exit"] = r["code"]
+            ff = _failure_file(pr)
+            pr.ev("%s-failure-record.json" % k, ff)
+            tok = (ff or {}).get("tokens") or {}
+            f[k + "_first_line_ok"] = (ff or {}).get("first", "").startswith("cys installer: critical executable verification FAILED")
+            f[k + "_four_tokens"] = bool(tok) and all(v is not None for v in tok.values())
+            f[k + "_unrecoverable_names_cys"] = "cys.exe" in (tok.get("unrecoverable") or "")
+            f[k + "_refused_names_cys"] = "cys.exe" in (tok.get("placement-refused") or "")
+            f[k + "_cys_size_after"] = os.path.getsize(cys_exe) if os.path.isfile(cys_exe) else None
+            f[k + "_cys_version_after"] = file_version(cys_exe)
+            f[k + "_replaced"] = f[k + "_cys_version_after"] == inst4
+            if hp:
+                kill_tree(hp)
+                pr.unregister_pid(hp)
+                time.sleep(1)
+            run(["icacls", cys_exe, "/reset"], 60)
+            for x in (cys_exe, pr.exe("cys-install-failure.txt")):
+                try:
+                    os.remove(x)
+                except OSError:
+                    pass
+            r = pr.ev_cmd("%s-recovery.json" % k, run([inst, "/S"], 900))
+            time.sleep(2)
+            f[k + "_recovery_exit"] = r["code"]
+            f[k + "_recovery_version_ok"] = file_version(cys_exe) == inst4
     # P4 - the installer killed while it runs: a working CLI stays; a rerun completes
     f["p4_base_ok"] = _base_install(pr)
     kw = {"creationflags": CREATE_NO_WINDOW}
@@ -3777,6 +3951,404 @@ def probe_s6_hangul(pr):
     pr.restored = False
 
 
+# ───────────────────────────── T6's Windows rows (RULINGS HT2): the job, the restart storm, the repair flow ─────────────────────────────
+
+T6_JOB_ID = "repair-probation-tick"
+
+
+def _schedule_row(cys_exe, job_id):
+    """`cys schedule list` -> the job's line: {last_fired (epoch or None), result (kind or None), line}."""
+    r = run([cys_exe, "schedule", "list"], 30, env=clean_env({"CYS_NO_AUTOSTART": "1"}))
+    for line in r["out"].splitlines():
+        if line.split("\t", 1)[0] == job_id:
+            m_lf = re.search(r"last_fired=(\d+)", line)
+            m_res = re.search(r"result=([A-Za-z_-]+)", line)
+            return {"line": line[:300], "last_fired": int(m_lf.group(1)) if m_lf else None,
+                    "result": m_res.group(1) if m_res else None}
+    return None
+
+
+def _stable_rels(pr):
+    """The pack files a restart must not touch: every vendor file and the edited files with their side copies."""
+    rels = set(vendor_rels())
+    for e in (pr.ctx.get("edits") or {}).values():
+        rels.update({e["rel"], e["rel"] + ".user", e["rel"] + ".new"})
+    return rels
+
+
+# RULINGS HV4: T9's protocol tests (src/pack.rs on track/T9 @56b1a791). Selected by the workflow's filters `t9_ m15_da_
+# m15_da2_` (m15_da2_ added: the same module's stage-2 case, not matched by `m15_da_`): 22 tests, none cfg(unix); one
+# (t9_r2_admission_onto_a_non_empty_slot_fails_onto_an_empty_slot_as_the_platform) asserts a cfg(windows) branch.
+T9_LIB_TEST_FILTERS = ("t9_", "m15_da_", "m15_da2_")
+T9_EXPECTED_TESTS = (
+    "m15_da_dept_boot_recovery_during_base_update_writes_base_bytes_into_dept_pack",
+    "m15_da_base_boot_recovery_during_dept_update_writes_dept_bytes_into_base_pack",
+    "m15_da_dept_boot_recovery_takes_base_crash_journal_and_base_stays_half_applied",
+    "m15_da_dept_at_target_version_deletes_base_crash_journal",
+    "m15_da2_same_base_revision_crash_in_step_2_is_not_rolled_back",
+    "t9_crash_after_every_step_is_entirely_old_or_entirely_new",
+    "t9_journal_of_a_running_or_unknown_writer_is_not_touched",
+    "t9_writer_life_is_decided_from_one_observation",
+    "t9_legacy_shared_journal_is_touched_by_no_lane_and_named",
+    "t9_r2_daemon_judged_gone_then_update_reuses_the_path_rollback_branch",
+    "t9_r2_daemon_judged_gone_then_update_reuses_the_path_cleanup_branch",
+    "t9_r2_two_recoverers_one_name_exactly_one_acts",
+    "t9_r2_taker_gone_mid_rollback_is_retaken_and_the_pack_ends_old",
+    "t9_r2_starter_beside_a_running_writer_or_taker_is_refused",
+    "t9_r2_two_starters_exactly_one_admitted",
+    "t9_r2_gone_writer_without_index_is_settled_running_is_kept",
+    "t9_r2_failed_rollback_gives_back_and_keeps_every_backup",
+    "t9_r2_starter_never_admitted_while_the_journal_is_retaken_by_dying_recoverers",
+    "t9_r2_settled_journal_half_removed_is_removed_not_rolled_back",
+    "t9_r2_admission_onto_a_non_empty_slot_fails_onto_an_empty_slot_as_the_platform",
+    "t9_r3_backup_list_is_read_after_admission_so_a_file_added_meanwhile_is_restored",
+    "t9_each_lane_has_its_own_journal_folder",
+)
+# The journal tests of the same module that are cfg(unix) (file modes): not selected by the filters, and not compiled
+# on Windows at all.
+T9_UNIX_ONLY = ("journal_rollback_restores_recorded_modes", "journal_rollback_keeps_a_recorded_non_exec_mode_on_a_shebang_file",
+                "orphan_journal_recovery_restores_modes", "journal_index_records_mode_only_for_existing_files",
+                "legacy_journal_without_mode_restores_exec_bit_by_the_shebang_rule",
+                "new_journal_index_parses_with_the_v0_14_56_struct_shape")
+# The pack-update verb's complete command (src/bin/cys.rs run_pack_update / pack_update_from_dir), run in-process by the
+# binary's own tests with a test-signed pack and a test keyring - the production CLI passes only the embedded keyring
+# ("no environment override"), so the shipped cys.exe accepts no pack this workflow could sign.
+T9_VERB_FILTERS = ("pack_update_", "b428_u9_")
+T9_VERB_EXPECTED = ("pack_update_from_dir_applies_signed_pack", "b428_u9_complete_command_classifies_before_clean_noop_and_publishes_first")
+
+
+def cargo_log_summary(log):
+    """What a `cargo test` log says: exit (the workflow's TW1-CARGO-EXIT line), result counts, per-test outcomes."""
+    m_exit = re.search(r"TW1-CARGO-EXIT=(\d+)", log)
+    res = re.findall(r"test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored", log)
+    ran = re.findall(r"(?m)^test (\S+) \.\.\. (ok|FAILED|ignored)", log)
+    return {"exit": int(m_exit.group(1)) if m_exit else None,
+            "result": [r[0] for r in res] or None,
+            "passed": sum(int(r[1]) for r in res) if res else None,
+            "failed": sum(int(r[2]) for r in res) if res else None,
+            "ignored": sum(int(r[3]) for r in res) if res else None,
+            "compiled": "error[E" not in log and "could not compile" not in log,
+            "ran": {n.split("::")[-1]: st for n, st in ran}}
+
+
+def probe_s7_t9_libtests(pr):
+    """RULINGS HV4: T9's own protocol tests and the pack-update verb's complete command, run by this workflow's job
+    `t9-libtests` on a Windows runner; its logs are read here (artifact tw1-t9-libtests of THIS run)."""
+    f = pr.facts
+    f["t9lib_filters"], f["t9verb_filters"] = list(T9_LIB_TEST_FILTERS), list(T9_VERB_FILTERS)
+    f["t9lib_unix_only_not_selected"] = list(T9_UNIX_ONLY)
+    f["t9lib_job_result"] = os.environ.get("TW1_T9_RESULT")
+    d = os.path.join(pr.work, "t9lib")
+    ok, note = fetch_artifact(os.environ.get("GITHUB_RUN_ID", ""), "tw1-t9-libtests", d, os.environ.get("GH_TOKEN", ""),
+                              pr.work)
+    f["t9lib_artifact_ok"], f["t9lib_artifact_note"] = ok, note
+    present = (read_text(os.path.join(d, "t9-present.txt")) or "").strip()
+    f["t9lib_tests_in_tree"] = (present == "present") if present in ("present", "absent") else None
+    for key, fn, expected in (("t9lib", "t9-libtests.log", T9_EXPECTED_TESTS), ("t9verb", "t9-verbtests.log", T9_VERB_EXPECTED)):
+        log = read_text(os.path.join(d, fn))
+        f[key + "_log_present"] = log is not None
+        if log is None:
+            continue
+        pr.ev(fn.replace(".log", "-tail.txt"), log[-20000:])
+        sm = cargo_log_summary(log)
+        f[key + "_cargo_exit"], f[key + "_compiled"] = sm["exit"], sm["compiled"]
+        f[key + "_passed"], f[key + "_failed"], f[key + "_ignored"] = sm["passed"], sm["failed"], sm["ignored"]
+        f[key + "_ran"] = len(sm["ran"])
+        f[key + "_failed_names"] = sorted(n for n, st in sm["ran"].items() if st == "FAILED")
+        f[key + "_expected_missing"] = sorted(n for n in expected if n not in sm["ran"])
+        f[key + "_expected_all_ok"] = all(sm["ran"].get(n) == "ok" for n in expected)
+        f[key + "_ran_unix_only"] = sorted(n for n in sm["ran"] if n in T9_UNIX_ONLY)
+    pr.restored = True
+
+
+def _restart_storm(pr, cys, tag, n=4):
+    """n quick daemon restarts (every cysd.exe of this run stopped, a fresh one started), `cys repair tick` asked
+    right after each launch. -> (answers, the last launch time, the last readiness time or None)."""
+    answers = []
+    launch = ready_at = None
+    for i in range(n):
+        for p in processes():
+            if (p.get("name") or "").lower() == "cysd.exe":
+                terminate(p["pid"])
+        time.sleep(1)
+        launch = time.time()
+        dp = start_detached([pr.exe("cysd.exe")], env=clean_env(), stdout_path=os.path.join(pr.ev_dir, "%s-%d-cysd.out" % (tag, i)))
+        pr.register_pid(dp, "%s daemon %d" % (tag, i))
+        first = None
+        t1 = time.monotonic()
+        while time.monotonic() - t1 < 60:
+            rr = run([cys, "repair", "tick"], 10, env=clean_env({"CYS_NO_AUTOSTART": "1"}))
+            if rr["code"] is not None and (rr["out"] + rr["err"]).strip() and "connect" not in (rr["err"] or "").lower():
+                first = (rr["code"], (rr["out"] + rr["err"]).strip()[:120])
+                break
+            time.sleep(0.2)
+        ok, _secs, _ = wait_ready(cys, 90)
+        ready_at = time.time() if ok else None
+        answers.append({"restart": i, "first_tick_answer": first, "ready": ok})
+    return answers, launch, ready_at
+
+
+def probe_s3_t6_jobs(pr):
+    """R-T6-TICKSHELL and G15 (T6 is in the tree from d00f4075): the scheduler runs T6's built-in job under Windows;
+    a restart storm changes no pack file and the job fires only after readiness."""
+    f = pr.facts
+    cys = pr.exe("cys.exe")
+    doc = _load(os.path.join(pr.pack_dir, "schedule.json")) or {}
+    job = next((j for j in (doc.get("jobs") or []) if isinstance(j, dict) and j.get("id") == T6_JOB_ID), None)
+    f["tick_job_present"] = job is not None
+    f["tick_job_command"] = (job or {}).get("command")
+    t0 = time.monotonic()
+    row = _schedule_row(cys, T6_JOB_ID)
+    while time.monotonic() - t0 < 300 and not (row and row["last_fired"] and row["result"] not in (None, "-")):
+        time.sleep(10)
+        row = _schedule_row(cys, T6_JOB_ID)
+    pr.ev("t6/schedule-row.json", row)
+    f["tick_job_last_fired"] = (row or {}).get("last_fired")
+    f["tick_job_result"] = (row or {}).get("result")
+    # the job's own command line, from a plain Git Bash (what the scheduler's bash runs)
+    r = pr.ev_cmd("t6/tick-command.json", run([pr.bundled_hook_bash(), "-c", "CYS_NO_AUTOSTART=1 cys repair tick"], 60,
+                                              env=seat_env(pr)))
+    f["tick_command_exit"] = r["code"]
+    f["tick_command_answer"] = (r["out"] + r["err"]).strip()[:200]
+    # G15 - the restart storm: four quick restarts, `cys repair tick` asked right after each launch
+    stable = _stable_rels(pr)
+    pre = pack_manifest(pr.pack_dir) or {}
+    answers, launch, ready_at = _restart_storm(pr, cys, "t6-storm")
+    pr.ev("t6/storm.json", answers)
+    f["storm_restarts"] = len(answers)
+    f["storm_all_ready"] = all(a["ready"] for a in answers)
+    f["storm_first_answers"] = [a["first_tick_answer"][1] if a["first_tick_answer"] else None for a in answers]
+    # the job after the last restart: fired after readiness, within 150 s of it, never before it
+    fired = None
+    t2 = time.monotonic()
+    while time.monotonic() - t2 < 240 and ready_at:
+        row = _schedule_row(cys, T6_JOB_ID)
+        if row and row["last_fired"] and row["last_fired"] >= int(launch or 0):
+            fired = row["last_fired"]
+            break
+        time.sleep(5)
+    f["storm_first_fire_after_ready_s"] = None if fired is None or ready_at is None else round(fired - ready_at, 1)
+    f["storm_fire_before_ready"] = None if fired is None or ready_at is None else fired < int(ready_at) - 1
+    post = pack_manifest(pr.pack_dir) or {}
+    f["storm_pack_changed"] = sorted(r for r in stable if pre.get(r) != post.get(r))
+    pr.restored = True
+
+
+# A worker / reviewer seat runs `cys <args>` as the pane's descendant (the daemon finds the caller's seat by the
+# process ancestry) and writes {rc, out, err} to a file.
+_SEAT_CYS_SCRIPT = r"""import json, os, subprocess, sys
+cys, out = sys.argv[1], sys.argv[2]
+r = subprocess.run([cys] + sys.argv[3:], capture_output=True, timeout=120)
+with open(out + ".tmp", "w", encoding="utf-8") as fh:
+    json.dump({"rc": r.returncode, "out": r.stdout.decode("utf-8", "replace"), "err": r.stderr.decode("utf-8", "replace")}, fh)
+os.replace(out + ".tmp", out)
+"""
+
+
+def _seat_cys(pr, sid, kind, args, tag):
+    d = os.path.join(pr.work, "repair-flow")
+    script = os.path.join(d, "seat_cys.py")
+    write_bytes(script, _SEAT_CYS_SCRIPT.encode("utf-8"))
+    outp = os.path.join(d, tag + ".json")
+    conv = _msys if kind == "bash" else (lambda x: x)
+    line = " ".join([conv(pr.bundled_python()), "-I", "-S", "-B", conv(script), conv(pr.exe("cys.exe")), conv(outp)]
+                    + list(args))
+    pr.cys(["send", "--surface", sid, line], timeout=30)
+    pr.cys(["send-key", "--surface", sid, "Return"], timeout=30)
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 90 and not os.path.isfile(outp):
+        time.sleep(1)
+    res = _load(outp)
+    pr.ev("repair-flow/%s.json" % tag, {"args": list(args), "result": res})
+    return res
+
+
+def _flow_seats(pr, tag):
+    """A worker seat and a reviewer1 seat (reviewer-codex) created by the daemon -> ({role: sid}, {role: "bash"|"native"})."""
+    seats, kinds = {}, {}
+    for role in ("worker", "reviewer-codex"):
+        ns = pr.ev_cmd("repair-flow/%s-new-surface-%s.json" % (tag, role), pr.cys(["new-surface", "--role", role], timeout=60))
+        seats[role] = ns["out"].strip().splitlines()[-1].strip() if ns["code"] == 0 and ns["out"].strip() else None
+    time.sleep(5)
+    lst = pr.cys(["list"], timeout=30, extra={"CYS_NO_AUTOSTART": "1"})
+    for role, sid in seats.items():
+        mm = re.search(r"^%s\t.*?\bpid=(\d+)" % re.escape(sid or "-"), lst["out"], re.M)
+        img = image_path(int(mm.group(1))) if mm else None
+        kinds[role] = "bash" if os.path.basename(img or "").lower() in ("bash.exe", "sh.exe") else "native"
+    return seats, kinds
+
+
+def _tick_settled(pr, limit_s=180):
+    """`cys repair tick` (seatless, as the job runs it) until the daemon's job has run and is no longer busy."""
+    cys = pr.exe("cys.exe")
+    answers = []
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < limit_s:
+        r = run([cys, "repair", "tick"], 30, env=clean_env({"CYS_NO_AUTOSTART": "1"}))
+        a = (r["out"] + r["err"]).strip()[:160]
+        answers.append(a)
+        if answers[1:] and not re.search(r"busy|started|not_ready", a):
+            break
+        time.sleep(3)
+    return answers[-6:]
+
+
+def probe_s3_repair_flow(pr):
+    """G16.product (the revert half), G15 (no false revert), I-AUTOOFF and R-T0-TS through the product's verbs from
+    seats: per repair begin, the live edit, record, submit, reviewer1's attest-verify, commit. Only once commit applies
+    a repair (T5b in the tree) do the legs after it run - repair 1 (the CG file): a restart storm in probation, the
+    revert with the target held; repair 2 (another unedited general file): a failing re-check (automatic return OFF on
+    Windows), a reparse point at the target. A new daemon incarnation makes T6's probation re-check due at once (C7 7.2),
+    so each re-check follows a restart; the seats die with the daemon and are made again. At d00f4075 commit stops at
+    T5b's checks (rehearsal::run_check 'not built'); every answer is recorded and the pack is put back."""
+    f = pr.facts
+    sel = pr.ctx.get("selection") or {}
+    cys = pr.exe("cys.exe")
+    pr.restored = True                       # until a live file is edited (an open repair in the ledger stays, as in EG2)
+    targets = {"1": sel.get("CG")}           # an UNEDITED general file (the control of CW7-GENERAL)
+    used = set(sel.values()) | {e.get("rel") for e in (pr.ctx.get("edits") or {}).values()}
+    targets["2"] = next((r for r in matrix()["scenario"]["general_changed_py"] if r not in used), None)
+    f["flow_target"], f["flow2_target"] = targets["1"], targets["2"]
+    if not targets["1"]:
+        return
+    seats, kinds = _flow_seats(pr, "a")
+    f["flow_seats"] = {k: bool(v) for k, v in seats.items()}
+    if not all(seats.values()):
+        return
+    state = {"seats": seats, "kinds": kinds}
+
+    def step(name, role, args):
+        sid = state["seats"][role]
+        res = _seat_cys(pr, sid, state["kinds"][role], args, name) or {}
+        f["flow_%s_rc" % name] = res.get("rc")
+        f["flow_%s_answer" % name] = ((res.get("out") or "") + (res.get("err") or "")).strip()[:300]
+        return res
+
+    def reseat(tag):
+        state["seats"], state["kinds"] = _flow_seats(pr, tag)
+        return all(state["seats"].values())
+
+    def commit_one(n, rel):
+        """begin -> live edit -> record -> submit -> attest-verify -> commit for one file. -> (rid, live, pre, edited)."""
+        px = "" if n == "1" else "r2_"
+        live = os.path.join(pr.pack_dir, *rel.split("/"))
+        pre = read_bytes(live) or b""
+        f["flow_%spre_sha" % px] = sha256_bytes(pre)
+        b = step(px + "begin", "worker", ["repair", "begin", "--files", rel, "--trigger", "owner-order", "--json"])
+        m_id = re.search(r"\bR-\d+\b", (b.get("out") or "") + (b.get("err") or ""))
+        rid = m_id.group(0) if m_id else None
+        f["flow_%srepair" % px] = rid
+        if not rid:
+            f["flow_%sstopped_at" % px] = "begin"
+            return None, live, pre, None
+        edited = pre + (b"" if pre.endswith(b"\n") else b"\n") + b"# tw1 repair flow edit\n"
+        write_bytes(live, edited)
+        f["flow_%sedited_sha" % px] = sha256_bytes(edited)
+        steps = []
+        for name, role, args in ((px + "record", "worker", ["repair", "record", rid, "--note", "tw1 flow", "--json"]),
+                                 (px + "submit", "worker", ["repair", "submit", rid, "--json"]),
+                                 (px + "attest", "reviewer-codex", ["repair", "attest-verify", rid, "--verdict", "pass", "--note", "tw1"]),
+                                 (px + "commit", "worker", ["repair", "commit", rid, "--json"])):
+            steps.append(name)
+            if step(name, role, args).get("rc") != 0:
+                f["flow_%sstopped_at" % px] = name
+                break
+        f["flow_%ssteps" % px] = steps
+        return rid, live, pre, edited
+
+    rid, live, pre, edited = commit_one("1", targets["1"])
+    ni = _source_const("src/repair/mod.rs", "NOT_IMPLEMENTED_KO")
+    f["flow_commit_not_implemented"] = bool(ni) and ni in (f.get("flow_commit_answer") or "")
+    f["flow_committed"] = bool(rid) and f.get("flow_commit_rc") == 0
+    if not f["flow_committed"]:
+        if edited is not None:
+            write_bytes(live, pre)           # the product never applied the edit: the pack is put back as it was
+        f["flow_live_restored"] = sha256_file(live) == f["flow_pre_sha"]
+        pr.restored = f["flow_live_restored"]
+        return
+    # ── from here only with T5b in the tree (repair 1 applied, in probation) ──
+    pr.restored = False
+    step("status_applied", "worker", ["repair", "status", rid, "--json"])
+    f["flow_live_after_commit_is_edited"] = sha256_file(live) == f["flow_edited_sha"]
+    # G15 (no false revert) + R-T0-TS (regular): the storm; the first tick of the new incarnation re-checks at once
+    answers, _l, _r = _restart_storm(pr, cys, "flow-storm")
+    pr.ev("repair-flow/storm.json", answers)
+    f["flow_storm_all_ready"] = all(a["ready"] for a in answers)
+    f["flow_recheck_regular_ticks"] = _tick_settled(pr)
+    f["flow_storm_live_is_edited"] = sha256_file(live) == f["flow_edited_sha"]
+    if not reseat("b"):
+        return
+    step("status_after_storm", "worker", ["repair", "status", rid, "--json"])
+    f["flow_storm_status_reverted"] = bool(re.search(r"revert|되돌렸", f.get("flow_status_after_storm_answer") or ""))
+    # G16.product (the revert half): the revert with the target held by a Python tool (no delete sharing)
+    hp, held = _hold_file(pr, live, "flow-revert")
+    f["revert_target_held"] = held
+    step("revert", "worker", ["repair", "revert", rid])
+    time.sleep(2)
+    after_held = sha256_file(live)
+    _stop_holder(pr, hp)
+    f["revert_held_live_sha_is_pre"] = after_held == f["flow_pre_sha"]
+    f["revert_held_live_sha_is_edited"] = after_held == f["flow_edited_sha"]
+    f["revert_held_nothing_deleted"] = os.path.isfile(live)
+    f["revert_held_outcome"] = ("success" if f["revert_held_live_sha_is_pre"] else
+                                "stopped" if f["revert_held_live_sha_is_edited"] else "other")
+    step("revert_again", "worker", ["repair", "revert", rid])
+    time.sleep(2)
+    f["revert_live_is_pre"] = sha256_file(live) == f["flow_pre_sha"]
+    # ── repair 2: I-AUTOOFF, then R-T0-TS (reparse point) ──
+    if not targets["2"]:
+        f["flow_r2_stopped_at"] = "no second unedited general file"
+        return
+    rid2, live2, pre2, edited2 = commit_one("2", targets["2"])
+    f["flow_r2_committed"] = bool(rid2) and f.get("flow_r2_commit_rc") == 0
+    if not f["flow_r2_committed"]:
+        if edited2 is not None:
+            write_bytes(live2, pre2)
+        pr.restored = bool(f["revert_live_is_pre"]) and sha256_file(live2) == f["flow_r2_pre_sha"]
+        return
+    broken = b"this is not python ((( tw1\n"
+    write_bytes(live2, broken)
+    _restart_storm(pr, cys, "flow-autooff", n=1)
+    f["flow_recheck_failing_ticks"] = _tick_settled(pr)
+    time.sleep(3)
+    f["autooff_live_still_broken"] = sha256_file(live2) == sha256_bytes(broken)
+    if reseat("c"):
+        step("status_after_failure", "worker", ["repair", "status", rid2, "--json"])
+        f["autooff_status_answer"] = f.get("flow_status_after_failure_answer")
+    sw = run([cys, "repair", "sweep", "--json"], 60, env=clean_env({"CYS_NO_AUTOSTART": "1"}))
+    pr.ev("repair-flow/sweep.json", sw)
+    f["autooff_notice_present"] = rid2 in (sw["out"] or "")
+    write_bytes(live2, edited2)               # the repaired bytes back (the reparse leg reads a repaired file)
+    copy = live2 + ".tw1-copy"
+    shutil.copyfile(live2, copy)
+    os.remove(live2)
+    mk = run(["cmd", "/c", "mklink", live2, copy], 30)
+    f["reparse_created"] = mk["code"] == 0 and os.path.islink(live2)
+    if f["reparse_created"]:
+        _restart_storm(pr, cys, "flow-reparse", n=1)
+        f["flow_recheck_reparse_ticks"] = _tick_settled(pr)
+        f["flow_recheck_reparse_answer"] = " | ".join(f["flow_recheck_reparse_ticks"])[:300]
+        f["reparse_link_still_there"] = os.path.islink(live2)
+        if reseat("d"):
+            step("status_after_reparse", "worker", ["repair", "status", rid2, "--json"])
+        if os.path.islink(live2):
+            os.remove(live2)
+    if not os.path.isfile(live2):
+        shutil.copyfile(copy, live2)
+    try:
+        os.remove(copy)
+    except OSError:
+        pass
+    # repair 2 ends as it began: the product's revert, else the pre-image written back (stated)
+    if reseat("e"):
+        step("r2_revert", "worker", ["repair", "revert", rid2])
+        time.sleep(2)
+    f["flow_r2_reverted_by_product"] = sha256_file(live2) == f["flow_r2_pre_sha"]
+    if not f["flow_r2_reverted_by_product"]:
+        write_bytes(live2, pre2)
+    pr.restored = bool(f["revert_live_is_pre"]) and sha256_file(live2) == f["flow_r2_pre_sha"]
+
+
 PROBES = {
     "s0_env": probe_s0_env,
     "s1_base": probe_s1_base,
@@ -3795,7 +4367,10 @@ PROBES = {
     "s3_eg2": probe_s3_eg2,
     "s3_clear_chain": probe_s3_clear_chain,
     "s3_cp949_tools": probe_s3_cp949_tools,
+    "s3_t6_jobs": probe_s3_t6_jobs,
+    "s3_repair_flow": probe_s3_repair_flow,
     "s7_primitives": probe_s7_primitives,
+    "s7_t9_libtests": probe_s7_t9_libtests,
     "s5_checklist": probe_s5_checklist,
     "s6_variants": probe_s6_variants,
     "s6_inplace": probe_s6_inplace,
