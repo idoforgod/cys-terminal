@@ -213,18 +213,31 @@ pub enum RecordRead {
 /// refused before any read), a link, an oversized file or a size that changed during the read is
 /// unreadable. It never waits and never retries.
 pub fn read_record_bytes(p: &Path) -> RecordRead {
+    read_bounded(p, false)
+}
+
+/// RULINGS IZ5 — [`read_record_bytes`] for a file the engine does NOT own whose link a user may have
+/// placed (the agents' settings file): a link is followed, and what it reaches must be a REGULAR file
+/// (checked through the open handle) — the same non-blocking open, the same one handle and limit.
+pub fn read_bounded_following(p: &Path) -> RecordRead {
+    read_bounded(p, true)
+}
+
+fn read_bounded(p: &Path, follow: bool) -> RecordRead {
     use std::io::Read;
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | if follow { 0 } else { libc::O_NOFOLLOW });
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        opts.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT: a link is opened as itself
+        if !follow {
+            opts.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT: a link is opened as itself
+        }
     }
     let f = match opts.open(p) {
         Ok(f) => f,

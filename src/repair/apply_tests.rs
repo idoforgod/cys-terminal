@@ -3787,6 +3787,57 @@ fn begin_refuses_a_file_over_the_limit() {
     assert!(e.contains(&CAP.to_string()), "the limit is named: {e}");
 }
 
+/// IZ5 (reviewer1 on T7b, review 4): the settings file the registrar's dry run named is read inside
+/// the pack-apply exclusion by the hook step — through the bounded reader: a FIFO at its name (a writer
+/// offering valid settings to every reader) is refused at once (the hook unit declines), never waited
+/// for; a file over the limit is refused without a byte of it read; a link to a regular settings file
+/// is still followed (as before). Without IZ5 the plain read waited on the FIFO for its writer (here:
+/// got the writer's settings) and read an oversized file whole.
+#[cfg(unix)]
+#[test]
+fn the_hook_steps_settings_read_is_bounded_and_never_waits() {
+    use crate::repair::durable::{read_seam, RECORD_READ_CAP as CAP};
+    use std::io::Write;
+    let r = rig("iz5");
+    let json = br#"{"hooks": {"Stop": [{"matcher": "m", "hooks": [{"type": "command", "command": "bash h.sh", "timeout": 7}]}]}}"#;
+    let real = r.base.join("cfg/settings.json");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, json).unwrap();
+    let link = r.base.join("cfg/linked.json");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(found_matcher_timeout(&link, "Stop", "h.sh").is_ok(), "a link to a regular settings file is followed");
+    let big = r.base.join("cfg/big.json");
+    std::fs::File::create(&big).unwrap().set_len(CAP + 1).unwrap();
+    assert!(found_matcher_timeout(&big, "Stop", "h.sh").is_err(), "over the limit: refused");
+    assert_eq!(read_seam::bytes_read_from(&big), 0, "never read");
+    let fifo = r.base.join("cfg/fifo.json");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (w_stop, w_at) = (std::sync::Arc::clone(&stop), fifo.clone());
+    let writer = std::thread::spawn(move || {
+        use std::os::unix::fs::FileTypeExt;
+        while !w_stop.load(std::sync::atomic::Ordering::SeqCst) && std::fs::symlink_metadata(&w_at).is_ok_and(|m| m.file_type().is_fifo()) {
+            match std::fs::OpenOptions::new().write(true).open(&w_at) {
+                Ok(mut f) => {
+                    let _ = f.write_all(json);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let got = found_matcher_timeout(&fifo, "Stop", "h.sh");
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let release = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&fifo).unwrap()
+    };
+    writer.join().unwrap();
+    drop(release);
+    assert!(got.is_err(), "a FIFO settings file is refused at once: {got:?}");
+}
+
 // ───────────────────────────── RULINGS IL2 — what reaches another department ─────────────────────────────
 
 /// IL2: the sentence about another department is true for the CLASS of the repair (0.15.0 has no
