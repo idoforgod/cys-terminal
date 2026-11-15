@@ -250,6 +250,7 @@ fn recheck_after_a_merge_through_the_dispatcher() {
         merge_lock: None,
         merge_attempt: 0,
         reason: String::new(),
+        hook_ops: Vec::new(),
         updated_at: T0,
     };
     ledger::write_lane_in(&r.root, &row).unwrap();
@@ -428,6 +429,7 @@ fn a_hook_only_repairs_conflict_is_merged_through_unregister_hook_joins() {
         merge_lock: None,
         merge_attempt: 0,
         reason: "훅 등록 해제를 이 부서에서 마치지 못했습니다 — (시험)".into(),
+        hook_ops: Vec::new(),
         updated_at: T0,
     };
     ledger::write_lane_in(&r.root, &row).unwrap();
@@ -448,7 +450,9 @@ fn a_hook_only_repairs_conflict_is_merged_through_unregister_hook_joins() {
     let v = handle_with(&ctx, &w, "recheck", &json!({"repair": "R-1"})).unwrap();
     assert_eq!(v["lane_state"], "verified", "{v}");
     assert_eq!(steps.get(), 1, "the lane's own hook step ran");
+    // RULINGS JD2 (added): the row records the hook operation the call completed
     let done = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
     assert_eq!(done.state, LaneState::Verified);
     assert!(done.merge_lock.is_none() && done.merge.is_some());
+    assert!(done.hook_ops.iter().any(|h| h.op == "test-hook-op"), "{:?}", done.hook_ops);
 }
