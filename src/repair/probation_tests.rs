@@ -1936,3 +1936,34 @@ fn the_notice_book_answers_unreadable_for_a_fifo_and_serves_the_next_request() {
     let due = hand_out_due_notices_in(&r.root, &lane).unwrap();
     assert_eq!(due.iter().map(|d| d.key.as_str()).collect::<Vec<_>>(), vec!["f:hooks/x.sh:ab:kept"]);
 }
+
+// ───────────────────────────── RULINGS IE1 — one observation of the generation ─────────────────────────────
+
+/// IE1 (codex T6b r1 M1): the pack's present generation is observed ONCE and that one value decides.
+/// The marker read answers "unknown" and a second read would answer the row's own generation (no
+/// update happened): the outcome is the one of an unknown generation (대체됨, EJ1 / EN3) — never HS1's
+/// "the update kept the bytes". Without IE1 the second read entered HS1 and the probation ended 사용 중
+/// with its automatic return disarmed.
+#[test]
+fn one_observation_of_the_generation_decides() {
+    let r = rig("ie1");
+    let a = rid("R-4");
+    committed_general(&r, &a, "hooks/s.sh", Some(b"OLD\n"), Some(b"REPAIRED\n"));
+    let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
+    let rec = ledger::read_record_in(&r.root, &a).unwrap().unwrap();
+    let mine = crate::repair::apply::Bound::from_row(row.probation.as_ref().unwrap());
+    assert!(mine.known().is_some());
+    crate::repair::apply::BOUND_NOW_SCRIPT.with(|q| q.borrow_mut().extend([crate::repair::apply::Bound::Unknown, mine.clone()]));
+    let never = |_: &str, _: &Path, _: Duration| -> Result<CheckOutcome, RepairError> { panic!("no check") };
+    let d = Doubles { check: &never, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    let env = job(&r, &d, ApplyForm::Exchange, NOW, &lock);
+    let mut report = TickReport::default();
+    let done = recheck_one(&env, &rec, &row, &mut report);
+    crate::repair::apply::BOUND_NOW_SCRIPT.with(|q| q.borrow_mut().clear());
+    done.unwrap();
+    let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
+    assert!(closed.starts_with("대체됨 — 팩 세대가 적용 때와 다르거나 알 수 없습니다"), "{closed}");
+    assert!(report.ended.is_empty(), "{report:?}");
+    assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::Superseded);
+}
