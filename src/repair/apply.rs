@@ -4472,10 +4472,14 @@ pub fn reconcile_hook_registrations(
 /// settings file that does not exist has none; one that cannot be read or parsed is an `Err` (the
 /// hook step then declines — never records "no matcher" for an entry it could not see).
 fn found_matcher_timeout(settings: &Path, event: &str, script: &str) -> Result<(Option<String>, Option<u64>), String> {
-    let bytes = match std::fs::read(settings) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
-        Err(e) => return Err(format!("{}: {e}", settings.display())),
+    // RULINGS IZ5 — read inside the pack-apply exclusion (the apply's, the revert's, T7b's recheck),
+    // so through the bounded reader: a non-regular or over-limit file is refused at once (the hook
+    // unit declines, the exclusion is released), never a wait; a user's link to a regular file is
+    // followed as before
+    let bytes = match super::durable::read_bounded_following(settings) {
+        super::durable::RecordRead::Bytes(b) => b,
+        super::durable::RecordRead::NotFound => return Ok((None, None)),
+        super::durable::RecordRead::Unreadable(why) => return Err(why),
     };
     let v = serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| format!("{}: {e}", settings.display()))?;
     Ok(found_matcher_timeout_in(&v, event, script))
