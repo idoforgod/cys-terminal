@@ -1993,3 +1993,47 @@ fn a_live_target_over_the_limit_is_never_read_by_the_recheck() {
     assert!(rep.lines.iter().any(|l| l.contains(&CAP.to_string())), "the limit is said: {:?}", rep.lines);
     assert_eq!(std::fs::metadata(&live).unwrap().len(), CAP + 1, "nothing moved");
 }
+
+/// IW2: M10's read of the approved holder made INSIDE the pack-apply exclusion goes through the
+/// bounded path — a FIFO (a writer offering bytes to every reader) or a file over the limit gives no
+/// hash at once (no put-back), never a wait or a whole read. Without IW2 it was `std::fs::read`.
+#[cfg(unix)]
+#[test]
+fn the_approved_holder_is_hashed_within_the_one_limit() {
+    use crate::repair::durable::RECORD_READ_CAP as CAP;
+    use std::io::Write;
+    let r = rig("iw2holder");
+    let small = r.base.join("holder/small");
+    std::fs::create_dir_all(small.parent().unwrap()).unwrap();
+    std::fs::write(&small, b"APPROVED\n").unwrap();
+    assert_eq!(holder_sha(&small), Some(sha_hex(b"APPROVED\n")));
+    let big = r.base.join("holder/big");
+    std::fs::File::create(&big).unwrap().set_len(CAP + 1).unwrap();
+    assert_eq!(holder_sha(&big), None, "over the limit: no hash");
+    let fifo = r.base.join("holder/fifo");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (w_stop, w_at) = (std::sync::Arc::clone(&stop), fifo.clone());
+    let writer = std::thread::spawn(move || {
+        use std::os::unix::fs::FileTypeExt;
+        while !w_stop.load(std::sync::atomic::Ordering::SeqCst) && std::fs::symlink_metadata(&w_at).is_ok_and(|m| m.file_type().is_fifo()) {
+            match std::fs::OpenOptions::new().write(true).open(&w_at) {
+                Ok(mut f) => {
+                    let _ = f.write_all(b"APPROVED\n");
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let got = holder_sha(&fifo);
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let release = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&fifo).unwrap()
+    };
+    writer.join().unwrap();
+    drop(release);
+    assert_eq!(got, None, "a FIFO holder: no hash, at once");
+}
