@@ -612,6 +612,16 @@ fn wa1_the_ceo_template_is_a_rule_document() {
     r.grant_on(5);
     let t = now0();
     let w = seat(3, "worker");
+    // RULINGS JV1 / KZ3: does this temporary volume give one file to two spellings that differ by letter
+    // case? Measured (written through one spelling, read through the other) — the door's name for a typed
+    // case alias of an EXISTING file depends on it.
+    let case_blind = {
+        let probe = r.pack.join("directives/b8j-case-probe.txt");
+        std::fs::write(&probe, b"b8j\n").unwrap();
+        let same = std::fs::read(r.pack.join("directives/B8J-CASE-PROBE.TXT")).is_ok_and(|b| b == b"b8j\n");
+        std::fs::remove_file(&probe).unwrap();
+        same
+    };
     let norm = |m: &str, spelled: &str| -> String {
         m.replace(spelled, "<DOC>")
             .replace("CEO_TEMPLATE.md", "<REAL>")
@@ -642,7 +652,15 @@ fn wa1_the_ceo_template_is_a_rule_document() {
                     et.message,
                     em.message
                 );
-                assert!(et.message.contains(tmpl), "the refusal names the file: {}", et.message);
+                // The refusal names the file under the name the door records for it (RULINGS JV1 / KZ3): on a
+                // volume that does not tell case apart, a typed case alias of the EXISTING template is recorded
+                // — and named — as `directives/CEO_TEMPLATE.md`; a path that does not exist (the pack root,
+                // another folder), and every row on a volume that distinguishes case, keeps the typed spelling.
+                // Old expectation, true before the door mapped existing files (WW1):
+                //   assert!(et.message.contains(tmpl), "the refusal names the file: {}", et.message);
+                let alias_of_existing = tmpl.starts_with("directives/") && tmpl != "directives/CEO_TEMPLATE.md";
+                let named = if case_blind && alias_of_existing { "directives/CEO_TEMPLATE.md" } else { tmpl };
+                assert!(et.message.contains(named), "the refusal names the file as {named}: {}", et.message);
             }
         }
         // the ONE definition — also the re-check job's exclusion (`repair_job.rs`: never reverted
