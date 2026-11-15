@@ -204,20 +204,6 @@ pub struct LaneRecord {
     /// written before it (empty — the serde default), and not written while empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reason: String,
-    /// RULINGS JD2 (T7b) — the hook operations THIS lane's daemon completed for the repair (the
-    /// un-registration of R's hook lines in this lane): the row's own record of the hook change the lane
-    /// made, kept by every later publication of the row (a newer reason or state does not erase it).
-    /// T6's return re-registers R's hook lines (from the record). Absent in rows written before it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub hook_ops: Vec<HookOpDone>,
-}
-
-/// RULINGS JD2 (T7b) — one hook operation a lane completed: the id of its operation record under
-/// `R-<n>/ops/` and the hook lines it named (`event:script`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HookOpDone {
-    pub op: String,
-    pub lines: Vec<String>,
 }
 
 /// `repairs/lanes/<lane_key>.job.json` (O-C7-4, RULINGS I7, I8, L1, O4).
@@ -1525,7 +1511,6 @@ mod tests {
             merge_lock: Some(lease(None)),
             merge_attempt: 1,
             reason: String::new(),
-            hook_ops: Vec::new(),
             updated_at: 7.5,
         };
         let v = serde_json::to_value(&lane).unwrap();

@@ -190,7 +190,6 @@ fn the_schedule_writers_jobs_after_our_exchange_stay_live() {
         merge_lock: None,
         merge_attempt: 0,
         reason: String::new(),
-        hook_ops: Vec::new(),
         updated_at: T0,
     };
     let faults = ScheduleWriterAfterExchange;

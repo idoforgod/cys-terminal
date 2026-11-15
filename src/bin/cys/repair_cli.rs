@@ -580,7 +580,8 @@ fn print_ok(out: &mut dyn Write, verb: &str, v: &Value, json_out: bool) {
                 _ => format!(" · 전파 완료 판정 불가({})", s(v, "propagation_note")),
             }
         )
-        .and_then(|_| lane_reason_lines(out, v)),
+        .and_then(|_| lane_reason_lines(out, v))
+        .and_then(|_| lane_hook_op_lines(out, v)),
         "status" => writeln!(
             out,
             "레인 {} — 수리 {}건 · 열린 결함 {}건{}",
@@ -701,6 +702,20 @@ fn lane_reason_lines(out: &mut dyn Write, v: &Value) -> std::io::Result<()> {
         if !reason.is_empty() {
             writeln!(out, "  {}: {} — {reason}", s(row, "lane"), s(row, "state_label"))?;
         }
+    }
+    Ok(())
+}
+
+/// RULINGS JI1 (T7b): one line per hook operation a lane COMPLETED for the repair, as the daemon read
+/// it from the operation records — `  <레인>: 완료한 훅 작업 — <작업>`; records it could not read → its
+/// sentence ("확인할 수 없습니다"), never nothing.
+fn lane_hook_op_lines(out: &mut dyn Write, v: &Value) -> std::io::Result<()> {
+    let unreadable = s(v, "hook_ops_unreadable");
+    if !unreadable.is_empty() {
+        writeln!(out, "  {unreadable}")?;
+    }
+    for op in v.get("hook_ops").and_then(|x| x.as_array()).into_iter().flatten() {
+        writeln!(out, "  {}: 완료한 훅 작업 — {}", s(op, "lane"), s(op, "text"))?;
     }
     Ok(())
 }
@@ -2091,6 +2106,27 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\n  dept-a: 충돌 — 사본 검사 실패 — 살아 있는 파일은 바꾸지 않았습니다\n"), "{text}");
         assert!(!text.contains("  base:"), "{text}");
+    }
+
+    /// RULINGS JI1: the readable `status <R>` prints one line per hook operation a lane completed (read by
+    /// the daemon from the operation records), and the daemon's sentence when it could not read them.
+    #[test]
+    fn status_prints_each_lanes_completed_hook_operations() {
+        let base = json!({"repair": "R-3", "state_label": "시험 기간", "classification_label": "일반", "attempt": 1, "max_rounds": 3,
+                          "lanes": {"base": "검증됨", "dept-a": "충돌"}, "propagation_complete": false, "lane_rows": []});
+        let mut v = base.clone();
+        v["hook_ops"] = json!([{"lane": "dept-a", "op": "op-9", "kind": "hook-unregister", "lines": ["Stop:x.sh"], "text": "훅 등록 해제(작업 op-9: Stop:x.sh)"}]);
+        let mut out = Vec::new();
+        print_ok(&mut out, "status", &v, false);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\n  dept-a: 완료한 훅 작업 — 훅 등록 해제(작업 op-9: Stop:x.sh)\n"), "{text}");
+        let mut v = base;
+        v["hook_ops"] = json!([]);
+        v["hook_ops_unreadable"] = json!("완료한 훅 작업을 확인할 수 없습니다 — R-3/ops: 목록을 읽을 수 없음");
+        let mut out = Vec::new();
+        print_ok(&mut out, "status", &v, false);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\n  완료한 훅 작업을 확인할 수 없습니다 — R-3/ops: 목록을 읽을 수 없음\n"), "{text}");
     }
 
     /// RULINGS JD2 / JF (CCR-JD2b): `cys repair recheck R` prints the daemon's sentence of what the call
