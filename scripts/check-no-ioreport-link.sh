@@ -48,6 +48,29 @@ if [ ! -f "$bin" ]; then
   exit 2
 fi
 
+# ★「스스로 해결」 0.15.0 RULINGS CZ8 (T5b): 같은 산출물 게이트가 **기본 빌드에 시험용 본인 확인 대역이 없음**도 잰다.
+#   대역(카고 기능 `repair-test-auth` 뒤의 각본 자식)은 기본 빌드에 없어야 한다 — 그 손잡이 문자열이 산출물에 있으면 대역이 들어간 것이다(실패 1).
+#   읽을 수 없는 파일은 판정 불가(2)다. 릴리스 맥 레그가 이 스크립트를 **출하되는** cysd(cys.app/Contents/MacOS/cysd)에 돌린다.
+if [ ! -r "$bin" ]; then
+  echo "$me 판정 불가: 읽을 수 없다: $bin  (exit 2)" >&2
+  exit 2
+fi
+if ! command -v grep >/dev/null 2>&1; then
+  echo "$me 판정 불가: grep 이 없다 — 시험용 대역 검사를 하지 못했다(exit 2)" >&2
+  exit 2
+fi
+knob="CYS_REPAIR_TEST""_AUTH_ANSWER"
+LC_ALL=C grep -a -F -q "$knob" "$bin"
+grc=$?
+if [ "$grc" -eq 0 ]; then
+  echo "::error::$me $bin 에 시험용 본인 확인 대역(repair-test-auth)이 들어 있다 — 기본 빌드에는 없어야 한다" >&2
+  echo "$me 실패: 시험용 대역의 손잡이 문자열 발견" >&2
+  exit 1
+elif [ "$grc" -ne 1 ]; then
+  echo "$me 판정 불가: grep 이 실패했다(rc=$grc): $bin  (exit 2)" >&2
+  exit 2
+fi
+
 out="$(otool -L "$bin" 2>&1)"
 rc=$?
 if [ "$rc" -ne 0 ]; then

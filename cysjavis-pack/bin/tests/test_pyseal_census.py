@@ -400,6 +400,14 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     "src/bin/cysd/schedule.rs",
     "src/bin/cysd/state.rs",
     "src/lib.rs",
+    # ★2026-11-14 T5b 등재(0.15.0 「스스로 해결」 예행·보호장치 심사 · 종전 43개 → 46개). **봉인 점검 결과(등재 = 이 선언)**:
+    #   셋 다 새 번들 python 진입점이 아니고 **봉인을 거는 쪽**이다 — 예행·심사는 자식 env 를 `env_clear` 로 새로
+    #   짜므로(상속 없음) 보통 좌석이 데몬에게서 물려받는 봉인(`PYTHONDONTWRITEBYTECODE=1`)을 그 env 에 직접 싣는다
+    #   (replay.rs `base_env` · screen.rs 의 훅 시험 env 두 곳 · rehearsal.rs 의 컴파일 검사는 `-B` 와 함께). 벗기지
+    #   않고 거는 방향이다 — 예행이 깐 팩 사본에 `__pycache__` 가 남지 않는다(test_lane_redirect 와 같은 계급).
+    "src/repair/rehearsal.rs",
+    "src/repair/replay.rs",
+    "src/repair/screen.rs",
 )
 
 
