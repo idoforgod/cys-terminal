@@ -1806,6 +1806,12 @@ fn run_ensure_team(
         .env("CYS_NO_AUTOSTART", "1")
         // SEAL-1: 번들 python 이 `.pyc` 를 쓰면 코드서명 봉인이 깨진다.
         .env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON)
+        // ★(0.15.0 · W3 · RULINGS JG1 / JK1) UTF-8 모드 — 팩 python 의 다른 모든 기동 경로(pane·훅·스케줄 잡·
+        //   등록기·앱 = `cys::spawn_env_pairs` ④)가 이미 싣는 그 한 변수만 싣는다(공용 쌍 전체는 싣지 않는다).
+        //   없으면 ANSI 코드페이지 949 Windows 에서 부트 체인의 `javis_preflight.py --fix`(파이프)가 첫 결과 줄의
+        //   '—' 에서 UnicodeEncodeError 로 죽는다. 데몬 env 의 PYTHONUTF8=0 은 덮고(공용 규약과 같다),
+        //   PYTHONIOENCODING 은 건드리지 않는다.
+        .env(cys::ENV_PY_UTF8, cys::PY_UTF8_ON)
         // ★(P2 · R3-P2-1/ANCHOR-1 ④) PATH 선두 = 데몬 exe_dir — bare "cys" 해소 보장.
         // ★(U15 · 0.14.41) CLT 없는 맥에서만 그 바로 뒤에 동봉 python 디렉터리(자손의 `python3` 셔임 회피).
         //   판정은 lib 단일 판정 — 그 밖의 기계는 종전과 바이트 동일(boot_child_path 주석).
@@ -5778,6 +5784,148 @@ mod tests {
             body.contains("macos_devtools::clt_absent_bundled_python("),
             "동봉 python 디렉터리를 lib 단일 판정 밖에서 정한다(판정 사본 = 조건 드리프트)"
         );
+    }
+
+    /// ★(0.15.0 · W3 · RULINGS JG1 / JK) what the boot chain the REAL `run_ensure_team` spawns actually sees. A fake
+    /// `javis_bootstrap.py` in an isolated pack writes one JSON line — its environment, its interpreter's UTF-8 mode,
+    /// its stdout encoding and `open()`'s default encoding — into a FIFO and exits; reading the FIFO is the only wait
+    /// (no clock), and the child is reaped by its pid. `daemon_env` = variables set in THIS process, i.e. the daemon's
+    /// own environment that the spawn inherits, for the duration of the spawn (`None` removes one); restored after,
+    /// also on panic. Holds `PACK_ENV_LOCK` (the process-wide `CYS_PACK_DIR`); the suite runs with one test thread.
+    #[cfg(unix)]
+    fn w3_boot_child_sees(tag: &str, daemon_env: &[(&str, Option<&str>)]) -> serde_json::Value {
+        let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct Restore(Vec<(String, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (k, v) in &self.0 {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let d = tmp_daemon(tag);
+        let base = d.socket_path.parent().unwrap().to_path_buf();
+        let pack = base.join("pack");
+        std::fs::create_dir_all(pack.join("bin")).unwrap();
+        let fifo = base.join("boot-child.fifo");
+        let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo {}", fifo.display());
+        std::fs::write(
+            pack.join("bin").join("javis_bootstrap.py"),
+            format!(
+                "import json, locale, os, sys\n\
+                 rec = {{'env': dict(os.environ), 'utf8_mode': sys.flags.utf8_mode,\n\
+                 \x20      'stdout': sys.stdout.encoding, 'open_default': locale.getpreferredencoding(False)}}\n\
+                 with open({}, 'w', encoding='utf-8') as f:\n\
+                 \x20   f.write(json.dumps(rec) + '\\n')\n",
+                serde_json::to_string(&fifo.to_string_lossy()).unwrap()
+            ),
+        )
+        .unwrap();
+        // a live master seat that the registry re-check accepts (the success leg — a real spawn)
+        let s = d
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("master seat");
+        d.surfaces.lock().unwrap().insert(s.id, s.clone());
+        d.roles.lock().unwrap().insert("master".into(), s.id);
+        let mut it = intent(tag);
+        it.surface_id = Some(s.id);
+        let mut keys = vec![cys::pack::ENV_PACK_DIR];
+        keys.extend(daemon_env.iter().map(|(k, _)| *k));
+        let _restore = Restore(keys.iter().map(|k| (k.to_string(), std::env::var_os(k))).collect());
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &pack);
+        for (k, v) in daemon_env {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let spawned = {
+            let _in_rt = rt.enter();
+            run_ensure_team(&d, &it, BootAction::EnsureTeam)
+        };
+        let pid: i32 = spawned
+            .as_deref()
+            .ok()
+            .and_then(|s| s.strip_prefix("pid="))
+            .and_then(|p| p.parse().ok())
+            .unwrap_or_else(|| panic!("the boot chain was not spawned: {spawned:?}"));
+        let line = std::fs::read_to_string(&fifo).expect("the boot chain's report");
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let _ = s.child.lock().unwrap().kill();
+        let _ = std::fs::remove_dir_all(&base);
+        serde_json::from_str(line.trim()).unwrap_or_else(|e| panic!("one JSON line from the boot chain ({e}): {line}"))
+    }
+
+    /// ★(0.15.0 · W3 · RULINGS JG1 / JK1) the boot chain runs its Python tools in UTF-8 mode, like every other launch of
+    /// the pack's Python (panes, hooks, scheduled jobs, the registrar, the app — `cys::spawn_env_pairs` ④): on a Windows
+    /// whose ANSI code page is 949, `javis_preflight.py --fix` (bootstrap's step ①, to a pipe) otherwise dies at its first
+    /// "[..] .. — .." result line. RED at d00f4075: the variable is absent. Nothing else of the spawn moves.
+    #[cfg(unix)]
+    #[test]
+    fn w3_boot_chain_runs_its_python_in_utf8_mode() {
+        let seen = w3_boot_child_sees("w3utf8", &[(cys::ENV_PY_UTF8, None), ("PYTHONIOENCODING", None)]);
+        let env = &seen["env"];
+        assert_eq!(env[cys::ENV_PY_UTF8], cys::PY_UTF8_ON, "the boot chain's spawn does not carry PYTHONUTF8=1 (JG1): {env}");
+        assert_eq!(seen["utf8_mode"], 1, "the boot chain's interpreter is not in UTF-8 mode");
+        assert_eq!(seen["open_default"].as_str().map(str::to_ascii_lowercase).as_deref(), Some("utf-8"), "open() default");
+        assert_eq!(seen["stdout"].as_str().map(str::to_ascii_lowercase).as_deref(), Some("utf-8"), "stdout (no PYTHONIOENCODING)");
+        // the variables the spawn set before W3 are still there, unchanged
+        assert_eq!(env["CYS_NO_AUTOSTART"], "1");
+        assert_eq!(env[cys::ENV_PY_NO_BYTECODE], cys::PY_NO_BYTECODE_ON);
+        assert_eq!(env[cys::ENV_ROLE], "master");
+        assert_eq!(env["CYS_CLAIM_RC"], "0");
+        assert!(env[cys::ENV_SOCKET].as_str().is_some_and(|s| !s.is_empty()), "CYS_SOCKET: {env}");
+    }
+
+    /// ★(0.15.0 · W3) the corners of the daemon's OWN environment. (a) A user's `PYTHONUTF8=0` there: the boot chain gets
+    /// 1 — as `spawn_env_pairs` pushes the pair unconditionally for every other launch path (a later `.env` wins over the
+    /// inherited value). (b) `PYTHONIOENCODING` there: the spawn neither sets nor removes it, so the child inherits it — and
+    /// it keeps its priority over UTF-8 mode for the three standard streams (PEP 540; measured with CPython 3.12.14:
+    /// `PYTHONUTF8=1 PYTHONIOENCODING=cp949` → stdout `cp949/strict`, `open()` default `utf-8`). RED at d00f4075 on (a).
+    #[cfg(unix)]
+    #[test]
+    fn w3_inherited_python_utf8_zero_is_overridden_and_python_ioencoding_passes_through() {
+        let seen = w3_boot_child_sees("w3corner", &[(cys::ENV_PY_UTF8, Some("0")), ("PYTHONIOENCODING", Some("cp949"))]);
+        let env = &seen["env"];
+        assert_eq!(env[cys::ENV_PY_UTF8], cys::PY_UTF8_ON, "a PYTHONUTF8=0 in the daemon's environment reached the boot chain");
+        assert_eq!(seen["utf8_mode"], 1);
+        assert_eq!(env["PYTHONIOENCODING"], "cp949", "the spawn changed PYTHONIOENCODING — it must pass through untouched");
+        assert_eq!(seen["stdout"].as_str().map(str::to_ascii_lowercase).as_deref(), Some("cp949"), "PYTHONIOENCODING keeps the streams");
+        assert_eq!(seen["open_default"].as_str().map(str::to_ascii_lowercase).as_deref(), Some("utf-8"), "UTF-8 mode keeps open()'s default");
+    }
+
+    /// ★(0.15.0 · W3 · RULINGS JK1) source pin of the supervisor's spawn: the boot chain's command carries
+    /// `.env(cys::ENV_PY_UTF8, cys::PY_UTF8_ON)` — the product's ONE constant for it — in the UNCONDITIONAL part of the
+    /// builder (before `.stdin(…)`, beside the bytecode seal), once; the variable is never removed or set to anything
+    /// else in `run_ensure_team`, `PYTHONIOENCODING` is not touched, and the shared set `spawn_env_pairs` (which would
+    /// also change PATH, HOME, CLAUDE_CODE_GIT_BASH_PATH, npm_config_prefix and CYS_PY on the boot chain) is NOT taken:
+    /// this variable and nothing else. Cross-platform (the behaviour tests above need a FIFO, i.e. unix).
+    #[test]
+    fn run_ensure_team_spawn_carries_python_utf8_through_the_one_constant_and_nothing_else() {
+        let src = include_str!("boot_supervisor.rs");
+        let raw = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = strip_line_comments(raw);
+        let at = prod.find("fn run_ensure_team(").expect("run_ensure_team 소실");
+        let body = &prod[at..at + prod[at..].find("\n}\n").expect("run_ensure_team 끝")];
+        let start = body.find("let mut cmd = tokio::process::Command::new(&python);").expect("부트 체인 스폰 소실");
+        let end = start + body[start..].find(".stdin(std::process::Stdio::null());").expect("무조건 빌더 끝 소실");
+        let chain = &body[start..end];
+        assert_eq!(
+            chain.matches(".env(cys::ENV_PY_UTF8, cys::PY_UTF8_ON)").count(),
+            1,
+            "the boot chain's spawn lost PYTHONUTF8=1 (W3 · RULINGS JG1) — on a code-page-949 Windows preflight dies at its first result line"
+        );
+        assert!(chain.contains(".env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON)"), "the bytecode seal moved");
+        assert_eq!(body.matches("ENV_PY_UTF8").count(), 1, "PYTHONUTF8 is removed or set again elsewhere in run_ensure_team");
+        assert!(!body.contains("\"PYTHONUTF8\""), "a literal PYTHONUTF8 instead of the product's one constant");
+        assert!(!body.contains("PYTHONIOENCODING"), "the spawn touches PYTHONIOENCODING (not part of W3)");
+        assert!(!body.contains("spawn_env_pairs"), "the whole shared spawn set was taken — JK1 allows this one variable only");
     }
 
     /// boot-supervisor.log 회전 1겹 — 상한 초과에서만 `.1` 로 밀린다.
