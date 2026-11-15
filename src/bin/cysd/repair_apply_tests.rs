@@ -765,3 +765,40 @@ fn status_says_how_an_update_ended_the_probation() {
         "{s}"
     );
 }
+
+/// RULINGS IL2: `reapply`'s refusal of a second re-application says what is true for the CLASS of the
+/// repair that re-applies — a boot-critical / protection-related one reaches another department only
+/// through that department's own repair (`--resolves`), both signatures and the owner's final approval;
+/// any other is carried by each department's daemon (a department whose file differs keeps its bytes
+/// and shows 충돌). Before IL2 both said "그 수리가 적용되면 전파로 이 부서에도 닿습니다".
+#[test]
+fn reapply_refusal_says_what_reaches_this_department_by_class() {
+    let r = rig("il2reapply");
+    let w = seat(3, "worker");
+    let id = committed(&r, "hooks/h.sh", b"#!/bin/sh\necho mine\n");
+    park(&r, "hooks/h.sh", b"#!/bin/sh\necho mine\n", b"#!/bin/sh\necho vendor\n");
+    let mut rec = r.record_of(&id);
+    rec.state = RepairState::Superseded;
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let v = r.call(T0 + 12.0, &w, "reapply", json!({"repair": id})).unwrap();
+    let new_id = v["repair"].as_str().unwrap().to_string();
+    let e = r.call(T0 + 14.0, &w, "reapply", json!({"repair": id})).unwrap_err();
+    assert!(
+        e.message.ends_with("두 번 입히지 않습니다. 이 수리는 각 부서의 데몬이 그 부서에 전파합니다 — 파일이 다른 부서는 제 바이트를 그대로 두고 그 수리를 충돌로 보입니다"),
+        "{}",
+        e.message
+    );
+    // the re-application is boot-critical (as a parked update file is)
+    let mut rp = r.record_of(&new_id);
+    rp.classification = Classification::BootCritical;
+    ledger::write_record_in(&r.root, &rp).unwrap();
+    let e = r.call(T0 + 15.0, &w, "reapply", json!({"repair": id})).unwrap_err();
+    assert!(
+        e.message.ends_with(&format!(
+            "두 번 입히지 않습니다. 기동 필수·보호장치 관련 수리는 다른 부서에 저절로 전해지지 않습니다 — 다른 부서에는 그 부서 자신의 수리(cys repair begin … --resolves {new_id})와 두 리뷰어의 서명, 그 부서에서의 주인 최종 승인으로만 들어갑니다"
+        )),
+        "{}",
+        e.message
+    );
+    assert!(!e.message.contains("전파로 이 부서에도 닿습니다"), "{}", e.message);
+}
