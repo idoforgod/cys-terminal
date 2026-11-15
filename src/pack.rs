@@ -2027,8 +2027,13 @@ pub fn read_pack_state(dir: &Path) -> PackStateRead {
     }
 }
 
+/// ★WJ1: the exact bytes [`write_pack_state`] writes (the transaction announces them before writing).
+fn pack_state_bytes(st: &PackState) -> Result<Vec<u8>, String> {
+    serde_json::to_vec_pretty(st).map_err(|e| format!("state 직렬화 실패: {e}"))
+}
+
 pub fn write_pack_state(dir: &Path, st: &PackState) -> Result<(), String> {
-    let json = serde_json::to_vec_pretty(st).map_err(|e| format!("state 직렬화 실패: {e}"))?;
+    let json = pack_state_bytes(st)?;
     write_atomic(&dir.join(PACK_STATE_FILE), &json)
         .map_err(|e| format!("state 기록 실패: {e}"))
 }
@@ -3523,7 +3528,10 @@ pub fn save_merge_pending(
     let p = dir.join(MERGE_PENDING_FILE);
     // ★T2i(RULINGS EC7): 영속이 증명된 쓰기(본문 · 교체 · 폴더 fsync — 실패는 돌려준다). vendor 우선은 이 결과를 보고서만
     //   살아 있는 파일을 바꾼다.
-    write_atomic_durable(&p, json.as_bytes()).map_err(|e| format!("병합 대기 원장 기록 실패 {}: {e}", p.display()))
+    // ★WJ1 (RULINGS KB2): announced first (a no-op outside a pack-update transaction).
+    announce_placement(&p, Some(json.as_bytes()))
+        .and_then(|_| write_atomic_durable(&p, json.as_bytes()))
+        .map_err(|e| format!("병합 대기 원장 기록 실패 {}: {e}", p.display()))
 }
 
 /// ★G3-축3 감사 원장 1줄 append. 다중 프로세스 appender 전제라 O_APPEND + **라인당 단일
@@ -5121,7 +5129,9 @@ fn ensure_pristine_checked(dir: &Path, rel: &str, content: &str) -> Result<(), S
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("pristine 디렉터리 생성 실패 {}: {e}", parent.display()))?;
     }
-    write_atomic(&p, content.as_bytes())
+    // ★WJ1 (RULINGS KB2): announced before the change of the final name.
+    announce_placement(&p, Some(content.as_bytes()))
+        .and_then(|_| write_atomic(&p, content.as_bytes()))
         .map_err(|e| format!("pristine 기록 실패 {}: {e}", p.display()))
 }
 
@@ -5249,6 +5259,8 @@ fn move_occupant_to_slot(
     for n in 1u32..=10_000 {
         let slot = if n == 1 { format!("{rel}.user.prev-{ts}") } else { format!("{rel}.user.prev-{ts}-{n}") };
         before_reserve(&dir.join(&slot));
+        // ★WJ1 (RULINGS KB2): the original `<rel>.user` name becomes absent — announced first.
+        announce_placement(&dir.join(&user_rel), None).map_err(|e| format!("기존 {rel}.user 세대 보존 실패({e})"))?;
         match beneath_move_no_replace(dir, &user_rel, &slot) {
             Ok(()) => return Ok(Some(slot)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -5314,6 +5326,8 @@ fn park_copy_at(
     let mut moved: Vec<String> = Vec::new();
     for attempt in 0..PARK_PLACE_TRIES {
         hook(ParkStep::BeforePlace(attempt));
+        // ★WJ1 (RULINGS KB2): announced first (a no-op outside a pack-update transaction).
+        announce_placement(&dir.join(&user_rel), Some(bytes)).map_err(|e| format!("{user_rel} 기록 실패: {e}"))?;
         match beneath_write(dir, &user_rel, bytes, None, false, Place::NoReplace, durable) {
             Ok(()) => return Ok(ParkOutcome { at: user_rel, moved, overlap: false, overlap_record_error: None }),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -5419,7 +5433,8 @@ fn park_user_kept(
 ) {
     let new_path = dir.join(format!("{rel}.new"));
     if read_start_meta(&new_path).text().as_deref() != Some(vendor) {
-        if let Err(e) = write_atomic(&new_path, vendor.as_bytes()) {
+        // ★WJ1 (RULINGS KB2): announced first.
+        if let Err(e) = announce_placement(&new_path, Some(vendor.as_bytes())).and_then(|_| write_atomic(&new_path, vendor.as_bytes())) {
             eprintln!("[init-pack] ⚠ {rel}: vendor 신버전 보관({rel}.new) 기록 실패({e}) — 사용자 파일은 그대로");
         }
     }
@@ -5428,7 +5443,10 @@ fn park_user_kept(
         if let Some(l) = live.filter(|l| l.contains('\r')) {
             let p = dir.join(rel);
             let fixed = l.replace('\r', "");
-            match write_pack_file(&p, fixed.as_bytes(), current_mode(&p), true) {
+            // ★WJ1 (RULINGS KB2): the LIVE file is rewritten (without CR) — announced first.
+            match announce_placement(&p, Some(fixed.as_bytes()))
+                .and_then(|_| write_pack_file(&p, fixed.as_bytes(), current_mode(&p), true))
+            {
                 Ok(()) => eol_fixed = true,
                 Err(e) => eprintln!("[init-pack] ⚠ {rel}: 셸 스크립트 CR 제거 실패({e})"),
             }
@@ -6727,7 +6745,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                             pending.get(rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str()),
                             Some("new-pending") | Some("user-kept")
                         ) {
-                            let _ = std::fs::remove_file(dir.join(format!("{rel}.new")));
+                            let _ = remove_announced(&dir.join(format!("{rel}.new"))); // ★WJ1: announced first
                         }
                         if let serde_json::Value::Object(mut entry) = serde_json::json!({
                             "kind": "vendor-first", "side": format!("{rel}.user"),
@@ -6811,7 +6829,9 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     // user-owned 보존 + 임베드 신버전 병치(idempotent) — '영구 동결'을 '보이는 병합 대기'로.
                     let new_path = dir.join(format!("{rel}.new"));
                     if read_start_meta(&new_path).text().as_deref() != Some(content) {
-                        let _ = write_atomic(&new_path, content.as_bytes());
+                        // ★WJ1 (RULINGS KB2): announced first.
+                        let _ = announce_placement(&new_path, Some(content.as_bytes()))
+                            .and_then(|_| write_atomic(&new_path, content.as_bytes()));
                     }
                     upsert_pending(&mut pending, &mut pending_dirty, rel, "new-pending", format!("{rel}.new"));
                 } else if !unreadable
@@ -6826,7 +6846,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     // 그대로 둬야 한다(읽지 못했다는 이유로 vendor 신버전 사본을 지우면 정보 손실).
                     pending.remove(rel);
                     pending_dirty = true;
-                    let _ = std::fs::remove_file(dir.join(format!("{rel}.new")));
+                    let _ = remove_announced(&dir.join(format!("{rel}.new"))); // ★WJ1: announced first
                 }
                 if unreadable {
                     unreadable_kept.push(rel.to_string());
@@ -6843,7 +6863,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 {
                     pending.remove(rel);
                     pending_dirty = true;
-                    let _ = std::fs::remove_file(dir.join(format!("{rel}.new")));
+                    let _ = remove_announced(&dir.join(format!("{rel}.new"))); // ★WJ1: announced first
                 }
                 // 원장 계상(kind:"kept-drift", side:rel) — 기존 kind∈LINEAGE(merged·conflicted)면
                 // kind 불변·state:"at-rest" 만(upsert_pending_v2 계보 규칙 · no-op 시 rewrite 0).
@@ -6957,7 +6977,9 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                             std::fs::create_dir_all(parent)
                                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
                         }
-                        write_atomic(&path, merged.as_bytes())
+                        // ★WJ1 (RULINGS KB2): announced first.
+                        announce_placement(&path, Some(merged.as_bytes()))
+                            .and_then(|_| write_atomic(&path, merged.as_bytes()))
                             .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
                         match ensure_pristine_checked(&dir, rel, content) {
                             Ok(()) => {
@@ -6968,7 +6990,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                                 ) {
                                     pending.remove(rel);
                                     pending_dirty = true;
-                                    let _ = std::fs::remove_file(dir.join(format!("{rel}.new")));
+                                    let _ = remove_announced(&dir.join(format!("{rel}.new"))); // ★WJ1: announced first
                                 }
                                 let capture_rel =
                                     format!("{}/{rel}", capture_seg.as_ref().unwrap().1);
@@ -7063,7 +7085,9 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     if let Some(b) = verified_base.as_deref() {
                         let base_path = dir.join(format!("{rel}.base"));
                         if read_start_meta(&base_path).text().as_deref() != Some(b) {
-                            let _ = write_atomic(&base_path, b.as_bytes());
+                            // ★WJ1 (RULINGS KB2): announced first.
+                            let _ = announce_placement(&base_path, Some(b.as_bytes()))
+                                .and_then(|_| write_atomic(&base_path, b.as_bytes()));
                         }
                     }
                     if let serde_json::Value::Object(entry) = serde_json::json!({
@@ -7191,7 +7215,9 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
-        write_atomic(&path, content.as_bytes())
+        // ★WJ1 (RULINGS KB2): announced first.
+        announce_placement(&path, Some(content.as_bytes()))
+            .and_then(|_| write_atomic(&path, content.as_bytes()))
             .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
         manifest.insert(rel.to_string(), content_hash(content));
         ensure_pristine(&dir, rel, content);
@@ -7204,7 +7230,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         ) {
             pending.remove(rel);
             pending_dirty = true;
-            let _ = std::fs::remove_file(dir.join(format!("{rel}.new")));
+            let _ = remove_announced(&dir.join(format!("{rel}.new"))); // ★WJ1: announced first
         }
         written += 1;
     }
@@ -7317,7 +7343,8 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         if manifest.get(&rel).map(String::as_str)
                             == Some(content_hash(&existing).as_str()) =>
                     {
-                        if std::fs::remove_file(&path).is_ok() {
+                        // ★WJ1 (RULINGS KB2): announced first.
+                        if announce_placement(&path, None).is_ok() && std::fs::remove_file(&path).is_ok() {
                             manifest.remove(&rel);
                             pruned += 1;
                         }
@@ -7343,7 +7370,9 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     //   대상이다.
     match serde_json::to_string_pretty(&manifest) {
         Ok(json) => {
-            let res = write_atomic(&manifest_path, json.as_bytes());
+            // ★WJ1 (RULINGS KB2): announced first.
+            let res = announce_placement(&manifest_path, Some(json.as_bytes()))
+                .and_then(|_| write_atomic(&manifest_path, json.as_bytes()));
             if transactional {
                 res.map_err(|e| format!("cannot write {}: {e}", manifest_path.display()))?;
             } else {
@@ -7986,6 +8015,11 @@ struct JournalIndex {
     /// index (not written by this version) is never acted on by [`recover_pack_journal`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     apply: Option<PackApplied>,
+    /// ★WJ1 (RULINGS JV2): `Some(1)` = this journal announces every change the apply makes to a pack name BEFORE making it
+    /// (the placement log [`PLACED_LOG`] beside the index — a missing log then means "nothing placed yet"). Absent = an index
+    /// written before WJ1 (the batch-7 form) → the roll-back's older-journal rule. Readers that do not know it ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    placements: Option<u32>,
 }
 
 /// apply 전 backup journal 작성: backup_set의 각 파일 기존 bytes를 저널에 복사(+fsync)하고
@@ -8039,6 +8073,7 @@ fn write_journal(
         target_version: target_version.to_string(),
         entries,
         apply: Some(apply.clone()),
+        placements: Some(1),
     };
     let json =
         serde_json::to_vec_pretty(&index).map_err(|e| format!("journal 인덱스 직렬화 실패: {e}"))?;
@@ -8082,13 +8117,480 @@ fn restore_journaled_file(
     }
 }
 
-/// 저널에서 pre-state로 복원: existed=true는 백업 bytes를 원위치 atomic 복원, existed=false는 (신규 생성분) 삭제.
+/// ★WJ1 (RULINGS JV2 · KB2): the apply's write-ahead PLACEMENT LOG, inside its own journal folder (`…/j.<me>.<id>/placed.log`
+/// — take / settle move it with the folder). One line per change of a pack name the transaction is about to make:
+/// `{"rel":"<pack-relative name, '/'-spelled>","sha256":"<hex of the bytes about to be placed>"}`, or `"sha256":null` when
+/// the name is about to become absent (removed, or moved away to `.user.prev-*`). Each line is durable (`sync_data` —
+/// `FlushFileBuffers` on Windows) BEFORE the change it announces begins, and stands immediately before the change of the
+/// FINAL name (the helpers write a temp file and rename it). [`rollback_journal`] reads it.
+const PLACED_LOG: &str = "placed.log";
+
+/// ★WJ1 (RULINGS JV2 · KB1): the lane's kept folder `L/kept/<id>/` — beside the slot `L/active` (the slot protocol lists only
+/// `L/active`): immutable items (`items/<sha256>[.<n>]` · `displaced/<n>/<name>`) and the append-only record `kept.log`.
+const KEPT_DIR: &str = "kept";
+
+/// ★WJ1 (RULINGS KA2 · KB3): the product's own record names — the files that DESCRIBE the pack's files.
+const RECORD_NAMES: [&str; 4] = [INSTALL_MANIFEST, PACK_STATE_FILE, PACK_VERSION_FILE, MERGE_PENDING_FILE];
+
+/// ★WJ1: one apply's placement log (see [`PLACED_LOG`]).
+struct PlacementLog {
+    pack: PathBuf,
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    /// Lines made durable so far.
+    count: usize,
+    /// STICKY: after one failure every later announcement fails too (RULINGS KB2) — so a best-effort arm or a merge
+    /// fallback that swallows the error still cannot change another pack name, and the transaction sees the failure.
+    failed: Option<String>,
+    /// The crash proof seam (production = None): announcements after this many lines stop the apply as a dying process.
+    stop_after: Option<usize>,
+    stopped: bool,
+}
+
+impl PlacementLog {
+    fn new(pack: &Path, own: &Path, stop_after: Option<usize>) -> Self {
+        PlacementLog {
+            pack: pack.to_path_buf(),
+            path: own.join(PLACED_LOG),
+            file: None,
+            count: 0,
+            failed: None,
+            stop_after,
+            stopped: false,
+        }
+    }
+
+    /// The pack-relative name of `path` spelled with `/` on every platform (as the journal's entries are), or None = not
+    /// a name inside this pack (outside the backup set: captures, snapshots, the isolated config — never announced).
+    fn rel_of(&self, path: &Path) -> Option<String> {
+        let rest = path.strip_prefix(&self.pack).ok()?;
+        let parts: Vec<String> = rest.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+        (!parts.is_empty()).then(|| parts.join("/"))
+    }
+
+    /// One durable line — or an error, and then the change must not be made.
+    fn announce(&mut self, rel: &str, bytes: Option<&[u8]>) -> std::io::Result<()> {
+        use std::io::Write;
+        if let Some(f) = &self.failed {
+            return Err(std::io::Error::other(format!("변경 예고 기록이 앞서 실패해 더 바꾸지 않습니다({f})")));
+        }
+        if self.stop_after.is_some_and(|k| self.count >= k) {
+            self.stopped = true;
+            self.failed = Some("crash proof seam".to_string());
+            return Err(std::io::Error::other("[pack-journal] stopped before this change (crash proof seam)"));
+        }
+        let mut line = serde_json::json!({ "rel": rel, "sha256": bytes.map(sha256_hex) }).to_string();
+        line.push('\n');
+        let r = (|| -> std::io::Result<()> {
+            if self.file.is_none() {
+                let f = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+                if let Some(parent) = self.path.parent() {
+                    // the log's own name is durable before the first change it announces ('지원하지 않음' alone is tolerated).
+                    if let Err(e) = sync_parent_dir(&self.path, parent) {
+                        if !dir_sync_unsupported(&e) {
+                            return Err(e);
+                        }
+                    }
+                }
+                self.file = Some(f);
+            }
+            let f = self.file.as_mut().expect("opened above");
+            f.write_all(line.as_bytes())?;
+            f.sync_data()
+        })();
+        match r {
+            Ok(()) => {
+                self.count += 1;
+                Ok(())
+            }
+            Err(e) => {
+                self.failed = Some(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    /// The line of a stop by the crash proof seam.
+    fn stop_line(&self) -> String {
+        format!("[pack-journal] transaction stopped after placement {} (crash proof seam)", self.count)
+    }
+}
+
+thread_local! {
+    /// ★WJ1: the placement log of the transaction running on THIS thread — set only around its ② install ([`PlacementScope`]);
+    /// None everywhere else (init-pack, the boot install, staging, the CLI's pack verbs, the repair engine announce nothing).
+    static PLACEMENTS: std::cell::RefCell<Option<PlacementLog>> = const { std::cell::RefCell::new(None) };
+}
+
+/// ★WJ1 (RULINGS KB2): announce that the pack name at `path` is about to receive `bytes` (None = about to become absent).
+/// Called immediately before the change of the FINAL name; a no-op outside a transaction's ② and for a path outside the
+/// pack. An error means: the change is NOT made (and the transaction fails — the log's failure is sticky).
+fn announce_placement(path: &Path, bytes: Option<&[u8]>) -> std::io::Result<()> {
+    PLACEMENTS.with(|c| match c.borrow_mut().as_mut() {
+        None => Ok(()),
+        Some(log) => match log.rel_of(path) {
+            None => Ok(()),
+            Some(rel) => log.announce(&rel, bytes),
+        },
+    })
+}
+
+/// ★WJ1: removes one pack file, announced first (nothing is announced when nothing is there).
+fn remove_announced(path: &Path) -> std::io::Result<()> {
+    if let Err(e) = std::fs::symlink_metadata(path) {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+    }
+    announce_placement(path, None)?;
+    std::fs::remove_file(path)
+}
+
+/// ★WJ1: a transaction's placement log installed on this thread for its ② (cleared on drop — also when unwinding).
+struct PlacementScope;
+
+impl PlacementScope {
+    fn enter(log: PlacementLog) -> Self {
+        PLACEMENTS.with(|c| *c.borrow_mut() = Some(log));
+        PlacementScope
+    }
+
+    fn leave(self) -> Option<PlacementLog> {
+        PLACEMENTS.with(|c| c.borrow_mut().take())
+    }
+}
+
+impl Drop for PlacementScope {
+    fn drop(&mut self) {
+        PLACEMENTS.with(|c| {
+            c.borrow_mut().take();
+        });
+    }
+}
+
+/// ★WJ1: the placement log of a journal folder as the roll-back reads it — every hash announced per name (`None` in the list =
+/// "about to become absent"). `Ok(None)` = unusable (a malformed line that is not the last — impossible by construction) →
+/// the older-journal rule; a torn LAST line is dropped (its change never began: changes start after the line is durable).
+fn read_placements(held: &Path) -> Result<Option<std::collections::HashMap<String, Vec<Option<String>>>>, String> {
+    #[derive(serde::Deserialize)]
+    struct Line {
+        rel: String,
+        sha256: Option<String>,
+    }
+    let p = held.join(PLACED_LOG);
+    let bytes = match read_start_meta(&p) {
+        StartRead::Missing => return Ok(Some(std::collections::HashMap::new())),
+        StartRead::Unreadable(e) => return Err(format!("변경 예고 기록 {} 판독 불가: {e}", p.display())),
+        StartRead::Bytes(b) => b,
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    lines.pop(); // "" after the last '\n', or a torn last line
+    let mut out: std::collections::HashMap<String, Vec<Option<String>>> = std::collections::HashMap::new();
+    for l in lines {
+        match serde_json::from_str::<Line>(l) {
+            Ok(x) => out.entry(x.rel).or_default().push(x.sha256),
+            Err(_) => return Ok(None),
+        }
+    }
+    Ok(Some(out))
+}
+
+/// ★WJ1: what the roll-back finds at one pack name (no link is followed).
+#[derive(Debug)]
+enum LiveState {
+    Absent,
+    File(Vec<u8>),
+    NotFile(&'static str),
+    Unreadable(String),
+}
+
+fn live_state(target: &Path) -> LiveState {
+    match std::fs::symlink_metadata(target) {
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => LiveState::Absent,
+        Err(e) => LiveState::Unreadable(e.to_string()),
+        Ok(m) if meta_is_link_like(&m) || m.file_type().is_symlink() => LiveState::NotFile("link"),
+        Ok(m) if m.is_dir() => LiveState::NotFile("folder"),
+        Ok(m) if !m.is_file() => LiveState::NotFile("special file"),
+        Ok(_) => match read_start_live(target) {
+            StartRead::Bytes(b) => LiveState::File(b),
+            StartRead::Missing => LiveState::Absent,
+            StartRead::Unreadable(e) => LiveState::Unreadable(e),
+        },
+    }
+}
+
+impl LiveState {
+    fn describe(&self) -> String {
+        match self {
+            LiveState::Absent => "absent".to_string(),
+            LiveState::File(b) => sha256_hex(b),
+            LiveState::NotFile(k) => format!("not a file ({k})"),
+            LiveState::Unreadable(e) => format!("unreadable ({e})"),
+        }
+    }
+}
+
+/// ★WJ1 (RULINGS JV2 · KA2 · KB3): the roll-back's decision for ONE entry.
+#[derive(Debug, PartialEq, Eq)]
+enum RollbackRow {
+    /// R1: live = the backup (the same bytes; or both absent) — nothing is written (the recorded mode is set again).
+    Same,
+    /// R2: live is what THIS update placed → the backup is put back, or the file the update created is removed.
+    Undo,
+    /// KB3 (a record name) / the older-journal rule: the live bytes are kept FIRST (an immutable item + a durable record line),
+    /// then the entry is undone.
+    PreserveThenUndo,
+    /// KA2: a non-file occupant at a record name is MOVED into the kept folder (record line first), then the backup is put back.
+    Displace,
+    /// R3: left as it is; the update's backup is kept; said once.
+    Leave,
+    /// The rule needs bytes it cannot read → the roll-back stops here (no settle; the next recovery tries again).
+    Fail(String),
+}
+
+/// ★WJ1: the decision table (pure). `placed` = every hash announced for this name (`None` inside = "about to become
+/// absent"); `placed = None` = an OLDER journal (an index without `placements`, or an unusable log). `announced_any` = the
+/// log announces at least one change of any name (RULINGS KB3).
+fn rollback_row(
+    rel: &str,
+    live: &LiveState,
+    backup: Option<&[u8]>,
+    placed: Option<&[Option<String>]>,
+    announced_any: bool,
+) -> RollbackRow {
+    let record = RECORD_NAMES.contains(&rel);
+    match (live, backup) {
+        (LiveState::Absent, None) => return RollbackRow::Same,
+        (LiveState::File(b), Some(bk)) if b.as_slice() == bk => return RollbackRow::Same,
+        _ => {}
+    }
+    match live {
+        // KA2: never a recursive removal — a record name is cleared by a move into the kept folder; any other name is left.
+        LiveState::NotFile(_) => return if record { RollbackRow::Displace } else { RollbackRow::Leave },
+        LiveState::Unreadable(e) => {
+            return if placed.is_none() || (record && announced_any) {
+                RollbackRow::Fail(format!("{rel}: 살아 있는 내용을 읽을 수 없어 먼저 보관할 수 없습니다({e}) — 되돌리지 않았습니다"))
+            } else {
+                RollbackRow::Leave
+            };
+        }
+        _ => {}
+    }
+    let Some(p) = placed else {
+        // An older journal: where live differs from the backup, keep the live bytes first, then undo.
+        return match live {
+            LiveState::File(_) => RollbackRow::PreserveThenUndo,
+            _ => RollbackRow::Undo,
+        };
+    };
+    let announced = match live {
+        LiveState::File(b) => {
+            let h = sha256_hex(b);
+            p.iter().any(|x| x.as_deref() == Some(h.as_str()))
+        }
+        LiveState::Absent => p.iter().any(|x| x.is_none()),
+        _ => false,
+    };
+    if announced {
+        return RollbackRow::Undo;
+    }
+    if record && announced_any {
+        // KB3: files were changed by this update, so the record must describe the files the roll-back puts back.
+        return match live {
+            LiveState::File(_) => RollbackRow::PreserveThenUndo,
+            _ => RollbackRow::Undo,
+        };
+    }
+    RollbackRow::Leave
+}
+
+/// ★WJ1 (RULINGS KB1): the kept folder of one journal (`L/kept/<id>/`). An item is NEVER overwritten: a content item is
+/// created exclusively under its content's hash (an existing one is reused only after its content was verified; otherwise
+/// the next free generation); a moved occupant goes into a generation folder this call created exclusively. The record
+/// `kept.log` is append-only — one durable line per kept item, written BEFORE the restore that depends on it — so a later
+/// recovery adds lines and never rewrites an earlier one's.
+struct KeptFolder {
+    dir: PathBuf,
+    apply_id: String,
+}
+
+impl KeptFolder {
+    fn of(held: &Path, apply_id: Option<&str>) -> Result<Self, String> {
+        let id = held
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(parse_slot_entry)
+            .map(|e| match e {
+                SlotEntry::Writer { id, .. } | SlotEntry::Taker { id, .. } | SlotEntry::GivenBack { id } | SlotEntry::Done { id } => id,
+            })
+            .ok_or_else(|| format!("journal 이름 판독 불가: {}", held.display()))?;
+        let lane = held
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| format!("journal 레인 폴더 판독 불가: {}", held.display()))?;
+        Ok(KeptFolder { dir: lane.join(KEPT_DIR).join(id), apply_id: apply_id.unwrap_or_default().to_string() })
+    }
+
+    fn sub(&self, name: &str) -> Result<PathBuf, String> {
+        let d = self.dir.join(name);
+        std::fs::create_dir_all(&d).map_err(|e| format!("보관 폴더 {} 를 만들지 못했습니다({e})", d.display()))?;
+        Ok(d)
+    }
+
+    /// An immutable item holding `bytes` — its name relative to the kept folder.
+    fn item(&self, bytes: &[u8]) -> Result<String, String> {
+        use std::io::Write;
+        let items = self.sub("items")?;
+        let sha = sha256_hex(bytes);
+        for g in 1u32..=64 {
+            let name = if g == 1 { sha.clone() } else { format!("{sha}.{g}") };
+            let p = items.join(&name);
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
+                Ok(mut f) => {
+                    f.write_all(bytes)
+                        .and_then(|_| f.sync_all())
+                        .map_err(|e| format!("보관본 {} 기록 실패({e})", p.display()))?;
+                    if let Err(e) = sync_parent_dir(&p, &items) {
+                        if !dir_sync_unsupported(&e) {
+                            return Err(format!("보관본 {} 폴더 내리기 실패({e})", p.display()));
+                        }
+                    }
+                    return Ok(format!("items/{name}"));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match read_start_meta(&p) {
+                    StartRead::Bytes(b) if sha256_hex(&b) == sha => return Ok(format!("items/{name}")),
+                    _ => continue,
+                },
+                Err(e) => return Err(format!("보관본 {} 를 만들지 못했습니다({e})", p.display())),
+            }
+        }
+        Err(format!("보관본 자리를 찾지 못했습니다({sha})"))
+    }
+
+    /// One durable line appended to `kept.log`.
+    fn record(&self, mut line: serde_json::Value) -> Result<(), String> {
+        use std::io::Write;
+        self.sub("")?;
+        let p = self.dir.join("kept.log");
+        if let serde_json::Value::Object(m) = &mut line {
+            m.insert("apply_id".into(), serde_json::json!(self.apply_id));
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            m.insert("at".into(), serde_json::json!(now));
+        }
+        let mut text = line.to_string();
+        text.push('\n');
+        let fresh = !p.exists();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+            .map_err(|e| format!("보관 기록 {} 를 열지 못했습니다({e})", p.display()))?;
+        f.write_all(text.as_bytes())
+            .and_then(|_| f.sync_data())
+            .map_err(|e| format!("보관 기록 {} 쓰기 실패({e})", p.display()))?;
+        if fresh {
+            if let Err(e) = sync_parent_dir(&p, &self.dir) {
+                if !dir_sync_unsupported(&e) {
+                    return Err(format!("보관 기록 {} 폴더 내리기 실패({e})", p.display()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// KB3 / the older rule: the live bytes, kept before the entry is undone.
+    fn preserve_live(&self, rel: &str, bytes: &[u8]) -> Result<(), String> {
+        let item = self.item(bytes)?;
+        self.record(serde_json::json!({ "rel": rel, "kind": "live-preserved", "item": item, "sha256": sha256_hex(bytes) }))
+    }
+
+    /// R3: left as it is; the update's backup kept (when there was one).
+    fn left(&self, rel: &str, backup: Option<&[u8]>, live: &LiveState) -> Result<(), String> {
+        let item = backup.map(|b| self.item(b)).transpose()?;
+        self.record(serde_json::json!({
+            "rel": rel, "kind": "left", "backup_item": item, "backup_sha256": backup.map(sha256_hex), "live": live.describe(),
+        }))
+    }
+
+    /// KA2: a non-file occupant at a record name moved into a generation folder created here exclusively; the record line
+    /// is written FIRST (a stop between the line and the move leaves the occupant in place for the next recovery).
+    fn displace(&self, rel: &str, target: &Path) -> Result<(), String> {
+        let base = self.sub("displaced")?;
+        let mut gen: Option<PathBuf> = None;
+        for n in 1u32..=1000 {
+            let g = base.join(n.to_string());
+            match std::fs::create_dir(&g) {
+                Ok(()) => {
+                    gen = Some(g);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("{rel}: 옮겨 둘 자리 {} 를 만들지 못했습니다({e}) — 그대로 둡니다", g.display())),
+            }
+        }
+        let g = gen.ok_or_else(|| format!("{rel}: 옮겨 둘 자리를 찾지 못했습니다 — 그대로 둡니다"))?;
+        let name = target.file_name().map(|n| n.to_owned()).unwrap_or_else(|| std::ffi::OsString::from("occupant"));
+        let dest = g.join(&name);
+        let item = dest.strip_prefix(&self.dir).map(|p| {
+            p.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/")
+        });
+        self.record(serde_json::json!({ "rel": rel, "kind": "displaced", "item": item.unwrap_or_default() }))?;
+        journal_move(target, &dest).map_err(|e| format!("{rel}: 파일이 아닌 항목을 보관 폴더로 옮기지 못했습니다({e}) — 그대로 둡니다"))
+    }
+}
+
+/// ★WJ1: undo one entry — the backup put back (bytes + mode, [`restore_journaled_file`]) or the created FILE removed (never
+/// a recursive removal — RULINGS KA2).
+fn undo_entry(target: &Path, backup: Option<&[u8]>, mode: Option<u32>) -> Result<(), String> {
+    match backup {
+        Some(b) => {
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            restore_journaled_file(target, b, mode)
+        }
+        None => match std::fs::remove_file(target) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("journal 신규파일 삭제 실패 {}: {e}", target.display())),
+        },
+    }
+}
+
+/// ★WJ1 (RULINGS KB4): R1 — the bytes equal the backup; the recorded mode is set again (bytes are never touched here).
+fn reset_recorded_mode(target: &Path, mode: Option<u32>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(m) = mode {
+            if current_mode(target) != Some(m) {
+                if let Err(e) = std::fs::set_permissions(target, std::fs::Permissions::from_mode(m)) {
+                    eprintln!("[pack-journal] ⚠ mode {m:04o} could not be set again on {} ({e}) — bytes untouched", target.display());
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target, mode);
+    }
+}
+
+/// 저널에서 pre-state로 복원 — ★WJ1 (RULINGS JV2 · KA · KB): a roll-back undoes what THIS update did, not what happened since.
+/// Per entry ([`rollback_row`]): live = the backup → nothing (the recorded mode is set again); live = something the update
+/// announced in its placement log ([`PLACED_LOG`]) → the backup is put back (bytes + mode, [`restore_journaled_file`]) or the
+/// file it created is removed; anything else → LEFT as it is, the update's backup kept in `L/kept/<id>/`, said once. The four
+/// record names: when the update announced at least one change, a content that is neither the backup nor announced is kept
+/// first and the backup restored (KB3); a non-file occupant there is moved into the kept folder (KA2); nothing is ever removed
+/// recursively. An OLDER journal (no placement log): where live differs from the backup, the live bytes are kept first, then
+/// restored as before. A kept item is never overwritten and every kept item has its durable record line before the restore
+/// that depends on it (KB1); a preservation that fails stops the roll-back with `Err` (no settle — the caller gives back).
 /// M15-가 (0.15.0): bytes AND mode — see [`restore_journaled_file`].
-/// ★HE4 / HE5 (T9 round 2): rolls back FROM THE FOLDER IT IS GIVEN (the writer's own `j.` or a taker's held `r.`) — no
-/// function reads "the lane's journal path" any more; `.pack-version` is in the backup set (GX2), so it is restored too.
-/// It never removes the folder: removal happens only after SETTLE (rename to `d.<id>`). `restored(n)` is asked after
-/// each restored entry (the crash proof; production always continues): `Ok(false)` = stopped there, `Ok(true)` = every
-/// entry restored, `Err` = a failure on the way (the folder and all its backups are still there).
+/// ★HE4 / HE5 (T9 round 2): rolls back FROM THE FOLDER IT IS GIVEN (the writer's own `j.` or a taker's held `r.`); it never
+/// removes the folder (removal happens only after SETTLE). `restored(n)` is asked after each entry (the crash proof;
+/// production always continues): `Ok(false)` = stopped there, `Ok(true)` = every entry done, `Err` = a failure on the way
+/// (the folder and all its backups are still there).
 fn rollback_journal(held: &Path, restored: &mut dyn FnMut(usize) -> bool) -> Result<bool, String> {
     let index_path = held.join("index.json");
     // ★T2i(RULINGS FP2): 데몬이 듣기 전의 판독 — 시작 경로의 판독기(막히지 않음 · 일반 파일 · 상한). 판독 불가 = 종전 읽기 오류와
@@ -8098,42 +8600,78 @@ fn rollback_journal(held: &Path, restored: &mut dyn FnMut(usize) -> bool) -> Res
         serde_json::from_str(&s).map_err(|e| format!("journal 인덱스 파싱 실패: {e}"))?;
     let dir = pack_dir();
     let files_dir = held.join("files");
+    // ★WJ1: the placement log (None = an older journal, or an unusable log → the conservative rule).
+    let placed = if index.placements.is_some() { read_placements(held)? } else { None };
+    let announced_any = placed.as_ref().is_some_and(|m| !m.is_empty());
+    let kept = KeptFolder::of(held, index.apply.as_ref().map(|a| a.apply_id.as_str()))?;
+    let (mut left, mut preserved, mut displaced): (Vec<&str>, Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new(), Vec::new());
     for (n, entry) in index.entries.iter().enumerate() {
         let target = dir.join(&entry.rel);
-        if entry.existed {
-            let backup = files_dir.join(&entry.rel);
-            let bytes = match read_start_meta(&backup) {
+        let backup: Option<Vec<u8>> = if entry.existed {
+            let path = files_dir.join(&entry.rel);
+            Some(match read_start_meta(&path) {
                 StartRead::Bytes(b) => b,
-                StartRead::Missing => return Err(format!("journal 백업 복원 읽기 실패 {}: 없음", backup.display())),
+                StartRead::Missing => return Err(format!("journal 백업 복원 읽기 실패 {}: 없음", path.display())),
                 StartRead::Unreadable(e) => {
-                    return Err(format!("journal 백업 복원 읽기 실패 {}: {e}", backup.display()))
+                    return Err(format!("journal 백업 복원 읽기 실패 {}: {e}", path.display()))
                 }
-            };
-            if let Some(parent) = target.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            restore_journaled_file(&target, &bytes, entry.mode)?;
+            })
         } else {
-            match std::fs::remove_file(&target) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                // 백업 시 파일이 아니라 디렉터리였던 경로(예: 손상돼 디렉터리가 된
-                // .install-manifest.json)는 bytes 백업 불가라 existed=false로 기록된다. remove_file은
-                // 디렉터리에 실패하므로 remove_dir_all로 손상물을 정리해 rollback이 중단 없이
-                // pre-state(손상물 부재=안전측)로 수렴하게 한다(R2CODE2 HIGH #1 fail-closed 경로).
-                Err(_) if target.is_dir() => {
-                    std::fs::remove_dir_all(&target).map_err(|e| {
-                        format!("journal 신규 디렉터리 삭제 실패 {}: {e}", target.display())
-                    })?;
-                }
-                Err(e) => {
-                    return Err(format!("journal 신규파일 삭제 실패 {}: {e}", target.display()))
+            None
+        };
+        let live = live_state(&target);
+        let announced: Option<&[Option<String>]> =
+            placed.as_ref().map(|m| m.get(&entry.rel).map(Vec::as_slice).unwrap_or(&[]));
+        match rollback_row(&entry.rel, &live, backup.as_deref(), announced, announced_any) {
+            RollbackRow::Same => {
+                if backup.is_some() {
+                    reset_recorded_mode(&target, entry.mode);
                 }
             }
+            RollbackRow::Undo => undo_entry(&target, backup.as_deref(), entry.mode)?,
+            RollbackRow::PreserveThenUndo => {
+                if let LiveState::File(b) = &live {
+                    kept.preserve_live(&entry.rel, b)
+                        .map_err(|e| format!("{}: 살아 있는 내용을 먼저 보관하지 못해 되돌리지 않았습니다 — {e}", entry.rel))?;
+                }
+                undo_entry(&target, backup.as_deref(), entry.mode)?;
+                preserved.push(&entry.rel);
+            }
+            RollbackRow::Displace => {
+                kept.displace(&entry.rel, &target)?;
+                if let Some(b) = backup.as_deref() {
+                    undo_entry(&target, Some(b), entry.mode)?;
+                }
+                displaced.push(&entry.rel);
+            }
+            RollbackRow::Leave => {
+                kept.left(&entry.rel, backup.as_deref(), &live)
+                    .map_err(|e| format!("{}: 업데이트의 백업을 보관하지 못했습니다 — {e}", entry.rel))?;
+                left.push(&entry.rel);
+            }
+            RollbackRow::Fail(e) => return Err(e),
         }
         if !restored(n + 1) {
             return Ok(false);
         }
+    }
+    // ★WJ1: say so ONCE (the durable record is `kept.log`).
+    let mut parts: Vec<String> = Vec::new();
+    if !left.is_empty() {
+        parts.push(format!("업데이트의 백업 뒤에 바뀐 {}개는 그대로 두었습니다({})", left.len(), left.join(", ")));
+    }
+    if !preserved.is_empty() {
+        parts.push(format!("살아 있던 내용을 먼저 보관하고 되돌린 {}개({})", preserved.len(), preserved.join(", ")));
+    }
+    if !displaced.is_empty() {
+        parts.push(format!("파일이 아닌 항목을 옮겨 둔 {}개({})", displaced.len(), displaced.join(", ")));
+    }
+    if !parts.is_empty() {
+        eprintln!(
+            "[pack-journal] 되돌리기: {} — 업데이트의 사본과 기록: {}",
+            parts.join(" · "),
+            kept.dir.join("kept.log").display()
+        );
     }
     Ok(true)
 }
@@ -8535,6 +9073,24 @@ fn apply_pack_transactional_steps<F>(
 where
     F: FnOnce() -> Result<(), String>,
 {
+    apply_pack_transactional_core(items, target_version, state, auth, post_commit, step, None)
+}
+
+/// [`apply_pack_transactional_steps`] with the placement crash seam (★WJ1): `stop_after = Some(k)` stops the transaction
+/// right after its k-th announced change (the (k+1)-th change is not made) — NO roll-back, as a process dying there.
+/// Production passes None.
+fn apply_pack_transactional_core<F>(
+    items: &[(&str, &str)],
+    target_version: &str,
+    state: &PackState,
+    auth: Option<PackWriteAuth>,
+    post_commit: F,
+    step: &mut dyn FnMut(TxStep) -> bool,
+    stop_after: Option<usize>,
+) -> Result<(usize, usize, bool), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
     // ⓪ 직전 crash로 남은 orphan 저널 자가치유(새 트랜잭션 전 pre-state 확정).
     // ★GX3: a journal it must keep (writer running / unknown / unreadable) makes this fail — never overwritten below.
     recover_pack_journal()?;
@@ -8606,22 +9162,48 @@ where
     }
     // ② 파일 반영(transactional=true) — .pack-version은 여기서 쓰지 않고(④에서 commit marker로),
     //    .install-manifest.json write 실패는 fail-closed로 Err가 되어 아래 rollback을 탄다.
-    let (written, kept) =
-        match install_from_iter(items.iter().copied(), false, target_version, true, auth) {
-            Ok(v) => v,
-            Err(e) => return Err(fail_before_commit(&own, "파일 반영 실패", &e)),
-        };
+    // ★WJ1 (RULINGS JV2 · KB2): every change of a pack name in ② is announced first in the apply's placement log (installed
+    //   on this thread for ② only); a failed announcement is the write's failure — the change is not made, the log's failure
+    //   is sticky (no later change either) and it fails the transaction here even where a best-effort arm swallowed it.
+    let scope = PlacementScope::enter(PlacementLog::new(&dir, &own, stop_after));
+    let installed = install_from_iter(items.iter().copied(), false, target_version, true, auth);
+    let Some(mut log) = scope.leave() else {
+        return Err(fail_before_commit(&own, "파일 반영 실패", "변경 예고 기록을 잃었습니다"));
+    };
+    if log.stopped {
+        return Err(log.stop_line());
+    }
+    if let Some(e) = log.failed.clone() {
+        return Err(fail_before_commit(&own, "변경 예고 기록 실패", &e));
+    }
+    let (written, kept) = match installed {
+        Ok(v) => v,
+        Err(e) => return Err(fail_before_commit(&own, "파일 반영 실패", &e)),
+    };
     if !step(TxStep::Installed) {
         return Err(stopped_at(TxStep::Installed));
     }
     // ③ `.pack-state.json` 기록 — journal 백업 대상이므로 실패 시 rollback으로 전체 복원.
+    // ★WJ1: announced first — the exact bytes `write_pack_state` writes.
+    if let Err(e) = pack_state_bytes(state).and_then(|b| log.announce(PACK_STATE_FILE, Some(&b)).map_err(|e| e.to_string())) {
+        if log.stopped {
+            return Err(log.stop_line());
+        }
+        return Err(fail_before_commit(&own, "state 기록 실패", &e));
+    }
     if let Err(e) = write_pack_state(&dir, state) {
         return Err(fail_before_commit(&own, "state 기록 실패", &e));
     }
     if !step(TxStep::StateWritten) {
         return Err(stopped_at(TxStep::StateWritten));
     }
-    // ④ .pack-version(결과 검사 — best-effort 금지). ★GX2: no longer the commit marker by itself.
+    // ④ .pack-version(결과 검사 — best-effort 금지). ★GX2: no longer the commit marker by itself. ★WJ1: announced first.
+    if let Err(e) = log.announce(PACK_VERSION_FILE, Some(target_version.as_bytes())) {
+        if log.stopped {
+            return Err(log.stop_line());
+        }
+        return Err(fail_before_commit(&own, ".pack-version 커밋 실패", &e.to_string()));
+    }
     if let Err(e) = write_atomic(&dir.join(PACK_VERSION_FILE), target_version.as_bytes()) {
         return Err(fail_before_commit(&own, ".pack-version 커밋 실패", &e.to_string()));
     }
@@ -15696,7 +16278,6 @@ mod tests {
     /// recovery puts back what the update wrote (the control `bin/selfheal.sh`, written by the update, untouched since)
     /// and leaves every byte written after the backup. Red on base8: the roll-back wrote the backup over every entry.
     #[test]
-    #[ignore = "WJ1 red on base8's roll-back — un-ignored with the fix"]
     fn wj1_general_file_changed_after_the_backup_survives_the_rollback() {
         let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut failures: Vec<String> = Vec::new();
@@ -15770,6 +16351,418 @@ mod tests {
         assert!(failures.is_empty(), "WJ1 T-b:\n  {}", failures.join("\n  "));
     }
 
+    // ───────────────────────── ★WJ1 (RULINGS JV2 · KA · KB): the roll-back undoes only what the update did ─────────────────────────
+
+    /// Every line of every `kept.log` under the current lane's kept folder.
+    fn wj1_kept_lines() -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        let kept = pack_journal_dir().join(KEPT_DIR);
+        for d in std::fs::read_dir(&kept).into_iter().flatten().flatten() {
+            if let Ok(t) = std::fs::read_to_string(d.path().join("kept.log")) {
+                out.extend(t.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()));
+            }
+        }
+        out
+    }
+
+    /// The bytes of every kept item (content items and moved occupants' files).
+    fn wj1_kept_contents() -> Vec<String> {
+        let mut out = Vec::new();
+        let kept = pack_journal_dir().join(KEPT_DIR);
+        for d in std::fs::read_dir(&kept).into_iter().flatten().flatten() {
+            out.extend(m15da_state(&d.path().join("items")).into_values().map(|(c, _)| c));
+        }
+        out
+    }
+
+    /// The pack's state without what a roll-back leaves ON PURPOSE (RULINGS KB4): `.user.prev-*` generations the update made
+    /// (a copy of the bytes the roll-back puts back at `.user`) and the append-only merge audit.
+    fn wj1_state(pd: &Path) -> M15daState {
+        m15da_state(pd)
+            .into_iter()
+            .filter(|(rel, _)| !rel.contains(".user.prev-") && rel != MERGE_AUDIT_FILE)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn wj1_set_mode(p: &Path, m: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    }
+
+    const WJ1_GENERAL_BASE: &str = "line one\nline two\nline three\nline four\nline five\n";
+    const WJ1_GENERAL_USER: &str = "line one (the user's)\nline two\nline three\nline four\nline five\n";
+    const WJ1_GENERAL_V2: &str = "line one\nline two\nline three\nline four\nline five (vendor v2)\n";
+
+    /// A lane that drives every kind of change the installer makes (RULINGS KB2's census): a vendor update, a created file, a
+    /// prune, a clean 3-way merge (+ the removal of a pre-existing `.new`), a CRLF user shell script kept for the user (its
+    /// `.new` + the rewrite of the LIVE file without CR), the locked asset healed over a pre-existing `.user` (moved to
+    /// `.user.prev-*`), a boot-critical file vendor-first (its `.user` + the removal of a pre-existing `.new`), a user-owned
+    /// file with a new vendor version (`.new`), a `#!` file whose mode only the update changes, the pending ledger, the
+    /// install record, the state, the version. Returns (root, pack, pre-state, env, items).
+    #[allow(clippy::type_complexity)]
+    fn wj1_rich_lane(tag: &str) -> (PathBuf, PathBuf, M15daState, (EnvGuard, EnvGuard), Vec<(&'static str, &'static str)>) {
+        let root = m15da_root(tag);
+        let pd = root.join("pack");
+        std::fs::create_dir_all(&pd).unwrap();
+        let env = set_pack_env(&pd, root.join("cfg"));
+        // (rel, vendor v1 = the install record, bytes on disk)
+        let on_disk: &[(&str, &str, &str)] = &[
+            ("bin/selfheal.sh", "#!/bin/sh\necho selfheal-v1\n", "#!/bin/sh\necho selfheal-v1\n"),
+            ("bin/old.sh", "#!/bin/sh\necho old\n", "#!/bin/sh\necho old\n"),
+            ("bin/plain.sh", "#!/bin/sh\necho plain\n", "#!/bin/sh\necho plain\n"),
+            ("docs/general.md", WJ1_GENERAL_BASE, WJ1_GENERAL_USER),
+            ("bin/crlf.sh", "#!/bin/sh\necho crlf-v1\n", "#!/bin/sh\r\necho crlf-v1\r\necho the user's line\r\n"),
+            ("trusted-keys.json", "{\"keys\":[\"a\"]}\n", "{\"keys\":[\"a\",\"tampered\"]}\n"),
+            ("hooks/guard.sh", "#!/bin/sh\necho guard-v1\n", "#!/bin/sh\necho guard-v1\necho the user's guard line\n"),
+            ("agents.json", "{\"a\":1}\n", "{\"a\":1,\"mine\":true}\n"),
+            ("schedule.json", "{\"jobs\":[]}\n", "{\"jobs\":[]}\n"),
+        ];
+        let mut manifest = serde_json::Map::new();
+        for (rel, v1, disk) in on_disk {
+            let p = pd.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, disk).unwrap();
+            #[cfg(unix)]
+            wj1_set_mode(&p, if *rel == "bin/plain.sh" { 0o644 } else if disk.starts_with("#!") { 0o755 } else { 0o644 });
+            manifest.insert((*rel).to_string(), serde_json::json!(content_hash(v1)));
+        }
+        std::fs::write(pd.join(INSTALL_MANIFEST), serde_json::Value::Object(manifest).to_string()).unwrap();
+        std::fs::write(pd.join(PACK_VERSION_FILE), "0.15.0").unwrap();
+        write_pack_state(&pd, &test_free_state("0.15.0")).unwrap();
+        // the verified base of the merge, the pre-existing side files and the pending ledger that points at them (a pending
+        // entry also keeps the two drifted files out of C-07's keep-in-place arm — `classify_stale_entry_with`)
+        std::fs::create_dir_all(pd.join(PRISTINE_DIR).join("docs")).unwrap();
+        std::fs::write(pd.join(PRISTINE_DIR).join("docs/general.md"), WJ1_GENERAL_BASE).unwrap();
+        std::fs::write(pd.join("docs/general.md.new"), "an older vendor version\n").unwrap();
+        std::fs::write(pd.join("trusted-keys.json.user"), "{\"keys\":[\"an older user copy\"]}\n").unwrap();
+        std::fs::write(pd.join("hooks/guard.sh.new"), "#!/bin/sh\necho guard-v0\n").unwrap();
+        std::fs::write(
+            pd.join(MERGE_PENDING_FILE),
+            "{\"docs/general.md\":{\"kind\":\"user-kept\",\"side\":\"docs/general.md.new\",\"version\":\"0.15.0\",\"ts\":1},\
+             \"hooks/guard.sh\":{\"kind\":\"new-pending\",\"side\":\"hooks/guard.sh.new\",\"version\":\"0.15.0\",\"ts\":1},\
+             \"bin/crlf.sh\":{\"kind\":\"kept-drift\",\"side\":\"bin/crlf.sh\",\"version\":\"0.15.0\",\"ts\":1},\
+             \"trusted-keys.json\":{\"kind\":\"kept-drift\",\"side\":\"trusted-keys.json\",\"version\":\"0.15.0\",\"ts\":1}}\n",
+        )
+        .unwrap();
+        let pre = wj1_state(&pd);
+        let items: Vec<(&'static str, &'static str)> = vec![
+            ("bin/selfheal.sh", "#!/bin/sh\necho selfheal-v2\n"),
+            ("bin/new.sh", "#!/bin/sh\necho new\n"),
+            ("bin/plain.sh", "#!/bin/sh\necho plain\n"),
+            ("docs/general.md", WJ1_GENERAL_V2),
+            ("bin/crlf.sh", "#!/bin/sh\necho crlf-v2\n"),
+            ("trusted-keys.json", "{\"keys\":[\"a\",\"b\"]}\n"),
+            ("hooks/guard.sh", "#!/bin/sh\necho guard-v2\n"),
+            ("agents.json", "{\"a\":2}\n"),
+            ("schedule.json", "{\"jobs\":[]}\n"),
+        ];
+        (root, pd, pre, env, items)
+    }
+
+    /// The current lane's own journal folder (the slot's one entry).
+    fn wj1_own_journal() -> Option<PathBuf> {
+        t9_slot_entry(&pack_journal_dir()).map(|(_, p)| p)
+    }
+
+    /// ★WJ1 T-e (RULINGS KB2 — the census): the REAL transaction on the rich lane stopped right after EACH of its announced
+    /// changes (the next one not made), the writer gone, the next recovery: the pack is ENTIRELY its pre-state every time
+    /// (outside what is left on purpose, KB4) and nothing was "left" or kept — so every change the update made was announced
+    /// with the bytes it placed (a missing announcement leaves the update's own change as "someone else's" → red).
+    #[test]
+    fn wj1_census_every_change_is_announced_and_undone_after_each_placement() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // the reference: the whole apply up to ④ (no commit marker) — how many changes it announces
+        let (root, pd, _pre, env, items) = wj1_rich_lane("wj1-e-ref");
+        let r = apply_pack_transactional_core(&items, "0.15.1", &test_free_state("0.15.1"), None, || Ok(()), &mut |s| s != TxStep::VersionWritten, None);
+        let log = wj1_own_journal().map(|j| std::fs::read_to_string(j.join(PLACED_LOG)).unwrap_or_default()).unwrap_or_default();
+        let n = log.lines().count();
+        let pending = std::fs::read_to_string(pd.join(MERGE_PENDING_FILE)).unwrap_or_default();
+        let crlf_live = std::fs::read_to_string(pd.join("bin/crlf.sh")).unwrap_or_default();
+        drop(env);
+        let _ = std::fs::remove_dir_all(&root);
+        eprintln!("[wj1 census] the rich lane's apply announces {n} changes:\n{log}");
+        assert!(r.is_err(), "the reference stops after ④: {r:?}");
+        for want in [
+            "\"bin/selfheal.sh\"", "\"bin/new.sh\"", "\"bin/old.sh\"", "\"docs/general.md\"", "\"docs/general.md.new\"",
+            "\"bin/crlf.sh\"", "\"bin/crlf.sh.new\"", "\"trusted-keys.json.user\"", "\"trusted-keys.json\"",
+            "\"agents.json.new\"", "\".install-manifest.json\"", "\".merge-pending.json\"", "\".pack-state.json\"", "\".pack-version\"",
+        ] {
+            assert!(log.contains(want), "the reference did not announce {want} — the lane no longer drives that change:\n{log}\npending={pending}");
+        }
+        assert!(!crlf_live.contains('\r'), "the user shell file must have been rewritten without CR: {crlf_live:?}");
+        let mut failures: Vec<String> = Vec::new();
+        for k in 0..n {
+            let (root, pd, pre, env, items) = wj1_rich_lane(&format!("wj1-e-{k}"));
+            let r = apply_pack_transactional_core(&items, "0.15.1", &test_free_state("0.15.1"), None, || Ok(()), &mut |_| true, Some(k));
+            let stopped = r.as_ref().err().is_some_and(|e| e.contains("stopped after placement"));
+            t9_writers_gone();
+            let rec = recover_pack_journal();
+            let after = wj1_state(&pd);
+            let kept = wj1_kept_lines();
+            let slot_left = pack_journal_dir().join(JOURNAL_SLOT).exists();
+            drop(env);
+            let _ = std::fs::remove_dir_all(&root);
+            let diff = m15da_diff(&pre, &after);
+            if !stopped || rec != Ok(true) || !diff.is_empty() || !kept.is_empty() || slot_left {
+                failures.push(format!("stop after {k}: apply={r:?} recovery={rec:?} slot_left={slot_left} pack vs pre={diff:?} kept={kept:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "census ({n} changes):\n  {}", failures.join("\n  "));
+    }
+
+    /// ★WJ1 T-c (controls): what the update DID is undone — the replaced file back with its mode, the created file removed,
+    /// `.pack-version` and the install record back, a mode the update alone changed set back (KB4; bytes equal the backup) —
+    /// and a roll-back stopped after EACH entry, its taker gone, converges at the next recovery (pack entirely old, nothing
+    /// kept).
+    #[test]
+    fn wj1_controls_the_update_s_own_changes_are_undone_and_a_stopped_rollback_converges() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut failures: Vec<String> = Vec::new();
+        // the number of entries of the journal
+        let (root, _pd, _pre, env, items) = wj1_rich_lane("wj1-c-ref");
+        let _ = apply_pack_transactional_core(&items, "0.15.1", &test_free_state("0.15.1"), None, || Ok(()), &mut |s| s != TxStep::VersionWritten, None);
+        let entries = wj1_own_journal()
+            .and_then(|j| std::fs::read_to_string(j.join("index.json")).ok())
+            .and_then(|s| serde_json::from_str::<JournalIndex>(&s).ok())
+            .map(|ix| ix.entries.len())
+            .unwrap_or(0);
+        drop(env);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(entries > 10, "the rich lane's journal: {entries} entries");
+        for stop in 0..=entries {
+            let (root, pd, pre, env, items) = wj1_rich_lane(&format!("wj1-c-{stop}"));
+            let r = apply_pack_transactional_core(&items, "0.15.1", &test_free_state("0.15.1"), None, || Ok(()), &mut |s| s != TxStep::VersionWritten, None);
+            let mid = (
+                std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap_or_default(),
+                std::fs::read_to_string(pd.join("bin/selfheal.sh")).unwrap_or_default(),
+                pd.join("bin/new.sh").exists(),
+            );
+            t9_writers_gone();
+            // the first recovery stops after `stop` entries (0 = it does not stop); its taker then dies
+            let first = if stop == 0 {
+                recover_pack_journal()
+            } else {
+                t9r2_recover(&mut || true, &mut || true, &mut |n| n < stop, &mut || true)
+            };
+            if stop > 0 {
+                t9_relabel(&pack_journal_dir(), "1");
+            }
+            let second = recover_pack_journal();
+            let after = wj1_state(&pd);
+            let kept = wj1_kept_lines();
+            drop(env);
+            let _ = std::fs::remove_dir_all(&root);
+            let diff = m15da_diff(&pre, &after);
+            let mid_ok = mid.0 == "0.15.1" && mid.1 == "#!/bin/sh\necho selfheal-v2\n" && mid.2;
+            let ok = r.is_err()
+                && mid_ok
+                && diff.is_empty()
+                && kept.is_empty()
+                && if stop == 0 { first == Ok(true) && second == Ok(false) } else { second == Ok(true) };
+            if !ok {
+                failures.push(format!("stop={stop}: apply={r:?} mid={mid:?} first={first:?} second={second:?} pack vs pre={diff:?} kept={kept:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "controls:\n  {}", failures.join("\n  "));
+    }
+
+    /// ★WJ1 T-d (an OLDER journal — an index without `placements`, the batch-7 form): where live differs from the backup the
+    /// live bytes are kept FIRST (an immutable item + a record line), then the entry is restored / the created file removed;
+    /// a folder at an ordinary name is LEFT (never removed recursively); a folder at a record name is MOVED into the kept
+    /// folder (RULINGS KA2). The recovery completes.
+    #[test]
+    fn wj1_older_journal_keeps_the_live_bytes_first_and_never_removes_a_folder() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (base, pd, _env) = txn_prestate("wj1-d", &[("a.txt", "old")], "1.0.0");
+        let jdir = t9_hand_journal();
+        std::fs::write(jdir.join("files").join("a.txt"), "old").unwrap();
+        std::fs::write(
+            jdir.join("index.json"),
+            r#"{"target_version":"2.0.0","entries":[{"rel":"a.txt","existed":true},{"rel":"created.txt","existed":false},{"rel":"folder-here","existed":false},{"rel":".merge-pending.json","existed":false}]}"#,
+        )
+        .unwrap();
+        t9_add_apply_record(&jdir);
+        std::fs::write(pd.join("a.txt"), "U: written after the backup").unwrap();
+        std::fs::write(pd.join("created.txt"), "X: the old update's new file, or anyone's").unwrap();
+        std::fs::create_dir_all(pd.join("folder-here").join("inner")).unwrap();
+        std::fs::write(pd.join("folder-here").join("inner").join("mine.txt"), "a user's folder").unwrap();
+        std::fs::create_dir_all(pd.join(MERGE_PENDING_FILE).join("x")).unwrap();
+        let rec = recover_pack_journal();
+        let a = std::fs::read_to_string(pd.join("a.txt")).unwrap_or_default();
+        let created = pd.join("created.txt").exists();
+        let folder = std::fs::read_to_string(pd.join("folder-here/inner/mine.txt")).unwrap_or_default();
+        let record_name_cleared = !pd.join(MERGE_PENDING_FILE).exists();
+        let kept = wj1_kept_lines();
+        let contents = wj1_kept_contents();
+        let displaced_dir = std::fs::read_dir(pack_journal_dir().join(KEPT_DIR))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|d| d.path().join("displaced/1").join(MERGE_PENDING_FILE).join("x").is_dir());
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(rec, Ok(true));
+        assert_eq!(a, "old", "the entry is restored after its live bytes were kept");
+        assert!(!created, "the created file is removed after its bytes were kept");
+        assert_eq!(folder, "a user's folder", "a folder at an ordinary name is LEFT, never removed recursively");
+        assert!(record_name_cleared && displaced_dir, "a folder at a record name is MOVED into the kept folder");
+        assert!(contents.iter().any(|c| c == "U: written after the backup"), "the live bytes of a.txt are kept: {contents:?}");
+        assert!(contents.iter().any(|c| c == "X: the old update's new file, or anyone's"), "{contents:?}");
+        let kinds: Vec<(String, String)> = kept
+            .iter()
+            .map(|l| (l["rel"].as_str().unwrap_or_default().to_string(), l["kind"].as_str().unwrap_or_default().to_string()))
+            .collect();
+        for want in [("a.txt", "live-preserved"), ("created.txt", "live-preserved"), ("folder-here", "left"), (MERGE_PENDING_FILE, "displaced")] {
+            assert!(kinds.contains(&(want.0.to_string(), want.1.to_string())), "record line {want:?} missing: {kinds:?}");
+        }
+    }
+
+    /// ★WJ1 KB5 (1) — the reviewer's M2 sequence: the update wrote its files, then stopped BEFORE its install record; a pack
+    /// verb advanced the record (the vendor baseline of one file — what `advance_vendor_baseline` writes); recovery puts the
+    /// files back AND the record (the verb's record kept first, KB3); the next install of the SAME version must then write
+    /// the vendor file — not keep the old file as drift.
+    #[test]
+    fn wj1_kb5_record_advanced_by_a_pack_verb_is_restored_with_the_files() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (root, pd, pre, _env) = t9r2_lane("wj1-kb5-1");
+        // the reference: where the install record is announced
+        let (root2, _pd2, _pre2, env2) = t9r2_lane("wj1-kb5-1-ref");
+        let _ = apply_pack_transactional_core(&t9r2_items(), "0.15.1", &test_free_state("0.15.1"), None, || Ok(()), &mut |s| s != TxStep::Installed, None);
+        let log = wj1_own_journal().map(|j| std::fs::read_to_string(j.join(PLACED_LOG)).unwrap_or_default()).unwrap_or_default();
+        let k = log.lines().position(|l| l.contains(&format!("\"{INSTALL_MANIFEST}\""))).expect("the install record is announced");
+        drop(env2);
+        let _ = std::fs::remove_dir_all(&root2);
+        let r = apply_pack_transactional_core(&t9r2_items(), "0.15.1", &test_free_state("0.15.1"), None, || Ok(()), &mut |_| true, Some(k));
+        let v2_written = std::fs::read_to_string(pd.join("bin/selfheal.sh")).unwrap_or_default() == "#!/bin/sh\necho selfheal-v2\n";
+        // the pack verb: the file's vendor baseline advanced to v2 (record + pristine), as `advance_vendor_baseline` does
+        let mut m: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(pd.join(INSTALL_MANIFEST)).unwrap()).unwrap();
+        m.insert("bin/selfheal.sh".into(), serde_json::json!(content_hash("#!/bin/sh\necho selfheal-v2\n")));
+        let verb_record = serde_json::Value::Object(m).to_string();
+        std::fs::write(pd.join(INSTALL_MANIFEST), &verb_record).unwrap();
+        t9_writers_gone();
+        let rec = recover_pack_journal();
+        let after = m15da_state(&pd);
+        let kept = wj1_kept_contents();
+        // the next install of the same version
+        let again = apply_pack_transactional(&t9r2_items(), "0.15.1", &test_free_state("0.15.1"), None, || Ok(()));
+        let selfheal = std::fs::read_to_string(pd.join("bin/selfheal.sh")).unwrap_or_default();
+        let pending = std::fs::read_to_string(pd.join(MERGE_PENDING_FILE)).unwrap_or_default();
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(r.is_err() && v2_written, "the update wrote its files and stopped before its record: {r:?}");
+        assert_eq!(rec, Ok(true));
+        assert!(m15da_diff(&pre, &after).is_empty(), "files AND record back: {:?}", m15da_diff(&pre, &after));
+        assert!(kept.iter().any(|c| c == &verb_record), "the verb's record is kept before the restore");
+        assert!(again.is_ok(), "{again:?}");
+        assert_eq!(selfheal, "#!/bin/sh\necho selfheal-v2\n", "the next install of the same version must write the vendor file, not keep the old one as drift");
+        assert!(!pending.contains("kept-drift"), "no drift: {pending}");
+    }
+
+    /// ★WJ1 KB5 (2) — preserve → restore → the recoverer dies → a normal writer changes the record again → ANOTHER recoverer
+    /// takes over: BOTH contents are in the kept folder afterwards and the append-only record names both (KB1: a kept item is
+    /// never overwritten).
+    #[test]
+    fn wj1_kb5_a_second_recoverer_keeps_both_contents() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (root, pd, pre, _env) = t9r2_lane("wj1-kb5-2");
+        let _ = t9r2_stopped_apply(TxStep::VersionWritten);
+        t9_writers_gone();
+        let entries: Vec<String> = wj1_own_journal()
+            .and_then(|j| std::fs::read_to_string(j.join("index.json")).ok())
+            .and_then(|s| serde_json::from_str::<JournalIndex>(&s).ok())
+            .map(|ix| ix.entries.into_iter().map(|e| e.rel).collect())
+            .unwrap_or_default();
+        let at = entries.iter().position(|r| r == INSTALL_MANIFEST).expect("the record is an entry") + 1;
+        let u = "{\"U\":\"a pack verb's record\"}";
+        let v = "{\"V\":\"another writer's record, after the first recoverer died\"}";
+        std::fs::write(pd.join(INSTALL_MANIFEST), u).unwrap();
+        let first = t9r2_recover(&mut || true, &mut || true, &mut |n| n < at, &mut || true);
+        let restored_once = std::fs::read_to_string(pd.join(INSTALL_MANIFEST)).unwrap_or_default() != u;
+        t9_relabel(&pack_journal_dir(), "1");
+        std::fs::write(pd.join(INSTALL_MANIFEST), v).unwrap();
+        let second = recover_pack_journal();
+        let after = m15da_state(&pd);
+        let contents = wj1_kept_contents();
+        let lines: Vec<serde_json::Value> = wj1_kept_lines()
+            .into_iter()
+            .filter(|l| l["rel"] == INSTALL_MANIFEST && l["kind"] == "live-preserved")
+            .collect();
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(first, Err(RECOVERY_STOPPED.to_string()));
+        assert!(restored_once, "the first recoverer restored the record after keeping U");
+        assert_eq!(second, Ok(true));
+        assert!(m15da_diff(&pre, &after).is_empty(), "{:?}", m15da_diff(&pre, &after));
+        assert!(contents.iter().any(|c| c == u) && contents.iter().any(|c| c == v), "both contents kept: {contents:?}");
+        let shas: Vec<&str> = lines.iter().filter_map(|l| l["sha256"].as_str()).collect();
+        assert!(
+            shas.contains(&sha256_hex(u.as_bytes()).as_str()) && shas.contains(&sha256_hex(v.as_bytes()).as_str()),
+            "the record names both: {lines:?}"
+        );
+    }
+
+    /// ★WJ1 KB5 (3) — a kept item that cannot be written: the entry is NOT restored, the roll-back does not settle (the taker
+    /// gives the journal back), the failure is said in words; once the item can be written the next recovery completes.
+    #[test]
+    fn wj1_kb5_a_kept_item_that_cannot_be_written_stops_and_the_next_recovery_completes() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (root, pd, pre, _env) = t9r2_lane("wj1-kb5-3");
+        let _ = t9r2_stopped_apply(TxStep::VersionWritten);
+        t9_writers_gone();
+        let u = "{\"U\":\"a pack verb's record\"}";
+        std::fs::write(pd.join(INSTALL_MANIFEST), u).unwrap();
+        let obstacle = pack_journal_dir().join(KEPT_DIR);
+        std::fs::write(&obstacle, "a file where the kept folder must be").unwrap();
+        let first = recover_pack_journal();
+        let still_u = std::fs::read_to_string(pd.join(INSTALL_MANIFEST)).unwrap_or_default() == u;
+        let given = t9_slot_entry(&pack_journal_dir()).map(|e| e.0);
+        std::fs::remove_file(&obstacle).unwrap();
+        let second = recover_pack_journal();
+        let after = m15da_state(&pd);
+        let contents = wj1_kept_contents();
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            first.as_ref().err().is_some_and(|l| l.contains("보관") && l.contains("u.")),
+            "the failure in words + given back: {first:?}"
+        );
+        assert!(still_u, "the entry is NOT restored without its preserved copy");
+        assert!(given.as_deref().is_some_and(|g| g.starts_with("u.")), "no settle — given back: {given:?}");
+        assert_eq!(second, Ok(true));
+        assert!(m15da_diff(&pre, &after).is_empty(), "{:?}", m15da_diff(&pre, &after));
+        assert!(contents.iter().any(|c| c == u), "U kept by the completing recovery");
+    }
+
+    /// ★WJ1 (RULINGS KB4 — minor #185): the MEASURED number of announced changes (= extra durable writes) of one apply of the
+    /// embedded pack with ONE changed file — on a lane whose pristine mirrors are present, and on the same lane without them
+    /// (then every kept file's mirror is written: proportional to the pack's file count).
+    #[test]
+    fn wj1_placement_count_measured_on_the_embedded_pack() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut counts: Vec<(bool, usize)> = Vec::new();
+        for pristine in [true, false] {
+            let root = m15da_root(&format!("wj1-count-{pristine}"));
+            let pd = root.join("pack");
+            let env = set_pack_env(&pd, root.join("cfg"));
+            install_into(pd.clone(), PACK_ALL.iter().copied(), false, "0.15.0", false, false, PackScope::Base, None, None).unwrap();
+            if !pristine {
+                std::fs::remove_dir_all(pd.join(PRISTINE_DIR)).unwrap();
+            }
+            let changed = format!("{}\n(changed by the next release)\n", PACK_ALL.iter().find(|(r, _)| *r == "README.md").map(|(_, c)| *c).unwrap_or(""));
+            let items: Vec<(&str, &str)> = PACK_ALL.iter().map(|(r, c)| if *r == "README.md" { (*r, changed.as_str()) } else { (*r, *c) }).collect();
+            let _ = apply_pack_transactional_core(&items, "0.15.1", &test_free_state("0.15.1"), None, || Ok(()), &mut |s| s != TxStep::VersionWritten, None);
+            let n = wj1_own_journal().map(|j| std::fs::read_to_string(j.join(PLACED_LOG)).unwrap_or_default().lines().count()).unwrap_or(0);
+            counts.push((pristine, n));
+            drop(env);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        eprintln!("[wj1 #185] embedded pack: {} files; announced changes with one changed file: pristine present = {}, pristine missing = {}", PACK_ALL.len(), counts[0].1, counts[1].1);
+        assert!(counts[0].1 >= 4 && counts[0].1 <= 8, "pristine present: {counts:?}");
+        assert!(counts[1].1 >= PACK_ALL.len() / 2, "pristine missing: {counts:?}");
+    }
+
     /// GX1: every lane's journal is its own folder under `.pack-journal.d`, never the legacy shared folder.
     #[test]
     fn t9_each_lane_has_its_own_journal_folder() {
@@ -15808,9 +16801,18 @@ mod tests {
         let new_exists = pd.join("new.txt").exists();
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
         let journal_exists = pack_journal_dir().join(JOURNAL_SLOT).exists();
+        // ★WJ1 (RULINGS KA2): the folder at the record name is MOVED into the kept folder, not deleted — the name is cleared
+        //   so the next update can write there (the pin's meaning), and the folder's content is kept.
+        let manifest_name_cleared = !mp.exists();
+        let moved_not_deleted = std::fs::read_dir(pack_journal_dir().join(KEPT_DIR))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|d| d.path().join("displaced/1").join(INSTALL_MANIFEST).join("child").is_dir());
         let _ = std::fs::remove_dir_all(&base);
 
         assert!(res.is_err(), "매니페스트 write 실패인데 성공 반환(best-effort 흡수)");
+        assert!(manifest_name_cleared && moved_not_deleted, "the folder at the install record's name: moved into the kept folder, not deleted");
         assert!(!committed.get(), "파일 반영 실패 전에 commit_extra가 호출되면 안됨");
         assert_eq!(soul, "OLD-SOUL", "rollback이 README.md를 pre-state로 복원 못함");
         assert!(!new_exists, "rollback이 신규 new.txt를 제거 못함(부분적용 잔존)");
