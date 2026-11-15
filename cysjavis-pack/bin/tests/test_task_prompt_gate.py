@@ -272,6 +272,41 @@ class TicketGate(unittest.TestCase):
         bad = subprocess.run([exe, "repair", "begin", "--joins", "R-7", "--trigger", "update"], capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(bad.returncode, 2, "a line without --files is refused by the parser (the mutation)")
 
+    # RULINGS IK1 (blocking — queue blocking): a department whose HOME holds Korean letters or a space. The
+    # key `javis_lane.lane_key` makes from its socket reaches the REAL `cys repair gate` as ONE argument (no
+    # shell); with an empty ledger the answer is OPEN and the department's ordinary ticket goes out.
+    def test_a_korean_or_spaced_home_gets_the_open_gate_of_the_real_cli(self):
+        td = os.environ.get("CARGO_TARGET_DIR")
+        exe = os.path.join(td, "debug", "cys.exe" if os.name == "nt" else "cys") if td else None
+        if not exe or not os.path.exists(exe):
+            self.skipTest("the built cys binary is not available here (CARGO_TARGET_DIR/debug/cys)")
+        import javis_lane
+        saved = {k: os.environ.get(k) for k in ("HOME", "CYS_NO_AUTOSTART")}
+        os.environ["HOME"] = self.tmp
+        os.environ["CYS_NO_AUTOSTART"] = "1"
+        os.makedirs(os.environ["CYS_LOCAL_DIR"])  # the repairs root's parent exists, the ledger is empty
+        try:
+            for i, home in enumerate(("홍길동", "Hong Gil Dong", "홍 길동")):
+                sock = os.path.join(self.tmp, "Users", home, ".local", "state", "cys-dept-sales %d" % i, "cys.sock")
+                with open(os.environ["CYS_DEPTS_JSON"], "w", encoding="utf-8") as f:
+                    json.dump({"depts": {"sales": {"socket": sock}}}, f, ensure_ascii=False)
+                key, why = orch._gate_lane_key("sales")
+                self.assertIsNone(why)
+                self.assertEqual(key, javis_lane.lane_key(sock))
+                with path_with(os.path.dirname(exe)):
+                    state, v, why = orch._repair_gate(key)
+                    self.assertEqual(state, "open", "%s → %s" % (key, why))
+                    self.assertEqual(v["lane"], key)
+                    rc, out, err = run_tp(surface="sales/surface:5")
+                self.assertEqual(rc, 0, err)
+                self.assertIn("[작업 위임", out)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
     # HH7: in the HQ lane the conflict summary is printed once per distinct summary; the mark lives in
     # the tool's own state file, never under the repairs folder
     def test_conflict_summary_is_printed_once_per_summary(self):
