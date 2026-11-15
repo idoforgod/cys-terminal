@@ -987,7 +987,35 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, _listed_row: &LaneRecor
     }
     let id = &rec.id;
     // the binding: this lane, the pack generation, the expected live states
-    if !apply::Bound::from_row(p).equals_now(env.op.pack) {
+    let row_bound = apply::Bound::from_row(p);
+    if !row_bound.equals_now(env.op.pack) {
+        // RULINGS HS1 — a GENERAL repair whose row and pack both state a KNOWN generation, and the
+        // generation moved on (an update): every target still holds this lane's applied result → the
+        // probation ENDS without a check and the repair STAYS IN FORCE (사용 중, no automatic return
+        // armed any more); the update wrote a target → 대체됨 naming it, nothing put back, the record
+        // superseded. An unknown generation (EJ1 / EN3) and the other classes: as before.
+        if rec.classification == super::types::Classification::General
+            && row_bound.known().is_some()
+            && apply::Bound::now(env.op.pack).known().is_some()
+        {
+            let mut written: Vec<String> = Vec::new();
+            for (rel, canon) in &p.expected {
+                if TargetState::read(&env.op.pack.join(rel))?.canon() != *canon {
+                    written.push(rel.clone());
+                }
+            }
+            if written.is_empty() {
+                close_row(env, id, &apply::update_kept_closure(), &[], Some(RepairState::InUse))?;
+                report.ended.push(id.clone());
+                report.lines.push(format!("{}: {}", id.as_str(), apply::UPDATE_KEPT_SENTENCE));
+            } else {
+                let closure = apply::update_wrote_closure(&written);
+                close_row(env, id, &closure, &[], Some(RepairState::Superseded))?;
+                report.superseded.push(id.clone());
+                report.lines.push(format!("{}: {closure}", id.as_str()));
+            }
+            return Ok(());
+        }
         let why = format!(
             "팩 세대가 적용 때와 다르거나 알 수 없습니다(지금 {}) — 아무것도 되돌리지 않습니다(새 버전 우선)",
             apply::pack_generation(env.op.pack).version
