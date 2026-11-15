@@ -5913,7 +5913,10 @@ mod tests {
         let prod = strip_line_comments(raw);
         let at = prod.find("fn run_ensure_team(").expect("run_ensure_team 소실");
         let body = &prod[at..at + prod[at..].find("\n}\n").expect("run_ensure_team 끝")];
-        let start = body.find("let mut cmd = tokio::process::Command::new(&python);").expect("부트 체인 스폰 소실");
+        // The two needles below are built from pieces (the convention of the seal census and of src/lib.rs's spawn-site pin,
+        // "조각 결합 — 자기참조 회피"): written whole, this test would itself be a second bytecode-seal line and a second
+        // python spawn site of this file for test_pyseal_census.py ⓐ / ⓒ(iii) and bundled_python_spawn_sites_are_enumerated_and_sealed.
+        let start = body.find(concat!("let mut cmd = tokio::process::Command", "::new(&python);")).expect("부트 체인 스폰 소실");
         let end = start + body[start..].find(".stdin(std::process::Stdio::null());").expect("무조건 빌더 끝 소실");
         let chain = &body[start..end];
         assert_eq!(
@@ -5921,7 +5924,7 @@ mod tests {
             1,
             "the boot chain's spawn lost PYTHONUTF8=1 (W3 · RULINGS JG1) — on a code-page-949 Windows preflight dies at its first result line"
         );
-        assert!(chain.contains(".env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON)"), "the bytecode seal moved");
+        assert!(chain.contains(concat!(".env(cys::ENV_PY_NO_BYTECODE, ", "cys::PY_NO_BYTECODE_ON)")), "the bytecode seal moved");
         assert_eq!(body.matches("ENV_PY_UTF8").count(), 1, "PYTHONUTF8 is removed or set again elsewhere in run_ensure_team");
         assert!(!body.contains("\"PYTHONUTF8\""), "a literal PYTHONUTF8 instead of the product's one constant");
         assert!(!body.contains("PYTHONIOENCODING"), "the spawn touches PYTHONIOENCODING (not part of W3)");
