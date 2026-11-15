@@ -3464,7 +3464,10 @@ mod ledger_verbs {
             };
             json!({"lane": l.owner.lane.0, "seat": l.owner.seat, "expires_at": l.expires_at, "claim": l.claim, "view": view})
         });
-        Ok(reply(
+        // T6b · RULINGS HS2: a probation an update ended is named by its closure (a true sentence —
+        // never "다른 수리로 대체됨" when no other repair replaced it)
+        let update_sentence = cys::repair::apply::update_closure_sentence(&rec, rows.iter().find(|r| r.lane == rec.origin_lane));
+        let mut v = reply(
             ctx,
             &rec,
             json!({
@@ -3491,7 +3494,11 @@ mod ledger_verbs {
                 "staging": if is_approval_class(rec.classification) || staging.exists() { json!(staging) } else { Value::Null },
                 "intake_signatures": rec.intake_signatures,
             }),
-        ))
+        );
+        if let Some(sentence) = update_sentence {
+            v["state_label"] = json!(sentence);
+        }
+        Ok(v)
     }
 
     // ─────────────────────────────── cleanup / revert lane condition (WORK) ───────────────────────────────

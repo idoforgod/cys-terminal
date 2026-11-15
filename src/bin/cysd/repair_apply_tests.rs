@@ -741,3 +741,27 @@ fn an_update_that_kept_the_bytes_leaves_the_repair_in_force_with_its_vault() {
     let c = r.call(T0 + 63.0, &human(), "cleanup", json!({"repair": wrote})).unwrap();
     assert!(c["removed"].as_array().is_some_and(|a| !a.is_empty()), "a superseded repair's slots may go: {c}");
 }
+
+/// RULINGS HS2: `cys repair status <R>` says truthfully how the update ended each probation — the
+/// repair whose bytes survived: 사용 중 with its closure sentence; the one whose file the update wrote:
+/// the 대체됨 sentence naming that file (never "다른 수리로 대체됨" — no other repair replaced it), and
+/// why its propagation is not complete. Without HS2 the label was the state's ("다른 수리로 대체됨").
+#[test]
+fn status_says_how_an_update_ended_the_probation() {
+    let r = rig("hs2status");
+    let (kept, wrote) = an_update_inside_two_probations(&r);
+    let s = r.call(T0 + 61.0, &human(), "status", json!({"repair": kept})).unwrap();
+    assert_eq!(s["state"], "in_use", "{s}");
+    assert_eq!(
+        s["state_label"],
+        "사용 중 — 업데이트 뒤에도 수리한 내용이 그대로 있습니다 — 시험 기간은 업데이트로 끝났고 자동 되돌리기는 하지 않습니다",
+        "{s}"
+    );
+    let s = r.call(T0 + 61.0, &human(), "status", json!({"repair": wrote})).unwrap();
+    assert_eq!(s["state"], "superseded", "{s}");
+    assert_eq!(
+        s["state_label"],
+        "대체됨 — 업데이트가 수리한 파일을 바꿨습니다(hooks/h.sh) — 아무것도 되돌리지 않습니다(새 버전 우선)",
+        "{s}"
+    );
+}
