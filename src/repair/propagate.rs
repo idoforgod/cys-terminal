@@ -10,7 +10,7 @@
 //! file goes through T6's engine (`apply::run_op` — the one door); the pass's only write inside a
 //! pack is the id file `<pack>/.repair-pack-id` (I8). Every comparison is of STATES (U2).
 
-use super::apply::{self, ApplyOutcome, Bound, CheckFn, HookStep, HookStepFn, OpEnv, OpSpec, Recorded, ReferenceFn, RepairLock, Source};
+use super::apply::{self, ApplyOutcome, Bound, CheckFn, HookStep, HookUnitEnd, OpEnv, OpSpec, Recorded, ReferenceFn, RepairLock, Source};
 use super::durable::{self, RecordRead};
 use super::ledger::{
     self, DirIdentity, GateVerdict, HoldCause, JobState, LaneRecord, MergeRecord, PackGeneration, RegisteredLanes,
@@ -598,6 +598,9 @@ pub type ResultBytesFn<'a> = dyn Fn(&RepairRecord, &str) -> Result<PathBuf, Stri
 /// protection asked first, BN2).
 pub type ClassifyFn<'a> = dyn Fn(&str) -> Result<Classification, RepairError> + 'a;
 
+/// T6's hook step with a GUARD (RULINGS IZ2): `(R, lane, step, guard) → how the unit ended`.
+pub type HookUnitFn<'a> = dyn Fn(&RepairId, &LaneKey, HookStep, &dyn Fn() -> Result<(), String>) -> Result<HookUnitEnd, RepairError> + 'a;
+
 /// Everything a lane's tick needs (the daemon builds it; tests build it with doubles).
 pub struct LaneEnv<'a> {
     pub op: OpEnv<'a>,
@@ -607,7 +610,9 @@ pub struct LaneEnv<'a> {
     pub reference: &'a ReferenceFn<'a>,
     pub classify: &'a ClassifyFn<'a>,
     pub locked: &'a RepairLock<'a>,
-    pub hooks: &'a HookStepFn<'a>,
+    /// The hook unit (RULINGS IZ1 (b) / IZ2): T6's hook step with a guard it runs right before its
+    /// first durable write (`apply::hook_lines_unit` in production).
+    pub hooks: &'a HookUnitFn<'a>,
     pub result_bytes: &'a ResultBytesFn<'a>,
     /// RULINGS HH1: what "known vendor content" means for a deletion (C11 11.3) — only its embedded
     /// copies and the compiled previous-release table are read (`pack::released_bytes`); production
@@ -1266,7 +1271,10 @@ fn own_apply_evidence(env: &LaneEnv<'_>, rec: &RepairRecord, live: &[(String, Ta
     let Bound::Known(gen) = bound else { return Ok(None) };
     let mut at: Option<f64> = None;
     for op in super::wal::list_checked_in(env.op.root, &rec.id)? {
-        if op.lane_key != *env.op.lane || op.kind != "propagate" || !op.finished || op.outcome.as_deref() != Some("applied") || op.pack_generation.as_ref() != Some(gen) {
+        if op.lane_key != *env.op.lane || !op.finished || op.outcome.as_deref() != Some("applied") || op.pack_generation.as_ref() != Some(gen) {
+            continue;
+        }
+        if op.kind != "propagate" {
             continue;
         }
         let committed = rec.committed.iter().find(|(r, _)| *r == op.rel).map(|(_, c)| c.as_str());
@@ -1409,13 +1417,15 @@ fn decide_pending(
     if all_result {
         // "already there" (I7(4) / J2): no file write; the hook lines (under the tried lock, the record
         // read again — IK3 / IG5), then this lane's own check (outside the lock)
-        match locked_hook_step(env, rec, stamp) {
-            Ok(None) => {}
-            Ok(Some(why)) => return finish(env, rec, stored, row, LaneState::Conflict, &why, stamp, report),
+        let unit = match locked_hook_step(env, rec, stamp, stored) {
+            Ok(u) => u,
             Err(left) => {
                 report.left.push((rec.id.clone(), left));
                 return Ok(None);
             }
+        };
+        if let Some(why) = unit.conflict {
+            return finish(env, rec, stored, row, LaneState::Conflict, &why, stamp, report);
         }
         row.merge = None;
         // IG3: "already there" because THIS lane applied R and stopped before its row (evidence: its own
@@ -1483,30 +1493,66 @@ fn decide_pending(
     apply_general(env, stored, row, rec, &positions, prev_applied, bound, stamp, report)
 }
 
-/// The hook lines of a hook-unregistration repair in this lane (X1 / Y1): `None` = done (or none);
-/// `Some(why)` = the step's error (Y2(c) → 충돌).
-fn hook_step(env: &LaneEnv<'_>, rec: &RepairRecord) -> Option<String> {
+/// The hook unit of a hook-unregistration repair in this lane (X1 / Y1 · IZ1 (b)): T6's hook step with
+/// `guard` run right before its first durable write.
+fn hook_step(env: &LaneEnv<'_>, rec: &RepairRecord, guard: &dyn Fn() -> Result<(), String>) -> HookOutcome {
     if ledger::hook_lines(rec).next().is_none() {
-        return None;
+        return HookOutcome::Nothing;
     }
-    match (env.hooks)(&rec.id, env.op.lane, HookStep::Unregister) {
-        Ok(_) => None,
-        Err(e) => Some(format!("훅 등록 해제를 이 부서에서 마치지 못했습니다 — {e:?}")),
+    match (env.hooks)(&rec.id, env.op.lane, HookStep::Unregister, guard) {
+        Ok(HookUnitEnd::Nothing) => HookOutcome::Nothing,
+        Ok(HookUnitEnd::Refused(why)) => HookOutcome::Refused(why),
+        Ok(HookUnitEnd::Ran { op, lines, result: Ok(_) }) => HookOutcome::Done(format!("이 부서의 훅 등록을 해제했습니다(작업 {op}: {})", lines.join(", "))),
+        Ok(HookUnitEnd::Ran { op, lines, result: Err(e) }) => {
+            HookOutcome::FailedAfter(format!("이 부서의 훅 등록 해제를 시작했으나 마치지 못했습니다(작업 {op}: {}) — {e:?}", lines.join(", ")))
+        }
+        Err(e) => HookOutcome::FailedBefore(format!("훅 등록 해제를 이 부서에서 마치지 못했습니다(아무것도 바꾸지 않음) — {e:?}")),
     }
 }
 
-/// The hook step of a repair with hook lines, run under the TRIED pack-apply lock after the record was
-/// read again (IK3 / IG5): `Ok(None)` done (or nothing to do), `Ok(Some(why))` the step's error (→ 충돌),
-/// `Err(why)` not run this tick (the lock held, the record changed) — the row stays as it was.
-fn locked_hook_step(env: &LaneEnv<'_>, rec: &RepairRecord, stamp: &Stamp) -> Result<Option<String>, String> {
+/// How the hook unit of a decision ended (RULINGS IZ1 (b) / JA1).
+enum HookOutcome {
+    /// R names no hook line.
+    Nothing,
+    /// The guard refused right before the unit's first durable write: nothing was written.
+    Refused(String),
+    /// Failed before any durable write (the dry run or the settings could not be measured).
+    FailedBefore(String),
+    /// The unit began AND finished its writes — this sentence is its trace (the operation, what changed).
+    Done(String),
+    /// The unit began its writes and did not finish them — its trace (the operation, the error).
+    FailedAfter(String),
+}
+
+/// The guard of a hook unit: the decision's stamp measured again (strict) — run by T6's hook step after
+/// its dry run and its settings measurement, right before its first durable write (IZ2).
+fn stamp_guard<'s>(env: &'s LaneEnv<'_>, rec: &'s RepairRecord, stamp: &'s Stamp) -> impl Fn() -> Result<(), String> + 's {
+    move || stamp.holds(env, rec, true).map_err(str::to_string)
+}
+
+/// What `locked_hook_step` did: `conflict` = the unit failed (the caller publishes 충돌, validated).
+#[derive(Default)]
+struct HookUnitDone {
+    conflict: Option<String>,
+}
+
+/// The hook unit of the "already there" arm and of `recheck` (IZ1 (b)), inside the tried pack-apply
+/// lock: T6's hook step runs with the stamp guard (validated after its dry run, right before its first
+/// durable write); a unit that began writing leaves its trace on the row inside the SAME lock (JA1).
+/// `Err(why)` = not run (the lock held, the stamp changed before the unit's first write): nothing written.
+fn locked_hook_step(env: &LaneEnv<'_>, rec: &RepairRecord, stamp: &Stamp, _stored: Option<&LaneRecord>) -> Result<HookUnitDone, String> {
     if ledger::hook_lines(rec).next().is_none() {
-        return Ok(None);
+        return Ok(HookUnitDone::default());
     }
-    let ran = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || {
-        // IV1: the hook step writes (the registrar, the lane's tombstones) only after the decision's
-        // stamp was measured again inside this lock
-        stamp.holds(env, rec, true).map_err(str::to_string)?;
-        Ok(hook_step(env, rec))
+    let ran = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || -> Result<HookUnitDone, String> {
+        let guard = stamp_guard(env, rec, stamp);
+        match hook_step(env, rec, &guard) {
+            HookOutcome::Nothing => Ok(HookUnitDone::default()),
+            HookOutcome::Refused(why) => Err(why),
+            HookOutcome::FailedBefore(why) => Ok(HookUnitDone { conflict: Some(why), ..HookUnitDone::default() }),
+            HookOutcome::Done(_) => Ok(HookUnitDone::default()),
+            HookOutcome::FailedAfter(why) => Ok(HookUnitDone { conflict: Some(why) }),
+        }
     });
     match ran {
         Ok(Some(r)) => r,
@@ -2010,13 +2056,16 @@ fn door_phase(
         }
     }
     if ledger::hook_lines(rec).next().is_some() {
-        if let Err(why) = stamp.holds(env, rec, true) {
-            return changed(&done, why);
+        // IZ1 (b) / IZ2: the hook unit validates the stamp ITSELF — after its dry run and its settings
+        // measurement, right before its first durable write
+        let guard = stamp_guard(env, rec, stamp);
+        match hook_step(env, rec, &guard) {
+            HookOutcome::Nothing => {}
+            HookOutcome::Refused(why) => return changed(&done, if why == RECORD_CHANGED { RECORD_CHANGED } else { STATES_CHANGED }),
+            HookOutcome::FailedBefore(why) => return Ok(DoorEnd::Conflict(why)),
+            HookOutcome::Done(trace) => done.push(trace),
+            HookOutcome::FailedAfter(why) => return Ok(DoorEnd::Conflict(why)),
         }
-        if let Some(why) = hook_step(env, rec) {
-            return Ok(DoorEnd::Conflict(why));
-        }
-        done.push("훅 등록 해제".into());
     }
     if let Err(why) = stamp.holds(env, rec, true) {
         return changed(&done, why);
@@ -2058,7 +2107,13 @@ fn door_phase(
 /// not what R is now) — with the reason naming the targets already changed and the live states
 /// (`conflict_live`). Nothing is put back, nothing further is written; the lane's worker merges it.
 fn changed_midway(env: &LaneEnv<'_>, stored: Option<&LaneRecord>, row: &LaneRecord, rec: &RepairRecord, done: &[String], cause: &str) -> Result<DoorEnd, RepairError> {
-    let what = if cause == RECORD_CHANGED { "수리 기록이 바뀌었습니다(대체·다시 확정·되돌림)" } else { "이 부서의 대상 파일·팩 세대·팩 식별 중 하나가 바뀌었습니다" };
+    let what = if cause == RECORD_CHANGED {
+        "수리 기록이 바뀌었습니다(대체·다시 확정·되돌림)"
+    } else if cause == STATES_CHANGED {
+        "이 부서의 대상 파일·팩 세대·팩 식별 중 하나가 바뀌었습니다"
+    } else {
+        cause
+    };
     let why = format!(
         "이 부서에 적용하는 도중 {what} — 이미 바꾼 대상: {} · 나머지 대상은 바꾸지 않았고 아무것도 되돌리지 않았습니다 — 이 부서의 워커가 합칩니다(cys repair status {})",
         done.join(", "),
@@ -2138,14 +2193,17 @@ pub fn recheck_lane_in(
     let stamp = Stamp::take(env, &rec, Some(&live));
     #[cfg(test)]
     seam(&AFTER_DECISION, env.op.pack);
-    let mut row = stored.clone();
-    // the hook step (it writes the registrar's file and the lane's tombstones) inside the tried lock,
-    // after the stamp was measured again — never with no lock or before the record was read again
-    match locked_hook_step(env, &rec, &stamp) {
-        Ok(None) => {}
-        Ok(Some(why)) => return Err(RepairError::CheckFailed(why)),
-        Err(why) => return Err(RepairError::Locked(format!("{}: {why} — 다시 하세요", id.as_str()))),
+    // the hook unit (it writes the registrar's file and the lane's tombstones) inside the tried lock;
+    // T6's hook step runs the stamp guard after its dry run, right before its first durable write (IZ2);
+    // a unit that began writing leaves its trace on the row in the same lock (JA1)
+    let unit = match locked_hook_step(env, &rec, &stamp, Some(&stored)) {
+        Ok(u) => u,
+        Err(why) => return Err(RepairError::Locked(format!("{}: {why} — 아무것도 쓰지 않았습니다. 다시 하세요", id.as_str()))),
+    };
+    if let Some(why) = unit.conflict {
+        return Err(RepairError::CheckFailed(why));
     }
+    let mut row = stored.clone();
     let refused = |p: Published| -> RepairError {
         let why = match p {
             Published::RecordChanged => RECORD_CHANGED.to_string(),
