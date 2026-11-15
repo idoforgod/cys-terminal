@@ -745,6 +745,47 @@ fn a_slot_holds(r: &Rig, id: &RepairId, bytes: &[u8]) -> bool {
     ledger::list_slots_in(&r.root, id).iter().any(|s| walk(&s.dir, bytes))
 }
 
+/// RULINGS IG2 — a verified row of a deleting repair implies this lane's tombstone: a stop between the
+/// deletion's door operation and its tombstone; after ONE restart the target is absent ("already at the
+/// result") and the row is 검증됨 WITH the tombstone — so an update does not put the vendor file back
+/// (shown with the per-file install fed this lane's tombstones; without them it would restore the file).
+#[test]
+fn a_stop_between_the_deletion_and_its_tombstone_is_completed_at_the_next_tick() {
+    let r = rig("ig2");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/gone.py", Some((b"x\n", 0o644)), None);
+    r.put(DEPT, "bin/gone.py", b"x\n", 0o644);
+    STOP_AFTER_DOOR_OP.with(|c| c.set(true));
+    let e = tick_with(&r, DEPT, &doubles(), &fid(1), &NoFaults, &|_| false).unwrap_err();
+    assert!(format!("{e:?}").contains(apply::INJECTED_STOP), "{e:?}");
+    assert_eq!(r.live(DEPT, "bin/gone.py"), TargetState::Absent, "the door operation was done");
+    assert!(crate::repair::tombstones::load_in(&r.root, &lane(DEPT)).unwrap().is_empty(), "the stop fell before the tombstone");
+    // one restart
+    tick(&r, DEPT, &doubles(), &fid(1));
+    assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Verified);
+    let ts = crate::repair::tombstones::load_in(&r.root, &lane(DEPT)).unwrap();
+    assert!(ts.iter().any(|t| t.rel == "bin/gone.py" && t.repair == id), "{ts:?}");
+    // an update: the install honours the lane's tombstone (and, as the control, restores without it)
+    let item = vec![("bin/gone.py", "x\n")];
+    let with = crate::pack::UpdateSources::none().with_tombstones(ts);
+    crate::pack::install_into_with(r.dept.clone(), item.clone(), false, "0.15.0", false, false, crate::pack::PackScope::Dept, None, None, &with).unwrap();
+    assert_eq!(r.live(DEPT, "bin/gone.py"), TargetState::Absent, "the update does not put the file back");
+    crate::pack::install_into_with(r.dept.clone(), item, false, "0.15.0", false, false, crate::pack::PackScope::Dept, None, None, &crate::pack::UpdateSources::none()).unwrap();
+    assert!(matches!(r.live(DEPT, "bin/gone.py"), TargetState::File { .. }), "control: without the tombstone the install restores it");
+}
+
+/// IG2: a lane that was at the deleting repair's result from the start gets the tombstone too.
+#[test]
+fn a_lane_already_at_a_deletions_result_gets_the_tombstone() {
+    let r = rig("ig2b");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/gone.py", Some((b"x\n", 0o644)), None);
+    tick(&r, DEPT, &doubles(), &fid(1));
+    assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Verified);
+    let ts = crate::repair::tombstones::load_in(&r.root, &lane(DEPT)).unwrap();
+    assert!(ts.iter().any(|t| t.rel == "bin/gone.py" && t.repair == id), "{ts:?}");
+}
+
 /// RULINGS HH1 (C11 11.3, design 4-14 "알려진 원본 판과 바이트까지 같을 때만"): a deletion where this
 /// lane's bytes are not the origin's pre-image but ARE a known vendor version (`Recorded::released` —
 /// `pack::released_bytes`) → the file is moved into a fresh vault slot, tombstoned in THIS lane's

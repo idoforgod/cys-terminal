@@ -1037,6 +1037,10 @@ fn check_live(
         Ok(t) => t,
         Err(why) => return finish(env, rec, stored, row, LaneState::Conflict, &format!("이 부서의 검사 실패 — {why}"), report),
     };
+    // IG2: a verified row of a deleting repair implies this lane's tombstones (also "already there")
+    if let Err(why) = ensure_tombstones(env, rec) {
+        return finish(env, rec, stored, row, LaneState::Conflict, &why, report);
+    }
     row.applied = rec.committed.clone();
     if merge.is_some() {
         row.merge = merge;
@@ -1194,6 +1198,32 @@ fn locked_hook_step(env: &LaneEnv<'_>, rec: &RepairRecord) -> Result<Option<Stri
         Ok(None) => Err(LOCK_BUSY_ROW.to_string()),
         Err(why) => Err(format!("팩 적용 잠금을 확인할 수 없습니다 — {why}")),
     }
+}
+
+/// RULINGS IG2 — an applied / verified row of a DELETING repair implies THIS lane's tombstone: every
+/// deletion of R (a pre-image present, the committed result absent) whose target is absent here is
+/// recorded in this lane's file — idempotently (`tombstones::record_in` keeps one entry), also when the
+/// lane was at the result from the start or a stop fell between the door operation and its tombstone
+/// (else the next update would put the vendor file back). `Err` = the reason (→ 충돌).
+fn ensure_tombstones(env: &LaneEnv<'_>, rec: &RepairRecord) -> Result<(), String> {
+    for f in ledger::file_targets(rec) {
+        if f.pre == ledger::PreImage::Absent || result_state(rec, &f.rel)? != TargetState::Absent {
+            continue;
+        }
+        let live = TargetState::read(&env.op.pack.join(&f.rel)).map_err(|e| format!("{}: 읽을 수 없습니다 — {e:?}", f.rel))?;
+        if live != TargetState::Absent {
+            continue;
+        }
+        let t = super::tombstones::Tombstone { rel: f.rel.clone(), kind: super::tombstones::TombstoneKind::File, repair: rec.id.clone() };
+        super::tombstones::record_in(env.op.root, env.op.lane, &t).map_err(|e| format!("{}: 삭제 표식(묘비) 기록 실패 — {e:?}", f.rel))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only (IG2): a stop right after a door operation completed, before its tombstone.
+    pub(crate) static STOP_AFTER_DOOR_OP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// How the door phase of one repair ended (IK3 / IG5 — everything here ran under ONE tried lock).
@@ -1635,6 +1665,10 @@ fn door_phase(
             ApplyOutcome::Superseded(m) => return Ok(DoorEnd::Left(format!("{rel}: {m}"), true)),
             ApplyOutcome::Declined(m) => return Ok(DoorEnd::Conflict(format!("{rel}: {m}"))),
         }
+        #[cfg(test)]
+        if STOP_AFTER_DOOR_OP.with(|c| c.replace(false)) {
+            return Err(RepairError::Io(format!("{} after the door operation of {rel}", apply::INJECTED_STOP)));
+        }
         // B1 / AD3: a real deletion is tombstoned in THIS lane's own file
         let pre_present = ledger::file_targets(rec).find(|f| f.rel == *rel).is_some_and(|f| f.pre != ledger::PreImage::Absent);
         if result == TargetState::Absent && pre_present {
@@ -1655,6 +1689,10 @@ fn door_phase(
     }
     if !record_unchanged(env, rec) {
         return Ok(changed(&done));
+    }
+    // IG2: an applied row of a deleting repair implies this lane's tombstones
+    if let Err(why) = ensure_tombstones(env, rec) {
+        return Ok(DoorEnd::Conflict(why));
     }
     // 적용됨, durably, before this lane's own check (a stop here is resumed by the next tick's check)
     let mut row = row.clone();
