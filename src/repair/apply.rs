@@ -445,6 +445,14 @@ impl Bound {
             Bound::Unknown => None,
         }
     }
+    /// The version this binding names, for a sentence — "unknown" when Unknown (RULINGS IE1: the
+    /// one observation's own value is said; EN3: the one place a generation becomes text).
+    pub fn version_label(&self) -> String {
+        match self {
+            Bound::Known(g) => g.version.clone(),
+            Bound::Unknown => "unknown".to_string(),
+        }
+    }
     /// Whether this is the free-channel generation of release `version` (the binary's own).
     pub fn is_release(&self, version: &str) -> bool {
         matches!(self, Bound::Known(g) if g.pro_revision.is_none() && g.version == version)
