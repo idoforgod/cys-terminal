@@ -3106,6 +3106,7 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("types.rs", "lane_pack_roots", "outside", 2, "another track's file, not changed by T6"),
     ("types.rs", "link_count", "outside", 2, "another track's file, not changed by T6"),
     ("types.rs", "link_target_refusal", "outside", 2, "another track's file, not changed by T6"),
+    ("types.rs", "read", "conservative", 1, "T6b IW1: the length of a file found over the limit while it is read cannot be re-read → the bytes already counted (more than the limit); the state is over the limit either way"),
     ("types.rs", "repair_number", "outside", 1, "another track's file, not changed by T6"),
     ("vault.rs", "basename", "not-a-read", 1, "a path's last part"),
     ("vault.rs", "build_slot", "not-a-read", 1, "the clock"),
@@ -3509,11 +3510,14 @@ fn sparse_file(p: &Path, len: u64) {
     std::fs::File::create(p).unwrap().set_len(len).unwrap();
 }
 
-/// IG1: `TargetState::read` takes at most RECORD_READ_CAP + 1 bytes from ONE handle — a file of
-/// exactly the limit is read; one byte over is refused before any byte is read (the sentence names the
-/// limit); a file that grows while it is read (within the limit, or past it) is refused — never a state
-/// of a prefix — and never more than the limit + 1 bytes are taken. Without IG1 every case was hashed to
-/// its end.
+/// IG1 / IW1: `TargetState::read` takes at most RECORD_READ_CAP + 1 bytes from ONE handle — a file of
+/// exactly the limit is read; a file one byte over the limit is a MEASURED state (IW1: "over the
+/// limit", the limit and its length in its canon, equal to no recorded state) with no byte of it read;
+/// a file that grows past the limit while it is read is the same state after at most the limit + 1
+/// bytes; a file whose size changes within the limit while it is read gives no state (an error — read
+/// again later). Before IW1 the two over-limit cases were errors (old expectations:
+/// `TargetState::read(&over).expect_err("one byte over the limit")` naming the limit, and
+/// `got.is_err()` for both growth cases).
 #[test]
 fn a_target_is_read_within_the_one_limit() {
     use crate::repair::durable::{read_seam, RECORD_READ_CAP as CAP};
@@ -3524,9 +3528,10 @@ fn a_target_is_read_within_the_one_limit() {
     assert_eq!(read_seam::bytes_read_from(&at), CAP);
     let over = r.pack.join("hooks/over.sh");
     sparse_file(&over, CAP + 1);
-    let e = format!("{:?}", TargetState::read(&over).expect_err("one byte over the limit"));
-    assert!(e.contains(&CAP.to_string()), "the sentence names the limit: {e}");
-    assert_eq!(read_seam::bytes_read_from(&over), 0, "refused before any byte is read");
+    let st = TargetState::read(&over).expect("a measured state");
+    assert!(st.is_over_limit(), "{st:?}");
+    assert!(st.canon().contains(&CAP.to_string()) && st.canon().contains(&(CAP + 1).to_string()), "the limit and the length are said: {}", st.canon());
+    assert_eq!(read_seam::bytes_read_from(&over), 0, "no byte of it is read");
     for (tag, grow_to) in [("within", 100u64), ("past", CAP * 4)] {
         let g = r.pack.join(format!("hooks/grow-{tag}.sh"));
         sparse_file(&g, 10);
@@ -3538,7 +3543,10 @@ fn a_target_is_read_within_the_one_limit() {
         })));
         let got = TargetState::read(&g);
         read_seam::set_after_open(None);
-        assert!(got.is_err(), "{tag}: a file that grew while it was read gives no state: {got:?}");
+        match tag {
+            "within" => assert!(got.is_err(), "{tag}: a size changed within the limit gives no state: {got:?}"),
+            _ => assert!(got.as_ref().is_ok_and(|s| s.is_over_limit()), "{tag}: grown past the limit — the measured state: {got:?}"),
+        }
         assert!(read_seam::bytes_read_from(&g) <= CAP + 1, "{tag}: at most the limit + 1 bytes");
     }
 }
@@ -3615,9 +3623,11 @@ fn an_approved_candidate_replaced_by_an_over_limit_file_is_refused_unread() {
     assert!(rec.approval.is_some(), "the approval did not move");
 }
 
-/// IG1 through the approved apply: a LIVE target over the limit when the apply measures it (step 0)
-/// — the apply is refused without reading it, nothing is displaced, the exclusion is free, the record
-/// and its approval did not move. Without IG1 the live file was hashed to its end under the exclusion.
+/// IG1 / IW1 through the approved apply: a LIVE target over the limit when the apply measures it (step
+/// 0) is ANOTHER writer's bytes (a measured difference) — the apply declines without reading it, the
+/// approval void (the accepted path for a live file that is not the pre-image), nothing displaced, the
+/// exclusion free. Before IW1 (old expectation): `res.expect_err("the apply is refused")` naming the
+/// limit, the record still `AwaitingApproval` with its approval.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_live_target_over_the_limit_refuses_the_apply_unread() {
@@ -3636,20 +3646,19 @@ fn a_live_target_over_the_limit_refuses_the_apply_unread() {
     ledger::write_record_in(&r.root, &rec).unwrap();
     let live = r.pack.join("hooks/g.sh");
     std::fs::OpenOptions::new().write(true).open(&live).unwrap().set_len(CAP + 1).unwrap();
+    let before = read_seam::bytes_read_from(&live);
     let lock = r.base.join(".pack-apply.lock");
     let env = r.env(&NoFaults, ApplyForm::Exchange);
     let res = crate::pack_apply_lock::with_apply_lock(&lock, || {
         apply_candidate_in(&env, &id, &[CandidateFile { rel: "hooks/g.sh".into(), staged: staging.clone(), mode: 0o644 }], &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock)
     })
     .unwrap();
-    let e = format!("{:?}", res.expect_err("the apply is refused"));
-    assert!(e.contains(&CAP.to_string()), "the limit is named: {e}");
-    assert_eq!(read_seam::bytes_read_from(&live), 0, "the live file is never read");
+    let rep = res.expect("the accepted path: a decline");
+    assert!(matches!(rep.outcome, ApplyOutcome::Declined(ref m) if m.contains("살아 있는 파일이 수리를 시작할 때와 다릅니다")), "{rep:?}");
+    assert_eq!(read_seam::bytes_read_from(&live) - before, 0, "the live file is never read");
     assert_eq!(std::fs::metadata(&live).unwrap().len(), CAP + 1, "nothing displaced");
     assert_eq!(crate::pack_apply_lock::try_with_apply_lock(&lock, || ()).unwrap(), Some(()), "the exclusion is free");
-    let rec = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
-    assert_eq!(rec.state, RepairState::AwaitingApproval, "the record did not move");
-    assert!(rec.approval.is_some(), "the approval did not move");
+    assert!(ledger::read_record_in(&r.root, &id).unwrap().unwrap().approval.is_none(), "the approval is void");
 }
 
 /// IV5 (reviewer1 on T7b, M4): the pack's generation marker is read inside the pack-apply exclusion,
@@ -3701,6 +3710,81 @@ fn the_generation_marker_is_read_within_the_one_limit_and_never_waited_for() {
     drop(release);
     assert_eq!(checked, Bound::Unknown, "a FIFO marker is unknown at once");
     assert_eq!(plain, "unknown");
+}
+
+/// IW1 (codex T6b r2 M2) — the reviewer's sequence to its END: an approved apply placed A and B and
+/// stopped (a crash) before it finished; B then grows past the engine's read limit; the restart's
+/// recovery puts A back (it still holds this attempt's own bytes), keeps B as another writer's bytes
+/// (a measured difference — its length exceeds the limit), records the intent `incomplete`; a second
+/// start does nothing more. Without IW1 the bounded read of B was an ERROR: the recovery stopped there,
+/// never undid A, and repeated at every start.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_target_grown_past_the_limit_is_kept_as_a_conflict_and_the_rest_undone() {
+    use crate::repair::durable::RECORD_READ_CAP as CAP;
+    let r = rig("iw1grow");
+    let id = rid("R-41");
+    let files = two_target_candidate(&r, &id);
+    let faults = StopOn { rel: "hooks/a2.sh", point: Point::BeforeDone, fired: Cell::new(false) };
+    assert!(apply_candidate_in(&r.env(&faults, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
+    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    resume_interrupted_in(&calm).unwrap();
+    assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"NEW-1\n");
+    // B grows past the limit before the restart's recovery
+    let b = r.pack.join("hooks/a2.sh");
+    std::fs::OpenOptions::new().write(true).open(&b).unwrap().set_len(CAP + 1).unwrap();
+    let lines = recover_apply_intents_in(&calm, &no_repair_lock);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("충돌") && lines[0].contains(&CAP.to_string()), "the conflict names the limit: {lines:?}");
+    assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"PRE-1\n", "A is back");
+    assert_eq!(std::fs::metadata(&b).unwrap().len(), CAP + 1, "B is kept");
+    assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "incomplete");
+    // a second start does nothing more
+    assert!(recover_apply_intents_in(&calm, &no_repair_lock).is_empty());
+    assert_eq!(std::fs::metadata(&b).unwrap().len(), CAP + 1);
+    assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "incomplete");
+}
+
+/// IW1: a REAL read failure still decides nothing — B cannot be opened (no permission): the
+/// recovery says so and changes nothing (A keeps this attempt's bytes, the intent stays `applying`);
+/// once B can be read again, the next recovery finishes as usual.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_real_read_failure_still_decides_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = rig("iw1perm");
+    let id = rid("R-42");
+    let files = two_target_candidate(&r, &id);
+    let faults = StopOn { rel: "hooks/a2.sh", point: Point::BeforeDone, fired: Cell::new(false) };
+    assert!(apply_candidate_in(&r.env(&faults, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
+    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    resume_interrupted_in(&calm).unwrap();
+    let b = r.pack.join("hooks/a2.sh");
+    let mode = std::fs::metadata(&b).unwrap().permissions().mode();
+    std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let lines = recover_apply_intents_in(&calm, &no_repair_lock);
+    std::fs::set_permissions(&b, std::fs::Permissions::from_mode(mode)).unwrap();
+    assert!(lines.iter().any(|l| l.contains("정리하지 못했습니다")), "{lines:?}");
+    assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"NEW-1\n", "nothing decided");
+    assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "applying");
+    let lines = recover_apply_intents_in(&calm, &no_repair_lock);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"PRE-1\n");
+    assert_eq!(std::fs::read(&b).unwrap(), b"PRE-2\n");
+    assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "undone");
+}
+
+/// IW1: `begin` on a file over the engine's read limit is refused with the limit named — the ledger
+/// never records such a state (so an over-limit state equals no recorded state).
+#[test]
+fn begin_refuses_a_file_over_the_limit() {
+    use crate::repair::durable::RECORD_READ_CAP as CAP;
+    let r = rig("iw1begin");
+    let id = rid("R-43");
+    let big = r.pack.join("hooks/big.sh");
+    sparse_file(&big, CAP + 1);
+    let e = format!("{:?}", ledger::copy_preimage_in(&r.root, &id, &r.lane, "hooks/big.sh", &big, 1.0).expect_err("refused"));
+    assert!(e.contains(&CAP.to_string()), "the limit is named: {e}");
 }
 
 // ───────────────────────────── RULINGS IL2 — what reaches another department ─────────────────────────────

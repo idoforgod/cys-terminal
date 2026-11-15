@@ -1970,10 +1970,10 @@ fn one_observation_of_the_generation_decides() {
 
 // ───────────────────────────── RULINGS IE4 / IG1 — the engine's one bound on what it reads ─────────────────────────────
 
-/// IG1: a LIVE target over the engine's read limit at the probation re-check — none of it is read;
-/// nothing is closed, no check runs, nothing is moved, the record keeps its state; the fault is
-/// reported with the limit (and retried at the next tick). Without IG1 the file was hashed to its end
-/// and the probation closed 대체됨.
+/// IG1 / IW1: a LIVE target over the engine's read limit at the probation re-check is ANOTHER writer's
+/// bytes (a measured difference): the probation closes 대체됨 without reading it, no check runs, nothing
+/// is moved, the record is superseded. Before IW1 (old expectation): nothing closed, the record still
+/// `Probation`, a fault line naming the limit (retried every tick).
 #[test]
 fn a_live_target_over_the_limit_is_never_read_by_the_recheck() {
     use crate::repair::durable::{read_seam, RECORD_READ_CAP as CAP};
@@ -1982,15 +1982,17 @@ fn a_live_target_over_the_limit_is_never_read_by_the_recheck() {
     committed_general(&r, &a, "hooks/s.sh", Some(b"OLD\n"), Some(b"REPAIRED\n"));
     let live = r.pack.join("hooks/s.sh");
     std::fs::OpenOptions::new().write(true).open(&live).unwrap().set_len(CAP + 1).unwrap();
+    let before = read_seam::bytes_read_from(&live);
     let never = |_: &str, _: &Path, _: Duration| -> Result<CheckOutcome, RepairError> { panic!("no check") };
     let d = Doubles { check: &never, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
     let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
-    assert_eq!(read_seam::bytes_read_from(&live), 0, "the live file is never read");
-    assert!(ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.is_none(), "nothing closed");
-    assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::Probation);
-    assert!(rep.reverted.is_empty() && rep.superseded.is_empty() && rep.ended.is_empty(), "{rep:?}");
-    assert!(rep.lines.iter().any(|l| l.contains(&CAP.to_string())), "the limit is said: {:?}", rep.lines);
+    assert_eq!(read_seam::bytes_read_from(&live) - before, 0, "the live file is never read");
+    assert_eq!(rep.superseded, vec![a.clone()], "{rep:?}");
+    let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
+    assert!(closed.starts_with("대체됨"), "{closed}");
+    assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::Superseded);
+    assert!(rep.reverted.is_empty() && rep.ended.is_empty(), "{rep:?}");
     assert_eq!(std::fs::metadata(&live).unwrap().len(), CAP + 1, "nothing moved");
 }
 
