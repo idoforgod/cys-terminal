@@ -32679,6 +32679,10 @@ mod tests {
         use std::io::Write;
         let Ok(mode) = std::env::var("CYS_B428_U9_CHILD") else { return };
         let base = std::env::temp_dir().join(format!("cys-b428-u9-{}", std::process::id()));
+        // ★(0.15.0 · S5-PINS 9/9 · RULINGS HY1 · DEFERRED #144) start from an EMPTY folder of our own: pids are reused and the
+        //   temp folder is shared by every run, so an older run's folder under this pid (its `.pack-state.json` 2.0.0 beside the
+        //   `.pack-version` this run writes) made the command refuse with "pack-state-mismatch". Removed again before we exit.
+        let _ = std::fs::remove_dir_all(&base);
         let pack = base.join("pack");
         let from = base.join("from");
         std::fs::create_dir_all(&pack).unwrap();
@@ -32774,6 +32778,8 @@ mod tests {
         std::io::stderr().flush().unwrap();
         #[cfg(unix)]
         drop(node_daemon);
+        // the parent asserts on this process's stdout and exit code only — nothing it checks lives in `base`
+        let _ = std::fs::remove_dir_all(&base);
         std::process::exit(rc);
     }
 
