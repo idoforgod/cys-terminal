@@ -98,15 +98,40 @@ pub fn normalize_rel(raw: &str) -> Result<String, RepairError> {
 /// (e.g. a Unicode normal form); the identities differ; or neither way gives a name (a pack folder that
 /// can be neither listed nor resolved — a broken installation). Nothing is refused here.
 pub fn on_disk_rel(pack: &Path, rel: &str) -> String {
-    on_disk_case_alias(pack, rel).unwrap_or_else(|| rel.to_string())
+    on_disk_case_alias(pack, rel, &list_names).unwrap_or_else(|| rel.to_string())
 }
 
-/// [`on_disk_rel`]'s answer when it differs from the typed rel (None = keep the typed rel).
-fn on_disk_case_alias(pack: &Path, rel: &str) -> Option<String> {
+/// A folder's names, or None when the listing could not be opened or read to its END (RULINGS KM1).
+type Lister<'a> = dyn Fn(&Path) -> Option<Vec<String>> + 'a;
+
+/// The product's [`Lister`]: `read_dir` through [`names_of`].
+fn list_names(dir: &Path) -> Option<Vec<String>> {
+    names_of(
+        std::fs::read_dir(dir)
+            .ok()?
+            .map(|e| e.map(|e| e.file_name().into_string().ok())),
+    )
+}
+
+/// RULINGS KM1: the names of a listing read to its end; an error from the entry iterator makes the
+/// listing INCOMPLETE (None) — never "no such name". A name that is not UTF-8 is skipped (`Ok(None)`).
+fn names_of(entries: impl Iterator<Item = std::io::Result<Option<String>>>) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for e in entries {
+        if let Some(n) = e.ok()? {
+            names.push(n);
+        }
+    }
+    Some(names)
+}
+
+/// [`on_disk_rel`]'s answer when it differs from the typed rel (None = keep the typed rel); `list` reads
+/// a folder's names (the product passes [`list_names`]).
+fn on_disk_case_alias(pack: &Path, rel: &str, list: &Lister<'_>) -> Option<String> {
     if crate::pack::listed_in_compiled_lists(rel) {
         return None;
     }
-    let real = match spelled_by_listing(pack, rel) {
+    let real = match spelled_by_listing(pack, rel, list) {
         Spelled::Name(n) => n,
         Spelled::NoName => return None,
         Spelled::Unlisted => spelled_by_canonical_path(pack, rel)?,
@@ -128,17 +153,15 @@ enum Spelled {
     Unlisted,
 }
 
-/// The first way of [`on_disk_rel`]: the directory entries, component by component.
-fn spelled_by_listing(pack: &Path, rel: &str) -> Spelled {
+/// The first way of [`on_disk_rel`]: the directory entries, component by component. Only a listing read
+/// to its end may answer "no such name"; one that could not be opened or read to its end is `Unlisted`.
+fn spelled_by_listing(pack: &Path, rel: &str, list: &Lister<'_>) -> Spelled {
     let mut dir = pack.to_path_buf();
     let mut real: Vec<String> = Vec::new();
     for typed in rel.split('/') {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Some(names) = list(&dir) else {
             return Spelled::Unlisted;
         };
-        let names: Vec<String> = entries
-            .filter_map(|e| e.ok().and_then(|e| e.file_name().into_string().ok()))
-            .collect();
         let Some(name) = entry_spelling(typed, &names) else {
             return Spelled::NoName;
         };
@@ -837,6 +860,39 @@ mod tests {
         drop(restore);
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(got, "bin/a.py");
+    }
+
+    /// WW1 (RULINGS KM1): a listing that OPENS and then fails mid-way, before the target's name, is an
+    /// incomplete listing — the canonical-path way then gives the real name (same conditions). The rule
+    /// over the entry iterator (an error after some names → incomplete; a non-UTF-8 name skipped), and the
+    /// whole map with the folder `bin`'s iterator failing after one name (the seam: the lister).
+    #[test]
+    fn ww1_km1_an_iterator_error_is_an_incomplete_listing() {
+        let io = |m: &str| std::io::Error::other(m.to_string());
+        assert_eq!(names_of(vec![Ok(Some("x".into())), Err(io("eio")), Ok(Some("a.py".into()))].into_iter()), None);
+        assert_eq!(
+            names_of(vec![Ok(Some("x".into())), Ok(None), Ok(Some("a.py".into()))].into_iter()),
+            Some(vec!["x".to_string(), "a.py".to_string()])
+        );
+        let d = tmp(34);
+        std::fs::create_dir_all(d.join("bin")).unwrap();
+        std::fs::write(d.join("bin/a.py"), b"a\n").unwrap();
+        std::fs::write(d.join("bin/b.py"), b"b\n").unwrap();
+        if !case_blind(&d) {
+            eprintln!("SKIPPED ww1_km1_…'s map half: the temporary volume distinguishes letter case");
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        let mid_way = |dir: &std::path::Path| -> Option<Vec<String>> {
+            if dir.file_name().is_some_and(|n| n == "bin") {
+                names_of(vec![Ok(Some("b.py".to_string())), Err(io("mid-way"))].into_iter())
+            } else {
+                list_names(dir)
+            }
+        };
+        let got = on_disk_case_alias(&d, "BIN/A.py", &mid_way);
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(got.as_deref(), Some("bin/a.py"));
     }
 
     /// RULINGS AW3 (a): Windows short names are refused on every system; a `~` that is not followed
