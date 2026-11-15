@@ -1090,8 +1090,10 @@ fn live_states(pack: &Path, rec: &RepairRecord) -> Result<Vec<(String, TargetSta
 }
 
 /// RULINGS IG1 / JH1 — the row sentence for a target over the engine's read limit (the limit named).
+/// RULINGS KI2: the measured length and the limit come FIRST — KF1's key is this sentence as the row keeps
+/// it (cut at 400 characters), so a long path can only shorten the path, never hide a grown file.
 fn over_limit_sentence(rel: &str, over: &Observed) -> String {
-    format!("{rel}: {} — 수리 전 내용과도 수리 결과와도 다른 파일로 잽니다(상태로 매기지 않습니다) — 이 부서의 워커가 합칩니다", over.describe())
+    format!("{} — {rel}: 수리 전 내용과도 수리 결과와도 다른 파일로 잽니다(상태로 매기지 않습니다) — 이 부서의 워커가 합칩니다", over.describe())
 }
 
 fn canon_list(states: &[(String, TargetState)]) -> Vec<(String, String)> {
