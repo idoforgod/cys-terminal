@@ -3085,7 +3085,7 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("probation.rs", "load_hand_outs", "evidence", 1, "after a checked read: absent on positive evidence"),
     ("probation.rs", "load_notice_acks", "evidence", 1, "after a checked read: absent on positive evidence"),
     ("probation.rs", "m10_sweep_full", "display", 1, "a link's target in a finding"),
-    ("probation.rs", "m10_sweep_full", "conservative", 4, "approved bytes unreadable → not recognised (the check runs) / no runner → nothing decided / no source → nothing put back"),
+    ("probation.rs", "m10_sweep_full", "conservative", 3, "approved bytes unreadable → not recognised (the check runs) / no runner → nothing decided / no source → nothing put back"),
     ("probation.rs", "probation_pass", "display", 1, "the report's path"),
     ("probation.rs", "read_job_state_in", "conservative", 4, "an unreadable job state = none: every pass due (more work, never less); it holds no duty"),
     ("probation.rs", "recheck_one", "display", 1, "the fault point's path"),
@@ -3650,6 +3650,57 @@ fn a_live_target_over_the_limit_refuses_the_apply_unread() {
     let rec = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
     assert_eq!(rec.state, RepairState::AwaitingApproval, "the record did not move");
     assert!(rec.approval.is_some(), "the approval did not move");
+}
+
+/// IV5 (reviewer1 on T7b, M4): the pack's generation marker is read inside the pack-apply exclusion,
+/// so it is read through the engine's one bounded reader — a marker over the limit is "unknown" without
+/// a byte of it read; a FIFO at its name (a writer offering a VALID marker to every reader) is "unknown"
+/// at once, never waited for. Without IV5 the old read took the oversized marker whole as a version and
+/// waited on the FIFO for its writer (here: got the writer's valid version).
+#[cfg(unix)]
+#[test]
+fn the_generation_marker_is_read_within_the_one_limit_and_never_waited_for() {
+    use crate::repair::durable::{read_seam, RECORD_READ_CAP as CAP};
+    use std::io::Write;
+    let r = rig("iv5");
+    let marker = r.pack.join(".pack-version");
+    assert!(Bound::now(&r.pack).known().is_some());
+    std::fs::remove_file(&marker).unwrap();
+    sparse_file(&marker, CAP + 1);
+    let before = read_seam::bytes_read_from(&marker); // the first read above took the small marker
+    assert_eq!(Bound::now(&r.pack), Bound::Unknown, "an oversized marker is unknown");
+    assert_eq!(pack_generation(&r.pack).version, "unknown");
+    assert_eq!(read_seam::bytes_read_from(&marker) - before, 0, "never read");
+    std::fs::remove_file(&marker).unwrap();
+    let c = std::ffi::CString::new(marker.to_str().unwrap()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (w_stop, w_at) = (std::sync::Arc::clone(&stop), marker.clone());
+    let writer = std::thread::spawn(move || {
+        // each open waits for a reader of the FIFO and serves it a valid marker; it ends when told to
+        // or when the name no longer holds the FIFO
+        use std::os::unix::fs::FileTypeExt;
+        while !w_stop.load(std::sync::atomic::Ordering::SeqCst) && std::fs::symlink_metadata(&w_at).is_ok_and(|m| m.file_type().is_fifo()) {
+            match std::fs::OpenOptions::new().write(true).open(&w_at) {
+                Ok(mut f) => {
+                    let _ = f.write_all(b"0.15.0\n");
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let checked = Bound::now(&r.pack);
+    let plain = pack_generation(&r.pack).version;
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let release = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&marker).unwrap()
+    };
+    writer.join().unwrap();
+    drop(release);
+    assert_eq!(checked, Bound::Unknown, "a FIFO marker is unknown at once");
+    assert_eq!(plain, "unknown");
 }
 
 // ───────────────────────────── RULINGS IL2 — what reaches another department ─────────────────────────────

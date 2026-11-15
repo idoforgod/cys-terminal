@@ -325,6 +325,21 @@ pub(crate) fn stop(p: Point) -> RepairError {
     RepairError::Io(format!("{INJECTED_STOP} at {p:?}"))
 }
 
+/// RULINGS IV5 — `.pack-version` read through the engine's ONE bounded reader (a regular file, a
+/// non-blocking open that follows no link, one handle, at most the limit + 1 bytes): a missing,
+/// special, unreadable or oversized marker is an error at once — never a wait (the generation is read
+/// inside the pack-apply exclusion). The state file is read by the pack's own bounded start reader
+/// (`pack::read_pack_state` → `read_start_meta`: the same four properties, its own limit).
+fn read_pack_version(pack: &Path) -> Result<String, String> {
+    match super::durable::read_record_bytes(&pack.join(".pack-version")) {
+        super::durable::RecordRead::Bytes(b) => String::from_utf8(b)
+            .map(|s| s.trim().to_string())
+            .map_err(|e| format!(".pack-version: {e}")),
+        super::durable::RecordRead::NotFound => Err(".pack-version: 없음".into()),
+        super::durable::RecordRead::Unreadable(why) => Err(format!(".pack-version: {why}")),
+    }
+}
+
 /// The pack generation of a lane's pack (C1 1.6, RULINGS O4): `.pack-version` + the pro revision
 /// (only for the pro channel — a pro revision under the same version is another generation).
 /// RULINGS FG1 — the pack generation with three answers: `Ok` (a readable `.pack-version`; the pro
@@ -332,10 +347,7 @@ pub(crate) fn stop(p: Point) -> RepairError {
 /// `Err` for everything else (no / unreadable / empty version, a CORRUPT state, a state whose
 /// `base_version` disagrees with `.pack-version`). Decisions read it through `Bound::now`.
 pub fn pack_generation_checked(pack: &Path) -> Result<PackGeneration, String> {
-    let version = std::fs::read_to_string(pack.join(".pack-version"))
-        .map_err(|e| format!(".pack-version: {e}"))?
-        .trim()
-        .to_string();
+    let version = read_pack_version(pack)?;
     if version.is_empty() {
         return Err(".pack-version: 비어 있음".into());
     }
@@ -355,9 +367,7 @@ pub fn pack_generation_checked(pack: &Path) -> Result<PackGeneration, String> {
 /// The pack generation for DISPLAY and records only (the word unknown when it cannot be read —
 /// never a decision: decisions use [`Bound::now`]).
 pub fn pack_generation(pack: &Path) -> PackGeneration {
-    let version = std::fs::read_to_string(pack.join(".pack-version"))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
+    let version = read_pack_version(pack).unwrap_or_else(|_| "unknown".to_string());
     let pro_revision = match crate::pack::read_pack_state(pack) {
         crate::pack::PackStateRead::Valid(st) if st.channel == "pro" => Some(st.pro_revision),
         _ => None,
