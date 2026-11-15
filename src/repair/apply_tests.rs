@@ -3838,6 +3838,163 @@ fn the_hook_steps_settings_read_is_bounded_and_never_waits() {
     assert!(got.is_err(), "a FIFO settings file is refused at once: {got:?}");
 }
 
+/// Grows the DISPLACED inode (now the slot's payload) past the limit right after the exchange — a
+/// writer that still holds a descriptor to the file that was live (codex T6b r3 M1).
+struct GrowDisplaced {
+    rel: &'static str,
+    fired: Cell<bool>,
+}
+
+impl Faults for GrowDisplaced {
+    fn at(&self, point: Point, live: &Path, slot: Option<&Slot>) -> bool {
+        if point == Point::AfterExchange && live.ends_with(self.rel) && !self.fired.get() {
+            if let Some(s) = slot {
+                std::fs::OpenOptions::new().write(true).open(s.payload()).unwrap().set_len(crate::repair::durable::RECORD_READ_CAP + 1).unwrap();
+                self.fired.set(true);
+            }
+        }
+        false
+    }
+}
+
+/// JH1 / JH2 (codex T6b r3 M1, M2): the inode an exchange displaced grows past the limit before the
+/// seal — with a copy-on-write clone and with the byte copy: no hash of it is recorded
+/// (`meta/sealed.json` holds neither `sealed_sha256` nor `slot_sha256_at_check` for it and says
+/// "kept_unsealed" with the limit), its bytes stay in the slot as moved, nothing is re-lived from it,
+/// and the deposit refuses to be a return's source (the slot's place and the limit named) — the same
+/// answer after a restart (the record is on disk). Without JH1 / JH2 the reserved value was persisted
+/// as `sealed_sha256` and later compared as a hash.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_displaced_file_grown_past_the_limit_is_kept_unsealed_and_never_a_hash() {
+    use crate::repair::durable::RECORD_READ_CAP as CAP;
+    for byte_copy in [false, true] {
+        let r = rig("jh1grow");
+        r.put("hooks/g.sh", b"OLD\n", 0o755);
+        let (src, st) = r.source("g.sh", b"NEW\n", 0o755);
+        let faults = GrowDisplaced { rel: "hooks/g.sh", fired: Cell::new(false) };
+        crate::repair::vault::FORCE_BYTE_COPY_SEAL.with(|c| c.set(byte_copy));
+        let env = r.env(&faults, ApplyForm::Exchange);
+        let d = run_op(&env, &OpSpec {
+            id: rid("R-2"),
+            rel: "hooks/g.sh".into(),
+            kind: "apply".into(),
+            expected: Recorded::for_test(r.live("hooks/g.sh")),
+            incoming: st,
+            source: Source::Fresh(src),
+            bound: Bound::now(&r.pack),
+        });
+        crate::repair::vault::FORCE_BYTE_COPY_SEAL.with(|c| c.set(false));
+        let d = d.unwrap();
+        assert!(faults.fired.get(), "byte_copy={byte_copy}");
+        let slot = Slot::at(d.slot.as_ref().expect("the slot"), "hooks/g.sh");
+        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(slot.meta_sealed()).unwrap()).unwrap();
+        assert!(meta["sealed_sha256"].is_null(), "byte_copy={byte_copy}: no hash recorded: {meta}");
+        assert!(meta["slot_sha256_at_check"].is_null(), "byte_copy={byte_copy}: no hash recorded: {meta}");
+        assert_eq!(meta["kept_unsealed"]["limit"], serde_json::json!(CAP), "byte_copy={byte_copy}: {meta}");
+        assert_eq!(std::fs::metadata(slot.payload()).unwrap().len(), CAP + 1, "byte_copy={byte_copy}: the bytes are kept as moved");
+        assert_eq!(std::fs::read(r.pack.join("hooks/g.sh")).unwrap(), b"NEW\n", "byte_copy={byte_copy}: nothing re-lived");
+        let e = format!("{:?}", crate::repair::vault::deposit_of(&slot).expect_err("never a source"));
+        assert!(e.contains(&CAP.to_string()) && e.contains(&slot.dir.display().to_string()), "byte_copy={byte_copy}: {e}");
+    }
+}
+
+/// JH2: an approved apply of two files; the inode B's exchange displaced grows past the limit (a
+/// writer holds it) — B's operation ends superseded with its displaced bytes KEPT in its slot as moved
+/// (never re-lived, never read whole), the apply is declined and undone from the begin copies (the
+/// kept slot is not needed: A and B are back), the intent ends `undone`, and the next recovery does
+/// nothing more. Before JH2 (run jh-red) the re-live read the over-limit sealed copy and the operation
+/// ended in an ERROR — retried at every start.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_apply_whose_displaced_file_grew_past_the_limit_keeps_those_bytes_and_is_undone_once() {
+    use crate::repair::durable::RECORD_READ_CAP as CAP;
+    let r = rig("jh2undo");
+    let id = rid("R-44");
+    let files = two_target_candidate(&r, &id);
+    let faults = GrowDisplaced { rel: "hooks/a2.sh", fired: Cell::new(false) };
+    let rep = apply_candidate_in(&r.env(&faults, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).unwrap();
+    assert!(faults.fired.get());
+    let ApplyOutcome::Declined(why) = &rep.outcome else { panic!("{rep:?}") };
+    assert!(why.contains(&CAP.to_string()), "the limit is said: {why}");
+    assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"PRE-1\n", "A is back");
+    assert_eq!(std::fs::read(r.pack.join("hooks/a2.sh")).unwrap(), b"PRE-2\n", "B is back from its begin copy");
+    assert!(
+        r.slots().iter().any(|d| std::fs::metadata(d.join("payload").join("a2.sh")).is_ok_and(|m| m.len() == CAP + 1)),
+        "the grown displaced bytes are kept in their slot"
+    );
+    assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "undone");
+    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    assert!(recover_apply_intents_in(&calm, &no_repair_lock).is_empty(), "no retry");
+}
+
+/// JH2: a return whose pre-image would come from a slot kept unsealed over the limit never uses it —
+/// the revert closes 충돌 (the slot's place and the limit in the sentence) and changes nothing; the
+/// pending-revert recovery takes that target as a conflict and ends its intent `incomplete`, once.
+/// Before JH2 the slot was a source like any other (the old deposit check ignored the field).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_return_needing_a_slot_kept_over_the_limit_is_a_conflict_once() {
+    use crate::repair::durable::RECORD_READ_CAP as CAP;
+    let kept = |slot_dir: &Path| {
+        std::fs::write(
+            slot_dir.join("meta").join("sealed.json"),
+            serde_json::json!({"schema": 1, "sealed_sha256": null, "slot_sha256_at_check": null, "link_target_at_check": null,
+                "kept_unsealed": {"reason": "over the limit", "limit": CAP, "len": CAP + 1}, "sealed_at": 1.0}).to_string(),
+        )
+        .unwrap();
+    };
+    // the revert
+    let r = rig("jh2kept");
+    let id = rid("R-46");
+    let rec = committed_general(&r, &id, "hooks/k.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let PreImage::Slot { slot_dir, .. } = &rec.files[0].pre else { panic!("a pre-image slot") };
+    kept(slot_dir);
+    let rep = revert_in(&r.env(&NoFaults, ApplyForm::Exchange), &id, RevertCaller::Human, &no_hooks, &no_repair_lock).unwrap();
+    assert!(matches!(&rep.outcome, ApplyOutcome::Declined(m) if m.contains(&CAP.to_string()) && m.contains(&slot_dir.display().to_string())), "{rep:?}");
+    assert_eq!(std::fs::read(r.pack.join("hooks/k.sh")).unwrap(), b"POST\n", "nothing changed");
+    assert_eq!(ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap().state, LaneState::Conflict);
+    // the pending revert
+    let r = rig("jh2keptpending");
+    let id = rid("R-47");
+    let rec = committed_general(&r, &id, "hooks/q.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let PreImage::Slot { slot_dir, .. } = &rec.files[0].pre else { panic!("a pre-image slot") };
+    kept(slot_dir);
+    let ri = RevertIntent {
+        schema: 1,
+        repair: id.clone(),
+        lane_key: r.lane.clone(),
+        op_tag: "t".into(),
+        state: "reverting".into(),
+        targets: vec![RevertTarget { rel: "hooks/q.sh".into(), applied: r.live("hooks/q.sh").canon(), pre: rec.files[0].pre.state().canon() }],
+        has_hooks: false,
+        pack_generation: Bound::now(&r.pack).known(),
+        by: BY_DAEMON_AUTO.into(),
+        created_at: 1.0,
+        updated_at: 1.0,
+    };
+    write_revert_intent(&r.root, &ri).unwrap();
+    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let lines = recover_revert_intents_in(&env, &no_hooks, &no_repair_lock);
+    assert!(lines.iter().any(|l| l.contains(&CAP.to_string())), "{lines:?}");
+    assert_eq!(std::fs::read(r.pack.join("hooks/q.sh")).unwrap(), b"POST\n", "nothing changed");
+    assert!(recover_revert_intents_in(&env, &no_hooks, &no_repair_lock).is_empty(), "once — no retry");
+}
+
+/// JH2: the copy of the incoming bytes for the place / deposit-first forms reads through the bound —
+/// a source over the limit is refused, never read whole. Without JH2 it was `std::fs::read`.
+#[test]
+fn the_incoming_copy_is_read_within_the_one_limit() {
+    use crate::repair::durable::RECORD_READ_CAP as CAP;
+    let r = rig("jh2incoming");
+    let src = r.base.join("src-big");
+    sparse_file(&src, CAP + 1);
+    let st = TargetState::File { sha256: "0".repeat(64), mode: 0o644 };
+    let env = r.env(&NoFaults, ApplyForm::DepositFirst);
+    let got = incoming_copy(&env, &rid("R-45"), "op-jh2", &st, Some(&src));
+    assert!(got.is_err(), "over the limit: refused: {got:?}");
+}
+
 // ───────────────────────────── RULINGS IL2 — what reaches another department ─────────────────────────────
 
 /// IL2: the sentence about another department is true for the CLASS of the repair (0.15.0 has no
