@@ -105,14 +105,22 @@ def paused_evidence():
 
     측정 불능을 '정지 아님'으로 읽으면 kill-switch 가 측정 실패 한 번으로
     무력화된다 — 이 계약에서 측정 불능은 통과가 아니다.
+
+    ★(0.15.0 · RULINGS JE1 · H-05-N4-01) 파일 시스템에 **직접** 묻는다(`os.lstat`). 종전의 `os.path.exists` 는
+    모든 오류를 삼켜 False 를 돌려주므로 아래 '확인 불능' 갈래가 죽어 있었다 — 표지가 있는데 그 폴더를 읽을 수
+    없으면(EACCES) '정지 아님'으로 읽혀 배달이 나갔다. "그런 파일 없음"·"디렉터리 아님"만 '표지 없음'이고,
+    그 밖의 어떤 오류도 확인 불능 = 정지다.
     """
     hits = []
     for p in paused_paths():
         try:
-            if os.path.exists(p):
-                hits.append(p)
-        except OSError as e:
+            os.lstat(p)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except Exception as e:  # 권한 거부·입출력 오류·잘못된 경로 등 — 확인 불능 = 정지(fail-closed)
             hits.append("%s (확인 불능: %s)" % (p, e))
+            continue
+        hits.append(p)
     return bool(hits), hits
 
 # ★T-0147-2 층1 I6 — severity 등급. 순서가 곧 계약이다(코얼레싱은 **상승만**).

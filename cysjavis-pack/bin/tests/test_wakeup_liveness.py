@@ -294,6 +294,32 @@ class DrainRefusedWhilePaused(unittest.TestCase):
     def test_workspace_mark_refuses_delivery(self):
         self._assert_refused(os.path.join(self.root, "_round", "AUTOPILOT_PAUSED"))
 
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                     "a folder without search permission cannot be made here (Windows / root) — "
+                     "PausedEvidenceUnknownState measures the same rule in-process")
+    def test_unknown_pause_state_is_refused(self):
+        """RULINGS JE1 (H-05-N4-01 "확인 불능도 거부"): the owner's mark is written, then its folder loses search
+        permission, so the pause state cannot be read (stat -> EACCES). That is a pause: exit 4, nothing delivered,
+        the notices stay pending, and the evidence names the path and the error."""
+        self._queue_repair_notices()
+        before = self._pending()
+        mark = os.path.join(self.pack, "AUTOPILOT_PAUSED")
+        with open(mark, "w", encoding="utf-8") as f:
+            f.write("paused by the owner\n")
+        os.chmod(self.pack, 0)
+        try:
+            r = self._run("drain", "--deliver")
+        finally:
+            os.chmod(self.pack, 0o700)
+        self.assertEqual(r.returncode, 4, "unknown pause state must be refused: rc=%s\n%s\n%s"
+                         % (r.returncode, r.stdout, r.stderr))
+        out = json.loads([ln for ln in r.stdout.splitlines() if ln.startswith("{")][-1])
+        self.assertEqual((out["delivered"], out.get("refused")), (0, "paused"), out)
+        self.assertTrue(any(mark in ev and "확인 불능" in ev for ev in out["evidence"]),
+                        "the evidence must name the unreadable path and say 확인 불능: %r" % out["evidence"])
+        self.assertEqual(self._cys_calls(), [], "an unreadable pause state let the drain reach `cys send`")
+        self.assertEqual(self._pending(), before, "the notices must stay pending")
+
     def test_control_without_a_mark_the_same_queue_is_delivered(self):
         self._queue_repair_notices()
         r = self._run("drain", "--deliver")
@@ -304,6 +330,46 @@ class DrainRefusedWhilePaused(unittest.TestCase):
         self.assertEqual(len(calls), 1, "one digest send for the master: %r" % calls)
         self.assertEqual(calls[0], "CALL send --queued --to master", calls)
         self.assertEqual(self._pending(), [])
+
+
+
+class PausedEvidenceUnknownState(_Patched):
+    """RULINGS JE1 — `paused_evidence()` asks the file system for each mark: "no such file" / "not a directory" means no
+    mark; ANY other error means the state is unknown, and unknown is a pause (fail-closed, "확인 불능도 거부"). In-process
+    and portable: the file-system calls are made to fail with EACCES for the mark only (stat and lstat both, whichever
+    the implementation asks)."""
+
+    @staticmethod
+    def _deny_mark(real):
+        def call(path, *a, **kw):
+            if os.path.basename(os.fspath(path)) == W.PAUSED_BASENAME:
+                raise PermissionError(13, "Permission denied", os.fspath(path))
+            return real(path, *a, **kw)
+        return call
+
+    def test_unreadable_mark_counts_as_paused(self):
+        from unittest import mock
+        with mock.patch.object(W.os, "stat", self._deny_mark(os.stat)), \
+                mock.patch.object(W.os, "lstat", self._deny_mark(os.lstat)):
+            paused, evidence = W.paused_evidence()
+        self.assertTrue(paused, "an unreadable pause state was read as 'not paused'")
+        self.assertEqual(len(evidence), 2, evidence)   # both paths are unknown
+        for ev, path in zip(evidence, W.paused_paths()):
+            self.assertTrue(ev.startswith(path) and "확인 불능" in ev, ev)
+
+    def test_no_mark_and_not_a_directory_are_not_a_pause(self):
+        self.assertEqual(W.paused_evidence(), (False, []), "no mark at either path")
+        blocker = os.path.join(self.tmp, "a-file")
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("x")
+        os.environ["CYS_PACK_DIR"] = blocker          # <file>/AUTOPILOT_PAUSED -> ENOTDIR = no such mark
+        self.assertEqual(W.paused_evidence(), (False, []), "'not a directory' is 'no mark', not 'unknown'")
+
+    def test_a_present_mark_is_a_pause(self):
+        mark = W.paused_paths()[0]
+        with open(mark, "w", encoding="utf-8") as f:
+            f.write("paused\n")
+        self.assertEqual(W.paused_evidence(), (True, [mark]))
 
 
 if __name__ == "__main__":
