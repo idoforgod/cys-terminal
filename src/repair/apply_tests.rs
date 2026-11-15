@@ -3030,7 +3030,7 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("apply.rs", "resume_hook_steps_report_in", "not-a-read", 1, "a literal id"),
     ("apply.rs", "resume_hook_steps_report_in", "display", 1, "a message part"),
     ("apply.rs", "revert_in", "evidence", 1, "a row without probation → Unknown binding"),
-    ("apply.rs", "run_bounded", "not-a-read", 1, "a child's exit poll in the grace; not reaped → said and handed to the detached reap"),
+    ("apply.rs", "run_bounded_exit", "not-a-read", 1, "a child's exit poll in the grace; not reaped → said and handed to the detached reap (WY1 / RULINGS LH2: the body of `run_bounded` renamed `run_bounded_exit`, the site moved with it)"),
     ("apply.rs", "run_registrar", "not-a-read", 1, "the process environment (current executable)"),
     ("apply.rs", "second_move", "conservative", 1, "an unreadable deposit → not resumed: abandoned, only bytes the record vouches for go back"),
     ("apply.rs", "second_move", "not-a-read", 1, "the copy path, present when copy_ok"),

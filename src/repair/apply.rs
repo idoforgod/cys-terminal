@@ -4086,6 +4086,39 @@ pub fn run_registrar(pack: &Path, dry_run: bool) -> Result<String, RepairError> 
     run_bounded(cmd, RECONCILE_DEADLINE)
 }
 
+/// RULINGS LH2 — the pipes [`run_bounded_exit`] reads: stdin null, stdout and stderr piped (the same
+/// three `run_registrar` sets on its own command). The rehearsal's check children take them from here, so
+/// that `rehearsal.rs` itself configures and reads no child's standard output (RULINGS GA1).
+pub fn bounded_pipes(cmd: &mut std::process::Command) {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+}
+
+/// RULINGS LH2 — what [`run_bounded_exit`] saw of a child that ended within its deadline with nothing
+/// left behind (every pipe read to its end, nothing dropped, no member of its group alive, no problem
+/// met): its exit status, its standard output, the kept bytes of its standard error. The registrar's
+/// [`run_bounded`] judges the status as before; a check child's failure is read from its standard error.
+#[derive(Debug)]
+pub struct BoundedExit {
+    pub status: std::process::ExitStatus,
+    pub stdout: String,
+    pub stderr: Vec<u8>,
+}
+
+/// The registrar's bounded run: [`run_bounded_exit`] naming the child `등록기`, an exit other than 0 an
+/// error (every sentence as before RULINGS LH2). Returns its stdout.
+pub fn run_bounded(cmd: std::process::Command, deadline: Duration) -> Result<String, RepairError> {
+    let done = run_bounded_exit(cmd, deadline, "등록기")?;
+    if !done.status.success() {
+        return Err(RepairError::CheckFailed(format!(
+            "등록기가 실패했습니다(종료 {:?})",
+            done.status.code()
+        )));
+    }
+    Ok(done.stdout)
+}
+
 /// RULINGS CT6 / CZ10 / DR3 — THE bounded child runner of the job and of every apply (the
 /// registrar). It NEVER blocks: ONE loop with ONE deadline reads every pipe without blocking (unix:
 /// `O_NONBLOCK`; Windows: a detached reader thread whose chunks the loop takes without waiting) and
@@ -4096,13 +4129,20 @@ pub fn run_registrar(pack: &Path, dry_run: bool) -> Result<String, RepairError> 
 /// truthfully what it could not kill or reap — a child it could not reap is left to a detached reap
 /// thread (the caller never waits for it) — and what it received. The child should lead its own
 /// process group (spawn policy `GroupScoped`). Windows residual: descendants are not killed there.
-pub fn run_bounded(mut cmd: std::process::Command, deadline: Duration) -> Result<String, RepairError> {
+/// RULINGS LH2: the same runner carries, on non-unix, the two file checks of the rehearsal (one child
+/// each); `who` names the child in every sentence (`등록기` for the registrar — its sentences are those
+/// of before; a name ending in a vowel, as 가 / 를 follow it). The exit status is returned, not judged.
+pub fn run_bounded_exit(
+    mut cmd: std::process::Command,
+    deadline: Duration,
+    who: &str,
+) -> Result<BoundedExit, RepairError> {
     let start = std::time::Instant::now();
     let grace = (deadline / 4).min(Duration::from_millis(1500));
     let run_until = deadline.saturating_sub(grace);
     let mut child = cmd
         .spawn()
-        .map_err(|e| RepairError::Io(format!("등록기를 시작할 수 없습니다: {e}")))?;
+        .map_err(|e| RepairError::Io(format!("{who}를 시작할 수 없습니다: {e}")))?;
     let pid = child.id();
     // measured NOW (spawn returns after exec — the session already made): once the child is reaped
     // its pid no longer answers, but its group still exists under that id
@@ -4223,7 +4263,7 @@ pub fn run_bounded(mut cmd: std::process::Command, deadline: Duration) -> Result
             });
         problems.push(format!("자식(pid {pid})을 기한 안에 거두지 못해 따로 거두게 두었습니다(기다리지 않음)"));
         return Err(RepairError::CheckTimeout(format!(
-            "등록기가 {}초 안에 끝나지 않았습니다 — {} — 받은 출력 {}바이트: {shown}",
+            "{who}가 {}초 안에 끝나지 않았습니다 — {} — 받은 출력 {}바이트: {shown}",
             deadline.as_secs(),
             problems.join(" · "),
             got.len()
@@ -4231,7 +4271,7 @@ pub fn run_bounded(mut cmd: std::process::Command, deadline: Duration) -> Result
     };
     if timed_out {
         return Err(RepairError::CheckTimeout(format!(
-            "등록기가 {}초 안에 끝나지 않아 멈추고 거두었습니다(종료 {:?}){}{} — 받은 출력 {}바이트: {shown}",
+            "{who}가 {}초 안에 끝나지 않아 멈추고 거두었습니다(종료 {:?}){}{} — 받은 출력 {}바이트: {shown}",
             deadline.as_secs(),
             st.code(),
             if problems.is_empty() { "" } else { " — " },
@@ -4241,16 +4281,17 @@ pub fn run_bounded(mut cmd: std::process::Command, deadline: Duration) -> Result
     }
     if !problems.is_empty() {
         return Err(RepairError::CheckFailed(format!(
-            "등록기 실행이 깨끗하게 끝나지 않았습니다(종료 {:?}) — {} — 받은 출력 {}바이트: {shown}",
+            "{who} 실행이 깨끗하게 끝나지 않았습니다(종료 {:?}) — {} — 받은 출력 {}바이트: {shown}",
             st.code(),
             problems.join(" · "),
             got.len()
         )));
     }
-    if !st.success() {
-        return Err(RepairError::CheckFailed(format!("등록기가 실패했습니다(종료 {:?})", st.code())));
-    }
-    Ok(got)
+    Ok(BoundedExit {
+        status: st,
+        stdout: got,
+        stderr: errp.buf,
+    })
 }
 
 /// EJ2: at most this many bytes are read from ONE pipe in one turn of the runner's loop.
