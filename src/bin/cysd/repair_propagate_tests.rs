@@ -123,18 +123,29 @@ fn commit_seals_the_committed_copy() {
 }
 
 /// HJ2: a result over the limit → the commit is REFUSED before anything is published, the limit in
-/// the sentence, the record still in progress.
+/// the sentence, the record still in progress. (Rewritten after the rebase onto T6b — the old sequence
+/// grew the file BEFORE `record` and expected `record` to accept it; since T6b's IW1 a file over the
+/// engine's read limit is refused at `record` with the limit in the sentence (asserted below), so the
+/// commit's own refusal is now reached by a file that grows past the limit AFTER its verification.)
 #[test]
 fn a_commit_over_the_seal_limit_is_refused_and_nothing_is_published() {
     let r = rig("big");
     let w = seat(3, "worker");
     let b = r.call(T0, &w, "begin", json!({"trigger": "owner_order", "files": ["bin/a.py"]})).unwrap();
     let id = b["repair"].as_str().unwrap().to_string();
-    let f = std::fs::OpenOptions::new().write(true).open(r.pack.join("bin/a.py")).unwrap();
-    f.set_len(cys::repair::propagate::SEAL_LIMIT + 1).unwrap();
-    drop(f);
-    r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "big"})).unwrap();
+    let grow = || {
+        let f = std::fs::OpenOptions::new().write(true).open(r.pack.join("bin/a.py")).unwrap();
+        f.set_len(cys::repair::propagate::SEAL_LIMIT + 1).unwrap();
+    };
+    // T6b (IW1): `record` of a file over the limit is refused, the limit named
+    grow();
+    let e = r.call(T0 + 0.5, &w, "record", json!({"repair": id, "note": "big"})).unwrap_err();
+    assert!(e.message.contains(&cys::repair::propagate::SEAL_LIMIT.to_string()), "{}", e.message);
+    std::fs::write(r.pack.join("bin/a.py"), b"print('fixed')\n").unwrap();
+    r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "fixed"})).unwrap();
     r.call(T0 + 2.0, &seat(7, "reviewer-codex"), "attest_verify", json!({"repair": id, "verdict": "pass", "note": "ok"})).unwrap();
+    // the file grows past the limit after its verification: the commit refuses before anything is published
+    grow();
     let e = r.call(T0 + 3.0, &w, "commit", json!({"repair": id})).unwrap_err();
     assert_eq!(e.code, cys::repair::types::ERR_PRECONDITION);
     assert!(e.message.contains(&cys::repair::propagate::SEAL_LIMIT.to_string()), "{}", e.message);
