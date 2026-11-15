@@ -2483,7 +2483,9 @@ fn a_target_over_the_limit_ends_its_repairs_turn_and_the_next_job_runs() {
     assert_eq!(read_seam::bytes_read_from(&live) - before, 0, "the live file is never read");
     let row = r.row(&a, DEPT).unwrap();
     assert_eq!(row.state, LaneState::Conflict, "{t:?}");
-    assert!(row.reason.starts_with("bin/a.py: 엔진의 읽기 한도") && row.reason.contains(&CAP.to_string()) && row.reason.contains("다른 파일로 잽니다"), "{}", row.reason);
+    // RULINGS KI2 (rewrite — the old expectation `starts_with("bin/a.py: 엔진의 읽기 한도")`): the length and
+    // the limit first, then the path
+    assert!(row.reason.starts_with("엔진의 읽기 한도") && row.reason.contains(" — bin/a.py: ") && row.reason.contains(&CAP.to_string()) && row.reason.contains("다른 파일로 잽니다"), "{}", row.reason);
     assert!(!row.reason.contains("읽을 수 없습니다"), "a measured difference, not a read failure: {}", row.reason);
     assert!(row.applied.is_empty() && row.conflict_live.is_empty() && row.probation.is_none(), "nothing of it recorded as a state: {row:?}");
     assert_eq!(std::fs::metadata(&live).unwrap().len(), CAP + 1, "nothing moved");
@@ -2552,6 +2554,34 @@ fn the_same_over_limit_observation_of_an_approval_class_repair_is_published_once
     assert!(row.reason.contains(&(CAP + 2).to_string()) && row.updated_at == T0 + 7200.0, "{}", row.reason);
     assert_ne!(std::fs::read(&path).unwrap(), first);
     assert!(row.conflict_live.is_empty(), "nothing of the over-limit file recorded as a state (JH1)");
+}
+
+/// RULINGS KI2 — KF1's key is the row's sentence as kept (cut at 400 characters): the measured length and the
+/// limit come FIRST, so a path of 444 characters can only shorten the path — the grown over-limit file at that
+/// path is a new observation (the row rewritten, its length new).
+#[test]
+fn a_grown_over_limit_file_at_a_long_path_is_a_new_observation() {
+    use crate::repair::durable::RECORD_READ_CAP as CAP;
+    let r = rig("ki2");
+    let id = rid("R-1");
+    let rel = format!("{}/x.sh", (0..40).map(|k| format!("d{k:09}")).collect::<Vec<_>>().join("/"));
+    assert!(rel.chars().count() > 400);
+    committed_in_hq(&r, &id, Classification::BootCritical, &rel, Some((b"#!/bin/sh\nold\n", 0o755)), Some((b"#!/bin/sh\nnew\n", 0o755)));
+    r.put(DEPT, &rel, b"#!/bin/sh\nold\n", 0o755);
+    let live = r.dept.join(&rel);
+    std::fs::OpenOptions::new().write(true).open(&live).unwrap().set_len(CAP + 1).unwrap();
+    tick(&r, DEPT, &doubles(), &fid(1));
+    let first = r.row(&id, DEPT).unwrap();
+    assert_eq!(first.state, LaneState::Conflict);
+    assert!(first.reason.starts_with(&format!("엔진의 읽기 한도 {CAP}바이트를 넘는 파일({}바이트) — ", CAP + 1)), "{}", first.reason);
+    assert_eq!(first.reason.chars().count(), 400, "the kept sentence is cut");
+    std::fs::OpenOptions::new().write(true).open(&live).unwrap().set_len(CAP + 2).unwrap();
+    TICK_NOW.with(|n| n.set(T0 + 600.0));
+    let t = tick(&r, DEPT, &doubles(), &fid(1));
+    TICK_NOW.with(|n| n.set(T0));
+    let row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.updated_at, T0 + 600.0, "the grown file is a new observation: {t:?}");
+    assert!(row.reason.contains(&format!("({}바이트)", CAP + 2)), "{}", row.reason);
 }
 
 /// RULINGS KF2 — a committed RULE-DOCUMENT repair (`directives/WORKER_DIRECTIVE.md`, the record's class)
