@@ -3722,11 +3722,15 @@ fn bj3_folded_spellings_of_protected_names_refused() {
                 json!({"trigger": "owner_order", "files": [rel]}),
             )
             .unwrap_err();
-        // T4: refused by the rule-document branch (no owner token), naming the real file (BJ3)
+        // T4: refused by the rule-document branch (no owner token), naming the real file (BJ3).
+        // WW1 (RULINGS JV1): an EXISTING file's alias enters the engine under the file system's name,
+        // so the branch already sees the real name and names it. Old expectation (before JV1):
+        // `e.message.contains(&format!("(= {real})"))` — the typed alias beside the real name.
         assert_eq!(e.code, "repair_precondition", "{rel}");
         assert!(e.message.contains("주인 지시 표"), "{rel}: {}", e.message);
+        let on_disk = cys::repair::intake::on_disk_rel(&r.pack, rel);
         assert!(
-            e.message.contains(&format!("(= {real})")),
+            e.message.contains(&format!("(= {real})")) || (on_disk != rel && e.message.contains(&on_disk)),
             "{rel}: {}",
             e.message
         );
@@ -4080,7 +4084,16 @@ fn da4_one_open_repair_per_file_not_per_spelling() {
             json!({"trigger": "owner_order", "files": ["notes/ITEM.txt"]}),
         )
         .unwrap_err();
-    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    // WW1 (RULINGS JV1): on a volume that does not distinguish case the alias enters as `notes/item.txt`
+    // — the same target set as the open repair — so it is refused at the pick-up (the open repair holds a
+    // live lock), naming that repair. Old expectation (before JV1): `e.code == "repair_precondition"` (the
+    // open-overlap refusal), with the message naming `a`. Still one open repair per FILE.
+    let expected = if cys::repair::intake::on_disk_rel(&r.pack, "notes/ITEM.txt") == "notes/item.txt" {
+        "repair_locked"
+    } else {
+        "repair_precondition"
+    };
+    assert_eq!(e.code, expected, "{}", e.message);
     assert!(e.message.contains(&a), "{}", e.message);
     // a file that does not exist yet: the folded name decides
     let a2 = r
@@ -4672,4 +4685,233 @@ fn eg1_a_failed_lookup_refuses_like_same() {
         begin(13, "z/two.txt").is_ok(),
         "two existing files with two identities are different"
     );
+}
+
+/// WW1 (RULINGS JV1): does the volume that holds `dir` give one file to two spellings that differ by
+/// letter case? Measured on the test's own temporary volume (written through one spelling, read
+/// through the other) — never assumed from the platform.
+fn ww1_case_blind_volume(dir: &Path) -> bool {
+    let lower = dir.join("ww1-case-probe.txt");
+    let _ = std::fs::write(&lower, b"ww1\n");
+    let same = std::fs::read(dir.join("WW1-CASE-PROBE.TXT")).is_ok_and(|b| b == b"ww1\n");
+    let _ = std::fs::remove_file(&lower);
+    same
+}
+
+/// WW1 (RULINGS JV1 · whole-diff review WD-WIN): a repair that names an EXISTING file in another
+/// letter case on a volume that does not distinguish case enters the ledger under the name the file
+/// system gives that file. Through the real verbs: `begin` with `BIN/A.py` → the seat deletes it under
+/// its own spelling → record / verify / commit → the record, the tombstone and the CLI's JSON
+/// (`cys repair tombstones --json` prints `TombstoneFile` — `src/bin/cys/repair_cli.rs`
+/// `tombstones_local_in`) carry `bin/a.py`; the install's exact look-up then keeps the file absent with
+/// the verdict naming the repair (and the preflight's exact `tombstoned_file("bin/a.py")` finds it).
+/// A case-sensitive temporary volume has no case alias of an existing file — skipped with the reason.
+#[test]
+fn ww1_an_existing_target_enters_the_ledger_under_its_on_disk_name() {
+    let r = rig("ww1");
+    if !ww1_case_blind_volume(&r.pack) {
+        eprintln!(
+            "SKIPPED ww1_an_existing_target_enters_the_ledger_under_its_on_disk_name: the temporary volume distinguishes letter case — no case alias of an existing file exists there"
+        );
+        return;
+    }
+    let w = seat(3, "worker");
+    let id = r
+        .call(T0, &w, "begin", json!({"trigger": "owner_order", "files": ["BIN/A.py"]}))
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // the seat deletes it under the spelling it typed
+    std::fs::remove_file(r.pack.join("BIN/A.py")).unwrap();
+    assert!(!r.pack.join("bin/a.py").exists());
+    r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "delete it"})).unwrap();
+    r.call(
+        T0 + 2.0,
+        &seat(7, "reviewer-codex"),
+        "attest_verify",
+        json!({"repair": id, "verdict": "pass", "note": "gone is right"}),
+    )
+    .unwrap();
+    r.call(T0 + 3.0, &w, "commit", json!({"repair": id})).unwrap();
+    // every fact of the chain, measured first and asserted together (a red shows all of them)
+    let rels: Vec<String> = r.record_of(&id).files.iter().map(|f| f.rel.clone()).collect();
+    let ts = cys::repair::tombstones::load_in(&r.root, &r.lane).unwrap();
+    let tomb: Vec<(String, String)> = ts.iter().map(|t| (t.rel.clone(), t.repair.as_str().to_string())).collect();
+    // what `cys repair tombstones --json` prints (the preflight's `lane_tombstones` reads exactly this)
+    let printed = serde_json::to_string(&cys::repair::tombstones::TombstoneFile {
+        schema: cys::repair::REPAIR_SCHEMA,
+        lane: r.lane.clone(),
+        tombstones: ts.clone(),
+    })
+    .unwrap();
+    // the install's look-up is exact (vendor spelling)
+    let src = cys::pack::UpdateSources::none().with_tombstones(ts);
+    let facts = cys::pack::UpdateFacts {
+        tombstoned: src.tombstone_for("bin/a.py").map(str::to_string),
+        ..Default::default()
+    };
+    let verdict = cys::pack::decide_file_action_with(
+        "bin/a.py",
+        "print('a')\n",
+        false,
+        None,
+        None,
+        false,
+        cys::pack::PackScope::Base,
+        None,
+        &facts,
+    );
+    assert_eq!(
+        (rels, tomb, printed.contains("\"rel\":\"bin/a.py\""), verdict),
+        (
+            vec!["bin/a.py".to_string()],
+            vec![("bin/a.py".to_string(), id.clone())],
+            true,
+            cys::pack::FileAction::KeepAbsent { repair: id.clone() }
+        ),
+        "record rels · tombstone · the CLI's JSON names the vendor spelling · the install's verdict — {printed}"
+    );
+}
+
+/// WW1 (RULINGS JV1) controls through `begin` (every volume): the real spelling is recorded unchanged;
+/// an absent target keeps the typed spelling (also its folder part); a link in the chain is still
+/// refused by the door's own rule (AW3 (b)) — nothing that is refused today is accepted, nothing that
+/// is accepted today is refused.
+#[test]
+fn ww1_controls_through_begin() {
+    let w = seat(3, "worker");
+    let rels_of = |r: &Rig, files: &[&str]| -> Result<Vec<String>, VerbError> {
+        let v = r.call(T0, &w, "begin", json!({"trigger": "owner_order", "files": files}))?;
+        let id = v["repair"].as_str().unwrap().to_string();
+        Ok(r.record_of(&id).files.iter().map(|f| f.rel.clone()).collect())
+    };
+    let r = rig("ww1c1");
+    assert_eq!(rels_of(&r, &["bin/a.py"]).unwrap(), ["bin/a.py"], "the real spelling is unchanged");
+    let r = rig("ww1c2");
+    assert_eq!(rels_of(&r, &["BIN/New.py"]).unwrap(), ["BIN/New.py"], "an absent target keeps the typed spelling");
+    #[cfg(unix)]
+    {
+        let r = rig("ww1c3");
+        std::os::unix::fs::symlink(r.pack.join("bin"), r.pack.join("lnk")).unwrap();
+        assert!(rels_of(&r, &["lnk/A.py"]).is_err(), "a link in the chain is still refused by the door");
+        assert!(rels_of(&r, &["lnk/a.py"]).is_err());
+    }
+}
+
+/// WW1 round 2 (RULINGS KH1): a LISTED file is not mapped away from the list's spelling. On a case-blind
+/// volume whose disk spells the protection file `hooks/GUARD.SH`, the list's exact `hooks/guard.sh`
+/// classifies as before — through the production classification, and through `begin` with it.
+#[test]
+fn ww1_kh1_a_listed_file_keeps_the_lists_spelling() {
+    let r = rig("ww1kh1");
+    if !ww1_case_blind_volume(&r.pack) {
+        eprintln!("SKIPPED ww1_kh1_…: the temporary volume distinguishes letter case");
+        return;
+    }
+    std::fs::write(r.pack.join("hooks/GUARD.SH"), b"#!/bin/sh\necho guard\n").unwrap();
+    let mapped = cys::repair::intake::on_disk_rel(&r.pack, "hooks/guard.sh");
+    assert_eq!(
+        production_classify(&mapped, &r.pack).map_err(|e| format!("{e:?}")),
+        Ok(Classification::ProtectionRelated),
+        "mapped to {mapped:?}"
+    );
+    let pack = r.pack.clone();
+    let classify = move |rel: &str| production_classify(rel, &pack);
+    let w = seat(3, "worker");
+    let v = handle_with(
+        &r.ctx(T0, &classify, &pass),
+        &w,
+        "begin",
+        &json!({"trigger": "owner_order", "files": ["hooks/guard.sh"]}),
+    )
+    .map_err(|e| e.message)
+    .unwrap();
+    let rec = r.record_of(v["repair"].as_str().unwrap());
+    assert_eq!(rec.classification, Classification::ProtectionRelated);
+    assert_eq!(rec.files.iter().map(|f| f.rel.as_str()).collect::<Vec<_>>(), ["hooks/guard.sh"]);
+}
+
+/// WW1 round 2 (RULINGS KH2): a report and a repair of the same file still meet. (a) `report --file
+/// BIN/A.py` and `begin --files BIN/A.py` (both through the verbs): the begin takes the report in, and after
+/// the commit the defect is joined, not open. (b) A row recorded under the alias by a build without the
+/// map (written straight through the intake writer) meets a repair begun under the real name.
+#[test]
+fn ww1_kh2_a_report_and_a_repair_of_the_same_file_meet() {
+    let r = rig("ww1kh2");
+    if !ww1_case_blind_volume(&r.pack) {
+        eprintln!("SKIPPED ww1_kh2_…: the temporary volume distinguishes letter case");
+        return;
+    }
+    let w = seat(3, "worker");
+    let a = r
+        .call(T0, &w, "report", json!({"file": "BIN/A.py", "error": "ValueError: bad"}))
+        .unwrap();
+    let begun = r
+        .call(T0, &w, "begin", json!({"trigger": "owner_order", "files": ["BIN/A.py"]}))
+        .unwrap();
+    let id = begun["repair"].as_str().unwrap().to_string();
+    std::fs::write(r.pack.join("bin/a.py"), b"print('fixed')\n").unwrap();
+    r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "fix"})).unwrap();
+    r.call(T0 + 2.0, &seat(7, "reviewer-codex"), "attest_verify", json!({"repair": id, "verdict": "pass", "note": "ok"}))
+        .unwrap();
+    r.call(T0 + 3.0, &w, "commit", json!({"repair": id})).unwrap();
+    let l = r.call(T0 + 4.0, &human(), "list", json!({})).unwrap();
+    let row = l["defects"].as_array().unwrap().iter().find(|d| d["signature"] == a["signature"]).cloned().unwrap();
+    assert_eq!(
+        (begun["intake_signatures"].clone(), row["joined"].clone(), row["open"].clone(), l["open_defects"].clone()),
+        (json!([a["signature"]]), json!(id), json!(false), json!(0)),
+        "the report and the repair of the same file meet: {row}"
+    );
+    // (b) an alias row from a build without the map
+    let r2 = rig("ww1kh2b");
+    let rep = cys::repair::intake::parse_report("BIN/A.py", "KeyError: 'k'").unwrap();
+    cys::repair::intake::record_in(&r2.root, &r2.lane, &rep, "seat-x", T0, 0, false, "KeyError: 'k'").unwrap();
+    let begun2 = r2
+        .call(T0, &w, "begin", json!({"trigger": "owner_order", "files": ["bin/a.py"]}))
+        .unwrap();
+    assert_eq!(begun2["intake_signatures"], json!([rep.signature]), "an alias row meets the repair of its file");
+}
+
+/// WW1 (RULINGS KM2): what the `report` map itself does — the verb's answer and the stored intake row
+/// carry `bin/a.py` for `report --file BIN/A.py` (this fails when only the report map is removed); and
+/// the automatic rows meet their repair through the commit in both directions: an alias row with a
+/// repair begun under the real name, and a real-name row with a repair begun under the alias.
+#[test]
+fn ww1_km2_the_report_map_and_both_directions_of_the_join() {
+    let r = rig("ww1km2");
+    if !ww1_case_blind_volume(&r.pack) {
+        eprintln!("SKIPPED ww1_km2_…: the temporary volume distinguishes letter case");
+        return;
+    }
+    let w = seat(3, "worker");
+    let a = r.call(T0, &w, "report", json!({"file": "BIN/A.py", "error": "ValueError: bad"})).unwrap();
+    let (rows, _) = cys::repair::intake::load_all_in(&r.root);
+    assert_eq!(
+        (a["rel"].clone(), rows.iter().map(|d| d.rel.as_str()).collect::<Vec<_>>()),
+        (json!("bin/a.py"), vec!["bin/a.py"]),
+        "the report's answer and its stored row carry the file system's name"
+    );
+    // the automatic rows (written straight through the intake writer, as the detector does), both ways
+    let commit_open = |row_rel: &str, begin_rel: &str, tag: &str| -> (Value, Value) {
+        let r = rig(tag);
+        let rep = cys::repair::intake::parse_report(row_rel, "KeyError: 'k'").unwrap();
+        cys::repair::intake::record_in(&r.root, &r.lane, &rep, "detector", T0, 0, false, "KeyError: 'k'").unwrap();
+        let id = r.call(T0, &w, "begin", json!({"trigger": "owner_order", "files": [begin_rel]})).unwrap()["repair"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::fs::write(r.pack.join("bin/a.py"), b"print('fixed')\n").unwrap();
+        r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "fix"})).unwrap();
+        r.call(T0 + 2.0, &seat(7, "reviewer-codex"), "attest_verify", json!({"repair": id, "verdict": "pass", "note": "ok"}))
+            .unwrap();
+        r.call(T0 + 3.0, &w, "commit", json!({"repair": id})).unwrap();
+        let l = r.call(T0 + 4.0, &human(), "list", json!({})).unwrap();
+        let row = l["defects"].as_array().unwrap().iter().find(|d| d["signature"] == json!(rep.signature)).cloned().unwrap();
+        (row["joined"].clone(), row["open"].clone())
+    };
+    let alias_row = commit_open("BIN/A.py", "bin/a.py", "ww1km2a");
+    let real_row = commit_open("bin/a.py", "BIN/A.py", "ww1km2b");
+    assert_eq!(alias_row, (json!("R-1"), json!(false)), "an alias row meets a repair begun under the real name");
+    assert_eq!(real_row, (json!("R-1"), json!(false)), "a real-name row meets a repair begun under the alias");
 }

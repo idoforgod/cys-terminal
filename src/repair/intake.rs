@@ -78,6 +78,139 @@ pub fn normalize_rel(raw: &str) -> Result<String, RepairError> {
     Ok(parts.join("/"))
 }
 
+/// RULINGS JV1 (WW1): the name the file system gives an EXISTING general target of a repair, when it
+/// differs from the typed rel (the output of [`normalize_rel`]) by letter case alone — so the records
+/// (a repair's files, its tombstones, a defect report) do not hold a case alias of an existing general
+/// file, and the readers that match a recorded rel against the vendor's rel by exact string (the
+/// install's tombstone look-up, the preflight's `tombstoned_file`, `cys repair tombstones --json`) meet
+/// the file's real name. First way: the directory entries, one component at a time from the pack root —
+/// an entry spelled exactly as typed is kept, otherwise the ONLY entry equal to the typed component under
+/// `crate::pack::list_key`'s fold (one definition) is taken; the same on every system (no `\\?\` prefix,
+/// no reliance on how a canonical path reports case), and a case alias of a folder is found too. Second
+/// way, only when a folder on the way cannot be LISTED (RULINGS KH3 — a failed listing is not absence):
+/// the canonical path of `pack/rel` against the canonical pack dir (the stored case on macOS and Windows),
+/// with no link anywhere on the typed chain. Either way the name is taken only when the difference is
+/// letter case alone under the fold and both spellings are the same file on this volume (volume + file
+/// id). The typed rel is kept EXACTLY as today when: the rel's fold is on a compiled list (RULINGS KH1 —
+/// a listed file's canonical name is the LIST's; the classification refuses aliases of it); the target
+/// or a component is absent; a component is a link (a junction on Windows reports as one); two entries
+/// fold to the typed component (a volume that distinguishes case); the difference is more than case
+/// (e.g. a Unicode normal form); the identities differ; or neither way gives a name (a pack folder that
+/// can be neither listed nor resolved — a broken installation). Nothing is refused here.
+pub fn on_disk_rel(pack: &Path, rel: &str) -> String {
+    on_disk_case_alias(pack, rel, &list_names).unwrap_or_else(|| rel.to_string())
+}
+
+/// A folder's names, or None when the listing could not be opened or read to its END (RULINGS KM1).
+type Lister<'a> = dyn Fn(&Path) -> Option<Vec<String>> + 'a;
+
+/// The product's [`Lister`]: `read_dir` through [`names_of`].
+fn list_names(dir: &Path) -> Option<Vec<String>> {
+    names_of(
+        std::fs::read_dir(dir)
+            .ok()?
+            .map(|e| e.map(|e| e.file_name().into_string().ok())),
+    )
+}
+
+/// RULINGS KM1: the names of a listing read to its end; an error from the entry iterator makes the
+/// listing INCOMPLETE (None) — never "no such name". A name that is not UTF-8 is skipped (`Ok(None)`).
+fn names_of(entries: impl Iterator<Item = std::io::Result<Option<String>>>) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for e in entries {
+        if let Some(n) = e.ok()? {
+            names.push(n);
+        }
+    }
+    Some(names)
+}
+
+/// [`on_disk_rel`]'s answer when it differs from the typed rel (None = keep the typed rel); `list` reads
+/// a folder's names (the product passes [`list_names`]).
+fn on_disk_case_alias(pack: &Path, rel: &str, list: &Lister<'_>) -> Option<String> {
+    if crate::pack::listed_in_compiled_lists(rel) {
+        return None;
+    }
+    let real = match spelled_by_listing(pack, rel, list) {
+        Spelled::Name(n) => n,
+        Spelled::NoName => return None,
+        Spelled::Unlisted => spelled_by_canonical_path(pack, rel)?,
+    };
+    if real == rel || crate::pack::list_key(&real) != crate::pack::list_key(rel) {
+        return None;
+    }
+    let typed_id = super::boot_critical::file_identity(&pack.join(rel))?;
+    (super::boot_critical::file_identity(&pack.join(&real))? == typed_id).then_some(real)
+}
+
+/// What the directory entries say about a typed rel.
+enum Spelled {
+    /// Every component found (exactly or as the one fold match), none a link.
+    Name(String),
+    /// A component absent, ambiguous, or a link.
+    NoName,
+    /// A folder on the way could not be listed.
+    Unlisted,
+}
+
+/// The first way of [`on_disk_rel`]: the directory entries, component by component. Only a listing read
+/// to its end may answer "no such name"; one that could not be opened or read to its end is `Unlisted`.
+fn spelled_by_listing(pack: &Path, rel: &str, list: &Lister<'_>) -> Spelled {
+    let mut dir = pack.to_path_buf();
+    let mut real: Vec<String> = Vec::new();
+    for typed in rel.split('/') {
+        let Some(names) = list(&dir) else {
+            return Spelled::Unlisted;
+        };
+        let Some(name) = entry_spelling(typed, &names) else {
+            return Spelled::NoName;
+        };
+        dir = dir.join(&name);
+        if !std::fs::symlink_metadata(&dir).is_ok_and(|m| !m.file_type().is_symlink()) {
+            return Spelled::NoName;
+        }
+        real.push(name);
+    }
+    Spelled::Name(real.join("/"))
+}
+
+/// The second way of [`on_disk_rel`] (RULINGS KH3), needing no listing: the canonical path of `pack/rel`
+/// relative to the canonical pack dir — only with no link on the typed chain and the same number of
+/// components inside the pack.
+fn spelled_by_canonical_path(pack: &Path, rel: &str) -> Option<String> {
+    let mut p = pack.to_path_buf();
+    for c in rel.split('/') {
+        p = p.join(c);
+        if std::fs::symlink_metadata(&p).ok()?.file_type().is_symlink() {
+            return None;
+        }
+    }
+    let base = std::fs::canonicalize(pack).ok()?;
+    let full = std::fs::canonicalize(pack.join(rel)).ok()?;
+    let parts = full
+        .strip_prefix(&base)
+        .ok()?
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<&str>>>()?;
+    (parts.len() == rel.split('/').count()).then(|| parts.join("/"))
+}
+
+/// One path component: the entry spelled exactly as typed, else the ONLY entry that `list_key` folds
+/// to the same key; None = absent or ambiguous.
+fn entry_spelling(typed: &str, names: &[String]) -> Option<String> {
+    if names.iter().any(|n| n == typed) {
+        return Some(typed.to_string());
+    }
+    let key = crate::pack::list_key(typed);
+    let mut folded = names.iter().filter(|n| crate::pack::list_key(n) == key);
+    let only = folded.next()?;
+    folded.next().is_none().then(|| only.clone())
+}
+
 /// RULINGS AW3 (a): a path component in the Windows 8.3 short-name form — a `~` directly followed
 /// by an ASCII digit anywhere in the component.
 pub fn is_short_name_component(c: &str) -> bool {
@@ -624,6 +757,142 @@ mod tests {
             assert!(normalize_rel(bad).is_err(), "{bad:?} accepted");
         }
         assert!(normalize_rel(&"a".repeat(MAX_REL_BYTES + 1)).is_err());
+    }
+
+    /// WW1 (RULINGS JV1): does the volume that holds `dir` give one file to two spellings that differ
+    /// by letter case? Measured (written through one spelling, read through the other).
+    fn case_blind(dir: &std::path::Path) -> bool {
+        let _ = std::fs::write(dir.join("ww1-probe.txt"), b"ww1\n");
+        let same = std::fs::read(dir.join("WW1-PROBE.TXT")).is_ok_and(|b| b == b"ww1\n");
+        let _ = std::fs::remove_file(dir.join("ww1-probe.txt"));
+        same
+    }
+
+    /// WW1 (RULINGS JV1): the component rule alone (no file system) — exact first; else the ONE entry
+    /// that folds to it; two entries that fold to it (a case-sensitive volume holding both) → none;
+    /// a difference beyond case (a Unicode normal form) → none.
+    #[test]
+    fn ww1_entry_spelling_rule() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(entry_spelling("a.py", &names(&["a.py", "b.py"])).as_deref(), Some("a.py"));
+        assert_eq!(entry_spelling("A.PY", &names(&["a.py", "b.py"])).as_deref(), Some("a.py"));
+        assert_eq!(entry_spelling("A.py", &names(&["a.py", "A.py"])).as_deref(), Some("A.py"), "exact wins");
+        assert_eq!(entry_spelling("a.PY", &names(&["a.py", "A.py"])), None, "two files that differ by case are never merged");
+        assert_eq!(entry_spelling("c.py", &names(&["a.py"])), None, "absent");
+        assert_eq!(entry_spelling("\u{e9}.md", &names(&["e\u{301}.md"])), None, "a normal-form difference is not a case difference");
+    }
+
+    /// WW1 (RULINGS JV1) on this machine's temporary volume: an existing file named in another case
+    /// (file and folder) → its on-disk spelling, only where the volume is measured case-blind; the typed
+    /// rel is kept for an absent target, for the real spelling itself, for a link in the chain and for a
+    /// normal-form difference. On a case-sensitive volume every answer is the typed rel (an alias does not
+    /// exist there) — asserted too, so the test says which volume it ran on.
+    #[test]
+    fn ww1_on_disk_rel_takes_the_real_name_of_an_existing_file_only() {
+        let d = tmp(31);
+        std::fs::create_dir_all(d.join("bin")).unwrap();
+        std::fs::write(d.join("bin/a.py"), b"a\n").unwrap();
+        let blind = case_blind(&d);
+        eprintln!("ww1: the temporary volume is {}", if blind { "case-blind" } else { "case-sensitive" });
+        let expect = |typed: &str, real: &str| if blind { real.to_string() } else { typed.to_string() };
+        assert_eq!(on_disk_rel(&d, "bin/A.py"), expect("bin/A.py", "bin/a.py"));
+        assert_eq!(on_disk_rel(&d, "BIN/A.PY"), expect("BIN/A.PY", "bin/a.py"), "a folder alias too");
+        assert_eq!(on_disk_rel(&d, "bin/a.py"), "bin/a.py", "the real spelling is unchanged");
+        assert_eq!(on_disk_rel(&d, "bin/New.py"), "bin/New.py", "an absent target keeps the typed spelling");
+        assert_eq!(on_disk_rel(&d, "BIN/New.py"), "BIN/New.py", "absent target: nothing is taken from its folder either");
+        // a normal-form difference (NFC typed, NFD on disk) is not taken, whatever the volume does with it
+        std::fs::write(d.join("bin/e\u{301}.md"), b"e\n").unwrap();
+        assert_eq!(on_disk_rel(&d, "bin/\u{e9}.md"), "bin/\u{e9}.md");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(d.join("bin"), d.join("lnk")).unwrap();
+            assert_eq!(on_disk_rel(&d, "LNK/a.py"), "LNK/a.py", "a link in the chain keeps the typed spelling");
+            assert_eq!(on_disk_rel(&d, "lnk/A.py"), "lnk/A.py");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// WW1 round 2 (RULINGS KH1): a name whose fold is on a compiled list keeps the typed spelling — for
+    /// a listed file the canonical name is the LIST's, and the classification refuses aliases of it. Here
+    /// the disk spells the protection file `hooks/GUARD.SH`; the list's `hooks/guard.sh` stays as typed.
+    #[test]
+    fn ww1_kh1_on_disk_rel_keeps_a_listed_name() {
+        let d = tmp(32);
+        std::fs::create_dir_all(d.join("hooks")).unwrap();
+        std::fs::write(d.join("hooks/GUARD.SH"), b"#!/bin/sh\n").unwrap();
+        assert!(crate::pack::listed_in_compiled_lists("hooks/guard.sh"), "hooks/guard.sh is a compiled-list row");
+        assert_eq!(on_disk_rel(&d, "hooks/guard.sh"), "hooks/guard.sh");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// WW1 round 2 (RULINGS KH3): a folder that cannot be LISTED is not an absent target — when the target
+    /// exists, the real name comes from the canonical path (the stored case on macOS and Windows) under the
+    /// same conditions. Unix only (the listing is denied with mode 0o311); skipped with the reason where the
+    /// volume distinguishes case or the listing cannot be denied (e.g. as root).
+    #[cfg(unix)]
+    #[test]
+    fn ww1_kh3_an_unlistable_folder_still_gives_the_real_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp(33);
+        std::fs::create_dir_all(d.join("bin")).unwrap();
+        std::fs::write(d.join("bin/a.py"), b"a\n").unwrap();
+        if !case_blind(&d) {
+            eprintln!("SKIPPED ww1_kh3_…: the temporary volume distinguishes letter case");
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        struct Restore(std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        std::fs::set_permissions(d.join("bin"), std::fs::Permissions::from_mode(0o311)).unwrap();
+        let restore = Restore(d.join("bin"));
+        if std::fs::read_dir(d.join("bin")).is_ok() {
+            eprintln!("SKIPPED ww1_kh3_…: the folder's listing could not be denied here (running as root?)");
+            drop(restore);
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        assert!(std::fs::metadata(d.join("BIN/A.py")).is_ok(), "the target exists although its folder cannot be listed");
+        let got = on_disk_rel(&d, "BIN/A.py");
+        drop(restore);
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(got, "bin/a.py");
+    }
+
+    /// WW1 (RULINGS KM1): a listing that OPENS and then fails mid-way, before the target's name, is an
+    /// incomplete listing — the canonical-path way then gives the real name (same conditions). The rule
+    /// over the entry iterator (an error after some names → incomplete; a non-UTF-8 name skipped), and the
+    /// whole map with the folder `bin`'s iterator failing after one name (the seam: the lister).
+    #[test]
+    fn ww1_km1_an_iterator_error_is_an_incomplete_listing() {
+        let io = |m: &str| std::io::Error::other(m.to_string());
+        assert_eq!(names_of(vec![Ok(Some("x".into())), Err(io("eio")), Ok(Some("a.py".into()))].into_iter()), None);
+        assert_eq!(
+            names_of(vec![Ok(Some("x".into())), Ok(None), Ok(Some("a.py".into()))].into_iter()),
+            Some(vec!["x".to_string(), "a.py".to_string()])
+        );
+        let d = tmp(34);
+        std::fs::create_dir_all(d.join("bin")).unwrap();
+        std::fs::write(d.join("bin/a.py"), b"a\n").unwrap();
+        std::fs::write(d.join("bin/b.py"), b"b\n").unwrap();
+        if !case_blind(&d) {
+            eprintln!("SKIPPED ww1_km1_…'s map half: the temporary volume distinguishes letter case");
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        let mid_way = |dir: &std::path::Path| -> Option<Vec<String>> {
+            if dir.file_name().is_some_and(|n| n == "bin") {
+                names_of(vec![Ok(Some("b.py".to_string())), Err(io("mid-way"))].into_iter())
+            } else {
+                list_names(dir)
+            }
+        };
+        let got = on_disk_case_alias(&d, "BIN/A.py", &mid_way);
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(got.as_deref(), Some("bin/a.py"));
     }
 
     /// RULINGS AW3 (a): Windows short names are refused on every system; a `~` that is not followed
