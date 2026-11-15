@@ -768,22 +768,67 @@ fn note_reason(env: &LaneEnv<'_>, id: &RepairId, why: &str) {
     }); // a note only: the job log carries the reason whatever happens here
 }
 
+/// The sentence of a check result that is not published because what it was made on changed (IQ1).
+pub const STATES_CHANGED: &str = "검사한 뒤 이 부서의 대상 파일·팩 세대·팩 식별 중 하나가 바뀌어 이 검사 결과를 쓰지 않았습니다 — 다음 차례에 새로 결정합니다";
+
+/// RULINGS IQ1 — what a check made OUTSIDE the lock was made on: the measured state of EVERY target of R
+/// (those passed over as "already at the result" included), the pack generation and the pack instance.
+/// Taken right before the check; measured again inside the publication's lock.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Observed {
+    states: Result<Vec<(String, String)>, String>,
+    generation: Option<PackGeneration>,
+    instance: Option<String>,
+}
+
+impl Observed {
+    fn now(env: &LaneEnv<'_>, rec: &RepairRecord) -> Observed {
+        Observed {
+            states: live_states(env.op.pack, rec).map(|l| canon_list(&l)),
+            generation: apply::pack_generation_checked(env.op.pack).ok(),
+            instance: match read_pack_instance(env.op.pack) {
+                FileRead::Value(id) => Some(id),
+                _ => None,
+            },
+        }
+    }
+    /// The same, and every part of it known (an unreadable part is never "unchanged").
+    fn holds_now(&self, env: &LaneEnv<'_>, rec: &RepairRecord) -> bool {
+        self.states.is_ok() && self.generation.is_some() && self.instance.is_some() && *self == Observed::now(env, rec)
+    }
+}
+
 /// What a publication did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Published {
     Written,
     OtherWriter,
     RecordChanged,
+    StatesChanged,
     LockBusy,
+}
+
+/// How a row is published: plain (`Plain`) or as the result of a check made outside the lock
+/// (`Checked` — IQ1: only for the state it checked).
+#[derive(Clone, Copy)]
+enum Publication<'a> {
+    Plain,
+    Checked { seen: &'a Observed },
 }
 
 /// RULINGS IK3 + IG5 — a row decided OUTSIDE the lock is PUBLISHED inside it: the pack-apply lock is
 /// tried, the record is read AGAIN (still in force, the same committed result), and the row is written
 /// only when no other writer changed it meanwhile. ★Never called while this thread holds the lock.
-fn publish(env: &LaneEnv<'_>, rec: &RepairRecord, stored: Option<&LaneRecord>, row: &LaneRecord) -> Result<Published, RepairError> {
+fn publish(env: &LaneEnv<'_>, rec: &RepairRecord, stored: Option<&LaneRecord>, row: &LaneRecord, how: Publication<'_>) -> Result<Published, RepairError> {
     let ran = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || -> Result<Published, RepairError> {
         if !record_unchanged(env, rec) {
             return Ok(Published::RecordChanged);
+        }
+        if let Publication::Checked { seen } = how {
+            // IQ1: measured AGAIN — the targets, the generation, the instance — inside this lock
+            if !seen.holds_now(env, rec) {
+                return Ok(Published::StatesChanged);
+            }
         }
         Ok(if write_row_if(env, stored, row)? { Published::Written } else { Published::OtherWriter })
     })
@@ -796,13 +841,18 @@ fn publish(env: &LaneEnv<'_>, rec: &RepairRecord, stored: Option<&LaneRecord>, r
 
 /// `publish`, with the reason of a row NOT written put in the report (`left`); `true` = written.
 fn publish_row(env: &LaneEnv<'_>, rec: &RepairRecord, stored: Option<&LaneRecord>, row: &LaneRecord, report: &mut TickReport) -> Result<bool, RepairError> {
-    let why = match publish(env, rec, stored, row)? {
+    publish_row_as(env, rec, stored, row, Publication::Plain, report)
+}
+
+fn publish_row_as(env: &LaneEnv<'_>, rec: &RepairRecord, stored: Option<&LaneRecord>, row: &LaneRecord, how: Publication<'_>, report: &mut TickReport) -> Result<bool, RepairError> {
+    let why = match publish(env, rec, stored, row, how)? {
         Published::Written => return Ok(true),
-        Published::OtherWriter => "다른 작성자가 이 행을 바꿔 다음 차례에 다시 봅니다",
-        Published::RecordChanged => RECORD_CHANGED,
-        Published::LockBusy => LOCK_BUSY_ROW,
+        Published::OtherWriter => "다른 작성자가 이 행을 바꿔 다음 차례에 다시 봅니다".to_string(),
+        Published::RecordChanged => RECORD_CHANGED.to_string(),
+        Published::StatesChanged => STATES_CHANGED.to_string(),
+        Published::LockBusy => LOCK_BUSY_ROW.to_string(),
     };
-    report.left.push((rec.id.clone(), why.to_string()));
+    report.left.push((rec.id.clone(), why));
     Ok(false)
 }
 
@@ -1033,9 +1083,24 @@ fn finish(
     env: &LaneEnv<'_>,
     rec: &RepairRecord,
     stored: Option<&LaneRecord>,
+    row: LaneRecord,
+    state: LaneState,
+    why: &str,
+    report: &mut TickReport,
+) -> Result<Option<LaneState>, RepairError> {
+    finish_as(env, rec, stored, row, state, why, Publication::Plain, report)
+}
+
+/// `finish` with the publication's kind (IQ1 for the result of a check made outside the lock).
+#[allow(clippy::too_many_arguments)]
+fn finish_as(
+    env: &LaneEnv<'_>,
+    rec: &RepairRecord,
+    stored: Option<&LaneRecord>,
     mut row: LaneRecord,
     state: LaneState,
     why: &str,
+    how: Publication<'_>,
     report: &mut TickReport,
 ) -> Result<Option<LaneState>, RepairError> {
     row.state = state;
@@ -1047,7 +1112,7 @@ fn finish(
         }
     }
     row.updated_at = env.op.now;
-    if !publish_row(env, rec, stored, &row, report)? {
+    if !publish_row_as(env, rec, stored, &row, how, report)? {
         return Ok(None);
     }
     report.rows.push((row.repair.clone(), state, why.to_string()));
@@ -1100,6 +1165,8 @@ fn check_live(
     merge: Option<MergeRecord>,
     report: &mut TickReport,
 ) -> Result<Option<LaneState>, RepairError> {
+    // IQ1: what this check is made on — published only if it still holds inside the lock
+    let seen = Observed::now(env, rec);
     let timings = match run_checks(env, rec, env.op.pack, true) {
         Ok(t) => t,
         Err(why) => {
@@ -1108,7 +1175,7 @@ fn check_live(
             if let Some(p) = row.probation.as_mut().filter(|p| p.closed.is_none()) {
                 p.closed = Some(failed_closure(env, &why));
             }
-            return finish(env, rec, stored, row, LaneState::Conflict, &format!("이 부서의 검사 실패 — {why}"), report);
+            return finish_as(env, rec, stored, row, LaneState::Conflict, &format!("이 부서의 검사 실패 — {why}"), Publication::Checked { seen: &seen }, report);
         }
     };
     // IG2: a verified row of a deleting repair implies this lane's tombstones (also "already there")
@@ -1142,7 +1209,7 @@ fn check_live(
             });
         }
     }
-    finish(env, rec, stored, row, LaneState::Verified, "이 부서의 검사 통과", report)
+    finish_as(env, rec, stored, row, LaneState::Verified, "이 부서의 검사 통과", Publication::Checked { seen: &seen }, report)
 }
 
 /// R's recorded check of every FILE target whose result is a file, against `root` (the live pack, or
@@ -1706,12 +1773,14 @@ fn apply_general(
         }
     };
     let applied_row = row.clone();
+    // IQ1: what the live check is made on (the door's targets and those already at the result)
+    let seen = Observed::now(env, rec);
     match run_checks(env, rec, pack, true) {
         Ok(timings) => {
             if let Some(p) = row.probation.as_mut() {
                 p.check_timings = timings;
             }
-            finish(env, rec, Some(&applied_row), row, LaneState::Verified, "적용 뒤 이 부서의 검사 통과", report)
+            finish_as(env, rec, Some(&applied_row), row, LaneState::Verified, "적용 뒤 이 부서의 검사 통과", Publication::Checked { seen: &seen }, report)
         }
         Err(why) => {
             // the lane's own failure: T6's probation owes the return of THIS lane's operations
@@ -1719,7 +1788,7 @@ fn apply_general(
             if let Some(p) = row.probation.as_mut() {
                 p.closed = Some(failed_closure(env, &why));
             }
-            finish(env, rec, Some(&applied_row), row, LaneState::Conflict, &format!("적용 뒤 이 부서의 검사 실패 — {why}"), report)
+            finish_as(env, rec, Some(&applied_row), row, LaneState::Conflict, &format!("적용 뒤 이 부서의 검사 실패 — {why}"), Publication::Checked { seen: &seen }, report)
         }
     }
 }
