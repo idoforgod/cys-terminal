@@ -2082,6 +2082,39 @@ fn clear_seams() {
     AFTER_DECISION.with(|h| *h.borrow_mut() = None);
     AFTER_DOOR_PHASE.with(|h| *h.borrow_mut() = None);
     BEFORE_CATCHUP.with(|h| *h.borrow_mut() = None);
+    AFTER_PASS.with(|h| *h.borrow_mut() = None);
+}
+
+/// RULINGS IZ3 — the tick's stamp for completeness and the catch-up record is the generation and
+/// instance the INSTANCE PASS used inside its lock: a 검증됨 row and an interrupted catch-up (its mark
+/// not written); at the next tick an update lands right after the pass released its lock (a new
+/// generation, new bytes). The row is taken as complete by the fast path, but the catch-up is NOT
+/// recorded: the pass's generation is no longer the pack's. (With the stamp read again after the pass,
+/// the updated generation became the base and the catch-up was recorded for a generation nothing was
+/// verified at.)
+#[test]
+fn the_catchup_is_judged_on_what_the_pass_used() {
+    let r = rig("iz3");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    tick(&r, DEPT, &doubles(), &fid(1));
+    assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Verified);
+    let mut st = r.job(DEPT);
+    st.initial_catchup_complete = false; // the catch-up's mark was never written (a stop right before it)
+    write_job_state(&r.root, &st).unwrap();
+    let dept = r.dept.clone();
+    AFTER_PASS.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move |_: &Path| {
+            std::fs::write(dept.join("bin/a.py"), b"updated\n").unwrap();
+            std::fs::write(dept.join(".pack-version"), "0.15.1\n").unwrap();
+        }))
+    });
+    let t = tick(&r, DEPT, &doubles(), &fid(1));
+    clear_seams();
+    assert!(!t.catchup_completed, "{t:?}");
+    assert!(!r.job(DEPT).initial_catchup_complete, "nothing was verified at the new generation");
+    assert!(t.lines.iter().any(|l| l.contains(STATES_CHANGED)), "{t:?}");
 }
 
 /// IV1 (M1) — an update placed RIGHT AFTER the decision (the stamp taken) is never taken as the
