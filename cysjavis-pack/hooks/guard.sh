@@ -1486,10 +1486,10 @@ if [ "$GUARD_ACTIVE" != "1" ] && [ -f "$CONST_TOKEN" ] && [ ! -L "$CONST_TOKEN" 
   fi
 fi
 
-# ★RULINGS ID2 (T4e): 수리 장부 규칙은 강등된 백스톱에서도 순수 셸로 지킨다(규칙 문서처럼). 장부의 자리는 위에서 이 훅의
-#   자리로 구한 GUARD_LEDGER_ROOTS 그대로다. 파일 도구의 경로가 장부 아래이고 `R-<n>/staging/` 이 아니면 막고, 셸 명령의
-#   글에 장부의 자리가 적혀 있고(작업 사본만이 아니고) 백스톱이 보는 쓰기 형태가 있으면 막는다. 장부의 자리를 가리키지
-#   않는 호출은 결코 막지 않는다(치명 4: 모든 것을 막는 강등된 가드는 모든 좌석을 죽인다).
+# ★RULINGS ID2 · IN6 (T4e): 수리 장부 규칙은 강등된 백스톱에서도 순수 셸로 지킨다(규칙 문서처럼). 장부의 자리는 위에서
+#   이 훅의 자리로 구한 GUARD_LEDGER_ROOTS 그대로다. 파일 도구의 경로가 장부 아래이고 `R-<n>/staging/` 이 아니면 막고,
+#   셸 명령의 글에 장부의 자리가 적혀 있으면(작업 사본만이 아니고) 그 명령은 읽기 명령 하나일 때만 통과한다(IN6).
+#   장부의 자리를 가리키지 않는 호출은 결코 막지 않는다(치명 4: 모든 것을 막는 강등된 가드는 모든 좌석을 죽인다).
 ledger_rest_is_ledger() {
   # RULINGS IJ3: the shell cannot normalise dot components here — the root's spelling followed by anything that holds a
   #   `..` component IS a ledger place (the working-copy exception does not apply to it)
@@ -1513,43 +1513,40 @@ ledger_backstop_spellings() {
 $GUARD_LEDGER_ROOTS
 EOF_LEDGER_ROOTS
 }
-ledger_backstop_sinks_ok() {
-  # RULINGS IJ2 / IJ4 in the shell's coarse form: 0 when every redirection target in the lower-cased command ($1) is a
-  #   harmless sink — /dev/null, a descriptor duplicate (&1 · &2 · >&-), or an absolute literal path (no `$`, back-quote,
-  #   glob, `..`) that is not under a root ($2 = the spellings). A relative target is not told here (no `cd` is followed).
-  local s="$1" sps="$2" t sp dd='(^|/)\.\.(/|$)'
-  while [[ "$s" == *">"* ]]; do
-    s="${s#*>}"
-    t="$s"
-    while [[ "$t" == ">"* || "$t" == "|"* || "$t" == " "* || "$t" == $'\t'* ]]; do t="${t:1}"; done
-    case "$t" in "&"*) t="${t:1}"; case "$t" in [0-9]*|-*) continue ;; esac ;; esac
-    case "$t" in
-      \"*) t="${t:1}"; t="${t%%\"*}" ;;            # a quoted target is taken whole (a root with a space)
-      \'*) t="${t:1}"; t="${t%%\'*}" ;;
-      *) t="${t%%[[:space:];|&<>()]*}"; t="${t//\"/}"; t="${t//\'/}" ;;
+ledger_backstop_one_reader() {
+  # RULINGS IN6: 0 when the command ($1, as given) is ONE simple command whose first word is a bare reader and whose only
+  #   redirections are the whole words 2>/dev/null, >/dev/null, 2>&1. Refused: a new line, `$(`, a back-quote, `<(`,
+  #   `>(`, `<<`, and any other word holding one of ; | & < > ( ) { } (a quoted one too — the degraded form's cost).
+  local c="$1" w readers nl=$'\n'
+  local -a words=()
+  case "$c" in *"$nl"*|*'$('*|*'`'*|*'<('*|*'>('*|*'<<'*) return 1 ;; esac
+  IFS=$' \t' read -r -a words <<EOF_LEDGER_CMD
+$c
+EOF_LEDGER_CMD
+  [ "${#words[@]}" -gt 0 ] || return 1
+  # RULINGS IN4: the reader names are the judge's own LEDGER_READERS — ONE list, read here from the PYSRC text in pure bash
+  #   (no call, no subshell). A list that cannot be read stays empty, and then every command that names the ledger is refused.
+  local re='LEDGER_READERS = \(([^)]*)\)'
+  [[ $PYSRC =~ $re ]] || return 1
+  readers="${BASH_REMATCH[1]}"; readers="${readers//\"/}"; readers="${readers//,/ }"; readers=" ${readers//$'\n'/ } "
+  case "$readers" in *" ${words[0]} "*) ;; *) return 1 ;; esac
+  for w in "${words[@]:1}"; do
+    case "$w" in
+      '2>/dev/null'|'>/dev/null'|'2>&1') ;;
+      *[\;\|\&\<\>\(\)\{\}]*) return 1 ;;
     esac
-    [ "$t" = "/dev/null" ] && continue
-    case "$t" in /*|"~/"*) ;; *) return 1 ;; esac
-    case "$t" in *'$'*|*'`'*|*'*'*|*'?'*|*'['*) return 1 ;; esac
-    [[ $t =~ $dd ]] && return 1
-    while IFS= read -r sp; do
-      [ -n "$sp" ] || continue
-      case "$t" in "$sp"|"$sp"/*) return 1 ;; esac
-    done <<EOF_LEDGER_SPS
-$sps
-EOF_LEDGER_SPS
   done
   return 0
 }
 ledger_backstop() {
-  # RULINGS IJ4: the degraded backstop protects the ledger exactly as far as it protects the rule documents — with jq: a
-  #   WRITING tool's path (a Read is never refused) and the coarse shell form (IJ1 / IJ2); without jq every field is empty
-  #   and nothing is protected (GAPS G22). A call that does not name the ledger is never refused.
+  # RULINGS IJ4 / IN6: the degraded backstop protects the ledger exactly as far as it protects the rule documents — with
+  #   jq: a WRITING tool's path (a Read is never refused) and, AFTER the early return for a command that does not name the
+  #   ledger, the one-simple-reader form (IN6); without jq every field is empty and nothing is protected (GAPS G22).
   local tool="$1" fp="$2" nb="$3" cmd="$4" sps sp p lp s c seg named="" first
   [ -n "$GUARD_LEDGER_ROOTS" ] || return 0
   sps="$(ledger_backstop_spellings)"
   first="$(printf '%s\n' "$GUARD_LEDGER_ROOTS" | sed -n '1p')"
-  local msg="백스톱: 수리 장부(${first})는 데몬이 \`cys repair …\` 동사로만 쓴다 — 좌석이 파일 도구나 셸 쓰기로 장부를 쓰는 것은 역할과 상관없이 막는다(좌석이 쓰는 자리는 수리의 작업 사본 \`R-<번호>/staging/\` 하나)."
+  local msg="백스톱: 수리 장부(${first})는 데몬이 \`cys repair …\` 동사로만 쓴다 — 좌석의 파일 도구는 장부를 쓰지 못하고, 판정기가 없는 지금 장부의 자리를 적은 셸 명령은 읽기 명령 하나(리다이렉트는 2>/dev/null · >/dev/null · 2>&1 만)일 때만 통과한다(좌석이 쓰는 자리는 수리의 작업 사본 \`R-<번호>/staging/\` 하나)."
   case "$tool" in
     Write|Edit|MultiEdit|NotebookEdit)
       for p in "$fp" "$nb"; do
@@ -1581,11 +1578,7 @@ EOF_LEDGER_SPS
 $sps
 EOF_LEDGER_SPS
   [ -n "$named" ] || return 0
-  local wre='(^|[[:space:];&|(])(tee|cp|dd|mv|install|ln|truncate|patch|vim|vi|nano|emacs|ex|rm|rmdir|chmod|chown)([[:space:]]|$)|(^|[[:space:];&|(])sed[[:space:]].*-i'
-  if [[ $lc =~ $wre ]]; then
-    emit_deny "$msg"
-  fi
-  ledger_backstop_sinks_ok "$lc" "$sps" || emit_deny "$msg"
+  ledger_backstop_one_reader "$cmd" || emit_deny "$msg"
   return 0
 }
 

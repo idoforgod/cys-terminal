@@ -634,6 +634,20 @@ def main():
                 if p.returncode != 0:
                     bad.append("%s rc=%d %r" % (label, p.returncode, p.stderr[-160:]))
             check("14 %s 백스톱은 장부를 쓰지 않는 호출을 막지 않는다(Read 포함 · 치명 4)" % mode, not bad, "; ".join(bad))
+        # RULINGS IN6: with jq and no interpreter a NAMED command passes only as ONE simple reader command whose redirections
+        # are the whole operators 2>/dev/null, >/dev/null, 2>&1 — a pipe or a file target is the degraded form's cost
+        for mode, extra in with_jq:
+            bad = []
+            for label, cmd in (("파이프", "cat %s 2>&1 | head" % os.path.join(ledger, "grant.json")),
+                               ("임시 파일로", "cat %s > %s" % (os.path.join(ledger, "grant.json"), os.path.join(out, "y.txt"))),
+                               ("두 명령", "ls %s; true" % ledger),
+                               ("경로로 쓴 cp", "/bin/cp %s %s" % (tmpf, tok_path)),
+                               ("앞의 리다이렉트", "2>/dev/null cp %s %s" % (tmpf, tok_path)),
+                               ("링크 대상", "cat %s > %s" % (os.path.join(ledger, "grant.json"), os.path.join(out, "lnk")))):
+                p, _ = run({"command": cmd}, tool="Bash", rc=0, extra=extra)
+                if not (p.returncode == 2 and "수리 장부" in p.stderr and "백스톱" in p.stderr):
+                    bad.append("%s rc=%d %r" % (label, p.returncode, p.stderr[-160:]))
+            check("14 %s(jq 있음) 장부를 적은 명령은 읽기 명령 하나로만 통과(IN6)" % mode, not bad, "; ".join(bad))
         mode, extra = no_jq
         bad = []
         for label, ti in (("규칙 문서 Write", {"file_path": soul, "content": "x"}),
@@ -750,13 +764,36 @@ def main():
             ("작은따옴표 안의 $(", "grep '$(x' %s/grant.json" % L),
             ("cd 장부 밖 && cat > 상대", "cd %s && cat %s/grant.json > y2.txt" % (out, L)),
             ("cd -P 장부 && ls", "cd -P %s && ls -la" % L),
-            ("작업 사본 쓰기", "cp %s %s/R-3/staging/x.md" % (tmpf, L)))
+            ("작업 사본 쓰기", "cp %s %s/R-3/staging/x.md" % (tmpf, L)),
+            ("무관한 복합 명령", "for f in a b; do echo $f; done > %s" % os.path.join(out, "f.txt")),
+            ("무관한 래퍼", "env -i ls | wc -l; nohup true >/dev/null 2>&1"),
+            ("무관한 치환", "echo \"$(date)\" > %s; cat `echo /etc/hosts` <(true)" % os.path.join(out, "d.txt")))
         bad = []
         for label, cmd in allowed:
             p, _ = run({"command": cmd}, tool="Bash", rc=0)
             if p.returncode != 0:
                 bad.append("%s rc=%d %r" % (label, p.returncode, p.stderr[-120:]))
-        check("16 읽기 명령만으로 된 명령 %d가지는 실제 훅을 통과" % len(allowed), not bad, "; ".join(bad))
+        check("16 읽기 명령만으로 된 명령과 장부를 적지 않은 명령 %d가지는 실제 훅을 통과" % len(allowed), not bad, "; ".join(bad))
+        # RULINGS IN6: the degraded form (jq, no interpreter) refuses every one of those sequences too, and passes a single
+        # reader with the three whole redirection words; its reader names are the judge's own LEDGER_READERS (one list)
+        for mode, extra in with_jq:
+            bad = []
+            for label, cmd in refused:
+                p, _ = run({"command": cmd}, tool="Bash", rc=0, extra=extra)
+                if not (p.returncode == 2 and "수리 장부" in p.stderr and "백스톱" in p.stderr):
+                    bad.append("%s rc=%d %r" % (label, p.returncode, p.stderr[-120:]))
+            check("16 %s(jq 있음) 같은 %d가지 모두 차단(IN6)" % (mode, len(refused)), not bad, "; ".join(bad))
+            bad = []
+            for label, cmd in (("ls 2>/dev/null", "ls %s/R-3 2>/dev/null" % L),
+                               ("grep -n", "grep -n k %s/R-3/record.json" % L),
+                               ("jq . >/dev/null 2>&1", "jq . %s/R-3/record.json >/dev/null 2>&1" % L),
+                               ("python3 -m json.tool", "python3 -m json.tool %s/grant.json" % L),
+                               ("[ -f ]", "[ -f %s/grant.json ]" % L),
+                               ("작업 사본 쓰기", "cp %s %s/R-3/staging/x.md" % (tmpf, L))):
+                p, _ = run({"command": cmd}, tool="Bash", rc=0, extra=extra)
+                if p.returncode != 0:
+                    bad.append("%s rc=%d %r" % (label, p.returncode, p.stderr[-120:]))
+            check("16 %s(jq 있음) 읽기 명령 하나는 통과(IN6)" % mode, not bad, "; ".join(bad))
 
         # 10 — RULINGS FZ2: every stub this test started is gone at its end
         left = [pid for pid in stub_pids if not gone_soon(pid)]
