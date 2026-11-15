@@ -285,9 +285,12 @@ def ceo_drift(fragment_bytes, master_bytes, ceo_bytes, separator):
 #   오너 원문 인용·날짜·사고 경위·개인 PC 경로·'벤더 팩 … 배포 전담 부서의 작업' 문장은 출하되지도 생성기 입력도
 #   아닌 `scripts/vendor-notes/ceo-header-vendor-notes.md` 로 옮겼고(바이트 그대로), 규칙은 제품 문장으로 다시 썼다.
 #   두 상수는 그 중립화된 조항으로 다시 고정했다(종전 6,918 B · ef982427…). 조용한 소실을 막는 모양은 그대로다.
+#   ★RULINGS DC4(T8b · codex J6 G6): 그 조항의 두 문장이 0.15.0 의 조립과 모순이었다('승격은 사용자 파일을 템플릿으로
+#   덮는다 … 다음 부서 생성이 파괴한다' · '⑵는 … 수리 흐름으로 한다') — 같은 자리의 같은 줄 수로 조립 설명으로 바꾸고 두 상수를
+#   다시 고정했다(종전 5,533 B · d0bf2d4a…). 조용한 소실을 막는 모양은 그대로다.
 OWNER_CLAUSE_HEADING = "## [CEO 와 master 의 차이"
-OWNER_CLAUSE_BYTES = 5533
-OWNER_CLAUSE_SHA256 = "d0bf2d4a692f3ee129b89bda42f983829a469f71655002af53c9af729166504d"
+OWNER_CLAUSE_BYTES = 5697
+OWNER_CLAUSE_SHA256 = "729cfa3800c8704b600cc92b81b4a2a617c04ed7a28ca1df73c8d7b47a27ab2e"
 VENDOR_NOTES = os.path.join(SCRIPTS, "vendor-notes", "ceo-header-vendor-notes.md")
 _TOP_SECTION_RE = re.compile(r"(?m)^## \[")
 

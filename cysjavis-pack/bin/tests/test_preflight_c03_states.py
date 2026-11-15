@@ -449,8 +449,12 @@ class ComposedMachine(Base):
         self.assertIn("구분선 뒤 본문", g1["detail"])
         self.assertIn("영수증 없음 — 다음 승격 확인 때 지금 지침을 그대로 두고 영수증을 다시 쓴다", g1["detail"])
         self.assertNotIn("0.14.x 승격", g1["detail"])
-        # 0.14 영수증(양성 증거) → 0.14.x 승격 + .pre-ceo.
+        # ★DC2: 해시가 살아 있는 파일과 다른 0.14 영수증은 증거가 아니다 — 여전히 조립.
         self.wf(".ceo-template-applied", sha256(b"v0.14 copy") + "\n")
+        g1b = self.row(self.run_c03(), "C03.demote-guard")
+        self.assertNotIn("0.14.x 승격", g1b["detail"], "해시가 안 맞는 0.14 영수증이 증거로 쓰였다(DC2)")
+        # 해시가 살아 있는 파일과 같은 0.14 영수증(양성 증거) → 0.14.x 승격 + .pre-ceo.
+        self.wf(".ceo-template-applied", sha256(self.compose(master_body()).encode("utf-8")) + "\n")
         g2 = self.row(self.run_c03(), "C03.demote-guard")
         self.assertEqual(g2["status"], PASS)
         self.assertIn("0.14.x 승격", g2["detail"])
@@ -676,7 +680,7 @@ class BootContractDelivery(Base):
         self.wf("CEO_TEMPLATE.md", tmpl)
         self.wf("MASTER_DIRECTIVE.md", tmpl + sep + master_body())
         self.wf("MASTER_DIRECTIVE.md.pre-ceo", master_body() + "USERFIX\n")
-        self.wf(".ceo-template-applied", sha256(b"v0.14 copy") + "\n")
+        self.wf(".ceo-template-applied", sha256((tmpl + sep + master_body()).encode("utf-8")) + "\n")   # 해시 일치(DC2)
         r = self.row(self.run_c03(), "C03.boot-contract")
         self.assertEqual(r["status"], WARN)
         self.assertIn("조립 이전(0.14.x 통째 복사)", r["detail"])
