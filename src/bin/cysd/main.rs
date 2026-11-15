@@ -10017,3 +10017,41 @@ mod hook_job_win_tests {
 // test-only module; it calls only entry points that exist at 9da2418d, so applied to the pin it is the RED run.
 #[cfg(test)]
 mod d9_tests;
+
+// ★(0.15.0 · S5-PINS 8/9 · H-14-A1-05-01) the daemon's lane↔pack mismatch log line — test-only module.
+#[cfg(test)]
+mod lane_pack_mismatch_log_tests {
+    /// H-14-A1-05-01 (TESTPLAN_RULINGS OQ-H-12 (e) · appendix A-1 #5 "소켓과 팩의 부서 불일치 기록" · RULINGS HN3 · stage-5
+    /// map H2 #71 "no test pin"): a daemon started with a socket of one lane and a pack of the other (a department socket
+    /// with the HQ pack, or the reverse) says so in its start log, as at v0.14.56. Pinned in `async_main`: the condition —
+    /// the socket side `cys::is_dept_socket(&socket_path)` (its semantics are pinned in lib.rs
+    /// `is_dept_socket_detects_dept_not_main`), the pack side the pack folder's `pack-dept-` prefix (a missing name counts
+    /// as HQ), the two compared with `!=` (both directions) — and the branch that writes the mismatch line with both
+    /// paths. Source pin in this file's form: every needle is split with `concat!`, so this test never counts itself.
+    #[test]
+    fn lane_pack_mismatch_is_logged_at_start() {
+        let src = include_str!("main.rs");
+        let start = src.find(concat!("\nasync fn async", "_main() {")).expect("async_main 소실");
+        let body = &src[start..start + 1 + src[start + 1..].find("\n}\n").expect("async_main 끝")];
+        let need = |from: usize, needle: &str, what: &str| -> usize {
+            from + body[from..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("{what}: `{needle}` 소실 — 레인↔팩 불일치 기록(부록 A-1 #5)이 바뀌었다"))
+        };
+        let a = need(0, concat!("let is_dept = cys::is_dept", "_socket(&socket_path);"), "소켓 쪽 판정");
+        let b = need(a, concat!("let pack = cys::pack::pack", "_dir();"), "팩 경로");
+        let c = need(b, concat!(".map(|n| n.to_string_lossy().starts_with(\"pack-", "dept-\"))"), "팩 쪽 판정");
+        let c2 = need(c, concat!(".unwrap_or(fal", "se);"), "이름 없는 팩 = 본부");
+        assert!(c2 - c < 80, "팩 쪽 판정의 기본값이 그 판정에 붙어 있지 않다");
+        let d = need(c2, concat!("if is_dept != pack_is", "_dept {"), "불일치 조건(양방향)");
+        let e = need(d, "} else {", "일치 갈래");
+        let branch = &body[d..e];
+        assert!(branch.contains("eprintln!("), "불일치 갈래가 기록하지 않는다");
+        assert!(
+            branch.contains(concat!("\"[cysd] ⚠ 레인↔팩 ", "불일치: socket={} (dept={is_dept}) pack={} (dept={pack_is_dept})")),
+            "불일치 줄의 문면이 바뀌었다"
+        );
+        assert!(branch.contains("socket_path.display(),") && branch.contains("pack.display()"), "불일치 줄에 소켓·팩 경로가 없다");
+        assert_eq!(src.matches(concat!("if is_dept != pack_is", "_dept {")).count(), 1, "판정은 기동 경로 한 곳");
+    }
+}
