@@ -1949,8 +1949,8 @@ def _parse_open_defect_state(raw):
     the form written before JT1 (a key without a count — that key was done)."""
     try:
         doc = json.loads(raw.decode("utf-8"))
-    except ValueError:                                     # also UnicodeDecodeError
-        return None, None, False, "not JSON"
+    except Exception as e:                                 # noqa: BLE001 — RULINGS KD1: ANY failure to parse = invalid
+        return None, None, False, "not JSON (%s)" % type(e).__name__
     if not isinstance(doc, dict):
         return None, None, False, "not an object"
     key = doc.get("key")
