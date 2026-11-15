@@ -1716,6 +1716,11 @@ fn a_hook_unregistration_runs_the_lanes_own_step() {
 // ───────────────────────────── recheck (H8) ─────────────────────────────
 
 fn recheck(r: &Rig, id: &RepairId, d: &Doubles, seat: u64, note: &str) -> Result<LaneState, RepairError> {
+    recheck_answer(r, id, d, seat, note).map(|a| a.state)
+}
+
+/// `recheck` with its whole answer (JD2: the state and what the call changed).
+fn recheck_answer(r: &Rig, id: &RepairId, d: &Doubles, seat: u64, note: &str) -> Result<Rechecked, RepairError> {
     let l = lane(DEPT);
     let check = |rel: &str, root: &Path, _: Duration| -> Result<CheckOutcome, RepairError> {
         d.checks.set(d.checks.get() + 1);
@@ -2576,6 +2581,55 @@ fn the_door_path_keeps_the_hook_operation_in_the_rows_content() {
     assert_eq!(row3.state, LaneState::Conflict);
     assert!(row3.reason.contains("bin/b.py"), "{}", row3.reason);
     assert_eq!(row3.hook_ops, op_test_hooks());
+}
+
+/// JD2 — `recheck`'s answer says what the call changed, in one sentence: the row (검증됨, or 충돌 with
+/// a new reason), the hook operation it completed, a deleting repair's tombstones.
+#[test]
+fn recheck_answers_what_the_call_changed() {
+    let id = rid("R-1");
+    // an edit, no hook
+    let r = rig("jd2g");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/a.py", b"mine\n", 0o644);
+    tick(&r, DEPT, &doubles(), &fid(1));
+    conflicted_with_lock(&r, &id, b"mine\n");
+    let a = recheck_answer(&r, &id, &doubles(), 5, "").unwrap();
+    assert_eq!(a.state, LaneState::Verified);
+    assert_eq!(a.changed, "이 호출이 바꾼 것: 이 부서의 행('충돌' → '검증됨', 합친 기록을 남기고 합치기 잠금을 풂)");
+    // an edit and a hook: passing, then failing
+    for pass in [true, false] {
+        let r = rig(if pass { "jd2h" } else { "jd2i" });
+        edit_and_hook_in_hq(&r, &id);
+        r.put(DEPT, "bin/a.py", b"mine\n", 0o644);
+        tick(&r, DEPT, &doubles(), &fid(1));
+        conflicted_with_lock(&r, &id, b"mine\n");
+        let d = doubles();
+        d.pass.set(pass);
+        let hook = "이 부서의 훅 등록 해제(작업 op-test: Stop:x.sh)";
+        match recheck_answer(&r, &id, &d, 5, "") {
+            Ok(a) => {
+                assert!(pass);
+                assert_eq!(a.changed, format!("이 호출이 바꾼 것: 이 부서의 행('충돌' → '검증됨', 합친 기록을 남기고 합치기 잠금을 풂), {hook}"));
+            }
+            Err(RepairError::CheckFailed(m)) => {
+                assert!(!pass);
+                assert!(m.ends_with(&format!("이 호출이 바꾼 것: 이 부서의 행('충돌' 그대로, 사유와 살아 있는 상태를 새로 적음), {hook}")), "{m}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    // a deletion merged by deleting the lane's file: its tombstone is recorded with the 검증됨 row
+    let r = rig("jd2j");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), None);
+    r.put(DEPT, "bin/a.py", b"mine\n", 0o644);
+    tick(&r, DEPT, &doubles(), &fid(1));
+    conflicted_with_lock(&r, &id, b"mine\n");
+    std::fs::remove_file(r.dept.join("bin/a.py")).unwrap();
+    let a = recheck_answer(&r, &id, &doubles(), 5, "").unwrap();
+    assert_eq!(a.state, LaneState::Verified);
+    assert!(a.changed.ends_with(", 이 부서의 삭제 표식(묘비) 확인·기록"), "{}", a.changed);
+    assert!(crate::repair::tombstones::load_in(&r.root, &lane(DEPT)).unwrap().iter().any(|t| t.rel == "bin/a.py"));
 }
 
 // ───────────────────────────── RULINGS JA2 / JA3 — what a row and the catch-up mean ─────────────────────────────
