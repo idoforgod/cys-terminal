@@ -280,6 +280,33 @@ class TicketGate(unittest.TestCase):
         head = [i for i, ln in enumerate(lines) if ln.startswith("병합 티켓 — R-7")][0]
         self.assertTrue(lines[head + 1].startswith("  까닭("), "the reason follows the head line")
 
+    # RULINGS JI1: the merge ticket prints the hook operations THIS lane completed for R (the daemon read them from
+    # the operation records) — never another lane's; records the daemon could not read → its sentence, never nothing
+    def test_merge_ticket_prints_the_lanes_completed_hook_operations(self):
+        sock = os.path.join(self.tmp, "state", "cys-dept-dept-a", "cys.sock")
+        with open(os.environ["CYS_DEPTS_JSON"], "w", encoding="utf-8") as f:
+            json.dump({"depts": {"dept-a": {"socket": sock}}}, f)
+        import javis_lane
+        key = javis_lane.lane_key(sock)
+        status = {"repair": "R-9", "trigger": "update", "classification": "general",
+                  "files": [{"rel": "settings:Stop:x.sh", "kind": {"hook_unregister": {"event": "Stop", "script": "x.sh"}}}],
+                  "lane_rows": [{"lane": key, "state_label": "충돌", "reason": ""}],
+                  "hook_ops": [{"lane": key, "op": "op-1", "kind": "hook-unregister", "lines": ["Stop:x.sh"], "text": "훅 등록 해제(작업 op-1: Stop:x.sh)"},
+                               {"lane": "base", "op": "op-2", "kind": "hook-unregister", "lines": ["Stop:x.sh"], "text": "훅 등록 해제(작업 op-2: Stop:x.sh)"}],
+                  "hook_ops_unreadable": None}
+        with path_with(self.stub(GATE_HELD, 95, status)):
+            rc, out, err = run_tp(merge="R-9", surface="dept-a/surface:5")
+        self.assertEqual(rc, 0, err)
+        lines = out.splitlines()
+        self.assertIn("  이 부서가 마친 훅 작업: 훅 등록 해제(작업 op-1: Stop:x.sh)", lines)
+        self.assertNotIn("op-2", out, "never another lane's operation")
+        status["hook_ops"] = []
+        status["hook_ops_unreadable"] = "완료한 훅 작업을 확인할 수 없습니다 — R-9/ops: 목록을 읽을 수 없음"
+        with path_with(self.stub(GATE_HELD, 95, status)):
+            rc, out, err = run_tp(merge="R-9", surface="dept-a/surface:5")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("  완료한 훅 작업을 확인할 수 없습니다 — R-9/ops: 목록을 읽을 수 없음", out.splitlines())
+
     # RULINGS IG6: a HOOK-ONLY repair (a hook unregistration and no file) gets its merge ticket — the hook target
     # and R's trigger kept, `begin --unregister-hook … --joins R` and `recheck R` printed (no `--files`)
     def test_a_hook_only_repair_gets_its_merge_ticket(self):
