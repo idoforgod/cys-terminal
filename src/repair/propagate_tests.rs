@@ -1072,6 +1072,13 @@ fn a_vendor_file_replaced_before_the_act_is_refused_by_the_door() {
     *d.vendor.borrow_mut() = Some(("bin/gone.py".into(), crate::pack::content_hash_pub("vendor v1\n")));
     tick_with(&r, DEPT, &d, &fid(1), &Replace, &|_| false).unwrap();
     assert_eq!(std::fs::read(r.dept.join("bin/gone.py")).unwrap(), b"someone else\n");
+    // REWRITTEN under RULINGS IV1 — old expectation, quoted: `assert_eq!(r.row(&id, DEPT).unwrap().state,
+    // LaneState::Conflict)` after this ONE tick. The door refused; the target differs from the
+    // decision's stamp → nothing written this tick; the next tick: the other writer's bytes are not a
+    // known vendor version → 충돌, nothing moved
+    assert!(r.row(&id, DEPT).is_none());
+    tick(&r, DEPT, &d, &fid(1));
+    assert_eq!(std::fs::read(r.dept.join("bin/gone.py")).unwrap(), b"someone else\n");
     assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Conflict);
     assert!(crate::repair::tombstones::load_in(&r.root, &lane(DEPT)).unwrap().is_empty());
 }
@@ -1265,7 +1272,15 @@ fn foreign_bytes_at_the_door_are_a_conflict_and_stay() {
     let id = rid("R-1");
     committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
     r.put(DEPT, "bin/a.py", b"old\n", 0o644);
-    tick_with(&r, DEPT, &doubles(), &fid(1), &Foreign, &|_| false).unwrap();
+    let t = tick_with(&r, DEPT, &doubles(), &fid(1), &Foreign, &|_| false).unwrap();
+    assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"foreign\n");
+    // REWRITTEN under RULINGS IV1 — old expectation, quoted: `assert_eq!(r.row(&id, DEPT).unwrap().state,
+    // LaneState::Conflict)` after this ONE tick. The door declined (GV1: another writer's bytes stay);
+    // the target's state now differs from the decision's stamp, so nothing is written for that decision
+    // this tick; the next tick decides from states — the foreign bytes are neither R's pre-image nor its
+    // result → 충돌 (never "superseded"), the bytes still kept
+    assert!(r.row(&id, DEPT).is_none(), "{t:?}");
+    tick(&r, DEPT, &doubles(), &fid(1));
     assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"foreign\n");
     assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Conflict);
 }
@@ -1555,8 +1570,16 @@ fn a_generation_change_during_the_apply_leaves_the_row_pending() {
     r.put(DEPT, "bin/a.py", b"old\n", 0o644);
     let t = tick_with(&r, DEPT, &doubles(), &fid(1), &Bump, &|_| false).unwrap();
     assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"old\n");
-    assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Pending, "{t:?}");
+    // REWRITTEN under RULINGS IV1 — old expectation, quoted: `assert_eq!(r.row(&id, DEPT).unwrap().state,
+    // LaneState::Pending)` (a new 대기 row written in the same tick). The generation is part of the
+    // decision's stamp: it changed, so NOTHING is written for that decision this tick (the reason said)
+    assert!(r.row(&id, DEPT).is_none(), "{t:?}");
+    assert!(t.left.iter().any(|(i, why)| *i == id && why == STATES_CHANGED), "{t:?}");
     assert!(!t.catchup_completed);
+    // the next tick decides anew, bound to the new generation: the edit is applied there
+    tick(&r, DEPT, &doubles(), &fid(1));
+    assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"new\n");
+    assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Verified);
 }
 
 /// CB1 / CG / T8b: a lane's promoted (composed) MASTER directive is never replaced by propagation.
@@ -1682,11 +1705,21 @@ fn recheck(r: &Rig, id: &RepairId, d: &Doubles, seat: u64, note: &str) -> Result
     let l = lane(DEPT);
     let check = |rel: &str, root: &Path, _: Duration| -> Result<CheckOutcome, RepairError> {
         d.checks.set(d.checks.get() + 1);
+        if let Some(f) = d.during_check.borrow().as_ref() {
+            f(root);
+        }
         let ok = matches!(TargetState::read(&root.join(rel)), Ok(TargetState::File { .. })) && d.pass.get();
         Ok(CheckOutcome { result: if ok { CheckResult::Pass } else { CheckResult::Fail("x".into()) }, ms: 1 })
     };
     let classify = |_: &str| -> Result<Classification, RepairError> { Ok(d.class.get()) };
-    let hooks = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> { Ok(ReconcileReport { hooks: Vec::new() }) };
+    let hooks = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> {
+        d.hook_calls.set(d.hook_calls.get() + 1);
+        if d.hooks_ok.get() {
+            Ok(ReconcileReport { hooks: Vec::new() })
+        } else {
+            Err(RepairError::Io("등록기가 실패했습니다(시험)".into()))
+        }
+    };
     let bytes = |_: &RepairRecord, _: &str| -> Result<PathBuf, String> { Err("none".into()) };
     let lock_file = r.base.join(".pack-apply.lock");
     let sources = sources_of(d);
@@ -1917,4 +1950,245 @@ fn the_id_file_survives_the_per_file_install_and_its_prune() {
     assert_eq!(pack_instance_pass_in(&pass_env(&r, &l, DEPT, &no), &fid(2)), PassOutcome::Equal);
     assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Verified, "no row demoted");
     assert_eq!(gate_verdict_in(&r.root, &lane(DEPT)), GateVerdict::Open, "the gate unchanged");
+}
+
+// ───────────────────────────── RULINGS IV2 — the census of propagate.rs's write sites ─────────────────────────────
+
+/// Every call in `propagate.rs`'s production text that writes something durable, per function — rows,
+/// the lane's tombstone file (also through the hook step), the job state and the catch-up record, the
+/// pack's id file, door operations, the committed copy and the lane's own scratch. Each row says
+/// whether the tried pack-apply lock is held there and which stamp is validated first (or why none
+/// applies). A new write site without a row fails `every_write_site_of_the_propagation_is_listed`.
+/// (fn, callee, count, lock, stamp, why)
+const WRITE_SITES: &[(&str, &str, usize, &str, &str, &str)] = &[
+    ("changed_midway", "write_row_if(", 1, "held (door phase)", "none — RULINGS IO1", "the visible 충돌 of a change between two targets: it describes what THIS lane did, not what R now is"),
+    ("copy_checked", "create_dir_all(", 1, "none", "none", "the lane's own scratch for the copy-check (11.2): not shared, not the pack, removed on every exit"),
+    ("copy_checked", "write_new(", 1, "none", "none", "as above"),
+    ("copy_checked_bytes_of", "create_dir_all(", 1, "none", "none", "as above"),
+    ("copy_checked_bytes_of", "write_new(", 1, "none", "none", "as above"),
+    ("door_phase", "ensure_tombstones(", 1, "held (door phase)", "decision (`holds` strict, then updated by `placed`)", "IG2: the tombstones of the applied row, after the stamp held"),
+    ("door_phase", "hook_step(", 1, "held (door phase)", "decision (strict)", "the hook step (registrar + the lane's tombstones) after the stamp held"),
+    ("door_phase", "record_in(", 1, "held (door phase)", "decision (strict) — before the operation", "B1: a deletion's tombstone right after its own door operation"),
+    ("door_phase", "run_op(", 1, "held (door phase)", "decision (strict) — before each target", "rule one through T6's door (which re-verifies the target and the generation itself)"),
+    ("door_phase", "write_row_if(", 1, "held (door phase)", "decision (strict) — after the last target", "the 적용됨 row"),
+    ("drop", "remove_dir_all(", 1, "none", "none", "`Scratch::drop`: the lane's own scratch, removed"),
+    ("ensure_tombstones", "record_in(", 1, "via its callers", "via its callers", "called only from `door_phase` and `publish`, both held and stamped"),
+    ("full_reset", "replace_pack_instance(", 1, "held (the pass)", "the pass's own reading, inside the same lock", "I8 step 3: read and written in ONE tried lock — no unlocked gap"),
+    ("full_reset", "update_row(", 1, "held (the pass)", "the pass's own reading", "I8 step 2: rows back to 대기"),
+    ("full_reset", "write_job_state(", 2, "held (the pass)", "the pass's own reading", "I8 steps 1 and 4"),
+    ("hook_step", "(env.hooks)(", 1, "via its callers", "via its callers", "called only from `door_phase` and `locked_hook_step`, both held and stamped"),
+    ("locked_hook_step", "hook_step(", 1, "held", "decision (strict)", "the \"already there\" arm and `recheck` (IV4)"),
+    ("note_reason", "update_row(", 1, "held", "none — by design", "IK2: the reason why a decision's writes were dropped; changes the reason text only"),
+    ("publish", "ensure_tombstones(", 1, "held", "decision (strict for a check's result)", "IQ2: one unit with the 검증됨 row"),
+    ("publish", "write_row_if(", 1, "held", "decision (strict for a check's result)", "every row the tick and `recheck` publish (IK3 / IG5 / IQ1 / IV1 / IV4)"),
+    ("replace_pack_instance", "remove_file(", 1, "via full_reset (held)", "the pass's own reading", "I8: the old id unlinked"),
+    ("replace_pack_instance", "write_all(", 1, "via full_reset (held)", "the pass's own reading", "I8: the new id created NEW"),
+    ("seal_committed_copy_in", "create_dir(", 2, "none (R's vault, not a pack)", "none — the commit validates it", "HI2 / HJ2: at the ORIGIN's commit; the copy's hash and mode are compared with the verified states under the per-repair mutex before the record is published"),
+    ("seal_committed_copy_in", "create_dir_all(", 1, "none (R's vault)", "none — as above", "as above"),
+    ("seal_committed_copy_in", "write_new(", 2, "none (R's vault)", "none — as above", "as above"),
+    ("sweep_own_scratch", "remove_dir_all(", 1, "none", "none", "a dead process's scratch of THIS lane, by its exact name"),
+    ("tick_body", "write_job_state(", 1, "held", "the tick's catch-up stamp (generation + instance, strict) — IV3", "the catch-up record"),
+    ("update_row", "write_lane_durable_in(", 1, "via its callers", "via its callers", "the primitive of `full_reset`, `verify_only`, `note_reason`"),
+    ("verify_only", "update_row(", 1, "held (the pass)", "the pass's own reading", "L5 (a): rows back to 대기"),
+    ("verify_only", "write_job_state(", 1, "held (the pass)", "the pass's own reading", "the recorded directory / generation"),
+    ("write_job_state", "write_json_durable(", 1, "via its callers", "via its callers", "the primitive of `tick_body`, `full_reset`, `verify_only`"),
+    ("write_row_if", "write_lane_durable_in(", 1, "via its callers", "via its callers", "the primitive of `publish`, `door_phase`, `changed_midway` (compare-and-write under the per-repair mutex)"),
+];
+
+/// The callees that write something durable (the census's vocabulary).
+const WRITE_CALLEES: &[&str] = &[
+    "write_row_if(", "update_row(", "write_lane_durable_in(", "write_job_state(", "record_in(", "ensure_tombstones(", "hook_step(", "(env.hooks)(",
+    "run_op(", "replace_pack_instance(", "write_new(", "create_dir_all(", "create_dir(", "remove_dir_all(", "remove_file(", "write_all(",
+    "write_json_durable(", "rename(",
+];
+
+/// (fn, callee) → count over a production text; a line belongs to the last `fn` above it; comment
+/// lines and the declaration's own name are skipped.
+fn write_sites_of(prod: &str) -> std::collections::BTreeMap<(String, String), usize> {
+    let mut m = std::collections::BTreeMap::new();
+    let mut cur = "<module>".to_string();
+    for line in prod.lines() {
+        let t = line.trim_start();
+        if t.starts_with("//") {
+            continue;
+        }
+        let code = match line.find("//") {
+            Some(i) if line[..i].matches('"').count() % 2 == 0 => &line[..i],
+            _ => line,
+        };
+        let mut body = code;
+        let decl = t.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim_start_matches("const ");
+        if let Some(rest) = decl.strip_prefix("fn ") {
+            cur = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            match code.find('{') {
+                Some(o) => body = &code[o + 1..],
+                None => continue,
+            }
+        }
+        for c in WRITE_CALLEES {
+            let n = body
+                .match_indices(c)
+                .filter(|(i, _)| !c.starts_with(|x: char| x.is_ascii_alphabetic()) || !body[..*i].chars().last().is_some_and(|p| p.is_ascii_alphanumeric() || p == '_'))
+                .count();
+            if n > 0 {
+                *m.entry((cur.clone(), c.to_string())).or_insert(0) += n;
+            }
+        }
+    }
+    m
+}
+
+fn write_site_violations(prod: &str) -> Vec<String> {
+    let counts = write_sites_of(prod);
+    let mut v = Vec::new();
+    for ((f, c), n) in &counts {
+        match WRITE_SITES.iter().find(|r| r.0 == f && r.1 == c) {
+            None => v.push(format!("{f}: {n} × {c} — a write site with no row (lock? stamp?)")),
+            Some(r) if r.2 != *n => v.push(format!("{f}: {n} × {c}, the census lists {} — classify the new one", r.2)),
+            Some(_) => {}
+        }
+    }
+    for r in WRITE_SITES {
+        if !counts.contains_key(&(r.0.to_string(), r.1.to_string())) {
+            v.push(format!("{}: {} listed but not found — remove the row", r.0, r.1));
+        }
+    }
+    v
+}
+
+fn propagate_production_text() -> String {
+    let src = include_str!("propagate.rs");
+    src[..src.find("#[cfg(test)]\n#[path").unwrap_or(src.len())].to_string()
+}
+
+/// RULINGS IV2 — every write site of the propagation is listed with its lock and its stamp; a new one
+/// without a row (or a changed count) fails. Mutation controls: a new write in a new function, and one
+/// more row write in a listed function, are both caught.
+#[test]
+fn every_write_site_of_the_propagation_is_listed() {
+    let prod = propagate_production_text();
+    let v = write_site_violations(&prod);
+    assert!(v.is_empty(), "{v:#?}");
+    assert!(!write_site_violations(&format!("{prod}\nfn census_mutant(env: &LaneEnv<'_>, r: &LaneRecord) {{ let _ = write_row_if(env, None, r); }}\n")).is_empty());
+    let more = prod.replacen("fn note_reason(env: &LaneEnv<'_>, id: &RepairId, why: &str) {", "fn note_reason(env: &LaneEnv<'_>, id: &RepairId, why: &str) {\n    let _ = write_job_state(env.op.root, &fresh_job_state(env.op.lane));", 1);
+    assert_ne!(more, prod, "the mutation applied");
+    assert!(!write_site_violations(&more).is_empty(), "one more write in a listed function");
+    assert!(WRITE_SITES.iter().all(|r| !r.3.is_empty() && !r.4.is_empty() && !r.5.is_empty()), "every row says lock, stamp and why");
+}
+
+// ───────────────────────────── RULINGS IV1 / IV3 / IV4 — the stamp at every write ─────────────────────────────
+
+fn clear_seams() {
+    AFTER_DECISION.with(|h| *h.borrow_mut() = None);
+    AFTER_DOOR_PHASE.with(|h| *h.borrow_mut() = None);
+    BEFORE_CATCHUP.with(|h| *h.borrow_mut() = None);
+}
+
+/// IV1 (M1) — an update placed RIGHT AFTER the decision (the stamp taken) is never taken as the
+/// baseline: the "already there" path → no 검증됨, no catch-up; the apply path, an update right after
+/// the door phase released its lock → the 적용됨 row stays, no 검증됨, no catch-up. (With a stamp taken
+/// at the start of the check, the updated bytes became the baseline and 검증됨 was published.)
+#[test]
+fn an_update_right_after_the_decision_is_never_the_baseline() {
+    for path in ["already-there", "after-the-door"] {
+        let r = rig(&format!("iv1-{path}"));
+        let id = rid("R-1");
+        committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+        r.put(DEPT, "bin/a.py", if path == "already-there" { b"new\n" } else { b"old\n" }, 0o644);
+        let dept = r.dept.clone();
+        let update: Box<dyn Fn(&Path)> = Box::new(move |_: &Path| {
+            std::fs::write(dept.join("bin/a.py"), b"updated\n").unwrap();
+            std::fs::write(dept.join(".pack-version"), "0.15.1\n").unwrap();
+        });
+        if path == "already-there" {
+            AFTER_DECISION.with(|h| *h.borrow_mut() = Some(update));
+        } else {
+            AFTER_DOOR_PHASE.with(|h| *h.borrow_mut() = Some(update));
+        }
+        let t = tick(&r, DEPT, &doubles(), &fid(1));
+        clear_seams();
+        assert!(!t.catchup_completed, "{path}: {t:?}");
+        assert!(!t.rows.iter().any(|(_, st, _)| *st == LaneState::Verified), "{path}: {t:?}");
+        assert!(t.left.iter().any(|(i, why)| *i == id && why == STATES_CHANGED), "{path}: {t:?}");
+        match r.row(&id, DEPT) {
+            Some(row) => assert_eq!((path, row.state), ("after-the-door", LaneState::Applied)),
+            None => assert_eq!(path, "already-there"),
+        }
+    }
+}
+
+/// IV3 (M2) — the catch-up record is written inside the tried lock after the generation and instance
+/// its completeness was judged on were measured again: an update between the last publication and the
+/// catch-up → not recorded this tick (the gate stays held by it); the next tick decides anew.
+#[test]
+fn an_update_before_the_catchup_record_is_not_recorded() {
+    let r = rig("iv3");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    let dept = r.dept.clone();
+    BEFORE_CATCHUP.with(|h| *h.borrow_mut() = Some(Box::new(move |_: &Path| std::fs::write(dept.join(".pack-version"), "0.15.1\n").unwrap())));
+    let t = tick(&r, DEPT, &doubles(), &fid(1));
+    clear_seams();
+    assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Verified, "the row was published before the update");
+    assert!(!t.catchup_completed, "{t:?}");
+    assert!(!r.job(DEPT).initial_catchup_complete, "the catch-up is not recorded");
+    assert!(t.lines.iter().any(|l| l.contains(STATES_CHANGED)), "{t:?}");
+}
+
+/// IV4 (M3) — `recheck` follows the same stamp and the same publication as the tick: (1) an update
+/// between its check and its row → nothing written (the row stays 충돌, the merge lock kept), the verb
+/// refused with the reason; (2) R reverted right after the decision, before the hook step of a hook
+/// repair → the hook step does not run (no registrar call, no tombstone), nothing written.
+#[test]
+fn recheck_uses_the_same_stamp_and_publication_as_the_tick() {
+    // (1) a file repair, an update during recheck's check
+    let r = rig("iv4a");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/a.py", b"mine\n", 0o644);
+    tick(&r, DEPT, &doubles(), &fid(1));
+    conflicted_with_lock(&r, &id, b"mine\n");
+    let d = doubles();
+    {
+        let dept = r.dept.clone();
+        *d.during_check.borrow_mut() = Some(Box::new(move |_: &Path| std::fs::write(dept.join("bin/a.py"), b"updated\n").unwrap()));
+    }
+    match recheck(&r, &id, &d, 5, "합침") {
+        Err(RepairError::Locked(m)) => assert!(m.contains(STATES_CHANGED), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    let row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Conflict);
+    assert!(row.merge_lock.is_some() && row.merge.is_none(), "nothing written");
+    // (2) a hook-only repair, R reverted right after recheck's decision
+    let r2 = rig("iv4b");
+    let id2 = rid("R-2");
+    record(&r2, &id2, Classification::General, vec![FileChange { rel: "settings:Stop:x.sh".into(), kind: ChangeKind::HookUnregister { event: "Stop".into(), script: "x.sh".into() }, pre: PreImage::Absent, post: TargetState::Absent, diff: None }], Vec::new(), HQ);
+    let d2 = doubles();
+    d2.hooks_ok.set(false); // the first tick: the lane's hook step fails → 충돌
+    tick(&r2, DEPT, &d2, &fid(1));
+    let mut row2 = r2.row(&id2, DEPT).unwrap();
+    assert_eq!(row2.state, LaneState::Conflict);
+    row2.merge_lock = Some(crate::repair::lock::new_lease(LockOwner { lane: lane(DEPT), seat: 5, incarnation: "inc".into() }, T0, None));
+    ledger::write_lane_durable_in(&r2.root, &row2).unwrap();
+    let d3 = doubles();
+    {
+        let (root, id2) = (r2.root.clone(), id2.clone());
+        AFTER_DECISION.with(|h| *h.borrow_mut() = Some(Box::new(move |_: &Path| {
+            let mut rec = ledger::read_record_in(&root, &id2).unwrap().unwrap();
+            rec.state = RepairState::Reverted;
+            ledger::write_record_in(&root, &rec).unwrap();
+        })));
+    }
+    let tombs_before = std::fs::read(crate::repair::tombstones::path_in(&r2.root, &lane(DEPT))).ok();
+    let out = recheck(&r2, &id2, &d3, 5, "");
+    clear_seams();
+    match out {
+        Err(RepairError::Locked(m)) => assert!(m.contains(RECORD_CHANGED), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(d3.hook_calls.get(), 0, "the hook step did not run");
+    assert_eq!(std::fs::read(crate::repair::tombstones::path_in(&r2.root, &lane(DEPT))).ok(), tombs_before, "no tombstone written");
+    assert_eq!(r2.row(&id2, DEPT).unwrap().state, LaneState::Conflict, "nothing written");
 }
