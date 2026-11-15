@@ -49606,6 +49606,81 @@ mod tests {
         assert!(refl_fn_body(src, "run_schedule").contains("remove_schedule_job(arr, &id)"), "the remove arm bypasses remove_schedule_job");
     }
 
+    /// ★WJ1 T-a (RULINGS JV2 · F3-B1 — the owner's fatal class 3): a periodic job saved by the REAL CLI schedule writer
+    /// ([`schedule_file_transaction`] — the schedule lock, the canonical form, the atomic write) AFTER a pack update's backup
+    /// survives that update's roll-back — the writer's own failure before its commit, and its death followed by the next
+    /// recovery. The update itself never writes `schedule.json` (seed-once), so the roll-back must not either. Control: the
+    /// vendor file the update DID replace is put back. Driven through the library's hidden test seam (RULINGS KA4).
+    /// Red on base8: the roll-back wrote the backup's schedule back and the job was gone.
+    #[test]
+    #[ignore = "WJ1 red on base8's roll-back — un-ignored with the fix"]
+    fn wj1_schedule_job_added_after_the_backup_survives_the_rollback() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let s0 = "{\n  \"jobs\": [\n    {\n      \"id\": \"base-only-job\",\n      \"action\": \"command\",\n      \"command\": \"true\",\n      \"every_minutes\": 60\n    }\n  ]\n}\n";
+        let v1 = "#!/bin/sh\necho vendor-v1\n";
+        let v2 = "#!/bin/sh\necho vendor-v2\n";
+        for writer_dies in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "cys-wj1-a-{writer_dies}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+            ));
+            let pack = root.join("pack");
+            std::fs::create_dir_all(pack.join("bin")).unwrap();
+            let _env = vec![
+                cys::pack::EnvGuard::set("CYS_PACK_DIR", &pack),
+                cys::pack::EnvGuard::set("CYS_CONFIG_DIR", root.join("cfg")),
+                cys::pack::EnvGuard::set("CYS_LOCAL_DIR", root.join("local")),
+            ];
+            std::fs::write(pack.join(".pack-version"), "0.15.0").unwrap();
+            std::fs::write(pack.join("schedule.json"), s0).unwrap();
+            std::fs::write(pack.join("bin/vendor.sh"), v1).unwrap();
+            let manifest = json!({
+                "schedule.json": cys::pack::content_hash_pub(s0),
+                "bin/vendor.sh": cys::pack::content_hash_pub(v1),
+            });
+            std::fs::write(pack.join(".install-manifest.json"), manifest.to_string()).unwrap();
+            let state = cys::pack::PackState { channel: "free".into(), base_version: "0.15.1".into(), pro_revision: 0 };
+            let items: Vec<(&str, &str)> = vec![("bin/vendor.sh", v2), ("schedule.json", s0)];
+            let schedule = pack.join("schedule.json");
+            let mut added: Option<Result<Vec<String>, String>> = None;
+            let r = cys::pack::apply_pack_transactional_paused(
+                &items,
+                "0.15.1",
+                &state,
+                "Installed",
+                &mut || {
+                    added = Some(schedule_file_transaction(&schedule, |arr| {
+                        arr.push(json!({"id": "user-watchdog", "action": "command", "command": "true", "every_minutes": 5}));
+                        Ok(())
+                    }));
+                },
+                writer_dies,
+            );
+            let recovered = if writer_dies { Some(cys::pack::recover_pack_journal()) } else { None };
+            let doc: Value = serde_json::from_str(&std::fs::read_to_string(&schedule).unwrap_or_default()).unwrap_or(Value::Null);
+            let ids: Vec<String> = doc["jobs"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|j| j["id"].as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let vendor = std::fs::read_to_string(pack.join("bin/vendor.sh")).unwrap_or_default();
+            let version = std::fs::read_to_string(pack.join(".pack-version")).unwrap_or_default();
+            drop(_env);
+            let _ = std::fs::remove_dir_all(&root);
+            assert!(matches!(added, Some(Ok(_))), "[dies={writer_dies}] the CLI writer did not save: {added:?}");
+            assert!(r.is_ok(), "[dies={writer_dies}] the stop: {r:?}");
+            if writer_dies {
+                assert_eq!(recovered, Some(Ok(true)), "the recovery after the writer died");
+            }
+            assert!(
+                ids.contains(&"user-watchdog".to_string()) && ids.contains(&"base-only-job".to_string()),
+                "[dies={writer_dies}] the job saved after the backup must survive the roll-back (F3): jobs = {ids:?}"
+            );
+            assert_eq!(vendor, v1, "[dies={writer_dies}] the file the update replaced is put back");
+            assert_eq!(version.trim(), "0.15.0", "[dies={writer_dies}] the version marker stays old");
+        }
+    }
+
     /// ★성찰 P8 — CLI 가 띄우는 데몬은 **좌석 신원을 물려받지 않는다**.
     ///
     /// 실패 방향: 역할 pane 안에서 `cys` 가 데몬을 자동 기동하면(온보딩④ sibling spawn) 그 cysd 가
