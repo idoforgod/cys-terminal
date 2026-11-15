@@ -223,6 +223,8 @@ struct Doubles {
     form: Cell<ApplyForm>,
     /// HH1: (rel, content hash) this test's previous-release table knows (`with_prev_vendor`).
     vendor: std::cell::RefCell<Option<(String, String)>>,
+    /// IK3 / IG5: runs inside every check call (the root it checks) — a seam that "parks" a check.
+    during_check: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>>,
 }
 
 fn doubles() -> Doubles {
@@ -235,6 +237,7 @@ fn doubles() -> Doubles {
         class: Cell::new(Classification::General),
         form: Cell::new(ApplyForm::Exchange),
         vendor: std::cell::RefCell::new(None),
+        during_check: std::cell::RefCell::new(None),
     }
 }
 
@@ -252,6 +255,9 @@ fn tick_with(r: &Rig, which: &str, d: &Doubles, fresh: &str, faults: &dyn Faults
     let pack = r.pack(which).to_path_buf();
     let check = |rel: &str, root: &Path, _: Duration| -> Result<CheckOutcome, RepairError> {
         d.checks.set(d.checks.get() + 1);
+        if let Some(f) = d.during_check.borrow().as_ref() {
+            f(root);
+        }
         // the check reads the file under the root it is given (a copy or the live pack)
         let result = match TargetState::read(&root.join(rel)) {
             Ok(TargetState::File { .. }) if d.pass.get() => CheckResult::Pass,
@@ -961,6 +967,90 @@ fn foreign_bytes_at_the_door_are_a_conflict_and_stay() {
     tick_with(&r, DEPT, &doubles(), &fid(1), &Foreign, &|_| false).unwrap();
     assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"foreign\n");
     assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Conflict);
+}
+
+/// RULINGS IK3 — NO LOCK ACROSS A CHECK: while this lane's copy-check and its live check run (a check
+/// child "parked" by the seam), the machine-wide pack-apply lock is free — a `try` of it succeeds and
+/// ANOTHER lane's tick runs its pass (which needs the lock) to its end. (On the old shape the whole tick
+/// held the lock: the `try` answered "held" and the other lane skipped its turn.)
+#[test]
+fn no_lock_is_held_across_a_check() {
+    let r = std::rc::Rc::new(rig("ik3"));
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    let lock = r.base.join(".pack-apply.lock");
+    let seen = std::rc::Rc::new(Cell::new(0u32));
+    let d = doubles();
+    {
+        let (lock, seen, rr) = (lock.clone(), seen.clone(), r.clone());
+        *d.during_check.borrow_mut() = Some(Box::new(move |_root: &Path| {
+            assert_eq!(crate::pack_apply_lock::try_with_apply_lock(&lock, || 7).unwrap(), Some(7), "the lock is free during a check");
+            let other = tick(&rr, HQ, &doubles(), &fid(9));
+            assert!(other.pass.is_some() && !other.lines.iter().any(|l| l.contains("바꾸는 중")), "{other:?}");
+            seen.set(seen.get() + 1);
+        }));
+    }
+    let t = tick(&r, DEPT, &d, &fid(1));
+    assert_eq!(seen.get(), 2, "the copy-check and the live check both ran parked: {t:?}");
+    assert_eq!(r.row(&id, DEPT).unwrap().state, LaneState::Verified, "{t:?}");
+}
+
+/// RULINGS IG5 (contract R3) — the record changed while this lane's copy-check ran (the origin
+/// reverted R, or committed it again with another result): the decision is DROPPED — nothing is
+/// written in this lane (no door operation, no row), the reason is said; the next tick decides anew.
+#[test]
+fn a_record_changed_during_the_copy_check_drops_the_decision() {
+    for change in ["reverted", "re-committed"] {
+        let r = rig(&format!("ig5-{change}"));
+        let id = rid("R-1");
+        committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+        r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+        let d = doubles();
+        {
+            let (root, id, change) = (r.root.clone(), id.clone(), change.to_string());
+            *d.during_check.borrow_mut() = Some(Box::new(move |_root: &Path| {
+                let mut rec = ledger::read_record_in(&root, &id).unwrap().unwrap();
+                if change == "reverted" {
+                    rec.state = RepairState::Reverted;
+                } else {
+                    rec.committed = vec![("bin/a.py".into(), TargetState::File { sha256: "1".repeat(64), mode: 0o644 }.canon())];
+                }
+                ledger::write_record_in(&root, &rec).unwrap();
+            }));
+        }
+        let t = tick(&r, DEPT, &d, &fid(1));
+        assert_eq!(std::fs::read(r.dept.join("bin/a.py")).unwrap(), b"old\n", "{change}: nothing applied");
+        assert!(r.row(&id, DEPT).is_none(), "{change}: no row written");
+        assert!(r.ops(&id).is_empty(), "{change}: no door operation");
+        assert!(t.left.iter().any(|(i, why)| *i == id && why == RECORD_CHANGED), "{change}: {t:?}");
+    }
+}
+
+/// IG5: the record changed while the LIVE check ran (after the door operations and the 적용됨 row):
+/// the 검증됨 row is not published — the row stays 적용됨 with its probation bundle.
+#[test]
+fn a_record_changed_during_the_live_check_publishes_nothing() {
+    let r = rig("ig5-live");
+    let id = rid("R-1");
+    committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
+    r.put(DEPT, "bin/a.py", b"old\n", 0o644);
+    let d = doubles();
+    {
+        let (root, id, dept) = (r.root.clone(), id.clone(), r.dept.clone());
+        *d.during_check.borrow_mut() = Some(Box::new(move |root_checked: &Path| {
+            if root_checked == dept.as_path() {
+                let mut rec = ledger::read_record_in(&root, &id).unwrap().unwrap();
+                rec.state = RepairState::Reverted;
+                ledger::write_record_in(&root, &rec).unwrap();
+            }
+        }));
+    }
+    let t = tick(&r, DEPT, &d, &fid(1));
+    let row = r.row(&id, DEPT).unwrap();
+    assert_eq!(row.state, LaneState::Applied, "{t:?}");
+    assert!(row.probation.is_some());
+    assert!(t.left.iter().any(|(i, why)| *i == id && why == RECORD_CHANGED), "{t:?}");
 }
 
 /// EJ1: the pack generation moved during the apply → nothing placed, the row stays 대기 (decided
