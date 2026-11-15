@@ -1880,6 +1880,29 @@ class OpenDefectLine(unittest.TestCase):
         for _ in range(3):
             self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"]))), [])
 
+    def test_kd1_bytes_no_parser_turns_into_a_state_give_the_current_set_up(self):
+        """RULINGS KD1 — REAL bytes (no mocked parser): an array nested beyond the interpreter's recursion limit makes the
+        JSON parser raise RecursionError, not ValueError. On 821ab6b2 that escaped to the line's outer handler: no
+        given-up record, so every later run met the same bytes and stayed silent, also for a changed or emptied set."""
+        nested = b"[" * 100000 + b"]" * 100000
+        gate_dir = os.path.join(self.tmp, "gate")
+        path = os.path.join(gate_dir, G.OPEN_DEFECT_STATE_FILE)
+        os.makedirs(gate_dir)
+        with open(path, "wb") as f:
+            f.write(nested)
+        self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"]))), [])
+        doc = self.state_doc()
+        self.assertEqual((doc["key"], doc["attempts"], doc["delivered"]),
+                         (G.open_defect_wake(["aa"])[1], 1 + JT1_RETRY_MAX, False))
+        self.assertIn("RecursionError", doc["gave_up"], "the reason says what was raised")
+        self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"]))), [])
+        self.assertEqual(len(_defect_wakes(self.run_once(lambda: (True, "base", ["aa", "bb"])))), 1,
+                         "a changed set afterwards gets its line")
+        with open(path, "wb") as f:
+            f.write(nested)
+        self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", []))), [])
+        self.assertIsNone(self.state_doc()["key"], "an emptied set resets the file")
+
 # ── RULINGS JT1 (F1-01) with the REAL wake queue — `G.Runner`'s own `enqueue` / `drain` run `javis_wakeup.py` with
 #    JAVIS_ROOT = the gate's state folder (as `main()` wires it); the send is stubbed at the `cys` boundary (a fake `cys`
 #    first on PATH that writes one line per call — as test_wakeup_durable_receipt.py does), the liveness probe is pinned
@@ -2100,6 +2123,19 @@ class OpenDefectLineRealQueue(unittest.TestCase):
         self.assertEqual(self.sends(), 1)
         doc = self.state_doc()
         self.assertEqual((doc["attempts"], doc["delivered"]), (1, True))
+
+    def test_kd1_a_deeply_nested_state_gives_a_changed_set_one_bounded_send(self):
+        with open(os.path.join(self.state, G.OPEN_DEFECT_STATE_FILE), "wb") as f:
+            f.write(b"[" * 100000 + b"]" * 100000)
+        for _ in range(3):
+            self.tick()
+            self.drain()
+        self.assertEqual((self.sends(), self.pending()), (0, []), "nothing for the set met with invalid bytes")
+        self.assertIn("RecursionError", self.state_doc()["gave_up"])
+        for _ in range(4):
+            self.tick(sigs=["aa", "bb", "cc"])
+            self.drain()
+        self.assertEqual(self.sends(), 1, "the changed set: one send, then silent")
 
 class CollectOpenDefects(unittest.TestCase):
     """`cys repair list --json` parsing with a fake `cys` (bounded, CYS_NO_AUTOSTART=1, distinct signatures — G4)."""
