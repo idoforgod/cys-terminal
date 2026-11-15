@@ -947,18 +947,22 @@ def loose_deny(n, n_slash=""):
             return "헌법파일 쓰기/덮어쓰기 차단(soul·CLAUDE·*_DIRECTIVE) — 규칙 문서는 오너 지시로만 고친다"
     return None
 
-# ================= 수리 장부 (RULINGS HP1 · T4e) =================
-# ★0.15.0 「스스로 해결」: 수리 장부는 데몬이 `cys repair …` 동사로만 쓴다. 좌석이 파일 도구나 이 가드가 이미 알아보는
-#   셸 쓰기 형태(리다이렉트 · tee/cp/dd/mv/install/ln/truncate/patch/편집기 · sed -i · rm/rmdir/chmod/chown)로 장부 아래를
-#   쓰면 역할과 모드에 상관없이 막는다. 좌석이 쓰는 자리는 계약이 준 하나 — 수리의 고정 작업 사본 `R-<n>/staging/`
+# ================= 수리 장부 (RULINGS HP1 · ID1 · T4e) =================
+# ★0.15.0 「스스로 해결」: 수리 장부는 데몬이 `cys repair …` 동사로만 쓴다. 좌석이 파일 도구나 이 가드가 알아보는 셸 쓰기
+#   형태(리다이렉트 · tee/cp/dd/mv/install/ln/truncate/patch/편집기 · sed -i · rm/rmdir/chmod/chown)로 장부 아래를 쓰면
+#   역할과 모드에 상관없이 막는다. 좌석이 쓰는 자리는 계약이 준 하나 — 수리의 고정 작업 사본 `R-<n>/staging/`
 #   (RULINGS U3) — 뿐이다. 장부의 자리(GUARD_LEDGER_ROOTS)는 bash 부분이 **이 훅 파일이 놓인 자리**에서 구해 넘긴다:
 #   데몬이 쓰는 `<팩의 부모>/local/repairs`(pack.rs local_dir() 의 기본값 · paths.rs repairs_root()). 훅의 환경 변수
-#   (CYS_LOCAL_DIR · CYS_PACK_DIR · HOME)는 그 자리를 정하지 않는다. 셸 명령은 새로 해석하지 않는다 — 규칙 문서 검사와
-#   같은 굵은 판정(장부를 가리키는 낱말 하나 + 쓰기 형태 하나)이다.
+#   (CYS_LOCAL_DIR · CYS_PACK_DIR · HOME)는 그 자리를 정하지 않는다.
+#   RULINGS ID1: 낱말의 자리는 셸이 닿는 대로 잰다 — 셸 낱말은 STRICT 와 같은 토큰화(따옴표 안의 공백을 지키는 shlex)로
+#   나누고, 상대 낱말은 호출의 작업 폴더와 **명령 스스로 옮겨 가는 폴더(cd · pushd 의 모든 대상)** 각각에서 푼다; 장부
+#   자리의 철자(두 빗금 형태 · 대소문자 접음 · ~ · $HOME)는 낱말 안에서 글자로 찾는다(공백 분리에 기대지 않는다).
 LEDGER_ROOTS = []          # compared case-folded (a case-insensitive volume reaches the same files)
 LEDGER_SHOWN = ""          # the first root as it is spelled, for the sentence
+_LEDGER_RAW = []
 for _r in os.environ.get("GUARD_LEDGER_ROOTS", "").split("\n"):
     if _r.strip():
+        _LEDGER_RAW.append(_r.strip())
         try:
             _rr = os.path.realpath(_r.strip())
         except Exception:
@@ -966,6 +970,32 @@ for _r in os.environ.get("GUARD_LEDGER_ROOTS", "").split("\n"):
         LEDGER_SHOWN = LEDGER_SHOWN or _rr
         if _rr.casefold() not in LEDGER_ROOTS:
             LEDGER_ROOTS.append(_rr.casefold())
+
+def _ledger_fold(t):
+    return unicodedata.normalize("NFKC", t or "").replace("\\", "/").casefold()
+
+def _ledger_spellings():
+    """Every spelling a command can use for a root: as given and with links resolved, '/'-separated and case-folded,
+    and under HOME also with `~`, `$HOME`, `${HOME}` (the HOME the seat's shell expands them with). Longest first."""
+    home = _ledger_fold(os.environ.get("HOME", "")).rstrip("/")
+    out = set()
+    for raw in _LEDGER_RAW:
+        forms = {raw}
+        try:
+            forms.add(os.path.realpath(raw))
+        except Exception:
+            pass
+        for f in forms:
+            sp = _ledger_fold(f).rstrip("/")
+            if not sp:
+                continue
+            out.add(sp)
+            if home and sp.startswith(home + "/"):
+                tail = sp[len(home):]
+                out.update(("~" + tail, "$home" + tail, "${home}" + tail))
+    return sorted(out, key=len, reverse=True)
+
+LEDGER_SPELLINGS = _ledger_spellings()
 LEDGER_WRITERS = {"tee", "cp", "dd", "mv", "install", "ln", "truncate", "patch", "vim", "vi", "nano", "emacs", "ex",
                   "rm", "rmdir", "chmod", "chown"}
 LEDGER_DENY = ("수리 장부(%s)는 데몬이 `cys repair …` 동사로만 쓴다 — 좌석이 파일 도구나 셸 쓰기로 장부를 쓰는 것은 역할과 "
@@ -984,7 +1014,7 @@ LEDGER_HINTS = {
 
 def _ledger_abs(p, cwd):
     """A path as the seat's shell would reach it: `~` and `$HOME` with the HOME the shell expands them with, a
-    relative path against the tool call's working directory; links resolved."""
+    relative path against the given working directory; links resolved."""
     home = os.environ.get("HOME", "")
     if p == "~" or p.startswith("~/"):
         p = home + p[1:]
@@ -999,52 +1029,146 @@ def _ledger_abs(p, cwd):
     except Exception:
         return os.path.normpath(p)
 
+def _ledger_rest_place(rest):
+    """The place of a path's part below a root: None if it climbs out of the root; "staging" for the repair's working
+    copy (U3); otherwise the store's key for the sentence."""
+    rest = (rest or "").replace("\\", "/").strip("/")
+    norm = os.path.normpath(rest).replace("\\", "/") if rest else ""
+    if norm in ("", "."):
+        return "record"
+    if norm == ".." or norm.startswith("../"):
+        return None
+    parts = [x for x in norm.split("/") if x]
+    if len(parts) >= 2 and re.fullmatch(r"r-[0-9]+", parts[0]) and parts[1] == "staging":
+        return "staging"
+    head = parts[0]
+    if head in ("grant.json", "grant-pause", "grant-seq"):
+        return "grant"
+    if head in ("owner-tokens", "tombstones", "displaced", "intake", "lanes"):
+        return head
+    return "record"
+
 def ledger_place(path, cwd):
     """None = not under the daemon's repair ledger; "staging" = the repair's working copy (U3 — the seat's place);
-    otherwise the store's key for the sentence."""
+    otherwise the store's key for the sentence. The path as the shell reaches it from `cwd` (links resolved)."""
     if not path or not LEDGER_ROOTS:
         return None
     rp = _ledger_abs(path, cwd).casefold()
     for root in LEDGER_ROOTS:
         if rp == root or rp.startswith(root.rstrip(os.sep) + os.sep):
-            parts = [x for x in rp[len(root):].split(os.sep) if x]
-            if len(parts) >= 2 and re.fullmatch(r"r-[0-9]+", parts[0]) and parts[1] == "staging":
-                return "staging"
-            if not parts:
-                return "record"
-            head = parts[0]
-            if head in ("grant.json", "grant-pause", "grant-seq"):
-                return "grant"
-            if head in ("owner-tokens", "tombstones", "displaced", "intake", "lanes"):
-                return head
-            return "record"
+            return _ledger_rest_place(rp[len(root):].replace(os.sep, "/"))
     return None
 
 def ledger_deny(place):
     return LEDGER_DENY % (LEDGER_SHOWN or "local/repairs", LEDGER_HINTS.get(place, LEDGER_HINTS["record"]))
 
-def ledger_shell_write(n, n_slash, cwd):
-    """The store a shell command writes into, or None — the rule-document scan's coarse judgment over the ledger: a word
-    that names a place in the ledger (not the working copy) and one write form this guard already recognises."""
-    toks = n.split() + (n_slash.split() if n_slash else [])
-    places = []
-    for t in toks:
-        cands = [t.lstrip(">")]
-        if "=" in t:
-            cands.append(t.split("=", 1)[1])
-        for c in cands:
-            pl = ledger_place(c, cwd) if c else None
-            if pl is not None and pl != "staging" and pl not in places:
-                places.append(pl)
-    if not places:
+_LEDGER_STOP = set(" \t\n\"'`;&|<>()")
+
+def _ledger_text_places(text):
+    """The ledger places a text names by a root's spelling (case-folded, both slash forms) — no splitting on white space:
+    the component after the spelling decides. Staging is reported as "staging"."""
+    out = []
+    for v in {unicodedata.normalize("NFKC", text or "").casefold(), _ledger_fold(text)}:
+        for sp in LEDGER_SPELLINGS:
+            i = v.find(sp)
+            while i >= 0:
+                end = i + len(sp)
+                if end == len(v) or v[end] == "/" or v[end] in _LEDGER_STOP:
+                    j = end
+                    while j < len(v) and v[j] not in _LEDGER_STOP:
+                        j += 1
+                    pl = _ledger_rest_place(v[end:j])
+                    if pl is not None and pl not in out:
+                        out.append(pl)
+                i = v.find(sp, i + 1)
+    return out
+
+def ledger_word_places(word, bases):
+    """The places one shell word reaches: its own text searched for a root's spelling (an `of=` / `--x=` prefix
+    included), and the word — and the value after its first `=` — as a path from each base (relative words; links)."""
+    out = [pl for pl in _ledger_text_places(word)]
+    cands = [word] + ([word.split("=", 1)[1]] if "=" in word else [])
+    for c in cands:
+        if not c:
+            continue
+        for b in bases:
+            pl = ledger_place(c, b)
+            if pl is not None and pl not in out:
+                out.append(pl)
+            if os.path.isabs(c) or c.startswith(("~", "$HOME", "${HOME}")):
+                break
+    return out
+
+def _ledger_tokens(n):
+    """STRICT's tokenization (quotes kept together, punctuation split); None when it cannot be told."""
+    try:
+        lex = shlex.shlex(n, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        return list(lex)
+    except ValueError:
         return None
-    seg_progs = set(); sed_inplace = False
+
+def _ledger_bases(cmds, cwd):
+    """The call's working directory and every directory the command itself changes to (`cd`, `pushd` — each target,
+    resolved from every base found before it). Bounded."""
+    bases = [cwd or os.getcwd()]
+    for prog, args in cmds:
+        if prog not in ("cd", "pushd"):
+            continue
+        ops = [x for x in args if not x.startswith("-") and x not in REDIRECTS]
+        target = ops[0] if ops else os.environ.get("HOME", "")
+        if not target:
+            continue
+        for b in list(bases):
+            nb = _ledger_abs(target, b)
+            if nb not in bases:
+                bases.append(nb)
+        if len(bases) > 16:
+            break
+    return bases
+
+def _ledger_coarse_write(n):
+    """A write form anywhere in the text (the coarse judgment: a redirection, a writer program, `sed -i`)."""
+    toks = n.split()
+    progs = set()
     for seg in l_segments(n):
-        p, a = l_cmd_word(seg); seg_progs.add(p)
+        p, a = l_cmd_word(seg)
+        progs.add(p)
         if p == "sed" and any(x == "-i" or x.startswith("-i") for x in a):
-            sed_inplace = True
-    if (">" in toks) or (seg_progs & LEDGER_WRITERS) or sed_inplace:
-        return places[0]
+            return True
+    return (">" in n) or bool(progs & LEDGER_WRITERS)
+
+def ledger_shell_write(command, cwd):
+    """The store a shell command writes into, or None. The words are STRICT's tokens; a word's place is judged as the
+    shell reaches it (from every directory the command changes to; a root's spelling found in the word's text). A
+    command the tokenizer cannot tell — unbalanced quotes, a command or process substitution, a ledger place named in
+    the text that no word carries — gets the coarse judgment: a ledger place named anywhere and a write form anywhere."""
+    n = norm_base(command)
+    named = [pl for pl in _ledger_text_places(n) if pl != "staging"]
+    toks = _ledger_tokens(n)
+    cannot_tell = toks is None or bool(re.search(r"\$\(|\x60|<\(|>\(", n))
+    if toks is not None and not cannot_tell:
+        cmds = extract_commands(toks)
+        bases = _ledger_bases(cmds, cwd)
+        carried = set()
+        places = []
+        for w in toks:
+            for pl in ledger_word_places(w, bases):
+                carried.add(pl)
+                if pl != "staging" and pl not in places:
+                    places.append(pl)
+        if any(pl not in carried for pl in named):
+            cannot_tell = True
+        else:
+            if not places:
+                return None
+            progs = {p for p, _a in cmds}
+            inplace = any(p == "sed" and any(x == "-i" or x.startswith("-i") for x in a) for p, a in cmds)
+            if any(t in REDIRECTS for t in toks) or (progs & LEDGER_WRITERS) or inplace:
+                return places[0]
+            return None
+    if named and _ledger_coarse_write(n):
+        return named[0]
     return None
 
 # ================= 메인 =================
@@ -1069,7 +1193,7 @@ if tool in WRITE_TOOLS:
         if _place is not None and _place != "staging":
             out_deny(ledger_deny(_place))
 if tool == "Bash" and command:
-    _place = ledger_shell_write(norm_loose(command), norm_loose_slash(command), _ledger_cwd)
+    _place = ledger_shell_write(command, _ledger_cwd)
     if _place is not None:
         out_deny(ledger_deny(_place))
 

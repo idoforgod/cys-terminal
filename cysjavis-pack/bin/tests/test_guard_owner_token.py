@@ -163,11 +163,14 @@ def main():
         directive = os.path.join(pack, "directives", "WORKER_DIRECTIVE.md")
 
         def run(tool_input, tool="Write", rc=None, sock_path=sock, active=False,
-                budget_ms=BIG_BUDGET_MS, test_mode=True, extra=None):
+                budget_ms=BIG_BUDGET_MS, test_mode=True, extra=None, guard=None, cwd=None):
             env = hook_env(rc=rc, sock_path=sock_path, active=active, budget_ms=budget_ms, test_mode=test_mode,
                            extra=extra)
-            payload = json.dumps({"tool_name": tool, "tool_input": tool_input})
-            proc = start_hook(env)
+            call = {"tool_name": tool, "tool_input": tool_input}
+            if cwd:
+                call["cwd"] = cwd
+            payload = json.dumps(call)
+            proc = start_hook(env, guard)
             try:
                 out, err = proc.communicate(payload, timeout=WATCHDOG_S)
             except subprocess.TimeoutExpired:
@@ -203,10 +206,10 @@ def main():
                 os.remove(log)
             return env
 
-        def start_hook(env):
+        def start_hook(env, guard=None):
             """The hook in a session of its own (RULINGS FZ2): its process group holds the shell, the parser and any
             stub the parser starts."""
-            return subprocess.Popen([BASH, GUARD], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            return subprocess.Popen([BASH, guard or GUARD], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
 
         def end_group(proc):
@@ -458,6 +461,46 @@ def main():
         p, _ = run({"file_path": os.path.join(elsewhere, "repairs", "grant.json"), "content": "{}"}, rc=0, extra=moved)
         check("11 환경 변수가 가리키는 다른 자리는 장부가 아니다(막는 자리는 훅이 놓인 팩에서 정해진다)",
               p.returncode == 0, "" if p.returncode == 0 else "rc=%d %r" % (p.returncode, p.stderr[-200:]))
+
+        # 12 — RULINGS ID1 (T4e round 2): the place of a word is judged as the shell will reach it — every relative word
+        #      also from each directory the command itself changes to (cd, pushd), and a root whose spelling holds a space
+        tok = os.path.join(ledger, "owner-tokens", "%s.json" % sha)
+        src = os.path.join(root, "src", "t.json")
+        for label, cmd in (
+                ("cd 작업 사본 뒤 ../../ 로 빠져나온 cp", "cd %s && cp %s ../../owner-tokens/%s.json"
+                 % (os.path.join(ledger, "R-1", "staging"), src, sha)),
+                ("pushd 작업 사본 뒤 ../../grant.json", "pushd %s && cp %s ../../grant.json"
+                 % (os.path.join(ledger, "R-1", "staging"), src)),
+                ("cd 두 번 이어서", "cd %s && cd staging && cp %s ../../owner-tokens/x.json"
+                 % (os.path.join(ledger, "R-1"), src)),
+                ("cd 장부 뒤 상대 리다이렉트", "cd %s; echo on > grant.json" % ledger)):
+            p, _ = run({"command": cmd}, tool="Bash", rc=0)
+            ok = ledger_refused(p, "cys repair")
+            check("12 %s → 차단" % label, ok, "" if ok else "rc=%d %r" % (p.returncode, p.stderr[-200:]))
+        # a root whose spelling holds a space: this guard copied into "<tmp>/space home/pack/hooks/"
+        spack = os.path.join(root, "space home", "pack")
+        os.makedirs(os.path.join(spack, "hooks"))
+        for f in ("guard.sh", "_lib.sh"):
+            shutil.copy(os.path.join(PACK, "hooks", f), os.path.join(spack, "hooks", f))
+        sguard = os.path.join(spack, "hooks", "guard.sh")
+        sl = os.path.join(root, "space home", "local", "repairs")
+        esc = sl.replace(" ", "\\ ")
+        for label, tool, ti in (
+                ("Write", "Write", {"file_path": os.path.join(sl, "grant.json"), "content": "{}"}),
+                ("리다이렉트", "Bash", {"command": 'echo on > "%s/grant.json"' % sl}),
+                ("덧붙이기", "Bash", {"command": 'echo on >> "%s/grant.json"' % sl}),
+                ("cp 안으로", "Bash", {"command": 'cp %s "%s/owner-tokens/%s.json"' % (src, sl, sha)}),
+                ("tee", "Bash", {"command": 'printf x | tee "%s/grant.json"' % sl}),
+                ("mv 안으로", "Bash", {"command": 'mv %s "%s/tombstones/base.json"' % (src, sl)}),
+                ("sed -i", "Bash", {"command": "sed -i s/a/b/ '%s/grant.json'" % sl}),
+                ("역슬래시로 띄운 공백", "Bash", {"command": "echo on > %s/grant.json" % esc}),
+                ("cd 뒤 ../../", "Bash", {"command": 'cd "%s/R-1/staging" && cp %s ../../grant.json' % (sl, src)})):
+            p, _ = run(ti, tool=tool, rc=0, guard=sguard)
+            ok = ledger_refused(p, "cys repair")
+            check("12 공백이 든 장부 자리(%s) → 차단" % label, ok, "" if ok else "rc=%d %r" % (p.returncode, p.stderr[-200:]))
+        p, _ = run({"command": 'cp %s "%s/R-1/staging/x.md"' % (src, sl)}, tool="Bash", rc=0, guard=sguard)
+        check("12 공백이 든 장부 자리의 작업 사본 → 통과", p.returncode == 0,
+              "" if p.returncode == 0 else "rc=%d %r" % (p.returncode, p.stderr[-200:]))
 
         # 10 — RULINGS FZ2: every stub this test started is gone at its end
         left = [pid for pid in stub_pids if not gone_soon(pid)]

@@ -1972,6 +1972,17 @@ fn hp1_route_f1_the_token_write_is_refused_and_begin_finds_none() {
     );
     assert_eq!(rc, 2, "{err}");
     assert!(err.contains("수리 장부"), "{err}");
+    // RULINGS ID1: the same token copied in after a `cd` into the working copy, climbing out with `../../`
+    let staging = r.root.join("R-1").join("staging");
+    let (rc, err) = guard_in_pack(
+        &r.pack,
+        json!({"tool_name": "Bash", "tool_input": {"command": format!(
+            "cd {} && cp /tmp/forged.json ../../owner-tokens/{sha}.json",
+            staging.display()
+        )}}),
+    );
+    assert_eq!(rc, 2, "{err}");
+    assert!(err.contains("수리 장부"), "{err}");
     // the refused call wrote nothing: begin with that token finds none, rule-doc-allowed answers no
     assert!(!target.exists());
     let w = seat(3, "worker");
