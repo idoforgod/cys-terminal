@@ -559,10 +559,19 @@ pub fn now_epoch() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// WY2 part B (RULINGS LH12) — the repair module's clock: an elapsed `Duration` since the epoch →
-/// epoch seconds (`f64`). RED STEP: today's formula; the next commit makes it microsecond.
+/// WY2 part B (RULINGS LH12) — THE repair module's clock is MICROSECOND at its source: an elapsed
+/// `Duration` since the epoch → `N / 10^6` with `N = d.as_micros()` (a floor — never a later time;
+/// N < 2^53 until the year 2255) = the nearest `f64`, at most 16 significant digits. The SAME formula
+/// as the daemon's `state::epoch_secs_us` (R2F-DM; the approval records' `approval::quantize_epoch_us`)
+/// — pinned bit-equal by cysd `repair::ledger_tests::wy2b_the_repair_clock_is_the_daemons_clock`.
+/// Why not serde_json's `float_roundtrip`: the product keeps it OFF (the wire ABI with old clients,
+/// docs/RELEASE_NOTES_0.14.43.md §7 / §12-1). Its default parser reads about one in ten 17-digit
+/// values one step off, and a raw `as_secs_f64()` of a 100-ns (Windows) or 1-ns (Linux) clock is such
+/// a value — measured on Windows as `cys repair commit` rc 94 "검사하는 동안 수리 기록이
+/// 바뀌었습니다" (runs/TW1-ci-7c). A microsecond-granular input (macOS) gives the same bits as
+/// `as_secs_f64()`.
 pub fn epoch_secs_us(d: std::time::Duration) -> f64 {
-    d.as_secs_f64()
+    d.as_micros() as f64 / 1e6
 }
 
 /// `<root>/R-<n>/`
