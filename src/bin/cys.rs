@@ -25998,7 +25998,9 @@ fn consume_reinject_pending_core(
         match presence(sid) {
             Presence::Present => match mark(sid, pending_ver, &new_hash) {
                 Ok(()) => {
-                    println!(
+                    // ★PO1 (RULINGS LH36): stderr — the pending pass runs BEFORE the terminal record and stdout carries the
+                    //   machine records only (the app takes the record only as stdout line 0)
+                    eprintln!(
                         "[pack-update] pending unknown surface {sid} ({role}): verified landed (ACK) — marked delivered, \
                          nothing typed"
                     );
@@ -26035,7 +26037,9 @@ fn consume_reinject_pending_core(
                 match inject(sid, &directive) {
                     Ok(()) => match mark(sid, pending_ver, &new_hash) {
                         Ok(()) => {
-                            println!(
+                            // ★PO1 (RULINGS LH36): stderr — the pending pass runs BEFORE the terminal record and stdout carries the
+                            //   machine records only (the app takes the record only as stdout line 0)
+                            eprintln!(
                                 "[pack-update] pending unknown surface {sid} ({role}): not in context (ReceivedNoAck) — \
                                  re-injected once, marked"
                             );
@@ -30252,6 +30256,12 @@ fn fetch_remote_pack(manifest_url: &str, base: &std::path::Path) -> Result<std::
             .arg(&out)
             .arg("--")
             .arg(&url)
+            // ★PO1 FR1 (RULINGS LH37): the curl child never inherits the command's stdout — that stdout carries the machine
+            //   records only (the app takes the terminal record only as stdout line 0), and a user's curl configuration
+            //   (`~/.curlrc` with `write-out = …`) would print there before the record. The body still goes to the `-o` file
+            //   and curl's errors to the inherited stderr. The user's configuration is NOT disabled (no `-q`, no
+            //   `CURL_HOME`): a proxy, CA or timeout set there must keep working.
+            .stdout(std::process::Stdio::null())
             .status()
             .map_err(|e| format!("curl 실행 실패: {e}"))?;
         if !status.success() {
@@ -32933,6 +32943,375 @@ mod tests {
         assert_eq!(rc, 1);
         assert!(output.starts_with("PACK_UPDATE_OUTCOME "));
         assert!(cys::pack_update_result::parse(&output, rc).is_err(), "a complete-looking record cannot override failed publication");
+    }
+
+    // ── PO1 (RULINGS LH36): the stdout of the REAL `cys pack-update` carries its machine records only ──
+
+    /// PO1: one fixture file at the disk version (1.0.0), the target version (2.0.0) and as the user edited it — the same
+    /// line changes on both sides, so a 3-way merge over the 1.0.0 ancestor conflicts.
+    const PO1_OLD: &str = "#!/bin/sh\n# po1 fixture 1.0.0\n";
+    const PO1_NEW: &str = "#!/bin/sh\n# po1 fixture 2.0.0\n";
+    const PO1_USER: &str = "#!/bin/sh\n# po1 fixture 1.0.0, edited by the user\n";
+
+    /// PO1: a signed fixture pack 2.0.0 of `files` in `from` (the b428-U9 recipe: TEST key, today's clock, the tar's
+    /// digest in the signed manifest). Returns the TEST public key the child hands to the command as its keyring.
+    pub(super) fn po1_sign_fixture(from: &std::path::Path, files: &[(&str, &str)]) -> String {
+        let (pk, sign) = gen_signer();
+        let now = chrono::Utc::now().timestamp();
+        build_signed_pack(from, files, "TESTKEY", "2.0.0", "0.4.1", now - 1, now + 3600, &sign);
+        let manifest_path = from.join("pack-manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["digest"] = json!(sha256_file(&from.join("pack.tar.gz").to_string_lossy()).unwrap());
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(&manifest_path, &bytes).unwrap();
+        std::fs::write(from.join("pack-manifest.json.minisig"), sign(&bytes)).unwrap();
+        pk
+    }
+
+    /// PO1: the TEST keyring of a fixture key (the b428-U9 one; the embedded release keyring is never what a test verifies
+    /// against — RULINGS IP1).
+    pub(super) fn po1_test_keyring(pk: &str) -> cys::packsig::Keyring {
+        test_keyring("TESTKEY", pk)
+    }
+
+    /// ★PO1 (RULINGS LH36) — the child of the PO1 real-process specimens, the b428-U9 pattern: THIS test binary runs the
+    /// real `run_pack_update` (signature, digest, version gate, journal, install core, the real pending consumer, terminal
+    /// record) with its stdout on the process's own fd 1, on a fixture signed by a TEST key, in an empty folder of its own
+    /// (pack, config, local, an absent socket, no autostart). Each mode prepares the pack so the install core really
+    /// produces one kind of human line; `init-pack` runs the real `cys init-pack --no-install-hook` instead (the
+    /// non-transactional caller, criterion 4). Everything after the line `PO1-OUTPUT` is the command's own output.
+    #[test]
+    #[ignore = "child of the PO1 real-process specimens"]
+    fn po1_command_child() {
+        use std::io::Write;
+        let Ok(mode) = std::env::var("CYS_PO1_CHILD") else { return };
+        let base = std::env::temp_dir().join(format!("cys-po1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (pack, from, local) = (base.join("pack"), base.join("from"), base.join("local"));
+        for d in [&pack, &from, &local] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &pack);
+        std::env::set_var(cys::pack::ENV_CONFIG_DIR, base.join("config"));
+        std::env::set_var("CYS_LOCAL_DIR", &local);
+        std::env::set_var("LOCALAPPDATA", base.join("localappdata"));
+        std::env::set_var(cys::ENV_SOCKET, base.join("absent.sock"));
+        std::env::set_var("CYS_NO_AUTOSTART", "1");
+        let put = |rel: &str, bytes: &[u8]| {
+            let p = pack.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        };
+        // the install record (`.install-manifest.json`): what the earlier install wrote, by its hash
+        let record = |rows: &[(&str, &str)]| {
+            let m: serde_json::Map<String, Value> =
+                rows.iter().map(|(r, c)| (r.to_string(), json!(sha256_of(c.as_bytes())))).collect();
+            std::fs::write(pack.join(".install-manifest.json"), Value::Object(m).to_string()).unwrap();
+        };
+        std::fs::write(pack.join(".pack-version"), if mode == "init-pack" { "0.0.1" } else { "1.0.0" }).unwrap();
+        let mut fixture: Vec<(&str, &str)> = vec![("po1/always.md", "po1 fixture\n")];
+        match mode.as_str() {
+            // (a) the disk version (1.0.0) differs from the target (2.0.0), an install record exists and one vendor file's
+            //     bytes change → the update snapshot is taken (src/pack.rs take_update_snapshot) and its line printed
+            "snapshot" => {
+                put("bin/po1.sh", PO1_OLD.as_bytes());
+                record(&[("bin/po1.sh", PO1_OLD)]);
+                fixture.push(("bin/po1.sh", PO1_NEW));
+            }
+            // (b) user-modified vendor files of both kinds the pending summary counts: the locked security asset
+            //     `trusted-keys.json` (system: healed — the user's bytes kept as `.user`, the vendor bytes written) and the
+            //     user-owned `acl.json` (kept, the vendor's new version beside it as `.new`). Both have their ancestor in
+            //     `.pristine/` (the earlier install's vendor copy), so neither is a stale record (C-07).
+            "pending" => {
+                let (tk_old, acl_old) = ("{\"po1\": 1}\n", "{\"po1\": \"acl 1\"}\n");
+                put("trusted-keys.json", b"{\"po1\": \"edited by the user\"}\n");
+                put(".pristine/trusted-keys.json", tk_old.as_bytes());
+                put("acl.json", b"{\"po1\": \"the user's acl\"}\n");
+                put(".pristine/acl.json", acl_old.as_bytes());
+                record(&[("trusted-keys.json", tk_old), ("acl.json", acl_old)]);
+                fixture.push(("trusted-keys.json", "{\"po1\": 2}\n"));
+                fixture.push(("acl.json", "{\"po1\": \"acl 2\"}\n"));
+            }
+            // (c) M11 가: a user-modified system file the vendor advanced; the 3-way merge over its `.pristine/` ancestor
+            //     conflicts → the user's file stays live, the vendor's version is kept as `.new` (ledger kind user-kept)
+            "user-kept" => {
+                put("bin/po1.sh", PO1_USER.as_bytes());
+                put(".pristine/bin/po1.sh", PO1_OLD.as_bytes());
+                record(&[("bin/po1.sh", PO1_OLD)]);
+                fixture.push(("bin/po1.sh", PO1_NEW));
+            }
+            // (c) M11 마 + T2j: the lane's tombstone file as the repair commit writes it (`repair::tombstones::record_in`,
+            //     `<local>/repairs/tombstones/base.json`): a deleted file the update keeps absent, and a tombstone on a
+            //     protection file (`state/hook-targets.json.example`) that the install does not follow
+            "tombstone" => {
+                use cys::repair::tombstones::{record_in, Tombstone, TombstoneKind};
+                use cys::repair::types::{LaneKey, RepairId};
+                let root = local.join("repairs");
+                let lane = LaneKey("base".to_string());
+                for (rel, id) in [("bin/po1-gone.sh", "R-1"), ("state/hook-targets.json.example", "R-2")] {
+                    let t = Tombstone { rel: rel.to_string(), kind: TombstoneKind::File, repair: RepairId::parse(id).unwrap() };
+                    record_in(&root, &lane, &t).unwrap();
+                }
+                fixture.push(("bin/po1-gone.sh", PO1_NEW));
+                fixture.push(("state/hook-targets.json.example", "{}\n"));
+            }
+            // (d) a user-owned file that is not UTF-8 (a CP949 save: the bytes of "한글") — not overwritten, not backed up,
+            //     named on the run's output
+            "unreadable" => {
+                put("schedule.json", b"{\"jobs\": \"\xc7\xd1\xb1\xdb\"}\n");
+                fixture.push(("schedule.json", "{\"jobs\": []}\n"));
+            }
+            // criterion (4): the real `cys init-pack --no-install-hook` over the embedded pack — an unmodified vendor file
+            // whose embedded bytes differ (→ the snapshot) and a user-modified user-owned file (→ the pending summary)
+            "init-pack" => {
+                let worker = "directives/WORKER_DIRECTIVE.md";
+                assert!(cys::pack::PACK_ALL.iter().any(|(r, _)| *r == worker), "{worker} is in the embedded pack");
+                let old = "# WORKER_DIRECTIVE po1 0.0.1\n";
+                let acl_old = "{\"po1\": \"acl 0.0.1\"}\n";
+                put(worker, old.as_bytes());
+                put("acl.json", b"{\"po1\": \"the user's acl\"}\n");
+                put(".pristine/acl.json", acl_old.as_bytes());
+                record(&[(worker, old), ("acl.json", acl_old)]);
+            }
+            // FR1 (RULINGS LH37): the remote route the app uses (`--manifest-url`, also with `--dry-run`) — the real
+            //   `fetch_remote_pack` with the machine's own `curl`, served WITHOUT the network (`file://`: the fetch derives
+            //   the signature and archive URLs from the manifest URL's folder), with a user curl configuration that writes to
+            //   stdout: `write-out` in `$CURL_HOME/.curlrc` (and `_curlrc`, the name Windows' curl.exe also reads). The fixture
+            //   produces no install-core line, so the case sees the fetch alone.
+            "remote" | "remote-dry" => {
+                let curl_home = base.join("curl-home");
+                po1_write_curlrc(&curl_home);
+                std::env::set_var("CURL_HOME", &curl_home);
+            }
+            other => panic!("unknown PO1 child mode {other}"),
+        }
+        let pk = po1_sign_fixture(&from, &fixture);
+        println!("PO1-OUTPUT");
+        std::io::stdout().flush().unwrap();
+        let rc = if mode == "init-pack" {
+            run_init_pack(false, true, None)
+        } else if mode.starts_with("remote") {
+            run_pack_update(None, Some(po1_file_url(&from.join("pack-manifest.json"))), mode == "remote-dry",
+                &|| Ok(test_keyring("TESTKEY", &pk)), &consume_reinject_pending, &mut std::io::stdout().lock())
+        } else {
+            run_pack_update(Some(from.to_string_lossy().into_owned()), None, false,
+                &|| Ok(test_keyring("TESTKEY", &pk)), &consume_reinject_pending, &mut std::io::stdout().lock())
+        };
+        std::io::stdout().flush().unwrap();
+        std::io::stderr().flush().unwrap();
+        // the parent asserts on this process's stdout, stderr and exit code only — nothing it checks lives in `base`
+        let _ = std::fs::remove_dir_all(&base);
+        std::process::exit(rc);
+    }
+
+    /// Runs [`po1_command_child`] in `mode` as a child process: (exit code, the command's stdout, its stderr).
+    fn po1_command_output(mode: &str) -> (i32, String, String) {
+        use cys::SpawnPolicy;
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .spawn_policy(cys::ChildLifetime::Attached)
+            .no_autostart()
+            .args(["--exact", "tests::po1_command_child", "--ignored", "--nocapture"])
+            .env("CYS_PO1_CHILD", mode)
+            .output()
+            .expect("PO1 command child");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let body = stdout
+            .split_once("PO1-OUTPUT\n")
+            .unwrap_or_else(|| panic!("the PO1 child did not run: {stdout}\n{stderr}"))
+            .1
+            .to_owned();
+        (output.status.code().unwrap_or(-1), body, stderr)
+    }
+
+    /// PO1 success criterion (3) on one real run of `cys pack-update`: exit 0 · the first stdout line is the terminal
+    /// record · the app's parser takes it (`Ok(Some)`, Applied) · no stdout line is a human `[init-pack]` / `[pack-update]`
+    /// line, every stdout line is a machine record · each human line of the case IS on stderr. Returns the failures.
+    pub(super) fn po1_failures(case: &str, rc: i32, out: &str, err: &str, human: &[&str]) -> Vec<String> {
+        po1_failures_for(case, rc, out, err, human, cys::pack_update_result::PackAction::Applied)
+    }
+
+    /// [`po1_failures`] with the record's expected action (`Validated` for a dry run).
+    fn po1_failures_for(case: &str, rc: i32, out: &str, err: &str, human: &[&str], want: cys::pack_update_result::PackAction) -> Vec<String> {
+        use cys::pack_update_result::parse;
+        let mut f = Vec::new();
+        if rc != 0 {
+            f.push(format!("{case}: exit {rc}, expected 0 ({want:?}; no daemon → reinject skipped)"));
+        }
+        if !out.lines().next().is_some_and(|l| l.starts_with("PACK_UPDATE_OUTCOME ")) {
+            f.push(format!("{case}: stdout line 0 is not the terminal record: {:?}", out.lines().next()));
+        }
+        match parse(out, rc) {
+            Ok(Some(r)) if r.action == want => {}
+            other => f.push(format!("{case}: cys::pack_update_result::parse(stdout, {rc}) = {other:?}, expected Ok(Some({want:?}))")),
+        }
+        for l in out.lines() {
+            if l.starts_with("[init-pack]") || l.starts_with("[pack-update]") {
+                f.push(format!("{case}: a human line on stdout: {l:?}"));
+            } else if !l.starts_with("PACK_UPDATE_") {
+                f.push(format!("{case}: a stdout line that is not a machine record: {l:?}"));
+            }
+        }
+        for h in human {
+            if !err.lines().any(|l| l.contains(h)) {
+                f.push(format!("{case}: the human line {h:?} is not on stderr"));
+            }
+        }
+        f
+    }
+
+    fn po1_assert(case: &str, human: &[&str]) {
+        let (rc, out, err) = po1_command_output(case);
+        let f = po1_failures(case, rc, &out, &err, human);
+        assert!(f.is_empty(), "{}\n--- stdout (exit {rc}) ---\n{out}--- stderr ---\n{err}", f.join("\n"));
+    }
+
+    /// PO1 (a) — RED on b821759c: line 0 of stdout is `[init-pack] 업데이트 전 스냅샷 …` (src/pack.rs 6575, `println!`),
+    /// the record is line 1 and `parse` returns Err (the measured PU1 case: `stage5/runs/pu1-234839/rowAC/cmd-04-A-apply.out`).
+    #[test]
+    fn po1_a_the_snapshot_line_goes_to_stderr_and_the_record_stays_line_0() {
+        po1_assert("snapshot", &["[init-pack] 업데이트 전 스냅샷: 이번 설치가 덮거나 지울 파일 1건"]);
+    }
+
+    /// PO1 (b) — the pending-merge summary and `pack: healed=…` (src/pack.rs 7290, 7301; both already in v0.14.56).
+    #[test]
+    fn po1_b_the_pending_summary_and_the_healed_line_go_to_stderr() {
+        po1_assert(
+            "pending",
+            &[
+                "[init-pack] 내 커스텀은 지워지지 않았습니다 — 병합 대기 2건 (내 수정본 .user 보존 1건 · vendor 신버전 .new 병치 1건)",
+                "[init-pack] pack: healed=1 merged=0 kept-drift=0 conflicted=0 quarantined=0 user-kept=0 vendor-first=0",
+            ],
+        );
+    }
+
+    /// PO1 (c) — M11 가: the after-update report of a kept user file (src/pack.rs 7301, 7310; new in 0.15.0).
+    #[test]
+    fn po1_c_the_m11_kept_user_file_lines_go_to_stderr() {
+        po1_assert(
+            "user-kept",
+            &[
+                "[init-pack] pack: healed=0 merged=0 kept-drift=0 conflicted=0 quarantined=0 user-kept=1 vendor-first=0",
+                "[init-pack] 보존된 수정 1건(사용자 파일 유지 1 · 제자리 보존 0)",
+            ],
+        );
+    }
+
+    /// PO1 (c) — M11 마 + T2j: a tombstone that keeps a file absent and a protection file's tombstone that is not followed
+    /// (src/pack.rs 7252, 7260; new in 0.15.0).
+    #[test]
+    fn po1_c_the_tombstone_lines_go_to_stderr() {
+        po1_assert(
+            "tombstone",
+            &[
+                "[init-pack] 수리 장부에 기록된 삭제 1건은 만들지 않았습니다(부재 유지): bin/po1-gone.sh (R-1)",
+                "[init-pack] 보호장치 파일의 삭제 표식(묘비) 1건은 따르지 않았습니다",
+                "state/hook-targets.json.example (R-2)",
+            ],
+        );
+    }
+
+    /// PO1 (d) — the unreadable-file line (src/pack.rs 7269; already in v0.14.56).
+    #[test]
+    fn po1_d_the_unreadable_file_line_goes_to_stderr() {
+        po1_assert("unreadable", &["[init-pack] 읽을 수 없어 손대지 않은 파일 1건", "schedule.json"]);
+    }
+
+    /// PO1 FR1: the user curl configuration of the remote cases — `write-out` prints a line on curl's stdout after every
+    /// transfer. Both names: `.curlrc` (every curl) and `_curlrc` (Windows' curl.exe reads it too).
+    fn po1_write_curlrc(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        for name in [".curlrc", "_curlrc"] {
+            std::fs::write(dir.join(name), "write-out = \"PO1-CURL-WRITE-OUT\\n\"\n").unwrap();
+        }
+    }
+
+    /// PO1 FR1: a `file://` URL of a local path (forward slashes; a drive path gets the third slash) — curl reads it without
+    /// any network.
+    fn po1_file_url(p: &std::path::Path) -> String {
+        let s = p.to_string_lossy().replace('\\', "/");
+        if s.starts_with('/') {
+            format!("file://{s}")
+        } else {
+            format!("file:///{s}")
+        }
+    }
+
+    /// PO1 FR1 — the CONTROL of the remote cases: in this test's environment the machine's `curl` (found on PATH, as the
+    /// fetch finds it) reads `$CURL_HOME/.curlrc` and prints its write-out on STDOUT for a `file://` transfer made with the
+    /// fetch's own arguments (`-fsSL -o <file> -- <url>`). Without it a green remote case could only mean "the config was
+    /// never read". No curl → Err (the case fails: the product's remote route needs curl there too).
+    fn po1_curl_control() -> Result<(), String> {
+        let dir = std::env::temp_dir().join(format!("cys-po1-curl-control-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        po1_write_curlrc(&dir);
+        std::fs::write(dir.join("src.txt"), "po1\n").unwrap();
+        let o = std::process::Command::new("curl")
+            .args(["-fsSL", "-o"])
+            .arg(dir.join("out.txt"))
+            .arg("--")
+            .arg(po1_file_url(&dir.join("src.txt")))
+            .env("CURL_HOME", &dir)
+            .stdin(std::process::Stdio::null())
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        let o = o.map_err(|e| format!("no `curl` could be run from PATH ({e}) — the remote route needs it; the case cannot be made"))?;
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        if o.status.success() && stdout.lines().any(|l| l == "PO1-CURL-WRITE-OUT") {
+            Ok(())
+        } else {
+            Err(format!("curl did not print the configured write-out (exit {:?}): stdout {stdout:?} stderr {:?}",
+                o.status.code(), String::from_utf8_lossy(&o.stderr)))
+        }
+    }
+
+    /// ★PO1 FR1 (RULINGS LH37) — the remote route the app uses: `cys pack-update --manifest-url <url>` (and with
+    /// `--dry-run`) through the real `fetch_remote_pack` and the machine's own curl, a user curl configuration with a
+    /// `write-out` (isolated `CURL_HOME`), the signed fixture served by `file://` (no network). Criterion (3)'s assertions +
+    /// the write-out text nowhere on stdout. The control first proves curl reads that configuration here. RED on 6ce29fe1:
+    /// `fetch_remote_pack` runs curl by `.status()`, the child inherits the command's stdout, and three
+    /// `PO1-CURL-WRITE-OUT` lines (manifest, signature, archive) precede the record.
+    #[test]
+    fn po1_r_the_remote_fetch_never_writes_to_the_commands_stdout() {
+        use cys::pack_update_result::PackAction;
+        po1_curl_control().unwrap_or_else(|e| panic!("CONTROL failed — {e}"));
+        let mut f = Vec::new();
+        for (mode, want) in [("remote", PackAction::Applied), ("remote-dry", PackAction::Validated)] {
+            let (rc, out, err) = po1_command_output(mode);
+            let mut g = po1_failures_for(mode, rc, &out, &err, &[], want);
+            if out.contains("PO1-CURL-WRITE-OUT") {
+                g.push(format!("{mode}: curl's write-out reached the command's stdout"));
+            }
+            if !g.is_empty() {
+                f.push(format!("{}\n--- stdout (exit {rc}) ---\n{out}--- stderr ---\n{err}", g.join("\n")));
+            }
+        }
+        assert!(f.is_empty(), "{}", f.join("\n"));
+    }
+
+    /// PO1 criterion (4) — the non-transactional caller is unchanged: the real `cys init-pack --no-install-hook` still
+    /// prints the snapshot line and the pending summary on STDOUT (and not on stderr), with its own result line.
+    #[test]
+    fn po1_init_pack_keeps_the_snapshot_and_pending_lines_on_stdout() {
+        let (rc, out, err) = po1_command_output("init-pack");
+        let mut f = Vec::new();
+        if rc != 0 {
+            f.push(format!("init-pack: exit {rc}"));
+        }
+        for h in [
+            "[init-pack] 업데이트 전 스냅샷: 이번 설치가 덮거나 지울 파일 1건",
+            "[init-pack] 내 커스텀은 지워지지 않았습니다 — 병합 대기 1건 (내 수정본 .user 보존 0건 · vendor 신버전 .new 병치 1건)",
+            "[pack] 훅 미설치(--no-install-hook)",
+            "CYSJavis Pack installed at ",
+        ] {
+            if !out.lines().any(|l| l.starts_with(h)) {
+                f.push(format!("init-pack: {h:?} is not on stdout"));
+            }
+            if err.lines().any(|l| l.starts_with(h)) {
+                f.push(format!("init-pack: {h:?} is on stderr"));
+            }
+        }
+        assert!(f.is_empty(), "{}\n--- stdout (exit {rc}) ---\n{out}--- stderr ---\n{err}", f.join("\n"));
     }
 
     /// pack-manifest emit(§2-①) — files 키가 PACK+PACK_SKILLS 전부 포함 + sha256이 content_hash
@@ -52251,6 +52630,16 @@ mod b360_tests {
             "boot" => run_boot(None, true),
             // ★(B-360 R2 revise · area P) no `--from`: the command stops after its pending pass (exit 1)
             "pack-update" => run_pack_update(None, None, false, &cys::packsig::embedded_keyring, &consume_reinject_pending, &mut std::io::stdout().lock()),
+            // ★PO1 (RULINGS LH36): the real command WITH `--from` (a TEST-signed fixture, `CYS_PO1_FROM` / `CYS_PO1_PK` — the
+            //   embedded release keyring is never what a test verifies against, RULINGS IP1) and the real pending consumer;
+            //   `PO1-OUTPUT` marks where the command's own stdout starts
+            "pack-update-from" => {
+                let from = std::env::var("CYS_PO1_FROM").expect("CYS_PO1_FROM");
+                let pk = std::env::var("CYS_PO1_PK").expect("CYS_PO1_PK");
+                println!("PO1-OUTPUT");
+                let _ = std::io::stdout().flush();
+                run_pack_update(Some(from), None, false, &|| Ok(super::tests::po1_test_keyring(&pk)), &consume_reinject_pending, &mut std::io::stdout().lock())
+            }
             // ★(B-360 R2 revise · area D) the real `cys drain --verify` (exit computed by run_drain_verify)
             "drain-verify" => run(Command::Drain { verify: true, timeout: 2 }),
             // ★(B-360 R2 revise · area E) the save-file gate (S48) and the verifier handshake (S49), not forced
@@ -53920,6 +54309,374 @@ mod b360_tests {
             }
         }
         out
+    }
+
+    /// ★PO1 (RULINGS LH36) — the pending pass's own human lines (`consume_reinject_pending_core`: std `println!` at
+    /// b821759c, src/bin/cys.rs 26001 / 26038, also in v0.14.56) are printed BEFORE the terminal record — the pass runs
+    /// first. Run 1 (in-process) leaves an UNKNOWN entry (the directive paste's write outcome is unknown); run 2 is the REAL
+    /// command `cys pack-update --from <signed fixture>` (child, the real pending consumer, a live fake daemon) whose pending
+    /// pass resolves the entry — by the ACK of the presence ping ("verified landed (ACK) — marked delivered") or by the
+    /// affirmative absence and one re-inject ("not in context (ReceivedNoAck) — re-injected once, marked"). The fixture
+    /// produces no install-core line, so the case sees the pending pass alone. RED on b821759c: that line is stdout line 0.
+    #[cfg(unix)]
+    #[test]
+    fn po1_pending_pass_lines_go_to_stderr_and_the_record_stays_line_0() {
+        let mut failures = Vec::new();
+        for (case, ping, line) in [
+            ("pending-ack", R2pPing::Ack, "verified landed (ACK) — marked delivered"),
+            ("pending-no-ack", R2pPing::NoAck, "not in context (ReceivedNoAck) — re-injected once, marked"),
+        ] {
+            let pack = R2cPack::new();
+            std::fs::write(pack.dir.join("pack/.pack-version"), "1.0.0").unwrap();
+            let ctl = r2p_ctl(r2c_reply(&pending_err()), ping, true);
+            let daemon = r2p_daemon(ctl.clone(), r2p_session(&pack));
+            let first = r2c_in_env(&daemon, &pack, || format!("{:?}", run_pack_reinject("9.9.9")));
+            if r2p_unknown_entries(&pack.dir).len() != 1 {
+                failures.push(format!("{case}: run 1 left no unknown entry: {first}"));
+                continue;
+            }
+            r2p_set(&ctl, r2c_ok(json!({})), ping, true);
+            let from = pack.dir.join("from");
+            std::fs::create_dir_all(&from).unwrap();
+            let pk = super::tests::po1_sign_fixture(&from, &[("po1/always.md", "po1 fixture\n")]);
+            let mut envs = pack.envs();
+            envs.push(("CYS_PO1_FROM", from.into_os_string()));
+            envs.push(("CYS_PO1_PK", pk.into()));
+            let (rc, raw, err) = r2c_child("pack-update-from", &daemon, &envs);
+            let Some((_, out)) = raw.split_once("PO1-OUTPUT\n") else {
+                failures.push(format!("{case}: the child did not reach the command: {raw}\n{err}"));
+                continue;
+            };
+            let f = super::tests::po1_failures(case, rc, out, &err, &[line]);
+            if !f.is_empty() {
+                failures.push(format!("{}\n--- stdout (exit {rc}) ---\n{out}--- stderr ---\n{err}", f.join("\n")));
+            }
+            if !r2p_unknown_entries(&pack.dir).is_empty() {
+                failures.push(format!("{case}: the pending pass did not resolve the entry (the case did not reach its line)"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// ★PO1 (RULINGS LH36) — the stdout census of `cys pack-update`'s reach. Every stdout writer (`println!`, `print!`,
+    /// `stdout()`, `Stdio::inherit`) in (A) the production text of src/pack.rs (the install core and everything beside it —
+    /// the WHOLE file, so a new writer anywhere in it is seen) and (B) the production functions of this file reachable from
+    /// the command's entry (`run_pack_update` and the pending provider the dispatch hands it, `consume_reinject_pending`;
+    /// calls followed transitively, the `run` dispatch excluded) must be one of:
+    ///   · (A) the install core's ONE helper `install_human_line!` (its own definition: stderr when `transactional`, else
+    ///     stdout) — and every use of it passes the parameter `transactional` itself, never a literal;
+    ///   · (A) a site PROVEN unreachable with `transactional == true` — the allow-list, two rows: the channel guard's line
+    ///     inside `if !transactional {` of `install_into_with`, and the `--no-install-hook` line inside `if !install_hooks {`
+    ///     of `setup_isolated_config_dir`, which the install core calls only as `setup_isolated_config_dir(true)` (every
+    ///     other call is in `install_staged`, the init-pack path, which the transaction never calls);
+    ///   · (B) the command's own terminal records: the `println!` of `run_pack_update` AFTER its local `macro_rules! println`
+    ///     (which writes `terminal_output`, the stdout the dispatch passes).
+    /// ★FR1 (RULINGS LH37) — CHILDREN: every `Command::new` in the same scanned code must not leave the child the
+    /// command's stdout: between it and the first `.status()` / `.spawn()` / `.output()` after it in the same function there
+    /// is a `.stdout(` (set explicitly) or `spawn_policy(cys::ChildLifetime::Survivor)` (null stdio, lib.rs `detach_stdio`),
+    /// or that first call is `.output()` (piped); a `Command::new` with no such call in its function fails too.
+    /// Anything else fails with its file, function and line. Modelled on FG6 (src/repair/apply_tests.rs
+    /// `every_write_of_the_repair_module_is_classified` + `the_write_census_catches_each_mutation`: a production-text census
+    /// with mutation controls) over the lexer and call-graph of `b360_r2r_p14` (comments / strings blanked, `#[cfg(test)]`
+    /// items cut).
+    ///
+    /// WHAT IT GUARANTEES, exactly: in the two files it reads — the whole production text of src/pack.rs, and the production
+    /// functions of src/bin/cys.rs reached from `run_pack_update` / `consume_reinject_pending` by a call spelled `name(` or
+    /// `name::<` (any function of that name, methods included; `run` and `main` not followed) — no `println!`, `print!`
+    /// (not preceded by an identifier character), `stdout()` or `Stdio::inherit` outside the two proven rows and the
+    /// records, and no `Command::new` whose stdout is left inherited in the form above.
+    /// WHAT IT CANNOT SEE (recorded, not built — DEFERRED_MINOR): (1) every other source file — the library modules the
+    /// reach calls (src/agy_statusline.rs, src/launchd.rs, src/factory_reset.rs, src/overrides.rs, …) and the other files of
+    /// the binary; (2) other spellings and aliases — `use std::io::stdout as o; o()`, a stdout handle kept in a variable or
+    /// passed in, a user macro that wraps `println!` or `write!` to a handle obtained elsewhere, a `Command` built in another
+    /// function or module and spawned here; (3) functions reached only as values (a fn pointer, a closure handed on) other
+    /// than the provider seeded by name; (4) a human `println!` placed AFTER `run_pack_update`'s local record macro — it is
+    /// taken as a record by its position, its content is not checked; (5) anything at run time (dup2, a child's own
+    /// redirections). The real-process tests (`po1_*`) are the proof of behaviour; this census only stops the next bare
+    /// writer of the spellings above.
+    fn po1_stdout_census(pack_src: &str, cys_src: &str) -> Vec<String> {
+        let mut v = Vec::new();
+        let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        // every stdout writer of a lexed text outside its test items: (offset, the writer)
+        let writers = |text: &str, tests: &[(usize, usize)]| -> Vec<(usize, &'static str)> {
+            let b = text.as_bytes();
+            let mut out = Vec::new();
+            for w in ["println!", "print!", "stdout()", "Stdio::inherit"] {
+                let mut from = 0;
+                while let Some(n) = text[from..].find(w) {
+                    let at = from + n;
+                    from = at + w.len();
+                    if at > 0 && (is_ident(b[at - 1]) || (w == "stdout()" && b[at - 1] == b'_')) {
+                        continue; // eprintln! / eprint! / ..._stdout()
+                    }
+                    if !tests.iter().any(|&(a, e)| a <= at && at < e) {
+                        out.push((at, w));
+                    }
+                }
+            }
+            out.sort();
+            out
+        };
+        let line_of = |text: &str, at: usize| text[..at].matches('\n').count() + 1;
+        let block_end = |text: &str, open: usize| -> usize {
+            let mut depth = 0usize;
+            for (k, ch) in text[open..].char_indices() {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        return open + k + 1;
+                    }
+                }
+            }
+            text.len()
+        };
+        let fn_of = |fns: &[(String, usize, usize)], at: usize| -> Option<(String, usize, usize)> {
+            fns.iter().filter(|(_, s, e)| *s <= at && at < *e).min_by_key(|(_, s, e)| e - s).cloned()
+        };
+        // inside a block of `fn_span` whose header is exactly `guard` (`if !x {`)?
+        let guarded = |text: &str, span: (usize, usize), guard: &str, at: usize| -> bool {
+            let mut from = span.0;
+            while let Some(n) = text[from..span.1].find(guard) {
+                let g = from + n;
+                from = g + guard.len();
+                let open = g + guard.len() - 1;
+                if g < at && at < block_end(text, open) {
+                    return true;
+                }
+            }
+            false
+        };
+
+        // FR1: every `Command::new` of the function span (s, e) whose innermost fn is `f` must not inherit stdout
+        let children = |text: &str, fns: &[(String, usize, usize)], file: &str, f: &str, s: usize, e: usize, v: &mut Vec<String>| {
+            let mut from = s;
+            while let Some(n) = text[from..e].find("Command::new") {
+                let c = from + n;
+                from = c + "Command::new".len();
+                if fn_of(fns, c).is_some_and(|(n, ..)| n != f) {
+                    continue;
+                }
+                let next = [".status()", ".spawn()", ".output()"]
+                    .iter()
+                    .filter_map(|t| text[c..e].find(t).map(|k| (c + k, *t)))
+                    .min();
+                let ok = match next {
+                    Some((_, ".output()")) => true,
+                    Some((t, _)) => text[c..t].contains(".stdout(") || text[c..t].contains("spawn_policy(cys::ChildLifetime::Survivor)"),
+                    None => false,
+                };
+                if !ok {
+                    v.push(format!("{file}:{} (fn {f}, reached by `cys pack-update`): a child process that inherits the command's stdout — set `.stdout(…)` explicitly (or `.output()`)",
+                        line_of(text, c)));
+                }
+            }
+        };
+
+        // ── (A) src/pack.rs ──
+        let (lexed, tests) = r2r_lex_production(pack_src);
+        let text = String::from_utf8_lossy(&lexed).into_owned();
+        let fns = r2r_fn_spans(&text, &tests);
+        let helper_head = "macro_rules! install_human_line {";
+        let helper = match (text.find(helper_head), text.matches(helper_head).count()) {
+            (Some(h), 1) => {
+                let end = block_end(&text, h + helper_head.len() - 1);
+                let body = &text[h..end];
+                if !(body.contains("if $transactional") && body.contains("eprintln!") && body.contains("println!")) {
+                    v.push(format!("pack.rs: the helper `install_human_line!` no longer chooses stderr when `transactional`: {body}"));
+                }
+                Some((h, end))
+            }
+            (_, n) => {
+                v.push(format!("pack.rs: `{helper_head}` found {n} time(s), expected exactly 1"));
+                None
+            }
+        };
+        // every use of the helper passes the parameter itself
+        let mut uses = 0;
+        let mut from = 0;
+        while let Some(n) = text[from..].find("install_human_line!(") {
+            let at = from + n;
+            from = at + 1;
+            if tests.iter().any(|&(a, e)| a <= at && at < e) {
+                continue;
+            }
+            uses += 1;
+            let arg = text[at + "install_human_line!(".len()..].trim_start();
+            if !arg.starts_with("transactional,") {
+                v.push(format!("pack.rs:{}: install_human_line! must be given the parameter `transactional` itself, not {:?}",
+                    line_of(&text, at), arg.chars().take(24).collect::<String>()));
+            }
+        }
+        if uses == 0 {
+            v.push("pack.rs: the helper `install_human_line!` is used nowhere".into());
+        }
+        let span_of = |name: &str| fns.iter().find(|(n, ..)| n == name).map(|(_, s, e)| (*s, *e));
+        let core = span_of("install_into_with");
+        for (at, w) in writers(&text, &tests) {
+            if helper.is_some_and(|(h, e)| h <= at && at < e) {
+                continue; // the helper's own two arms
+            }
+            let f = fn_of(&fns, at);
+            let name = f.as_ref().map(|(n, ..)| n.as_str()).unwrap_or("<no fn>");
+            let proven = match (name, f.as_ref()) {
+                ("install_into_with", Some((_, s, e))) => guarded(&text, (*s, *e), "if !transactional {", at),
+                ("setup_isolated_config_dir", Some((_, s, e))) => {
+                    let inside = guarded(&text, (*s, *e), "if !install_hooks {", at);
+                    // every production call passes `true`, except the init-pack path's (`install_staged`)
+                    let mut calls_ok = true;
+                    let mut cf = 0;
+                    while let Some(n) = text[cf..].find("setup_isolated_config_dir(") {
+                        let c = cf + n;
+                        cf = c + 1;
+                        if c > 0 && is_ident(text.as_bytes()[c - 1]) || tests.iter().any(|&(a, e)| a <= c && c < e) {
+                            continue;
+                        }
+                        let caller = fn_of(&fns, c).map(|(n, ..)| n).unwrap_or_default();
+                        let arg = text[c + "setup_isolated_config_dir(".len()..].trim_start();
+                        if caller == "setup_isolated_config_dir" || arg.starts_with("install_hooks: bool") {
+                            continue; // the definition itself
+                        }
+                        if !(arg.starts_with("true)") || caller == "install_staged") {
+                            calls_ok = false;
+                            v.push(format!("pack.rs:{}: `setup_isolated_config_dir` called by {caller} with {:?} — the `--no-install-hook` line is then reachable",
+                                line_of(&text, c), arg.chars().take(20).collect::<String>()));
+                        }
+                    }
+                    // and the transaction never reaches `install_staged`
+                    let staged_reached = ["apply_pack_transactional_core", "install_from_iter", "install_into_with"]
+                        .iter()
+                        .filter_map(|n| span_of(n))
+                        .any(|(s, e)| text[s..e].contains("install_staged("));
+                    if staged_reached {
+                        v.push("pack.rs: the transaction reaches `install_staged`".into());
+                    }
+                    inside && calls_ok && !staged_reached
+                }
+                _ => false,
+            };
+            if !proven {
+                v.push(format!("pack.rs:{} (fn {name}): a bare stdout writer `{w}` — in the transactional path stdout belongs to the machine records: use install_human_line!(transactional, …), or prove the site unreachable with transactional=true",
+                    line_of(&text, at)));
+            }
+        }
+        if core.is_none() {
+            v.push("pack.rs: `install_into_with` not found".into());
+        }
+        for (n, s, e) in &fns {
+            children(&text, &fns, "pack.rs", n, *s, *e, &mut v);
+        }
+
+        // ── (B) src/bin/cys.rs: the command's reach ──
+        let (lexed, tests) = r2r_lex_production(cys_src);
+        let text = String::from_utf8_lossy(&lexed).into_owned();
+        let fns = r2r_fn_spans(&text, &tests);
+        let mut by_name: std::collections::HashMap<&str, Vec<(usize, usize)>> = std::collections::HashMap::new();
+        for (n, s, e) in &fns {
+            by_name.entry(n.as_str()).or_default().push((*s, *e));
+        }
+        // the dispatch hands the command its pending provider and the process's stdout
+        match text.find("Command::PackUpdate") {
+            Some(d) => {
+                let arm = &text[d..text[d..].find("=> {").map(|n| d + n).and_then(|o| Some(block_end(&text, o + 3))).unwrap_or(text.len())];
+                if !(arm.contains("run_pack_update(") && arm.contains("consume_reinject_pending") && arm.contains("stdout().lock()")) {
+                    v.push(format!("cys.rs: the PackUpdate dispatch no longer passes consume_reinject_pending and the stdout lock: {arm}"));
+                }
+            }
+            None => v.push("cys.rs: no `Command::PackUpdate` dispatch".into()),
+        }
+        let mut reach: Vec<String> = Vec::new();
+        let mut queue: Vec<String> = vec!["run_pack_update".into(), "consume_reinject_pending".into()];
+        while let Some(f) = queue.pop() {
+            if reach.contains(&f) || !by_name.contains_key(f.as_str()) {
+                continue;
+            }
+            reach.push(f.clone());
+            for &(s, e) in &by_name[f.as_str()] {
+                let body = &text[s..e];
+                let bb = body.as_bytes();
+                let mut i = 0;
+                while i < bb.len() {
+                    if (bb[i].is_ascii_alphabetic() || bb[i] == b'_') && (i == 0 || !is_ident(bb[i - 1])) {
+                        let mut j = i;
+                        while j < bb.len() && is_ident(bb[j]) {
+                            j += 1;
+                        }
+                        let name = &body[i..j];
+                        let next = body[j..].trim_start();
+                        let callish = next.starts_with('(') || next.starts_with("::<");
+                        if callish && name != "run" && name != "main" && by_name.contains_key(name) && !reach.iter().any(|r| r == name) {
+                            queue.push(name.to_string());
+                        }
+                        i = j;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+        if !(reach.iter().any(|r| r == "consume_reinject_pending_core") && reach.iter().any(|r| r == "pack_update_from_dir")) {
+            v.push(format!("cys.rs: control — the reach lost the pending pass or the apply: {reach:?}"));
+        }
+        let all_writers = writers(&text, &tests);
+        for f in &reach {
+            for &(s, e) in &by_name[f.as_str()] {
+                let shadow = (f == "run_pack_update")
+                    .then(|| text[s..e].find("macro_rules! println").map(|n| s + n))
+                    .flatten();
+                if f == "run_pack_update" {
+                    let ok = shadow.is_some_and(|m| text[m..e].contains("writeln!(terminal_output"));
+                    if !ok {
+                        v.push("cys.rs: run_pack_update lost its local `println!` over `terminal_output`".into());
+                    }
+                }
+                children(&text, &fns, "cys.rs", f, s, e, &mut v);
+                for &(at, w) in all_writers.iter().filter(|(at, _)| s <= *at && *at < e) {
+                    // nested fns are their own entries; count a site once, in its innermost fn
+                    if fn_of(&fns, at).is_some_and(|(n, ..)| &n != f) {
+                        continue;
+                    }
+                    let record = w == "println!" && shadow.is_some_and(|m| at > m);
+                    if !record {
+                        v.push(format!("cys.rs:{} (fn {f}, reached by `cys pack-update`): a bare stdout writer `{w}` before the terminal record — write human lines to stderr",
+                            line_of(&text, at)));
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    /// ★PO1 (RULINGS LH36) criterion (5): no bare stdout writer in `cys pack-update`'s reach (see [`po1_stdout_census`]).
+    #[test]
+    fn po1_census_no_bare_stdout_in_the_pack_update_reach() {
+        let v = po1_stdout_census(include_str!("../pack.rs"), include_str!("cys.rs"));
+        assert!(v.is_empty(), "{v:#?}");
+    }
+
+    /// ★PO1 criterion (5)'s mutation controls (FG6 style): each of these edits makes the census fail — a bare `println!`
+    /// in a new function of pack.rs, a helper site turned back into `println!`, a helper given a literal instead of the
+    /// parameter, the channel guard's line taken out of `if !transactional`, the install core calling the setup with
+    /// `false`, a `println!` added to the pending pass, a `stdout()` write added to the apply of this file, and (FR1) the
+    /// fetch's curl child back to a plain `.status()` with the inherited stdout.
+    #[test]
+    fn po1_census_catches_each_mutation() {
+        let (pack, cys) = (include_str!("../pack.rs"), include_str!("cys.rs"));
+        assert!(po1_stdout_census(pack, cys).is_empty(), "the unmutated sources pass (else see the census test)");
+        let mut cases: Vec<(&str, String, String)> = Vec::new();
+        cases.push(("a new fn in pack.rs", format!("{pack}\nfn po1_mutant() {{ println!(\"x\"); }}\n"), cys.to_string()));
+        cases.push(("a helper site back to println!", pack.replacen("install_human_line!(\n            transactional,", "println!(", 1), cys.to_string()));
+        cases.push(("a literal instead of the parameter", pack.replacen("install_human_line!(\n            transactional,", "install_human_line!(\n            false,", 1), cys.to_string()));
+        cases.push(("the channel guard unguarded", pack.replacen("if !transactional {\n        if let Some(reason) = channel_guard_and_heal(&dir) {", "if true {\n        if let Some(reason) = channel_guard_and_heal(&dir) {", 1), cys.to_string()));
+        cases.push(("the setup called with false", pack.replacen("setup_isolated_config_dir(true);", "setup_isolated_config_dir(false);", 1), cys.to_string()));
+        cases.push(("a println! in the pending pass", pack.to_string(), cys.replacen("    for u in pending_unknown {\n", "    println!(\"x\");\n    for u in pending_unknown {\n", 1)));
+        cases.push(("a stdout() write in the apply", pack.to_string(), cys.replacen("    let _ = std::fs::remove_dir_all(staging);\n    extract_tar_gz(&tar_path, staging)?;", "    let _ = std::fs::remove_dir_all(staging);\n    let _ = std::io::Write::write_all(&mut std::io::stdout(), b\"x\");\n    extract_tar_gz(&tar_path, staging)?;", 1)));
+        cases.push(("the curl child back to an inherited stdout", pack.to_string(), cys.replacen("            .stdout(std::process::Stdio::null())\n            .status()\n            .map_err(|e| format!(\"curl 실행 실패: {e}\"))?;", "            .status()\n            .map_err(|e| format!(\"curl 실행 실패: {e}\"))?;", 1)));
+        for (name, p, c) in &cases {
+            assert!(p != pack || c != cys, "{name}: the mutation did not apply");
+            assert!(!po1_stdout_census(p, c).is_empty(), "{name}: not caught");
+        }
     }
 
     /// Area P · head condition (b): the pending pass's reconciliation (`consume_reinject_pending`, its core, and the
