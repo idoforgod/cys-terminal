@@ -85,8 +85,11 @@ pub fn full_flush_file(f: &std::fs::File) -> std::io::Result<()> {
     }
 }
 
-/// Unit WY2 — opens an EXISTING file so that [`full_flush_file`] (or the ledger's twin) can flush
-/// it. unix: `File::open`, exactly the call every site made before (a read-only descriptor may be
+/// Unit WY2 — opens an EXISTING file that was NOT just written by the caller (the vault's sealed
+/// copy in `vault::finish_seal_with` / `seal_with`, the screen's verdict off unix in
+/// `screen::write_verdict_in`) so that [`full_flush_file`] (or the ledger's twin) can flush it. A file
+/// the caller writes itself is flushed on the handle that wrote it ([`write_durable`]; WY2 FR1, RULINGS
+/// LH15). unix: `File::open`, exactly the call every site made before (a read-only descriptor may be
 /// `fsync`ed / `F_FULLFSYNC`ed). Other platforms: write ACCESS — no create, no truncate, no append;
 /// Windows' `FlushFileBuffers` needs a handle with write access ("The file handle must have the
 /// GENERIC_WRITE access right", Microsoft's FlushFileBuffers reference) and answers a read-only

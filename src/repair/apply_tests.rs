@@ -3003,6 +3003,8 @@ const WRITE_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("ledger.rs", "write_lane_durable_in", "ledger", 1, "FG4 seam: a lane row, durable"),
     ("ledger.rs", "write_lane_in", "ledger", 1, "T3: a lane row (T3's callers)"),
     ("ledger.rs", "write_record_in", "ledger", 1, "T3: a repair record"),
+    // WY2 FR1 (RULINGS LH15): the durable record write now goes through the ledger's durable writer itself (before: through `write_record_in`, which no census call names)
+    ("ledger.rs", "write_record_durable_in", "ledger", 1, "WY2 FR1: a repair record, flushed before it is published (durable::write_json_durable)"),
     ("owner_origin.rs", "create_token_in", "ledger", 4, "T4: an owner-origin token"),
     ("owner_origin.rs", "write_token_in", "ledger", 1, "T4: an owner-origin token"),
     ("probation.rs", "ack_notices_in", "ledger", 1, "the notice acknowledgements (durable)"),
@@ -3143,7 +3145,6 @@ const READ_DEFAULT_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("grant.rs", "refresh_pause_in", "outside", 1, "another track's file, not changed by T6"),
     ("grant.rs", "snapshot", "outside", 2, "another track's file, not changed by T6"),
     ("grant.rs", "try_claim_in", "outside", 5, "another track's file, not changed by T6"),
-    ("grant.rs", "write_decision_in", "outside", 1, "another track's file, not changed by T6"),
     ("guard.rs", "drop", "not-a-read", 1, "a poisoned mutex recovered"),
     ("guard.rs", "is_held", "not-a-read", 1, "a poisoned mutex recovered"),
     ("guard.rs", "try_take", "not-a-read", 1, "a poisoned mutex recovered"),
