@@ -881,6 +881,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// WY2 — the seal's record step re-opens the sealed copy for its full flush (`finish_seal_with`);
+    /// on Windows that re-open was read-only and `FlushFileBuffers` refuses it, so every deposit of
+    /// the Windows form (`op_deposit_first`, `op_move_in`: an undo, a propagation apply) would stop
+    /// there after the live file was moved in. Here the byte-copy seal (the path Windows always
+    /// takes) and `finish_seal`, on every platform.
+    #[test]
+    fn wy2_finish_seal_flushes_the_byte_copy_seal() {
+        let root = tmp("wy2-seal");
+        let id = rid("R-2");
+        let s = build_slot(
+            &root,
+            &id,
+            &LaneKey("base".into()),
+            "bin/javis_report.py",
+            "op",
+            DepositKind::Displaced,
+            &TargetState::Absent,
+            &Staged::Bytes {
+                bytes: b"displaced\n".to_vec(),
+                mode: 0o644,
+            },
+            2.0,
+            &root,
+        )
+        .unwrap();
+        FORCE_BYTE_COPY_SEAL.with(|c| c.set(true));
+        let sealed = seal(&s);
+        FORCE_BYTE_COPY_SEAL.with(|c| c.set(false));
+        sealed.expect("the byte-copy seal");
+        let facts = finish_seal(&s, 3.0).expect("finish_seal flushes the sealed copy");
+        assert!(facts.sealed_sha256.is_some(), "the sealed copy's hash is recorded");
+        assert_eq!(std::fs::read(s.sealed()).unwrap(), b"displaced\n");
+        assert!(std::fs::symlink_metadata(s.meta_sealed()).is_ok(), "meta/sealed.json is written");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// H1/K8: the seal is a new write-once entry; a later write into the payload (an old
     /// descriptor) changes the payload only — the sealed copy and `sealed.json` stay; `deposit_of`
     /// returns the sealed copy; the E4 flag of `list_slots_in` sees the difference.

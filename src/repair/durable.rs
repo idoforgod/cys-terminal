@@ -379,6 +379,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// WY2 — the CAUSE, measured where it lives: Windows refuses the flush of a READ-ONLY handle
+    /// with ERROR_ACCESS_DENIED (5) — the shape of the runner's message (runs/TW1-ci-7a commit.json).
+    /// A hypothesis until this runs on Windows (not compiled on unix, where a read-only descriptor
+    /// may be flushed).
+    #[cfg(windows)]
+    #[test]
+    fn wy2_windows_refuses_the_flush_of_a_read_only_handle() {
+        let d = tmp("wy2-ro");
+        let p = d.join("record.json");
+        std::fs::write(&p, b"{}\n").unwrap();
+        let ro = std::fs::File::open(&p).unwrap();
+        let e = full_flush_file(&ro).expect_err("FlushFileBuffers on a read-only handle");
+        assert_eq!(e.raw_os_error(), Some(5), "{e}");
+        drop(ro);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn full_flush_dir_on_missing_dir_is_an_error() {
         let d = tmp("missing");
