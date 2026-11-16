@@ -19,7 +19,7 @@
 //! `meta/sealed.json` is compared wherever it exists.
 
 use super::durable::{full_flush_dir, full_flush_file};
-use super::types::{LaneKey, RepairError, RepairId, TargetState};
+use super::types::{LaneKey, Observed, RepairError, RepairId, TargetState};
 use std::path::{Path, PathBuf};
 
 /// What a slot's `meta/pre.json` says the slot holds (C2 O-C2-2 `kind`).
@@ -330,16 +330,16 @@ pub fn sweep_stale_temps(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Reads a regular file without following a link (the source of a staged copy is read ONCE).
+/// Reads a regular file without following a link (the source of a staged copy is read ONCE) —
+/// RULINGS IE4 / IG1: through the engine's one bounded reader (a non-blocking open that follows no
+/// link, a regular file only, at most RECORD_READ_CAP + 1 bytes from that one handle); over the
+/// limit, or a size that changed while it was read, is refused with the reason (the limit named).
 fn read_regular(p: &Path) -> Result<Vec<u8>, RepairError> {
-    let m = std::fs::symlink_metadata(p).map_err(|e| io(p, e))?;
-    if !m.file_type().is_file() {
-        return Err(RepairError::Precondition(format!(
-            "{}: 일반 파일이 아닙니다",
-            p.display()
-        )));
+    match super::durable::read_record_bytes(p) {
+        super::durable::RecordRead::Bytes(b) => Ok(b),
+        super::durable::RecordRead::NotFound => Err(io(p, std::io::Error::from(std::io::ErrorKind::NotFound))),
+        super::durable::RecordRead::Unreadable(why) => Err(RepairError::Precondition(why)),
     }
-    std::fs::read(p).map_err(|e| io(p, e))
 }
 
 /// RULINGS FI1 — the generation a slot's `meta/pre.json` records for its bytes: `Ok(Some(g))`;
@@ -509,6 +509,11 @@ pub fn seal_with(slot: &Slot, hook: &mut PublishHook<'_>) -> Result<(), RepairEr
     if m.file_type().is_symlink() {
         return Ok(());
     }
+    // RULINGS JH2 — a displaced file over the engine's read limit is KEPT IN ITS SLOT AS MOVED: no
+    // clone, no copy (its bytes are never read whole); `finish_seal` records it as kept unsealed
+    if m.len() > super::durable::RECORD_READ_CAP {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     if !force_byte_copy() {
         use std::os::unix::ffi::OsStrExt;
@@ -536,8 +541,20 @@ pub fn seal_with(slot: &Slot, hook: &mut PublishHook<'_>) -> Result<(), RepairEr
             return full_flush_dir(&slot.dir.join("sealed"));
         }
     }
-    // no copy-on-write here: a byte copy published the same way (temporary entry → flush → place)
-    let bytes = std::fs::read(&payload).map_err(|e| io(&payload, e))?;
+    // no copy-on-write here: a byte copy published the same way (temporary entry → flush → place) —
+    // RULINGS JH2: at most the limit + 1 bytes from one handle; a payload that grew past the limit
+    // while it was read is kept as moved (unsealed), never read whole
+    let bytes = match super::durable::read_record_bytes(&payload) {
+        super::durable::RecordRead::Bytes(b) => b,
+        super::durable::RecordRead::NotFound => return Err(io(&payload, "없음")),
+        super::durable::RecordRead::Unreadable(why) => {
+            let grown = std::fs::symlink_metadata(&payload).map_err(|e| io(&payload, e))?.len() > super::durable::RECORD_READ_CAP;
+            if grown {
+                return Ok(());
+            }
+            return Err(RepairError::Precondition(why));
+        }
+    };
     #[cfg(unix)]
     let mode = {
         use std::os::unix::fs::PermissionsExt;
@@ -555,6 +572,9 @@ fn verify_published_seal(slot: &Slot) -> Result<(), RepairError> {
         return Ok(()); // placed only when complete (CT1); its hash is recorded next
     }
     let recorded = read_sealed_meta(slot)?;
+    if kept_unsealed(&recorded) {
+        return Ok(()); // JH2: kept as moved, over the limit — no hash was recorded
+    }
     if let Some(want) = recorded.get("sealed_sha256").and_then(|v| v.as_str()) {
         match TargetState::read(&slot.sealed())? {
             TargetState::File { sha256, .. } if sha256 == want => {}
@@ -583,10 +603,20 @@ fn read_sealed_meta(slot: &Slot) -> Result<serde_json::Value, RepairError> {
 /// The post-seal facts written once into `meta/sealed.json` (K8 / L3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealFacts {
-    /// The sealed copy's content hash (`None` for a link — interpretation 30).
+    /// The sealed copy's content hash (`None` for a link — interpretation 30 — and for a deposit
+    /// kept unsealed over the limit, JH2).
     pub sealed_sha256: Option<String>,
-    /// The deposit's state as sealed (a file's sha256 + mode, or the link).
-    pub sealed_state: TargetState,
+    /// The deposit as sealed: its state (a file's sha256 + mode, or the link), or — RULINGS JH2 — a
+    /// file over the engine's read limit kept in its slot as moved (no state, never a source).
+    pub sealed_state: Observed,
+}
+
+/// RULINGS JH2 — the field of `meta/sealed.json` that says the deposit is kept unsealed, over the
+/// limit (its bytes moved into the slot, never read whole, never an automatic return's source).
+pub const KEPT_UNSEALED: &str = "kept_unsealed";
+
+fn kept_unsealed(meta: &serde_json::Value) -> bool {
+    meta.get(KEPT_UNSEALED).is_some_and(|k| !k.is_null())
 }
 
 /// After [`seal`] and the parent flushes: the sealed copy made durable, its hash and the step-4
@@ -613,47 +643,58 @@ pub fn finish_seal_with(slot: &Slot, now: f64, hook: &mut PublishHook<'_>) -> Re
         full_flush_file(&f).map_err(|e| io(&sealed, e))?;
         drop(f);
         full_flush_dir(&slot.dir.join("sealed"))?;
-        let st = TargetState::read(&sealed)?;
+        // JH2: a clone of a payload that grew past the limit before the clone is over the limit too
+        let st = TargetState::observe(&sealed)?;
         let sha = match &st {
-            TargetState::File { sha256, .. } => Some(sha256.clone()),
+            Observed::State(TargetState::File { sha256, .. }) => Some(sha256.clone()),
             _ => None,
         };
         (st, sha)
     } else {
         // a link payload: the link itself is the deposit (a FILE payload without its sealed copy is
-        // never recorded as one)
-        let st = TargetState::read(&payload)?;
-        if matches!(st, TargetState::File { .. }) {
+        // never recorded as one) — JH2: a payload over the limit is kept as moved (no copy was made)
+        let st = TargetState::observe(&payload)?;
+        if matches!(st, Observed::State(TargetState::File { .. })) {
             return Err(RepairError::Superseded(format!("{}: 봉인 사본이 없습니다", sealed.display())));
         }
         (st, None)
+    };
+    let over = match &sealed_state {
+        Observed::OverLimit { len } => Some(*len),
+        Observed::State(_) => None,
     };
     let meta = slot.meta_sealed();
     if std::fs::symlink_metadata(&meta).is_ok() {
         // recovery: the record is read back and must agree with the sealed copy (never rewritten)
         let recorded = read_sealed_meta(slot)?;
         let want = recorded.get("sealed_sha256").and_then(|v| v.as_str()).map(str::to_string);
-        if want != sealed_sha {
+        if want != sealed_sha || kept_unsealed(&recorded) != over.is_some() {
             return Err(RepairError::Superseded(format!(
                 "{}: 봉인 기록이 봉인 사본과 다릅니다",
                 meta.display()
             )));
         }
     } else {
-        let slot_now = match TargetState::read(&payload)? {
-            TargetState::File { sha256, .. } => serde_json::json!(sha256),
-            TargetState::Link { target } => serde_json::json!(format!("link:{target}")),
-            TargetState::Absent => serde_json::Value::Null,
+        // JH2: an over-limit observation is never written as a hash — the field of its own says it
+        let slot_now = match TargetState::observe(&payload)? {
+            Observed::State(TargetState::File { sha256, .. }) => serde_json::json!(sha256),
+            Observed::State(TargetState::Link { target }) => serde_json::json!(format!("link:{target}")),
+            Observed::State(TargetState::Absent) | Observed::OverLimit { .. } => serde_json::Value::Null,
         };
         let link_seen = match &sealed_state {
-            TargetState::Link { target } => serde_json::json!(target),
+            Observed::State(TargetState::Link { target }) => serde_json::json!(target),
             _ => serde_json::Value::Null,
+        };
+        let kept = match over {
+            Some(len) => serde_json::json!({"reason": "over the limit", "limit": super::durable::RECORD_READ_CAP, "len": len}),
+            None => serde_json::Value::Null,
         };
         let v = serde_json::json!({
             "schema": super::REPAIR_SCHEMA,
             "sealed_sha256": sealed_sha,
             "slot_sha256_at_check": slot_now,
             "link_target_at_check": link_seen,
+            KEPT_UNSEALED: kept,
             "sealed_at": now,
         });
         let mut bytes = serde_json::to_vec_pretty(&v).map_err(|e| RepairError::Io(e.to_string()))?;
@@ -677,6 +718,15 @@ pub fn deposit_of(slot: &Slot) -> Result<(TargetState, PathBuf), RepairError> {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
     };
+    // RULINGS JH2 — a deposit kept unsealed over the limit is never an automatic return's source:
+    // the caller leaves that target as a conflict (the slot's place and the limit in the sentence)
+    if read_json(&slot.meta_sealed()).is_some_and(|v| kept_unsealed(&v)) {
+        return Err(RepairError::Declined(format!(
+            "{}: 밀려난 파일이 엔진의 읽기 한도 {}바이트를 넘어 봉인하지 않고 이 보관 칸에 옮긴 그대로 두었습니다 — 자동으로 되돌리는 원본이 되지 않습니다(충돌)",
+            slot.dir.display(),
+            super::durable::RECORD_READ_CAP
+        )));
+    }
     let sealed = slot.sealed();
     if std::fs::symlink_metadata(&sealed).is_ok() {
         let st = TargetState::read(&sealed)?;

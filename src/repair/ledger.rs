@@ -1004,6 +1004,7 @@ pub fn copy_preimage_in(
     live: &Path,
     now: f64,
 ) -> Result<PreImage, RepairError> {
+    // T6b · RULINGS IW1 / JH1: a file longer than the engine's read limit has no state — `begin` is refused
     let state = TargetState::read(live)?;
     if state == TargetState::Absent {
         return Ok(PreImage::Absent);
