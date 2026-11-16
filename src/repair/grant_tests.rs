@@ -259,6 +259,21 @@ fn off_means_zero_starts() {
     check(&r);
 }
 
+/// WY2 — the decision file is written, then re-opened for its full flush (`write_decision_in`). On
+/// Windows that re-open was read-only, so the flush failed SILENTLY (its result is ignored by
+/// design — the decision is in place either way; only its durability across a power loss was
+/// missing). This reaches the changed open on every platform and reads the decision back; the open
+/// itself is proven by `durable::tests::wy2_open_for_flush_gives_a_handle_the_full_flush_accepts`.
+#[test]
+fn wy2_the_decision_file_is_written_and_reads_back() {
+    let r = root("wy2-decision");
+    grant_on(&r, 3);
+    let d = read_decision_in(&r).unwrap().expect("the decision is in place");
+    assert_eq!(d.state, GrantState::On);
+    assert_eq!(d.daily_cap, 3);
+    let _ = std::fs::remove_dir_all(&r);
+}
+
 /// On → one concurrent: the first start is allowed with claim 1; a second (another seat, another
 /// lane) is `Busy` and places nothing; after the first is committed the next start closes claim 1
 /// and takes claim 2.

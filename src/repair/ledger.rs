@@ -1663,6 +1663,27 @@ mod storage_tests {
         }
     }
 
+    /// WY2 — the measured failure, reached from the library: `write_record_durable_in` (the
+    /// commit's durable record, RULINGS Y1 / E1; also every apply / revert / probation / claim step
+    /// that must not run ahead of its record) writes the record, re-opens it for the full flush and
+    /// flushes it and its folder. On Windows the re-open was read-only and the commit answered exit 1
+    /// "record.json: Access is denied. (os error 5)" (runs/TW1-ci-7a commit.json). It must succeed
+    /// on every platform, twice in a row (the commit's step 3b writes again), and read back as written.
+    #[test]
+    fn wy2_the_durable_record_write_succeeds_and_reads_back() {
+        let root = tmp(line!());
+        let id = RepairId::parse("R-2").unwrap();
+        std::fs::create_dir_all(repair_dir_in(&root, &id)).unwrap();
+        let mut rec = sample(&id);
+        rec.state = RepairState::Probation;
+        write_record_durable_in(&root, &rec).expect("the durable record write");
+        assert_eq!(read_record_in(&root, &id).unwrap(), Some(rec.clone()));
+        rec.checks.push(("bin/a.py".into(), "wy2".into()));
+        write_record_durable_in(&root, &rec).expect("the second durable record write");
+        assert_eq!(read_record_in(&root, &id).unwrap(), Some(rec));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The `_in` layouts are exactly the T0 path helpers relative to the repairs root.
     #[test]
     fn layouts_match_paths_rs() {
