@@ -33067,6 +33067,16 @@ mod tests {
                 put(".pristine/acl.json", acl_old.as_bytes());
                 record(&[(worker, old), ("acl.json", acl_old)]);
             }
+            // FR1 (RULINGS LH37): the remote route the app uses (`--manifest-url`, also with `--dry-run`) — the real
+            //   `fetch_remote_pack` with the machine's own `curl`, served WITHOUT the network (`file://`: the fetch derives
+            //   the signature and archive URLs from the manifest URL's folder), with a user curl configuration that writes to
+            //   stdout: `write-out` in `$CURL_HOME/.curlrc` (and `_curlrc`, the name Windows' curl.exe also reads). The fixture
+            //   produces no install-core line, so the case sees the fetch alone.
+            "remote" | "remote-dry" => {
+                let curl_home = base.join("curl-home");
+                po1_write_curlrc(&curl_home);
+                std::env::set_var("CURL_HOME", &curl_home);
+            }
             other => panic!("unknown PO1 child mode {other}"),
         }
         let pk = po1_sign_fixture(&from, &fixture);
@@ -33074,6 +33084,9 @@ mod tests {
         std::io::stdout().flush().unwrap();
         let rc = if mode == "init-pack" {
             run_init_pack(false, true, None)
+        } else if mode.starts_with("remote") {
+            run_pack_update(None, Some(po1_file_url(&from.join("pack-manifest.json"))), mode == "remote-dry",
+                &|| Ok(test_keyring("TESTKEY", &pk)), &consume_reinject_pending, &mut std::io::stdout().lock())
         } else {
             run_pack_update(Some(from.to_string_lossy().into_owned()), None, false,
                 &|| Ok(test_keyring("TESTKEY", &pk)), &consume_reinject_pending, &mut std::io::stdout().lock())
@@ -33109,17 +33122,22 @@ mod tests {
     /// record · the app's parser takes it (`Ok(Some)`, Applied) · no stdout line is a human `[init-pack]` / `[pack-update]`
     /// line, every stdout line is a machine record · each human line of the case IS on stderr. Returns the failures.
     pub(super) fn po1_failures(case: &str, rc: i32, out: &str, err: &str, human: &[&str]) -> Vec<String> {
-        use cys::pack_update_result::{parse, PackAction};
+        po1_failures_for(case, rc, out, err, human, cys::pack_update_result::PackAction::Applied)
+    }
+
+    /// [`po1_failures`] with the record's expected action (`Validated` for a dry run).
+    fn po1_failures_for(case: &str, rc: i32, out: &str, err: &str, human: &[&str], want: cys::pack_update_result::PackAction) -> Vec<String> {
+        use cys::pack_update_result::parse;
         let mut f = Vec::new();
         if rc != 0 {
-            f.push(format!("{case}: exit {rc}, expected 0 (applied; no daemon → reinject skipped)"));
+            f.push(format!("{case}: exit {rc}, expected 0 ({want:?}; no daemon → reinject skipped)"));
         }
         if !out.lines().next().is_some_and(|l| l.starts_with("PACK_UPDATE_OUTCOME ")) {
             f.push(format!("{case}: stdout line 0 is not the terminal record: {:?}", out.lines().next()));
         }
         match parse(out, rc) {
-            Ok(Some(r)) if r.action == PackAction::Applied => {}
-            other => f.push(format!("{case}: cys::pack_update_result::parse(stdout, {rc}) = {other:?}, expected Ok(Some(Applied))")),
+            Ok(Some(r)) if r.action == want => {}
+            other => f.push(format!("{case}: cys::pack_update_result::parse(stdout, {rc}) = {other:?}, expected Ok(Some({want:?}))")),
         }
         for l in out.lines() {
             if l.starts_with("[init-pack]") || l.starts_with("[pack-update]") {
@@ -33191,6 +33209,78 @@ mod tests {
     #[test]
     fn po1_d_the_unreadable_file_line_goes_to_stderr() {
         po1_assert("unreadable", &["[init-pack] 읽을 수 없어 손대지 않은 파일 1건", "schedule.json"]);
+    }
+
+    /// PO1 FR1: the user curl configuration of the remote cases — `write-out` prints a line on curl's stdout after every
+    /// transfer. Both names: `.curlrc` (every curl) and `_curlrc` (Windows' curl.exe reads it too).
+    fn po1_write_curlrc(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        for name in [".curlrc", "_curlrc"] {
+            std::fs::write(dir.join(name), "write-out = \"PO1-CURL-WRITE-OUT\\n\"\n").unwrap();
+        }
+    }
+
+    /// PO1 FR1: a `file://` URL of a local path (forward slashes; a drive path gets the third slash) — curl reads it without
+    /// any network.
+    fn po1_file_url(p: &std::path::Path) -> String {
+        let s = p.to_string_lossy().replace('\\', "/");
+        if s.starts_with('/') {
+            format!("file://{s}")
+        } else {
+            format!("file:///{s}")
+        }
+    }
+
+    /// PO1 FR1 — the CONTROL of the remote cases: in this test's environment the machine's `curl` (found on PATH, as the
+    /// fetch finds it) reads `$CURL_HOME/.curlrc` and prints its write-out on STDOUT for a `file://` transfer made with the
+    /// fetch's own arguments (`-fsSL -o <file> -- <url>`). Without it a green remote case could only mean "the config was
+    /// never read". No curl → Err (the case fails: the product's remote route needs curl there too).
+    fn po1_curl_control() -> Result<(), String> {
+        let dir = std::env::temp_dir().join(format!("cys-po1-curl-control-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        po1_write_curlrc(&dir);
+        std::fs::write(dir.join("src.txt"), "po1\n").unwrap();
+        let o = std::process::Command::new("curl")
+            .args(["-fsSL", "-o"])
+            .arg(dir.join("out.txt"))
+            .arg("--")
+            .arg(po1_file_url(&dir.join("src.txt")))
+            .env("CURL_HOME", &dir)
+            .stdin(std::process::Stdio::null())
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        let o = o.map_err(|e| format!("no `curl` could be run from PATH ({e}) — the remote route needs it; the case cannot be made"))?;
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        if o.status.success() && stdout.lines().any(|l| l == "PO1-CURL-WRITE-OUT") {
+            Ok(())
+        } else {
+            Err(format!("curl did not print the configured write-out (exit {:?}): stdout {stdout:?} stderr {:?}",
+                o.status.code(), String::from_utf8_lossy(&o.stderr)))
+        }
+    }
+
+    /// ★PO1 FR1 (RULINGS LH37) — the remote route the app uses: `cys pack-update --manifest-url <url>` (and with
+    /// `--dry-run`) through the real `fetch_remote_pack` and the machine's own curl, a user curl configuration with a
+    /// `write-out` (isolated `CURL_HOME`), the signed fixture served by `file://` (no network). Criterion (3)'s assertions +
+    /// the write-out text nowhere on stdout. The control first proves curl reads that configuration here. RED on 6ce29fe1:
+    /// `fetch_remote_pack` runs curl by `.status()`, the child inherits the command's stdout, and three
+    /// `PO1-CURL-WRITE-OUT` lines (manifest, signature, archive) precede the record.
+    #[test]
+    fn po1_r_the_remote_fetch_never_writes_to_the_commands_stdout() {
+        use cys::pack_update_result::PackAction;
+        po1_curl_control().unwrap_or_else(|e| panic!("CONTROL failed — {e}"));
+        let mut f = Vec::new();
+        for (mode, want) in [("remote", PackAction::Applied), ("remote-dry", PackAction::Validated)] {
+            let (rc, out, err) = po1_command_output(mode);
+            let mut g = po1_failures_for(mode, rc, &out, &err, &[], want);
+            if out.contains("PO1-CURL-WRITE-OUT") {
+                g.push(format!("{mode}: curl's write-out reached the command's stdout"));
+            }
+            if !g.is_empty() {
+                f.push(format!("{}\n--- stdout (exit {rc}) ---\n{out}--- stderr ---\n{err}", g.join("\n")));
+            }
+        }
+        assert!(f.is_empty(), "{}", f.join("\n"));
     }
 
     /// PO1 criterion (4) — the non-transactional caller is unchanged: the real `cys init-pack --no-install-hook` still
