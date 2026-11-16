@@ -3826,6 +3826,26 @@ mod tests {
         }
     }
 
+    /// S5-MUT part 1 · H-09-A1-08-01 (RULINGS JU): the first-run seeding runs ONLY on a first run — no remembered state,
+    /// no state file, no quarantined copy beside it — and is the one writer of the seeded clocks. The test above checks
+    /// interval_due alone; a tick that re-seeds every job each time (no periodic job ever due) stayed green. Source pin
+    /// over scheduler_tick, the form the tree already uses for it (`job_result_ledger_is_memory_only_and_never_gates_firing`);
+    /// the needles are counted inside the tick's body only (this test's own text holds them too).
+    #[test]
+    fn first_run_seeding_is_guarded_by_the_three_first_run_facts() {
+        let src = include_str!("schedule.rs");
+        let t = src.find("\nfn scheduler_tick(").expect("scheduler_tick 소실");
+        let body = &src[t..t + 1 + src[t + 1..].find("\n}\n").expect("tick 끝")];
+        let seed = body.find("let mut seeded: HashMap<String, i64> = HashMap::new();").expect("the seeding block");
+        let guard = body[..seed].trim_end().rsplit('\n').next().unwrap().trim();
+        assert_eq!(
+            guard, "if state.last_fired.is_empty() && !state_path(daemon).exists() && !had_corrupt {",
+            "the first-run seeding is no longer guarded by exactly the three first-run facts"
+        );
+        assert_eq!(body.matches("let mut seeded: HashMap<String, i64>").count(), 1, "one seeding block");
+        assert_eq!(body.matches("state.last_fired = seeded;").count(), 1, "one writer of the seeded clocks in the tick");
+    }
+
     /// ★★감사 확정 회귀(앵커 ①③ 동시 방어): 디스크 영속이 실패해도
     ///  ①전 주기 잡이 30초마다 재발화하지 않고(폭주) ②영원히 침묵하지도 않는다(자가치유 전멸).
     /// 메모리 오버레이가 그 둘 사이의 유일한 올바른 상태(정확한 간격)를 유지한다.
