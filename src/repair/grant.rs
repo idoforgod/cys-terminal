@@ -743,7 +743,7 @@ fn mtime_epoch(p: &Path) -> Option<f64> {
         .ok()?
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
-        .map(|d| d.as_secs_f64())
+        .map(ledger::epoch_secs_us)
 }
 
 // ───────────────────────────── the claim sequence (F1 / G1–G3 …) ─────────────────────────────

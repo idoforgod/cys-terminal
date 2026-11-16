@@ -551,12 +551,18 @@ pub const AUDIT_WINDOW_SECS: u64 = 86_400;
 // by that lane's daemon — enforced by the daemon module, which serialises every read-modify-write of
 // one repair under its in-memory per-repair mutex (G6, R3). Ledger files are never deleted here.
 
-/// Seconds since the epoch (the ledger's clock).
+/// Seconds since the epoch (the ledger's clock) — through [`epoch_secs_us`].
 pub fn now_epoch() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
+        .map(epoch_secs_us)
         .unwrap_or(0.0)
+}
+
+/// WY2 part B (RULINGS LH12) — the repair module's clock: an elapsed `Duration` since the epoch →
+/// epoch seconds (`f64`). RED STEP: today's formula; the next commit makes it microsecond.
+pub fn epoch_secs_us(d: std::time::Duration) -> f64 {
+    d.as_secs_f64()
 }
 
 /// `<root>/R-<n>/`
@@ -1685,39 +1691,101 @@ mod storage_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// WY2 part B (RULINGS LH10) — every f64 the ledger writes is read back as ITSELF. The value is
-    /// the one measured by the master: 1794799840.0102947 (17 significant digits — a 100-ns clock
-    /// (Windows) or a 1-ns clock (Linux) makes such times; a microsecond clock (macOS) does not).
-    /// serde_json without the feature `float_roundtrip` writes it as "1794799840.0102947" and parses
-    /// that text to 1794799840.010295 — so a record holding it is not equal to itself after the
-    /// ledger's round trip, and the commit door's step 3a (cysd repair.rs ~3212, `rec != snapshot`)
-    /// refuses with "검사하는 동안 수리 기록이 바뀌었습니다" although nothing changed (Windows,
-    /// runs/TW1-ci-7c commit.json rc 94).
+    /// WY2 part B — `x` written and read back by serde_json the way the ledger does (`from_str::<f64>`
+    /// and `Value` → `as_f64`, the record reader's path); true = one of them is not `x` to the bit.
+    fn wy2b_lossy(x: f64) -> bool {
+        let text = serde_json::to_string(&x).unwrap();
+        let a: f64 = serde_json::from_str(&text).unwrap();
+        let b = serde_json::from_str::<serde_json::Value>(&text).unwrap().as_f64().unwrap();
+        a.to_bits() != x.to_bits() || b.to_bits() != x.to_bits()
+    }
+
+    /// WY2 part B — a deterministic grid of epoch Durations on a clock of `unit_ns` (100 = Windows,
+    /// 1 = Linux, 1000 = macOS), near today's epoch (the same spread as cysd state.rs's `grid`).
+    fn wy2b_grid(unit_ns: u64, i: u64) -> std::time::Duration {
+        let total_ns: u128 = 1_794_700_000u128 * 1_000_000_000 + (i as u128) * 7_919_113u128 * (unit_ns as u128);
+        std::time::Duration::new((total_ns / 1_000_000_000) as u64, (total_ns % 1_000_000_000) as u32)
+    }
+
+    /// WY2 part B (RULINGS LH12) — the repair clock's values, and those values plus every integer
+    /// constant the engine adds before it writes a time (the lease `LEASE_SECS`, the pause cover,
+    /// minutes, an hour, a day), come back from serde_json's DEFAULT parser as themselves on the
+    /// 100-ns (Windows) and 1-ns (Linux) grids, 20,000 values each; each is the microsecond floor of
+    /// its input (never later, at most 6 decimals). Not vacuous: the RAW values (`as_secs_f64()`) of the
+    /// same grids miss in 1,000 or more cases (if that ever stops, `float_roundtrip` was switched on —
+    /// the product keeps it off, RELEASE_NOTES_0.14.43 §7). The macOS grid (1 µs) is bit-identical to
+    /// `as_secs_f64()` (RULINGS LH12 B5': the unix clock that macOS has does not change).
     #[test]
-    fn wy2_a_17_digit_lease_time_survives_the_ledgers_json_round_trip() {
-        let t: f64 = 1_794_799_840.010_294_7;
+    fn wy2b_the_repair_clock_survives_the_default_json_parser_on_the_100ns_and_1ns_grids() {
+        let offsets = [0.0, crate::repair::types::LEASE_SECS as f64, 5.0, -60.0, 60.0, 600.0, 3_600.0, 86_400.0];
+        for (label, unit) in [("100 ns (Windows)", 100u64), ("1 ns (Linux)", 1u64)] {
+            let (mut raw_lossy, mut lossy, mut later, mut not_floor, mut decimals) = (0u32, 0u32, 0u32, 0u32, 0usize);
+            let mut first_bad: Option<std::time::Duration> = None;
+            for i in 0..20_000u64 {
+                let d = wy2b_grid(unit, i);
+                if wy2b_lossy(d.as_secs_f64() + crate::repair::types::LEASE_SECS as f64) {
+                    raw_lossy += 1;
+                }
+                let v = epoch_secs_us(d);
+                for off in offsets {
+                    if wy2b_lossy(v + off) {
+                        lossy += 1;
+                        first_bad.get_or_insert(d);
+                    }
+                }
+                if v > d.as_secs_f64() {
+                    later += 1;
+                }
+                if (v * 1e6).round() as u128 != d.as_micros() {
+                    not_floor += 1;
+                }
+                let text = serde_json::to_string(&v).unwrap();
+                decimals = decimals.max(text.split_once('.').map_or(0, |(_, f)| f.len()));
+            }
+            assert!(raw_lossy >= 1_000, "{label}: the raw lease values miss only {raw_lossy}/20000 — the premise is gone (float_roundtrip on?)");
+            assert_eq!((lossy, later, not_floor), (0, 0, 0), "{label}: {lossy} value(s) did not come back as themselves, {later} later than the input, {not_floor} not the µs floor — first input {first_bad:?}");
+            assert!(decimals <= 6, "{label}: {decimals} decimals (expected <= 6)");
+        }
+        for i in 0..20_000u64 {
+            let d = wy2b_grid(1_000, i);
+            assert_eq!(epoch_secs_us(d).to_bits(), d.as_secs_f64().to_bits(), "1 µs grid (macOS) i={i}: the value changed");
+        }
+    }
+
+    /// WY2 part B (RULINGS LH12) — a record written at a Windows clock time reads back EQUAL (what the
+    /// commit door's step 3a compares, cysd repair.rs ~3212 `rec != snapshot`). The time is the
+    /// measured one: 1794792640 s + 10 294 700 ns; with the raw formula its lease is the text
+    /// "1794799840.0102947", which the default parser reads as 1794799840.010295 (runs/TW1-ci-7c).
+    #[test]
+    fn wy2b_a_record_written_at_a_windows_clock_time_reads_back_equal() {
+        let d = std::time::Duration::new(1_794_792_640, 10_294_700);
+        assert_eq!(
+            serde_json::to_string(&(d.as_secs_f64() + crate::repair::types::LEASE_SECS as f64)).unwrap(),
+            "1794799840.0102947",
+            "premise: the raw formula gives the measured lease text"
+        );
+        let now = epoch_secs_us(d);
         let root = tmp(line!());
         let id = RepairId::parse("R-2").unwrap();
         std::fs::create_dir_all(repair_dir_in(&root, &id)).unwrap();
         let mut rec = sample(&id);
+        rec.created_at = now;
+        rec.audit_due_at = Some(now + 86_400.0);
         rec.lock = Some(Lease {
             owner: LockOwner { lane: LaneKey("base".into()), seat: 3, incarnation: "inc-1".into() },
-            expires_at: t,
+            expires_at: now + crate::repair::types::LEASE_SECS as f64,
             claim: None,
         });
         write_record_in(&root, &rec).unwrap();
         let back = read_record_in(&root, &id).unwrap().unwrap();
         assert_eq!(
             back.lock.as_ref().map(|l| l.expires_at.to_bits()),
-            Some(t.to_bits()),
-            "the lease time read back: {:?} (written {t:?})",
-            back.lock.as_ref().map(|l| l.expires_at)
+            rec.lock.as_ref().map(|l| l.expires_at.to_bits()),
+            "the lease read back: {:?} (written {:?})",
+            back.lock.as_ref().map(|l| l.expires_at),
+            rec.lock.as_ref().map(|l| l.expires_at)
         );
-        assert_eq!(back, rec, "the record reads back EQUAL (what the commit door's step 3a compares)");
-        // the parser alone, on the writer's own text
-        let text = serde_json::to_string(&t).unwrap();
-        assert_eq!(text, "1794799840.0102947", "the writer's shortest text");
-        assert_eq!(serde_json::from_str::<f64>(&text).unwrap().to_bits(), t.to_bits(), "the text parses back to the same f64");
+        assert_eq!(back, rec, "the record reads back EQUAL");
         let _ = std::fs::remove_dir_all(&root);
     }
 
