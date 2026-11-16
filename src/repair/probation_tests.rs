@@ -3,7 +3,7 @@
 //! mode, the start-time pass (AK7, DEFERRED #49) and M10 (F9, notices, line endings, rule documents).
 
 use super::*;
-use crate::repair::apply::tests::{committed_general, lane_row, rid, rig, Rig};
+use crate::repair::apply::tests::{committed_general, lane_row, rid, rig, run_form, Rig};
 use crate::repair::apply::{no_repair_lock, CheckOutcome, NoFaults, ReconcileReport};
 use crate::repair::boot_critical::CheckKind;
 use crate::repair::ledger::CheckTiming;
@@ -90,7 +90,7 @@ fn failing_recheck_reverts_one_repair_and_files_one_defect() {
     };
     let d = Doubles { check: &fail_a, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &note, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    let rep = run_tick(&job(&r, &d, run_form(), NOW, &lock), false).unwrap();
     assert_eq!(rep.reverted, vec![a.clone()]);
     assert_eq!(std::fs::read(r.pack.join("hooks/a.sh")).unwrap(), b"A0\n");
     assert_eq!(std::fs::read(r.pack.join("hooks/b.sh")).unwrap(), b"B1\n", "only that one repair");
@@ -155,7 +155,7 @@ fn update_arm(update: &str, wrote: bool) {
     let fail = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Fail("would fail".into()), 5);
     let d = Doubles { check: &fail, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    let rep = run_tick(&job(&r, &d, run_form(), NOW, &lock), false).unwrap();
     assert!(rep.reverted.is_empty(), "{update}/{wrote}: never reverted");
     let want: &[u8] = if wrote { b"VENDOR-NEW\n" } else { b"REPAIRED\n" };
     assert_eq!(std::fs::read(r.pack.join("hooks/s.sh")).unwrap(), want, "{update}/{wrote}");
@@ -210,7 +210,7 @@ fn an_update_that_wrote_one_target_supersedes_the_repair() {
     let never = |_: &str, _: &Path, _: Duration| -> Result<CheckOutcome, RepairError> { panic!("no check after an update") };
     let d = Doubles { check: &never, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
-    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    let rep = run_tick(&job(&r, &d, run_form(), NOW, &lock), false).unwrap();
     assert!(rep.reverted.is_empty(), "never reverted");
     assert_eq!(rep.superseded, vec![a.clone()]);
     assert_eq!(std::fs::read(r.pack.join("hooks/m1.sh")).unwrap(), b"REPAIRED1\n");
@@ -244,7 +244,7 @@ fn an_update_in_another_lane_closes_that_lanes_probation_by_the_same_rule() {
     let never = |_: &str, _: &Path, _: Duration| -> Result<CheckOutcome, RepairError> { panic!("no check after an update") };
     let d = Doubles { check: &never, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
-    let mut env = job(&r, &d, ApplyForm::Exchange, NOW, &lock);
+    let mut env = job(&r, &d, run_form(), NOW, &lock);
     env.op.lane = &other;
     let _ = run_tick(&env, false).unwrap();
     let row = ledger::read_lane_in(&r.root, &kept, &other).unwrap().unwrap();
@@ -261,7 +261,7 @@ fn an_update_in_another_lane_closes_that_lanes_probation_by_the_same_rule() {
     );
     assert_eq!(ledger::read_record_in(&r.root, &wrote).unwrap().unwrap().state, RepairState::Probation, "another lane never decides the record");
     // the origin's own pass then decides the records
-    let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 700.0, &lock), false).unwrap();
+    let _ = run_tick(&job(&r, &d, run_form(), NOW + 700.0, &lock), false).unwrap();
     assert_eq!(ledger::read_record_in(&r.root, &kept).unwrap().unwrap().state, RepairState::InUse);
     assert_eq!(ledger::read_record_in(&r.root, &wrote).unwrap().unwrap().state, RepairState::Superseded);
 }
@@ -282,7 +282,7 @@ fn probation_rechecks_only_repaired_files() {
     let d = Doubles { check: &rec, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
     let mut report = TickReport::default();
-    let env = job(&r, &d, ApplyForm::Exchange, NOW, &lock);
+    let env = job(&r, &d, run_form(), NOW, &lock);
     probation_pass(&env, &mut report);
     assert_eq!(*seen.borrow(), vec!["hooks/a.sh".to_string()]);
 }
@@ -333,7 +333,7 @@ fn o3_timeout_attribution() {
         let reference = |_: CheckKind, _: Duration| outcome(CheckResult::Pass, c.ref_now_ms);
         let d = Doubles { check: &check, reference: &reference, original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
         let lock = r.base.join(".pack-apply.lock");
-        let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+        let rep = run_tick(&job(&r, &d, run_form(), NOW, &lock), false).unwrap();
         if c.failure {
             assert_eq!(rep.reverted, vec![a.clone()], "case {n}");
             assert_eq!(std::fs::read(r.pack.join("hooks/t.sh")).unwrap(), b"PRE\n");
@@ -361,7 +361,7 @@ fn created_file_hang_is_blamed_only_within_the_reference_slowdown() {
         let check = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Timeout, 60_000);
         let d = Doubles { check: &check, reference: &reference, original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
         let lock = r.base.join(".pack-apply.lock");
-        run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+        run_tick(&job(&r, &d, run_form(), NOW, &lock), false).unwrap();
         assert_eq!(r.live("hooks/new.sh") == TargetState::Absent, moved, "ratio {ratio}");
     }
 }
@@ -378,7 +378,7 @@ fn probation_of_only_timeouts_ends_in_use_at_24h() {
     let never = |_: &str, _: &Path, _: Duration| -> Result<CheckOutcome, RepairError> { panic!("no check after 24 h") };
     let d = Doubles { check: &never, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
-    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 2.0 * 86_400.0, &lock), false).unwrap();
+    let rep = run_tick(&job(&r, &d, run_form(), NOW + 2.0 * 86_400.0, &lock), false).unwrap();
     assert_eq!(rep.ended, vec![a.clone()]);
     assert!(rep.lines.iter().any(|l| l.contains("시간 초과 1건")));
     assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::InUse);
@@ -397,7 +397,7 @@ fn start_time_pass_rebuilds_tombstones_and_finishes_an_interrupted_commit() {
     std::fs::remove_file(ledger::lane_path_in(&r.root, &newer, &r.lane)).unwrap();
     let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
-    let env = job(&r, &d, ApplyForm::Exchange, NOW, &lock);
+    let env = job(&r, &d, run_form(), NOW, &lock);
     let lines = start_time_pass(&env).unwrap();
     assert!(!lines.is_empty());
     let ts = crate::repair::tombstones::load_in(&r.root, &r.lane).unwrap();
@@ -492,7 +492,7 @@ fn m10_planted_row_still_reverted() {
     let fails = |x: &str, _: &Path, _: Duration| if x == rel { outcome(CheckResult::Fail("bad".into()), 5) } else { outcome(CheckResult::Pass, 5) };
     let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let f = m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
     assert_ne!(std::fs::read(r.pack.join(rel)).unwrap(), orig, "nothing put back on unknown evidence");
     assert!(f.iter().any(|x| x.rel == rel && x.kind == "approval-unknown"), "{f:?}");
 }
@@ -519,7 +519,7 @@ fn m10_changed_between_check_and_revert_is_left() {
     let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
     let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let f = m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
     assert!(f.iter().any(|x| x.kind == "superseded"), "{f:?}");
     assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"#!/bin/bash\nthird\n");
 }
@@ -552,7 +552,7 @@ fn m10_hang_attribution() {
         let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
         let d = Doubles { check: &check, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
         let lock = r.base.join(".pack-apply.lock");
-        let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+        let f = m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
         assert_eq!(std::fs::read(r.pack.join(rel)).unwrap() == b"#!/bin/bash\necho ok\n", reverted, "control_ok={control_ok} second={second:?}");
         assert!(f.iter().any(|x| x.rel == rel && x.kind == "check-timeout" && !x.notice), "{f:?}");
     }
@@ -580,7 +580,7 @@ fn supersession_is_checked_before_the_24_hour_close() {
         let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
         let lock = r.base.join(".pack-apply.lock");
         let later = NOW + 3.0 * 86_400.0;
-        let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, later, &lock), false).unwrap();
+        let rep = run_tick(&job(&r, &d, run_form(), later, &lock), false).unwrap();
         let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
         if wrote {
             assert!(rep.superseded.contains(&a) && !rep.ended.contains(&a), "{rep:?}");
@@ -643,7 +643,7 @@ fn tick_child_deadline_is_clamped() {
     };
     let d = Doubles { check: &check, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
-    run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    run_tick(&job(&r, &d, run_form(), NOW, &lock), false).unwrap();
     assert_eq!(*seen.borrow(), vec![("bin/plain.py".to_string(), Duration::from_secs(60))]);
     if let Some(e) = crate::repair::boot_critical::entries().iter().find(|e| e.timeout_s.is_some()) {
         let want = u64::from(crate::repair::boot_critical::clamp_check_timeout(e.timeout_s));
@@ -676,11 +676,11 @@ fn m10_unknown_original_uses_the_install_manifest_for_unchanged_only() {
     };
     let d = Doubles { check: &check, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let f = m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
     assert!(f.iter().all(|x| x.rel != rel), "{f:?}");
     assert_eq!(*calls.borrow(), 0, "an unchanged file is not even checked");
     r.put(rel, b"#!/bin/bash\necho edited\n", 0o755);
-    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let f = m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
     assert!(f.iter().any(|x| x.rel == rel && x.kind == "kept"), "{f:?}");
 }
 
@@ -701,7 +701,7 @@ fn m10_finding_names_the_kept_copy_and_the_repair_route() {
     let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
     let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let f = m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
     let rev = f.iter().find(|x| x.kind == "reverted").expect("a put-back");
     let kept = rev.kept_copy.clone().expect("the kept copy's path");
     assert!(kept.starts_with(m10_root_in(&r.root, &r.lane)), "in the lane's M10 sub-ledger: {}", kept.display());
@@ -737,11 +737,11 @@ fn m10_each_put_back_takes_a_fresh_slot() {
     let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
     r.put(rel, b"#!/bin/bash\nfirst(\n", 0o755);
-    let a = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let a = m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
     let slot_a = a.iter().find(|x| x.kind == "reverted").unwrap().slot.clone().unwrap();
     let kept_a = a.iter().find(|x| x.kind == "reverted").unwrap().kept_copy.clone().unwrap();
     r.put(rel, b"#!/bin/bash\nsecond(\n", 0o755);
-    let b = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0, &lock)).unwrap();
+    let b = m10_sweep(&job(&r, &d, run_form(), NOW + 3600.0, &lock)).unwrap();
     let slot_b = b.iter().find(|x| x.kind == "reverted").unwrap().slot.clone().unwrap();
     assert_ne!(slot_a, slot_b, "a fresh slot per put-back");
     assert_eq!(std::fs::read(&kept_a).unwrap(), b"#!/bin/bash\nfirst(\n", "the earlier deposit is untouched");
@@ -781,7 +781,7 @@ fn m10_put_back_revalidates_its_binding_under_the_lock() {
     let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
     let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let f = m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
     assert!(f.iter().any(|x| x.rel == rel && x.kind == "superseded"), "{f:?}");
     assert!(!f.iter().any(|x| x.kind == "reverted"), "nothing put back: {f:?}");
     assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"#!/bin/bash\nbroken(\n");
@@ -804,7 +804,7 @@ fn recovery_waits_for_an_active_writer() {
         }
     }
     let spec = crate::repair::apply::OpSpec { id: rid("R-7"), rel: "hooks/w.sh".into(), kind: "revert".into(), expected: crate::repair::apply::Recorded::for_test(before), incoming, source: crate::repair::apply::Source::Fresh(src), bound: crate::repair::apply::Bound::now(&r.pack) };
-    assert!(crate::repair::apply::run_op(&r.env(&StopAfterRecord, ApplyForm::Exchange), &spec).is_err());
+    assert!(crate::repair::apply::run_op(&r.env(&StopAfterRecord, run_form()), &spec).is_err());
     assert_eq!(crate::repair::wal::unfinished_for_lane(&r.root, &r.lane).len(), 1);
     let lock = r.base.join(".pack-apply.lock");
     let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
@@ -819,13 +819,13 @@ fn recovery_waits_for_an_active_writer() {
         .unwrap();
     });
     held_rx.recv().unwrap();
-    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    let rep = run_tick(&job(&r, &d, run_form(), NOW, &lock), false).unwrap();
     assert!(rep.lines.iter().any(|l| l.contains("아무것도 하지 않습니다")), "{:?}", rep.lines);
     assert_eq!(crate::repair::wal::unfinished_for_lane(&r.root, &r.lane).len(), 1, "not touched while a writer is active");
     assert!(read_job_state_in(&r.root, &r.lane).is_none(), "the tick stays due");
     release_tx.send(()).unwrap();
     holder.join().unwrap();
-    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    let rep = run_tick(&job(&r, &d, run_form(), NOW, &lock), false).unwrap();
     assert_eq!(rep.resumed, 1, "{:?}", rep.lines);
     assert!(crate::repair::wal::unfinished_for_lane(&r.root, &r.lane).is_empty());
 }
@@ -855,7 +855,7 @@ fn hook_only_commit_interrupted_before_its_hook_record_is_recovered() {
     };
     let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    let env = JobEnv { hooks: &hooks, ..job(&r, &d, ApplyForm::Exchange, NOW, &lock) };
+    let env = JobEnv { hooks: &hooks, ..job(&r, &d, run_form(), NOW, &lock) };
     let lines = start_time_pass(&env).unwrap();
     assert_eq!(*calls.borrow(), vec![HookStep::Unregister], "{lines:?}");
     assert!(ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().is_some(), "the origin's row is written");
@@ -878,7 +878,7 @@ fn reconstructed_origin_row_is_closed_when_the_generation_cannot_be_confirmed() 
         }
         let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
         let lock = r.base.join(".pack-apply.lock");
-        start_time_pass(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+        start_time_pass(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
         let row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
         assert!(row.probation.as_ref().unwrap().closed.as_deref().is_some_and(|c| c.starts_with("대체됨")), "updated_since={updated_since}: {:?}", row.probation);
     }
@@ -905,7 +905,7 @@ fn line_endings_only_is_ledger_only_before_any_check() {
     let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
     let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let f = m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
     assert!(f.iter().any(|x| x.rel == rel && x.kind == "line-endings-only" && !x.notice), "{f:?}");
     assert_eq!(*checked.borrow(), 0, "never checked");
     assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"#!/bin/bash\r\necho ok\r\n", "never written");
@@ -927,16 +927,16 @@ fn a_put_back_finding_survives_a_crash_before_it_is_written() {
     let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
     let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    let first = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let first = m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
     assert!(first.iter().any(|x| x.kind == "reverted"));
     // the crash: the findings write never happened
     std::fs::remove_file(findings_path_in(&r.root, &r.lane)).unwrap();
-    let again = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0, &lock)).unwrap();
+    let again = m10_sweep(&job(&r, &d, run_form(), NOW + 3600.0, &lock)).unwrap();
     let rebuilt = again.iter().find(|x| x.rel == rel && x.kind == "reverted").expect("rebuilt from the operation record");
     let kept = rebuilt.kept_copy.clone().expect("names the kept copy");
     assert_eq!(std::fs::read(&kept).unwrap(), b"#!/bin/bash\nbroken(\n");
     assert!(rebuilt.note.contains("cys repair begin --files"), "{}", rebuilt.note);
-    let third = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 7200.0, &lock)).unwrap();
+    let third = m10_sweep(&job(&r, &d, run_form(), NOW + 7200.0, &lock)).unwrap();
     assert!(!third.iter().any(|x| x.kind == "reverted"), "idempotent: {third:?}");
 }
 
@@ -965,14 +965,14 @@ fn one_unreadable_record_never_stops_the_job() {
     };
     let d = Doubles { check: &check, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &intake, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), true).unwrap();
+    let rep = run_tick(&job(&r, &d, run_form(), NOW, &lock), true).unwrap();
     assert!(checked.borrow().contains(&"hooks/c1.sh".to_string()) && checked.borrow().contains(&"hooks/c3.sh".to_string()), "{:?}", checked.borrow());
     assert!(read_job_state_in(&r.root, &r.lane).is_some(), "the job state is written");
     // EJ3 / EN4: one row for the repair's fault, one for the cause of the suspended scan
     assert_eq!(filed.borrow().iter().filter(|(_, l)| l.contains("처리하지 못함")).count(), 1, "one fault row: {:?}", filed.borrow());
     assert!(rep.lines.iter().any(|l| l.starts_with("R-2:")), "{:?}", rep.lines);
     // the next probation run: logged again, filed no more
-    let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 700.0, &lock), false).unwrap();
+    let _ = run_tick(&job(&r, &d, run_form(), NOW + 700.0, &lock), false).unwrap();
     assert_eq!(filed.borrow().iter().filter(|(_, l)| l.contains("처리하지 못함")).count(), 1, "filed once per repair");
 }
 
@@ -995,12 +995,12 @@ fn a_revert_that_errors_every_time_ends_failed() {
     let fails = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Fail("bad".into()), 5);
     let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    let rep = run_tick(&job(&r, &d, run_form(), NOW, &lock), false).unwrap();
     assert!(rep.reported_only.iter().any(|(i, _)| *i == a), "{rep:?}");
     let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
     assert_eq!(row.state, crate::repair::types::LaneState::Conflict);
     assert!(row.probation.as_ref().unwrap().closed.as_deref().unwrap().starts_with("실패"));
-    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 2.0 * 86_400.0, &lock), false).unwrap();
+    let rep = run_tick(&job(&r, &d, run_form(), NOW + 2.0 * 86_400.0, &lock), false).unwrap();
     assert!(!rep.ended.contains(&a), "never 사용 중");
     assert_ne!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::InUse);
 }
@@ -1042,7 +1042,7 @@ fn the_scan_never_puts_back_less_than_the_approved_copy() {
         let orig_of = |_: &str| Some(b"#!/bin/bash\necho vendor\n".to_vec());
         let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
         let lock = r.base.join(".pack-apply.lock");
-        let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+        let f = m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
         let live = std::fs::read(r.pack.join(rel)).unwrap();
         if tamper {
             assert_eq!(live, b"#!/bin/bash\nbroken(\n", "nothing put back when the approved copy cannot be verified");
@@ -1069,10 +1069,10 @@ fn a_boot_critical_symlink_is_a_finding() {
     std::os::unix::fs::symlink("/nonexistent/elsewhere", &p).unwrap();
     let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| Some(b"x".to_vec()), intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let f = m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
     assert!(f.iter().any(|x| x.rel == rel && x.kind == "not-a-file" && x.notice), "{f:?}");
     assert!(std::fs::symlink_metadata(&p).unwrap().file_type().is_symlink(), "left as it is");
-    let again = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0, &lock)).unwrap();
+    let again = m10_sweep(&job(&r, &d, run_form(), NOW + 3600.0, &lock)).unwrap();
     assert!(!again.iter().any(|x| x.kind == "not-a-file"), "noticed once");
 }
 
@@ -1100,14 +1100,14 @@ fn a_report_is_marked_filed_only_after_the_intake_accepted_it() {
     };
     let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &intake, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    run_tick(&job(&r, &d, run_form(), NOW, &lock), false).unwrap();
     assert_eq!(calls.get(), 1, "tried once in the tick");
-    run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 700.0, &lock), false).unwrap();
+    run_tick(&job(&r, &d, run_form(), NOW + 700.0, &lock), false).unwrap();
     assert_eq!(calls.get(), 2, "still pending → retried at the next tick, once");
     accept.set(true);
-    run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 1400.0, &lock), false).unwrap();
+    run_tick(&job(&r, &d, run_form(), NOW + 1400.0, &lock), false).unwrap();
     assert_eq!(calls.get(), 3, "accepted now");
-    run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 2100.0, &lock), false).unwrap();
+    run_tick(&job(&r, &d, run_form(), NOW + 2100.0, &lock), false).unwrap();
     assert_eq!(calls.get(), 3, "filed: never sent again");
 }
 
@@ -1154,12 +1154,12 @@ fn a_finding_is_notified_once_for_ever() {
     }
     let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
-    let _view = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let _view = m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
     let delivered = take_notices_in(&r.root, &r.lane).unwrap();
     assert_eq!(delivered.iter().filter(|f| f.kind == "reverted").count(), 501, "every put-back delivered once");
     assert!(take_notices_in(&r.root, &r.lane).unwrap().is_empty(), "never twice");
     for k in 1..3 {
-        let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0 * k as f64, &lock)).unwrap();
+        let f = m10_sweep(&job(&r, &d, run_form(), NOW + 3600.0 * k as f64, &lock)).unwrap();
         assert!(f.is_empty(), "sweep {k}: a delivered finding came back: {}", f.len());
     }
 }
@@ -1300,13 +1300,13 @@ fn every_broken_member_makes_the_approved_copy_unknown_on_both_paths() {
         let orig_of = |_: &str| Some(b"#!/bin/bash\necho vendor\n".to_vec());
         let lock = r.base.join(".pack-apply.lock");
         let d = Doubles { check: &pass, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
-        m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+        m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
         assert!(unreadable || *checked.borrow() >= 1, "{member}: no check is skipped");
         // restoration: a failing file — nothing put back
         r.put(rel, b"#!/bin/bash\nbroken(\n", 0o755);
         let fails = |x: &str, _: &Path, _: Duration| if x == rel { outcome(CheckResult::Fail("bad".into()), 5) } else { outcome(CheckResult::Pass, 5) };
         let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
-        let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0, &lock)).unwrap();
+        let f = m10_sweep(&job(&r, &d, run_form(), NOW + 3600.0, &lock)).unwrap();
         assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"#!/bin/bash\nbroken(\n", "{member}: nothing put back");
         if unreadable {
             assert!(f.iter().any(|x| x.kind == "ledger-unreadable") || f.is_empty(), "{member}: {f:?}");
@@ -1345,13 +1345,13 @@ fn the_job_never_waits_for_the_pack_apply_lock() {
     let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
     let mut report = TickReport::default();
     let t = std::time::Instant::now();
-    recheck_one(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), &rec, &row, &mut report).unwrap();
+    recheck_one(&job(&r, &d, run_form(), NOW, &lock), &rec, &row, &mut report).unwrap();
     assert!(t.elapsed() < Duration::from_secs(10), "returned without waiting for the lock");
     assert!(report.deferred_probation, "{:?}", report.lines);
     assert_eq!(std::fs::read(r.pack.join("hooks/w.sh")).unwrap(), b"POST\n", "nothing reverted while held");
     release_tx.send(()).unwrap();
     holder.join().unwrap();
-    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 1.0, &lock), false).unwrap();
+    let rep = run_tick(&job(&r, &d, run_form(), NOW + 1.0, &lock), false).unwrap();
     assert!(rep.reverted.contains(&a), "reverted at the next tick: {:?}", rep.lines);
 }
 
@@ -1375,13 +1375,13 @@ fn an_unreadable_ledger_suspends_the_put_back_with_one_finding() {
     let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
     let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let f = m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
     assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"#!/bin/bash\nbroken(\n", "nothing put back");
     let cause: Vec<_> = f.iter().filter(|x| x.kind == "ledger-unreadable").collect();
     assert_eq!(cause.len(), 1, "ONE finding for the cause: {f:?}");
     assert!(cause[0].rel.contains("R-1") && cause[0].note.contains(rel) && cause[0].notice);
     assert!(f.iter().all(|x| x.kind == "ledger-unreadable"), "no finding per file: {f:?}");
-    let again = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0, &lock)).unwrap();
+    let again = m10_sweep(&job(&r, &d, run_form(), NOW + 3600.0, &lock)).unwrap();
     assert!(again.is_empty(), "not again next hour: {again:?}");
 }
 
@@ -1473,7 +1473,7 @@ fn a_stop_at_the_hand_over_keeps_the_measured_failure() {
     let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
     let stop = AtHandOver;
-    let mut env = job(&r, &d, ApplyForm::Exchange, NOW, &lock);
+    let mut env = job(&r, &d, run_form(), NOW, &lock);
     env.op.faults = &stop;
     let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
     let res = recheck_one(&env, &rec, &row, &mut TickReport::default());
@@ -1481,7 +1481,7 @@ fn a_stop_at_the_hand_over_keeps_the_measured_failure() {
     let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed;
     assert!(closed.as_deref().is_some_and(crate::repair::apply::closure_owes_return), "durable before the hand-over: {closed:?}");
     assert_eq!(std::fs::read(r.pack.join("hooks/h.sh")).unwrap(), b"POST\n", "nothing put back yet");
-    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 700.0, &lock), false).unwrap();
+    let rep = run_tick(&job(&r, &d, run_form(), NOW + 700.0, &lock), false).unwrap();
     assert!(rep.reverted.contains(&a), "the owed return was made: {:?}", rep.lines);
     assert_eq!(std::fs::read(r.pack.join("hooks/h.sh")).unwrap(), b"PRE\n");
 }
@@ -1509,7 +1509,7 @@ fn a_supersession_during_a_recheck_defers() {
     let lock = r.base.join(".pack-apply.lock");
     let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
     let mut report = TickReport::default();
-    recheck_one(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), &rec, &row, &mut report).unwrap();
+    recheck_one(&job(&r, &d, run_form(), NOW, &lock), &rec, &row, &mut report).unwrap();
     let (done, deferred) = seen.borrow().clone().unwrap();
     assert!(done.is_empty() && deferred == vec![a.clone()], "the supersession deferred: {done:?} {deferred:?}");
     assert!(report.reverted.contains(&a), "{:?}", report.lines);
@@ -1549,7 +1549,7 @@ fn a_partial_automatic_return_is_reported_until_acknowledged() {
     let failing_hooks = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> { Err(RepairError::Io("등록기 없음".into())) };
     let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &intake, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
-    let mut env = job(&r, &d, ApplyForm::Exchange, NOW, &lock);
+    let mut env = job(&r, &d, run_form(), NOW, &lock);
     env.hooks = &failing_hooks;
     let _ = run_tick(&env, false).unwrap();
     let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
@@ -1557,12 +1557,12 @@ fn a_partial_automatic_return_is_reported_until_acknowledged() {
     assert_eq!(std::fs::read(r.pack.join("hooks/p.sh")).unwrap(), b"PRE\n", "the file was put back");
     // the restart: a new job environment, the intake accepting
     accept.set(true);
-    let mut env = job(&r, &d, ApplyForm::Exchange, NOW + 700.0, &lock);
+    let mut env = job(&r, &d, run_form(), NOW + 700.0, &lock);
     env.hooks = &failing_hooks;
     let _ = run_tick(&env, false).unwrap();
     let n = || filed.borrow().iter().filter(|l| l.contains("충돌")).count();
     assert_eq!(n(), 1, "filed once after the restart: {:?}", filed.borrow());
-    let mut env = job(&r, &d, ApplyForm::Exchange, NOW + 1400.0, &lock);
+    let mut env = job(&r, &d, run_form(), NOW + 1400.0, &lock);
     env.hooks = &failing_hooks;
     let _ = run_tick(&env, false).unwrap();
     assert_eq!(n(), 1, "never twice");
@@ -1592,14 +1592,14 @@ fn a_conflict_after_probation_ended_in_use_owes_its_report() {
     let lock = r.base.join(".pack-apply.lock");
     let day2 = NOW + 2.0 * 86_400.0;
     // the normal end of probation
-    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, day2, &lock), false).unwrap();
+    let rep = run_tick(&job(&r, &d, run_form(), day2, &lock), false).unwrap();
     assert_eq!(rep.ended, vec![a.clone()]);
     let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
     assert!(closed.starts_with("사용 중"), "{closed}");
     assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::InUse);
     // another writer, the same pack generation; then a revert is asked
     std::fs::write(r.pack.join("hooks/u.sh"), b"FOREIGN\n").unwrap();
-    let rev = crate::repair::apply::revert_in(&r.env(&NoFaults, ApplyForm::Exchange), &a, crate::repair::apply::RevertCaller::Human, &no_hooks, &no_repair_lock).unwrap();
+    let rev = crate::repair::apply::revert_in(&r.env(&NoFaults, run_form()), &a, crate::repair::apply::RevertCaller::Human, &no_hooks, &no_repair_lock).unwrap();
     assert!(matches!(rev.outcome, crate::repair::apply::ApplyOutcome::Declined(_)), "{rev:?}");
     assert_eq!(std::fs::read(r.pack.join("hooks/u.sh")).unwrap(), b"FOREIGN\n", "the bytes stay");
     let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
@@ -1608,15 +1608,15 @@ fn a_conflict_after_probation_ended_in_use_owes_its_report() {
     assert_eq!(crate::repair::apply::closure_report_class(&closed), Some("conflict"), "its report is owed: {closed}");
     assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::InUse, "still in force");
     // the intake rejects it at the next tick; after a restart it is filed once, never twice
-    let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, day2 + 700.0, &lock), false).unwrap();
+    let _ = run_tick(&job(&r, &d, run_form(), day2 + 700.0, &lock), false).unwrap();
     assert!(filed.borrow().is_empty());
     accept.set(true);
-    let mut env = job(&r, &d, ApplyForm::Exchange, day2 + 1400.0, &lock);
+    let mut env = job(&r, &d, run_form(), day2 + 1400.0, &lock);
     env.incarnation = "inc-3";
     let _ = run_tick(&env, false).unwrap();
     let n = || filed.borrow().iter().filter(|l| l.contains("충돌")).count();
     assert_eq!(n(), 1, "filed once after the restart: {:?}", filed.borrow());
-    let mut env = job(&r, &d, ApplyForm::Exchange, day2 + 2100.0, &lock);
+    let mut env = job(&r, &d, run_form(), day2 + 2100.0, &lock);
     env.incarnation = "inc-3";
     let _ = run_tick(&env, false).unwrap();
     assert_eq!(n(), 1, "never twice");
@@ -1668,12 +1668,12 @@ fn a_terminal_hook_error_is_reported_until_acknowledged() {
     };
     let d = Doubles { check: &pass, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &intake, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
-    let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    let _ = run_tick(&job(&r, &d, run_form(), NOW, &lock), false).unwrap();
     accept.set(true);
-    let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 700.0, &lock), false).unwrap();
+    let _ = run_tick(&job(&r, &d, run_form(), NOW + 700.0, &lock), false).unwrap();
     let n = || filed.borrow().iter().filter(|l| l.contains("훅 단계가 끝나지 못했습니다")).count();
     assert_eq!(n(), 1, "filed once after the restart: {:?}", filed.borrow());
-    let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 1400.0, &lock), false).unwrap();
+    let _ = run_tick(&job(&r, &d, run_form(), NOW + 1400.0, &lock), false).unwrap();
     assert_eq!(n(), 1, "never twice");
 }
 
@@ -1695,7 +1695,7 @@ fn m10_recovery_errors_have_their_own_key() {
     let pass = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Pass, 5);
     let d = Doubles { check: &pass, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
-    let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    let _ = run_tick(&job(&r, &d, run_form(), NOW, &lock), false).unwrap();
     let acks = load_acks_checked(&r.root, &r.lane).unwrap();
     assert!(acks.contains_key(&format!("m10:{}:recovery-error", r.lane.0)), "{acks:?}");
     assert!(acks.contains_key("R-1:recovery-error"), "the real repair's own report: {acks:?}");
@@ -1717,7 +1717,7 @@ fn an_unlistable_root_and_unreadable_acknowledgements_are_reported() {
     let d = Doubles { check: &pass, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
     crate::repair::ledger::FAIL_LIST_IDS.with(|c| c.set(true));
-    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false);
+    let rep = run_tick(&job(&r, &d, run_form(), NOW, &lock), false);
     crate::repair::ledger::FAIL_LIST_IDS.with(|c| c.set(false));
     let rep = rep.unwrap();
     assert!(rep.deferred_probation, "the probation stays due: {:?}", rep.lines);
@@ -1755,10 +1755,10 @@ fn an_unreadable_boot_critical_file_is_a_finding() {
     std::fs::set_permissions(r.pack.join(rel), std::fs::Permissions::from_mode(0o000)).unwrap();
     let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|x| x != rel };
     let lock = r.base.join(".pack-apply.lock");
-    let found = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let found = m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
     std::fs::set_permissions(r.pack.join(rel), std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(found.iter().any(|f| f.rel == rel && f.kind == "unreadable" && f.notice), "{found:?}");
-    let again = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0, &lock));
+    let again = m10_sweep(&job(&r, &d, run_form(), NOW + 3600.0, &lock));
     assert!(again.is_ok());
 }
 
@@ -1780,7 +1780,7 @@ fn an_unreadable_intent_is_a_reported_fault() {
     };
     let d = Doubles { check: &pass, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &intake, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
-    let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    let _ = run_tick(&job(&r, &d, run_form(), NOW, &lock), false).unwrap();
     assert!(filed.borrow().iter().any(|l| l.contains("적용 의도를 읽을 수 없습니다")), "{:?}", filed.borrow());
     assert!(load_acks_checked(&r.root, &r.lane).unwrap().contains_key("R-1:recovery-error"));
 }
@@ -1813,12 +1813,12 @@ fn a_deferred_failed_recheck_is_never_closed_in_use() {
     held_rx.recv().unwrap();
     let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
     let mut report = TickReport::default();
-    recheck_one(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), &rec, &row, &mut report).unwrap();
+    recheck_one(&job(&r, &d, run_form(), NOW, &lock), &rec, &row, &mut report).unwrap();
     let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
     assert!(crate::repair::apply::closure_owes_return(&closed), "the failure is durable in that tick: {closed}");
     release_tx.send(()).unwrap();
     holder.join().unwrap();
-    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 2.0 * 86_400.0, &lock), false).unwrap();
+    let rep = run_tick(&job(&r, &d, run_form(), NOW + 2.0 * 86_400.0, &lock), false).unwrap();
     assert!(rep.reverted.contains(&a), "the owed return was made: {:?}", rep.lines);
     assert!(!rep.ended.contains(&a), "never 사용 중");
     assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::Reverted);
@@ -1841,7 +1841,7 @@ fn a_corrupt_pack_state_suspends_the_put_back() {
     let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
     let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    let _ = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let _ = m10_sweep(&job(&r, &d, run_form(), NOW, &lock)).unwrap();
     assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"#!/bin/bash\nbroken(\n", "nothing put back");
 }
 
@@ -1957,7 +1957,7 @@ fn one_observation_of_the_generation_decides() {
     let never = |_: &str, _: &Path, _: Duration| -> Result<CheckOutcome, RepairError> { panic!("no check") };
     let d = Doubles { check: &never, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
-    let env = job(&r, &d, ApplyForm::Exchange, NOW, &lock);
+    let env = job(&r, &d, run_form(), NOW, &lock);
     let mut report = TickReport::default();
     let done = recheck_one(&env, &rec, &row, &mut report);
     crate::repair::apply::BOUND_NOW_SCRIPT.with(|q| q.borrow_mut().clear());
@@ -1986,7 +1986,7 @@ fn a_live_target_over_the_limit_is_never_read_by_the_recheck() {
     let never = |_: &str, _: &Path, _: Duration| -> Result<CheckOutcome, RepairError> { panic!("no check") };
     let d = Doubles { check: &never, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
-    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    let rep = run_tick(&job(&r, &d, run_form(), NOW, &lock), false).unwrap();
     assert_eq!(read_seam::bytes_read_from(&live) - before, 0, "the live file is never read");
     assert_eq!(rep.superseded, vec![a.clone()], "{rep:?}");
     let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
@@ -2077,7 +2077,7 @@ fn an_unreadable_job_state_is_left_byte_identical_by_the_tick() {
     let before = std::fs::read(&p).unwrap();
     let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    let tick = || run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    let tick = || run_tick(&job(&r, &d, run_form(), NOW, &lock), false).unwrap();
     // (1) a read error (mode 000)
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
     if std::fs::read(&p).is_err() {

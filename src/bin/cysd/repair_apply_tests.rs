@@ -27,6 +27,18 @@ impl Drop for Rig {
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// WZ2 (measurement only): the apply form a test runs — the Windows form `DepositFirst` on a Windows
+/// target (what `platform::apply_form()` answers there) or when `CYS_TEST_APPLY_FORM=deposit-first`
+/// is set (a baseline run of the Windows form on another host), else the unix form `Exchange`. Read
+/// by the tests only (the product reads no such variable).
+fn run_form() -> cys::repair::platform::ApplyForm {
+    if cfg!(windows) || std::env::var("CYS_TEST_APPLY_FORM").as_deref() == Ok("deposit-first") {
+        cys::repair::platform::ApplyForm::DepositFirst
+    } else {
+        cys::repair::platform::ApplyForm::Exchange
+    }
+}
+
 fn rig(tag: &str) -> Rig {
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let base = std::env::temp_dir().join(format!("cys-t6d-{tag}-{}-{n}", std::process::id()));
@@ -198,7 +210,7 @@ fn the_schedule_writers_jobs_after_our_exchange_stay_live() {
         pack: &r.pack,
         lane: &r.lane,
         now: T0 + 1.0,
-        form: cys::repair::platform::ApplyForm::Exchange,
+        form: run_form(),
         faults: &faults,
         own_check: &|_, _| None,
     };
@@ -644,7 +656,7 @@ fn a_commit_in_its_hook_phase_excludes_the_start_pass() {
         };
         let lock = r.root.join(".pack-apply.lock");
         let env = cys::repair::probation::JobEnv {
-            op: cys::repair::apply::OpEnv { root: &r.root, pack: &r.pack, lane: &r.lane, now: T0 + 4.0, form: cys::repair::platform::ApplyForm::Exchange, faults: &cys::repair::apply::NoFaults, own_check: &|_, _| None },
+            op: cys::repair::apply::OpEnv { root: &r.root, pack: &r.pack, lane: &r.lane, now: T0 + 4.0, form: run_form(), faults: &cys::repair::apply::NoFaults, own_check: &|_, _| None },
             incarnation: "inc-x",
             check: &|_, _, _| Err(RepairError::Io("no checks here".into())),
             reference: &|_, _| Err(RepairError::Io("no checks here".into())),
@@ -682,7 +694,7 @@ fn run_probation(r: &Rig, now: f64) -> cys::repair::probation::TickReport {
             pack: &r.pack,
             lane: &r.lane,
             now,
-            form: cys::repair::platform::ApplyForm::Exchange,
+            form: run_form(),
             faults: &cys::repair::apply::NoFaults,
             own_check: &|_, _| None,
         },

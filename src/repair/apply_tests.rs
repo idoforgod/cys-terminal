@@ -9,6 +9,18 @@ use crate::repair::types::{LockOwner, Trigger};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
+/// WZ2 (measurement only): the apply form a test runs — the Windows form `DepositFirst` on a Windows
+/// target (what `platform::apply_form()` answers there) or when `CYS_TEST_APPLY_FORM=deposit-first`
+/// is set (a baseline run of the Windows form on another host), else the unix form `Exchange`. Read
+/// by the tests only (the lib's repair tests share this one; the product reads no such variable).
+pub(crate) fn run_form() -> ApplyForm {
+    if cfg!(windows) || std::env::var("CYS_TEST_APPLY_FORM").as_deref() == Ok("deposit-first") {
+        ApplyForm::DepositFirst
+    } else {
+        ApplyForm::Exchange
+    }
+}
+
 pub(crate) struct Rig {
     pub base: PathBuf,
     pub root: PathBuf,
@@ -280,6 +292,15 @@ fn rule_one_property_every_op_every_point() {
     let mut combos = 0;
     let mut fired_inside_seal = 0;
     for case in CASES {
+        // WZ2: a unix-form row runs in the run's form (`run_form`), except a row that exists to drive the
+        // exchange itself — both states present, so `run_op_depth` picks the operation by the form (edit,
+        // mode, link) — which is skipped when the run's form is deposit-first (that form's edit is the
+        // `windows` row); move-in and place never read the form and run in the run's form.
+        let form = if case.form == ApplyForm::Exchange { run_form() } else { case.form };
+        if form != case.form && case.before.is_some() && case.incoming.is_some() {
+            continue;
+        }
+        let case = &Case { form, ..*case };
         for point in points {
             if point == Point::AfterFirstMove && case.form != ApplyForm::DepositFirst {
                 continue;
@@ -473,7 +494,7 @@ fn every_form_applies_with_mode_and_fresh_mtime() {
     let (src, st) = r.source("new.sh", b"NEW\n", 0o755);
     let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
     std::fs::File::options().write(true).open(&src).unwrap().set_modified(old).unwrap();
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let d = run_op(&env, &OpSpec {
         id: rid("R-1"),
         rel: "hooks/a.sh".into(),
@@ -595,7 +616,7 @@ fn displaced_garbage_is_never_relived() {
         let (src, st) = r.source("s.json", b"{\"jobs\":[1]}\n", 0o644);
         let inj = Inject::new(Point::AfterRecord, Action::ReplaceLive(other.clone()), None, &r.pack);
         let own = move |_rel: &str, _p: &Path| Some(check_passes);
-        let env = OpEnv { own_check: &own, ..r.env(&inj, ApplyForm::Exchange) };
+        let env = OpEnv { own_check: &own, ..r.env(&inj, run_form()) };
         let d = run_op(&env, &OpSpec {
             id: rid("R-2"),
             rel: "schedule.json".into(),
@@ -732,7 +753,7 @@ fn revert_puts_the_pre_image_back_and_keeps_the_repaired_copy() {
     let r = rig("revert");
     let id = rid("R-3");
     committed_general(&r, &id, "hooks/x.sh", Some(b"PRE\n"), Some(b"POST\n"));
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let rep = revert_in(&env, &id, RevertCaller::Human, &no_hooks, &no_repair_lock).unwrap();
     assert_eq!(rep.outcome, ApplyOutcome::Applied, "{rep:?}");
     assert_eq!(std::fs::read(r.pack.join("hooks/x.sh")).unwrap(), b"PRE\n");
@@ -756,7 +777,7 @@ fn revert_of_created_deleted_and_moved_on_files() {
     let r = rig("revert2");
     let created = rid("R-4");
     committed_general(&r, &created, "hooks/new.sh", None, Some(b"NEW\n"));
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     assert_eq!(revert_in(&env, &created, RevertCaller::Human, &no_hooks, &no_repair_lock).unwrap().outcome, ApplyOutcome::Applied);
     assert_eq!(r.live("hooks/new.sh"), TargetState::Absent);
     assert!(r.vault_bytes().contains(&b"NEW\n".to_vec()));
@@ -865,7 +886,7 @@ fn staged_pack_swap_during_an_operation_then_second_install() {
         }
     }
     let f = Swap(&r, Cell::new(false));
-    let env = r.env(&f, ApplyForm::Exchange);
+    let env = r.env(&f, run_form());
     let d = run_op(&env, &OpSpec { id: rid("R-10"), rel: "hooks/a.sh".into(), kind: "apply".into(), expected: Recorded::for_test(r.live("hooks/a.sh")), incoming: st, source: Source::Fresh(src), bound: Bound::now(&r.pack) }).unwrap();
     // GV1 (old expectation: Superseded): the swapped-in pack states the same generation, so its file
     // is another writer's bytes — a conflict
@@ -901,7 +922,7 @@ pub(crate) fn approved_and_applied(r: &Rig, id: &RepairId, rel: &str, pre: &[u8]
     rec.approval = Some(approval(&fp));
     rec.verify = Some(Attestation { seat: 2, role: "reviewer-codex".into(), verdict: "pass".into(), note: String::new(), at: 1.0, fingerprint_sha256: fp });
     ledger::write_record_in(&r.root, &rec).unwrap();
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let rep = apply_candidate_in(
         &env,
         id,
@@ -1024,7 +1045,7 @@ fn apply_uses_the_slot_bytes_and_refuses_a_mismatch() {
     let mut rec2 = record(&r, &id2, Classification::BootCritical, vec![FileChange { rel: "hooks/f.sh".into(), kind: ChangeKind::Edit, pre: pre_img, post: TargetState::Absent, diff: None }], RepairState::AwaitingApproval);
     rec2.approval = Some(approval(&"ab".repeat(32)));
     ledger::write_record_in(&r.root, &rec2).unwrap();
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let rep = apply_candidate_in(&env, &id2, &[CandidateFile { rel: "hooks/f.sh".into(), staged: staging.clone(), mode: 0o755 }], &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).unwrap();
     assert!(matches!(rep.outcome, ApplyOutcome::Declined(_)));
     assert_eq!(std::fs::read(r.pack.join("hooks/f.sh")).unwrap(), b"PRE2\n", "nothing applied");
@@ -1056,7 +1077,7 @@ fn apply_time_screen_declines_and_sees_the_slot_bytes() {
         assert_eq!(c.targets.len(), 1);
         Err("보호장치 검사가 이 레인에서 적용을 막았습니다 — 측정 불가: G-1".into())
     };
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let rep = apply_candidate_in(&env, &id, &[CandidateFile { rel: "hooks/g.sh".into(), staged: staging, mode: 0o644 }], &screen, &pass_check, &pass_ref, &no_repair_lock).unwrap();
     assert!(matches!(rep.outcome, ApplyOutcome::Declined(ref m) if m.contains("측정 불가")));
     assert_eq!(seen.borrow().as_deref(), Some(&b"CAND\n"[..]), "the screen saw the slot's bytes");
@@ -1100,7 +1121,7 @@ fn slot_changed_during_the_screen_is_never_applied() {
         }
         Ok(())
     };
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let rep = apply_candidate_in(&env, &id, &[CandidateFile { rel: "hooks/t.sh".into(), staged: staging, mode: 0o644 }], &screen, &pass_check, &pass_ref, &no_repair_lock).unwrap();
     assert!(*tampered.borrow() >= 1, "the double reached the slot");
     assert!(matches!(rep.outcome, ApplyOutcome::Declined(ref m) if m.contains("바뀌었습니다")), "{:?}", rep.outcome);
@@ -1140,7 +1161,7 @@ fn apply_time_check_failure_puts_the_repair_back() {
     rec.approval = Some(approval(&fp));
     ledger::write_record_in(&r.root, &rec).unwrap();
     let timeout = |_: &str, _: &Path, _: Duration| Ok(CheckOutcome { result: CheckResult::Timeout, ms: 60_000 });
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let rep = apply_candidate_in(&env, &id, &[CandidateFile { rel: "hooks/h.sh".into(), staged: staging, mode: 0o644 }], &|_, _, _| Ok(()), &timeout, &pass_ref, &no_repair_lock).unwrap();
     assert!(matches!(rep.outcome, ApplyOutcome::Declined(_)));
     assert_eq!(std::fs::read(r.pack.join("hooks/h.sh")).unwrap(), b"PRE\n", "put back");
@@ -1167,7 +1188,7 @@ fn apply_refuses_an_alias_of_a_listed_file() {
     let mut rec = record(&r, &id, Classification::BootCritical, vec![FileChange { rel: "x/alias.sh".into(), kind: ChangeKind::Edit, pre: PreImage::Absent, post: TargetState::Absent, diff: None }], RepairState::AwaitingApproval);
     rec.approval = Some(approval("ff"));
     ledger::write_record_in(&r.root, &rec).unwrap();
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let rep = apply_candidate_in(&env, &id, &[CandidateFile { rel: "x/alias.sh".into(), staged: staging, mode: 0o644 }], &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).unwrap();
     assert!(matches!(rep.outcome, ApplyOutcome::Declined(ref m) if m.contains("AW3")), "{rep:?}");
     assert_eq!(std::fs::read(r.pack.join(row.rel)).unwrap(), b"LISTED\n");
@@ -1301,7 +1322,7 @@ fn approved_mode_only_and_link_applies() {
     let mut rec = record(&r, &id, Classification::BootCritical, vec![FileChange { rel: "hooks/m.sh".into(), kind: ChangeKind::Mode, pre: pre_img, post: st.clone(), diff: None }], RepairState::AwaitingApproval);
     rec.approval = Some(approval(&fp));
     ledger::write_record_in(&r.root, &rec).unwrap();
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let rep = apply_candidate_in(&env, &id, &[CandidateFile { rel: "hooks/m.sh".into(), staged: staging, mode: 0o755 }], &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).unwrap();
     assert_eq!(rep.outcome, ApplyOutcome::Applied, "{rep:?}");
     assert_eq!(r.live("hooks/m.sh"), st);
@@ -1340,7 +1361,7 @@ fn apply_declines_parent_link_and_link_into_a_pack() {
     let mut rec = record(&r, &id, Classification::BootCritical, vec![FileChange { rel: "hooks2/x.sh".into(), kind: ChangeKind::Create, pre: PreImage::Absent, post: st.clone(), diff: None }], RepairState::AwaitingApproval);
     rec.approval = Some(approval(&crate::repair::types::fingerprint(&[("hooks2/x.sh".into(), st)])));
     ledger::write_record_in(&r.root, &rec).unwrap();
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let rep = apply_candidate_in(&env, &id, &[CandidateFile { rel: "hooks2/x.sh".into(), staged: staging, mode: 0o644 }], &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).unwrap();
     assert!(matches!(rep.outcome, ApplyOutcome::Declined(_)), "{rep:?}");
     assert!(!r.pack.join("hooks/x.sh").exists());
@@ -1379,7 +1400,7 @@ fn failing_exchange_declines_and_closes_the_record() {
     let r = rig("e9");
     r.put("hooks/z.sh", b"LIVE\n", 0o755);
     let (src, st) = r.source("z.sh", b"NEW\n", 0o755);
-    let env = r.env(&Vanish, ApplyForm::Exchange);
+    let env = r.env(&Vanish, run_form());
     let d = run_op(&env, &OpSpec { id: rid("R-34"), rel: "hooks/z.sh".into(), kind: "apply".into(), expected: Recorded::for_test(r.live("hooks/z.sh")), incoming: st, source: Source::Fresh(src), bound: Bound::now(&r.pack) }).unwrap();
     assert!(matches!(d.outcome, ApplyOutcome::Declined(ref m) if m.contains("ENOENT")), "{:?}", d.outcome);
     assert_eq!(std::fs::read(r.pack.join("hooks/z.sh")).unwrap(), b"LIVE\n");
@@ -1409,13 +1430,13 @@ fn flush_failure_after_the_exchange_keeps_the_evidence() {
     let (src, incoming) = r.source("f-new", b"NEW\n", 0o755);
     let spec = OpSpec { id: rid("R-6"), rel: "hooks/f.sh".into(), kind: "revert".into(), expected: Recorded::for_test(before), incoming: incoming.clone(), source: Source::Fresh(src), bound: Bound::now(&r.pack) };
     let faults = FailFlushAfterExchange;
-    let res = run_op(&r.env(&faults, ApplyForm::Exchange), &spec);
+    let res = run_op(&r.env(&faults, run_form()), &spec);
     crate::repair::durable::INJECT_FLUSH_ERRNO.with(|c| c.set((0, 0)));
     assert!(res.is_err(), "a failed full flush is an error, never an outcome: {res:?}");
     let unfinished = wal::unfinished_for_lane(&r.root, &r.lane);
     assert_eq!(unfinished.len(), 1, "the operation keeps its record");
     assert!(unfinished[0].slot.is_some() && unfinished[0].slot_identity.is_some() && unfinished[0].live_identity.is_some());
-    resume_interrupted_in(&r.env(&NoFaults, ApplyForm::Exchange)).unwrap();
+    resume_interrupted_in(&r.env(&NoFaults, run_form())).unwrap();
     assert!(wal::unfinished_for_lane(&r.root, &r.lane).is_empty(), "finished from the record");
     assert_eq!(r.live("hooks/f.sh"), incoming);
     assert!(r.vault_bytes().contains(&b"OLD\n".to_vec()));
@@ -1467,7 +1488,7 @@ fn unapproved_bytes_exchanged_in_are_put_back_by_a_checked_operation() {
     rec.approval = Some(approval(&fp));
     ledger::write_record_in(&r.root, &rec).unwrap();
     let faults = TamperSlotAfterRecord(Cell::new(false));
-    let env = r.env(&faults, ApplyForm::Exchange);
+    let env = r.env(&faults, run_form());
     let rep = apply_candidate_in(&env, &id, &[CandidateFile { rel: rel.into(), staged: staging, mode: 0o644 }], &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).unwrap();
     assert!(faults.0.get(), "the tamper fired");
     assert!(matches!(rep.outcome, ApplyOutcome::Declined(_)), "{:?}", rep.outcome);
@@ -1502,7 +1523,7 @@ fn revert_with_a_failed_reregistration_is_incomplete_then_finished() {
     let failing = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> {
         Err(RepairError::CheckFailed("registrar down".into()))
     };
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let first = revert_in(&env, &id, RevertCaller::Human, &failing, &no_repair_lock).unwrap();
     assert!(matches!(first.outcome, ApplyOutcome::Declined(ref m) if m.contains("충돌")), "{:?}", first.outcome);
     assert_eq!(std::fs::read(r.pack.join("hooks/x.sh")).unwrap(), b"PRE\n", "the file part is reverted");
@@ -1530,7 +1551,7 @@ fn hook_only_repair_is_revertible() {
         called.set(called.get() + 1);
         Ok(ReconcileReport { hooks: Vec::new() })
     };
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let rep = revert_in(&env, &id, RevertCaller::Human, &hooks, &no_repair_lock).unwrap();
     assert_eq!(rep.outcome, ApplyOutcome::Applied, "{:?}", rep.outcome);
     assert_eq!(called.get(), 1);
@@ -1616,14 +1637,14 @@ fn crash_between_the_targets_of_one_apply_is_undone_as_a_whole() {
         let id = rid("R-40");
         let files = two_target_candidate(&r, &id);
         let faults = StopOn { rel: "hooks/a2.sh", point, fired: Cell::new(false) };
-        let env = r.env(&faults, ApplyForm::Exchange);
+        let env = r.env(&faults, run_form());
         let res = apply_candidate_in(&env, &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock);
         assert!(faults.fired.get(), "{point:?}: the stop fired");
         assert!(res.is_err(), "{point:?}: the simulated crash");
         assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"NEW-1\n", "{point:?}: the first target was applied before the crash");
         assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "applying");
         // the next ready tick: interrupted operations, then the intent
-        let calm = r.env(&NoFaults, ApplyForm::Exchange);
+        let calm = r.env(&NoFaults, run_form());
         resume_interrupted_in(&calm).unwrap();
         let lines = recover_apply_intents_in(&calm, &no_repair_lock);
         assert_eq!(lines.len(), 1, "{point:?}: {lines:?}");
@@ -1649,8 +1670,8 @@ fn unrecoverable_target_leaves_a_revertible_conflict_row() {
     let id = rid("R-41");
     let files = two_target_candidate(&r, &id);
     let faults = StopOn { rel: "hooks/a2.sh", point: Point::BeforeDone, fired: Cell::new(false) };
-    assert!(apply_candidate_in(&r.env(&faults, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
-    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    assert!(apply_candidate_in(&r.env(&faults, run_form()), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
+    let calm = r.env(&NoFaults, run_form());
     resume_interrupted_in(&calm).unwrap();
     // another writer changes the second file before the recovery runs
     r.put("hooks/a2.sh", b"SOMEONE-ELSE\n", 0o755);
@@ -1853,15 +1874,15 @@ fn approved_apply_property_every_file_every_point() {
                 let files = two_target_candidate(&r, &id);
                 crate::repair::vault::FORCE_BYTE_COPY_SEAL.with(|c| c.set(byte_copy));
                 let faults = StopOn { rel: target, point, fired: Cell::new(false) };
-                let res = apply_candidate_in(&r.env(&faults, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock);
+                let res = apply_candidate_in(&r.env(&faults, run_form()), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock);
                 let crashed = faults.fired.get();
                 if crashed {
                     fired += 1;
                     assert!(res.is_err(), "{target}/{point:?}: the stop is a crash");
                     let again = StopOn { rel: target, point, fired: Cell::new(false) };
-                    let _ = resume_interrupted_in(&r.env(&again, ApplyForm::Exchange));
+                    let _ = resume_interrupted_in(&r.env(&again, run_form()));
                 }
-                let calm = r.env(&NoFaults, ApplyForm::Exchange);
+                let calm = r.env(&NoFaults, run_form());
                 resume_interrupted_in(&calm).unwrap();
                 let _ = recover_apply_intents_in(&calm, &no_repair_lock);
                 crate::repair::vault::FORCE_BYTE_COPY_SEAL.with(|c| c.set(false));
@@ -1907,7 +1928,7 @@ fn the_screen_view_is_removed_even_when_the_screen_panics() {
     let id = rid("R-43");
     let files = two_target_candidate(&r, &id);
     let screen = |_: &RepairId, _: &crate::repair::screen::ScreenCandidate, _: &Path| -> Result<(), String> { panic!("screen blew up") };
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         apply_candidate_in(&env, &id, &files, &screen, &pass_check, &pass_ref, &no_repair_lock)
     }));
@@ -1928,7 +1949,7 @@ fn a_view_changed_during_the_screen_declines() {
         std::fs::write(c.files.join("hooks/a1.sh"), b"OTHER\n").unwrap();
         Ok(())
     };
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let rep = apply_candidate_in(&env, &id, &files, &screen, &pass_check, &pass_ref, &no_repair_lock).unwrap();
     assert!(matches!(rep.outcome, ApplyOutcome::Declined(ref m) if m.contains("보호장치 검사가 본 내용")), "{:?}", rep.outcome);
     assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"PRE-1\n");
@@ -2087,12 +2108,12 @@ fn recovery_never_touches_a_live_operation() {
     let (src, incoming) = r.source("l2-new", b"NEW\n", 0o755);
     let spec = OpSpec { id: rid("R-39"), rel: "hooks/l2.sh".into(), kind: "revert".into(), expected: Recorded::for_test(before), incoming, source: Source::Fresh(src), bound: Bound::now(&r.pack) };
     let stop = StopOn { rel: "hooks/l2.sh", point: Point::AfterRecord, fired: Cell::new(false) };
-    assert!(run_op(&r.env(&stop, ApplyForm::Exchange), &spec).is_err());
+    assert!(run_op(&r.env(&stop, run_form()), &spec).is_err());
     let rec = wal::unfinished_for_lane(&r.root, &r.lane).into_iter().next().unwrap();
     let owner = crate::repair::guard::RepairGuard::try_take(&r.root, &rec.repair).unwrap();
-    assert_eq!(resume_interrupted_in(&r.env(&NoFaults, ApplyForm::Exchange)).unwrap(), 0);
+    assert_eq!(resume_interrupted_in(&r.env(&NoFaults, run_form())).unwrap(), 0);
     drop(owner);
-    assert_eq!(resume_interrupted_in(&r.env(&NoFaults, ApplyForm::Exchange)).unwrap(), 1);
+    assert_eq!(resume_interrupted_in(&r.env(&NoFaults, run_form())).unwrap(), 1);
 }
 
 // ───────────────────────────── RULINGS DR1 / DX2 — bindings and the commit point ─────────────────────────────
@@ -2108,9 +2129,9 @@ fn an_interrupted_apply_is_never_undone_across_a_generation_change() {
     let id = rid("R-45");
     let files = two_target_candidate(&r, &id);
     let stop = StopOn { rel: "hooks/a2.sh", point: Point::AfterRecord, fired: Cell::new(false) };
-    assert!(apply_candidate_in(&r.env(&stop, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
+    assert!(apply_candidate_in(&r.env(&stop, run_form()), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
     std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
-    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    let calm = r.env(&NoFaults, run_form());
     resume_interrupted_in(&calm).unwrap();
     let lines = recover_apply_intents_in(&calm, &no_repair_lock);
     assert!(lines[0].contains("세대"), "{lines:?}");
@@ -2129,10 +2150,10 @@ fn a_committed_apply_is_completed_forward() {
     let id = rid("R-46");
     let files = two_target_candidate(&r, &id);
     let stop = StopOn { rel: "hooks/a1.sh", point: Point::AfterRecordCommit, fired: Cell::new(false) };
-    assert!(apply_candidate_in(&r.env(&stop, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
+    assert!(apply_candidate_in(&r.env(&stop, run_form()), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
     assert!(stop.fired.get());
     assert!(ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().is_none(), "the window: no row yet");
-    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    let calm = r.env(&NoFaults, run_form());
     let lines = recover_apply_intents_in(&calm, &no_repair_lock);
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"NEW-1\n");
@@ -2175,11 +2196,11 @@ fn a_revert_interrupted_between_its_files_is_completed_as_a_whole() {
         let id = rid("R-47");
         two_file_general(&r, &id);
         let stop = StopOn { rel: "hooks/v2.sh", point: Point::AfterRecord, fired: Cell::new(false) };
-        assert!(revert_in(&r.env(&stop, ApplyForm::Exchange), &id, RevertCaller::Human, &no_hooks, &no_repair_lock).is_err());
+        assert!(revert_in(&r.env(&stop, run_form()), &id, RevertCaller::Human, &no_hooks, &no_repair_lock).is_err());
         assert_eq!(std::fs::read(r.pack.join("hooks/v1.sh")).unwrap(), b"PRE-1\n");
         assert_eq!(std::fs::read(r.pack.join("hooks/v2.sh")).unwrap(), b"POST-2\n");
         assert_eq!(read_revert_intent_in(&r.root, &id, &r.lane).unwrap().state, "reverting");
-        let calm = r.env(&NoFaults, ApplyForm::Exchange);
+        let calm = r.env(&NoFaults, run_form());
         resume_interrupted_in(&calm).unwrap();
         if via_manual {
             let rep = revert_in(&calm, &id, RevertCaller::Human, &no_hooks, &no_repair_lock).unwrap();
@@ -2222,7 +2243,7 @@ fn the_hook_step_removes_only_hook_tombstones() {
     let root = r.root.clone();
     let pack = r.pack.clone();
     let hooks = move |rid: &RepairId, lane: &LaneKey, step: HookStep| hook_lines_step_in(&root, &pack, rid, lane, step, &registrar, 9.0);
-    let rep = revert_in(&r.env(&inj, ApplyForm::Exchange), &id, RevertCaller::Human, &hooks, &no_repair_lock).unwrap();
+    let rep = revert_in(&r.env(&inj, run_form()), &id, RevertCaller::Human, &hooks, &no_repair_lock).unwrap();
     assert!(!matches!(rep.outcome, ApplyOutcome::Applied), "{rep:?}");
     let left = crate::repair::tombstones::load_in(&r.root, &r.lane).unwrap();
     assert!(left.contains(&file_t), "the file was not restored: its tombstone stays: {left:?}");
@@ -2449,7 +2470,7 @@ fn approved_with(r: &Rig, id: &RepairId, rel: &str, between: &dyn Fn(&Rig), faul
     rec.approval = Some(approval(&fp));
     rec.verify = Some(Attestation { seat: 2, role: "reviewer-codex".into(), verdict: "pass".into(), note: String::new(), at: 1.0, fingerprint_sha256: fp });
     ledger::write_record_in(&r.root, &rec).unwrap();
-    let env = r.env(faults, ApplyForm::Exchange);
+    let env = r.env(faults, run_form());
     apply_candidate_in(&env, id, &[CandidateFile { rel: rel.into(), staged: staging.join(rel), mode: 0o755 }], &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).unwrap()
 }
 
@@ -2478,7 +2499,7 @@ fn an_update_between_begin_and_commit_commits_a_repair_that_is_not_put_back() {
     assert!(closed.contains(NOT_REVERTIBLE_SENTENCE), "the row says so: {closed}");
     let rec = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
     assert!(!revertible_here(&rec, &row, &r.lane));
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     assert!(revert_in(&env, &id, RevertCaller::Human, &no_hooks, &no_repair_lock).is_err(), "refused");
     assert_eq!(std::fs::read(r.pack.join("hooks/fi.sh")).unwrap(), b"POST\n", "nothing put back");
 }
@@ -2525,7 +2546,7 @@ fn a_slot_without_its_generation_is_never_put_back() {
     std::fs::write(&p, serde_json::to_vec(&v).unwrap()).unwrap();
     assert_eq!(vault::slot_generation(&dir).unwrap(), None);
     assert_eq!(put_back_bound(Some(&dir), &Bound::now(&r.pack)), Bound::Unknown);
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let rep = revert_in(&env, &id, RevertCaller::Human, &no_hooks, &no_repair_lock).unwrap();
     assert!(matches!(rep.outcome, ApplyOutcome::Superseded(_)), "{rep:?}");
     assert_eq!(std::fs::read(r.pack.join("hooks/fu.sh")).unwrap(), b"POST\n", "nothing put back");
@@ -2576,7 +2597,7 @@ fn an_unreadable_recorded_state_is_an_error_never_absent() {
         notice: None,
     };
     wal::write_in(&r.root, &op).unwrap();
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let (_, errors) = resume_interrupted_report_in(&env).unwrap();
     assert!(errors.iter().any(|(i, why)| *i == id && why.contains("기록된 상태를 읽을 수 없습니다")), "{errors:?}");
     assert!(!wal::read_in(&r.root, &id, &op.op).unwrap().unwrap().finished, "left unfinished (retried, reported)");
@@ -3413,7 +3434,7 @@ fn a_pending_revert_never_puts_back_a_slot_without_its_generation_or_with_anothe
             updated_at: 1.0,
         };
         write_revert_intent(&r.root, &ri).unwrap();
-        let env = r.env(&NoFaults, ApplyForm::Exchange);
+        let env = r.env(&NoFaults, run_form());
         let _ = recover_revert_intents_in(&env, &no_hooks, &no_repair_lock);
         assert_eq!(std::fs::read(r.pack.join("hooks/v.sh")).unwrap(), b"POST\n", "{tag}: nothing put back");
     }
@@ -3441,7 +3462,7 @@ fn another_writers_bytes_after_our_exchange_stay_live() {
     let r = rig("gk2file");
     let id = rid("R-81");
     committed_general(&r, &id, "hooks/o.sh", Some(b"PRE\n"), Some(b"POST\n"));
-    let env = r.env(&WriterAfterExchange, ApplyForm::Exchange);
+    let env = r.env(&WriterAfterExchange, run_form());
     let rep = revert_in(&env, &id, RevertCaller::DaemonAuto, &no_hooks, &no_repair_lock).unwrap();
     assert!(matches!(rep.outcome, ApplyOutcome::Declined(_)), "{rep:?}");
     assert_eq!(std::fs::read(r.pack.join("hooks/o.sh")).unwrap(), b"OTHER WRITER\n", "the other writer's bytes stay");
@@ -3477,7 +3498,7 @@ fn a_revert_meeting_another_writers_bytes_closes_as_conflict() {
             std::fs::write(r.pack.join("hooks/g.sh"), b"FOREIGN\n").unwrap();
         }
         let faults = WriteAtRecord;
-        let env = if at_door { r.env(&faults, ApplyForm::Exchange) } else { r.env(&NoFaults, ApplyForm::Exchange) };
+        let env = if at_door { r.env(&faults, run_form()) } else { r.env(&NoFaults, run_form()) };
         let rep = revert_in(&env, &id, RevertCaller::Human, &no_hooks, &no_repair_lock).unwrap();
         assert!(matches!(rep.outcome, ApplyOutcome::Declined(_)), "{tag}: {rep:?}");
         let want: &[u8] = if at_door { b"FOREIGN AT THE DOOR\n" } else { b"FOREIGN\n" };
@@ -3514,7 +3535,7 @@ fn a_pending_revert_meeting_another_writers_bytes_closes_as_conflict() {
     };
     write_revert_intent(&r.root, &ri).unwrap();
     std::fs::write(r.pack.join("hooks/q.sh"), b"FOREIGN\n").unwrap();
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let _ = recover_revert_intents_in(&env, &no_hooks, &no_repair_lock);
     assert_eq!(std::fs::read(r.pack.join("hooks/q.sh")).unwrap(), b"FOREIGN\n", "the bytes stay");
     let closed = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
@@ -3552,13 +3573,13 @@ fn recovery_leaves_a_repair_alone_while_its_owner_runs() {
                 go_rx.recv().unwrap();
                 Ok(ReconcileReport { hooks: Vec::new() })
             };
-            let env = OpEnv { root: &rr.root, pack: &rr.pack, lane: &rr.lane, now: 1_800_000_000.0, form: ApplyForm::Exchange, faults: &NoFaults, own_check: &|_, _| None };
+            let env = OpEnv { root: &rr.root, pack: &rr.pack, lane: &rr.lane, now: 1_800_000_000.0, form: run_form(), faults: &NoFaults, own_check: &|_, _| None };
             revert_in(&env, idr, RevertCaller::Human, &hooks, &no_repair_lock).map(|x| x.outcome)
         });
         in_rx.recv().unwrap();
         // the owner is inside its hook phase: the revert intent says "reverting", the file restored
         assert_eq!(read_revert_intent_in(&r.root, &id, &r.lane).unwrap().state, "reverting");
-        let calm = r.env(&NoFaults, ApplyForm::Exchange);
+        let calm = r.env(&NoFaults, run_form());
         let called = Cell::new(0);
         let other_hooks = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> {
             called.set(called.get() + 1);
@@ -3605,8 +3626,8 @@ fn forward_completion_rebuilds_an_existing_row() {
         updated_at: 1.0,
     }).unwrap();
     let stop = StopOn { rel: "hooks/a1.sh", point: Point::AfterRecordCommit, fired: Cell::new(false) };
-    assert!(apply_candidate_in(&r.env(&stop, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
-    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    assert!(apply_candidate_in(&r.env(&stop, run_form()), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
+    let calm = r.env(&NoFaults, run_form());
     recover_apply_intents_in(&calm, &no_repair_lock);
     let row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
     assert_eq!(row.state, LaneState::Verified);
@@ -3625,9 +3646,9 @@ fn the_revert_recovery_sentence_follows_the_outcome() {
     let id = rid("R-54");
     two_file_general(&r, &id);
     let stop = StopOn { rel: "hooks/v2.sh", point: Point::AfterRecord, fired: Cell::new(false) };
-    assert!(revert_in(&r.env(&stop, ApplyForm::Exchange), &id, RevertCaller::Human, &no_hooks, &no_repair_lock).is_err());
+    assert!(revert_in(&r.env(&stop, run_form()), &id, RevertCaller::Human, &no_hooks, &no_repair_lock).is_err());
     std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
-    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    let calm = r.env(&NoFaults, run_form());
     resume_interrupted_in(&calm).unwrap();
     let lines = recover_revert_intents_in(&calm, &no_hooks, &no_repair_lock);
     assert_eq!(lines.len(), 1, "{lines:?}");
@@ -3647,10 +3668,10 @@ fn a_corrupt_pack_state_is_an_unknown_generation_for_recovery() {
     let id = rid("R-55");
     let files = two_target_candidate(&r, &id);
     let stop = StopOn { rel: "hooks/a2.sh", point: Point::AfterRecord, fired: Cell::new(false) };
-    assert!(apply_candidate_in(&r.env(&stop, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
+    assert!(apply_candidate_in(&r.env(&stop, run_form()), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
     std::fs::write(r.pack.join(crate::pack::PACK_STATE_FILE), b"{ corrupt").unwrap();
     assert_eq!(Bound::now(&r.pack), Bound::Unknown);
-    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    let calm = r.env(&NoFaults, run_form());
     resume_interrupted_in(&calm).unwrap();
     recover_apply_intents_in(&calm, &no_repair_lock);
     assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"NEW-1\n", "nothing put back into an unknown generation");
@@ -3785,7 +3806,7 @@ fn an_approved_candidate_replaced_by_an_over_limit_file_is_refused_unread() {
     sparse_file(&staging, CAP + 1);
     let before = read_seam::bytes_read_from(&staging);
     let lock = r.base.join(".pack-apply.lock");
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let res = crate::pack_apply_lock::with_apply_lock(&lock, || {
         apply_candidate_in(&env, &id, &[CandidateFile { rel: "hooks/g.sh".into(), staged: staging.clone(), mode: 0o644 }], &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock)
     })
@@ -3825,7 +3846,7 @@ fn a_live_target_over_the_limit_refuses_the_apply_unread() {
     std::fs::OpenOptions::new().write(true).open(&live).unwrap().set_len(CAP + 1).unwrap();
     let before = read_seam::bytes_read_from(&live);
     let lock = r.base.join(".pack-apply.lock");
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let res = crate::pack_apply_lock::with_apply_lock(&lock, || {
         apply_candidate_in(&env, &id, &[CandidateFile { rel: "hooks/g.sh".into(), staged: staging.clone(), mode: 0o644 }], &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock)
     })
@@ -3903,8 +3924,8 @@ fn a_target_grown_past_the_limit_is_kept_as_a_conflict_and_the_rest_undone() {
     let id = rid("R-41");
     let files = two_target_candidate(&r, &id);
     let faults = StopOn { rel: "hooks/a2.sh", point: Point::BeforeDone, fired: Cell::new(false) };
-    assert!(apply_candidate_in(&r.env(&faults, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
-    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    assert!(apply_candidate_in(&r.env(&faults, run_form()), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
+    let calm = r.env(&NoFaults, run_form());
     resume_interrupted_in(&calm).unwrap();
     assert_eq!(std::fs::read(r.pack.join("hooks/a1.sh")).unwrap(), b"NEW-1\n");
     // B grows past the limit before the restart's recovery
@@ -3933,8 +3954,8 @@ fn a_real_read_failure_still_decides_nothing() {
     let id = rid("R-42");
     let files = two_target_candidate(&r, &id);
     let faults = StopOn { rel: "hooks/a2.sh", point: Point::BeforeDone, fired: Cell::new(false) };
-    assert!(apply_candidate_in(&r.env(&faults, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
-    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    assert!(apply_candidate_in(&r.env(&faults, run_form()), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
+    let calm = r.env(&NoFaults, run_form());
     resume_interrupted_in(&calm).unwrap();
     let b = r.pack.join("hooks/a2.sh");
     let mode = std::fs::metadata(&b).unwrap().permissions().mode();
@@ -4051,7 +4072,7 @@ fn a_displaced_file_grown_past_the_limit_is_kept_unsealed_and_never_a_hash() {
         let (src, st) = r.source("g.sh", b"NEW\n", 0o755);
         let faults = GrowDisplaced { rel: "hooks/g.sh", fired: Cell::new(false) };
         crate::repair::vault::FORCE_BYTE_COPY_SEAL.with(|c| c.set(byte_copy));
-        let env = r.env(&faults, ApplyForm::Exchange);
+        let env = r.env(&faults, run_form());
         let d = run_op(&env, &OpSpec {
             id: rid("R-2"),
             rel: "hooks/g.sh".into(),
@@ -4090,7 +4111,7 @@ fn an_apply_whose_displaced_file_grew_past_the_limit_keeps_those_bytes_and_is_un
     let id = rid("R-44");
     let files = two_target_candidate(&r, &id);
     let faults = GrowDisplaced { rel: "hooks/a2.sh", fired: Cell::new(false) };
-    let rep = apply_candidate_in(&r.env(&faults, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).unwrap();
+    let rep = apply_candidate_in(&r.env(&faults, run_form()), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).unwrap();
     assert!(faults.fired.get());
     let ApplyOutcome::Declined(why) = &rep.outcome else { panic!("{rep:?}") };
     assert!(why.contains(&CAP.to_string()), "the limit is said: {why}");
@@ -4101,7 +4122,7 @@ fn an_apply_whose_displaced_file_grew_past_the_limit_keeps_those_bytes_and_is_un
         "the grown displaced bytes are kept in their slot"
     );
     assert_eq!(read_intent_in(&r.root, &id, &r.lane).unwrap().state, "undone");
-    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    let calm = r.env(&NoFaults, run_form());
     assert!(recover_apply_intents_in(&calm, &no_repair_lock).is_empty(), "no retry");
 }
 
@@ -4127,7 +4148,7 @@ fn a_return_needing_a_slot_kept_over_the_limit_is_a_conflict_once() {
     let rec = committed_general(&r, &id, "hooks/k.sh", Some(b"PRE\n"), Some(b"POST\n"));
     let PreImage::Slot { slot_dir, .. } = &rec.files[0].pre else { panic!("a pre-image slot") };
     kept(slot_dir);
-    let rep = revert_in(&r.env(&NoFaults, ApplyForm::Exchange), &id, RevertCaller::Human, &no_hooks, &no_repair_lock).unwrap();
+    let rep = revert_in(&r.env(&NoFaults, run_form()), &id, RevertCaller::Human, &no_hooks, &no_repair_lock).unwrap();
     assert!(matches!(&rep.outcome, ApplyOutcome::Declined(m) if m.contains(&CAP.to_string()) && m.contains(&slot_dir.display().to_string())), "{rep:?}");
     assert_eq!(std::fs::read(r.pack.join("hooks/k.sh")).unwrap(), b"POST\n", "nothing changed");
     assert_eq!(ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap().state, LaneState::Conflict);
@@ -4151,7 +4172,7 @@ fn a_return_needing_a_slot_kept_over_the_limit_is_a_conflict_once() {
         updated_at: 1.0,
     };
     write_revert_intent(&r.root, &ri).unwrap();
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let lines = recover_revert_intents_in(&env, &no_hooks, &no_repair_lock);
     assert!(lines.iter().any(|l| l.contains(&CAP.to_string())), "{lines:?}");
     assert_eq!(std::fs::read(r.pack.join("hooks/q.sh")).unwrap(), b"POST\n", "nothing changed");
@@ -4204,7 +4225,7 @@ fn the_sentence_about_other_departments_is_true_for_each_class() {
     rec.approval = Some(approval(&fp));
     rec.origin_lane = LaneKey("dept-2".into());
     ledger::write_record_in(&r.root, &rec).unwrap();
-    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let env = r.env(&NoFaults, run_form());
     let e = format!("{:?}", apply_candidate_in(&env, &id, &[CandidateFile { rel: "hooks/g.sh".into(), staged: staging, mode: 0o644 }], &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).expect_err("another department"));
     assert!(e.contains(approval_form), "{e}");
     assert!(!e.contains("다른 부서는 전파"), "{e}");

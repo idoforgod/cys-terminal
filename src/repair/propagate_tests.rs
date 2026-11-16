@@ -8,6 +8,7 @@ use crate::repair::apply::{CheckOutcome, Faults, NoFaults, Point, ReconcileRepor
 use crate::repair::ledger::{ChangeKind, FileChange, PreImage, Probation};
 use crate::repair::types::{LockOwner, Trigger};
 use crate::repair::vault::Slot;
+use crate::repair::apply::tests::run_form;
 use std::cell::Cell;
 use std::time::Duration;
 
@@ -246,7 +247,7 @@ fn doubles() -> Doubles {
         hook_calls: Cell::new(0),
         bytes_calls: Cell::new(0),
         class: Cell::new(Classification::General),
-        form: Cell::new(ApplyForm::Exchange),
+        form: Cell::new(run_form()),
         vendor: std::cell::RefCell::new(None),
         reference_ms: Cell::new(7),
         during_check: std::cell::RefCell::new(None),
@@ -650,6 +651,10 @@ fn the_id_file_is_not_boot_critical_and_only_repair_code_names_it() {
 #[test]
 fn a_new_department_receives_an_edit_through_the_engine() {
     for form in [ApplyForm::Exchange, ApplyForm::DepositFirst] {
+        // WZ2: the unix-form iteration is skipped when the run's form is deposit-first (the next one is it)
+        if form == ApplyForm::Exchange && run_form() == ApplyForm::DepositFirst {
+            continue;
+        }
         let r = rig("r1");
         let id = rid("R-1");
         committed_in_hq(&r, &id, Classification::General, "bin/a.py", Some((b"old\n", 0o644)), Some((b"new\n", 0o755)));
@@ -941,7 +946,7 @@ fn a_receiving_lanes_repeated_timeout_is_attributed_with_its_own_reference() {
     let l = lane(DEPT);
     let lock = r.base.join(".pack-apply.lock");
     let job = JobEnv {
-        op: OpEnv { root: &r.root, pack: &r.dept, lane: &l, now: T0 + 700.0, form: ApplyForm::Exchange, faults: &NoFaults, own_check: &|_, _| None },
+        op: OpEnv { root: &r.root, pack: &r.dept, lane: &l, now: T0 + 700.0, form: run_form(), faults: &NoFaults, own_check: &|_, _| None },
         incarnation: "inc-ig4",
         check: &check,
         reference: &reference,
@@ -991,7 +996,7 @@ fn a_restored_probation_is_returned_by_t6s_tick() {
     let l = lane(DEPT);
     let lock = r.base.join(".pack-apply.lock");
     let job = JobEnv {
-        op: OpEnv { root: &r.root, pack: &r.dept, lane: &l, now: T0 + 60.0, form: ApplyForm::Exchange, faults: &NoFaults, own_check: &|_, _| None },
+        op: OpEnv { root: &r.root, pack: &r.dept, lane: &l, now: T0 + 60.0, form: run_form(), faults: &NoFaults, own_check: &|_, _| None },
         incarnation: "inc-iq3",
         check: &check,
         reference: &reference,
@@ -1653,9 +1658,13 @@ fn an_approval_class_repair_is_never_applied_in_a_receiving_lane() {
     for (form, class, at_result) in [
         (ApplyForm::Exchange, Classification::BootCritical, false),
         (ApplyForm::DepositFirst, Classification::BootCritical, false),
-        (ApplyForm::Exchange, Classification::ProtectionRelated, false),
-        (ApplyForm::Exchange, Classification::BootCritical, true),
+        (run_form(), Classification::ProtectionRelated, false),
+        (run_form(), Classification::BootCritical, true),
     ] {
+        // WZ2: the first row (unix form) is skipped when the run's form is deposit-first (its twin is the second row)
+        if form == ApplyForm::Exchange && run_form() == ApplyForm::DepositFirst {
+            continue;
+        }
         let r = rig("hj1");
         let id = rid("R-1");
         committed_in_hq(&r, &id, class, "hooks/x.sh", Some((b"#!/bin/sh\nold\n", 0o755)), Some((b"#!/bin/sh\nnew\n", 0o755)));
@@ -1770,7 +1779,7 @@ fn recheck_answer(r: &Rig, id: &RepairId, d: &Doubles, seat: u64, note: &str) ->
     let lock_file = r.base.join(".pack-apply.lock");
     let sources = sources_of(d);
     let env = LaneEnv {
-        op: OpEnv { root: &r.root, pack: &r.dept, lane: &l, now: T0, form: ApplyForm::Exchange, faults: &NoFaults, own_check: &|_, _| None },
+        op: OpEnv { root: &r.root, pack: &r.dept, lane: &l, now: T0, form: run_form(), faults: &NoFaults, own_check: &|_, _| None },
         check: &check,
         reference: &|_, _| Ok(CheckOutcome { result: CheckResult::Pass, ms: d.reference_ms.get() }),
         classify: &classify,
@@ -2514,7 +2523,7 @@ fn a_target_over_the_limit_ends_its_repairs_turn_and_the_next_job_runs() {
     let registrar = |_: &Path, _: bool| -> Result<String, RepairError> { Ok(String::new()) };
     let pass = |_: &str, _: &Path, _: Duration| -> Result<CheckOutcome, RepairError> { Ok(CheckOutcome { result: CheckResult::Pass, ms: 1 }) };
     let job = crate::repair::probation::JobEnv {
-        op: OpEnv { root: &r.root, pack: &r.dept, lane: &l, now: T0, form: ApplyForm::Exchange, faults: &NoFaults, own_check: &|_, _| None },
+        op: OpEnv { root: &r.root, pack: &r.dept, lane: &l, now: T0, form: run_form(), faults: &NoFaults, own_check: &|_, _| None },
         incarnation: "inc",
         check: &pass,
         reference: &|_, _| Ok(CheckOutcome { result: CheckResult::Pass, ms: 1 }),
@@ -2961,7 +2970,7 @@ fn t6_tick(r: &Rig, which: &str, now: f64, fails: bool) -> crate::repair::probat
     let l = lane(which);
     let lock = r.base.join(".pack-apply.lock");
     let job = JobEnv {
-        op: OpEnv { root: &r.root, pack: r.pack(which), lane: &l, now, form: ApplyForm::Exchange, faults: &NoFaults, own_check: &|_, _| None },
+        op: OpEnv { root: &r.root, pack: r.pack(which), lane: &l, now, form: run_form(), faults: &NoFaults, own_check: &|_, _| None },
         incarnation: "inc-wp1",
         check: &check,
         reference: &reference,
