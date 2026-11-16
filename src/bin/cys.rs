@@ -54371,10 +54371,29 @@ mod b360_tests {
     ///     other call is in `install_staged`, the init-pack path, which the transaction never calls);
     ///   · (B) the command's own terminal records: the `println!` of `run_pack_update` AFTER its local `macro_rules! println`
     ///     (which writes `terminal_output`, the stdout the dispatch passes).
+    /// ★FR1 (RULINGS LH37) — CHILDREN: every `Command::new` in the same scanned code must not leave the child the
+    /// command's stdout: between it and the first `.status()` / `.spawn()` / `.output()` after it in the same function there
+    /// is a `.stdout(` (set explicitly) or `spawn_policy(cys::ChildLifetime::Survivor)` (null stdio, lib.rs `detach_stdio`),
+    /// or that first call is `.output()` (piped); a `Command::new` with no such call in its function fails too.
     /// Anything else fails with its file, function and line. Modelled on FG6 (src/repair/apply_tests.rs
     /// `every_write_of_the_repair_module_is_classified` + `the_write_census_catches_each_mutation`: a production-text census
     /// with mutation controls) over the lexer and call-graph of `b360_r2r_p14` (comments / strings blanked, `#[cfg(test)]`
     /// items cut).
+    ///
+    /// WHAT IT GUARANTEES, exactly: in the two files it reads — the whole production text of src/pack.rs, and the production
+    /// functions of src/bin/cys.rs reached from `run_pack_update` / `consume_reinject_pending` by a call spelled `name(` or
+    /// `name::<` (any function of that name, methods included; `run` and `main` not followed) — no `println!`, `print!`
+    /// (not preceded by an identifier character), `stdout()` or `Stdio::inherit` outside the two proven rows and the
+    /// records, and no `Command::new` whose stdout is left inherited in the form above.
+    /// WHAT IT CANNOT SEE (recorded, not built — DEFERRED_MINOR): (1) every other source file — the library modules the
+    /// reach calls (src/agy_statusline.rs, src/launchd.rs, src/factory_reset.rs, src/overrides.rs, …) and the other files of
+    /// the binary; (2) other spellings and aliases — `use std::io::stdout as o; o()`, a stdout handle kept in a variable or
+    /// passed in, a user macro that wraps `println!` or `write!` to a handle obtained elsewhere, a `Command` built in another
+    /// function or module and spawned here; (3) functions reached only as values (a fn pointer, a closure handed on) other
+    /// than the provider seeded by name; (4) a human `println!` placed AFTER `run_pack_update`'s local record macro — it is
+    /// taken as a record by its position, its content is not checked; (5) anything at run time (dup2, a child's own
+    /// redirections). The real-process tests (`po1_*`) are the proof of behaviour; this census only stops the next bare
+    /// writer of the spellings above.
     fn po1_stdout_census(pack_src: &str, cys_src: &str) -> Vec<String> {
         let mut v = Vec::new();
         let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
@@ -54428,6 +54447,31 @@ mod b360_tests {
                 }
             }
             false
+        };
+
+        // FR1: every `Command::new` of the function span (s, e) whose innermost fn is `f` must not inherit stdout
+        let children = |text: &str, fns: &[(String, usize, usize)], file: &str, f: &str, s: usize, e: usize, v: &mut Vec<String>| {
+            let mut from = s;
+            while let Some(n) = text[from..e].find("Command::new") {
+                let c = from + n;
+                from = c + "Command::new".len();
+                if fn_of(fns, c).is_some_and(|(n, ..)| n != f) {
+                    continue;
+                }
+                let next = [".status()", ".spawn()", ".output()"]
+                    .iter()
+                    .filter_map(|t| text[c..e].find(t).map(|k| (c + k, *t)))
+                    .min();
+                let ok = match next {
+                    Some((_, ".output()")) => true,
+                    Some((t, _)) => text[c..t].contains(".stdout(") || text[c..t].contains("spawn_policy(cys::ChildLifetime::Survivor)"),
+                    None => false,
+                };
+                if !ok {
+                    v.push(format!("{file}:{} (fn {f}, reached by `cys pack-update`): a child process that inherits the command's stdout — set `.stdout(…)` explicitly (or `.output()`)",
+                        line_of(text, c)));
+                }
+            }
         };
 
         // ── (A) src/pack.rs ──
@@ -54520,6 +54564,9 @@ mod b360_tests {
         if core.is_none() {
             v.push("pack.rs: `install_into_with` not found".into());
         }
+        for (n, s, e) in &fns {
+            children(&text, &fns, "pack.rs", n, *s, *e, &mut v);
+        }
 
         // ── (B) src/bin/cys.rs: the command's reach ──
         let (lexed, tests) = r2r_lex_production(cys_src);
@@ -54584,6 +54631,7 @@ mod b360_tests {
                         v.push("cys.rs: run_pack_update lost its local `println!` over `terminal_output`".into());
                     }
                 }
+                children(&text, &fns, "cys.rs", f, s, e, &mut v);
                 for &(at, w) in all_writers.iter().filter(|(at, _)| s <= *at && *at < e) {
                     // nested fns are their own entries; count a site once, in its innermost fn
                     if fn_of(&fns, at).is_some_and(|(n, ..)| &n != f) {
@@ -54610,7 +54658,8 @@ mod b360_tests {
     /// ★PO1 criterion (5)'s mutation controls (FG6 style): each of these edits makes the census fail — a bare `println!`
     /// in a new function of pack.rs, a helper site turned back into `println!`, a helper given a literal instead of the
     /// parameter, the channel guard's line taken out of `if !transactional`, the install core calling the setup with
-    /// `false`, a `println!` added to the pending pass and a `stdout()` write added to the apply of this file.
+    /// `false`, a `println!` added to the pending pass, a `stdout()` write added to the apply of this file, and (FR1) the
+    /// fetch's curl child back to a plain `.status()` with the inherited stdout.
     #[test]
     fn po1_census_catches_each_mutation() {
         let (pack, cys) = (include_str!("../pack.rs"), include_str!("cys.rs"));
@@ -54623,6 +54672,7 @@ mod b360_tests {
         cases.push(("the setup called with false", pack.replacen("setup_isolated_config_dir(true);", "setup_isolated_config_dir(false);", 1), cys.to_string()));
         cases.push(("a println! in the pending pass", pack.to_string(), cys.replacen("    for u in pending_unknown {\n", "    println!(\"x\");\n    for u in pending_unknown {\n", 1)));
         cases.push(("a stdout() write in the apply", pack.to_string(), cys.replacen("    let _ = std::fs::remove_dir_all(staging);\n    extract_tar_gz(&tar_path, staging)?;", "    let _ = std::fs::remove_dir_all(staging);\n    let _ = std::io::Write::write_all(&mut std::io::stdout(), b\"x\");\n    extract_tar_gz(&tar_path, staging)?;", 1)));
+        cases.push(("the curl child back to an inherited stdout", pack.to_string(), cys.replacen("            .stdout(std::process::Stdio::null())\n            .status()\n            .map_err(|e| format!(\"curl 실행 실패: {e}\"))?;", "            .status()\n            .map_err(|e| format!(\"curl 실행 실패: {e}\"))?;", 1)));
         for (name, p, c) in &cases {
             assert!(p != pack || c != cys, "{name}: the mutation did not apply");
             assert!(!po1_stdout_census(p, c).is_empty(), "{name}: not caught");
