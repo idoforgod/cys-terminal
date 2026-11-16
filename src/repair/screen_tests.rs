@@ -2224,6 +2224,30 @@ fn after_run_single_difference_noted() {
 
 // ───────────────────────────── the verdict travels with what was screened (AY5, BC7, BD5) ─────────────────────────────
 
+/// WY2 — the recorded verdict is written, re-opened for its full flush and flushed
+/// (`write_verdict_in`). On unix the re-open is `replay::open_nofollow_nonblock` as before; elsewhere
+/// that function is a read-only `File::open`, which `FlushFileBuffers` refuses (Access is denied) —
+/// there the re-open is now the open that serves a flush. Plain files, no screen run: runs on every
+/// platform (the screen itself stays pending on Windows — nothing reaches this there today).
+#[test]
+fn wy2_the_recorded_verdict_is_written_durably_and_reads_back() {
+    let root = test_root("wy2-verdict");
+    let ledger = root.join("repairs");
+    let id = RepairId::parse("R-2").unwrap();
+    std::fs::create_dir_all(super::super::ledger::repair_dir_in(&ledger, &id)).unwrap();
+    let v = RecordedVerdict {
+        schema: SCREEN_SCHEMA,
+        verdict: ScreenVerdict::Refused,
+        input_fingerprint: "00".repeat(32),
+        build_id: "wy2".into(),
+        notes: vec!["wy2".into()],
+        at: 2.0,
+    };
+    write_verdict_in(&ledger, &id, &v).expect("the durable verdict write");
+    assert_eq!(read_verdict_in(&ledger, &id).unwrap(), Some(v));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn verdict_record_roundtrip_and_holds() {
     let root = test_root("verdict");

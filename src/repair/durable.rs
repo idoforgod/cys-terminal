@@ -85,6 +85,29 @@ pub fn full_flush_file(f: &std::fs::File) -> std::io::Result<()> {
     }
 }
 
+/// Unit WY2 — opens an EXISTING file that was NOT just written by the caller (the vault's sealed
+/// copy in `vault::finish_seal_with` / `seal_with`, the screen's verdict off unix in
+/// `screen::write_verdict_in`) so that [`full_flush_file`] (or the ledger's twin) can flush it. A file
+/// the caller writes itself is flushed on the handle that wrote it ([`write_durable`]; WY2 FR1, RULINGS
+/// LH15). unix: `File::open`, exactly the call every site made before (a read-only descriptor may be
+/// `fsync`ed / `F_FULLFSYNC`ed). Other platforms: write ACCESS — no create, no truncate, no append;
+/// Windows' `FlushFileBuffers` needs a handle with write access ("The file handle must have the
+/// GENERIC_WRITE access right", Microsoft's FlushFileBuffers reference) and answers a read-only
+/// handle with ERROR_ACCESS_DENIED (5) — measured on the Windows runner as `cys repair commit`
+/// exit 1 "record.json: Access is denied. (os error 5)" (runs/TW1-ci-7a). No byte is written
+/// through this handle and a missing file is an error (never created). The flush stays the
+/// caller's and stays fail-closed.
+pub fn open_for_flush(p: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(p)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new().write(true).open(p)
+    }
+}
+
 fn io(p: &Path, e: impl std::fmt::Display) -> RepairError {
     RepairError::Io(format!("{}: {e}", p.display()))
 }
@@ -376,6 +399,48 @@ mod tests {
         let big = d.join("big.json");
         std::fs::File::create(&big).unwrap().set_len(RECORD_READ_CAP + 1).unwrap();
         assert!(matches!(read_record_bytes(&big), RecordRead::Unreadable(_)), "over the cap");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// WY2 — the open that serves a flush: both full flushes (this module's and the ledger's twin)
+    /// ACCEPT its handle, and the open changes nothing — the same bytes, length, read-only flag and
+    /// modification time; a missing file is an error and is never created. Plain std::fs in a temp
+    /// folder: runs on every platform (on Windows it is the proof of the non-unix arm).
+    #[test]
+    fn wy2_open_for_flush_gives_a_handle_the_full_flush_accepts() {
+        let d = tmp("wy2-open");
+        let p = d.join("record.json");
+        std::fs::write(&p, b"{\"a\":1}\n").unwrap();
+        let before = std::fs::metadata(&p).unwrap();
+        let f = open_for_flush(&p).expect("open an existing file for its flush");
+        full_flush_file(&f).expect("the full flush accepts the handle");
+        crate::repair::ledger::full_flush_file(&f).expect("the ledger's full flush accepts it too");
+        drop(f);
+        let after = std::fs::metadata(&p).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"{\"a\":1}\n", "no byte changed");
+        assert_eq!(after.len(), before.len(), "the length is unchanged (no truncation)");
+        assert_eq!(after.permissions().readonly(), before.permissions().readonly(), "the read-only flag is unchanged");
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap(), "the open and the flush leave the modification time");
+        let missing = d.join("missing.json");
+        assert!(open_for_flush(&missing).is_err(), "a missing file is an error");
+        assert!(std::fs::symlink_metadata(&missing).is_err(), "and it is never created");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// WY2 — the CAUSE, measured where it lives: Windows refuses the flush of a READ-ONLY handle
+    /// with ERROR_ACCESS_DENIED (5) — the shape of the runner's message (runs/TW1-ci-7a commit.json).
+    /// A hypothesis until this runs on Windows (not compiled on unix, where a read-only descriptor
+    /// may be flushed).
+    #[cfg(windows)]
+    #[test]
+    fn wy2_windows_refuses_the_flush_of_a_read_only_handle() {
+        let d = tmp("wy2-ro");
+        let p = d.join("record.json");
+        std::fs::write(&p, b"{}\n").unwrap();
+        let ro = std::fs::File::open(&p).unwrap();
+        let e = full_flush_file(&ro).expect_err("FlushFileBuffers on a read-only handle");
+        assert_eq!(e.raw_os_error(), Some(5), "{e}");
+        drop(ro);
         let _ = std::fs::remove_dir_all(&d);
     }
 

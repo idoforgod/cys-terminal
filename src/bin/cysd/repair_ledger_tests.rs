@@ -564,6 +564,79 @@ fn report_aggregates_excludes_and_joins() {
 
 // ───────────────────────────── the general flow (C1 1.9 / 1.10 / N1 / U2 / K1) ─────────────────────────────
 
+/// WY2 part B (RULINGS LH12) — THE commit door, end to end, at a 100-ns clock time: step (1)
+/// renews the holder's lease (`expires_at = now + LEASE_SECS`) and writes the record; step (3a)
+/// re-reads it from JSON and refuses if it differs from the record step (1) holds in memory
+/// (`rec != snapshot`, cysd repair.rs ~3212). `ctx.now` is the repair clock's value for the fixture
+/// 1794792640 s + 10 294 700 ns — the master's SCRATCH reproducer (impl/runs/WY2-float-roundtrip/
+/// result.txt), not a clock value from the runner; with the RAW formula (`as_secs_f64()`) its lease is
+/// the text "1794799840.0102947", which serde_json's default parser reads one step off — the commit
+/// then answers "검사하는 동안 수리 기록이 바뀌었습니다" with nothing changed (this Mac, the logged red
+/// run; the same sentence is the Windows runner's error, runs/TW1-ci-7c commit.json rc 94). The commit
+/// must SUCCEED.
+#[test]
+fn wy2b_a_commit_at_a_windows_clock_time_is_not_refused() {
+    let d = std::time::Duration::new(1_794_792_640, 10_294_700);
+    assert_eq!(
+        serde_json::to_string(&(d.as_secs_f64() + cys::repair::types::LEASE_SECS as f64)).unwrap(),
+        "1794799840.0102947",
+        "premise: the raw formula gives the scratch reproducer's lease text"
+    );
+    let now = cys::repair::ledger::epoch_secs_us(d);
+    let r = rig("wy2-lease");
+    let w = seat(3, "worker");
+    let b = r
+        .call(now - 3.0, &w, "begin", json!({"trigger": "owner_order", "files": ["bin/a.py"]}))
+        .unwrap();
+    let id = b["repair"].as_str().unwrap().to_string();
+    std::fs::write(r.pack.join("bin/a.py"), b"print('fixed')\n").unwrap();
+    r.call(now - 2.0, &w, "record", json!({"repair": id, "note": "fix print"})).unwrap();
+    r.call(
+        now - 1.0,
+        &seat(7, "reviewer-codex"),
+        "attest_verify",
+        json!({"repair": id, "verdict": "pass", "note": "repro gone"}),
+    )
+    .unwrap();
+    let c = r
+        .call(now, &w, "commit", json!({"repair": id}))
+        .unwrap_or_else(|e| panic!("the commit was refused: {} — {}", e.code, e.message));
+    assert_eq!(c["state"], "probation", "{c}");
+    let rec = r.record_of(&id);
+    assert_eq!(rec.state, RepairState::Probation);
+    assert!(rec.lock.is_none(), "the commit released its lock");
+}
+
+/// WY2 part B (RULINGS LH12) — the repair module's clock IS the daemon's clock: the library's
+/// `ledger::epoch_secs_us` and cysd's `state::epoch_secs_us` (R2F-DM) give the same bits for every
+/// Duration — on the 1 µs (macOS), 100 ns (Windows) and 1 ns (Linux) grids and at the edges — so the
+/// two can never drift apart.
+#[test]
+fn wy2b_the_repair_clock_is_the_daemons_clock() {
+    let mut ds: Vec<std::time::Duration> = vec![
+        std::time::Duration::new(0, 0),
+        std::time::Duration::new(0, 999),
+        std::time::Duration::new(1_794_792_640, 10_294_700),
+        std::time::Duration::new(1_791_116_826, 741_613_900),
+        std::time::Duration::new(1_791_116_826, 741_613_999),
+        std::time::Duration::new(1_791_116_826, 999_999_999),
+        std::time::Duration::new(4_102_444_800, 123_456_789),
+    ];
+    for unit in [1_000u64, 100, 1] {
+        for i in 0..5_000u64 {
+            let total: u128 = 1_794_700_000u128 * 1_000_000_000 + (i as u128) * 7_919_113u128 * (unit as u128);
+            ds.push(std::time::Duration::new((total / 1_000_000_000) as u64, (total % 1_000_000_000) as u32));
+        }
+    }
+    for d in ds {
+        assert_eq!(
+            cys::repair::ledger::epoch_secs_us(d).to_bits(),
+            crate::state::epoch_secs_us(d).to_bits(),
+            "{d:?}: the repair clock differs from the daemon's"
+        );
+    }
+}
+
 /// The whole general path, and K1: commit writes this lane's own row only; status counts every
 /// registered lane, a lane without a row shows 대기 and "전파 완료" is withheld.
 #[test]
