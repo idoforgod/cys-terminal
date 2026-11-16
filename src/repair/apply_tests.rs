@@ -2826,6 +2826,61 @@ fn read_census(sources: &[(String, String)]) -> Vec<String> {
     census_violations(sources, &[], CENSUS_READ_LITERALS, READ_DEFAULT_CENSUS, CENSUS_READ_CLASSES)
 }
 
+/// WY2 part B (RULINGS LH12 (iii)) — every time the repair engine writes comes from ONE microsecond
+/// clock: `ledger::now_epoch` maps through `ledger::epoch_secs_us`, whose body is the floor to the
+/// microsecond (the daemon's own `state::epoch_secs_us`, R2F-DM); and no repair source
+/// (src/repair/*.rs and src/bin/cysd/repair*.rs, production text) makes an `f64` out of a `Duration`
+/// any other way — except two values that are only COMPARED IN ORDER and never written, named here.
+/// A raw `as_secs_f64()` of a 100-ns / 1-ns clock has 17 significant digits and serde_json's default
+/// parser reads about one in ten back one step off (Windows: `cys repair commit` rc 94).
+#[test]
+fn wy2b_every_repair_time_comes_from_the_microsecond_clock() {
+    let ledger_src = census_prod(include_str!("ledger.rs"));
+    let body = |head: &str| -> String {
+        let i = ledger_src.find(head).unwrap_or_else(|| panic!("`{head}` not found in ledger.rs"));
+        let rest = &ledger_src[i..];
+        rest[..rest.find("\n}\n").unwrap_or(rest.len())].to_string()
+    };
+    assert!(body("pub fn now_epoch() -> f64 {").contains(".map(epoch_secs_us)"), "ledger::now_epoch must go through epoch_secs_us");
+    assert!(
+        body("pub fn epoch_secs_us(d: std::time::Duration) -> f64 {").contains("d.as_micros() as f64 / 1e6"),
+        "ledger::epoch_secs_us must be the microsecond floor `d.as_micros() as f64 / 1e6` (cysd state::epoch_secs_us)"
+    );
+    let mut sources = census_sources();
+    let cysd = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("bin").join("cysd");
+    for e in std::fs::read_dir(&cysd).unwrap() {
+        let p = e.unwrap().path();
+        let name = p.file_name().unwrap().to_str().unwrap().to_string();
+        if name.starts_with("repair") && name.ends_with(".rs") && !name.ends_with("_tests.rs") {
+            sources.push((format!("cysd/{name}"), census_prod(&std::fs::read_to_string(&p).unwrap())));
+        }
+    }
+    assert!(sources.iter().any(|(f, _)| f == "cysd/repair.rs"), "the daemon's repair module was not read");
+    let banned = ["as_secs_f64(", "as_secs_f32(", "as_nanos() as f64", "as_millis() as f64", "as_micros() as f64"];
+    let allowed: &[(&str, &str)] = &[
+        // the clock itself
+        ("ledger.rs", "d.as_micros() as f64 / 1e6"),
+        // `age_of`: a claim file's AGE at `now` (from its mtime), compared with `<=` to the hold bound — never written
+        ("grant.rs", "Some(d) => (now - d.as_secs_f64()).max(0.0),"),
+        // the consumption clock: `ctx.now` advanced by monotonic time, compared with the request's expiry — never written
+        ("cysd/repair_approval.rs", "ctx.now + started.elapsed().as_secs_f64()"),
+    ];
+    let mut bad = Vec::new();
+    for (f, prod) in &sources {
+        for (i, l) in prod.lines().enumerate() {
+            let code = l.split("//").next().unwrap_or("");
+            if banned.iter().any(|b| code.contains(b)) && !allowed.iter().any(|(af, al)| af == f && l.contains(al)) {
+                bad.push(format!("{f} (production line {}): {}", i + 1, l.trim()));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "an f64 time made outside the microsecond clock: {bad:#?}");
+    for (af, al) in allowed {
+        let n: usize = sources.iter().filter(|(f, _)| f == af).map(|(_, p)| p.matches(al).count()).sum();
+        assert_eq!(n, 1, "{af}: the listed line `{al}` must be there exactly once (update this list with the code)");
+    }
+}
+
 /// RULINGS FG6 (codex r4 M7): every write primitive (write, copy, rename, create_dir*, exchange,
 /// place, remove, …) in EVERY file of the repair module is classified — door / vault / staging /
 /// ledger; an unclassified one, a new one in a classified function, or a file of the module the
