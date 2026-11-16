@@ -525,7 +525,7 @@ pub fn seal_with(slot: &Slot, hook: &mut PublishHook<'_>) -> Result<(), RepairEr
         // SAFETY: two NUL-terminated paths alive for the call; CLONE_NOFOLLOW = 0x0001.
         if unsafe { libc::clonefile(cs.as_ptr(), cd.as_ptr(), 0x0001) } == 0 {
             hook(PublishStep::Created)?;
-            let flushed = std::fs::File::open(&tmp)
+            let flushed = super::durable::open_for_flush(&tmp)
                 .and_then(|f| full_flush_file(&f))
                 .map_err(|e| io(&tmp, e));
             if let Err(e) = flushed {
@@ -639,7 +639,8 @@ pub fn finish_seal_with(slot: &Slot, now: f64, hook: &mut PublishHook<'_>) -> Re
         Err(e) => return Err(io(&sealed, e)),
     };
     let (sealed_state, sealed_sha) = if sealed_present {
-        let f = std::fs::File::open(&sealed).map_err(|e| io(&sealed, e))?;
+        // WY2: a handle the flush accepts on every platform (unix: the same `File::open`)
+        let f = super::durable::open_for_flush(&sealed).map_err(|e| io(&sealed, e))?;
         full_flush_file(&f).map_err(|e| io(&sealed, e))?;
         drop(f);
         full_flush_dir(&slot.dir.join("sealed"))?;

@@ -636,8 +636,9 @@ pub fn write_record_in(root: &Path, rec: &RepairRecord) -> Result<(), RepairErro
 pub fn write_record_durable_in(root: &Path, rec: &RepairRecord) -> Result<(), RepairError> {
     write_record_in(root, rec)?;
     let p = record_path_in(root, &rec.id);
-    let f =
-        std::fs::File::open(&p).map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
+    // WY2: a handle the flush accepts on every platform (unix: the same `File::open`)
+    let f = super::durable::open_for_flush(&p)
+        .map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
     full_flush_file(&f).map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
     full_flush_dir(&repair_dir_in(root, &rec.id))
 }
