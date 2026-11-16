@@ -699,3 +699,70 @@ fn status_of_a_rule_document_repair_counts_its_origin_lane_only() {
     let rows = v["lane_rows"].as_array().unwrap();
     assert!(rows.iter().any(|x| x["lane"] == "base" && x["reason"] == cys::repair::propagate::RULE_DOCUMENT_ELSEWHERE), "{v}");
 }
+
+/// RULINGS LA (unit WP1) (2) — a GENERAL repair's ORIGIN row as T3's REAL `commit` writes it (검증됨, an
+/// OPEN bundle), then this lane's FIRST propagation tick (no job state → the full reset — the rig's
+/// cand1-LA1-general-origin): the bundle stays OPEN with its applied_at; and when the check then fails,
+/// T6's probation returns the repair (the live file is the pre-image again, the record says 되돌려짐).
+#[cfg(target_os = "macos")]
+#[test]
+fn wp1_a_general_commits_origin_bundle_survives_the_first_tick_and_is_returned() {
+    use cys::repair::apply::{no_repair_lock, CheckOutcome, HookStep, HookUnitEnd, NoFaults, OpEnv, ReconcileReport};
+    use cys::repair::rehearsal::CheckResult;
+    let r = rig("wp1-general");
+    let w = seat(3, "worker");
+    let id = verified(&r, "bin/a.py", b"print('fixed')\n");
+    r.call(T0 + 3.0, &w, "commit", json!({"repair": id})).unwrap();
+    let rid = RepairId::parse(&id).unwrap();
+    let row = ledger::read_lane_in(&r.root, &rid, &r.lane).unwrap().unwrap();
+    let at = row.probation.as_ref().map(|p| p.applied_at);
+    assert!(row.state == LaneState::Verified && row.probation.as_ref().is_some_and(|p| p.closed.is_none()), "the commit wrote an OPEN bundle: {row:?}");
+    // this lane's first propagation tick (the rig's pack holds an id file but the lane has no job state)
+    let check = |_: &str, _: &Path, _: std::time::Duration| -> Result<CheckOutcome, RepairError> { Ok(CheckOutcome { result: CheckResult::Pass, ms: 1 }) };
+    let reference = |_: CheckKind, _: std::time::Duration| -> Result<CheckOutcome, RepairError> { Ok(CheckOutcome { result: CheckResult::Pass, ms: 1 }) };
+    let classify = |_: &str| -> Result<Classification, RepairError> { Ok(Classification::General) };
+    let hooks = |_: &RepairId, _: &LaneKey, _: HookStep, _: &dyn Fn() -> Result<(), String>| -> Result<HookUnitEnd, RepairError> { Ok(HookUnitEnd::Nothing) };
+    let bytes = |rec: &RepairRecord, rel: &str| cys::repair::propagate::committed_copy_in(&r.root, rec, rel);
+    let sources = cys::pack::UpdateSources::none();
+    let lock_file = r.base.join(".pack-apply.lock");
+    let env = cys::repair::propagate::LaneEnv {
+        op: OpEnv { root: &r.root, pack: &r.pack, lane: &r.lane, now: T0 + 60.0, form: cys::repair::platform::ApplyForm::Exchange, faults: &NoFaults, own_check: &|_, _| None },
+        check: &check,
+        reference: &reference,
+        classify: &classify,
+        locked: &no_repair_lock,
+        hooks: &hooks,
+        result_bytes: &bytes,
+        sources: &sources,
+        apply_lock: &lock_file,
+        pass_stop: &|_| false,
+    };
+    let t = cys::repair::propagate::propagation_tick_in(&env, Some(&"cd".repeat(32))).unwrap();
+    let row = ledger::read_lane_in(&r.root, &rid, &r.lane).unwrap().unwrap();
+    let p = row.probation.clone().unwrap_or_else(|| panic!("the bundle was dropped: {t:?}"));
+    assert!(p.closed.is_none(), "the open bundle was closed: {:?} ({t:?})", p.closed);
+    assert_eq!(Some(p.applied_at), at, "the bundle was re-stamped");
+    // T6's probation in this lane, the check failing
+    let fail = |rel: &str, _: &Path, _: std::time::Duration| -> Result<CheckOutcome, RepairError> {
+        Ok(CheckOutcome { result: CheckResult::Fail(format!("{rel}: 검사 실패(시험)")), ms: 5 })
+    };
+    let t6_hooks = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> { Ok(ReconcileReport { hooks: Vec::new() }) };
+    let registrar = |_: &Path, _: bool| -> Result<String, RepairError> { Ok("{\"hooks\": []}".into()) };
+    let job = cys::repair::probation::JobEnv {
+        op: OpEnv { root: &r.root, pack: &r.pack, lane: &r.lane, now: T0 + 600.0, form: cys::repair::platform::ApplyForm::Exchange, faults: &NoFaults, own_check: &|_, _| None },
+        incarnation: "inc-wp1",
+        check: &fail,
+        reference: &reference,
+        hooks: &t6_hooks,
+        registrar: &registrar,
+        locked: &no_repair_lock,
+        excluded: &|_| false,
+        original: &|_| None,
+        intake: &|_, _| true,
+        apply_lock: &lock_file,
+    };
+    let rep = cys::repair::probation::run_tick(&job, false).unwrap();
+    assert_eq!(rep.reverted, vec![rid.clone()], "{rep:?}");
+    assert_eq!(std::fs::read(r.pack.join("bin/a.py")).unwrap(), b"print('a')\n", "the pre-image is back");
+    assert_eq!(r.record_of(&id).state, RepairState::Reverted);
+}
