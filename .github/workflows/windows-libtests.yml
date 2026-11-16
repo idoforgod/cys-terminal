@@ -47,7 +47,7 @@ jobs:
           filter=()
           read -r -a filter <<< "${TW3_FILTER:-}"
           rc=0
-          cargo test --lib --no-fail-fast -- "${filter[@]}" > out/lib.log 2>&1 || rc=$?
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib --no-fail-fast -- --test-threads=1 "${filter[@]}" > out/lib.log 2>&1 || rc=$?
           echo "TW1-CARGO-EXIT=$rc" >> out/lib.log
       - name: B - cysd repair tests (out/cysd-repair.log)
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
@@ -56,7 +56,7 @@ jobs:
         run: |
           mkdir -p out
           rc=0
-          cargo test --bin cysd --no-fail-fast -- repair > out/cysd-repair.log 2>&1 || rc=$?
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd --no-fail-fast -- --test-threads=1 repair > out/cysd-repair.log 2>&1 || rc=$?
           echo "TW1-CARGO-EXIT=$rc" >> out/cysd-repair.log
       - name: C - cys repair tests (out/cys-repair.log)
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
@@ -65,7 +65,7 @@ jobs:
         run: |
           mkdir -p out
           rc=0
-          cargo test --bin cys --no-fail-fast -- repair > out/cys-repair.log 2>&1 || rc=$?
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys --no-fail-fast -- --test-threads=1 repair > out/cys-repair.log 2>&1 || rc=$?
           echo "TW1-CARGO-EXIT=$rc" >> out/cys-repair.log
       # Per log: its exit line, its `test result:` lines, the count and sorted names of the tests on a
       #   `test <name> ... FAILED` line; also any name that only libtest's closing failures list holds (a panic
