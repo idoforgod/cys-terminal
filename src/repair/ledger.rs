@@ -1681,10 +1681,11 @@ mod storage_tests {
 
     /// WY2 — the measured failure, reached from the library: `write_record_durable_in` (the
     /// commit's durable record, RULINGS Y1 / E1; also every apply / revert / probation / claim step
-    /// that must not run ahead of its record) writes the record, re-opens it for the full flush and
-    /// flushes it and its folder. On Windows the re-open was read-only and the commit answered exit 1
-    /// "record.json: Access is denied. (os error 5)" (runs/TW1-ci-7a commit.json). It must succeed
-    /// on every platform, twice in a row (the commit's step 3b writes again), and read back as written.
+    /// that must not run ahead of its record). On Windows it used to re-open the renamed record
+    /// read-only for the full flush and the commit answered exit 1 "record.json: Access is denied.
+    /// (os error 5)" (runs/TW1-ci-7a commit.json); since FR1 (RULINGS LH15) it writes through the
+    /// ledger's durable writer (flush on the writing handle, then the rename). The durable record write
+    /// succeeds on every platform, twice in a row (the commit's step 3b writes again), and reads back.
     #[test]
     fn wy2_the_durable_record_write_succeeds_and_reads_back() {
         let root = tmp(line!());
@@ -1697,6 +1698,42 @@ mod storage_tests {
         rec.checks.push(("bin/a.py".into(), "wy2".into()));
         write_record_durable_in(&root, &rec).expect("the second durable record write");
         assert_eq!(read_record_in(&root, &id).unwrap(), Some(rec));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// WY2 FR1 (RULINGS LH15; reviewer1 WY2-r1 MAJOR-2) — the durable record write publishes NOTHING
+    /// before it is flushed: under an injected failure of the full flush (the module's test seam,
+    /// `durable::INJECT_FLUSH_ERRNO`) it returns an error AND the record on disk is still the OLD one,
+    /// with no temporary sibling left (at the commit door: the record stays 진행 중 with its lock, so
+    /// the retry is the ordinary one). Before FR1 the new record was renamed into place FIRST and
+    /// flushed through a re-opened handle AFTERWARDS: a failure there left the new record behind an error.
+    #[test]
+    fn wy2_fr1_a_failed_flush_leaves_the_old_record() {
+        let root = tmp(line!());
+        let id = RepairId::parse("R-3").unwrap();
+        std::fs::create_dir_all(repair_dir_in(&root, &id)).unwrap();
+        let mut old = sample(&id);
+        old.lock = Some(Lease {
+            owner: LockOwner { lane: LaneKey("base".into()), seat: 3, incarnation: "inc-1".into() },
+            expires_at: 1_800_000_000.5,
+            claim: None,
+        });
+        write_record_durable_in(&root, &old).expect("the first durable record write");
+        let mut new = old.clone();
+        new.state = RepairState::Probation;
+        new.lock = None;
+        // errno 5 = EIO on macOS / Linux (not "not supported", not EINTR): the flush fails
+        crate::repair::durable::INJECT_FLUSH_ERRNO.with(|c| c.set((5, 1)));
+        let w = write_record_durable_in(&root, &new);
+        crate::repair::durable::INJECT_FLUSH_ERRNO.with(|c| c.set((0, 0)));
+        assert!(w.is_err(), "a failed flush must be an error of the durable record write, got {w:?}");
+        assert_eq!(read_record_in(&root, &id).unwrap(), Some(old), "the OLD record must still be on disk");
+        let left: Vec<String> = std::fs::read_dir(repair_dir_in(&root, &id))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(left, vec!["record.json".to_string()], "no temporary sibling left: {left:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1716,17 +1753,40 @@ mod storage_tests {
         std::time::Duration::new((total_ns / 1_000_000_000) as u64, (total_ns % 1_000_000_000) as u32)
     }
 
-    /// WY2 part B (RULINGS LH12) — the repair clock's values, and those values plus every integer
-    /// constant the engine adds before it writes a time (the lease `LEASE_SECS`, the pause cover,
-    /// minutes, an hour, a day), come back from serde_json's DEFAULT parser as themselves on the
-    /// 100-ns (Windows) and 1-ns (Linux) grids, 20,000 values each; each is the microsecond floor of
-    /// its input (never later, at most 6 decimals). Not vacuous: the RAW values (`as_secs_f64()`) of the
+    /// WY2 part B (RULINGS LH12) — the repair clock's values, and those values plus each constant the
+    /// engine adds to the clock before it writes a time — named in `offsets` below: the lease, the
+    /// lease + grace hold bound, the approval TTL, the question lapse, the pause quiet time and cover and
+    /// their sum (1,800 s, 5 s, 1,805 s), the audit window, the probation, the token TTL, plus a few
+    /// plain test offsets — come back from serde_json's DEFAULT parser as themselves on the 100-ns
+    /// (Windows) and 1-ns (Linux) grids, 20,000 values each; each is the microsecond floor of its input
+    /// (never later, at most 6 decimals). A finite sample, not a proof for every value (INFERRED for
+    /// all values: a µs value and an integer offset in the same binary exponent add exactly, and a
+    /// decimal of at most 16 significant digits takes the parser's exact path). Not vacuous: the RAW values (`as_secs_f64()`) of the
     /// same grids miss in 1,000 or more cases (if that ever stops, `float_roundtrip` was switched on —
     /// the product keeps it off, RELEASE_NOTES_0.14.43 §7). The macOS grid (1 µs) is bit-identical to
     /// `as_secs_f64()` (RULINGS LH12 B5': the unix clock that macOS has does not change).
     #[test]
     fn wy2b_the_repair_clock_survives_the_default_json_parser_on_the_100ns_and_1ns_grids() {
-        let offsets = [0.0, crate::repair::types::LEASE_SECS as f64, 5.0, -60.0, 60.0, 600.0, 3_600.0, 86_400.0];
+        use crate::repair::{grant, owner_origin, types};
+        let offsets: [f64; 17] = [
+            0.0,
+            types::LEASE_SECS as f64,
+            (types::LEASE_SECS + grant::EXPIRY_GRACE_SECS) as f64,
+            APPROVAL_TTL_SECS as f64,
+            owner_origin::QUESTION_LAPSE_SECS as f64,
+            grant::PAUSE_QUIET_SECS as f64,
+            grant::PAUSE_COVER_SECS,
+            grant::PAUSE_COVER_SECS + grant::PAUSE_QUIET_SECS as f64,
+            AUDIT_WINDOW_SECS as f64,
+            PROBATION_SECS as f64,
+            owner_origin::TOKEN_TTL_SECS as f64,
+            -600.0,
+            -60.0,
+            1.0,
+            10.0,
+            60.0,
+            3_600.0,
+        ];
         for (label, unit) in [("100 ns (Windows)", 100u64), ("1 ns (Linux)", 1u64)] {
             let (mut raw_lossy, mut lossy, mut later, mut not_floor, mut decimals) = (0u32, 0u32, 0u32, 0u32, 0usize);
             let mut first_bad: Option<std::time::Duration> = None;
@@ -1752,7 +1812,7 @@ mod storage_tests {
                 decimals = decimals.max(text.split_once('.').map_or(0, |(_, f)| f.len()));
             }
             assert!(raw_lossy >= 1_000, "{label}: the raw lease values miss only {raw_lossy}/20000 — the premise is gone (float_roundtrip on?)");
-            assert_eq!((lossy, later, not_floor), (0, 0, 0), "{label}: {lossy} value(s) did not come back as themselves, {later} later than the input, {not_floor} not the µs floor — first input {first_bad:?}");
+            assert_eq!((lossy, later, not_floor), (0, 0, 0), "{label}: {lossy} value(s) of {} did not come back as themselves, {later} later than the input, {not_floor} not the µs floor — first input {first_bad:?}", 20_000 * offsets.len());
             assert!(decimals <= 6, "{label}: {decimals} decimals (expected <= 6)");
         }
         for i in 0..20_000u64 {
@@ -1761,17 +1821,19 @@ mod storage_tests {
         }
     }
 
-    /// WY2 part B (RULINGS LH12) — a record written at a Windows clock time reads back EQUAL (what the
-    /// commit door's step 3a compares, cysd repair.rs ~3212 `rec != snapshot`). The time is the
-    /// measured one: 1794792640 s + 10 294 700 ns; with the raw formula its lease is the text
-    /// "1794799840.0102947", which the default parser reads as 1794799840.010295 (runs/TW1-ci-7c).
+    /// WY2 part B (RULINGS LH12) — a record written at a 100-ns clock time reads back EQUAL (what the
+    /// commit door's step 3a compares, cysd repair.rs ~3212 `rec != snapshot`). The fixture
+    /// 1794792640 s + 10 294 700 ns is the master's SCRATCH reproducer (impl/runs/WY2-float-roundtrip/
+    /// result.txt), not a clock value from the runner (the runner's record, runs/TW1-ci-7c commit.json,
+    /// holds only the error): with the raw formula its lease is the text "1794799840.0102947", which
+    /// the default parser reads as 1794799840.010295.
     #[test]
     fn wy2b_a_record_written_at_a_windows_clock_time_reads_back_equal() {
         let d = std::time::Duration::new(1_794_792_640, 10_294_700);
         assert_eq!(
             serde_json::to_string(&(d.as_secs_f64() + crate::repair::types::LEASE_SECS as f64)).unwrap(),
             "1794799840.0102947",
-            "premise: the raw formula gives the measured lease text"
+            "premise: the raw formula gives the scratch reproducer's lease text"
         );
         let now = epoch_secs_us(d);
         let root = tmp(line!());
