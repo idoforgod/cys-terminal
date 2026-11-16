@@ -734,3 +734,455 @@ fn reference_fixtures_pass() {
         );
     }
 }
+
+// ───────────── WY1 (RULINGS LH1 / LH2): the checks on a platform without the replay runner ─────────────
+
+/// A fake Windows install under the test's own folder: `<dir>\runtime\python\python3.exe` and the
+/// bundled Git's MSYS shells `<dir>\runtime\git\usr\bin\{sh,bash}.exe` (empty regular files — the
+/// lookup only looks).
+fn wy1_fake_install(name: &str) -> PathBuf {
+    let r = root(name);
+    for rel in [
+        "runtime/python/python3.exe",
+        "runtime/git/usr/bin/sh.exe",
+        "runtime/git/usr/bin/bash.exe",
+    ] {
+        put(&r, rel, "");
+    }
+    r
+}
+
+/// RULINGS LH1 / LH2 — THE LOOKUP, driven with the Windows answer on any host: the interpreter of the
+/// compile check is `<daemon's folder>\runtime\python\python3.exe` (the coordinate the product's health
+/// list requires), the shells of the syntax check are the bundled Git's MSYS `sh.exe` / `bash.exe` in
+/// `<daemon's folder>\runtime\git\usr\bin`. On 29632b90 the interpreter is looked for under the name
+/// `python3` (no `.exe`) and the shells are `/bin/sh` / `/bin/bash`: a runtime holding `python3.exe`
+/// is not found.
+#[test]
+fn wy1_lookup_finds_the_bundled_windows_programs() {
+    let r = wy1_fake_install("wy1-lookup");
+    let rt = r.join("runtime");
+    assert_eq!(
+        bundled_check_program_for(&r, "windows", CheckProgram::Python),
+        Ok(rt.join("python").join("python3.exe")),
+        "the bundled interpreter of a Windows install is not found"
+    );
+    assert_eq!(
+        bundled_check_program_for(&r, "windows", CheckProgram::Sh),
+        Ok(rt.join("git").join("usr").join("bin").join("sh.exe"))
+    );
+    assert_eq!(
+        bundled_check_program_for(&r, "windows", CheckProgram::Bash),
+        Ok(rt.join("git").join("usr").join("bin").join("bash.exe"))
+    );
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
+/// The lookup answers only Windows, names what it looked for when the file is not there, and its
+/// interpreter and bash are the coordinates of the product's own health list.
+#[test]
+fn wy1_lookup_names_what_it_looked_for_and_answers_only_windows() {
+    let r = root("wy1-absent");
+    match bundled_check_program_for(&r, "windows", CheckProgram::Python) {
+        Err(why) => assert!(
+            why.contains(
+                &r.join("runtime")
+                    .join("python")
+                    .join("python3.exe")
+                    .display()
+                    .to_string()
+            ),
+            "{why}"
+        ),
+        other => panic!("an absent interpreter was found: {other:?}"),
+    }
+    let full = wy1_fake_install("wy1-other-os");
+    for os in ["macos", "linux"] {
+        for p in [CheckProgram::Python, CheckProgram::Sh, CheckProgram::Bash] {
+            assert!(
+                bundled_check_program_for(&full, os, p).is_err(),
+                "{os} {p:?}: a Windows path answered on another platform"
+            );
+        }
+    }
+    // the health list (`windows_runtime_missing_for`) requires exactly these two files
+    for p in [CheckProgram::Python, CheckProgram::Bash] {
+        assert!(
+            crate::BUNDLED_WINDOWS_RUNTIME_REL
+                .iter()
+                .any(|c| *c == p.windows_rel()),
+            "{p:?}: {:?} is not a coordinate of the health list",
+            p.windows_rel()
+        );
+    }
+    // sh.exe lies in the folder of the health list's MSYS bash.exe
+    let sh = CheckProgram::Sh.windows_rel();
+    let bash = CheckProgram::Bash.windows_rel();
+    assert_eq!(sh[..sh.len() - 1], bash[..bash.len() - 1]);
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+    replay::remove_tree(&full).expect("the test's scratch folder is removed");
+}
+
+/// The rule of `sh_syntax`: a first line naming bash → bash, everything else → sh.
+#[test]
+fn wy1_shell_is_chosen_by_the_first_line() {
+    let r = root("wy1-shell-pick");
+    put(&r, "a.sh", "#!/bin/bash\nset -u\n");
+    put(&r, "b.sh", "#!/usr/bin/env bash\n");
+    put(&r, "c.sh", "#!/bin/sh\n");
+    put(&r, "d.sh", "echo no shebang\n");
+    assert_eq!(shell_for_script(&r.join("a.sh")), CheckProgram::Bash);
+    assert_eq!(shell_for_script(&r.join("b.sh")), CheckProgram::Bash);
+    assert_eq!(shell_for_script(&r.join("c.sh")), CheckProgram::Sh);
+    assert_eq!(shell_for_script(&r.join("d.sh")), CheckProgram::Sh);
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
+/// The environment of a check child, stated whole.
+#[test]
+fn wy1_check_child_env_is_stated_whole() {
+    let seal = (
+        std::ffi::OsString::from("PYTHONDONTWRITEBYTECODE"),
+        std::ffi::OsString::from("1"),
+    );
+    assert_eq!(
+        check_child_env(Some("C:\\Windows".into())),
+        vec![("SystemRoot".into(), "C:\\Windows".into()), seal.clone()]
+    );
+    assert_eq!(check_child_env(None), vec![seal.clone()]);
+    assert_eq!(check_child_env(Some("".into())), vec![seal]);
+}
+
+/// A fake program (a `/bin/sh` script) under the test's folder.
+#[cfg(unix)]
+fn wy1_fake_program(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let p = dir.join(name);
+    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+    replay::set_mode(&p, 0o755);
+    p
+}
+
+fn wy1_units() -> (usize, usize, bool) {
+    UNITS.with(|u| u.get())
+}
+
+fn wy1_units_reset() {
+    UNITS.with(|u| u.set((0, 0, false)));
+}
+
+/// RULINGS LH2 — THE RUN, driven with a REAL interpreter on this host: a file that compiles passes; a
+/// syntax error fails with the interpreter's own message; the file is never executed; no `__pycache__`
+/// is written; the check's one unit ends observed whole.
+#[cfg(unix)]
+#[test]
+fn wy1_compile_child_passes_fails_with_the_message_and_never_executes() {
+    let py = replay::bundled_interpreter().expect("a python3 for this test (the harness pins one)");
+    let r = root("wy1-py");
+    put(
+        &r,
+        "bin/ok.py",
+        "open(__file__ + '.ran', 'w').write('x')\n\ndef f():\n    return 1\n",
+    );
+    put(&r, "bin/bad.py", "def f(:\n    return 1\n");
+    wy1_units_reset();
+    assert_eq!(
+        bounded_py_compile(
+            &py,
+            &r.join("bin/ok.py"),
+            "bin/ok.py",
+            Duration::from_secs(60)
+        ),
+        CheckResult::Pass
+    );
+    assert_eq!(
+        wy1_units(),
+        (0, 1, false),
+        "the one unit ended observed whole"
+    );
+    assert!(
+        !r.join("bin/ok.py.ran").exists(),
+        "the checked file was executed"
+    );
+    match bounded_py_compile(
+        &py,
+        &r.join("bin/bad.py"),
+        "bin/bad.py",
+        Duration::from_secs(60),
+    ) {
+        CheckResult::Fail(m) => {
+            assert!(
+                m.starts_with("bin/bad.py: 파이썬 컴파일 검사 실패(종료 Some(1))"),
+                "{m}"
+            );
+            assert!(
+                m.contains("SyntaxError"),
+                "the interpreter's message is not carried: {m}"
+            );
+        }
+        other => panic!("expected a failure, got {other:?}"),
+    }
+    assert!(
+        !r.join("bin/__pycache__").exists(),
+        "the compile check wrote __pycache__"
+    );
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
+/// A missing interpreter (or shell) fails, naming the path; nothing is counted as observed whole.
+#[test]
+fn wy1_missing_program_fails_naming_the_path() {
+    let r = root("wy1-missing");
+    put(&r, "bin/x.py", "x = 1\n");
+    put(&r, "bin/x.sh", "x=1\n");
+    let py = r.join("runtime").join("python").join("python3.exe");
+    wy1_units_reset();
+    match bounded_py_compile(
+        &py,
+        &r.join("bin/x.py"),
+        "bin/x.py",
+        Duration::from_secs(10),
+    ) {
+        CheckResult::Fail(m) => {
+            assert!(m.contains("파이썬 컴파일 검사를 시작할 수 없습니다"), "{m}");
+            assert!(
+                m.contains(&py.display().to_string()),
+                "the path is not named: {m}"
+            );
+        }
+        other => panic!("expected a failure, got {other:?}"),
+    }
+    assert_eq!(
+        wy1_units(),
+        (0, 0, true),
+        "a child that never started is not observed whole"
+    );
+    let sh = r
+        .join("runtime")
+        .join("git")
+        .join("usr")
+        .join("bin")
+        .join("sh.exe");
+    match bounded_sh_syntax(
+        &sh,
+        &r.join("bin/x.sh"),
+        "bin/x.sh",
+        Duration::from_secs(10),
+    ) {
+        CheckResult::Fail(m) => {
+            assert!(m.contains("셸 문법 검사를 시작할 수 없습니다"), "{m}");
+            assert!(
+                m.contains(&sh.display().to_string()),
+                "the path is not named: {m}"
+            );
+        }
+        other => panic!("expected a failure, got {other:?}"),
+    }
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
+/// A child that never ends is killed at the deadline — itself and what it started — and the check
+/// ends in the deadline's answer (a time-out, which every caller takes as a failure); the call returns
+/// within the deadline; nothing of the run is left alive.
+#[cfg(unix)]
+#[test]
+fn wy1_child_that_never_ends_is_killed_at_the_deadline() {
+    let r = root("wy1-hang");
+    put(&r, "bin/x.py", "x = 1\n");
+    let pids = r.join("pids");
+    let fake = wy1_fake_program(
+        &r,
+        "python3.exe",
+        &format!(
+            "echo $$ > '{p}'\n/bin/sleep 30 &\necho $! >> '{p}'\nwait",
+            p = pids.display()
+        ),
+    );
+    wy1_units_reset();
+    let started = std::time::Instant::now();
+    let got = bounded_py_compile(
+        &fake,
+        &r.join("bin/x.py"),
+        "bin/x.py",
+        Duration::from_secs(2),
+    );
+    let took = started.elapsed();
+    assert_eq!(got, CheckResult::Timeout);
+    // the runner's own loop ends at the deadline; the margin only absorbs a loaded host's scheduling
+    assert!(
+        took < Duration::from_millis(3500),
+        "the runner did not return by its deadline: {took:?}"
+    );
+    assert_eq!(
+        wy1_units(),
+        (0, 0, true),
+        "a timed-out unit is not observed whole"
+    );
+    let list = std::fs::read_to_string(&pids).unwrap();
+    let pids: Vec<u32> = list.lines().map(|l| l.trim().parse().unwrap()).collect();
+    assert_eq!(pids.len(), 2, "{list}");
+    for pid in pids {
+        assert!(
+            gone(pid),
+            "process {pid} of the check survived the deadline"
+        );
+    }
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
+/// The child gets EXACTLY the stated environment (nothing of the test process's — HOME, PATH, CYS_*),
+/// its working folder is the program's own folder, its stdin is empty.
+#[cfg(unix)]
+#[test]
+fn wy1_child_gets_only_the_stated_environment() {
+    let r = root("wy1-env");
+    put(&r, "bin/x.py", "x = 1\n");
+    let out = r.join("seen");
+    let fake = wy1_fake_program(
+        &r,
+        "python3.exe",
+        &format!(
+            "/usr/bin/env > '{o}.env'\n/bin/pwd > '{o}.pwd'\n/bin/cat > '{o}.stdin'",
+            o = out.display()
+        ),
+    );
+    assert_eq!(
+        bounded_py_compile(
+            &fake,
+            &r.join("bin/x.py"),
+            "bin/x.py",
+            Duration::from_secs(20)
+        ),
+        CheckResult::Pass
+    );
+    let env = std::fs::read_to_string(format!("{}.env", out.display())).unwrap();
+    let mut keys: Vec<&str> = env
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, _)| k))
+        // what the shell running the fake sets for itself
+        .filter(|k| !matches!(*k, "PWD" | "OLDPWD" | "SHLVL" | "_"))
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["CYS_NO_AUTOSTART", "PYTHONDONTWRITEBYTECODE"],
+        "{env}"
+    );
+    assert!(env.contains("CYS_NO_AUTOSTART=1\n") && env.contains("PYTHONDONTWRITEBYTECODE=1\n"));
+    let pwd = std::fs::read_to_string(format!("{}.pwd", out.display())).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(pwd.trim()).unwrap(),
+        std::fs::canonicalize(&r).unwrap(),
+        "the working folder is not the program's own"
+    );
+    assert_eq!(
+        std::fs::read(format!("{}.stdin", out.display())).unwrap(),
+        b""
+    );
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
+/// RULINGS LH2 — the syntax check driven with REAL shells on this host: a good script passes, a syntax
+/// error fails with the shell's message, a script saved with CRLF line ends fails (the unix answer of
+/// `sh -n` too), the script is never run.
+#[cfg(unix)]
+#[test]
+fn wy1_shell_child_passes_fails_and_never_runs() {
+    let r = root("wy1-sh");
+    let marker = r.join("ran");
+    put(
+        &r,
+        "hooks/ok.sh",
+        &format!(
+            "#!/bin/sh\nset -u\n/usr/bin/touch '{}'\nif true; then\n  :\nfi\n",
+            marker.display()
+        ),
+    );
+    put(&r, "hooks/bad.sh", "#!/bin/sh\nif true; then\n  :\n");
+    put(
+        &r,
+        "hooks/crlf.sh",
+        "#!/bin/sh\r\nif true; then\r\n  :\r\nfi\r\n",
+    );
+    put(
+        &r,
+        "hooks/b.sh",
+        "#!/bin/bash\nf() { [[ -n \"${1:-}\" ]]; }\n",
+    );
+    let (sh, bash) = (Path::new("/bin/sh"), Path::new("/bin/bash"));
+    let dl = Duration::from_secs(60);
+    assert_eq!(
+        bounded_sh_syntax(sh, &r.join("hooks/ok.sh"), "hooks/ok.sh", dl),
+        CheckResult::Pass
+    );
+    assert!(!marker.exists(), "the checked script was run");
+    match bounded_sh_syntax(sh, &r.join("hooks/bad.sh"), "hooks/bad.sh", dl) {
+        CheckResult::Fail(m) => {
+            assert!(
+                m.starts_with("hooks/bad.sh: 셸 문법 검사 실패(종료 Some(2))"),
+                "{m}"
+            );
+            assert!(
+                m.contains("syntax error"),
+                "the shell's message is not carried: {m}"
+            );
+        }
+        other => panic!("expected a failure, got {other:?}"),
+    }
+    assert!(
+        matches!(
+            bounded_sh_syntax(sh, &r.join("hooks/crlf.sh"), "hooks/crlf.sh", dl),
+            CheckResult::Fail(_)
+        ),
+        "a CRLF script passed the syntax check"
+    );
+    // the unix check answers the same for the CRLF script (one rule on both paths)
+    assert!(matches!(
+        run_check(&req(&r, "hooks/crlf.sh")).unwrap(),
+        CheckResult::Fail(_)
+    ));
+    let shell = match shell_for_script(&r.join("hooks/b.sh")) {
+        CheckProgram::Bash => bash,
+        _ => sh,
+    };
+    assert_eq!(shell, bash);
+    assert_eq!(
+        bounded_sh_syntax(shell, &r.join("hooks/b.sh"), "hooks/b.sh", dl),
+        CheckResult::Pass
+    );
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
+/// The registrar's sentences are those of before the runner was shared (RULINGS LH2): its start
+/// failure and its failed exit.
+#[cfg(unix)]
+#[test]
+fn wy1_registrar_sentences_are_unchanged() {
+    use crate::repair::apply::{run_bounded, run_bounded_exit};
+    let none = std::process::Command::new("/nonexistent-wy1/registrar");
+    match run_bounded(none, Duration::from_secs(5)) {
+        Err(RepairError::Io(m)) => assert!(m.starts_with("등록기를 시작할 수 없습니다: "), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    let mut three = std::process::Command::new("/bin/sh");
+    three
+        .args(["-c", "echo out; echo err >&2; exit 3"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    assert_eq!(
+        run_bounded(three, Duration::from_secs(10)),
+        Err(RepairError::CheckFailed(
+            "등록기가 실패했습니다(종료 Some(3))".into()
+        ))
+    );
+    let mut three = std::process::Command::new("/bin/sh");
+    three
+        .args(["-c", "echo out; echo err >&2; exit 3"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let done = run_bounded_exit(three, Duration::from_secs(10), "셸 문법 검사").unwrap();
+    assert_eq!(done.status.code(), Some(3));
+    assert_eq!(done.stdout, "out\n");
+    assert_eq!(done.stderr, b"err\n");
+}

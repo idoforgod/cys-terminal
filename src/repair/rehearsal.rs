@@ -198,8 +198,16 @@ fn run_kind(
             "{rel}: 일반 파일이 아닙니다(없거나 링크·폴더)"
         ))),
         CheckKind::JsonParse => Ok(json_parse(file, rel)),
+        #[cfg(unix)]
         CheckKind::ShSyntax => Ok(sh_syntax(file, rel, req.deadline)),
+        #[cfg(unix)]
         CheckKind::PyCompile => py_compile(file, rel, req.deadline),
+        // RULINGS LH2: where the replay runner is not built, ONE bounded child per check (a hook
+        // replay's own syntax check stays on `sh_syntax`: HookReplay is not built there)
+        #[cfg(not(unix))]
+        CheckKind::ShSyntax => Ok(bundled_sh_check(file, rel, req.deadline)),
+        #[cfg(not(unix))]
+        CheckKind::PyCompile => Ok(bundled_py_check(file, rel, req.deadline)),
         CheckKind::SelfTest => executed(root, rel, req, Exec::SelfTest(arg)),
         CheckKind::HookReplay => executed(root, rel, req, Exec::Hook(arg)),
     }
@@ -311,6 +319,7 @@ fn sh_syntax(file: &Path, rel: &str, deadline: Duration) -> CheckResult {
 const PY_COMPILE: &str =
     "import sys\nsrc = open(sys.argv[1], 'rb').read()\ncompile(src, sys.argv[1], 'exec')\n";
 
+#[cfg(unix)]
 fn py_compile(file: &Path, rel: &str, deadline: Duration) -> Result<CheckResult, RepairError> {
     let Some(py) = replay::bundled_interpreter() else {
         return Ok(CheckResult::Fail(format!(
@@ -333,6 +342,225 @@ fn py_compile(file: &Path, rel: &str, deadline: Duration) -> Result<CheckResult,
     let o = replay::run_child(&argv, &env, cwd, b"", deadline);
     note(&o);
     Ok(outcome_result(&o, rel, "파이썬 컴파일 검사"))
+}
+
+/// RULINGS LH2 — the programs a check child runs where the replay runner is not built (Windows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckProgram {
+    /// the interpreter of the compile check
+    Python,
+    /// the shell of the syntax check of a script whose first line does not name bash
+    Sh,
+    /// the shell of the syntax check of a script whose first line names bash
+    Bash,
+}
+
+impl CheckProgram {
+    /// Its place in a Windows install, under the daemon's folder. The interpreter is the coordinate
+    /// the product's health list requires (`crate::BUNDLED_WINDOWS_RUNTIME_REL` ③); the shells are the
+    /// bundled Git's MSYS binaries in `runtime\git\usr\bin` (② of the same list is its `bash.exe`) —
+    /// NOT the launcher `runtime\git\bin\bash.exe`, which only prepares a Git environment around the
+    /// same binary. `sh.exe` checks a script whose first line does not name bash (as `/bin/sh` on
+    /// unix), `bash.exe` one that does (as `/bin/bash`).
+    pub fn windows_rel(self) -> &'static [&'static str] {
+        match self {
+            CheckProgram::Python => &["runtime", "python", "python3.exe"],
+            CheckProgram::Sh => &["runtime", "git", "usr", "bin", "sh.exe"],
+            CheckProgram::Bash => &["runtime", "git", "usr", "bin", "bash.exe"],
+        }
+    }
+}
+
+/// RULINGS LH1 / LH2 — where the check finds `prog` for a daemon whose binary lies in `exe_dir`, on
+/// `os` (the `std::env::consts::OS` spelling): a PURE function of those two inputs (one stat), so that
+/// a test on any host drives the Windows answer with a temporary folder. `Ok` = a regular file is
+/// there; `Err` = a sentence naming what was looked for. Only Windows is answered: the unix checks
+/// keep their own programs (`sh_syntax` / `py_compile`, unchanged) and never ask; no PATH is searched
+/// (a bare `python3.exe` on a Windows PATH can be the Store's alias, which opens a window).
+pub fn bundled_check_program_for(
+    exe_dir: &Path,
+    os: &str,
+    prog: CheckProgram,
+) -> Result<PathBuf, String> {
+    if os != "windows" {
+        return Err(format!(
+            "{os}: 이 운영체제의 검사는 동봉 런타임에서 실행기를 찾지 않습니다"
+        ));
+    }
+    let mut p = exe_dir.to_path_buf();
+    for seg in prog.windows_rel() {
+        p.push(seg);
+    }
+    if p.is_file() {
+        Ok(p)
+    } else {
+        Err(format!("{} 에 실행 파일이 없습니다", p.display()))
+    }
+}
+
+/// The shell a script's syntax is checked with — the rule of `sh_syntax`: a script whose first line
+/// names bash is checked by bash, every other one by sh.
+pub fn shell_for_script(file: &Path) -> CheckProgram {
+    if first_line(file).contains("bash") {
+        CheckProgram::Bash
+    } else {
+        CheckProgram::Sh
+    }
+}
+
+/// RULINGS LH2 — the environment of a check child, stated whole (the builder's environment is cleared
+/// first: nothing of the daemon's or the user's is inherited):
+/// - `SystemRoot`, the daemon's own value when it has one (never on unix): a Windows process started
+///   with a cleared environment needs it to start whole (system DLLs and the system's crypto provider
+///   are found through it; CPython's start-up takes its random seed from that provider);
+/// - `PYTHONDONTWRITEBYTECODE=1`: the bytecode seal (SEAL-1) that `python_command` sets and the
+///   clearing removed — the compile child's `-B` does the work and `-I` makes CPython ignore every
+///   `PYTHON*` variable; inert for a shell; restated so that no spawn of the product drops the seal.
+///
+/// `CYS_NO_AUTOSTART=1` is added after this list by `no_autostart` (every child of the daemon). Nothing
+/// else: no PATH (both programs are absolute paths just looked up, their DLLs lie beside them, and
+/// neither child starts another program), no HOME / USERPROFILE / APPDATA (nothing of the user's site),
+/// no TEMP / TMP (neither child writes a file).
+pub fn check_child_env(
+    system_root: Option<std::ffi::OsString>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut env = Vec::new();
+    if let Some(v) = system_root.filter(|v| !v.is_empty()) {
+        env.push(("SystemRoot".into(), v));
+    }
+    env.push((
+        crate::ENV_PY_NO_BYTECODE.into(),
+        crate::PY_NO_BYTECODE_ON.into(),
+    ));
+    env
+}
+
+/// RULINGS LH2 — the one preparation of a check child (a spawn-policy wrapper the spawn census reads):
+/// the environment cleared and restated ([`check_child_env`]); the console hidden and the child leading
+/// its own process group (`GroupScoped` — the registrar's grade on the same runner: a new process group
+/// and `CREATE_NO_WINDOW` on Windows, a new session on unix, so that the bounded runner can stop it at
+/// the deadline); no autostart of a rival daemon; the pipes the bounded runner reads, set by the runner's
+/// own module (`apply::bounded_pipes`) — this file configures and reads no child's standard output (the
+/// RULINGS GA1 census: only the judge reads a hook's output).
+fn prepare_check_child(cmd: &mut std::process::Command) {
+    cmd.env_clear();
+    for (k, v) in check_child_env(std::env::var_os("SystemRoot")) {
+        cmd.env(k, v);
+    }
+    {
+        use crate::SpawnPolicy as _;
+        cmd.spawn_policy(crate::ChildLifetime::GroupScoped)
+            .no_autostart();
+    }
+    super::apply::bounded_pipes(cmd);
+}
+
+/// RULINGS LH2 — ONE prepared check child run through the bounded runner of every apply
+/// (`apply::run_bounded_exit`: one deadline, killed and reaped, never blocks) and read as the unix
+/// check reads its child: exit 0 = pass; another exit = fail with the tail of its standard error; the
+/// deadline = time-out; a child that could not start or did not end cleanly = fail naming the program.
+fn run_check_child(
+    mut cmd: std::process::Command,
+    program: &Path,
+    rel: &str,
+    what: &str,
+    deadline: Duration,
+) -> CheckResult {
+    // the program's own folder as the working folder — never a folder of the pack: Windows holds a
+    // process's working folder open, and a folder held open cannot be renamed (the pack update renames
+    // pack folders)
+    if let Some(d) = program.parent().filter(|d| !d.as_os_str().is_empty()) {
+        cmd.current_dir(d);
+    }
+    match super::apply::run_bounded_exit(cmd, deadline, what) {
+        Ok(done) => {
+            // RULINGS GA3: the check's one unit ended observed whole — an exit status within the
+            // deadline, both outputs read to their end with nothing dropped, nothing of it left alive
+            note_unit(true);
+            if done.status.success() {
+                CheckResult::Pass
+            } else {
+                CheckResult::Fail(format!(
+                    "{rel}: {what} 실패(종료 {:?}) — {}",
+                    done.status.code(),
+                    tail(&done.stderr)
+                ))
+            }
+        }
+        Err(e) => {
+            note_unit(false);
+            match e {
+                RepairError::CheckTimeout(_) => CheckResult::Timeout,
+                RepairError::Io(m) | RepairError::CheckFailed(m) => {
+                    CheckResult::Fail(format!("{rel}: {m} — 실행 파일 {}", program.display()))
+                }
+                other => CheckResult::Fail(format!(
+                    "{rel}: {what} — {other:?} — 실행 파일 {}",
+                    program.display()
+                )),
+            }
+        }
+    }
+}
+
+/// RULINGS LH2 — the compile check as ONE bounded child where the replay runner is not built (only
+/// non-unix calls it; written platform-neutral so that the tests on any host drive this same function
+/// with a real child): `<py> -I -S -B -c <PY_COMPILE> <file>` — the file's bytes are read and
+/// compiled, never executed or imported; the file is an argument, never part of a command string.
+pub fn bounded_py_compile(py: &Path, file: &Path, rel: &str, deadline: Duration) -> CheckResult {
+    // SEAL-1: the one sealed factory of a direct Python spawn
+    let mut cmd = crate::python_command(py);
+    prepare_check_child(&mut cmd);
+    cmd.args(["-I", "-S", "-B", "-c", PY_COMPILE]).arg(file);
+    run_check_child(cmd, py, rel, "파이썬 컴파일 검사", deadline)
+}
+
+/// RULINGS LH2 — the syntax check as ONE bounded child where the replay runner is not built (as
+/// [`bounded_py_compile`]): `<shell> -n <file>` — the script is parsed, never run.
+pub fn bounded_sh_syntax(shell: &Path, file: &Path, rel: &str, deadline: Duration) -> CheckResult {
+    let mut cmd = std::process::Command::new(shell);
+    prepare_check_child(&mut cmd);
+    cmd.arg("-n").arg(file);
+    run_check_child(cmd, shell, rel, "셸 문법 검사", deadline)
+}
+
+/// The folder of the running binary — `cysd.exe` and `cys.exe` are installed side by side, the
+/// bundled runtime beside them (`<folder>\runtime`).
+#[cfg(not(unix))]
+fn daemon_folder() -> Result<PathBuf, String> {
+    match std::env::current_exe() {
+        Ok(p) => match p.parent() {
+            Some(d) => Ok(d.to_path_buf()),
+            None => Err(format!("{}: 실행 파일의 폴더가 없습니다", p.display())),
+        },
+        Err(e) => Err(format!("실행 파일의 경로를 알 수 없습니다 — {e}")),
+    }
+}
+
+/// RULINGS LH2 — the compile check on non-unix: the bundled interpreter, then ONE bounded child.
+#[cfg(not(unix))]
+fn bundled_py_check(file: &Path, rel: &str, deadline: Duration) -> CheckResult {
+    match daemon_folder()
+        .and_then(|d| bundled_check_program_for(&d, std::env::consts::OS, CheckProgram::Python))
+    {
+        Ok(py) => bounded_py_compile(&py, file, rel, deadline),
+        Err(why) => CheckResult::Fail(format!(
+            "{rel}: 파이썬 실행기를 찾지 못해 컴파일 검사를 할 수 없습니다 — {why}"
+        )),
+    }
+}
+
+/// RULINGS LH2 — the syntax check on non-unix: the bundled shell the script's first line asks for,
+/// then ONE bounded child.
+#[cfg(not(unix))]
+fn bundled_sh_check(file: &Path, rel: &str, deadline: Duration) -> CheckResult {
+    let prog = shell_for_script(file);
+    match daemon_folder().and_then(|d| bundled_check_program_for(&d, std::env::consts::OS, prog)) {
+        Ok(shell) => bounded_sh_syntax(&shell, file, rel, deadline),
+        Err(why) => CheckResult::Fail(format!(
+            "{rel}: 셸을 찾지 못해 문법 검사를 할 수 없습니다 — {why}"
+        )),
+    }
 }
 
 enum Exec<'a> {
