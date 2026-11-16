@@ -30256,6 +30256,12 @@ fn fetch_remote_pack(manifest_url: &str, base: &std::path::Path) -> Result<std::
             .arg(&out)
             .arg("--")
             .arg(&url)
+            // ★PO1 FR1 (RULINGS LH37): the curl child never inherits the command's stdout — that stdout carries the machine
+            //   records only (the app takes the terminal record only as stdout line 0), and a user's curl configuration
+            //   (`~/.curlrc` with `write-out = …`) would print there before the record. The body still goes to the `-o` file
+            //   and curl's errors to the inherited stderr. The user's configuration is NOT disabled (no `-q`, no
+            //   `CURL_HOME`): a proxy, CA or timeout set there must keep working.
+            .stdout(std::process::Stdio::null())
             .status()
             .map_err(|e| format!("curl 실행 실패: {e}"))?;
         if !status.success() {
