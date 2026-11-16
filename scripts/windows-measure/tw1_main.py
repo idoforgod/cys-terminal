@@ -114,6 +114,8 @@ def cmd_probe(a):
                "evidence": pr.evidence, "restored": False}
     if P.KILL_REFUSED:  # TW2: a kill by a remembered pid that named another process by then (no verdict reads it)
         obs["kill_refused"] = list(P.KILL_REFUSED)
+    if pr.findings:  # TW4: finding lines the probe wrote itself (the shell repair flow's outcome); no verdict reads them
+        obs["findings"] = list(pr.findings)
     if pr.ctx_updates:
         ctx = _load_json(ctx_path, {})
         for k, v in pr.ctx_updates.items():
@@ -283,7 +285,8 @@ def cmd_run(a):
     meta = {"commit": os.environ.get("GITHUB_SHA"), "phase": a.phase, "matrix": "scripts/windows-measure/matrix.json",
             "run_id": os.environ.get("GITHUB_RUN_ID"), "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
             "finished_epoch": time.time(), "units": _units(m, ctx)}
-    record = R.build_record(meta, environment, setup, row_results, sub_results)
+    record = R.build_record(meta, environment, setup, row_results, sub_results,
+                            R.probe_findings(m["order"], outcomes))
     record = R.redact(record, mapping)
     for pid, oc in outcomes.items():
         _dump_json(os.path.join(a.out, "observations", pid + ".json"), R.redact(oc, mapping))

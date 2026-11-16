@@ -11,6 +11,7 @@ Nothing here repairs what it finds; product files are changed only as the scenar
 product's own actions the scenario reproduces (the app's init-pack, the daemon start, the narrow hook registrar).
 """
 
+import copy
 import glob
 import hashlib
 import json
@@ -721,6 +722,7 @@ class Probe:
         self.evidence = []
         self.ctx_updates = {}
         self.restored = None
+        self.findings = []      # TW4: finding lines a probe writes itself (the record lists them after the rows')
         self.ev_dir = os.path.join(out, "evidence", pid)
         os.makedirs(self.ev_dir, exist_ok=True)
         self.mapping = [tuple(x) for x in ctx.get("redaction", [])]
@@ -4583,8 +4585,10 @@ def _pane_quote(arg, kind):
     return "'" + a.replace("'", "''") + "'"
 
 
-def _seat_cys(pr, sid, kind, args, tag):
-    d = os.path.join(pr.work, "repair-flow")
+def _seat_cys(pr, sid, kind, args, tag, folder="repair-flow", wait_s=90):
+    """`folder` names the work and evidence sub-folder; `wait_s` how long the answer file is waited for (TW4: the shell
+    flow passes its own folder and what is left of its time budget; the Python flow's calls use the defaults)."""
+    d = os.path.join(pr.work, folder)
     script = os.path.join(d, "seat_cys.py")
     write_bytes(script, _SEAT_CYS_SCRIPT.encode("utf-8"))
     outp = os.path.join(d, tag + ".json")
@@ -4595,18 +4599,18 @@ def _seat_cys(pr, sid, kind, args, tag):
     pr.cys(["send", "--surface", sid, line], timeout=30)
     pr.cys(["send-key", "--surface", sid, "Return"], timeout=30)
     t0 = time.monotonic()
-    while time.monotonic() - t0 < 90 and not os.path.isfile(outp):
+    while time.monotonic() - t0 < wait_s and not os.path.isfile(outp):
         time.sleep(1)
     res = _load(outp)
-    pr.ev("repair-flow/%s.json" % tag, {"args": list(args), "result": res})
+    pr.ev("%s/%s.json" % (folder, tag), {"args": list(args), "result": res})
     return res
 
 
-def _flow_seats(pr, tag):
+def _flow_seats(pr, tag, folder="repair-flow"):
     """A worker seat and a reviewer1 seat (reviewer-codex) created by the daemon -> ({role: sid}, {role: "bash"|"native"})."""
     seats, kinds = {}, {}
     for role in ("worker", "reviewer-codex"):
-        ns = pr.ev_cmd("repair-flow/%s-new-surface-%s.json" % (tag, role), pr.cys(["new-surface", "--role", role], timeout=60))
+        ns = pr.ev_cmd("%s/%s-new-surface-%s.json" % (folder, tag, role), pr.cys(["new-surface", "--role", role], timeout=60))
         seats[role] = ns["out"].strip().splitlines()[-1].strip() if ns["code"] == 0 and ns["out"].strip() else None
     time.sleep(5)
     lst = pr.cys(["list"], timeout=30, extra={"CYS_NO_AUTOSTART": "1"})
@@ -4788,6 +4792,320 @@ def probe_s3_repair_flow(pr):
         write_bytes(live2, pre2)
     pr.restored = bool(f["revert_live_is_pre"]) and sha256_file(live2) == f["flow_r2_pre_sha"]
 
+# ── TW4: a second, SEPARATE repair flow in the same stage, on ONE general shell file ──
+# The commit door checks a general shell file on Windows with the bundled Git shell (unit WY1, rehearsal.rs
+# `bundled_sh_check` -> `bounded_sh_syntax`: `<install>\runtime\git\usr\bin\sh.exe -n <file>`, or `bash.exe -n` when the
+# file's first line names bash - `shell_for_script`). The Python flow above edits a .py file only, so that check never
+# ran on the runner. This flow runs AFTER the Python flow and leaves it alone: no fact of the stage, no evidence file of
+# its list (so no row's evidence column moves), no row, no verdict. Its outcome is ONE finding line of the record and
+# the folder evidence/s3_repair_flow/repair-flow-sh/. The file is the first candidate the product answers `general` for
+# (its local query `cys repair boot-critical --path <file> --json`, which writes nothing; then `begin`'s own
+# classification); every candidate below was checked against the pack tree of the release candidate (exists, LF, a #!
+# line, on neither compiled list nor among the protection inputs, in no scenario pool of this driver).
+SH_FLOW_CANDIDATES = (
+    "hooks/brief-lint-warn.sh",                      # #!/bin/sh -> sh.exe (the door WY1 built); a hook the product never
+                                                     # registers (boot_critical_derive.rs DROPPED_CANDIDATES)
+    "skills/systematic-debugging/find-polluter.sh",  # #!/usr/bin/env bash -> bash.exe (a skill's helper script)
+    "skills/brainstorming/scripts/stop-server.sh",   # #!/usr/bin/env bash -> bash.exe (a skill's helper script)
+)
+SH_FLOW_DIR = "repair-flow-sh"
+SH_FLOW_EDIT = b"# tw4 repair flow edit\n"
+SH_FLOW_MAX_COMMITS = 2
+SH_FLOW_RETRY_RC = 94        # EXIT_REPAIR_LOCKED (repair/types.rs): repair_locked AND target_changed - the float
+                             # defect's false sentence '검사하는 동안 수리 기록이 바뀌었습니다' and every lock sentence
+SH_FLOW_RESERVE_S = 120      # kept free before the stage's time limit: the write-back and the observation file
+SH_FLOW_MIN_START_S = 300    # the two seats alone take up to 155 s when every call runs to its time limit
+SH_FLOW_STEP_MIN_S = 70      # one seat step: send + send-key (up to 30 s each), then the wait for its answer
+SH_FLOW_ASSUMPTION = (
+    "WY1: on Windows the commit door checks a general shell file with the bundled Git shell "
+    "(runtime\\git\\usr\\bin\\sh.exe -n <file>; bash.exe -n when the first line names bash) and a general repair of a "
+    "shell file commits (rc 0). TW4 writes this line in every run whatever the outcome - rc 0 = the assumption holds; "
+    "anything else names the step, its exit code and the product's sentence")
+
+
+def sh_flow_shell(first_line):
+    """The shell the product checks a script with (rehearsal.rs `shell_for_script`): bash when the first line names
+    bash, sh otherwise."""
+    return "bash" if "bash" in (first_line or "") else "sh"
+
+
+def sh_candidate_refusal(rel, data, excluded):
+    """Why the file `rel` (its live bytes `data`) cannot be the shell flow's file - or None."""
+    if rel in excluded:
+        return "used by another leg of this run (a scenario pool, the selection, an edit)"
+    if data is None:
+        return "absent or not readable"
+    if not data.startswith(b"#!"):
+        return "no #! first line"
+    if b"\r" in data:
+        return "has CR bytes (a CRLF script is not what this flow measures)"
+    return None
+
+
+def _last_json(text):
+    for ln in reversed((text or "").strip().splitlines()):
+        ln = ln.strip()
+        if ln.startswith("{"):
+            try:
+                doc = json.loads(ln)
+            except ValueError:
+                return None
+            return doc if isinstance(doc, dict) else None
+    return None
+
+
+def sh_query_refusal(code, out):
+    """The product's LOCAL answer for a file (`cys repair boot-critical --path <file> --json`: exit 0 boot-critical,
+    1 not, 2 cannot decide; `protection` true for a protection file) -> why it is not general, or None."""
+    if code != 1:
+        return "the product's query answers exit %r (0 boot-critical, 2 cannot decide)" % (code,)
+    doc = _last_json(out) or {}
+    if doc.get("boot_critical") is not False or doc.get("protection") is not False:
+        return "the product's query answers boot_critical=%r protection=%r" % (doc.get("boot_critical"),
+                                                                                doc.get("protection"))
+    return None
+
+
+def _answer(res):
+    return ((res or {}).get("out") or "") + ((res or {}).get("err") or "")
+
+
+def sh_commit_attempts(commit):
+    """`commit(n)` -> the {rc, out, err} of attempt n, or None when it could not be made (no time left). At most
+    SH_FLOW_MAX_COMMITS attempts; a further one only after rc 94 (ticket TW4 (3): every attempt is recorded, so that a
+    94 followed by a 0 is visible as such). -> [{attempt, rc, message}]"""
+    attempts = []
+    for n in range(1, SH_FLOW_MAX_COMMITS + 1):
+        res = commit(n)
+        if res is None:
+            break
+        attempts.append({"attempt": n, "rc": res.get("rc"), "message": _answer(res).strip()})
+        if res.get("rc") != SH_FLOW_RETRY_RC:
+            break
+    return attempts
+
+
+def sh_flow_finding(s, mapping, evidence):
+    """The ONE line the record shows for the shell flow (ticket TW4 (2)): `repair-flow-sh: commit rc=<n> <first 200
+    characters of the product's message>` per attempt - or the step that stopped it with its rc and message, or why no
+    file was taken, or why the flow did not run - then the file, its shell and whether the pack file is back. Every
+    message is redacted BEFORE it is cut (a needle cut in two could not be found any more)."""
+    def cut(t):
+        return re.sub(r"\s+", " ", R.redact(t or "", mapping)).strip()[:200]
+    if s.get("not_run"):
+        check, head = "not-run", "not run - %s" % s["not_run"]
+    elif s.get("error") and not s.get("commit_attempts"):
+        check, head = "driver-error", "stopped by the driver: %s" % cut(s["error"])
+    elif s.get("picked") is None:
+        check = "no-general-shell-file"
+        head = "no general shell file found (%s)" % "; ".join(
+            "%s: %s" % (c.get("rel"), c.get("refused")) for c in s.get("candidates") or [])
+    elif s.get("commit_attempts"):
+        check = "commit"
+        head = " | retried: ".join("commit rc=%s %s" % (a.get("rc"), cut(a.get("message")))
+                                   for a in s["commit_attempts"])
+    elif s.get("stopped_at"):
+        check = "stopped"
+        head = "stopped at %s rc=%s %s" % (s["stopped_at"], s.get("stopped_rc"), cut(s.get("stopped_message")))
+    else:
+        check, head = "stopped", "stopped before commit (no step answered)"
+    tail = []
+    if s.get("picked"):
+        tail.append("file %s, shell %s (%s, present: %s)" % (s["picked"], s.get("shell"), s.get("shell_program"),
+                                                             s.get("shell_program_exists")))
+    if s.get("repair"):
+        tail.append("repair %s" % s["repair"])
+    if s.get("error") and s.get("commit_attempts"):
+        tail.append("driver error after the commit: %s" % cut(s["error"]))
+    if "revert_rc" in s:
+        tail.append("revert rc=%s" % s["revert_rc"])
+    if s.get("budget_out_at"):
+        tail.append("the stage's time budget was used up before step %s" % s["budget_out_at"])
+    if "pack_file_back" in s:
+        tail.append("pack file back to its pre-image: %s" % (
+            ("yes (%s)" % s.get("restored_by")) if s["pack_file_back"] else "NO - the stage's state is unknown"))
+    observed = R.redact("repair-flow-sh: " + head + ((" | " + "; ".join(tail)) if tail else ""), mapping)
+    return {"row": "repair-flow-sh", "check": check, "assumption": SH_FLOW_ASSUMPTION, "observed": observed,
+            "evidence": list(evidence)}
+
+
+def _sh_flow_fallback_finding(e, mapping):
+    return {"row": "repair-flow-sh", "check": "driver-error", "assumption": SH_FLOW_ASSUMPTION,
+            "observed": R.redact("repair-flow-sh: stopped by the driver: %s: %s" % (type(e).__name__, e), mapping)[:400],
+            "evidence": []}
+
+
+def _sh_flow_body(pr, s, st, deadline):
+    """Pick the file, then begin -> the live edit -> record -> attest-verify (reviewer1) -> commit (twice at most) ->
+    the product's revert when the repair may be applied. Writes into `s` (the summary) and `st` (live path, pre-image)."""
+    cys = pr.exe("cys.exe")
+    sc = matrix()["scenario"]
+    excluded = {v for v in (pr.ctx.get("selection") or {}).values() if v}
+    excluded |= {e.get("rel") for e in (pr.ctx.get("edits") or {}).values()}
+    for pool in sc.get("tnv_mark_pools") or []:
+        excluded |= set(sc.get(pool) or [])
+    excluded.add(sc.get("query_listed_rel"))
+    for rel in SH_FLOW_CANDIDATES:
+        live = os.path.join(pr.pack_dir, *rel.split("/"))
+        data = read_bytes(live)
+        first = data.split(b"\n", 1)[0].decode("utf-8", "replace") if data else None
+        c = {"rel": rel, "first_line": first, "shell": sh_flow_shell(first) if first is not None else None}
+        why = sh_candidate_refusal(rel, data, excluded)
+        if why is None:
+            code, _lane, r = _boot_critical_exit(cys, live)
+            c["query"] = {"code": code, "out": R.redact(r["out"], pr.mapping)[-600:],      # redacted, THEN cut
+                          "err": R.redact(r["err"], pr.mapping)[-600:], "timed_out": r["timed_out"]}
+            why = sh_query_refusal(code, r["out"])
+        c["refused"] = why
+        s["candidates"].append(c)
+        if why is None:
+            s["picked"], s["shell"] = rel, c["shell"]
+            break
+    pr.ev(SH_FLOW_DIR + "/candidates.json", s["candidates"])
+    if s["picked"] is None:
+        return
+    rel = s["picked"]
+    prog = ["runtime", "git", "usr", "bin", s["shell"] + ".exe"]
+    s["shell_program"] = "\\".join(prog)
+    s["shell_program_exists"] = os.path.isfile(os.path.join(pr.install_dir, *prog))
+    st["live"] = live = os.path.join(pr.pack_dir, *rel.split("/"))
+    st["pre"] = pre = read_bytes(live)
+    s["pre_sha"] = sha256_bytes(pre)
+    if deadline - time.monotonic() < SH_FLOW_MIN_START_S:
+        s["stopped_at"], s["stopped_message"] = "seats", "not started: the stage's time budget is used up"
+        return
+    seats, kinds = _flow_seats(pr, "a", folder=SH_FLOW_DIR)
+    s["seats"] = {k: bool(v) for k, v in seats.items()}
+    s["seat_kinds"] = dict(kinds)
+    if not all(seats.values()):
+        s["stopped_at"], s["stopped_message"] = "seats", "a seat was not created (see a-new-surface-*.json)"
+        return
+
+    def step(name, role, args):
+        left = deadline - time.monotonic()
+        if left < SH_FLOW_STEP_MIN_S:
+            s["budget_out_at"] = name
+            return None
+        res = _seat_cys(pr, seats[role], kinds[role], args, name, folder=SH_FLOW_DIR,
+                        wait_s=min(90, left - (SH_FLOW_STEP_MIN_S - 10))) or {}
+        s["steps"].append({"step": name, "rc": res.get("rc"),
+                           "answer": R.redact(_answer(res).strip(), pr.mapping)[:400]})   # redacted, THEN cut
+        return res
+
+    def stop(name, res):
+        if res is None:
+            s["stopped_at"], s["stopped_message"] = name, "not run: the stage's time budget is used up"
+        else:
+            s["stopped_at"], s["stopped_rc"], s["stopped_message"] = name, res.get("rc"), (
+                _answer(res).strip() or "no answer within the wait (the seat wrote no result file)")
+
+    b = step("begin", "worker", ["repair", "begin", "--files", rel, "--trigger", "owner-order", "--json"])
+    doc = _last_json((b or {}).get("out")) or {}
+    m_id = re.search(r"\bR-\d+\b", _answer(b))
+    s["repair"] = doc.get("repair") or (m_id.group(0) if m_id else None)
+    s["classification"] = doc.get("classification")
+    if b is None or b.get("rc") != 0 or not s["repair"]:
+        stop("begin", b)
+        return
+    if s["classification"] != "general":
+        s["stopped_at"], s["stopped_rc"] = "begin", b.get("rc")
+        s["stopped_message"] = "begin classified the file %r, not general - nothing edited" % (s["classification"],)
+        return
+    edited = pre + (b"" if pre.endswith(b"\n") else b"\n") + SH_FLOW_EDIT
+    write_bytes(live, edited)
+    st["edited"] = edited
+    s["edited_sha"] = sha256_bytes(edited)
+    rid = s["repair"]
+    for name, role, args in (("record", "worker", ["repair", "record", rid, "--note", "tw4 shell repair flow", "--json"]),
+                             ("attest", "reviewer-codex", ["repair", "attest-verify", rid, "--verdict", "pass",
+                                                           "--note", "tw4"])):
+        r = step(name, role, args)
+        if r is None or r.get("rc") != 0:
+            stop(name, r)
+            return
+    s["commit_attempts"] = sh_commit_attempts(
+        lambda n: step("commit" if n == 1 else "commit-%d" % n, "worker", ["repair", "commit", rid, "--json"]))
+    if not s["commit_attempts"]:
+        stop("commit", None)
+        return
+    last = s["commit_attempts"][-1]["rc"]
+    s["committed"] = last == 0
+    if s["committed"]:
+        s["live_after_commit_is_edited"] = sha256_file(live) == s["edited_sha"]
+    if last in (0, None):            # applied, or no answer in time (it may be applied): the product's revert first
+        r = step("revert", "worker", ["repair", "revert", rid])
+        s["revert_rc"] = None if r is None else r.get("rc")
+        time.sleep(2)
+        s["reverted_by_product"] = sha256_file(live) == s["pre_sha"]
+
+
+def _repair_flow_sh(pr, t0):
+    """TW4 - the shell flow (see SH_FLOW_CANDIDATES). Never raises. Leaves the stage's facts and its evidence list as
+    they were; the shell file is put back (the product's revert after a commit, else the pre-image written back by the
+    driver). pr.restored is lowered ONLY when the file could not be put back - a pack file left changed would make the
+    later stages measure another pack (plan 3.7 rule 8); it is never raised."""
+    facts0, ev0 = copy.deepcopy(pr.facts), list(pr.evidence)
+    s = {"candidates": [], "picked": None, "shell": None, "steps": [], "commit_attempts": []}
+    st = {"live": None, "pre": None, "edited": None}
+    try:
+        limit = matrix()["probes"]["s3_repair_flow"]["time_limit_s"]
+        deadline = t0 + limit - SH_FLOW_RESERVE_S
+        s["budget_s_at_start"] = round(deadline - time.monotonic(), 1)
+        if s["budget_s_at_start"] < SH_FLOW_MIN_START_S:
+            s["not_run"] = "%d s of the stage's %d s time limit were left after the Python flow (it needs %d s)" % (
+                int(s["budget_s_at_start"] + SH_FLOW_RESERVE_S), limit, SH_FLOW_MIN_START_S + SH_FLOW_RESERVE_S)
+        else:
+            _sh_flow_body(pr, s, st, deadline)
+    except Exception as e:  # noqa: BLE001 - the flow's own failure is its finding, never the stage's
+        s["error"] = "%s: %s" % (type(e).__name__, e)
+    finally:
+        live, pre = st["live"], st["pre"]
+        if live and pre is not None:
+            for _ in range(3):
+                if sha256_file(live) == sha256_bytes(pre):
+                    break
+                try:
+                    write_bytes(live, pre)
+                    s["written_back_by_driver"] = True
+                except OSError as e:
+                    s.setdefault("write_back_errors", []).append(str(e))
+                    time.sleep(2)
+            s["pack_file_back"] = sha256_file(live) == sha256_bytes(pre)
+            s["restored_by"] = ("unchanged" if st["edited"] is None else
+                                "the product's revert" if s.get("reverted_by_product") else "the driver")
+            if not s["pack_file_back"]:
+                pr.restored = False
+        try:
+            pr.ev(SH_FLOW_DIR + "/summary.json", s)
+        except Exception as e:  # noqa: BLE001
+            s["summary_error"] = "%s: %s" % (type(e).__name__, e)
+        new = [e for e in pr.evidence if e not in ev0]
+        pr.evidence[:] = ev0
+        if pr.facts != facts0:
+            pr.facts.clear()
+            pr.facts.update(facts0)
+        try:
+            pr.findings.append(sh_flow_finding(s, pr.mapping, new))
+        except Exception as e:  # noqa: BLE001 - the line itself must not fail the stage
+            pr.findings.append(_sh_flow_fallback_finding(e, pr.mapping))
+
+
+def probe_s3_repair_flow_stage(pr):
+    """Stage s3_repair_flow: the Python repair flow (`probe_s3_repair_flow`, unchanged), then - TW4 - the separate repair
+    of one general shell file (`_repair_flow_sh`), which cannot change the first flow's facts, evidence list or rows.
+    The first flow raising keeps its 'error' status; the shell flow then does not run and says so."""
+    t0 = time.monotonic()
+    try:
+        probe_s3_repair_flow(pr)
+    except Exception:
+        pr.findings.append(sh_flow_finding({"not_run": "the Python repair flow before it raised (the stage's status "
+                                                       "is 'error')"}, pr.mapping, []))
+        raise
+    try:
+        _repair_flow_sh(pr, t0)
+    except Exception as e:  # noqa: BLE001 - defence in depth: the shell flow never turns the stage into an error
+        pr.findings.append(_sh_flow_fallback_finding(e, pr.mapping))
+
 
 PROBES = {
     "s0_env": probe_s0_env,
@@ -4808,7 +5126,7 @@ PROBES = {
     "s3_clear_chain": probe_s3_clear_chain,
     "s3_cp949_tools": probe_s3_cp949_tools,
     "s3_t6_jobs": probe_s3_t6_jobs,
-    "s3_repair_flow": probe_s3_repair_flow,
+    "s3_repair_flow": probe_s3_repair_flow_stage,     # TW4: the Python flow, then the shell flow
     "s7_primitives": probe_s7_primitives,
     "s7_t9_libtests": probe_s7_t9_libtests,
     "s7_w3_bootstep": probe_s7_w3_bootstep,

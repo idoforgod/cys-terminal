@@ -13,7 +13,9 @@ machine (scripts/tests/windows_measure_selftest.py):
   * a row needing a unit that is absent in the build is NOT-MEASURED "feature absent in this build";
   * a row that cannot be measured on a hosted runner is NOT-MEASURABLE-HERE, its fail-safe probes are sub-rows;
   * an observation that contradicts a stated assumption of the design or of a ruling is a FINDING (RULINGS EQ3): it never
-    changes a verdict and never turns the job red, but it is listed first and counted;
+    changes a verdict and never turns the job red, but it is listed first and counted; a probe may also write a finding
+    line of its own (TW4: the outcome of the shell repair flow of stage s3_repair_flow) - listed after the rows'
+    findings, counted the same way, read by no verdict;
   * the job is red when any row or sub-row is MEASURED-FAIL (after every probe ran) or when the set-up / the identity of the
     installation under test failed (RULINGS EQ4, D10);
   * every probe has a time limit; a probe that could not restore the state it promised makes the state "unknown" and every
@@ -584,10 +586,23 @@ def job_conclusion(record):
     return ("red" if reasons else "green"), reasons
 
 
-def build_record(meta, environment, setup, row_results, sub_results):
+def probe_findings(order, outcomes):
+    """TW4: the finding lines probes wrote themselves (their observation's `findings`), in probe order, each marked with
+    its probe. A probe that timed out wrote no observation and so has none."""
+    out = []
+    for pid in order:
+        for fd in ((outcomes or {}).get(pid) or {}).get("findings") or []:
+            if isinstance(fd, dict):
+                out.append(dict(fd, probe=pid))
+    return out
+
+
+def build_record(meta, environment, setup, row_results, sub_results, extra_findings=()):
+    """`extra_findings` (TW4): a probe's own finding lines - listed after the rows' findings, counted the same way."""
     findings = []
     for r in list(row_results) + list(sub_results):
         findings.extend(r.get("findings", []))
+    findings.extend(extra_findings)
     summary = summarize(row_results, sub_results, setup.get("failed"), findings)
     return {
         "schema": 1,

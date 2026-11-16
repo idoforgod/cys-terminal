@@ -19,7 +19,11 @@ What it pins (the rules of the record - plan impl/plans/TW1.md 3.7, each by a te
   W  the workflow file: triggers, permissions, time limits, pins, retention, concurrency, no secret, cleanup always();
   K  (TW2, RULINGS LH6) a kill by a REMEMBERED pid acts only while that pid still names the process that was recorded
      (creation time + image); a tree is walked only from a verified root and only to children not older than their
-     parent; every successful stop closes the pid's registration; the early copy of the record is redacted.
+     parent; every successful stop closes the pid's registration; the early copy of the record is redacted;
+  SH (TW4) stage s3_repair_flow's second repair flow on ONE general shell file: its candidates, its evidence folder
+     repair-flow-sh/ and its ONE finding line for a commit (rc 0, 94 then 0, two 94s, a refusal), a stop before the
+     commit, no general file, no time left; the Python flow's facts, evidence list and state are the same whatever
+     it does; the line and the folder are redacted (also across the 200-character cut) and reach the record.
 
 Standard library only. Run: python3 scripts/tests/windows_measure_selftest.py
 """
@@ -533,8 +537,14 @@ class PrivacyTests(unittest.TestCase):
                 fh.write("run as someone in X:\\profiles\\someone\r\nSOMEONE again\r\n")
             with open(os.path.join(src, "evidence", "s2_update", "new-cysd.out"), "wb") as fh:
                 fh.write("데몬 X:/profiles/someone/.cys/pack 시작\n".encode("utf-8"))
+            os.makedirs(os.path.join(src, "evidence", "s3_repair_flow", "repair-flow-sh"))    # TW4's folder
+            with open(os.path.join(src, "evidence", "s3_repair_flow", "repair-flow-sh", "commit.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"args": ["repair", "commit", "R-2", "--json"], "result": {"rc": 96, "out": "", "err": (
+                    "X:\\profiles\\someone\\.cys\\pack\\hooks\\x.sh: 셸 문법 검사 실패 — /x/profiles/SOMEONE/x.sh "
+                    "by someactor")}}, fh)
             sm = M.redacted_copy(src, dest, mp)
-            self.assertEqual((sm["copied"], sm["redacted"]), (3, 3), sm)
+            self.assertEqual((sm["copied"], sm["redacted"]), (4, 4), sm)
             blob = self._all_bytes_under(dest).lower()
             for needle in self.NEEDLES:
                 self.assertNotIn(needle.encode("utf-8"), blob, needle)
@@ -1468,6 +1478,541 @@ class KillIdentityTests(unittest.TestCase):
             src = fh.read()
         for banned in ("taskkill", "Stop-Process", "os.kill(", "wmic "):
             self.assertNotIn(banned, src)
+
+
+def split_native(line):
+    """The words of a native pane's command line as `_pane_quote` writes them (single quotes, '' for a quote)."""
+    out, i = [], 0
+    while i < len(line):
+        if line[i] == " ":
+            i += 1
+            continue
+        if line[i] == "'":
+            j, buf = i + 1, ""
+            while True:
+                if line[j] == "'" and line[j + 1:j + 2] == "'":
+                    buf, j = buf + "'", j + 2
+                    continue
+                if line[j] == "'":
+                    break
+                buf, j = buf + line[j], j + 1
+            out.append(buf)
+            i = j + 1
+        else:
+            j = line.find(" ", i)
+            j = len(line) if j < 0 else j
+            out.append(line[i:j])
+            i = j
+    return out
+
+
+class FakeProduct:
+    """TW4: cys.exe and its panes as the repair flows meet them. `run` is the driver's runner: the local query answers
+    per file, `new-surface` makes a seat, `send` to a seat runs the typed `cys repair …` line (the words after the
+    answer file of `_seat_cys`'s line) and writes the seat's answer file - as the pane's seat_cys.py does. The repair
+    verbs keep a small ledger: begin takes the live bytes as the pre-image; a commit with rc 0 applies (the live bytes
+    stay); revert of an applied repair writes the pre-image back. `commits` = per kind ("sh" / "py") the answers of the
+    successive commits; the Python flow's default is run 7c's 94."""
+    F94 = "repair.commit: %s: 검사하는 동안 수리 기록이 바뀌었습니다 — 확정을 멈춥니다(다시 `cys repair commit`)"
+
+    def __init__(self, pack, commits=None, query=None, begin_class=None, record_rc=None, answer_missing=()):
+        self.pack = pack
+        self.commits = {"sh": list((commits or {}).get("sh", [])), "py": list((commits or {}).get("py", []))}
+        self.query = dict(query or {})              # rel -> (exit code, {boot_critical, protection})
+        self.begin_class = dict(begin_class or {})  # rel -> classification begin answers (default general)
+        self.record_rc = dict(record_rc or {})      # kind -> (rc, message)
+        self.answer_missing = set(answer_missing)   # verbs of the SHELL repair whose seat never writes an answer file
+        self.calls, self.ledger, self.surfaces = [], {}, 0
+
+    def _rel_of(self, path):
+        return os.path.relpath(path, self.pack).replace(os.sep, "/")
+
+    def _verb(self, args):
+        verb = args[1]
+        self.calls.append(tuple(args))
+        if verb == "begin":
+            rel = args[args.index("--files") + 1]
+            rid = "R-%d" % (len(self.ledger) + 1)
+            with open(os.path.join(self.pack, *rel.split("/")), "rb") as fh:
+                pre = fh.read()
+            self.ledger[rid] = {"rel": rel, "pre": pre, "applied": False,
+                                "kind": "sh" if rel.endswith(".sh") else "py"}
+            return 0, json.dumps({"repair": rid, "classification": self.begin_class.get(rel, "general"),
+                                  "state": "in_progress"}) + "\n", ""
+        rid = args[2]
+        rec = self.ledger[rid]
+        if verb == "record":
+            rc, msg = self.record_rc.get(rec["kind"], (0, json.dumps({"repair": rid, "state": "in_progress"})))
+            return (rc, msg + "\n", "") if rc == 0 else (rc, "", msg + "\n")
+        if verb == "attest-verify":
+            return 0, "%s 검증 서명(pass) — 상태 진행 중\n" % rid, ""
+        if verb == "commit":
+            queue = self.commits[rec["kind"]]
+            rc, msg = queue.pop(0) if queue else ((94, self.F94 % rid) if rec["kind"] == "py" else (0, "{}"))
+            if rc == 0:
+                rec["applied"] = True
+                return 0, msg + "\n", ""
+            return rc, "", msg + "\n"
+        if verb == "revert":
+            if not rec["applied"]:
+                return 95, "", "repair.revert: %s: 적용되지 않은 수리입니다\n" % rid
+            with open(os.path.join(self.pack, *rec["rel"].split("/")), "wb") as fh:
+                fh.write(rec["pre"])
+            rec["applied"] = False
+            return 0, "%s 되돌렸습니다\n" % rid, ""
+        return 0, "{}\n", ""
+
+    def run(self, cmd, timeout, env=None, cwd=None, stdin_path=None):
+        args = [str(c) for c in cmd][1:]
+        res = {"cmd": [str(c) for c in cmd], "code": 0, "out": "", "err": "", "secs": 0.0, "timed_out": False}
+        if args[:2] == ["repair", "boot-critical"]:
+            rel = self._rel_of(args[args.index("--path") + 1])
+            code, doc = self.query.get(rel, (1, {"boot_critical": False, "protection": False}))
+            res.update(code=code, out=json.dumps(dict(doc, rel=rel)) + "\n")
+        elif args[:1] == ["new-surface"]:
+            self.surfaces += 1
+            res["out"] = "surface:%d\n" % self.surfaces
+        elif args[:1] == ["send"]:
+            words = split_native(args[3])
+            outp, rargs = words[6], words[7:]
+            silent = (rargs[:1] == ["repair"] and rargs[1] in self.answer_missing and rargs[1] != "begin"
+                      and self.ledger.get(rargs[2], {}).get("kind") == "sh")
+            if rargs[:1] == ["repair"] and not silent:
+                rc, out, err = self._verb(rargs)
+                with open(outp, "w", encoding="utf-8") as fh:
+                    json.dump({"rc": rc, "out": out, "err": err}, fh)
+            elif rargs[:1] == ["repair"]:
+                self.calls.append(tuple(rargs))
+        return res
+
+    def verbs(self, kind):
+        return [c[1] for c in self.calls if c[1] == "begin" and c[3].endswith(".sh") == (kind == "sh")
+                or c[1] != "begin" and c[2] in self.ledger and self.ledger[c[2]]["kind"] == kind]
+
+
+SH_PRE = b"#!/bin/sh\n# brief lint warn (test copy)\nexit 0\n"
+
+
+class ShellRepairFlowTests(unittest.TestCase):
+    """TW4: the second repair flow of stage s3_repair_flow - ONE general shell file - through the REAL driver functions
+    (probe_s3_repair_flow_stage -> probe_s3_repair_flow unchanged, then _repair_flow_sh with _flow_seats, _seat_cys,
+    _pane_quote, _boot_critical_exit) over an injected runner (FakeProduct). Its outcome is one finding and the folder
+    repair-flow-sh/; the Python flow's facts, its evidence list and the stage's state are the same whatever it does."""
+
+    def setUp(self):
+        import tempfile
+        from unittest import mock
+        import tw1_probes as P
+        self.P, self.mock = P, mock
+        self.tmp = tempfile.TemporaryDirectory()
+        root = self.tmp.name
+        self.work, self.out = os.path.join(root, "tw1"), os.path.join(root, "tw1-record")
+        self.inst, self.pack = os.path.join(root, "inst"), os.path.join(root, "pack")
+        os.makedirs(self.work)
+        self.files = {"bin/javis_report.py": b"print('report')\n", P.SH_FLOW_CANDIDATES[0]: SH_PRE,
+                      P.SH_FLOW_CANDIDATES[1]: b"#!/usr/bin/env bash\necho find\n",
+                      P.SH_FLOW_CANDIDATES[2]: b"#!/usr/bin/env bash\necho stop\n"}
+        for rel, data in self.files.items():
+            os.makedirs(os.path.dirname(self.live(rel)), exist_ok=True)
+            with open(self.live(rel), "wb") as fh:
+                fh.write(data)
+        self.saved = (dict(P._REGISTRY),)
+        self.clock = [1000.0]           # a fake clock that only sleep moves: a missing answer costs no real time
+
+        def sleep(s):
+            self.clock[0] += max(float(s), 0.001)
+        for name, fn in (("sleep", sleep), ("monotonic", lambda: self.clock[0])):
+            pt = mock.patch.object(P.time, name, fn)
+            pt.start()
+            self.addCleanup(pt.stop)
+
+    def tearDown(self):
+        self.P._REGISTRY.clear()
+        self.P._REGISTRY.update(self.saved[0])
+        self.tmp.cleanup()
+
+    def live(self, rel):
+        return os.path.join(self.pack, *rel.split("/"))
+
+    def read(self, rel):
+        with open(self.live(rel), "rb") as fh:
+            return fh.read()
+
+    def probe(self, mapping=()):
+        return self.P.Probe("s3_repair_flow", self.work, self.out, {
+            "paths": {"install_dir": self.inst, "pack_dir": self.pack, "local_dir": os.path.join(self.tmp.name, "local")},
+            "selection": {"CG": "bin/javis_report.py"}, "redaction": [list(x) for x in mapping]})
+
+    def stage(self, product, fn=None, mapping=()):
+        """Run the stage (or `fn`) with the injected runner -> the probe."""
+        pr = self.probe(mapping)
+        with self.mock.patch.object(self.P, "run", product.run):
+            (fn or self.P.PROBES["s3_repair_flow"])(pr)
+        return pr
+
+    def sh_evidence(self):
+        d = os.path.join(self.out, "evidence", "s3_repair_flow", "repair-flow-sh")
+        return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
+    def sh_json(self, name):
+        with open(os.path.join(self.out, "evidence", "s3_repair_flow", "repair-flow-sh", name), encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def finding(self, pr):
+        sh = [f for f in pr.findings if f["row"] == "repair-flow-sh"]
+        self.assertEqual(len(sh), 1, pr.findings)
+        return sh[0]
+
+    # ── the static choice ──
+    def test_the_candidates_are_general_looking_shell_files_outside_every_scenario_pool(self):
+        P = self.P
+        sc = load()["scenario"]
+        pools = {x for k in sc["tnv_mark_pools"] for x in sc[k]} | {sc["query_listed_rel"]}
+        self.assertTrue(P.SH_FLOW_CANDIDATES)
+        for rel in P.SH_FLOW_CANDIDATES:
+            self.assertTrue(rel.endswith(".sh"), rel)
+            self.assertNotIn(rel, pools, rel)
+            with open(os.path.join(REPO, "cysjavis-pack", *rel.split("/")), "rb") as fh:   # the pack this driver ships with
+                data = fh.read()
+            self.assertIsNone(P.sh_candidate_refusal(rel, data, pools), rel)
+        with open(os.path.join(REPO, "cysjavis-pack", *P.SH_FLOW_CANDIDATES[0].split("/")), "rb") as fh:
+            self.assertEqual(P.sh_flow_shell(fh.read().split(b"\n")[0].decode()), "sh")   # the first one is sh.exe's
+        self.assertEqual(self.P.PROBES["s3_repair_flow"], P.probe_s3_repair_flow_stage)
+
+    def test_pure_rules(self):
+        P = self.P
+        self.assertEqual(P.sh_flow_shell("#!/bin/sh"), "sh")
+        self.assertEqual(P.sh_flow_shell("#!/usr/bin/env bash"), "bash")
+        self.assertEqual(P.sh_flow_shell("#!/bin/bash -e"), "bash")
+        self.assertIn("another leg", P.sh_candidate_refusal("a.sh", b"#!/bin/sh\n", {"a.sh"}))
+        self.assertIn("absent", P.sh_candidate_refusal("a.sh", None, set()))
+        self.assertIn("#!", P.sh_candidate_refusal("a.sh", b"echo x\n", set()))
+        self.assertIn("CR", P.sh_candidate_refusal("a.sh", b"#!/bin/sh\r\nx\r\n", set()))
+        self.assertIsNone(P.sh_candidate_refusal("a.sh", b"#!/bin/sh\nx\n", set()))
+        ok = json.dumps({"boot_critical": False, "protection": False})
+        self.assertIsNone(P.sh_query_refusal(1, ok + "\n"))
+        self.assertIn("exit 0", P.sh_query_refusal(0, json.dumps({"boot_critical": True, "protection": False})))
+        self.assertIn("exit 2", P.sh_query_refusal(2, ""))
+        self.assertIn("protection=True", P.sh_query_refusal(1, json.dumps({"boot_critical": False, "protection": True})))
+        self.assertIn("protection=None", P.sh_query_refusal(1, "not json"))          # an unreadable answer is not general
+
+        def scripted(*rcs):
+            seq = list(rcs)
+
+            def commit(n):
+                if not seq:
+                    return None
+                rc = seq.pop(0)
+                return None if rc == "budget" else {"rc": rc, "out": "", "err": "m%d" % n}
+            return commit
+        self.assertEqual([a["rc"] for a in P.sh_commit_attempts(scripted(0))], [0])
+        self.assertEqual([a["rc"] for a in P.sh_commit_attempts(scripted(94, 0))], [94, 0])
+        self.assertEqual([a["rc"] for a in P.sh_commit_attempts(scripted(94, 94, 0))], [94, 94])   # never a third
+        self.assertEqual([a["rc"] for a in P.sh_commit_attempts(scripted(96, 0))], [96])           # only 94 is retried
+        self.assertEqual([a["rc"] for a in P.sh_commit_attempts(scripted(94, "budget"))], [94])
+        self.assertEqual(P.sh_commit_attempts(scripted("budget")), [])
+        self.assertEqual(P.sh_commit_attempts(scripted(94, 0))[1]["message"], "m2")
+
+    # ── outcomes ──
+    def test_a_committed_shell_repair_is_recorded_and_reverted_by_the_product(self):
+        os.makedirs(os.path.join(self.inst, "runtime", "git", "usr", "bin"))
+        open(os.path.join(self.inst, "runtime", "git", "usr", "bin", "sh.exe"), "wb").close()
+        fp = FakeProduct(self.pack, commits={"sh": [(0, '{"repair":"R-2","state":"probation"}')]})
+        pr = self.stage(fp)
+        rel = self.P.SH_FLOW_CANDIDATES[0]
+        self.assertEqual(fp.verbs("sh"), ["begin", "record", "attest-verify", "commit", "revert"])
+        self.assertEqual(self.sh_evidence(), ["a-new-surface-reviewer-codex.json", "a-new-surface-worker.json",
+                                              "attest.json", "begin.json", "candidates.json", "commit.json",
+                                              "record.json", "revert.json", "summary.json"])
+        for name, verb in (("begin", "begin"), ("record", "record"), ("attest", "attest-verify"), ("commit", "commit")):
+            ev = self.sh_json(name + ".json")
+            self.assertEqual(sorted(ev), ["args", "result"])                         # the shape of repair-flow/*.json
+            self.assertEqual(ev["args"][:2], ["repair", verb])
+            self.assertEqual(sorted(ev["result"]), ["err", "out", "rc"])
+        self.assertEqual(self.sh_json("begin.json")["args"], ["repair", "begin", "--files", rel, "--trigger",
+                                                              "owner-order", "--json"])
+        self.assertEqual(self.sh_json("attest.json")["args"][:3], ["repair", "attest-verify", "R-2"])
+        fd = self.finding(pr)
+        self.assertEqual(fd["check"], "commit")
+        self.assertTrue(fd["observed"].startswith('repair-flow-sh: commit rc=0 {"repair":"R-2","state":"probation"}'),
+                        fd["observed"])
+        self.assertIn("file %s, shell sh (runtime\\git\\usr\\bin\\sh.exe, present: True)" % rel, fd["observed"])
+        self.assertIn("revert rc=0", fd["observed"])
+        self.assertIn("pack file back to its pre-image: yes (the product's revert)", fd["observed"])
+        self.assertEqual(self.read(rel), SH_PRE)
+        s = self.sh_json("summary.json")
+        self.assertTrue(s["committed"] and s["live_after_commit_is_edited"] and s["reverted_by_product"])
+        self.assertEqual(s["edited_sha"], self.P.sha256_bytes(SH_PRE + self.P.SH_FLOW_EDIT))   # one comment line, LF
+        self.assertTrue(pr.restored)
+        self.assertTrue(all(e.startswith("evidence/s3_repair_flow/repair-flow-sh/") for e in fd["evidence"]))
+        self.assertFalse([e for e in pr.evidence if "repair-flow-sh" in e])           # not on any row's evidence list
+
+    def test_a_94_then_a_0_is_recorded_as_two_attempts(self):
+        fp = FakeProduct(self.pack, commits={"sh": [(94, FakeProduct.F94 % "R-2"), (0, '{"state":"probation"}')]})
+        pr = self.stage(fp)
+        self.assertEqual(fp.verbs("sh"), ["begin", "record", "attest-verify", "commit", "commit", "revert"])
+        self.assertEqual((self.sh_json("commit.json")["result"]["rc"], self.sh_json("commit-2.json")["result"]["rc"]),
+                         (94, 0))
+        obs = self.finding(pr)["observed"]
+        self.assertTrue(obs.startswith("repair-flow-sh: commit rc=94 repair.commit: R-2: 검사하는 동안 수리 기록이 바뀌었습니다"),
+                        obs)
+        self.assertIn(" | retried: commit rc=0 ", obs)
+        self.assertEqual([a["rc"] for a in self.sh_json("summary.json")["commit_attempts"]], [94, 0])
+
+    def test_two_94s_stop_after_the_second_attempt_and_the_driver_puts_the_file_back(self):
+        fp = FakeProduct(self.pack, commits={"sh": [(94, FakeProduct.F94 % "R-2")] * 3})
+        pr = self.stage(fp)
+        self.assertEqual(fp.verbs("sh"), ["begin", "record", "attest-verify", "commit", "commit"])   # no third, no revert
+        obs = self.finding(pr)["observed"]
+        self.assertEqual(obs.count("commit rc=94"), 2)
+        self.assertIn("pack file back to its pre-image: yes (the driver)", obs)
+        self.assertEqual(self.read(self.P.SH_FLOW_CANDIDATES[0]), SH_PRE)
+        self.assertTrue(pr.restored)
+
+    def test_a_refused_commit_names_the_rc_and_the_products_sentence(self):
+        msg = ("repair.commit: R-2: 살아 있는 파일의 검사가 실패해 확정을 거부합니다 — hooks/brief-lint-warn.sh: 셸 문법 검사 "
+               "실패(종료 Some(2)) — sh: line 3: syntax error near unexpected token")
+        fp = FakeProduct(self.pack, commits={"sh": [(96, msg)]})
+        pr = self.stage(fp)
+        self.assertEqual(fp.verbs("sh"), ["begin", "record", "attest-verify", "commit"])
+        fd = self.finding(pr)
+        self.assertEqual(fd["check"], "commit")
+        self.assertTrue(fd["observed"].startswith("repair-flow-sh: commit rc=96 " + msg[:200]), fd["observed"])
+        self.assertEqual(self.read(self.P.SH_FLOW_CANDIDATES[0]), SH_PRE)
+        self.assertEqual(self.sh_json("commit.json")["result"]["rc"], 96)
+
+    def test_a_flow_stopped_before_the_commit_names_the_step(self):
+        fp = FakeProduct(self.pack, record_rc={"sh": (95, "repair.record: R-2: 기록할 수 없습니다")})
+        pr = self.stage(fp)
+        self.assertEqual(fp.verbs("sh"), ["begin", "record"])
+        fd = self.finding(pr)
+        self.assertEqual(fd["check"], "stopped")
+        self.assertTrue(fd["observed"].startswith("repair-flow-sh: stopped at record rc=95 repair.record: R-2: 기록할 수 없습니다"),
+                        fd["observed"])
+        self.assertEqual(self.read(self.P.SH_FLOW_CANDIDATES[0]), SH_PRE)
+
+    def test_a_commit_without_an_answer_is_reverted_by_the_product_first(self):
+        fp = FakeProduct(self.pack, answer_missing={"commit"})
+        pr = self.stage(fp)
+        obs = self.finding(pr)["observed"]
+        self.assertTrue(obs.startswith("repair-flow-sh: commit rc=None "), obs)
+        self.assertIn("revert", fp.verbs("sh"))
+        self.assertEqual(self.read(self.P.SH_FLOW_CANDIDATES[0]), SH_PRE)
+
+    def test_no_general_shell_file_is_a_finding_and_touches_nothing(self):
+        c = self.P.SH_FLOW_CANDIDATES
+        os.remove(self.live(c[2]))
+        fp = FakeProduct(self.pack, query={c[0]: (0, {"boot_critical": True, "protection": False}),
+                                           c[1]: (1, {"boot_critical": False, "protection": True})})
+        pr = self.stage(fp)
+        self.assertEqual(fp.verbs("sh"), [])
+        self.assertEqual(fp.surfaces, 1 + 1)                     # the Python flow's two seats only
+        fd = self.finding(pr)
+        self.assertEqual(fd["check"], "no-general-shell-file")
+        self.assertTrue(fd["observed"].startswith("repair-flow-sh: no general shell file found ("), fd["observed"])
+        for rel, why in ((c[0], "exit 0"), (c[1], "protection=True"), (c[2], "absent")):
+            self.assertIn("%s: " % rel, fd["observed"])
+            self.assertIn(why, fd["observed"])
+        self.assertEqual(self.sh_evidence(), ["candidates.json", "summary.json"])
+        self.assertEqual((self.read(c[0]), self.read(c[1])), (self.files[c[0]], self.files[c[1]]))
+
+    def test_the_first_general_candidate_is_taken_and_its_shell_named(self):
+        c = self.P.SH_FLOW_CANDIDATES
+        fp = FakeProduct(self.pack, query={c[0]: (0, {"boot_critical": True, "protection": False})})
+        pr = self.stage(fp)
+        self.assertEqual([x[3] for x in fp.calls if x[1] == "begin"][-1], c[1])
+        self.assertIn("file %s, shell bash (runtime\\git\\usr\\bin\\bash.exe, present: False)" % c[1],
+                      self.finding(pr)["observed"])
+
+    def test_begin_answering_another_class_stops_before_any_edit(self):
+        c0 = self.P.SH_FLOW_CANDIDATES[0]
+        fp = FakeProduct(self.pack, begin_class={c0: "boot_critical"})
+        writes = []
+        real = self.P.write_bytes
+        with self.mock.patch.object(self.P, "write_bytes", lambda p, b: (writes.append(p), real(p, b))):
+            pr = self.stage(fp)
+        self.assertEqual(fp.verbs("sh"), ["begin"])
+        self.assertNotIn(self.live(c0), writes)
+        obs = self.finding(pr)["observed"]
+        self.assertIn("stopped at begin rc=0 begin classified the file 'boot_critical', not general", obs)
+
+    def test_it_does_not_start_without_time_left_in_the_stage(self):
+        fp = FakeProduct(self.pack)
+        pr = self.probe()
+        with self.mock.patch.object(self.P, "run", fp.run):
+            self.P._repair_flow_sh(pr, self.P.time.monotonic() - 1500)
+        self.assertEqual(fp.calls, [])
+        fd = self.finding(pr)
+        self.assertEqual(fd["check"], "not-run")
+        self.assertIn("time limit", fd["observed"])
+
+    # ── the Python flow is the same whatever the shell flow does ──
+    def outcomes(self):
+        c = self.P.SH_FLOW_CANDIDATES
+        return {
+            "rc0": dict(commits={"sh": [(0, "{}")]}),
+            "94-then-0": dict(commits={"sh": [(94, "x"), (0, "{}")]}),
+            "94-twice": dict(commits={"sh": [(94, "x"), (94, "x")]}),
+            "refused-96": dict(commits={"sh": [(96, "refused")]}),
+            "stopped-at-record": dict(record_rc={"sh": (95, "no")}),
+            "no-general-file": dict(query={r: (0, {"boot_critical": True, "protection": False}) for r in c}),
+            "no-commit-answer": dict(answer_missing={"commit"}),
+        }
+
+    def fresh_run_folders(self, name):
+        self.work, self.out = os.path.join(self.tmp.name, name, "tw1"), os.path.join(self.tmp.name, name, "tw1-record")
+        os.makedirs(self.work)
+        for rel, data in self.files.items():
+            with open(self.live(rel), "wb") as fh:
+                fh.write(data)
+
+    def test_the_python_flows_facts_evidence_and_state_are_unchanged_by_every_outcome(self):
+        P = self.P
+        self.fresh_run_folders("python-flow-alone")
+        base = self.stage(FakeProduct(self.pack), fn=P.probe_s3_repair_flow)          # the Python flow alone
+        self.assertEqual(base.facts.get("flow_commit_rc"), 94)                     # run 7c's answer
+        self.assertEqual(base.facts.get("flow_target"), "bin/javis_report.py")
+        want = (copy.deepcopy(base.facts), list(base.evidence), base.restored)
+        cases = dict(self.outcomes())
+        cases["the-shell-flow-raises"] = dict()
+        for name, kw in sorted(cases.items()):
+            with self.subTest(outcome=name):
+                self.fresh_run_folders(name)
+                if name == "the-shell-flow-raises":
+                    real = P._flow_seats
+
+                    def seats(pr, tag, folder="repair-flow"):
+                        if folder != "repair-flow":
+                            raise RuntimeError("boom")
+                        return real(pr, tag)
+                    with self.mock.patch.object(P, "_flow_seats", seats):
+                        pr = self.stage(FakeProduct(self.pack))
+                    self.assertEqual(self.finding(pr)["check"], "driver-error")
+                    self.assertIn("RuntimeError: boom", self.finding(pr)["observed"])
+                else:
+                    pr = self.stage(FakeProduct(self.pack, **kw))
+                    self.finding(pr)
+                self.assertEqual(pr.facts, want[0])
+                self.assertEqual(pr.evidence, want[1])
+                self.assertEqual(pr.restored, want[2])
+                for rel, data in self.files.items():
+                    self.assertEqual(self.read(rel), data, rel)
+
+    def test_a_shell_file_left_changed_makes_the_state_unknown(self):
+        """The one way the shell flow can move the stage's state: its file could not be put back (a later stage would
+        measure another pack - plan 3.7 rule 8). Never the other way."""
+        P = self.P
+        real = P.write_bytes
+        rel = P.SH_FLOW_CANDIDATES[0]
+
+        def no_write_back(p, b):
+            if p == self.live(rel) and b == SH_PRE:
+                raise PermissionError("held")
+            return real(p, b)
+        with self.mock.patch.object(P, "write_bytes", no_write_back):
+            pr = self.stage(FakeProduct(self.pack, commits={"sh": [(96, "refused")]}))
+        self.assertIs(pr.restored, False)
+        self.assertIn("pack file back to its pre-image: NO", self.finding(pr)["observed"])
+        self.assertEqual(self.sh_json("summary.json")["write_back_errors"], ["held"] * 3)
+
+    def test_a_raising_python_flow_keeps_its_error_and_the_shell_flow_does_not_run(self):
+        P = self.P
+        fp = FakeProduct(self.pack)
+        pr = self.probe()
+        with self.mock.patch.object(P, "run", fp.run), \
+                self.mock.patch.object(P, "probe_s3_repair_flow", side_effect=RuntimeError("python flow")):
+            with self.assertRaises(RuntimeError):
+                P.probe_s3_repair_flow_stage(pr)
+        self.assertEqual(fp.calls, [])
+        self.assertEqual(self.finding(pr)["check"], "not-run")
+
+    def test_the_stage_never_raises_for_the_shell_flow(self):
+        """Defence in depth: whatever escapes the shell flow becomes its finding; the stage keeps the Python flow's
+        observation (status 'ran')."""
+        P = self.P
+        self.fresh_run_folders("python-flow-alone")
+        base = self.stage(FakeProduct(self.pack), fn=P.probe_s3_repair_flow)
+        self.fresh_run_folders("shell-flow-escapes")
+        with self.mock.patch.object(P, "_repair_flow_sh", side_effect=OSError("escaped")):
+            pr = self.stage(FakeProduct(self.pack))
+        self.assertEqual((pr.facts, pr.evidence, pr.restored), (base.facts, base.evidence, base.restored))
+        fd = self.finding(pr)
+        self.assertEqual(fd["check"], "driver-error")
+        self.assertIn("OSError: escaped", fd["observed"])
+
+    # ── the record and the observation ──
+    def test_the_finding_reaches_the_observation_and_the_record(self):
+        import tw1_main as M
+        from types import SimpleNamespace
+        P = self.P
+        with open(os.path.join(self.work, "ctx.json"), "w", encoding="utf-8") as fh:
+            json.dump({"paths": {"install_dir": self.inst, "pack_dir": self.pack}}, fh)
+        fd = {"row": "repair-flow-sh", "check": "commit", "assumption": "a", "observed": "repair-flow-sh: commit rc=0 ok"}
+
+        def ok_probe(pr):
+            pr.facts["x"] = 1
+            pr.findings.append(dict(fd))
+
+        def raising_probe(pr):
+            pr.findings.append(dict(fd, check="not-run"))
+            raise RuntimeError("x")
+        for pid, fn, status in (("s3_repair_flow", ok_probe, "ran"), ("s3_repair_flow", raising_probe, "error")):
+            with self.mock.patch.dict(P.PROBES, {pid: fn}):
+                M.cmd_probe(SimpleNamespace(id=pid, work=self.work, out=self.out))
+            with open(os.path.join(self.work, "obs", pid + ".json"), encoding="utf-8") as fh:
+                obs = json.load(fh)
+            self.assertEqual(obs["status"], status)
+            self.assertEqual(len(obs["findings"]), 1)
+        with self.mock.patch.dict(P.PROBES, {"s3_eg2": lambda pr: None}):            # no finding: no key, as before
+            M.cmd_probe(SimpleNamespace(id="s3_eg2", work=self.work, out=self.out))
+        with open(os.path.join(self.work, "obs", "s3_eg2.json"), encoding="utf-8") as fh:
+            self.assertNotIn("findings", json.load(fh))
+        outcomes = {"s3_eg2": {"status": "ran", "facts": {}}, "s3_repair_flow": {"status": "ran", "findings": [fd]},
+                    "s3_t6_jobs": {"status": "timeout", "facts": {}}}
+        extra = R.probe_findings(["s3_eg2", "s3_t6_jobs", "s3_repair_flow"], outcomes)
+        self.assertEqual(extra, [dict(fd, probe="s3_repair_flow")])
+        rows = [{"id": "D", "verdict": R.NMH, "findings": [{"row": "D", "check": "x", "assumption": "a", "observed": "o"}]},
+                {"id": "A", "verdict": R.PASS, "findings": []}]
+        rec = R.build_record({}, {}, {"failed": False, "reasons": []}, rows, [], extra)
+        self.assertEqual([f["row"] for f in rec["findings"]], ["D", "repair-flow-sh"])   # after the rows' findings
+        self.assertEqual(rec["summary"]["findings"], 2)
+        self.assertEqual(R.job_conclusion(rec), ("green", []))                    # a finding never turns it red
+        self.assertIn("- **repair-flow-sh / commit** - assumption: a - observed: repair-flow-sh: commit rc=0 ok",
+                      R.render_markdown(rec))
+        same = R.build_record({}, {}, {"failed": False, "reasons": []}, rows, [])
+        self.assertEqual([r["verdict"] for r in rec["rows"]], [r["verdict"] for r in same["rows"]])
+
+    # ── privacy (RULINGS EQ6 / HC6): the new folder and the line, in every form of the existing test ──
+    def test_the_shell_flow_evidence_and_finding_are_redacted_in_every_form(self):
+        import tw1_main as M
+        mp = R.redaction_map(PrivacyTests.ENV)
+        forms = ("X:\\profiles\\someone\\.cys\\pack\\hooks\\brief-lint-warn.sh", "x:/PROFILES/SOMEONE/.cys/pack",
+                 json.dumps("X:\\profiles\\someone\\x"), "/x/profiles/someone/.cys", "https://example/someowner/somerepo",
+                 "by someactor")
+        # the account name across character 200 (the finding's cut) and across character 400 (the summary's cut)
+        msg = "e" * 195 + "someone" + "g" * 193 + "someone" + " — " + " ".join(forms)
+        fp = FakeProduct(self.pack, commits={"sh": [(94, msg), (96, msg)]},
+                         record_rc={"py": (0, json.dumps({"note": " ".join(forms)}))})
+        pr = self.stage(fp, mapping=mp)
+        d = os.path.join(self.out, "evidence", "s3_repair_flow", "repair-flow-sh")
+        blob = PrivacyTests._all_bytes_under(None, d).lower()
+        for needle in PrivacyTests.NEEDLES + ("someo",):       # "someo": a needle cut before it was redacted
+            self.assertNotIn(needle.encode("utf-8"), blob, needle)
+        self.assertIn(b"%username%", blob)
+        fd = self.finding(pr)
+        line = json.dumps(fd, ensure_ascii=False).lower()
+        for needle in PrivacyTests.NEEDLES + ("someo",):       # "someo": a needle cut before it was redacted
+            self.assertNotIn(needle, line, needle)
+        self.assertIn("e" * 195 + "%user", line)                # redacted first, then cut at 200 characters
+        rec = R.redact(R.build_record({}, {}, {"failed": False, "reasons": []}, [], [],
+                                      R.probe_findings(["s3_repair_flow"], {"s3_repair_flow": {"findings": [fd]}})), mp)
+        text = (json.dumps(rec, ensure_ascii=False) + R.render_markdown(rec)).lower()
+        for needle in PrivacyTests.NEEDLES:
+            self.assertNotIn(needle, text, needle)
+        early = os.path.join(self.tmp.name, "tw1-record-early")
+        M.redacted_copy(self.out, early, mp)
+        self.assertNotIn(b"someone", PrivacyTests._all_bytes_under(None, early).lower())
+        self.assertTrue(os.path.isfile(os.path.join(early, "evidence", "s3_repair_flow", "repair-flow-sh", "commit-2.json")))
 
 
 class WorkflowTests(unittest.TestCase):
