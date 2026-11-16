@@ -259,18 +259,30 @@ fn off_means_zero_starts() {
     check(&r);
 }
 
-/// WY2 — the decision file is written, then re-opened for its full flush (`write_decision_in`). On
-/// Windows that re-open was read-only, so the flush failed SILENTLY (its result is ignored by
-/// design — the decision is in place either way; only its durability across a power loss was
-/// missing). This reaches the changed open on every platform and reads the decision back; the open
-/// itself is proven by `durable::tests::wy2_open_for_flush_gives_a_handle_the_full_flush_accepts`.
+/// WY2 FR1 (RULINGS LH15; reviewer1 WY2-r1 MAJOR-1) — the owner's decision file is written DURABLY OR
+/// NOT AT ALL: it reads back after a write; and under an injected failure of the full flush (the
+/// module's test seam `durable::INJECT_FLUSH_ERRNO`) the write returns an ERROR and the previous
+/// decision is still the one on disk. Before FR1 the open's and the flush's results were ignored
+/// (`if let Ok` / `let _`): the call answered Ok with the new decision renamed into place, unflushed —
+/// on Windows always so (a read-only re-open cannot be flushed there).
 #[test]
-fn wy2_the_decision_file_is_written_and_reads_back() {
+fn wy2_the_decision_file_is_written_durably_or_not_at_all() {
     let r = root("wy2-decision");
     grant_on(&r, 3);
     let d = read_decision_in(&r).unwrap().expect("the decision is in place");
-    assert_eq!(d.state, GrantState::On);
-    assert_eq!(d.daily_cap, 3);
+    assert_eq!((d.state, d.daily_cap), (GrantState::On, 3));
+    let mut off = d.clone();
+    off.state = GrantState::Off;
+    // errno 5 = EIO on macOS / Linux (not "not supported", not EINTR): the flush fails
+    crate::repair::durable::INJECT_FLUSH_ERRNO.with(|c| c.set((5, 1)));
+    let w = write_decision_in(&r, &off);
+    crate::repair::durable::INJECT_FLUSH_ERRNO.with(|c| c.set((0, 0)));
+    assert!(w.is_err(), "a failed flush must be an error of the decision write, got {w:?}");
+    assert_eq!(
+        read_decision_in(&r).unwrap().map(|x| x.state),
+        Some(GrantState::On),
+        "the previous decision must still be on disk"
+    );
     let _ = std::fs::remove_dir_all(&r);
 }
 

@@ -564,21 +564,23 @@ fn report_aggregates_excludes_and_joins() {
 
 // ───────────────────────────── the general flow (C1 1.9 / 1.10 / N1 / U2 / K1) ─────────────────────────────
 
-/// WY2 part B (RULINGS LH12) — THE commit door, end to end, at a Windows clock time: step (1)
+/// WY2 part B (RULINGS LH12) — THE commit door, end to end, at a 100-ns clock time: step (1)
 /// renews the holder's lease (`expires_at = now + LEASE_SECS`) and writes the record; step (3a)
 /// re-reads it from JSON and refuses if it differs from the record step (1) holds in memory
-/// (`rec != snapshot`, cysd repair.rs ~3212). `ctx.now` is the repair clock's value for the measured
-/// Windows time 1794792640 s + 10 294 700 ns; with the RAW formula (`as_secs_f64()`) its lease is the
-/// text "1794799840.0102947", which serde_json's default parser reads one step off — the commit then
-/// answers "검사하는 동안 수리 기록이 바뀌었습니다" with nothing changed (Windows, runs/TW1-ci-7c
-/// commit.json rc 94; on this Mac too with that time). The commit must SUCCEED.
+/// (`rec != snapshot`, cysd repair.rs ~3212). `ctx.now` is the repair clock's value for the fixture
+/// 1794792640 s + 10 294 700 ns — the master's SCRATCH reproducer (impl/runs/WY2-float-roundtrip/
+/// result.txt), not a clock value from the runner; with the RAW formula (`as_secs_f64()`) its lease is
+/// the text "1794799840.0102947", which serde_json's default parser reads one step off — the commit
+/// then answers "검사하는 동안 수리 기록이 바뀌었습니다" with nothing changed (this Mac, the logged red
+/// run; the same sentence is the Windows runner's error, runs/TW1-ci-7c commit.json rc 94). The commit
+/// must SUCCEED.
 #[test]
 fn wy2b_a_commit_at_a_windows_clock_time_is_not_refused() {
     let d = std::time::Duration::new(1_794_792_640, 10_294_700);
     assert_eq!(
         serde_json::to_string(&(d.as_secs_f64() + cys::repair::types::LEASE_SECS as f64)).unwrap(),
         "1794799840.0102947",
-        "premise: the raw formula gives the measured lease text"
+        "premise: the raw formula gives the scratch reproducer's lease text"
     );
     let now = cys::repair::ledger::epoch_secs_us(d);
     let r = rig("wy2-lease");
