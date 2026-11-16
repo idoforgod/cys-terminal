@@ -3010,7 +3010,14 @@ def publish_notice(md, key, title, body):
     box = outbox_dir(md)
     name = key + ".notice"
     try:
-        if present(os.path.join(box, name)) or present(os.path.join(box, "sent", name)):
+        # ★RULINGS JZ2·KE1·KK1(WC1): 그 키의 알림은 어느 형태로든 있으면 '있다' — 다시 쓰면 그 알림이 또 올라간다. 형태: <키>.notice ·
+        #   시도 예약 <키>.notice.<k>(폴더 · k = 1 … 9 · 지우지 않는다) · 받힘 표지 <키>.notice.done · sent/<키>.notice. 알림 파일은 한
+        #   방향으로만 옮겨 간다: <키>.notice → (.done | sent/<키>.notice) — sent/ 를 떠나는 것은 없다. 그래서 그 **방향대로** 살핀다
+        #   (알림함의 이름들 먼저, sent/ 마지막): 두 관찰 사이에 다른 실행이 옮겨도 뒤의 관찰이 반드시 본다(종전: sent/ 를 먼저, 알림함을
+        #   나중에 봐 그 사이의 이동을 놓치고 새 <키>.notice 를 썼다). 예약은 옮겨 가지 않고 남으므로 언제 보든 보인다 — 한 번이라도
+        #   시도된 알림은 다시 놓이지 않는다. 관찰의 실패는 '없음'이 아니다(Unknown → 아래에서 넣지 않음).
+        forms = [name] + ["%s.%d" % (name, i) for i in range(1, 10)] + [name + ".done"]
+        if any(present(os.path.join(box, f)) for f in forms) or present(os.path.join(box, "sent", name)):
             return True
         fs_mkdir(box)
         tmp = write_temp(os.path.join(box, name), ("%s\n%s\n" % (clean(title), clean(body))).encode("utf-8"))
@@ -3664,23 +3671,60 @@ ceo_notice_once(){  # $1=제목 $2=본문 — 0 = 피드가 받았다(같은 제
 # ★RULINGS FY3 — 영속 알림함 배달(한 실행에 최대 20건 · ceo_demote_notices_close 와 같은 상한): 알림마다 제목 dedupe(ceo_notice_once)를
 #   지나고, 피드가 받았을 때만(올리기 rc 0 또는 같은 제목이 이미 대기 중) sent/ 로 옮긴다. 올리지 못한 것은 남아 다음 입구가 다시
 #   한다. 배달은 관문이 아니다 — 데몬·소켓이 없어 비우지 못해도 조립·부서 켜기를 막지 않는다(S3 · DC3: 늘 0).
+# ★RULINGS JZ2·KK1(WC1) — 한 알림을 올리는 시도마다 올리기 **전에** 예약을 만든다: 알림함 안의 폴더 <키>.notice.<k>(k = 이번이 몇
+#   번째 시도인가 · 1 … 1 + CEO_NOTICE_RETRIES)를 mkdir 로 배타 생성하고, **그것을 만든 실행만** 올린다. 배타 생성은 한 호출에게만
+#   성공한다 — 두 실행이 같은 k 를 함께 예약하려 하면 하나는 '이미 있다'로 지고, 진 실행은 이번에 올리지 않는다. 예약은 지우지도 다시
+#   쓰지도 않는다: 예약이 곧 시도 수이고, 사람이 읽는 'k 번째 시도를 했다'다. 그래서 알림 하나는 모든 입구 · 동시에 도는 실행들을
+#   통틀어 많아야 1 + CEO_NOTICE_RETRIES 번 올라간다 — 올리기의 답이 무엇이든, sent/ 가 어떻든, 어느 두 걸음 사이에서 멈추든
+#   (종전 FY3: 받힌 뒤 sent/ 로 못 옮기면 알림함에 그대로 남아 다음 입구가 같은 알림을 또 올렸다 — 상한 없음. 종전 WC1 r1·r2:
+#   알림 파일을 mv -n 으로 <키>.notice.<k> 로 옮기고 '목적지 있음 · 원본 없음'을 보았다 — 덮지 않는 이름 바꾸기는 목적지가 이미
+#   있으면 옮기지 않고도 0 을 답할 수 있고, 함께 보는 끝 상태는 누가 옮겼는지 말하지 않아 두 실행이 같은 시도를 함께 올렸다).
+#   왜 mkdir 인가: 그 이름에 무엇이든(파일 · 폴더 · FIFO · 끊긴 링크) 있으면 실패하는 시스템 호출 하나다(POSIX mkdir(2) — EEXIST).
+#   `( set -C; : > 이름 )` 은 아니다: bash 의 noclobber 는 정규 파일만 거절하고 FIFO 는 그대로 열어 매달린다(이 맥 /bin/bash 3.2
+#   실측 · hooks/_lib.sh 의 R2 와 같은 사실). Git-for-Windows bash 의 mkdir 도 이름이 있으면 실패하고, 팩의 hooks/_lib.sh 가 그
+#   셸에서 같은 근거(원자 · 배타)로 mkdir 을 쓴다 — Windows 에서 두 실행을 겨룬 실측은 없다.
+#   알림 파일은 <키>.notice 그대로 있다가 피드가 받으면(올리기 rc 0 · 같은 제목이 이미 대기 중) sent/<키>.notice 로, 그것이 안 되면
+#   알림함 안에서 <키>.notice.done 으로 옮긴다 — 받힌 알림은 다시 올리지 않는다. 예약을 만들지 못하면('이미 있다'가 아닌 실패 —
+#   알림함에 쓸 수 없다) 그 실행에서는 올리지 않는다(stderr 한 번 — 적지 못한 시도는 세지 못한다). 예산을 다 쓴 알림은 <키>.notice 와
+#   예약 1 … 1 + N 으로 남아 사람이 읽는다(지우지 않는다). 잠금·대기·되풀이 없음 — 알림마다 한 실행에 한 번 · 늘 0(배달은 관문이 아니다).
+CEO_NOTICE_RETRIES=2
 _CEO_DELIVERED=0
 _CEO_TRIED="|"
+_CEO_UNRECORDED=""
 ceo_outbox_deliver(){
-  local _f _t _b
+  local _f _k _claim _t _b
   [ -d "$CEO_OUTBOX" ] || return 0
   for _f in "$CEO_OUTBOX"/*.notice; do
     [ -f "$_f" ] || continue
     case "$_CEO_TRIED" in *"|${_f##*/}|"*) continue ;; esac   # 한 실행에 알림마다 한 번만 시도한다
     _CEO_TRIED="${_CEO_TRIED}${_f##*/}|"
+    if [ -e "$CEO_OUTBOX/sent/${_f##*/}" ]; then
+      # ★RULINGS KE1(c): 같은 키가 이미 sent/ 에 있다 — 받힌 알림이다: 올리지 않고 받힘 표지로 둔다(옮기지 못하면 그대로 — 이번엔 안 올림)
+      mv -n "$_f" "$_f.done" 2>/dev/null || true
+      continue
+    fi
+    _k=1                    # 아직 예약되지 않은 첫 시도 번호 — 예약은 지워지지 않으니 1 부터 많아야 1 + N 개를 본다(되풀이가 아니다)
+    while [ "$_k" -le $((1 + CEO_NOTICE_RETRIES)) ] && [ -e "$_f.$_k" ]; do _k=$((_k + 1)); done
+    [ "$_k" -le $((1 + CEO_NOTICE_RETRIES)) ] || continue        # 예산을 다 썼다 — 알림과 예약들은 그대로(사람이 읽는다) · 더 올리지 않는다
     [ "$_CEO_DELIVERED" -lt 20 ] || break
     _CEO_DELIVERED=$((_CEO_DELIVERED + 1))
     _t=""; _b=""
     { IFS= read -r _t; IFS= read -r _b; } < "$_f" 2>/dev/null || true
     [ -n "$_t" ] || continue
+    _claim="$_f.$_k"
+    if ! mkdir "$_claim" 2>/dev/null; then
+      # 이번에는 올리지 않는다. 그 이름이 있으면 다른 실행이 방금 이 k 번째 시도를 예약한 것이다(그 실행이 올린다 — 조용히).
+      # 없으면 예약을 만들 수 없었다 — 적지 못한 시도는 세지 못한다(한 번 말한다).
+      if [ ! -e "$_claim" ]; then
+        [ -n "$_CEO_UNRECORDED" ] || echo "[cys-dept] WARN: CEO 알림을 올리기 전에 그 시도를 알림함에 적지 못해 이번에는 올리지 않는다($_claim) — 다음 입구가 다시 한다" >&2
+        _CEO_UNRECORDED=1
+      fi
+      continue
+    fi
     if ceo_notice_once "$_t" "$_b"; then
-      { mkdir -p "$CEO_OUTBOX/sent" && mv -n "$_f" "$CEO_OUTBOX/sent/"; } 2>/dev/null \
-        || echo "[cys-dept] WARN: 피드가 받은 알림을 sent/ 로 옮기지 못했다($_f) — 다음 입구가 다시 본다" >&2
+      { { mkdir -p "$CEO_OUTBOX/sent" && mv -n "$_f" "$CEO_OUTBOX/sent/${_f##*/}"; } 2>/dev/null && [ ! -e "$_f" ]; } \
+        || { mv -n "$_f" "$_f.done" 2>/dev/null && [ ! -e "$_f" ]; } \
+        || echo "[cys-dept] WARN: 피드가 받은 알림을 sent/ 로도 받힘 표지($_f.done)로도 옮기지 못했다 — 그 시도의 예약이 남아 많아야 $((1 + CEO_NOTICE_RETRIES))번까지만 다시 올린다" >&2
     fi
   done
   return 0

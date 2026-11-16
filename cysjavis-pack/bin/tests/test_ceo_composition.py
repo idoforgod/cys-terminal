@@ -181,8 +181,13 @@ class Rig(unittest.TestCase):
         return os.path.join(self.home, ".cys", "state", "ceo-notices")
 
     def outbox_files(self, sent=False):
+        # ★RULINGS JZ2·KK1(WC1): 알림함의 알림 파일은 <키>.notice 와 받힘 표지 <키>.notice.done 이다 — 알림함 쪽은 둘 다 센다. 시도
+        #   예약 <키>.notice.<k> 는 폴더라 세지 않는다(알림이 아니다 — 아래 isfile). 종전 정의(그대로 인용): `if f.endswith(".notice")`
+        #   — 알림함·sent/ 모두 .notice 로 끝나는 것만.
         d = os.path.join(self.outbox(), "sent") if sent else self.outbox()
-        return sorted(os.path.join(d, f) for f in (os.listdir(d) if os.path.isdir(d) else []) if f.endswith(".notice"))
+        names = os.listdir(d) if os.path.isdir(d) else []
+        keep = (lambda f: f.endswith(".notice")) if sent else (lambda f: ".notice" in f and not f.startswith("."))
+        return sorted(os.path.join(d, f) for f in names if keep(f) and os.path.isfile(os.path.join(d, f)))
 
     def notices_text(self):
         """영속 알림함의 알림 — 아직 배달되지 않은 것과 sent/ 의 것 — 의 제목·본문(시험이 '알림이 있다'를 재는 곳)."""
@@ -2126,6 +2131,248 @@ class DurableOutbox(Rig):
         rc, out, err = self.run_dept("promote-if-pending")
         self.assertEqual(rc, 0, out + err)
         return out + err
+
+    # ── ★RULINGS JZ2 · KK1 · WC1 — 한 알림을 올리는 시도마다 알림함 안에 예약(<키>.notice.<k> 폴더 · 배타 생성)을 먼저 만들고 그것을
+    #    만든 실행만 올린다 — 알림 하나는 모든 입구를 통틀어 많아야 1 + N 번 올라간다(예약이 곧 시도 수 · 지우지도 다시 쓰지도 않는다) ──
+    BUDGET = 3          # 1 + N, N = 2 (cys-dept CEO_NOTICE_RETRIES)
+    TITLE_A = "CEO 지침 교체 기록 확인 필요"
+
+    def put_notice(self, key, title, body="본문 — 시험이 직접 놓은 알림"):
+        _write(os.path.join(self.outbox(), key + ".notice"), "%s\n%s\n" % (title, body))
+
+    def notice_forms(self, key):
+        """알림함에 남은 그 알림의 파일(어느 형태든) — 사람이 읽을 수 있는 제목 줄과 함께."""
+        box = self.outbox()
+        names = sorted(n for n in (os.listdir(box) if os.path.isdir(box) else []) if n.startswith(key + ".notice"))
+        return [(n, _slurp(os.path.join(box, n), encoding="utf-8").split("\n", 1)[0]) for n in names
+                if os.path.isfile(os.path.join(box, n))]
+
+    def claims(self, key):
+        """그 알림의 시도 예약(폴더 <키>.notice.<k>) — 사람이 읽는 'k 번째 시도를 했다'."""
+        box = self.outbox()
+        return sorted(n for n in (os.listdir(box) if os.path.isdir(box) else [])
+                      if re.fullmatch(re.escape(key) + r"\.notice\.[0-9]", n) and os.path.isdir(os.path.join(box, n)))
+
+    def break_sent(self):
+        """sent/ 를 쓸 수 없게 — 그 이름에 일반 파일(mkdir -p 도 mv 도 실패한다)."""
+        os.makedirs(self.outbox(), exist_ok=True)
+        _write(os.path.join(self.outbox(), "sent"), "sent 는 폴더가 아니다\n")
+
+    def test_an_accepted_notice_is_not_pushed_again_when_sent_cannot_be_written(self):
+        """codex WF1-r1 M1(RULINGS JZ2): 피드가 받았다 → sent/ 에 옮기지 못한다 → 받는 쪽이 닫는다 → 다음 입구가 같은 제목을 대기 중에서
+        찾지 못해 같은 알림을 또 올렸다 — 저장 실패가 이어지는 동안 끝없이. 이제 깨끗이 받힌 뒤에는 sent/ 로 못 옮겨도 더 올리지 않고,
+        알림은 알림함에 사람이 읽을 수 있는 파일로 남는다(지운 것 없음). 배달은 관문이 아니다 — 입구는 늘 0 으로 끝난다."""
+        self.seed()
+        key = "a" * 32
+        self.put_notice(key, self.TITLE_A)
+        self.break_sent()
+        for _ in range(8):                  # 스텁의 대기 목록은 비어 있다 — 받는 쪽이 매번 닫았다
+            self.tick()
+        self.assertLessEqual(self.pushes(self.TITLE_A), self.BUDGET, "받힌 알림이 입구마다 다시 올라갔다(상한 없음 — JZ2)")
+        self.assertEqual(self.pushes(self.TITLE_A), 1, "깨끗이 받힌 알림을 sent/ 실패 뒤에 또 올렸다")
+        forms = self.notice_forms(key)
+        self.assertEqual(len(forms), 1, "알림 파일이 하나로 남지 않았다: %r" % forms)
+        self.assertEqual(forms[0][1], self.TITLE_A, "남은 파일을 사람이 읽을 수 없다")
+
+    def test_a_notice_the_feed_never_takes_is_pushed_at_most_the_budget_and_then_kept(self):
+        """올리기가 1 + N 번 모두 실패하면(받지 않았음이 확인됨) 그 뒤로는 조용하다 — 그 알림 파일은 그대로 남아 사람이 읽는다."""
+        self.seed()
+        key = "b" * 32
+        self.put_notice(key, self.TITLE_A)
+        _write(self.pushfail, "1\n")
+        for _ in range(8):
+            self.tick()
+        self.assertEqual(self.pushes(self.TITLE_A), self.BUDGET, "받지 않는 알림이 1 + N 번을 넘거나 못 미치게 올라갔다")
+        forms = self.notice_forms(key)
+        self.assertEqual([t for _n, t in forms], [self.TITLE_A], "예산을 다 쓴 알림 파일이 남지 않았다: %r" % forms)
+        self.assertEqual(self.claims(key), [key + ".notice.%d" % k for k in range(1, self.BUDGET + 1)],
+                         "시도마다 예약 하나가 남지 않았다(RULINGS KK1 — 예약이 곧 시도 수)")
+
+    def test_a_second_notice_is_not_held_back_by_the_first_ones_exhausted_budget(self):
+        self.seed()
+        self.put_notice("c" * 32, self.TITLE_A)
+        _write(self.pushfail, "1\n")
+        for _ in range(5):
+            self.tick()
+        self.assertEqual(self.pushes(self.TITLE_A), self.BUDGET)
+        os.unlink(self.pushfail)
+        second = "CEO 지침 보류(파일을 읽지 못함)"
+        self.put_notice("d" * 32, second)
+        self.tick()
+        self.assertEqual(self.pushes(second), 1, "다른 알림이 앞 알림의 다 쓴 예산에 막혔다")
+        self.assertEqual(self.pushes(self.TITLE_A), self.BUDGET, "예산을 다 쓴 알림이 다시 올라갔다")
+
+    def test_a_lasting_hold_whose_notice_is_never_taken_is_pushed_at_most_the_budget(self):
+        """ceo_py 가 같은 보류(같은 키)의 알림을 입구마다 다시 놓으려 해도, 시도가 적힌 알림은 '이미 있다'로 본다 — 예산이 새로 생기지
+        않는다(종전: 넣지 못한 알림이 알림함에 그대로 남아 매 입구 다시 올라갔다)."""
+        self.barrier()
+        _write(self.pushfail, "1\n")
+        for _ in range(8):
+            self.tick()
+        self.assertEqual(self.pushes("CEO 지침 교체 기록 확인 필요"), self.BUDGET,
+                         "같은 보류의 알림이 입구마다 새 예산으로 올라갔다")
+
+    def deliver_script(self):
+        funcs = "".join(extract_shell_function(_slurp(DEPT, encoding="utf-8"), f)
+                        for f in ("ceo_notice_once", "ceo_outbox_deliver"))
+        return ["bash", "-c", 'CYS=cys\nCEO_OUTBOX="$1"\nCEO_NOTICE_RETRIES=2\n_CEO_DELIVERED=0\n_CEO_TRIED="|"\n'
+                + funcs + 'ceo_outbox_deliver\n', DEPT, self.outbox()]
+
+    def deliver_now(self):
+        """다른 보통 실행 하나의 배달(ceo_outbox_deliver 그대로 — 스텁 cys · 같은 알림함)."""
+        r = subprocess.run(self.deliver_script(), capture_output=True, text=True, encoding="utf-8", env=self.env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def deliver_paused_at_the_reservation(self):
+        """또 하나의 보통 실행 B(같은 ceo_outbox_deliver · 같은 알림함)를 띄운다 — 시험의 멈춤 자리: B 의 PATH 앞에 둔 대역 mv·mkdir 이
+        시도 이름(<키>.notice.<숫자>)을 만드는 호출에서만 seam/b-reserving 을 놓고 seam/a-done 까지 기다린다(시험 쪽 상한 60초).
+        mv 대역은 덮지 않는 이름 바꾸기가 원본을 본 뒤 멈추고, 풀리면 -n 의 뜻 그대로 한다 — 목적지가 있으면 옮기지 않고 0(codex
+        WC1-r2 의 순서). mkdir 대역은 멈춘 뒤 진짜 mkdir 을 그대로 부른다. (Popen, seam 폴더)."""
+        seam = os.path.join(self.tmp, "seam")
+        stub = os.path.join(self.tmp, "stub-bin")
+        os.makedirs(seam)
+        os.makedirs(stub)
+        real = {c: shutil.which(c, path=self.env["PATH"]) for c in ("mv", "mkdir")}
+        wait = ('    : > "%(s)s/b-reserving"\n'
+                '    i=0; while [ ! -e "%(s)s/a-done" ] && [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done\n' % {"s": seam})
+        _write(os.path.join(stub, "mv"),
+               '#!/bin/sh\n'
+               'if [ "$1" = "-n" ] && [ $# -eq 3 ]; then\n'
+               '  case "$3" in *.notice.[0-9])\n'
+               '    if [ -e "$2" ]; then\n' + wait +
+               '      [ -e "$3" ] && exit 0\n'
+               '    fi ;;\n'
+               '  esac\n'
+               'fi\n'
+               'exec "%s" "$@"\n' % real["mv"], 0o755)
+        _write(os.path.join(stub, "mkdir"),
+               '#!/bin/sh\n'
+               'for a in "$@"; do last="$a"; done\n'
+               'case "${last:-}" in *.notice.[0-9])\n' + wait + ';;\n'
+               'esac\n'
+               'exec "%s" "$@"\n' % real["mkdir"], 0o755)
+        env = dict(self.env)
+        env["PATH"] = stub + os.pathsep + env["PATH"]
+        b = subprocess.Popen(self.deliver_script(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, encoding="utf-8", env=env)
+        return b, seam
+
+    def test_two_ordinary_deliverers_at_the_same_attempt_push_it_once(self):
+        """codex WC1-r2 M1(RULINGS KK1): 두 번 못 올라간 알림(받지 않는 피드)을 두 보통 실행 A·B 가 함께 읽는다. B 가 세 번째 시도의
+        예약 자리에 와 있는 사이 A 가 같은 세 번째 시도를 끝까지 한다(예약 · 올리기 실패). 종전(94ccb2de): B 의 덮지 않는 이름 바꾸기는
+        A 가 이미 만든 목적지를 보고 옮기지 않은 채 0 을 답했고, 뒤의 확인(.3 있음 · .2 없음)은 A 가 만든 상태라 B 에게도 참이었다 —
+        둘 다 올렸다(모두 네 번). 이제 예약은 배타 생성(mkdir)이라 한 실행만 이기고, 이긴 실행만 올린다 — 모두 세 번, 예약도 셋."""
+        self.seed()
+        key = "9" * 32
+        self.put_notice(key, self.TITLE_A)
+        _write(self.pushfail, "1\n")
+        for _ in range(2):
+            self.deliver_now()
+        self.assertEqual(self.pushes(self.TITLE_A), 2, "시험 전제: 두 번 못 올라갔다")
+        b, seam = self.deliver_paused_at_the_reservation()
+        try:
+            deadline = time.monotonic() + 60
+            while not os.path.exists(os.path.join(seam, "b-reserving")):
+                if b.poll() is not None or time.monotonic() > deadline:
+                    self.fail("시험 무효: B 가 세 번째 시도의 예약 자리에 오지 않았다")
+                time.sleep(0.05)
+            self.deliver_now()                                     # A — 같은 세 번째 시도를 끝까지
+            self.assertEqual(self.pushes(self.TITLE_A), 3, "시험 전제: A 가 세 번째로 올렸다")
+        finally:
+            _write(os.path.join(seam, "a-done"), "")
+            _out, err = b.communicate(timeout=120)
+        self.assertEqual(b.returncode, 0, err)
+        self.assertEqual(self.pushes(self.TITLE_A), self.BUDGET,
+                         "두 보통 실행이 같은 세 번째 시도를 둘 다 올렸다 — 모두 네 번(codex WC1-r2 M1)")
+        self.assertNotIn("적지 못해", err, "예약을 진 실행은 시도를 적지 못한 것이 아니다 — 경고하지 않는다")
+        self.assertEqual(self.claims(key), [key + ".notice.%d" % k for k in range(1, self.BUDGET + 1)],
+                         "시도마다 예약 하나가 아니다")
+
+    def test_a_producer_paused_between_its_observations_cannot_restart_a_budget(self):
+        """codex WC1-r1 M1(RULINGS KE1 · KK2): 같은 보류 알림 K 가 두 번 못 올라갔다(KK1 부터: K.notice 와 예약 K.notice.1 · .2 —
+        WC1 r1·r2 에서는 K.notice.2 하나). 쓰는 쪽(ceo_py)이 K 를 처음 살펴본 직후 멈춘 사이 다른 보통 실행이 세 번째 시도를 하고 피드가
+        받아 sent/ 로 옮긴다(받는 쪽은 닫는다). 쓰는 쪽이 이어 가면 — WC1 r1 에서는 sent/ 를 먼저 보고(없음) 알림함을 나중에 봐서(이미
+        옮겨져 없음) 새 K.notice 를 썼고, 배달이 그것을 네 번째로 올렸다. 이제 옮겨 가는 방향으로(알림함 먼저, sent/ 마지막) 살피고
+        예약은 남아 있으므로 어느 순간에 멈춰도 K 를 놓치지 않는다 — 많아야 세 번, 그리고 쓰는 쪽의 걸음 바로 뒤에 새 K.notice 가 없다
+        (KK2 — 올린 수만으로는 배달의 sent/ 방어가 쓰는 쪽의 회귀를 가린다)."""
+        self.barrier()
+        title = "CEO 지침 교체 기록 확인 필요"
+        _write(self.pushfail, "1\n")
+        for _ in range(2):
+            self.tick()
+        self.assertEqual(self.pushes(title), 2, "시험 전제: 두 번 못 올라갔다")
+        keys = {n[:32] for n in os.listdir(self.outbox()) if re.fullmatch(r"[0-9a-f]{32}\.notice.*", n)}
+        self.assertEqual(len(keys), 1, "시험 전제: 알림 하나(K): %r" % keys)
+        plain = os.path.join(self.outbox(), keys.pop() + ".notice")
+        os.unlink(self.pushfail)
+        ns = ceo_py_module()
+        paused = []
+        for name in ("fs_kind", "fs_list", "fs_read"):
+            orig = ns[name]
+
+            def look(path, *a, _orig=orig, **kw):
+                r = _orig(path, *a, **kw)
+                base = os.path.basename(str(path))
+                if not paused and ".notice" in base and os.path.abspath(self.outbox()) in os.path.abspath(str(path)):
+                    paused.append(base)         # 쓰는 쪽의 K 에 대한 첫 관찰 바로 뒤 — 여기서 '멈춘다'
+                    self.deliver_now()          # 다른 실행: 세 번째 시도 · 피드가 받는다 · sent/ 로
+                return r
+            ns[name] = look
+        self.assertEqual(ns["do_recover"]([self.p("MASTER_DIRECTIVE.md"), ""]), 0)
+        self.assertTrue(paused, "시험 무효: 쓰는 쪽이 K 를 살펴보지 않았다")
+        self.assertEqual(self.pushes(title), 3, "시험 전제: 다른 실행의 세 번째 시도가 올라갔다")
+        # ★RULINGS KK2: 올린 수만 보면 배달의 sent/ 방어(KE1 c)가 쓰는 쪽의 회귀를 가린다 — 쓰는 쪽의 걸음 바로 뒤에 새 K.notice 가
+        #   없음을 직접 본다(피드가 받아 sent/ 로 옮긴 알림을 쓰는 쪽이 다시 놓지 않았다).
+        self.assertFalse(os.path.exists(plain), "쓰는 쪽이 받힌 알림 K 를 새 <키>.notice 로 다시 놓았다(KE1 · KK2)")
+        self.assertTrue(os.path.exists(os.path.join(self.outbox(), "sent", os.path.basename(plain))),
+                        "시험 전제: 다른 실행이 받힌 K 를 sent/ 로 옮겼다")
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(self.pushes(title), 3, "쓰는 쪽이 새 예산으로 K 를 다시 놓아 네 번째로 올라갔다(codex WC1-r1 M1)")
+
+    def test_an_attempt_whose_reservation_cannot_be_made_is_not_pushed(self):
+        """RULINGS KK1: 예약의 배타 생성이 '이미 있다'가 아닌 이유로 실패하면(알림함에 쓸 수 없다) 그 시도는 적을 수 없다 — 그 실행에서는
+        올리지 않고 stderr 에 한 번 말한다(알림이 둘이어도 한 번). 알림은 그대로 남고, 알림함이 다시 쓰이면 다음 입구가 첫 시도를 한다."""
+        self.seed()
+        second = "CEO 지침 보류(파일을 읽지 못함)"
+        self.put_notice("1" * 32, self.TITLE_A)
+        self.put_notice("2" * 32, second)
+        box = self.outbox()
+        os.chmod(box, 0o555)
+        self.addCleanup(os.chmod, box, 0o755)
+        r = subprocess.run(self.deliver_script(), capture_output=True, text=True, encoding="utf-8", env=self.env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.pushes(self.TITLE_A) + self.pushes(second), 0, "예약을 만들지 못한 시도를 올렸다(세지 못한 시도)")
+        self.assertEqual(r.stderr.count("적지 못해"), 1, "예약 실패를 한 번 말하지 않았다: %r" % r.stderr)
+        self.assertEqual(self.claims("1" * 32) + self.claims("2" * 32), [])
+        os.chmod(box, 0o755)
+        self.deliver_now()
+        self.assertEqual((self.pushes(self.TITLE_A), self.pushes(second)), (1, 1), "알림함이 다시 쓰인 뒤 첫 시도가 없었다")
+        self.assertEqual(self.claims("1" * 32) + self.claims("2" * 32), ["1" * 32 + ".notice.1", "2" * 32 + ".notice.1"])
+
+    def test_a_plain_notice_whose_key_is_already_in_sent_is_not_pushed(self):
+        """RULINGS KE1(c): 배달은 첫 시도 전에 sent/ 에 같은 키가 있으면 받힌 것으로 본다 — 올리지 않고 <키>.notice.done 으로 둔다."""
+        self.seed()
+        key = "f" * 32
+        self.put_notice(key, self.TITLE_A)
+        os.makedirs(os.path.join(self.outbox(), "sent"))
+        _write(os.path.join(self.outbox(), "sent", key + ".notice"), "%s\n앞서 받힌 같은 알림\n" % self.TITLE_A)
+        self.tick()
+        self.assertEqual(self.pushes(self.TITLE_A), 0, "sent/ 에 이미 있는 키를 또 올렸다")
+        self.assertEqual([n for n, _t in self.notice_forms(key)], [key + ".notice.done"])
+
+    def test_delivery_never_holds_the_composition_or_a_launch(self):
+        """sent/ 를 쓸 수 없고 올리기도 실패해도 배달은 관문이 아니다 — 부서 켜기는 0 으로 끝나고 조립은 이루어진다."""
+        self.seed()
+        self.put_notice("e" * 32, self.TITLE_A)
+        self.break_sent()
+        _write(self.pushfail, "1\n")
+        rc, out, err = self.run_dept("launch", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER, "배달 실패가 조립을 막았다")
+        for _ in range(4):
+            self.tick()
+        self.assertLessEqual(self.pushes(self.TITLE_A), self.BUDGET)
 
     def test_a_notice_survives_the_shell_dying_before_delivery(self):
         """codex R3 — 종전: 보류 알림을 임시 파일에 덧붙인 뒤 .held 표지를 적어, 셸이 그 파일을 배달하기 전에 죽으면 알림은 영영
