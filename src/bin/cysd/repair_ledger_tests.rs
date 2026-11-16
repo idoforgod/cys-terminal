@@ -564,6 +564,43 @@ fn report_aggregates_excludes_and_joins() {
 
 // ───────────────────────────── the general flow (C1 1.9 / 1.10 / N1 / U2 / K1) ─────────────────────────────
 
+/// WY2 part B (RULINGS LH10) — THE commit door, end to end: step (1) renews the holder's lease
+/// (`expires_at = now + LEASE_SECS`) and writes the record; step (3a) re-reads it from JSON and
+/// refuses if it differs from the record step (1) holds in memory (`rec != snapshot`, cysd
+/// repair.rs ~3212). With a `now` whose renewed lease is 1794799840.0102947 — the measured value —
+/// serde_json without `float_roundtrip` reads the lease back one step off and the commit answers
+/// "검사하는 동안 수리 기록이 바뀌었습니다" with nothing changed (measured on Windows, runs/TW1-ci-7c
+/// commit.json rc 94). The commit must SUCCEED. The premise is checked here without the parser:
+/// the renewed lease's text is exactly that measured text.
+#[test]
+fn wy2_a_commit_whose_renewed_lease_is_a_17_digit_time_is_not_refused() {
+    let now: f64 = 1_794_792_640.010_294_7;
+    let lease = now + cys::repair::types::LEASE_SECS as f64;
+    assert_eq!(serde_json::to_string(&lease).unwrap(), "1794799840.0102947", "premise: the renewed lease's text");
+    let r = rig("wy2-lease");
+    let w = seat(3, "worker");
+    let b = r
+        .call(now - 3.0, &w, "begin", json!({"trigger": "owner_order", "files": ["bin/a.py"]}))
+        .unwrap();
+    let id = b["repair"].as_str().unwrap().to_string();
+    std::fs::write(r.pack.join("bin/a.py"), b"print('fixed')\n").unwrap();
+    r.call(now - 2.0, &w, "record", json!({"repair": id, "note": "fix print"})).unwrap();
+    r.call(
+        now - 1.0,
+        &seat(7, "reviewer-codex"),
+        "attest_verify",
+        json!({"repair": id, "verdict": "pass", "note": "repro gone"}),
+    )
+    .unwrap();
+    let c = r
+        .call(now, &w, "commit", json!({"repair": id}))
+        .unwrap_or_else(|e| panic!("the commit was refused: {} — {}", e.code, e.message));
+    assert_eq!(c["state"], "probation", "{c}");
+    let rec = r.record_of(&id);
+    assert_eq!(rec.state, RepairState::Probation);
+    assert!(rec.lock.is_none(), "the commit released its lock");
+}
+
 /// The whole general path, and K1: commit writes this lane's own row only; status counts every
 /// registered lane, a lane without a row shows 대기 and "전파 완료" is withheld.
 #[test]

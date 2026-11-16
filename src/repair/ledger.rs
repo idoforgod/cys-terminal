@@ -1685,6 +1685,42 @@ mod storage_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// WY2 part B (RULINGS LH10) — every f64 the ledger writes is read back as ITSELF. The value is
+    /// the one measured by the master: 1794799840.0102947 (17 significant digits — a 100-ns clock
+    /// (Windows) or a 1-ns clock (Linux) makes such times; a microsecond clock (macOS) does not).
+    /// serde_json without the feature `float_roundtrip` writes it as "1794799840.0102947" and parses
+    /// that text to 1794799840.010295 — so a record holding it is not equal to itself after the
+    /// ledger's round trip, and the commit door's step 3a (cysd repair.rs ~3212, `rec != snapshot`)
+    /// refuses with "검사하는 동안 수리 기록이 바뀌었습니다" although nothing changed (Windows,
+    /// runs/TW1-ci-7c commit.json rc 94).
+    #[test]
+    fn wy2_a_17_digit_lease_time_survives_the_ledgers_json_round_trip() {
+        let t: f64 = 1_794_799_840.010_294_7;
+        let root = tmp(line!());
+        let id = RepairId::parse("R-2").unwrap();
+        std::fs::create_dir_all(repair_dir_in(&root, &id)).unwrap();
+        let mut rec = sample(&id);
+        rec.lock = Some(Lease {
+            owner: LockOwner { lane: LaneKey("base".into()), seat: 3, incarnation: "inc-1".into() },
+            expires_at: t,
+            claim: None,
+        });
+        write_record_in(&root, &rec).unwrap();
+        let back = read_record_in(&root, &id).unwrap().unwrap();
+        assert_eq!(
+            back.lock.as_ref().map(|l| l.expires_at.to_bits()),
+            Some(t.to_bits()),
+            "the lease time read back: {:?} (written {t:?})",
+            back.lock.as_ref().map(|l| l.expires_at)
+        );
+        assert_eq!(back, rec, "the record reads back EQUAL (what the commit door's step 3a compares)");
+        // the parser alone, on the writer's own text
+        let text = serde_json::to_string(&t).unwrap();
+        assert_eq!(text, "1794799840.0102947", "the writer's shortest text");
+        assert_eq!(serde_json::from_str::<f64>(&text).unwrap().to_bits(), t.to_bits(), "the text parses back to the same f64");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The `_in` layouts are exactly the T0 path helpers relative to the repairs root.
     #[test]
     fn layouts_match_paths_rs() {
