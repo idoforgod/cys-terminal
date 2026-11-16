@@ -24,6 +24,9 @@ What it pins (the rules of the record - plan impl/plans/TW1.md 3.7, each by a te
      repair-flow-sh/ and its ONE finding line for a commit (rc 0, 94 then 0, two 94s, a refusal), a stop before the
      commit, no general file, no time left; the Python flow's facts, evidence list and state are the same whatever
      it does; the line and the folder are redacted (also across the 200-character cut) and reach the record.
+  PO (TW5, RULINGS LH36) the job t9-libtests also runs PO1's po1_ tests in its two test steps (one more filter word
+     each; the steps' shell otherwise as before); through the REAL probe and the REAL matrix rows a red po1_ test
+     fails the T9 rows and turns the job red, a green one passes, and logs without any po1_ test are judged as before.
 
 Standard library only. Run: python3 scripts/tests/windows_measure_selftest.py
 """
@@ -2015,6 +2018,135 @@ class ShellRepairFlowTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(early, "evidence", "s3_repair_flow", "repair-flow-sh", "commit-2.json")))
 
 
+_PO1_LIB_OK = ("test pack::tests::po1_install_core_child ... ignored, child of the PO1 library specimen\n",
+               "test pack::tests::po1_install_core_lines_follow_the_caller ... ok\n")
+_PO1_CYS = ("po1_a_the_snapshot_line_goes_to_stderr_and_the_record_stays_line_0",
+            "po1_b_the_pending_summary_and_the_healed_line_go_to_stderr",
+            "po1_c_the_m11_kept_user_file_lines_go_to_stderr", "po1_c_the_tombstone_lines_go_to_stderr",
+            "po1_d_the_unreadable_file_line_goes_to_stderr", "po1_init_pack_keeps_the_snapshot_and_pending_lines_on_stdout")
+
+
+def _cargo_log(lines, failures="", rc=0, failed=None):
+    """A `cargo test` log as the step writes it (compile lines, libtest's lines, its closing line, the exit line)."""
+    st = [ln.rsplit(" ... ", 1)[-1].split(",")[0].strip() for ln in lines if ln.startswith("test ")]
+    n_ok, n_ign = st.count("ok"), st.count("ignored")
+    n_failed = st.count("FAILED") if failed is None else failed
+    return ("   Compiling cys-terminal v0.15.1 (D:\\a\\x\\x)\n    Finished `test` profile [unoptimized + debuginfo]\n"
+            "     Running unittests (target\\debug\\deps\\x.exe)\n\nrunning %d tests\n%s%s\ntest result: %s. %d passed; "
+            "%d failed; %d ignored; 0 measured; 600 filtered out; finished in 9.10s\n\nTW1-CARGO-EXIT=%d\n"
+            % (len(lines), "".join(lines), failures, "FAILED" if n_failed else "ok", n_ok, n_failed, n_ign, rc))
+
+
+class PO1OnTheT9StepsTests(unittest.TestCase):
+    """TW5 (RULINGS LH36): PO1's po1_ tests ride on the two test steps of the job t9-libtests. Their result reaches the
+    conclusion the way a pack_update_ test's does: the step's exit line and libtest's `test ... FAILED` lines, read by
+    the REAL probe s7_t9_libtests (the artifact download injected), judged by the REAL rows T9-JOURNAL-TAKE.libtests /
+    .verb. They are not in the expected lists: a tree without PO1 is judged as before."""
+
+    ROWS = ("T9-JOURNAL-TAKE.libtests", "T9-JOURNAL-TAKE.verb")
+
+    def setUp(self):
+        import tempfile
+        import tw1_probes as P
+        self.P = P
+        self.tmp = tempfile.TemporaryDirectory()
+        self.work, self.out = os.path.join(self.tmp.name, "tw1"), os.path.join(self.tmp.name, "tw1-record")
+        os.makedirs(self.work)
+        self.saved = dict(P._REGISTRY)
+
+    def tearDown(self):
+        self.P._REGISTRY.clear()
+        self.P._REGISTRY.update(self.saved)
+        self.tmp.cleanup()
+
+    def t9_lines(self, lib):
+        if lib:
+            return ["test pack::tests::%s ... ok\n" % t for t in self.P.T9_EXPECTED_TESTS]
+        return ["test tests::%s ... ok\n" % t for t in self.P.T9_VERB_EXPECTED]
+
+    def judge(self, lib_log, verb_log):
+        """-> (facts, {row id: verdict result}, job conclusion) through the real probe and the real rows."""
+        from unittest import mock
+        P = self.P
+
+        def fetch(run_id, name, dest, token, work):
+            self.assertEqual(name, "tw1-t9-libtests")
+            os.makedirs(dest, exist_ok=True)
+            for fn, text in (("t9-present.txt", "present\n"), ("t9-libtests.log", lib_log), ("t9-verbtests.log", verb_log)):
+                with open(os.path.join(dest, fn), "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(text)
+            return True, "fixture"
+        pr = P.Probe("s7_t9_libtests", self.work, self.out, {})
+        with mock.patch.object(P, "fetch_artifact", fetch):
+            P.PROBES["s7_t9_libtests"](pr)
+        rows = {r["id"]: r for r, _ in R.iter_rows(load())}
+        res = {rid: R.compute_verdict(rows[rid], ran(pr.facts)) for rid in self.ROWS}
+        subs = [dict(v, id=rid, parent="T9-JOURNAL-TAKE") for rid, v in res.items()]
+        top = [{"id": "T9-JOURNAL-TAKE", "verdict": R.worst([v["verdict"] for v in res.values()]), "findings": []}]
+        rec = R.build_record({}, {}, {"failed": False, "reasons": []}, top, subs)
+        return pr.facts, res, R.job_conclusion(rec)[0]
+
+    def cys_lines(self, failed=()):
+        out = ["test tests::po1_command_child ... ignored, child of the PO1 real-process specimens\n"]
+        out += ["test tests::%s ... %s\n" % (t, "FAILED" if t in failed else "ok") for t in _PO1_CYS]
+        out += ["test b360_tests::po1_census_no_bare_stdout_in_the_pack_update_reach ... ok\n",
+                "test b360_tests::po1_census_catches_each_mutation ... ok\n"]
+        return out
+
+    def test_the_probe_records_the_filters_the_steps_run(self):
+        facts, _, _ = self.judge(_cargo_log(self.t9_lines(True)), _cargo_log(self.t9_lines(False)))
+        self.assertEqual(facts["t9lib_filters"], ["t9_", "m15_da_", "m15_da2_", "po1_"])
+        self.assertEqual(facts["t9verb_filters"], ["pack_update_", "b428_u9_", "po1_"])
+
+    def test_green_po1_tests_pass_the_rows(self):
+        facts, res, concl = self.judge(_cargo_log(self.t9_lines(True) + list(_PO1_LIB_OK)),
+                                       _cargo_log(self.t9_lines(False) + self.cys_lines()))
+        self.assertEqual({k: v["verdict"] for k, v in res.items()}, dict.fromkeys(self.ROWS, R.PASS), res)
+        self.assertEqual(concl, "green")
+        self.assertEqual((facts["t9lib_passed"], facts["t9lib_ignored"]), (len(self.P.T9_EXPECTED_TESTS) + 1, 1))
+        self.assertEqual((facts["t9verb_passed"], facts["t9verb_ignored"]), (len(self.P.T9_VERB_EXPECTED) + 8, 1))
+
+    def test_logs_without_any_po1_test_are_judged_as_before(self):
+        """A tree without PO1: the word po1_ selects nothing, nothing is missing, the rows pass as before."""
+        facts, res, concl = self.judge(_cargo_log(self.t9_lines(True)), _cargo_log(self.t9_lines(False)))
+        self.assertEqual({k: v["verdict"] for k, v in res.items()}, dict.fromkeys(self.ROWS, R.PASS), res)
+        self.assertEqual(concl, "green")
+        self.assertEqual((facts["t9lib_expected_missing"], facts["t9verb_expected_missing"]), ([], []))
+
+    def test_a_red_library_po1_test_fails_the_libtests_row_and_the_job(self):
+        lib = self.t9_lines(True) + [_PO1_LIB_OK[0], "test pack::tests::po1_install_core_lines_follow_the_caller ... FAILED\n"]
+        fail = ("\nfailures:\n\n---- pack::tests::po1_install_core_lines_follow_the_caller stdout ----\n\nthread "
+                "'pack::tests::po1_install_core_lines_follow_the_caller' panicked at src\\pack.rs:19700:9:\nall-tx: "
+                "\"[init-pack] x\" is not on stderr\n\n\nfailures:\n    pack::tests::po1_install_core_lines_follow_the_caller\n")
+        facts, res, concl = self.judge(_cargo_log(lib, fail, rc=101),
+                                       _cargo_log(self.t9_lines(False) + self.cys_lines()))
+        self.assertEqual(res["T9-JOURNAL-TAKE.libtests"]["verdict"], R.FAIL, res)
+        self.assertIn("po1_install_core_lines_follow_the_caller", res["T9-JOURNAL-TAKE.libtests"]["reason"])
+        self.assertIn("exit0", res["T9-JOURNAL-TAKE.libtests"]["reason"])
+        self.assertEqual(res["T9-JOURNAL-TAKE.verb"]["verdict"], R.PASS)
+        self.assertEqual(concl, "red")
+
+    def test_a_red_cys_po1_test_fails_the_verb_row_and_the_job(self):
+        bad = "po1_a_the_snapshot_line_goes_to_stderr_and_the_record_stays_line_0"
+        facts, res, concl = self.judge(_cargo_log(self.t9_lines(True) + list(_PO1_LIB_OK)),
+                                       _cargo_log(self.t9_lines(False) + self.cys_lines(failed=(bad,)), rc=101))
+        self.assertEqual(res["T9-JOURNAL-TAKE.verb"]["verdict"], R.FAIL, res)
+        self.assertEqual(facts["t9verb_failed_names"], [bad])
+        self.assertEqual(res["T9-JOURNAL-TAKE.libtests"]["verdict"], R.PASS)
+        self.assertEqual(concl, "red")
+
+    def test_a_split_form_failure_still_fails_by_the_exit_line(self):
+        """On the runner a panic message can sit between `test X ... ` and `FAILED` (TW3, WIN_LOG_STEP9): the FAILED
+        name is then not read from that line, but the step's exit line (101) still fails the row."""
+        lines = self.t9_lines(False) + self.cys_lines()[:1] + [
+            "test tests::po1_d_the_unreadable_file_line_goes_to_stderr ... \nthread 'x' panicked at src\\bin\\cys.rs:1:1:\n"
+            "FAILED\n"] + self.cys_lines()[2:]
+        facts, res, concl = self.judge(_cargo_log(self.t9_lines(True) + list(_PO1_LIB_OK)), _cargo_log(lines, rc=101, failed=1))
+        self.assertEqual(res["T9-JOURNAL-TAKE.verb"]["verdict"], R.FAIL, res)
+        self.assertIn("exit0", res["T9-JOURNAL-TAKE.verb"]["reason"])
+        self.assertEqual(concl, "red")
+
+
 class WorkflowTests(unittest.TestCase):
     ALLOWED_USES = {"actions/checkout@v4", "actions/setup-python@v5", "actions/upload-artifact@v4",
                     "dtolnay/rust-toolchain@stable", "swatinem/rust-cache@v2"}
@@ -2130,6 +2262,31 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue(any(t.startswith(x) for x in P.T9_LIB_TEST_FILTERS), t)
         for t in P.T9_UNIX_ONLY:
             self.assertFalse(any(x in t for x in P.T9_LIB_TEST_FILTERS), t)
+
+    def test_the_t9_steps_also_run_the_po1_tests_and_nothing_else_moved(self):
+        """TW5 (RULINGS LH36): each test step is exactly as before plus the filter word po1_ - same condition, same
+        shell, same rc capture into the exit line, same log; no continue-on-error and no `|| true` in the job."""
+        import tw1_probes as P
+        self.assertEqual(P.PO1_FILTER, "po1_")
+        self.assertEqual(P.T9_LIB_TEST_FILTERS, ("t9_", "m15_da_", "m15_da2_", "po1_"))
+        self.assertEqual(P.T9_VERB_FILTERS, ("pack_update_", "b428_u9_", "po1_"))
+        body = self.jobs["t9-libtests"]
+        for name, cmd, log in (
+                ("T9 protocol tests (library)", "cargo test --lib -- t9_ m15_da_ m15_da2_ po1_", "t9-libtests.log"),
+                ("Pack-update verb, complete command, test-signed pack (binary tests)",
+                 "cargo test --bin cys -- pack_update_ b428_u9_ po1_", "t9-verbtests.log")):
+            step = re.search(r"(?ms)^      - name: %s\n(.*?)(?=^      - |\Z)" % re.escape(name), body)
+            self.assertIsNotNone(step, name)
+            self.assertEqual(step.group(1), "        if: steps.detect.outputs.present == 'true'\n"
+                                            "        shell: bash\n"
+                                            "        run: |\n"
+                                            "          rc=0\n"
+                                            "          %s > t9-out/%s 2>&1 || rc=$?\n"
+                                            "          echo \"TW1-CARGO-EXIT=$rc\" >> t9-out/%s\n" % (cmd, log, log))
+        self.assertNotIn("continue-on-error", body)
+        self.assertNotIn("|| true", body)
+        for t in P.T9_EXPECTED_TESTS + P.T9_VERB_EXPECTED:      # PO1's tests are never required: a tree without them
+            self.assertNotIn(P.PO1_FILTER, t)                   # is judged as before
 
     def test_cargo_log_summary(self):
         import tw1_probes as P

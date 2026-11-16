@@ -4320,7 +4320,12 @@ def _stable_rels(pr):
 # RULINGS HV4: T9's protocol tests (src/pack.rs on track/T9 @56b1a791). Selected by the workflow's filters `t9_ m15_da_
 # m15_da2_` (m15_da2_ added: the same module's stage-2 case, not matched by `m15_da_`): 22 tests, none cfg(unix); one
 # (t9_r2_admission_onto_a_non_empty_slot_fails_onto_an_empty_slot_as_the_platform) asserts a cfg(windows) branch.
-T9_LIB_TEST_FILTERS = ("t9_", "m15_da_", "m15_da2_")
+# TW5 (RULINGS LH36): both steps also take PO1's word `po1_` (the tests of `cys pack-update`'s stdout: in the library
+# pack::tests::po1_install_core_lines_follow_the_caller, in the cys binary the real-process cases and the census). Their
+# result reaches the rows through the same exit line and FAILED names; they are NOT in the expected lists, so a tree
+# without PO1 (no po1_ test: the word selects nothing) is judged exactly as before.
+PO1_FILTER = "po1_"
+T9_LIB_TEST_FILTERS = ("t9_", "m15_da_", "m15_da2_", PO1_FILTER)
 T9_EXPECTED_TESTS = (
     "m15_da_dept_boot_recovery_during_base_update_writes_base_bytes_into_dept_pack",
     "m15_da_base_boot_recovery_during_dept_update_writes_dept_bytes_into_base_pack",
@@ -4354,7 +4359,7 @@ T9_UNIX_ONLY = ("journal_rollback_restores_recorded_modes", "journal_rollback_ke
 # The pack-update verb's complete command (src/bin/cys.rs run_pack_update / pack_update_from_dir), run in-process by the
 # binary's own tests with a test-signed pack and a test keyring - the production CLI passes only the embedded keyring
 # ("no environment override"), so the shipped cys.exe accepts no pack this workflow could sign.
-T9_VERB_FILTERS = ("pack_update_", "b428_u9_")
+T9_VERB_FILTERS = ("pack_update_", "b428_u9_", PO1_FILTER)
 T9_VERB_EXPECTED = ("pack_update_from_dir_applies_signed_pack", "b428_u9_complete_command_classifies_before_clean_noop_and_publishes_first")
 
 

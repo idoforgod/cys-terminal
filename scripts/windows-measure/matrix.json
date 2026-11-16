@@ -10492,7 +10492,7 @@
       "T9"
      ],
      "run_when_absent": true,
-     "title": "T9's own protocol tests on the Windows runner: cargo test --lib -- t9_ m15_da_ m15_da2_ (22 tests, none cfg(unix); the 6 cfg(unix) journal-mode tests of the module are not selected and are not compiled on Windows)",
+     "title": "T9's own protocol tests on the Windows runner: cargo test --lib -- t9_ m15_da_ m15_da2_ po1_ (22 T9 tests, none cfg(unix); the 6 cfg(unix) journal-mode tests of the module are not selected and are not compiled on Windows; po1_ = PO1's library test of the install core's output streams, TW5 - not required, a red one fails this row)",
      "checks": [
       {
        "id": "artifact",
@@ -10557,7 +10557,7 @@
      ],
      "run_when_absent": true,
      "why": "observed through the binary's own tests that run the complete command (src/bin/cys.rs run_pack_update -> pack_update_from_dir -> apply_pack_transactional) with a test-signed pack and a test keyring; see .shipped",
-     "title": "the pack-update verb's complete command with a test-signed pack reaches T9's admission and completes, on the Windows runner (cargo test --bin cys -- pack_update_ b428_u9_)",
+     "title": "the pack-update verb's complete command with a test-signed pack reaches T9's admission and completes, on the Windows runner (cargo test --bin cys -- pack_update_ b428_u9_ po1_; po1_ = PO1's real-process tests of the command's stdout, TW5 - not required, a red one fails this row)",
      "checks": [
       {
        "id": "artifact",

@@ -86,6 +86,10 @@ jobs:
   #   none is cfg(unix)) and the pack-update verb's complete command with a test-signed pack (src/bin/cys.rs tests;
   #   the shipped CLI trusts only its embedded keyring) on a real Windows runner. Skipped - and recorded as absent -
   #   while T9 is not in the tree. No cache (EQ6).
+  # TW5 (RULINGS LH36): both test steps also take the filter word po1_ - PO1's tests of `cys pack-update`'s stdout: the
+  #   library's pack::tests::po1_install_core_lines_follow_the_caller (it starts its ignored child itself, with its own
+  #   arguments) and the cys binary's real-process po1_ cases and census. Same rc capture, same logs, same probe: a red
+  #   po1_ test turns the T9 rows (and the job) red as a red pack_update_ test does. A tree without PO1 has no po1_ test.
   t9-libtests:
     runs-on: windows-latest
     timeout-minutes: 90
@@ -109,14 +113,14 @@ jobs:
         shell: bash
         run: |
           rc=0
-          cargo test --lib -- t9_ m15_da_ m15_da2_ > t9-out/t9-libtests.log 2>&1 || rc=$?
+          cargo test --lib -- t9_ m15_da_ m15_da2_ po1_ > t9-out/t9-libtests.log 2>&1 || rc=$?
           echo "TW1-CARGO-EXIT=$rc" >> t9-out/t9-libtests.log
       - name: Pack-update verb, complete command, test-signed pack (binary tests)
         if: steps.detect.outputs.present == 'true'
         shell: bash
         run: |
           rc=0
-          cargo test --bin cys -- pack_update_ b428_u9_ > t9-out/t9-verbtests.log 2>&1 || rc=$?
+          cargo test --bin cys -- pack_update_ b428_u9_ po1_ > t9-out/t9-verbtests.log 2>&1 || rc=$?
           echo "TW1-CARGO-EXIT=$rc" >> t9-out/t9-verbtests.log
       - name: Upload the T9 test logs (always)
         if: always()
