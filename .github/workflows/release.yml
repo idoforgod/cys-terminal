@@ -647,9 +647,13 @@ jobs:
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
                    test_report_gate test_orchestra_todo_path test_todo_shared_constants test_import_guard test_event_spool_rc test_org_dispatch_delivers test_pkg3a_tools_lane test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
-                   test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
+                   test_dept_name_guard test_preflight_c03_states test_content_pins_parity test_ceo_composition \
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
                    test_preflight_c62_c68_ledger \
+                   test_preflight_reconcile_hooks \
+                   test_preflight_update_rules \
+                   test_schedule_writer_census \
+                   test_guard_owner_token \
                    test_runtime_seal test_preflight_c80_runtime_seal test_runtime_manifest_parity \
                    test_check_ack_addr_gate test_hook_launcher_split test_hook_r34 test_session_start_r31 test_mission_origin_parity \
                    test_bootlast_golden_lock_parity test_bootv2_doc_contract test_pyseal_census \
@@ -657,6 +661,10 @@ jobs:
                    test_sandbox_state_isolation test_settings_torn_write test_state_snapshot_root test_cysd_accept_emfile \
                    test_preflight_hook_body test_preflight_npm_prefix test_learn_digest_queue \
                    test_trust_seed test_capgate_registration test_capgate_hook_shell \
+                   test_capgate_boot_critical \
+                   test_preflight_c84_repair_sweep \
+                   test_task_prompt_gate \
+                   test_boot_critical_start_replay \
                    test_cso_directive_rev test_role_authority test_role_authority_shell \
                    test_role_authority_triage \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
@@ -987,6 +995,60 @@ jobs:
           HOST_TRIPLE="$([ "$(uname -m)" = "arm64" ] && echo aarch64-apple-darwin || echo x86_64-apple-darwin)"
           if [ "$TRIPLE" = "$HOST_TRIPLE" ]; then SRC="target/release/bundle"; else SRC="target/$TRIPLE/release/bundle"; fi
           bash scripts/check-no-ioreport-link.sh "$SRC/macos/cys.app/Contents/MacOS/cysd"
+
+      # ★(0.15.0 · T11 · RULINGS BQ1(b)(2) · 오너 지시 추가 11) 번들 아키텍처 게이트 — 업로드 **전** · IOReport 게이트 옆.
+      #   무엇을 막는가: 인텔(x86_64) 레그는 arm64 러너의 **크로스 빌드**이고 동봉 runtime(python·node·git·uv)은
+      #   타깃별로 내려받는다 — 그런데 출하되는 Mach-O 의 아키텍처를 보는 장치가 0개였다. 인텔용 설치 파일에
+      #   M칩 전용 python 이 실려도 서명·공증·업로드까지 아무것도 붉어지지 않는 구조다.
+      #   scripts/check_macho_arch.py 가 Mach-O·fat 헤더 바이트를 읽어(lipo·실행 없음) 타깃이 없는 파일을 **이름으로**
+      #   붉힌다 — 대상 셋: ① 레그가 만든 cys.app ② 올라갈 업데이터 아카이브(cys.app.tar.gz) ③ DMG 안의 두 앱
+      #   (.support/cys.app · Install cys.app · 읽기 전용 마운트). 진입점의 최소 macOS 와 LSMinimumSystemVersion 도
+      #   찍는다(BQ1(e) 보고용 · 실패 사유 아님). 요약은 GITHUB_STEP_SUMMARY 로 승격 — BQ2(발행 증적에 두 레그 출력 인용).
+      #   CPU 하위 유형까지 본다(x86_64h 만·arm64e 만은 불합격 · CA2(a)), 진입점 넷을 요구한다(CA2(b)), 아카이브는 한 번의
+      #   스트리밍 읽기다(CA1 — 정렬 순서 읽기는 실제 0.14.56 아카이브에서 약 35분이었다). 두 스텝 모두 시간 상한을 단다.
+      #   바로 앞 스텝이 게이트의 합성 헤더 대조군을 돌린다(게이트 신뢰 직전 · test_release_postprocess_gate 와 같은 규율).
+      - name: 번들 아키텍처 게이트 대조군 (test_check_macho_arch · 게이트 신뢰 직전)
+        if: matrix.platform == 'macos-latest'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_check_macho_arch.py"
+          [ -f "$f" ] || { echo "::error::게이트 대조군 누락: $f (git add 누락 의심)" >&2; exit 1; }
+          python3 "$f"
+
+      - name: 번들 아키텍처 게이트 (Mach-O 헤더 · 앱 · 업데이터 아카이브 · DMG 안 두 앱 · macOS 전용 · 업로드 전)
+        if: matrix.platform == 'macos-latest'
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          TRIPLE="${{ matrix.target }}"
+          VERSION="$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')"
+          case "$TRIPLE" in aarch64-apple-darwin) ARCH=aarch64 ;; x86_64-apple-darwin) ARCH=x64 ;; *) echo "::error::unexpected target $TRIPLE"; exit 1 ;; esac
+          HOST_TRIPLE="$([ "$(uname -m)" = "arm64" ] && echo aarch64-apple-darwin || echo x86_64-apple-darwin)"
+          if [ "$TRIPLE" = "$HOST_TRIPLE" ]; then SRC="target/release/bundle"; else SRC="target/$TRIPLE/release/bundle"; fi
+          DST="target/$TRIPLE/release/bundle"
+          DMG="$DST/dmg/cys_${VERSION}_${ARCH}.dmg"
+          GLOG="$(mktemp)"; rc=0
+          # 진입점 넷(python·node·git·uv)은 최종 게이트마다 **요구**된다 — 없거나 링크가 끊기면 붉다(CA2(b)).
+          REQ=(--require Contents/Resources/runtime/python/bin/python3 --require Contents/Resources/runtime/node/bin/node
+               --require Contents/Resources/runtime/git/bin/git --require Contents/Resources/runtime/uv/uv)
+          gate() { python3 scripts/check_macho_arch.py --target "$TRIPLE" "$@" 2>&1 | tee -a "$GLOG" || { r=$?; [ "$r" -gt "$rc" ] && rc=$r; true; }; }
+          gate "${REQ[@]}" "$SRC/macos/cys.app"
+          gate "${REQ[@]}" "$DST/macos/cys.app.tar.gz"
+          MNT="$(mktemp -d)"
+          trap 'hdiutil detach "$MNT" -force >/dev/null 2>&1 || true' EXIT
+          hdiutil attach -readonly -nobrowse -noautoopen -mountpoint "$MNT" "$DMG" >/dev/null
+          gate "${REQ[@]}" "$MNT/.support/cys.app"
+          gate "$MNT/Install cys.app"     # 설치 도우미 애플릿(유니버설이어야 정상 · runtime 없음 → 진입점 요구 없음)
+          {
+            echo "### 번들 아키텍처 게이트 — ${TRIPLE} (BQ2 증적)"
+            grep -E '^(== |  Mach-O files|  Info.plist|  WARN|FAIL|CANNOT JUDGE|RESULT)' "$GLOG" || echo '(게이트 출력 없음)'
+            grep -E 'python/bin/python3 ' "$GLOG" || true
+            echo "- exit=$rc (0=PASS · 1=FAIL · 2=판정 불가 — 통과 아님)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
 
       # ★macOS 격리 속성 + Gatekeeper 실평가 게이트 — 업로드 **전** (2026-08-13 신설).
       #   위 스텝이 서명·공증·staple 을 끝냈다. 그러나 그 산출물이 **실사용자 환경**에서 열리는지는
@@ -1409,7 +1471,18 @@ jobs:
       #   (알림 rc 2 를 단계 detail 에만 적는다) **보류 사실을 master 에게 알리는 통로가 통째로 사라진다** — B-360 이
       #   막으려는 바로 그 손실이다(기능 의존 — RELEASE.md 불변 규칙 :75-77). pack-release.yml
       #   PACK_MIN_BINARY_OVERRIDE · docs/RELEASE.md §0-A 2단계 리터럴과 같은 커밋에서 동시 상향(두 값 동일 계약).
-      PACK_MIN_BINARY: '0.14.52'
+      # ★0.15.0 상향(2026-11-16 · 「스스로 해결」 릴리스 버전 커밋 · 설계 v0.5 §4-11 카 · RULINGS AE3). 이 세대 팩이
+      #   **0.15.0 에 처음 생긴 CLI 표면의 실행을 직접 지시**한다 — `cys repair …`: 지침의 결함 접수
+      #   `cys repair report --file … --error …`(MASTER_DIRECTIVE.md:104·CEO_TEMPLATE.md:220·CSO_DIRECTIVE.md:165) ·
+      #   javis_preflight.py:521/:556 의 `cys repair boot-critical --list --json` / `cys repair tombstones --json` ·
+      #   javis_report_gate.py:1971/:2029 의 `cys repair list --json`. 부재 실측(2026-11-16 · v0.14.56=31f87878 대조):
+      #   `git show v0.14.56:src/bin/cys.rs | grep -cE 'repair_cli|RepairCmd'` → 0, `src/bin/cys/repair_cli.rs` 는
+      #   v0.14.56 트리에 없다. 하나라도 빠지면 0.14.52~0.14.56 본체가 0.15.0 팩을 옛 규칙으로 깔고 새 지침이
+      #   시키는 `cys repair` 가 없어 실패한다(설계 §4-11 카). 세 곳 동일성과 AE3(Cargo.toml ≥ 0.15.0 ⇒ 하한 ≥ 0.15.0)는
+      #   scripts/check_min_binary_floor.py 가 검사한다(ci-branch `release-floor-parity`). pack-release.yml
+      #   PACK_MIN_BINARY_OVERRIDE · docs/RELEASE.md §0-A 2단계 리터럴과 같은 커밋에서 동시 상향(두 값 동일 계약).
+      #   security-floor.txt(보안 하한 0.12.48)는 건드리지 않는다.
+      PACK_MIN_BINARY: '0.15.0'
     steps:
       - uses: actions/checkout@v4
 
@@ -1582,6 +1655,10 @@ jobs:
                    test_sandbox_state_isolation test_settings_torn_write test_state_snapshot_root test_cysd_accept_emfile \
                    test_preflight_hook_body test_preflight_npm_prefix test_learn_digest_queue \
                    test_trust_seed test_capgate_registration test_capgate_hook_shell \
+                   test_capgate_boot_critical \
+                   test_preflight_c84_repair_sweep \
+                   test_task_prompt_gate \
+                   test_boot_critical_start_replay \
                    test_cso_directive_rev test_role_authority test_role_authority_shell \
                    test_role_authority_triage \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
