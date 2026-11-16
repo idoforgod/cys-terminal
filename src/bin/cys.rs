@@ -54262,6 +54262,277 @@ mod b360_tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    /// ★PO1 (RULINGS LH36) — the stdout census of `cys pack-update`'s reach. Every stdout writer (`println!`, `print!`,
+    /// `stdout()`, `Stdio::inherit`) in (A) the production text of src/pack.rs (the install core and everything beside it —
+    /// the WHOLE file, so a new writer anywhere in it is seen) and (B) the production functions of this file reachable from
+    /// the command's entry (`run_pack_update` and the pending provider the dispatch hands it, `consume_reinject_pending`;
+    /// calls followed transitively, the `run` dispatch excluded) must be one of:
+    ///   · (A) the install core's ONE helper `install_human_line!` (its own definition: stderr when `transactional`, else
+    ///     stdout) — and every use of it passes the parameter `transactional` itself, never a literal;
+    ///   · (A) a site PROVEN unreachable with `transactional == true` — the allow-list, two rows: the channel guard's line
+    ///     inside `if !transactional {` of `install_into_with`, and the `--no-install-hook` line inside `if !install_hooks {`
+    ///     of `setup_isolated_config_dir`, which the install core calls only as `setup_isolated_config_dir(true)` (every
+    ///     other call is in `install_staged`, the init-pack path, which the transaction never calls);
+    ///   · (B) the command's own terminal records: the `println!` of `run_pack_update` AFTER its local `macro_rules! println`
+    ///     (which writes `terminal_output`, the stdout the dispatch passes).
+    /// Anything else fails with its file, function and line. Modelled on FG6 (src/repair/apply_tests.rs
+    /// `every_write_of_the_repair_module_is_classified` + `the_write_census_catches_each_mutation`: a production-text census
+    /// with mutation controls) over the lexer and call-graph of `b360_r2r_p14` (comments / strings blanked, `#[cfg(test)]`
+    /// items cut).
+    fn po1_stdout_census(pack_src: &str, cys_src: &str) -> Vec<String> {
+        let mut v = Vec::new();
+        let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        // every stdout writer of a lexed text outside its test items: (offset, the writer)
+        let writers = |text: &str, tests: &[(usize, usize)]| -> Vec<(usize, &'static str)> {
+            let b = text.as_bytes();
+            let mut out = Vec::new();
+            for w in ["println!", "print!", "stdout()", "Stdio::inherit"] {
+                let mut from = 0;
+                while let Some(n) = text[from..].find(w) {
+                    let at = from + n;
+                    from = at + w.len();
+                    if at > 0 && (is_ident(b[at - 1]) || (w == "stdout()" && b[at - 1] == b'_')) {
+                        continue; // eprintln! / eprint! / ..._stdout()
+                    }
+                    if !tests.iter().any(|&(a, e)| a <= at && at < e) {
+                        out.push((at, w));
+                    }
+                }
+            }
+            out.sort();
+            out
+        };
+        let line_of = |text: &str, at: usize| text[..at].matches('\n').count() + 1;
+        let block_end = |text: &str, open: usize| -> usize {
+            let mut depth = 0usize;
+            for (k, ch) in text[open..].char_indices() {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        return open + k + 1;
+                    }
+                }
+            }
+            text.len()
+        };
+        let fn_of = |fns: &[(String, usize, usize)], at: usize| -> Option<(String, usize, usize)> {
+            fns.iter().filter(|(_, s, e)| *s <= at && at < *e).min_by_key(|(_, s, e)| e - s).cloned()
+        };
+        // inside a block of `fn_span` whose header is exactly `guard` (`if !x {`)?
+        let guarded = |text: &str, span: (usize, usize), guard: &str, at: usize| -> bool {
+            let mut from = span.0;
+            while let Some(n) = text[from..span.1].find(guard) {
+                let g = from + n;
+                from = g + guard.len();
+                let open = g + guard.len() - 1;
+                if g < at && at < block_end(text, open) {
+                    return true;
+                }
+            }
+            false
+        };
+
+        // ── (A) src/pack.rs ──
+        let (lexed, tests) = r2r_lex_production(pack_src);
+        let text = String::from_utf8_lossy(&lexed).into_owned();
+        let fns = r2r_fn_spans(&text, &tests);
+        let helper_head = "macro_rules! install_human_line {";
+        let helper = match (text.find(helper_head), text.matches(helper_head).count()) {
+            (Some(h), 1) => {
+                let end = block_end(&text, h + helper_head.len() - 1);
+                let body = &text[h..end];
+                if !(body.contains("if $transactional") && body.contains("eprintln!") && body.contains("println!")) {
+                    v.push(format!("pack.rs: the helper `install_human_line!` no longer chooses stderr when `transactional`: {body}"));
+                }
+                Some((h, end))
+            }
+            (_, n) => {
+                v.push(format!("pack.rs: `{helper_head}` found {n} time(s), expected exactly 1"));
+                None
+            }
+        };
+        // every use of the helper passes the parameter itself
+        let mut uses = 0;
+        let mut from = 0;
+        while let Some(n) = text[from..].find("install_human_line!(") {
+            let at = from + n;
+            from = at + 1;
+            if tests.iter().any(|&(a, e)| a <= at && at < e) {
+                continue;
+            }
+            uses += 1;
+            let arg = text[at + "install_human_line!(".len()..].trim_start();
+            if !arg.starts_with("transactional,") {
+                v.push(format!("pack.rs:{}: install_human_line! must be given the parameter `transactional` itself, not {:?}",
+                    line_of(&text, at), arg.chars().take(24).collect::<String>()));
+            }
+        }
+        if uses == 0 {
+            v.push("pack.rs: the helper `install_human_line!` is used nowhere".into());
+        }
+        let span_of = |name: &str| fns.iter().find(|(n, ..)| n == name).map(|(_, s, e)| (*s, *e));
+        let core = span_of("install_into_with");
+        for (at, w) in writers(&text, &tests) {
+            if helper.is_some_and(|(h, e)| h <= at && at < e) {
+                continue; // the helper's own two arms
+            }
+            let f = fn_of(&fns, at);
+            let name = f.as_ref().map(|(n, ..)| n.as_str()).unwrap_or("<no fn>");
+            let proven = match (name, f.as_ref()) {
+                ("install_into_with", Some((_, s, e))) => guarded(&text, (*s, *e), "if !transactional {", at),
+                ("setup_isolated_config_dir", Some((_, s, e))) => {
+                    let inside = guarded(&text, (*s, *e), "if !install_hooks {", at);
+                    // every production call passes `true`, except the init-pack path's (`install_staged`)
+                    let mut calls_ok = true;
+                    let mut cf = 0;
+                    while let Some(n) = text[cf..].find("setup_isolated_config_dir(") {
+                        let c = cf + n;
+                        cf = c + 1;
+                        if c > 0 && is_ident(text.as_bytes()[c - 1]) || tests.iter().any(|&(a, e)| a <= c && c < e) {
+                            continue;
+                        }
+                        let caller = fn_of(&fns, c).map(|(n, ..)| n).unwrap_or_default();
+                        let arg = text[c + "setup_isolated_config_dir(".len()..].trim_start();
+                        if caller == "setup_isolated_config_dir" || arg.starts_with("install_hooks: bool") {
+                            continue; // the definition itself
+                        }
+                        if !(arg.starts_with("true)") || caller == "install_staged") {
+                            calls_ok = false;
+                            v.push(format!("pack.rs:{}: `setup_isolated_config_dir` called by {caller} with {:?} — the `--no-install-hook` line is then reachable",
+                                line_of(&text, c), arg.chars().take(20).collect::<String>()));
+                        }
+                    }
+                    // and the transaction never reaches `install_staged`
+                    let staged_reached = ["apply_pack_transactional_core", "install_from_iter", "install_into_with"]
+                        .iter()
+                        .filter_map(|n| span_of(n))
+                        .any(|(s, e)| text[s..e].contains("install_staged("));
+                    if staged_reached {
+                        v.push("pack.rs: the transaction reaches `install_staged`".into());
+                    }
+                    inside && calls_ok && !staged_reached
+                }
+                _ => false,
+            };
+            if !proven {
+                v.push(format!("pack.rs:{} (fn {name}): a bare stdout writer `{w}` — in the transactional path stdout belongs to the machine records: use install_human_line!(transactional, …), or prove the site unreachable with transactional=true",
+                    line_of(&text, at)));
+            }
+        }
+        if core.is_none() {
+            v.push("pack.rs: `install_into_with` not found".into());
+        }
+
+        // ── (B) src/bin/cys.rs: the command's reach ──
+        let (lexed, tests) = r2r_lex_production(cys_src);
+        let text = String::from_utf8_lossy(&lexed).into_owned();
+        let fns = r2r_fn_spans(&text, &tests);
+        let mut by_name: std::collections::HashMap<&str, Vec<(usize, usize)>> = std::collections::HashMap::new();
+        for (n, s, e) in &fns {
+            by_name.entry(n.as_str()).or_default().push((*s, *e));
+        }
+        // the dispatch hands the command its pending provider and the process's stdout
+        match text.find("Command::PackUpdate") {
+            Some(d) => {
+                let arm = &text[d..text[d..].find("=> {").map(|n| d + n).and_then(|o| Some(block_end(&text, o + 3))).unwrap_or(text.len())];
+                if !(arm.contains("run_pack_update(") && arm.contains("consume_reinject_pending") && arm.contains("stdout().lock()")) {
+                    v.push(format!("cys.rs: the PackUpdate dispatch no longer passes consume_reinject_pending and the stdout lock: {arm}"));
+                }
+            }
+            None => v.push("cys.rs: no `Command::PackUpdate` dispatch".into()),
+        }
+        let mut reach: Vec<String> = Vec::new();
+        let mut queue: Vec<String> = vec!["run_pack_update".into(), "consume_reinject_pending".into()];
+        while let Some(f) = queue.pop() {
+            if reach.contains(&f) || !by_name.contains_key(f.as_str()) {
+                continue;
+            }
+            reach.push(f.clone());
+            for &(s, e) in &by_name[f.as_str()] {
+                let body = &text[s..e];
+                let bb = body.as_bytes();
+                let mut i = 0;
+                while i < bb.len() {
+                    if (bb[i].is_ascii_alphabetic() || bb[i] == b'_') && (i == 0 || !is_ident(bb[i - 1])) {
+                        let mut j = i;
+                        while j < bb.len() && is_ident(bb[j]) {
+                            j += 1;
+                        }
+                        let name = &body[i..j];
+                        let next = body[j..].trim_start();
+                        let callish = next.starts_with('(') || next.starts_with("::<");
+                        if callish && name != "run" && name != "main" && by_name.contains_key(name) && !reach.iter().any(|r| r == name) {
+                            queue.push(name.to_string());
+                        }
+                        i = j;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+        if !(reach.iter().any(|r| r == "consume_reinject_pending_core") && reach.iter().any(|r| r == "pack_update_from_dir")) {
+            v.push(format!("cys.rs: control — the reach lost the pending pass or the apply: {reach:?}"));
+        }
+        let all_writers = writers(&text, &tests);
+        for f in &reach {
+            for &(s, e) in &by_name[f.as_str()] {
+                let shadow = (f == "run_pack_update")
+                    .then(|| text[s..e].find("macro_rules! println").map(|n| s + n))
+                    .flatten();
+                if f == "run_pack_update" {
+                    let ok = shadow.is_some_and(|m| text[m..e].contains("writeln!(terminal_output"));
+                    if !ok {
+                        v.push("cys.rs: run_pack_update lost its local `println!` over `terminal_output`".into());
+                    }
+                }
+                for &(at, w) in all_writers.iter().filter(|(at, _)| s <= *at && *at < e) {
+                    // nested fns are their own entries; count a site once, in its innermost fn
+                    if fn_of(&fns, at).is_some_and(|(n, ..)| &n != f) {
+                        continue;
+                    }
+                    let record = w == "println!" && shadow.is_some_and(|m| at > m);
+                    if !record {
+                        v.push(format!("cys.rs:{} (fn {f}, reached by `cys pack-update`): a bare stdout writer `{w}` before the terminal record — write human lines to stderr",
+                            line_of(&text, at)));
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    /// ★PO1 (RULINGS LH36) criterion (5): no bare stdout writer in `cys pack-update`'s reach (see [`po1_stdout_census`]).
+    #[test]
+    fn po1_census_no_bare_stdout_in_the_pack_update_reach() {
+        let v = po1_stdout_census(include_str!("../pack.rs"), include_str!("cys.rs"));
+        assert!(v.is_empty(), "{v:#?}");
+    }
+
+    /// ★PO1 criterion (5)'s mutation controls (FG6 style): each of these edits makes the census fail — a bare `println!`
+    /// in a new function of pack.rs, a helper site turned back into `println!`, a helper given a literal instead of the
+    /// parameter, the channel guard's line taken out of `if !transactional`, the install core calling the setup with
+    /// `false`, a `println!` added to the pending pass and a `stdout()` write added to the apply of this file.
+    #[test]
+    fn po1_census_catches_each_mutation() {
+        let (pack, cys) = (include_str!("../pack.rs"), include_str!("cys.rs"));
+        assert!(po1_stdout_census(pack, cys).is_empty(), "the unmutated sources pass (else see the census test)");
+        let mut cases: Vec<(&str, String, String)> = Vec::new();
+        cases.push(("a new fn in pack.rs", format!("{pack}\nfn po1_mutant() {{ println!(\"x\"); }}\n"), cys.to_string()));
+        cases.push(("a helper site back to println!", pack.replacen("install_human_line!(\n            transactional,", "println!(", 1), cys.to_string()));
+        cases.push(("a literal instead of the parameter", pack.replacen("install_human_line!(\n            transactional,", "install_human_line!(\n            false,", 1), cys.to_string()));
+        cases.push(("the channel guard unguarded", pack.replacen("if !transactional {\n        if let Some(reason) = channel_guard_and_heal(&dir) {", "if true {\n        if let Some(reason) = channel_guard_and_heal(&dir) {", 1), cys.to_string()));
+        cases.push(("the setup called with false", pack.replacen("setup_isolated_config_dir(true);", "setup_isolated_config_dir(false);", 1), cys.to_string()));
+        cases.push(("a println! in the pending pass", pack.to_string(), cys.replacen("    for u in pending_unknown {\n", "    println!(\"x\");\n    for u in pending_unknown {\n", 1)));
+        cases.push(("a stdout() write in the apply", pack.to_string(), cys.replacen("    let _ = std::fs::remove_dir_all(staging);\n    extract_tar_gz(&tar_path, staging)?;", "    let _ = std::fs::remove_dir_all(staging);\n    let _ = std::io::Write::write_all(&mut std::io::stdout(), b\"x\");\n    extract_tar_gz(&tar_path, staging)?;", 1)));
+        for (name, p, c) in &cases {
+            assert!(p != pack || c != cys, "{name}: the mutation did not apply");
+            assert!(!po1_stdout_census(p, c).is_empty(), "{name}: not caught");
+        }
+    }
+
     /// Area P · head condition (b): the pending pass's reconciliation (`consume_reinject_pending`, its core, and the
     /// presence ping `directive_presence`) is NOT reachable from boot, restore, launch-agent or node-recover: kept panes are
     /// record-only. A call-graph pin over the production region (comments/strings blanked, `#[cfg(test)]` items cut): the
