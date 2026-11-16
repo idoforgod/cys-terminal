@@ -104,7 +104,14 @@ jobs:
       #   검증기(해법②)는 태그 `v$MIN_BINARY` 소스를 빌드하므로 이 레인의 다음 팩-only 발행은 v0.15.0 본체 태그
       #   뒤에만 가능하다(설계 §4-11 카 "다음 팩 단독 발행은 v0.15.0 태그가 생긴 뒤에야 가능하다").
       #   두 값 동일 계약이므로 release.yml PACK_MIN_BINARY 와 같은 커밋에서 함께 올린다.
-      PACK_MIN_BINARY_OVERRIDE: '0.15.0'
+      # ★0.15.1 상향(2026-11-17 · 「스스로 해결」 0.15.1 릴리스 버전 커밋 · RULINGS LH36 · AE3 그대로) — 근거는 release.yml
+      #   PACK_MIN_BINARY 주석과 같다: 0.15.0 빌드(태그 v0.15.0=b821759c)는 공개 전에 철회했고(태그는 다시 쓰지 않는다), 그
+      #   빌드에서는 팩만 받는 업데이트가 반영돼도 stdout 의 결과 기록 앞에 설치기의 안내 줄이 나와 앱이 실패로 알린다(그
+      #   빌드의 cys 와 발행 키로 서명한 팩으로 실측 · 0.15.1 에서 수정 — src/pack.rs:6522 · src/bin/cys.rs:30264 ·
+      #   src/pack_update_result.rs:164). 그래서 0.15.1 미만 본체는 0.15.1 이상의 팩을 반영하지 못하게 한다(하한 = 수정
+      #   버전). ⚠ 아래 하한 검증기(해법②)는 태그 `v$MIN_BINARY` 소스를 빌드하므로 이 레인의 다음 팩-only 발행은 v0.15.1
+      #   본체 태그 뒤에만 가능하다. 두 값 동일 계약이므로 release.yml PACK_MIN_BINARY 와 같은 커밋에서 함께 올린다.
+      PACK_MIN_BINARY_OVERRIDE: '0.15.1'
     steps:
       - uses: actions/checkout@v4
 

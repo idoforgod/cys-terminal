@@ -6,7 +6,7 @@ exclude = ["vendor/portable-pty", "vendor/vt100"]
 
 [package]
 name = "cys-terminal"
-version = "0.15.0"
+version = "0.15.1"
 edition = "2021"
 description = "cys — the CYSJavis terminal: bidirectional socket IPC, multi-agent OS (CYSJavis Pack), governance, heartbeat"
 license = "MIT"

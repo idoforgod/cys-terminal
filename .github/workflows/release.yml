@@ -1482,7 +1482,23 @@ jobs:
       #   scripts/check_min_binary_floor.py 가 검사한다(ci-branch `release-floor-parity`). pack-release.yml
       #   PACK_MIN_BINARY_OVERRIDE · docs/RELEASE.md §0-A 2단계 리터럴과 같은 커밋에서 동시 상향(두 값 동일 계약).
       #   security-floor.txt(보안 하한 0.12.48)는 건드리지 않는다.
-      PACK_MIN_BINARY: '0.15.0'
+      # ★0.15.1 상향(2026-11-17 · 「스스로 해결」 0.15.1 릴리스 버전 커밋 · RULINGS LH36 · AE3 그대로). 이번 근거는 새 CLI
+      #   표면이 아니라 **0.15.0 빌드의 결함**이다. 0.15.0 빌드(태그 v0.15.0=b821759c)는 공개 전에 철회했다 — 그 태그는
+      #   다시 쓰지 않는다. 발행 전 실측(2026-11-16 · 그 빌드의 cys + 발행 키로 서명한 팩 · 격리 환경): 팩만 받는 업데이트
+      #   `cys pack-update --from …` 는 팩을 반영했으나(rc 0) stdout 첫 줄이 설치기의 안내 줄 "[init-pack] 업데이트 전
+      #   스냅샷: …" 이었고 결과 기록 `PACK_UPDATE_OUTCOME … schema=2 …` 은 둘째 줄이었다. 앱은 결과 기록을 stdout 첫 줄
+      #   에서만 받으므로(src/pack_update_result.rs:164 `if index != 0 …` · parse :155) 반영된 업데이트를 실패로 알린다
+      #   (src-tauri/src/main.rs:8737 "… 성공으로 간주하지 않습니다" — 코드로 확인 · 앱은 실행하지 않았다). 0.15.1 의 수정:
+      #   설치 핵심부의 안내 줄은 pack-update 경로에서 stderr 로 간다(src/pack.rs:6522 `install_human_line!` — 스냅샷 줄
+      #   :6594 포함 8곳), 대기 처리의 두 안내 줄도 stderr 로 간다(src/bin/cys.rs:26003 · :26042), 원격 받기의 curl 자식은
+      #   그 stdout 을 물려받지 않는다(src/bin/cys.rs:30264 · fetch_remote_pack :30237). 대조 실측(v0.15.0 트리):
+      #   `git show v0.15.0:src/pack.rs | grep -c install_human_line` → 0, 같은 트리
+      #   :6575 의 스냅샷 줄은 `println!`. 그래서 0.15.1 미만 본체는 0.15.1 이상의 팩을 반영하지 못하게 한다 — 하한 = 수정이
+      #   든 버전(0.14.56 이하는 앞선 하한 0.15.0 으로 이미 거부되고, 이번 상향이 더 막는 것은 0.15.0 빌드다).
+      #   AE3(Cargo.toml ≥ 0.15.0 ⇒ 하한 ≥ 0.15.0)는 그대로 성립한다. 위의 앞선 근거 블록들은 이력으로 둔다. pack-release.yml
+      #   PACK_MIN_BINARY_OVERRIDE · docs/RELEASE.md §0-A 2단계 리터럴과 같은 커밋에서 동시 상향(두 값 동일 계약).
+      #   security-floor.txt(보안 하한 0.12.48)는 건드리지 않는다.
+      PACK_MIN_BINARY: '0.15.1'
     steps:
       - uses: actions/checkout@v4
 

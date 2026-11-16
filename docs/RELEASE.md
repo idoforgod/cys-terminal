@@ -57,7 +57,7 @@ pack_version은 빌드 시점 `CARGO_PKG_VERSION`에 용접돼 있어(`cys.rs bu
 1. 버전 범프(§0) → `cargo build --release --bin cys` (Tauri 빌드 불요 — cys 단독).
 2. pack 3종 생성 — release.yml `pack-artifacts` 잡과 동일 파라미터(스캔 게이트 2종 선행 포함):
    `cys pack-manifest --key-id … --signed-at … --expires-at … --min-binary-version $PACK_MIN_BINARY > pack-manifest.json`
-   (`$PACK_MIN_BINARY` = release.yml `PACK_MIN_BINARY` env 와 **동일값** — 현행 0.15.0 — 2026-11-16 0.15.0 「스스로 해결」(`cys repair` 신설 — 팩 지침·javis_preflight.py·javis_report_gate.py 가 부른다 · 설계 §4-11 카 · RULINGS AE3) 상향. 수기 리터럴 금지:
+   (`$PACK_MIN_BINARY` = release.yml `PACK_MIN_BINARY` env 와 **동일값** — 현행 0.15.1 — 2026-11-17 0.15.1 「스스로 해결」 수정판(철회한 0.15.0 빌드는 반영된 팩만 받는 업데이트를 앱이 실패로 알린다 — `cys pack-update` stdout 에서 설치기 안내 줄이 결과 기록보다 먼저 나온다 · 0.15.1 에서 수정 · RULINGS LH36 · AE3 그대로) 상향. 수기 리터럴 금지:
    두 레인 값보다 낮게 서명하면 아래 불변 규칙이 막은 스큐가 이 수동 문으로 재개방된다.)
    → 결정론 tar(`--mtime` 고정) → minisign 서명.
 3. **직전 릴리스의 latest.json + 바이너리 업데이트 자산을 그대로 동봉**해 새 릴리스를 만들고

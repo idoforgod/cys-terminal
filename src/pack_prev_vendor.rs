@@ -10,13 +10,13 @@
 // with no tags, so the release build cannot read previous release tags at all. The freshness
 // check is the ci-branch.yml job `prev-vendor-freshness` (fetch-depth: 0, `--check`).
 //
-// WINDOW         : 54 resolvable release tags (v*/pack-v* >= 0.14.0, not HEAD's own), v0.14.0 .. v0.14.56
+// WINDOW         : 55 resolvable release tags (v*/pack-v* >= 0.14.0, not HEAD's own), v0.14.0 .. v0.15.0
 // PACK_ALL paths : 476   (build.rs:48-65 predicate)
 // with a row     : 135
 // unchanged      : 341   (identical in every tag they appeared in -> no row needed:
 //                  an unedited copy already equals the embed and Arm 1 matches before the table)
 // absent         : 0   (new in this release - no previous vendor content exists)
-// generated from : 758f4d8e5a29b72111b823e9a9ef1cc38654394d
+// generated from : 0b3744b5d85f62dde366ed903655d98f1675d3d9
 
 /// `(rel, &[sha256 of that path's content in each prior release where it differed])`.
 /// Sorted by `rel`; [`prev_vendor_hashes`] relies on that for a binary search.
