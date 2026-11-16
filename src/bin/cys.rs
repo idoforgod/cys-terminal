@@ -25998,7 +25998,9 @@ fn consume_reinject_pending_core(
         match presence(sid) {
             Presence::Present => match mark(sid, pending_ver, &new_hash) {
                 Ok(()) => {
-                    println!(
+                    // ★PO1 (RULINGS LH36): stderr — the pending pass runs BEFORE the terminal record and stdout carries the
+                    //   machine records only (the app takes the record only as stdout line 0)
+                    eprintln!(
                         "[pack-update] pending unknown surface {sid} ({role}): verified landed (ACK) — marked delivered, \
                          nothing typed"
                     );
@@ -26035,7 +26037,9 @@ fn consume_reinject_pending_core(
                 match inject(sid, &directive) {
                     Ok(()) => match mark(sid, pending_ver, &new_hash) {
                         Ok(()) => {
-                            println!(
+                            // ★PO1 (RULINGS LH36): stderr — the pending pass runs BEFORE the terminal record and stdout carries the
+                            //   machine records only (the app takes the record only as stdout line 0)
+                            eprintln!(
                                 "[pack-update] pending unknown surface {sid} ({role}): not in context (ReceivedNoAck) — \
                                  re-injected once, marked"
                             );

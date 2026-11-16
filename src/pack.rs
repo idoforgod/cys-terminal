@@ -6512,6 +6512,23 @@ fn take_update_snapshot(
     ))
 }
 
+/// ★PO1 (RULINGS LH36 · 0.15.1): ONE rule for every human line of the install core. In the transactional path
+/// (`cys pack-update`: `transactional == true`) stdout belongs to the command's machine records — the app takes the
+/// terminal record only as stdout line 0 (`pack_update_result::parse`) — so the line goes to STDERR there (the app shows
+/// stderr when a command fails; a terminal user sees both streams). Every other caller (`cys init-pack`, the daemon's boot
+/// install, the app's own init-pack) keeps the line on STDOUT, byte for byte. The text and the condition of each line stay
+/// at its site; only the stream is chosen here. Guard: the census `po1_census_no_bare_stdout_in_the_pack_update_reach`
+/// (src/bin/cys.rs) — a bare `println!` in this file fails it.
+macro_rules! install_human_line {
+    ($transactional:expr, $($arg:tt)*) => {
+        if $transactional {
+            eprintln!($($arg)*)
+        } else {
+            println!($($arg)*)
+        }
+    };
+}
+
 /// [`install_into`] 의 입력원 주입판 — 판정·실행의 본체(★0.15.0 M11 업데이트 규칙).
 #[allow(clippy::too_many_arguments)]
 pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
@@ -6560,7 +6577,9 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         {
             if version_gt(&dv, target_version) {
                 // stdout 명시 — 정상 멱등 설치(0 written)와 구분되도록 호출처/UI가 차단을 인지하게 한다.
-                println!(
+                // ★PO1: 트랜잭션 경로(pack-update)에서는 stderr — 그 stdout 은 기계 기록 전용이다(install_human_line!).
+                install_human_line!(
+                    transactional,
                     "[init-pack] 다운그레이드 차단 — 팩 미반영 (디스크 {dv} > 바이너리 {target_version}). 의도적 재설치는 force로."
                 );
                 return Ok((0, 0));
@@ -6572,7 +6591,8 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     // 온전하다). 복사만 한다(살아 있는 팩의 이름을 바꾸지 않는다 — 윈도우 규칙). 실패는 설치를 막지 않는다(경고 1줄).
     match take_update_snapshot(&dir, &items, force, target_version, scope, sources, &manifest) {
         Some(Ok(o)) => {
-            println!(
+            install_human_line!(
+                transactional,
                 "[init-pack] 업데이트 전 스냅샷: 이번 설치가 덮거나 지울 파일 {}건 · {:.1}MB → {}",
                 o.files,
                 o.bytes as f64 / 1_048_576.0,
@@ -7249,7 +7269,8 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     }
     // ★M11 마: 묘비로 부재를 유지한 파일 — 사실대로 한 줄(어느 수리가 부재를 유지하는지).
     if !absent_kept.is_empty() {
-        println!(
+        install_human_line!(
+            transactional,
             "[init-pack] 수리 장부에 기록된 삭제 {}건은 만들지 않았습니다(부재 유지): {} — 되돌리려면 그 수리를 `cys repair revert <번호>`",
             absent_kept.len(),
             absent_kept.join(", ")
@@ -7257,7 +7278,8 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     }
     // ★T2j(RULINGS HP4 (a)): 따르지 않은 보호장치 파일의 묘비 — 사실대로 한 번(묘비 파일은 지우지 않았다).
     if !sources.void_tombstones().is_empty() {
-        println!(
+        install_human_line!(
+            transactional,
             "[init-pack] 보호장치 파일의 삭제 표식(묘비) {}건은 따르지 않았습니다 — 보호장치는 승인된 수리로도 지울 수 없어 그 표식은 정당한 기록일 수 없습니다. 그 파일은 다른 파일처럼 설치했고(없으면 되살림) 표식은 지우지 않았습니다: {}",
             sources.void_tombstones().len(),
             sources.void_tombstones().iter().map(|(r, n)| format!("{r} ({n})")).collect::<Vec<_>>().join(", ")
@@ -7266,7 +7288,8 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     // ★W-1(P0): 판독 불가라 손대지 않은 파일은 **같은 실행의 출력에 반드시 드러난다.** 침묵하면
     // 사용자는 "덮어썼는지 아닌지"를 알 길이 없고, 아래 병합 대기 수치를 전량으로 오독한다.
     if !unreadable_kept.is_empty() {
-        println!(
+        install_human_line!(
+            transactional,
             "[init-pack] 읽을 수 없어 손대지 않은 파일 {}건 — 내용이 UTF-8 이 아니거나(한국어 Windows 의 \
              CP949/ANSI 저장 등) 권한·잠금으로 읽기 실패. 덮어쓰기·백업 **둘 다 하지 않았고** 파일은 그대로입니다: {}\n\
              \x20 조치: 해당 파일을 UTF-8 로 다시 저장하면 다음 설치부터 정상 비교·병합 대상이 됩니다.",
@@ -7287,7 +7310,8 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             format!(" · 판독 불가라 손대지 않음 {}건(위 안내)", unreadable_kept.len())
         };
         if c.healed + c.new_pending > 0 {
-            println!(
+            install_human_line!(
+                transactional,
                 "[init-pack] 내 커스텀은 지워지지 않았습니다 — 병합 대기 {}건 (내 수정본 .user 보존 {}건 · vendor 신버전 .new 병치 {}건){}\n\
                  \x20 검토·병합: `cys pack-merge` · 직전 상태 파일 복원: `cys pack-rollback`",
                 c.healed + c.new_pending, c.healed, c.new_pending, unreadable_note
@@ -7298,7 +7322,8 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             + c.vendor_first
             > 0
         {
-            println!(
+            install_human_line!(
+                transactional,
                 "[init-pack] pack: healed={} merged={} kept-drift={} conflicted={} quarantined={} user-kept={} vendor-first={} — cys pack-merge 로 확인",
                 c.healed, c.merged, c.kept_drift, c.conflicted, c.quarantined, c.user_kept,
                 c.vendor_first
@@ -7307,7 +7332,8 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         // ★0.15.0 M11: 업데이트 뒤 보고의 설치기 몫(설계 §4-11 "보존된 수정 N건, 합쳐진 것 M건, …,
         // 합치기 대기 J건" — '원본에 반영되어 내린 것'은 수리 장부의 상태라 여기서 세지 않는다).
         if c.user_kept + c.vendor_first > 0 {
-            println!(
+            install_human_line!(
+                transactional,
                 "[init-pack] 보존된 수정 {}건(사용자 파일 유지 {} · 제자리 보존 {}) · 합쳐진 것 {}건 · 합치기·다시 입히기 대기 {}건(사용자 파일 유지 + .new {} · 기동 필수 vendor 우선 + 사용자본 보관 {}) — 워커가 부서당 과제 하나로 처리",
                 c.user_kept + c.kept_drift,
                 c.user_kept,
