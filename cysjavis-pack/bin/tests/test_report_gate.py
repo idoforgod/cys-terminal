@@ -1784,5 +1784,130 @@ class CollectOpenDefects(unittest.TestCase):
         self.assertIsNone(G.open_defect_wake([]))
 
 
+# ── 「스스로 해결」 track T5b — RULINGS CI6 (c) (계약 C9 9.8 (4)): 허락 켜짐 + 일시정지 동안 열린 결함 줄은 보류된다 ──────
+#   보류된 실행은 보내지도 기억을 바꾸지도 않는다 → 일시정지가 끝난 첫 실행에서, 열린 집합이 여전히 다르면 간다.
+#   허락 꺼짐 = 오늘처럼 간다 · 상태를 읽지 못함(옛 데몬·무응답·시간 초과) = 오늘처럼 간다.
+class OpenDefectLineFollowsThePause(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="gate-pause-")
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+
+    def run_once(self, grant):
+        r = FakeRunner(report_ok=False, err="collector absent")
+        clk = Clock(1_000_000.0)
+        g = G.Gate(os.path.join(self.tmp, "gate"), r, cycle_minutes=5, now_epoch_fn=clk.now_epoch,
+                   now_iso_fn=clk.now_iso, defect_source=lambda: (True, "base", ["aa", "bb"]), grant_source=grant)
+        self.assertEqual(g.run(shadow=False), 0)
+        return _defect_wakes(r)
+
+    def test_paused_is_held_then_sent_after_the_pause(self):
+        self.assertEqual(self.run_once(lambda: "held"), [], "held while the grant is on and paused")
+        self.assertEqual(self.run_once(lambda: "held"), [], "still held — nothing remembered")
+        sent = self.run_once(lambda: "send")
+        self.assertEqual(len(sent), 1, "the first tick after the pause sends the line")
+        self.assertEqual(sent[0][2], "열린 결함 2건 — 워커에게 맡길 것", "the text is unchanged")
+        self.assertEqual(self.run_once(lambda: "send"), [], "and only when the set changes, as before")
+
+    def test_grant_off_sends_as_today(self):
+        self.assertEqual(len(self.run_once(lambda: "send")), 1)
+
+    def test_state_unreadable_sends_as_today(self):
+        def boom():
+            raise RuntimeError("no answer")
+        self.assertEqual(len(self.run_once(boom)), 1)
+        self.assertEqual(len(G.open_defect_wake(["aa"])), 2)
+
+    @unittest.skipIf(os.name == "nt", "shell fake")
+    def test_read_grant_pause_reads_t4_status(self):
+        def fake(body, rc=0):
+            d = tempfile.mkdtemp(prefix="fake-cys-grant-")
+            self.addCleanup(__import__("shutil").rmtree, d, True)
+            argv = os.path.join(d, "argv.log")
+            p = os.path.join(d, "cys")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\nprintf '%%s %%s\\n' \"$*\" \"$CYS_NO_AUTOSTART\" > '%s'\ncat <<'JSON'\n%s\nJSON\nexit %d\n" % (argv, body, rc))
+            os.chmod(p, 0o755)
+            return p, argv
+        cys, argv = fake('{"state": "on", "paused": true, "paused_until": 5.0, "daily_cap": 5}')
+        self.assertEqual(G.read_grant_pause(cys), "held")
+        with open(argv, encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), "repair grant status --json 1", "a READ verb, autostart off")
+        for body, rc in (('{"state": "off", "paused": true}', 0), ('{"state": "on", "paused": false}', 0),
+                         ("not json", 0), ('{"state": "on", "paused": true}', 93)):
+            cys, _ = fake(body, rc)
+            self.assertEqual(G.read_grant_pause(cys), "send", body)
+        self.assertEqual(G.read_grant_pause("/nonexistent/cys"), "send")
+
+
+# ── 「스스로 해결」 track T5b — 승인 대기 한 줄(설계 §4-7 8단계 · C5 5.6 · 승인 통로 17번째 자리) ───────────────
+class ApprovalWaitingLine(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="gate-approval-")
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+
+    def run_once(self, source):
+        r = FakeRunner(report_ok=False, err="collector absent")
+        clk = Clock(1_000_000.0)
+        g = G.Gate(os.path.join(self.tmp, "gate"), r, cycle_minutes=5, now_epoch_fn=clk.now_epoch,
+                   now_iso_fn=clk.now_iso, approval_source=source)
+        self.assertEqual(g.run(shadow=False), 0)
+        return [e for e in r.enqueues if e[1] == G.APPROVAL_TASK]
+
+    def test_one_line_when_the_waiting_set_changes(self):
+        w = self.run_once(lambda: (True, "dept-x", ["R-3"]))
+        self.assertEqual(len(w), 1)
+        to, _task, body, idem, sev = w[0]
+        self.assertEqual((to, sev), ("master", G.SEV_INFO))
+        self.assertIn("dept-x", body)
+        self.assertIn("R-3", body)
+        self.assertIn("기다리지 않는다", body)
+        self.assertEqual(self.run_once(lambda: (True, "dept-x", ["R-3"])), [], "same set → silent")
+        self.assertEqual(len(self.run_once(lambda: (True, "dept-x", ["R-3", "R-4"]))), 1)
+        self.assertEqual(self.run_once(lambda: (False, None, [])), [])
+        self.assertEqual(self.run_once(lambda: (True, "dept-x", [])), [])
+
+    @unittest.skipIf(os.name == "nt", "shell fake")
+    def test_collect_counts_own_lane_awaiting_approval(self):
+        d = tempfile.mkdtemp(prefix="fake-cys-list-")
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        # RULINGS DF3: the set is the daemon's `approval_cards` (requests past step 3, the owner's
+        # decision pending) — never the records' 승인 대기 state (R-4: in step 3 or expired, no card)
+        doc = {"lane": "base", "approval_cards": ["R-1"], "repairs": [
+            {"repair": "R-1", "state": "awaiting_approval", "origin_lane": "base"},
+            {"repair": "R-2", "state": "in_progress", "origin_lane": "base"},
+            {"repair": "R-3", "state": "awaiting_approval", "origin_lane": "dept-1"},
+            {"repair": "R-4", "state": "awaiting_approval", "origin_lane": "base"},
+        ]}
+
+        def fake(doc):
+            p = os.path.join(d, "cys")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\ncat <<'JSON'\n%s\nJSON\n" % json.dumps(doc))
+            os.chmod(p, 0o755)
+            return p
+        self.assertEqual(G.collect_awaiting_approval(fake(doc)), (True, "base", ["R-1"]))
+        doc.pop("approval_cards")  # a daemon without the key → nothing is sent
+        self.assertEqual(G.collect_awaiting_approval(fake(doc)), (False, None, []))
+        self.assertEqual(G.collect_awaiting_approval("/nonexistent/cys"), (False, None, []))
+        self.assertIsNone(G.approval_wake("base", []))
+
+    @unittest.skipIf(os.name == "nt", "shell fake")
+    def test_resubmit_cycle_refused_by_step3_sends_nothing(self):
+        """RULINGS DF3: submit → step 3 refuses → fixed → submit → step 3 refuses again: the records say
+        승인 대기 / 진행 중 in turn, the daemon never shows a card — the master is sent nothing."""
+        d = tempfile.mkdtemp(prefix="fake-cys-list-")
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        p = os.path.join(d, "cys")
+        sent = []
+        for state in ("awaiting_approval", "in_progress", "awaiting_approval", "in_progress"):
+            doc = {"lane": "base", "approval_cards": [],
+                   "repairs": [{"repair": "R-7", "state": state, "origin_lane": "base"}]}
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\ncat <<'JSON'\n%s\nJSON\n" % json.dumps(doc))
+            os.chmod(p, 0o755)
+            sent += self.run_once(lambda: G.collect_awaiting_approval(p))
+        self.assertEqual(sent, [])
+
+
 if __name__ == "__main__":
     unittest.main()

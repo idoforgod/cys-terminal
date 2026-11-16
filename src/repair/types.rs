@@ -350,6 +350,81 @@ impl TargetState {
         }))
     }
 
+    /// RULINGS GR5 (CCR-T5b-1) — [`TargetState::read`] with a SIZE LIMIT, for a path a candidate
+    /// shapes: the same `lstat` semantics (a link is a link, never followed; a directory or any other
+    /// kind of entry refused), the regular file opened without following a link and without blocking,
+    /// and AT MOST `cap + 1` bytes read. A file over `cap` is "over the size limit" — refused at once
+    /// when its size already says so (nothing read), and at byte `cap + 1` when it grew after the
+    /// size was looked at. The uncapped [`TargetState::read`] and its callers are unchanged.
+    pub fn read_capped(path: &Path, cap: u64) -> Result<TargetState, RepairError> {
+        let over = || {
+            RepairError::Precondition(format!(
+                "{}: over the size limit ({cap} bytes) — not read to the end",
+                path.display()
+            ))
+        };
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(TargetState::Absent),
+            Err(e) => return Err(RepairError::Io(format!("{}: {e}", path.display()))),
+        };
+        let kind = meta.file_type();
+        if kind.is_symlink() {
+            let target = std::fs::read_link(path)
+                .map_err(|e| RepairError::Io(format!("{}: {e}", path.display())))?;
+            let target = target.into_os_string().into_string().map_err(|_| {
+                RepairError::Io(format!(
+                    "{}: link target is not valid UTF-8",
+                    path.display()
+                ))
+            })?;
+            return Ok(TargetState::Link { target });
+        }
+        if !kind.is_file() {
+            return Err(RepairError::Precondition(format!(
+                "{}: not a regular file or symbolic link",
+                path.display()
+            )));
+        }
+        if meta.len() > cap {
+            return Err(over());
+        }
+        let file = open_no_follow(path)
+            .map_err(|e| RepairError::Io(format!("{}: {e}", path.display())))?;
+        let opened = file
+            .metadata()
+            .map_err(|e| RepairError::Io(format!("{}: {e}", path.display())))?;
+        if !opened.file_type().is_file() {
+            return Err(RepairError::Precondition(format!(
+                "{}: changed while being read (no longer a regular file)",
+                path.display()
+            )));
+        }
+        if opened.len() > cap {
+            return Err(over());
+        }
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut limited = std::io::Read::take(file, cap.saturating_add(1));
+        let mut total: u64 = 0;
+        loop {
+            let n = std::io::Read::read(&mut limited, &mut buf)
+                .map_err(|e| RepairError::Io(format!("{}: {e}", path.display())))?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            if total > cap {
+                return Err(over());
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(TargetState::File {
+            sha256: hex(&hasher.finalize()),
+            mode: permission_bits(&opened),
+        })
+    }
+
     /// `absent` | `file:<sha256>:<mode as 4 octal digits>` | `link:<target>` (RULINGS U2).
     pub fn canon(&self) -> String {
         match self {

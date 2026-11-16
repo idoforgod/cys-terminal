@@ -31,7 +31,11 @@
 //   같이 고쳐야 한다(샷건 서저리). import 로 단일화.
 import { TEAM_CREATE_KIND } from "./teamproposal";
 
-export type PendingFeedClass = "cycle-verify" | "daemon-detected" | "team-create" | "standard";
+export type PendingFeedClass = "cycle-verify" | "daemon-detected" | "team-create" | "repair-approval" | "standard";
+
+/** 「스스로 해결」(0.15.0) 최종 승인 카드의 kind — 결정은 카드의 [수정 최종 승인] 뒤 데몬이 띄운 운영체제 본인 확인만 한다.
+ *  일반 Allow 가 없고, 팔레트 'feed 승인'("standard" 만)에서 빠지며, 끝난 좌석 표지도 붙지 않는다(OWNER_CARD_FEED_KINDS). */
+export const REPAIR_APPROVAL_KIND = "repair-approval";
 
 export function classifyPendingFeed(i: {
   kind: string;
@@ -43,6 +47,7 @@ export function classifyPendingFeed(i: {
   // 순서가 안전 방향이다(오판이 Allow 를 살리는 쪽으로 나지 않게).
   if (i.kind === "cycle-verify") return "cycle-verify";
   if (i.kind === TEAM_CREATE_KIND) return "team-create";
+  if (i.kind === REPAIR_APPROVAL_KIND) return "repair-approval";
   if (i.kind === "approval" && (i.daemon_issued ?? i.request_id.startsWith("daemon-")))
     return "daemon-detected";
   return "standard";
@@ -99,10 +104,7 @@ export function feedCreatedToastTitle(kind: unknown): string {
 
 /** 오너의 카드·결정 카드 종류 — 요청한 좌석이 끝났어도 「요청한 좌석이 종료됨」 표지를 붙이지 않는다(기다리지 않고 올리는 것이 규칙인 카드가 있다 — `handlers.rs` 팀 제안은 `--wait` 불가).
  *  `learn_proposal` 은 데몬이 올리는 학습 제안(state.rs NOTICE_FEED_KINDS 주석이 결정성으로 못박은 kind). */
-export const OWNER_CARD_FEED_KINDS: readonly string[] = [TEAM_CREATE_KIND, "ceo-promote-request", "cycle-verify", "learn_proposal"];
-
-/** 「스스로 해결」(0.15.0) 최종 승인 카드의 feed kind — T0 골격은 상수만 둔다. 위 OWNER_CARD_FEED_KINDS 에는 아직 넣지 않는다(카드 배선은 T5b · 핀 feedclass-0144). */
-export const REPAIR_APPROVAL_KIND = "repair-approval";
+export const OWNER_CARD_FEED_KINDS: readonly string[] = [TEAM_CREATE_KIND, "ceo-promote-request", "cycle-verify", "learn_proposal", REPAIR_APPROVAL_KIND];
 
 export function isOwnerCardKind(kind: unknown): boolean {
   return typeof kind === "string" && OWNER_CARD_FEED_KINDS.indexOf(kind) >= 0;

@@ -38,7 +38,8 @@ describe("표지 — 다섯이 모두 참일 때만(대기 · 데몬이 올린 �
     for (const kind of [TEAM_CREATE_KIND, "ceo-promote-request", "cycle-verify", "learn_proposal"]) {
       expect({ kind, 카드: isOwnerCardKind(kind), 표지: isEndedSeatRequest(f({ kind })) }).toEqual({ kind, 카드: true, 표지: false });
     }
-    expect(OWNER_CARD_FEED_KINDS.length).toBe(4);
+    // T5b (rewrite: was 4 — the repair final-approval kind joined the owner's cards, C5 site 12)
+    expect(OWNER_CARD_FEED_KINDS.length).toBe(5);
   });
   it("request_id 가 daemon- 접두인데 daemon_issued 칸이 없는 옛 데몬 — 데몬이 올린 것으로 본다(표지 없음)", () => {
     expect(isEndedSeatRequest({ kind: "approval", request_id: "daemon-1-2", waiter: false, publisher_alive: false })).toBe(false);

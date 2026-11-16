@@ -31,6 +31,11 @@ mod grant_tests;
 #[path = "repair_apply_tests.rs"]
 mod t6_tests;
 
+// Track T5b — the CM3 pin of `production_check` (a rel with a folder).
+#[cfg(test)]
+#[path = "repair_t5b_check_tests.rs"]
+mod t5b_check_tests;
+
 use crate::handlers::Reply;
 use crate::state::Daemon;
 use cys::repair::roles::{reviewer_slot_of, verb_class, CallerKind, ReviewerSlot, VerbClass};
@@ -465,7 +470,13 @@ pub(crate) fn handle(
         });
     }
     let classify = |rel: &str| production_classify(rel, &cys::pack::pack_dir());
-    let check = production_check;
+    // RULINGS EO5 (a): the comparison around the worker's check has the step-3 consequences
+    let d = daemon.clone();
+    let check = move |rel: &str, live: &Path, dl: std::time::Duration| {
+        production_check_with(rel, live, dl, &|c| {
+            crate::repair_approval::comparison_consequence(&d, rel, c)
+        })
+    };
     let product_pause = || product_pause_in_force(daemon, &cys::pack::pack_dir());
     let ctx = Ctx {
         root: production_root(daemon),
@@ -488,10 +499,110 @@ pub(crate) fn handle(
         prompts: &daemon.repair_prompt_origin,
         product_pause: &product_pause,
     };
-    Reply::Single(match handle_with(&ctx, &caller, sub, params) {
+    // Track T5b: `submit` and the three approval verbs need the daemon (threads, the table, the
+    // helper); `status` gains the approval part (TRACKS T5b "submit/status/approval_*").
+    let result = match crate::repair_approval::route(daemon, &ctx, &caller, sub, params) {
+        Some(r) => r,
+        None => handle_with(&ctx, &caller, sub, params)
+            .map(|v| crate::repair_approval::augment_status(daemon, sub, params, v)),
+    };
+    Reply::Single(match result {
         Ok(v) => ok_response(id, v),
         Err(e) => err_response(id, &e.code, &e.message),
     })
+}
+
+/// Track T5b — a production [`Ctx`] for work the daemon does on its own threads (step 3, the
+/// helper's result, the watchdog's expiry sweep), built exactly as [`handle`] builds it.
+pub(crate) fn with_daemon_ctx<T>(daemon: &Arc<Daemon>, f: impl FnOnce(&Ctx<'_>) -> T) -> T {
+    let classify = |rel: &str| production_classify(rel, &cys::pack::pack_dir());
+    let d = daemon.clone();
+    let check = move |rel: &str, live: &Path, dl: std::time::Duration| {
+        production_check_with(rel, live, dl, &|c| {
+            crate::repair_approval::comparison_consequence(&d, rel, c)
+        })
+    };
+    // T4e (HP2) joined: the daemon's own work reads the kill-switch exactly as `handle` does
+    let product_pause = || product_pause_in_force(daemon, &cys::pack::pack_dir());
+    let ctx = Ctx {
+        root: production_root(daemon),
+        lane: LaneKey::of_socket(&daemon.socket_path),
+        incarnation: daemon.incarnation.clone(),
+        pack_dir: cys::pack::pack_dir(),
+        now: cys::repair::ledger::now_epoch(),
+        windows: cfg!(windows),
+        registry: cys::lane::registry_path(),
+        mutexes: &daemon.repair_mutexes,
+        seats: Vec::new(),
+        classify: &classify,
+        check: &check,
+        hook_step: &cys::repair::apply::hook_lines_step,
+        claim: &cys::repair::grant::try_claim_autonomous_start,
+        prompts: &daemon.repair_prompt_origin,
+        product_pause: &product_pause,
+    };
+    f(&ctx)
+}
+
+/// RULINGS GA8 — the intake ledger's answer for one row the daemon files: the ledger is the
+/// obligation AND the memory ("already told" follows from a NEW row, never from a set in memory).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Filed {
+    /// a NEW row (the ledger's first count) — the only answer a pointer to the master may follow
+    New,
+    /// a row with this signature already exists — counted again; that IS the durable row (GR6)
+    Exists,
+    /// the row was NOT written: an error, the ledger's hourly quota, an excluded class — nothing is
+    /// marked, and a finding that could not be recorded refuses (RULINGS GR6)
+    Failed(String),
+}
+
+impl Filed {
+    /// The finding is in the ledger (a new row, or the existing row of its signature) — a cache in
+    /// memory may follow only then (GA8 (2)); anything else refuses (GR6).
+    pub(crate) fn recorded(&self) -> bool {
+        matches!(self, Filed::New | Filed::Exists)
+    }
+}
+
+/// RULINGS GR6: the sentence of a finding that could not be recorded.
+pub(crate) const UNRECORDED_FINDING: &str = "찾은 것을 접수 장부에 남기지 못했습니다";
+
+/// Track T5b — one intake row filed by the daemon itself (a lane finding of the protection screen,
+/// C4 AY1: "one intake row naming the protection"; a comparison's finding — GA8), through the
+/// `report` verb's own body; returns the ledger's answer.
+pub(crate) fn file_intake(daemon: &Arc<Daemon>, file: &str, error: &str) -> Filed {
+    with_daemon_ctx(daemon, |ctx| file_intake_in(ctx, file, error))
+}
+
+/// [`file_intake`] in a given context (the `report` verb's answer: `accepted` and the row's `count`,
+/// which is 1 exactly for a new row).
+pub(crate) fn file_intake_in(ctx: &Ctx<'_>, file: &str, error: &str) -> Filed {
+    let caller = Caller {
+        kind: CallerKind::Detached,
+        role: None,
+        app_token: false,
+        bound_family: None,
+    };
+    match handle_with(ctx, &caller, "report", &serde_json::json!({"file": file, "error": error})) {
+        Ok(v) if v.get("accepted").and_then(Value::as_bool) == Some(true) => {
+            if v.get("count").and_then(Value::as_u64) == Some(1) {
+                Filed::New
+            } else {
+                Filed::Exists
+            }
+        }
+        // RULINGS GR6: declined by the ledger's own rule — NOT recorded
+        Ok(v) => Filed::Failed(if v.get("over_quota").and_then(Value::as_bool) == Some(true) {
+            "the intake ledger's hourly quota is used up".to_string()
+        } else {
+            format!(
+                "an excluded class ({})",
+                v.get("excluded").and_then(Value::as_str).unwrap_or("?")
+            )
+        }),
+        Err(e) => Filed::Failed(e.message),
+    }
 }
 
 /// The verb dispatcher behind [`handle`]: role table first, then the body.
@@ -975,15 +1086,61 @@ fn production_check(
     live: &Path,
     deadline: std::time::Duration,
 ) -> Result<CheckReport, RepairError> {
-    use cys::repair::rehearsal::{run_check, run_reference_check, CheckRequest, CheckResult};
+    // no daemon here: no intake ledger — a finding cannot be recorded (RULINGS GR6: it refuses)
+    production_check_with(rel, live, deadline, &|_| {
+        Some(Filed::Failed("no intake ledger in this context".into()))
+    })
+}
+
+/// [`production_check`] telling `compared` what the scoped after-run comparison found (RULINGS EO5 (a):
+/// a refusal — and a noted difference — has the same consequences wherever the comparison runs; the
+/// daemon's closure files them, `repair_approval::comparison_consequence`).
+pub(crate) fn production_check_with(
+    rel: &str,
+    live: &Path,
+    deadline: std::time::Duration,
+    compared: &dyn Fn(&cys::repair::rehearsal::Comparison) -> Option<Filed>,
+) -> Result<CheckReport, RepairError> {
+    use cys::repair::rehearsal::{run_reference_check, CheckRequest, CheckResult};
     let kind = check_kind_for(rel);
     let started = std::time::Instant::now();
-    let r = run_check(&CheckRequest {
+    // RULINGS CM3: the scratch root is the PACK root (`live` = `<pack>/<rel>`), so that
+    // `<scratch_root>/<entry_rel>` is the live file also for a rel with a folder (`hooks/x.sh`)
+    let mut pack_root = live.to_path_buf();
+    for _ in Path::new(rel).components() {
+        pack_root.pop();
+    }
+    // RULINGS CZ3 / DE1: the check runs inside the scoped after-run comparison of the live pack
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+    let req = CheckRequest {
         entry_rel: rel.to_string(),
-        scratch_root: live.parent().map(Path::to_path_buf).unwrap_or_default(),
+        scratch_root: pack_root.clone(),
         recorded_input: None,
         deadline,
-    })?;
+    };
+    let (r, cmp) = cys::repair::rehearsal::compared_runs(&pack_root, &home, || {
+        // RULINGS GA3: complete only when the check ran to a result observed whole
+        cys::repair::rehearsal::run_check_observed(&req)
+    });
+    // RULINGS GR6: what the comparison found is written first; a finding whose row could not be
+    // written is never "passed" — the answer names the finding and why it was not recorded
+    let filed = if cmp != cys::repair::rehearsal::Comparison::Clean {
+        compared(&cmp)
+    } else {
+        None
+    };
+    let unrecorded = match &filed {
+        Some(Filed::Failed(why)) => Some(why.clone()),
+        _ => None,
+    };
+    let r = match (cmp, unrecorded) {
+        (cys::repair::rehearsal::Comparison::Refused(line), None) => CheckResult::Fail(line),
+        (cys::repair::rehearsal::Comparison::Refused(line), Some(why))
+        | (cys::repair::rehearsal::Comparison::Noted(line), Some(why)) => CheckResult::Fail(format!(
+            "{UNRECORDED_FINDING}({why}) — 기록하지 못한 발견이 있으므로 통과가 아닙니다: {line}"
+        )),
+        _ => r?,
+    };
     let check_ms = started.elapsed().as_millis() as u64;
     let started = std::time::Instant::now();
     let reference = run_reference_check(kind, deadline)?;
@@ -4637,9 +4794,8 @@ pub(crate) fn strict_origin(norm: &str, reply: &Value) -> &'static str {
     }
 }
 
-/// The pending final-approval requests (C5; memory only — void after a restart). T5b fills it.
-#[derive(Default)]
-pub(crate) struct ApprovalTable {}
+/// The pending final-approval requests (C5; memory only — void after a restart) — T5b's table.
+pub(crate) use crate::repair_approval::ApprovalTable;
 
 /// The per-seat owner-prompt record (T3 writes, T4 reads). `named_docs` = rule-document base names,
 /// lower-cased, found in the seat's latest owner-typed prompt (RULINGS U4(a)); no prompt text kept.
@@ -5283,9 +5439,18 @@ mod tests {
                     }));
                     let (code, msg) = result.unwrap_or_else(|_| panic!("repair.{sub} panicked"));
                     // T6 (rewrite: `revert` / `reapply` / `tick` / `sweep` left the stub set — the old
-                    // expectation for them was `repair_not_implemented` after the role table)
-                    if T3_VERBS.contains(sub) || T4_VERBS.contains(sub) || T6_VERBS.contains(sub) {
-                        // T3's / T4's / T6's bodies answer a success or a structured error — never the stub
+                    // expectation for them was `repair_not_implemented` after the role table); T5b
+                    // rewrite (was: `submit` and the three approval verbs among the stubs): their bodies
+                    // are in now — like T3's / T4's they answer a success or a structured error, never
+                    // the stub (none of these calls can spawn the real helper: in a unit test the spawn
+                    // refuses)
+                    if T3_VERBS.contains(sub)
+                        || T4_VERBS.contains(sub)
+                        || T6_VERBS.contains(sub)
+                        || crate::repair_approval::T5B_VERBS.contains(sub)
+                    {
+                        // T3's / T4's / T6's / T5b's bodies answer a success or a structured error —
+                        // never the stub
                         assert_ne!(code, "repair_not_implemented", "repair.{sub}: {msg}");
                         assert_ne!(code, "method_not_found", "repair.{sub}");
                         continue;
