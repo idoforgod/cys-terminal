@@ -1,0 +1,144 @@
+name: windows-libtests (TW3 · quick Windows library tests)
+
+# Purpose (release 0.15.0, self-repair; unit TW3): on every measurement push, run the product's own library tests and
+#   the repair tests of the two binaries on GitHub's real Windows runner, so that a Windows-only failure is seen in
+#   minutes instead of after the installer measurement (windows-measure.yml, about ninety minutes per round).
+#   - A MEASUREMENT, not a gate: a failing test never turns this job red. Each log ends with its line
+#     `TW1-CARGO-EXIT=<rc>` (absent = the step did not end) and a person reads the summary and the logs.
+#     Only a step that could not run at all (checkout, toolchain) or a step that reached its time limit turns it red.
+#   - Modelled on the job t9-libtests of windows-measure.yml: no cache (RULINGS EQ6), no secret, nothing published.
+#   - windows-measure.yml is not changed and does not wait for this workflow; the two never cancel each other.
+# Triggers: the branch patterns of windows-measure.yml, or a manual dispatch (optional words for the library run).
+
+on:
+  push:
+    branches: ['fix/tw1-measure-**', 'fix/*-candidate']
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: 'optional words passed after -- to the library run only (test-name filters or libtest flags, separated by spaces); empty = the whole library suite'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-libtests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  libtests:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
+      # B and C run after an earlier test step failed or reached its time limit, but not after a failed set-up and
+      #   not in a cancelled run (a newer push to the same branch): cargo is not started for a run nobody will read.
+      - name: A - library tests, whole suite or the dispatch filter (out/lib.log)
+        shell: bash
+        timeout-minutes: 30
+        env:
+          TW3_FILTER: ${{ inputs.filter }}
+        run: |
+          mkdir -p out
+          filter=()
+          read -r -a filter <<< "${TW3_FILTER:-}"
+          rc=0
+          cargo test --lib --no-fail-fast -- "${filter[@]}" > out/lib.log 2>&1 || rc=$?
+          echo "TW1-CARGO-EXIT=$rc" >> out/lib.log
+      - name: B - cysd repair tests (out/cysd-repair.log)
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          mkdir -p out
+          rc=0
+          cargo test --bin cysd --no-fail-fast -- repair > out/cysd-repair.log 2>&1 || rc=$?
+          echo "TW1-CARGO-EXIT=$rc" >> out/cysd-repair.log
+      - name: C - cys repair tests (out/cys-repair.log)
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          mkdir -p out
+          rc=0
+          cargo test --bin cys --no-fail-fast -- repair > out/cys-repair.log 2>&1 || rc=$?
+          echo "TW1-CARGO-EXIT=$rc" >> out/cys-repair.log
+      # Per log: its exit line, its `test result:` lines, the count and sorted names of the tests on a
+      #   `test <name> ... FAILED` line; also any name that only libtest's closing failures list holds (a panic
+      #   message printed between `test <name> ... ` and FAILED puts the word on a line of its own).
+      - name: D - summary (always; out/summary.txt and the job summary)
+        if: always()
+        shell: bash
+        timeout-minutes: 5
+        env:
+          TW3_FILTER: ${{ inputs.filter }}
+        run: |
+          export LC_ALL=C
+          mkdir -p out
+          esc=$(printf '\033')
+          clean=$(mktemp)
+          grepped=$(mktemp)
+          listed=$(mktemp)
+          {
+            echo "windows-libtests (TW3) at ${GITHUB_SHA:-unknown commit}: a failing test does not turn this job red"
+            if [ -n "${TW3_FILTER:-}" ]; then
+              echo "library run filter (dispatch input): $TW3_FILTER"
+            fi
+            for name in lib cysd-repair cys-repair; do
+              log="out/$name.log"
+              echo
+              echo "== $name.log"
+              if [ ! -f "$log" ]; then
+                echo "not written: the step did not run"
+                continue
+              fi
+              sed "s/${esc}\[[0-9;]*m//g" "$log" | tr -d '\r' > "$clean"
+              exitline=$(awk '/^TW1-CARGO-EXIT=/ { v = $0 } END { print v }' "$clean")
+              if [ -n "$exitline" ]; then
+                echo "exit line present: $exitline"
+              else
+                echo "exit line ABSENT: the step did not end (time limit reached or stopped); libtest's long-running notes:"
+                awk '/has been running for over/ && n < 10 { print "  " $0; n++ } END { if (!n) print "  (none)" }' "$clean"
+              fi
+              results=$(awk '/^test result:/' "$clean")
+              if [ -n "$results" ]; then
+                printf '%s\n' "$results"
+              else
+                echo "no 'test result:' line; first error lines:"
+                awk '/^error/ && n < 10 { print "  " $0; n++ } END { if (!n) print "  (none)" }' "$clean"
+              fi
+              awk '/^test .* \.\.\. FAILED/ { sub(/^test /, ""); sub(/ \.\.\. FAILED.*$/, ""); print }' "$clean" \
+                | sort -u > "$grepped"
+              echo "FAILED: $(awk 'END { print NR }' "$grepped")"
+              sed 's/^/  /' "$grepped"
+              awk '/^failures:$/ { inlist = 1; n = 0; next }
+                   inlist && /^    [^ ]/ { names[++n] = substr($0, 5); next }
+                   inlist && /^[ \t]*$/ { next }
+                   inlist && /^test result:/ { for (i = 1; i <= n; i++) print names[i] }
+                   { inlist = 0 }' "$clean" | sort -u > "$listed"
+              only=$(awk 'FILENAME == ARGV[1] { seen[$0] = 1; next } !($0 in seen)' "$grepped" "$listed")
+              if [ -n "$only" ]; then
+                echo "also FAILED by libtest's closing failures list, not on a 'test ... FAILED' line: $(printf '%s\n' "$only" | awk 'END { print NR }')"
+                printf '%s\n' "$only" | sed 's/^/  /'
+              fi
+            done
+          } > out/summary.txt
+          rm -f "$clean" "$grepped" "$listed"
+          cat out/summary.txt
+          {
+            echo '```text'
+            cat out/summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: E - upload the logs and the summary (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tw1-win-libtests
+          path: out
+          retention-days: 14
+          if-no-files-found: warn
