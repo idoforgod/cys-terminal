@@ -264,7 +264,12 @@ pub fn write_verdict_in(
     v.schema = SCREEN_SCHEMA;
     crate::atomic_write_json(&p, &v)
         .map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
+    #[cfg(unix)]
     let f = replay::open_nofollow_nonblock(&p)
+        .map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
+    // WY2: elsewhere `open_nofollow_nonblock` is a read-only `File::open` — the flush needs write access
+    #[cfg(not(unix))]
+    let f = super::durable::open_for_flush(&p)
         .map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
     super::ledger::full_flush_file(&f)
         .map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;

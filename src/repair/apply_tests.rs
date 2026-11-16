@@ -2928,6 +2928,8 @@ const WRITE_CENSUS: &[(&str, &str, &str, usize, &str)] = &[
     ("apply.rs", "write_revert_intent", "ledger", 1, "the revert intent (durable)"),
     ("durable.rs", "write_durable", "ledger", 6, "the durable writer of ledger files: temporary sibling, flush, rename"),
     ("durable.rs", "write_json_durable", "ledger", 1, "the durable writer of ledger files"),
+    // WY2: `.write(true)` = write ACCESS of the non-unix arm (FlushFileBuffers needs it) — no byte is written, nothing created or truncated
+    ("durable.rs", "open_for_flush", "ledger", 1, "WY2: the open that serves a flush of an existing ledger file or sealed copy (non-unix: write access only)"),
     ("exchange.rs", "exchange", "door", 1, "the exchange primitive the door calls"),
     ("exchange.rs", "rename_excl", "door", 1, "the no-replace primitive under the door and the vault's publication"),
     ("grant.rs", "create_marker", "ledger", 2, "T4: a claim marker"),
