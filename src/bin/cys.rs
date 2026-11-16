@@ -32935,6 +32935,285 @@ mod tests {
         assert!(cys::pack_update_result::parse(&output, rc).is_err(), "a complete-looking record cannot override failed publication");
     }
 
+    // ── PO1 (RULINGS LH36): the stdout of the REAL `cys pack-update` carries its machine records only ──
+
+    /// PO1: one fixture file at the disk version (1.0.0), the target version (2.0.0) and as the user edited it — the same
+    /// line changes on both sides, so a 3-way merge over the 1.0.0 ancestor conflicts.
+    const PO1_OLD: &str = "#!/bin/sh\n# po1 fixture 1.0.0\n";
+    const PO1_NEW: &str = "#!/bin/sh\n# po1 fixture 2.0.0\n";
+    const PO1_USER: &str = "#!/bin/sh\n# po1 fixture 1.0.0, edited by the user\n";
+
+    /// PO1: a signed fixture pack 2.0.0 of `files` in `from` (the b428-U9 recipe: TEST key, today's clock, the tar's
+    /// digest in the signed manifest). Returns the TEST public key the child hands to the command as its keyring.
+    pub(super) fn po1_sign_fixture(from: &std::path::Path, files: &[(&str, &str)]) -> String {
+        let (pk, sign) = gen_signer();
+        let now = chrono::Utc::now().timestamp();
+        build_signed_pack(from, files, "TESTKEY", "2.0.0", "0.4.1", now - 1, now + 3600, &sign);
+        let manifest_path = from.join("pack-manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["digest"] = json!(sha256_file(&from.join("pack.tar.gz").to_string_lossy()).unwrap());
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(&manifest_path, &bytes).unwrap();
+        std::fs::write(from.join("pack-manifest.json.minisig"), sign(&bytes)).unwrap();
+        pk
+    }
+
+    /// PO1: the TEST keyring of a fixture key (the b428-U9 one; the embedded release keyring is never what a test verifies
+    /// against — RULINGS IP1).
+    pub(super) fn po1_test_keyring(pk: &str) -> cys::packsig::Keyring {
+        test_keyring("TESTKEY", pk)
+    }
+
+    /// ★PO1 (RULINGS LH36) — the child of the PO1 real-process specimens, the b428-U9 pattern: THIS test binary runs the
+    /// real `run_pack_update` (signature, digest, version gate, journal, install core, the real pending consumer, terminal
+    /// record) with its stdout on the process's own fd 1, on a fixture signed by a TEST key, in an empty folder of its own
+    /// (pack, config, local, an absent socket, no autostart). Each mode prepares the pack so the install core really
+    /// produces one kind of human line; `init-pack` runs the real `cys init-pack --no-install-hook` instead (the
+    /// non-transactional caller, criterion 4). Everything after the line `PO1-OUTPUT` is the command's own output.
+    #[test]
+    #[ignore = "child of the PO1 real-process specimens"]
+    fn po1_command_child() {
+        use std::io::Write;
+        let Ok(mode) = std::env::var("CYS_PO1_CHILD") else { return };
+        let base = std::env::temp_dir().join(format!("cys-po1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (pack, from, local) = (base.join("pack"), base.join("from"), base.join("local"));
+        for d in [&pack, &from, &local] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &pack);
+        std::env::set_var(cys::pack::ENV_CONFIG_DIR, base.join("config"));
+        std::env::set_var("CYS_LOCAL_DIR", &local);
+        std::env::set_var("LOCALAPPDATA", base.join("localappdata"));
+        std::env::set_var(cys::ENV_SOCKET, base.join("absent.sock"));
+        std::env::set_var("CYS_NO_AUTOSTART", "1");
+        let put = |rel: &str, bytes: &[u8]| {
+            let p = pack.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        };
+        // the install record (`.install-manifest.json`): what the earlier install wrote, by its hash
+        let record = |rows: &[(&str, &str)]| {
+            let m: serde_json::Map<String, Value> =
+                rows.iter().map(|(r, c)| (r.to_string(), json!(sha256_of(c.as_bytes())))).collect();
+            std::fs::write(pack.join(".install-manifest.json"), Value::Object(m).to_string()).unwrap();
+        };
+        std::fs::write(pack.join(".pack-version"), if mode == "init-pack" { "0.0.1" } else { "1.0.0" }).unwrap();
+        let mut fixture: Vec<(&str, &str)> = vec![("po1/always.md", "po1 fixture\n")];
+        match mode.as_str() {
+            // (a) the disk version (1.0.0) differs from the target (2.0.0), an install record exists and one vendor file's
+            //     bytes change → the update snapshot is taken (src/pack.rs take_update_snapshot) and its line printed
+            "snapshot" => {
+                put("bin/po1.sh", PO1_OLD.as_bytes());
+                record(&[("bin/po1.sh", PO1_OLD)]);
+                fixture.push(("bin/po1.sh", PO1_NEW));
+            }
+            // (b) user-modified vendor files of both kinds the pending summary counts: the locked security asset
+            //     `trusted-keys.json` (system: healed — the user's bytes kept as `.user`, the vendor bytes written) and the
+            //     user-owned `acl.json` (kept, the vendor's new version beside it as `.new`). Both have their ancestor in
+            //     `.pristine/` (the earlier install's vendor copy), so neither is a stale record (C-07).
+            "pending" => {
+                let (tk_old, acl_old) = ("{\"po1\": 1}\n", "{\"po1\": \"acl 1\"}\n");
+                put("trusted-keys.json", b"{\"po1\": \"edited by the user\"}\n");
+                put(".pristine/trusted-keys.json", tk_old.as_bytes());
+                put("acl.json", b"{\"po1\": \"the user's acl\"}\n");
+                put(".pristine/acl.json", acl_old.as_bytes());
+                record(&[("trusted-keys.json", tk_old), ("acl.json", acl_old)]);
+                fixture.push(("trusted-keys.json", "{\"po1\": 2}\n"));
+                fixture.push(("acl.json", "{\"po1\": \"acl 2\"}\n"));
+            }
+            // (c) M11 가: a user-modified system file the vendor advanced; the 3-way merge over its `.pristine/` ancestor
+            //     conflicts → the user's file stays live, the vendor's version is kept as `.new` (ledger kind user-kept)
+            "user-kept" => {
+                put("bin/po1.sh", PO1_USER.as_bytes());
+                put(".pristine/bin/po1.sh", PO1_OLD.as_bytes());
+                record(&[("bin/po1.sh", PO1_OLD)]);
+                fixture.push(("bin/po1.sh", PO1_NEW));
+            }
+            // (c) M11 마 + T2j: the lane's tombstone file as the repair commit writes it (`repair::tombstones::record_in`,
+            //     `<local>/repairs/tombstones/base.json`): a deleted file the update keeps absent, and a tombstone on a
+            //     protection file (`state/hook-targets.json.example`) that the install does not follow
+            "tombstone" => {
+                use cys::repair::tombstones::{record_in, Tombstone, TombstoneKind};
+                use cys::repair::types::{LaneKey, RepairId};
+                let root = local.join("repairs");
+                let lane = LaneKey("base".to_string());
+                for (rel, id) in [("bin/po1-gone.sh", "R-1"), ("state/hook-targets.json.example", "R-2")] {
+                    let t = Tombstone { rel: rel.to_string(), kind: TombstoneKind::File, repair: RepairId::parse(id).unwrap() };
+                    record_in(&root, &lane, &t).unwrap();
+                }
+                fixture.push(("bin/po1-gone.sh", PO1_NEW));
+                fixture.push(("state/hook-targets.json.example", "{}\n"));
+            }
+            // (d) a user-owned file that is not UTF-8 (a CP949 save: the bytes of "한글") — not overwritten, not backed up,
+            //     named on the run's output
+            "unreadable" => {
+                put("schedule.json", b"{\"jobs\": \"\xc7\xd1\xb1\xdb\"}\n");
+                fixture.push(("schedule.json", "{\"jobs\": []}\n"));
+            }
+            // criterion (4): the real `cys init-pack --no-install-hook` over the embedded pack — an unmodified vendor file
+            // whose embedded bytes differ (→ the snapshot) and a user-modified user-owned file (→ the pending summary)
+            "init-pack" => {
+                let worker = "directives/WORKER_DIRECTIVE.md";
+                assert!(cys::pack::PACK_ALL.iter().any(|(r, _)| *r == worker), "{worker} is in the embedded pack");
+                let old = "# WORKER_DIRECTIVE po1 0.0.1\n";
+                let acl_old = "{\"po1\": \"acl 0.0.1\"}\n";
+                put(worker, old.as_bytes());
+                put("acl.json", b"{\"po1\": \"the user's acl\"}\n");
+                put(".pristine/acl.json", acl_old.as_bytes());
+                record(&[(worker, old), ("acl.json", acl_old)]);
+            }
+            other => panic!("unknown PO1 child mode {other}"),
+        }
+        let pk = po1_sign_fixture(&from, &fixture);
+        println!("PO1-OUTPUT");
+        std::io::stdout().flush().unwrap();
+        let rc = if mode == "init-pack" {
+            run_init_pack(false, true, None)
+        } else {
+            run_pack_update(Some(from.to_string_lossy().into_owned()), None, false,
+                &|| Ok(test_keyring("TESTKEY", &pk)), &consume_reinject_pending, &mut std::io::stdout().lock())
+        };
+        std::io::stdout().flush().unwrap();
+        std::io::stderr().flush().unwrap();
+        // the parent asserts on this process's stdout, stderr and exit code only — nothing it checks lives in `base`
+        let _ = std::fs::remove_dir_all(&base);
+        std::process::exit(rc);
+    }
+
+    /// Runs [`po1_command_child`] in `mode` as a child process: (exit code, the command's stdout, its stderr).
+    fn po1_command_output(mode: &str) -> (i32, String, String) {
+        use cys::SpawnPolicy;
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .spawn_policy(cys::ChildLifetime::Attached)
+            .no_autostart()
+            .args(["--exact", "tests::po1_command_child", "--ignored", "--nocapture"])
+            .env("CYS_PO1_CHILD", mode)
+            .output()
+            .expect("PO1 command child");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let body = stdout
+            .split_once("PO1-OUTPUT\n")
+            .unwrap_or_else(|| panic!("the PO1 child did not run: {stdout}\n{stderr}"))
+            .1
+            .to_owned();
+        (output.status.code().unwrap_or(-1), body, stderr)
+    }
+
+    /// PO1 success criterion (3) on one real run of `cys pack-update`: exit 0 · the first stdout line is the terminal
+    /// record · the app's parser takes it (`Ok(Some)`, Applied) · no stdout line is a human `[init-pack]` / `[pack-update]`
+    /// line, every stdout line is a machine record · each human line of the case IS on stderr. Returns the failures.
+    pub(super) fn po1_failures(case: &str, rc: i32, out: &str, err: &str, human: &[&str]) -> Vec<String> {
+        use cys::pack_update_result::{parse, PackAction};
+        let mut f = Vec::new();
+        if rc != 0 {
+            f.push(format!("{case}: exit {rc}, expected 0 (applied; no daemon → reinject skipped)"));
+        }
+        if !out.lines().next().is_some_and(|l| l.starts_with("PACK_UPDATE_OUTCOME ")) {
+            f.push(format!("{case}: stdout line 0 is not the terminal record: {:?}", out.lines().next()));
+        }
+        match parse(out, rc) {
+            Ok(Some(r)) if r.action == PackAction::Applied => {}
+            other => f.push(format!("{case}: cys::pack_update_result::parse(stdout, {rc}) = {other:?}, expected Ok(Some(Applied))")),
+        }
+        for l in out.lines() {
+            if l.starts_with("[init-pack]") || l.starts_with("[pack-update]") {
+                f.push(format!("{case}: a human line on stdout: {l:?}"));
+            } else if !l.starts_with("PACK_UPDATE_") {
+                f.push(format!("{case}: a stdout line that is not a machine record: {l:?}"));
+            }
+        }
+        for h in human {
+            if !err.lines().any(|l| l.contains(h)) {
+                f.push(format!("{case}: the human line {h:?} is not on stderr"));
+            }
+        }
+        f
+    }
+
+    fn po1_assert(case: &str, human: &[&str]) {
+        let (rc, out, err) = po1_command_output(case);
+        let f = po1_failures(case, rc, &out, &err, human);
+        assert!(f.is_empty(), "{}\n--- stdout (exit {rc}) ---\n{out}--- stderr ---\n{err}", f.join("\n"));
+    }
+
+    /// PO1 (a) — RED on b821759c: line 0 of stdout is `[init-pack] 업데이트 전 스냅샷 …` (src/pack.rs 6575, `println!`),
+    /// the record is line 1 and `parse` returns Err (the measured PU1 case: `stage5/runs/pu1-234839/rowAC/cmd-04-A-apply.out`).
+    #[test]
+    fn po1_a_the_snapshot_line_goes_to_stderr_and_the_record_stays_line_0() {
+        po1_assert("snapshot", &["[init-pack] 업데이트 전 스냅샷: 이번 설치가 덮거나 지울 파일 1건"]);
+    }
+
+    /// PO1 (b) — the pending-merge summary and `pack: healed=…` (src/pack.rs 7290, 7301; both already in v0.14.56).
+    #[test]
+    fn po1_b_the_pending_summary_and_the_healed_line_go_to_stderr() {
+        po1_assert(
+            "pending",
+            &[
+                "[init-pack] 내 커스텀은 지워지지 않았습니다 — 병합 대기 2건 (내 수정본 .user 보존 1건 · vendor 신버전 .new 병치 1건)",
+                "[init-pack] pack: healed=1 merged=0 kept-drift=0 conflicted=0 quarantined=0 user-kept=0 vendor-first=0",
+            ],
+        );
+    }
+
+    /// PO1 (c) — M11 가: the after-update report of a kept user file (src/pack.rs 7301, 7310; new in 0.15.0).
+    #[test]
+    fn po1_c_the_m11_kept_user_file_lines_go_to_stderr() {
+        po1_assert(
+            "user-kept",
+            &[
+                "[init-pack] pack: healed=0 merged=0 kept-drift=0 conflicted=0 quarantined=0 user-kept=1 vendor-first=0",
+                "[init-pack] 보존된 수정 1건(사용자 파일 유지 1 · 제자리 보존 0)",
+            ],
+        );
+    }
+
+    /// PO1 (c) — M11 마 + T2j: a tombstone that keeps a file absent and a protection file's tombstone that is not followed
+    /// (src/pack.rs 7252, 7260; new in 0.15.0).
+    #[test]
+    fn po1_c_the_tombstone_lines_go_to_stderr() {
+        po1_assert(
+            "tombstone",
+            &[
+                "[init-pack] 수리 장부에 기록된 삭제 1건은 만들지 않았습니다(부재 유지): bin/po1-gone.sh (R-1)",
+                "[init-pack] 보호장치 파일의 삭제 표식(묘비) 1건은 따르지 않았습니다",
+                "state/hook-targets.json.example (R-2)",
+            ],
+        );
+    }
+
+    /// PO1 (d) — the unreadable-file line (src/pack.rs 7269; already in v0.14.56).
+    #[test]
+    fn po1_d_the_unreadable_file_line_goes_to_stderr() {
+        po1_assert("unreadable", &["[init-pack] 읽을 수 없어 손대지 않은 파일 1건", "schedule.json"]);
+    }
+
+    /// PO1 criterion (4) — the non-transactional caller is unchanged: the real `cys init-pack --no-install-hook` still
+    /// prints the snapshot line and the pending summary on STDOUT (and not on stderr), with its own result line.
+    #[test]
+    fn po1_init_pack_keeps_the_snapshot_and_pending_lines_on_stdout() {
+        let (rc, out, err) = po1_command_output("init-pack");
+        let mut f = Vec::new();
+        if rc != 0 {
+            f.push(format!("init-pack: exit {rc}"));
+        }
+        for h in [
+            "[init-pack] 업데이트 전 스냅샷: 이번 설치가 덮거나 지울 파일 1건",
+            "[init-pack] 내 커스텀은 지워지지 않았습니다 — 병합 대기 1건 (내 수정본 .user 보존 0건 · vendor 신버전 .new 병치 1건)",
+            "[pack] 훅 미설치(--no-install-hook)",
+            "CYSJavis Pack installed at ",
+        ] {
+            if !out.lines().any(|l| l.starts_with(h)) {
+                f.push(format!("init-pack: {h:?} is not on stdout"));
+            }
+            if err.lines().any(|l| l.starts_with(h)) {
+                f.push(format!("init-pack: {h:?} is on stderr"));
+            }
+        }
+        assert!(f.is_empty(), "{}\n--- stdout (exit {rc}) ---\n{out}--- stderr ---\n{err}", f.join("\n"));
+    }
+
     /// pack-manifest emit(§2-①) — files 키가 PACK+PACK_SKILLS 전부 포함 + sha256이 content_hash
     /// (sha256_hex 동일산식)와 일치. 플래그 주입 채움·미지정 생략(fail-closed) 검증.
     #[test]
@@ -52251,6 +52530,16 @@ mod b360_tests {
             "boot" => run_boot(None, true),
             // ★(B-360 R2 revise · area P) no `--from`: the command stops after its pending pass (exit 1)
             "pack-update" => run_pack_update(None, None, false, &cys::packsig::embedded_keyring, &consume_reinject_pending, &mut std::io::stdout().lock()),
+            // ★PO1 (RULINGS LH36): the real command WITH `--from` (a TEST-signed fixture, `CYS_PO1_FROM` / `CYS_PO1_PK` — the
+            //   embedded release keyring is never what a test verifies against, RULINGS IP1) and the real pending consumer;
+            //   `PO1-OUTPUT` marks where the command's own stdout starts
+            "pack-update-from" => {
+                let from = std::env::var("CYS_PO1_FROM").expect("CYS_PO1_FROM");
+                let pk = std::env::var("CYS_PO1_PK").expect("CYS_PO1_PK");
+                println!("PO1-OUTPUT");
+                let _ = std::io::stdout().flush();
+                run_pack_update(Some(from), None, false, &|| Ok(super::tests::po1_test_keyring(&pk)), &consume_reinject_pending, &mut std::io::stdout().lock())
+            }
             // ★(B-360 R2 revise · area D) the real `cys drain --verify` (exit computed by run_drain_verify)
             "drain-verify" => run(Command::Drain { verify: true, timeout: 2 }),
             // ★(B-360 R2 revise · area E) the save-file gate (S48) and the verifier handshake (S49), not forced
@@ -53920,6 +54209,53 @@ mod b360_tests {
             }
         }
         out
+    }
+
+    /// ★PO1 (RULINGS LH36) — the pending pass's own human lines (`consume_reinject_pending_core`: std `println!` at
+    /// b821759c, src/bin/cys.rs 26001 / 26038, also in v0.14.56) are printed BEFORE the terminal record — the pass runs
+    /// first. Run 1 (in-process) leaves an UNKNOWN entry (the directive paste's write outcome is unknown); run 2 is the REAL
+    /// command `cys pack-update --from <signed fixture>` (child, the real pending consumer, a live fake daemon) whose pending
+    /// pass resolves the entry — by the ACK of the presence ping ("verified landed (ACK) — marked delivered") or by the
+    /// affirmative absence and one re-inject ("not in context (ReceivedNoAck) — re-injected once, marked"). The fixture
+    /// produces no install-core line, so the case sees the pending pass alone. RED on b821759c: that line is stdout line 0.
+    #[cfg(unix)]
+    #[test]
+    fn po1_pending_pass_lines_go_to_stderr_and_the_record_stays_line_0() {
+        let mut failures = Vec::new();
+        for (case, ping, line) in [
+            ("pending-ack", R2pPing::Ack, "verified landed (ACK) — marked delivered"),
+            ("pending-no-ack", R2pPing::NoAck, "not in context (ReceivedNoAck) — re-injected once, marked"),
+        ] {
+            let pack = R2cPack::new();
+            std::fs::write(pack.dir.join("pack/.pack-version"), "1.0.0").unwrap();
+            let ctl = r2p_ctl(r2c_reply(&pending_err()), ping, true);
+            let daemon = r2p_daemon(ctl.clone(), r2p_session(&pack));
+            let first = r2c_in_env(&daemon, &pack, || format!("{:?}", run_pack_reinject("9.9.9")));
+            if r2p_unknown_entries(&pack.dir).len() != 1 {
+                failures.push(format!("{case}: run 1 left no unknown entry: {first}"));
+                continue;
+            }
+            r2p_set(&ctl, r2c_ok(json!({})), ping, true);
+            let from = pack.dir.join("from");
+            std::fs::create_dir_all(&from).unwrap();
+            let pk = super::tests::po1_sign_fixture(&from, &[("po1/always.md", "po1 fixture\n")]);
+            let mut envs = pack.envs();
+            envs.push(("CYS_PO1_FROM", from.into_os_string()));
+            envs.push(("CYS_PO1_PK", pk.into()));
+            let (rc, raw, err) = r2c_child("pack-update-from", &daemon, &envs);
+            let Some((_, out)) = raw.split_once("PO1-OUTPUT\n") else {
+                failures.push(format!("{case}: the child did not reach the command: {raw}\n{err}"));
+                continue;
+            };
+            let f = super::tests::po1_failures(case, rc, out, &err, &[line]);
+            if !f.is_empty() {
+                failures.push(format!("{}\n--- stdout (exit {rc}) ---\n{out}--- stderr ---\n{err}", f.join("\n")));
+            }
+            if !r2p_unknown_entries(&pack.dir).is_empty() {
+                failures.push(format!("{case}: the pending pass did not resolve the entry (the case did not reach its line)"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// Area P · head condition (b): the pending pass's reconciliation (`consume_reinject_pending`, its core, and the

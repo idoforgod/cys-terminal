@@ -19519,6 +19519,145 @@ mod tests {
         let _ = std::fs::remove_dir_all(pack);
     }
 
+    // ── PO1 (RULINGS LH36): the install core's human lines follow the caller — stderr in the transactional path ──
+
+    /// The human lines the PO1 library specimen makes the install core print, each by a fact of its fixture (a prefix of
+    /// the line; the snapshot · the tombstone kept absent · the protection tombstone not followed · the unreadable file ·
+    /// the pending summary · `pack: healed=…` · the M11 after-update report).
+    const PO1_LIB_LINES: &[&str] = &[
+        "[init-pack] 업데이트 전 스냅샷: 이번 설치가 덮거나 지울 파일 ",
+        "[init-pack] 수리 장부에 기록된 삭제 1건은 만들지 않았습니다(부재 유지): bin/po1-gone.sh (R-1)",
+        "[init-pack] 보호장치 파일의 삭제 표식(묘비) 1건은 따르지 않았습니다",
+        "[init-pack] 읽을 수 없어 손대지 않은 파일 1건",
+        "[init-pack] 내 커스텀은 지워지지 않았습니다 — 병합 대기 2건 (내 수정본 .user 보존 1건 · vendor 신버전 .new 병치 1건)",
+        "[init-pack] pack: healed=1 merged=0 kept-drift=0 conflicted=0 quarantined=0 user-kept=1 vendor-first=0",
+        "[init-pack] 보존된 수정 1건(사용자 파일 유지 1 · 제자리 보존 0)",
+    ];
+    const PO1_LIB_DOWNGRADE: &str = "[init-pack] 다운그레이드 차단 — 팩 미반영 (디스크 3.0.0 > 바이너리 2.0.0)";
+
+    /// ★PO1 (RULINGS LH36) — the child of [`po1_install_core_lines_follow_the_caller`]: ONE `install_into_with` over a
+    /// fixture that makes the install core print every kind of its human line (mode `all*`), or the downgrade block (mode
+    /// `downgrade*` — in `cys pack-update` only a race reaches it: another installer advancing `.pack-version` between the
+    /// command's version gate and the install), with `transactional` = the mode's `-tx` suffix. A child process because
+    /// libtest captures `println!` of the test thread: only a process's own fd 1 / fd 2 show which stream a line takes.
+    /// Runs on every OS (no socket, no daemon) — the Windows proof of the stream rule.
+    #[test]
+    #[ignore = "child of the PO1 library specimen"]
+    fn po1_install_core_child() {
+        use crate::repair::tombstones::{Tombstone, TombstoneKind};
+        use crate::repair::types::RepairId;
+        use std::io::Write;
+        let Ok(mode) = std::env::var("CYS_PO1_LIB_CHILD") else { return };
+        let transactional = mode.ends_with("-tx");
+        let base = std::env::temp_dir().join(format!("cys-po1-lib-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("pack");
+        let put = |rel: &str, bytes: &[u8]| {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        };
+        let (old, new, user) = ("#!/bin/sh\n# po1 1.0.0\n", "#!/bin/sh\n# po1 2.0.0\n", "#!/bin/sh\n# po1 1.0.0, edited by the user\n");
+        let (tk_old, acl_old) = ("{\"po1\": 1}\n", "{\"po1\": \"acl 1\"}\n");
+        let mut items: Vec<(&str, &str)> = vec![("po1/always.md", "po1 fixture\n")];
+        let mut sources = UpdateSources::none();
+        if mode.starts_with("downgrade") {
+            put(PACK_VERSION_FILE, b"3.0.0");
+        } else {
+            put(PACK_VERSION_FILE, b"1.0.0");
+            put("bin/po1.sh", old.as_bytes()); // unmodified vendor file → updated → the snapshot
+            put("bin/po1-kept.sh", user.as_bytes()); // user-modified, merge conflicts → user-kept (M11 가)
+            put(".pristine/bin/po1-kept.sh", old.as_bytes());
+            put("trusted-keys.json", b"{\"po1\": \"edited\"}\n"); // locked asset, modified → healed
+            put(".pristine/trusted-keys.json", tk_old.as_bytes());
+            put("acl.json", b"{\"po1\": \"the user's acl\"}\n"); // user-owned, modified → .new beside it
+            put(".pristine/acl.json", acl_old.as_bytes());
+            put("schedule.json", b"{\"jobs\": \"\xc7\xd1\xb1\xdb\"}\n"); // not UTF-8 (CP949) → unreadable, kept
+            let manifest: std::collections::BTreeMap<&str, String> = [
+                ("bin/po1.sh", content_hash(old)),
+                ("bin/po1-kept.sh", content_hash(old)),
+                ("trusted-keys.json", content_hash(tk_old)),
+                ("acl.json", content_hash(acl_old)),
+            ]
+            .into_iter()
+            .collect();
+            put(INSTALL_MANIFEST, serde_json::to_string(&manifest).unwrap().as_bytes());
+            items.extend([
+                ("bin/po1.sh", new),
+                ("bin/po1-kept.sh", new),
+                ("trusted-keys.json", "{\"po1\": 2}\n"),
+                ("acl.json", "{\"po1\": \"acl 2\"}\n"),
+                ("schedule.json", "{\"jobs\": []}\n"),
+                ("bin/po1-gone.sh", new),                     // absent + tombstone → kept absent (M11 마)
+                ("state/hook-targets.json.example", "{}\n"), // a protection file's tombstone → not followed (T2j)
+            ]);
+            let tomb = |rel: &str, id: &str| Tombstone { rel: rel.to_string(), kind: TombstoneKind::File, repair: RepairId::parse(id).unwrap() };
+            sources = sources
+                .with_snapshot("base", base.join("local").join("update-snapshots"))
+                .with_tombstones(vec![tomb("bin/po1-gone.sh", "R-1"), tomb("state/hook-targets.json.example", "R-2")]);
+        }
+        println!("PO1-LIB-OUTPUT");
+        std::io::stdout().flush().unwrap();
+        let r = install_into_with(dir, items, false, "2.0.0", transactional, false, PackScope::Base, None, None, &sources);
+        std::io::stdout().flush().unwrap();
+        eprintln!("PO1-LIB-RESULT {r:?}");
+        std::io::stderr().flush().unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        std::process::exit(if r.is_ok() { 0 } else { 1 });
+    }
+
+    /// ★PO1 (RULINGS LH36) criteria (2) · (4) · (6) at the library level — one rule, both directions: with
+    /// `transactional = true` (`cys pack-update`) every human line of the install core is on STDERR and none on stdout;
+    /// with `transactional = false` (`cys init-pack`, the daemon's boot install) the same lines are on STDOUT, as before.
+    /// RED on b821759c for the transactional half (every line on stdout). Runs on Windows (child process, no socket).
+    #[test]
+    fn po1_install_core_lines_follow_the_caller() {
+        let run = |mode: &str| -> (i32, String, String) {
+            let o = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "pack::tests::po1_install_core_child", "--ignored", "--nocapture"])
+                .env("CYS_PO1_LIB_CHILD", mode)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("PO1 library child");
+            let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+            let body = stdout
+                .split_once("PO1-LIB-OUTPUT\n")
+                .unwrap_or_else(|| panic!("the PO1 library child did not run: {stdout}\n{stderr}"))
+                .1
+                .to_owned();
+            (o.status.code().unwrap_or(-1), body, stderr)
+        };
+        let mut failures = Vec::new();
+        for (mode, transactional, lines) in [
+            ("all-tx", true, PO1_LIB_LINES),
+            ("all", false, PO1_LIB_LINES),
+            ("downgrade-tx", true, &[PO1_LIB_DOWNGRADE][..]),
+            ("downgrade", false, &[PO1_LIB_DOWNGRADE][..]),
+        ] {
+            let (rc, out, err) = run(mode);
+            let (want, other) = if transactional { (&err, &out) } else { (&out, &err) };
+            let mut f: Vec<String> = Vec::new();
+            if rc != 0 {
+                f.push(format!("exit {rc}"));
+            }
+            for l in lines {
+                if !want.lines().any(|x| x.starts_with(l)) {
+                    f.push(format!("{l:?} is not on {}", if transactional { "stderr" } else { "stdout" }));
+                }
+                if other.lines().any(|x| x.starts_with(l)) {
+                    f.push(format!("{l:?} is on {}", if transactional { "stdout" } else { "stderr" }));
+                }
+            }
+            if transactional && out.lines().any(|x| x.starts_with("[init-pack]")) {
+                f.push("a human `[init-pack]` line is on stdout of the transactional path".into());
+            }
+            if !f.is_empty() {
+                failures.push(format!("{mode}: {}\n--- stdout (exit {rc}) ---\n{out}--- stderr ---\n{err}", f.join("; ")));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
 }
 
 /// ★0.15.0 「스스로 해결」 M11 — 업데이트 규칙의 회귀 시험(설계 §4-11 · §6-11 · CONTRACTS C8 · testplan H §6-11).
