@@ -465,6 +465,8 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
         //   수리를 재검사 — `javis_dept_schedule.py` 의 본부 전용 목록에 넣지 않는다) · via_queue 없음.
         //   데몬은 `repair.tick` 에 곧바로 답하고(started|busy|not_ready|idle) 일은 데몬 스레드 하나가 한다 —
         //   예약기의 발화 규칙·600초 시간 초과·다른 작업은 그대로다. 결과는 장부에만 남는다(큐·경보·버스 0).
+        // ★WS1 (RULINGS KN1): this job is FIXED by its id (`cys::repair::probation::FIXED_BUILTIN_JOB_IDS`) — no writer
+        //   may remove or change it: the boot restores it whole and the scheduler's tick re-ensures it in a valid file.
         json!({
             "id": REPAIR_JOB_ID,
             "every_minutes": 2,
@@ -476,8 +478,89 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
     ]
 }
 
-/// ★0.15.0 (T6 · C7 O-C7-1): the ONE appended built-in job's id.
-pub(crate) const REPAIR_JOB_ID: &str = "repair-probation-tick";
+/// ★0.15.0 (T6 · C7 O-C7-1): the ONE appended built-in job's id — defined in the library
+/// (`cys::repair::probation::REPAIR_JOB_ID`, WS1 · RULINGS KN1) so that the CLI reads the same id.
+pub(crate) use cys::repair::probation::REPAIR_JOB_ID;
+
+/// ★0.15.0 (WS1 · RULINGS KN1): is this built-in definition a FIXED job — one no writer may remove or change
+/// (RULINGS AW7 / AY7)? Decided by the job's ID in the library's ONE definition
+/// (`cys::repair::probation::FIXED_BUILTIN_JOB_IDS`), never by a field of the file: a `_builtin_fixed` left in a stored
+/// entry by a preview build decides nothing (the whole-definition restore drops it), and a user's job that carries one is
+/// an ordinary job. The boot's ensure restores such a job WHOLE ([`restore_fixed_builtin`]) and the scheduler's tick
+/// re-ensures it in a valid file ([`restore_fixed_builtin_jobs`]).
+fn is_fixed_builtin(bj: &serde_json::Value) -> bool {
+    bj.get("id").and_then(|v| v.as_str()).is_some_and(|id| cys::repair::probation::FIXED_BUILTIN_JOB_IDS.contains(&id))
+}
+
+/// ★0.15.0 (T6 · RULINGS AW7 as amended by AY7 · AGREEMENT 21 "내장 자가치유 작업"; WS1 · RULINGS JX1 / KN1): put ONE
+/// fixed built-in job (`bj`, its id is in `FIXED_BUILTIN_JOB_IDS`) back WHOLE in `jobs` — its ENTIRE definition from code (every
+/// field, compared canonically: serde_json values compare as maps), whatever the stored entry holds (marker or not);
+/// duplicate entries under its id are dropped (CU4); logged once per restore. Returns whether `jobs` changed. The ONE
+/// restore of such a job: the boot's ensure ([`apply_builtin_jobs`]) and the scheduler's tick
+/// ([`restore_fixed_builtin_jobs`]) both call it.
+fn restore_fixed_builtin(jobs: &mut Vec<serde_json::Value>, bj: serde_json::Value, id: &str) -> bool {
+    let mut changed = false;
+    // CU4: duplicate entries under this id — the first is restored below, the rest dropped
+    let mut seen = false;
+    let before = jobs.len();
+    jobs.retain(|j| {
+        if j.get("id").and_then(|v| v.as_str()) != Some(id) {
+            return true;
+        }
+        let keep = !seen;
+        seen = true;
+        keep
+    });
+    if jobs.len() != before {
+        eprintln!("[cysd] ensure_builtin_jobs: 내장 자가치유 작업 '{id}' 의 중복 항목 {}개를 지움(하나만 남김)", before - jobs.len());
+        changed = true;
+    }
+    match jobs
+        .iter()
+        .position(|j| j.get("id").and_then(|v| v.as_str()) == Some(id))
+    {
+        Some(pos) if jobs[pos] == bj => {}
+        Some(pos) => {
+            eprintln!(
+                "[cysd] ensure_builtin_jobs: 내장 자가치유 작업 '{id}' 의 정의를 코드 정의로 되살림(이 작업은 schedule.json 으로 바꾸거나 지울 수 없다 — RULINGS AY7) · 구 항목: {}",
+                jobs[pos]
+            );
+            jobs[pos] = bj;
+            changed = true;
+        }
+        None => {
+            jobs.push(bj);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// ★0.15.0 (WS1 · RULINGS JX1 · whole-diff F3-B2): the tick's half of the fixed jobs' rule. Another writer can remove a
+/// fixed job from a VALID file right after the boot registered it (the preflight's C16 fix — released code, not
+/// changed — writes an older read back without the lock); before JX1 nothing registered it again until a restart. At
+/// every tick that holds the writer lock, each fixed built-in job is put back whole through [`restore_fixed_builtin`] —
+/// the boot's own restore — and NOTHING else: every other built-in keeps the boot-only rule (RULINGS JX2 — a
+/// department's seed removes two of them on purpose). `root` is a validated document; a missing `jobs` key is created
+/// as the boot does. Returns the ids put back; on a complete file this is one comparison per fixed job.
+fn restore_fixed_builtin_jobs(root: &mut serde_json::Value) -> Vec<String> {
+    let mut restored = Vec::new();
+    let Some(obj) = root.as_object_mut() else {
+        return restored;
+    };
+    let Some(jobs) = obj.entry("jobs").or_insert_with(|| json!([])).as_array_mut() else {
+        return restored;
+    };
+    for bj in builtin_jobs().into_iter().filter(is_fixed_builtin) {
+        let Some(id) = bj.get("id").and_then(|v| v.as_str()).map(str::to_string) else {
+            continue;
+        };
+        if restore_fixed_builtin(jobs, bj, &id) {
+            restored.push(id);
+        }
+    }
+    restored
+}
 
 /// ★0.15.0 (T6 · RULINGS H6(1) / X1): the scheduler's OWN check of a `schedule.json` held at `path` —
 /// the same read + validation a normal read-modify-write uses (`read_schedule_root` →
@@ -556,19 +639,22 @@ fn canonicalize_schedule_file(path: &std::path::Path, root: &mut serde_json::Val
 /// `schedule.json` 자리에 놓을 수 있었다(부분 JSON → 손상 격리 → 빈 스케줄 → 전 builtin 침묵).
 /// 이름 분리는 torn 파일을 막고, **쓰기 순서**는 [`ScheduleFileLock`] 이 직렬화한다.
 fn write_schedule_atomic(path: &std::path::Path, root: &serde_json::Value) -> bool {
-    let Ok(body) = serde_json::to_string_pretty(root) else {
-        return false;
-    };
+    try_write_schedule_atomic(path, root).is_ok()
+}
+
+/// The same write with its I/O error (★0.15.0 WS1 · KN minor (b): the restore's failure report names its reason).
+fn try_write_schedule_atomic(path: &std::path::Path, root: &serde_json::Value) -> std::io::Result<()> {
+    let body = serde_json::to_string_pretty(root).map_err(std::io::Error::other)?;
     let tmp = schedule_tmp_path(path);
-    if std::fs::write(&tmp, body).is_err() {
+    if let Err(e) = std::fs::write(&tmp, body) {
         let _ = std::fs::remove_file(&tmp);
-        return false;
+        return Err(e);
     }
-    if std::fs::rename(&tmp, path).is_err() {
+    if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        return false;
+        return Err(e);
     }
-    true
+    Ok(())
 }
 
 /// writer 별로 다른 임시 파일 — `schedule.json.<pid>.<nonce>.tmp`(같은 디렉터리 = 같은 볼륨 → rename 원자).
@@ -723,6 +809,55 @@ impl ScheduleRefusal {
     fn read(error: std::io::Error) -> Self {
         Self { reason: "read_failed", io_kind: Some(error.kind()), raw_os_error: error.raw_os_error() }
     }
+    fn write(error: std::io::Error) -> Self {
+        Self { reason: "write_failed", io_kind: Some(error.kind()), raw_os_error: error.raw_os_error() }
+    }
+}
+
+/// ★0.15.0 (WS1 · KN minor (b)): the restore of a fixed job whose write keeps failing is reported when the failure
+/// starts and when its reason changes — not at every tick while it lasts — and once when it heals (a restore written,
+/// or nothing left to put back). Per schedule file; the state lives in this process only. On a healthy tick this is one
+/// atomic load.
+fn note_restore_fixed(path: &std::path::Path, outcome: Result<(), ScheduleRefusal>) {
+    type Reason = (&'static str, Option<std::io::ErrorKind>, Option<i32>);
+    static FAILING: std::sync::Mutex<Vec<(PathBuf, Reason)>> = std::sync::Mutex::new(Vec::new());
+    static ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    match outcome {
+        Ok(()) => {
+            if !ANY.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let Ok(mut failing) = FAILING.lock() else { return };
+            let before = failing.len();
+            failing.retain(|(p, _)| p != path);
+            if failing.len() != before {
+                eprintln!("[cysd] schedule: 내장 자가치유 작업을 되살리는 schedule.json 쓰기가 다시 된다(restore_fixed 정상화 · {})", path.display());
+            }
+            ANY.store(!failing.is_empty(), std::sync::atomic::Ordering::Relaxed);
+        }
+        Err(error) => {
+            let reason: Reason = (error.reason, error.io_kind, error.raw_os_error);
+            let Ok(mut failing) = FAILING.lock() else {
+                report_schedule_refusal("restore_fixed", &error);
+                return;
+            };
+            let new = match failing.iter_mut().find(|(p, _)| p == path) {
+                Some((_, r)) if *r == reason => false,
+                Some((_, r)) => {
+                    *r = reason;
+                    true
+                }
+                None => {
+                    failing.push((path.to_path_buf(), reason));
+                    true
+                }
+            };
+            ANY.store(true, std::sync::atomic::Ordering::Relaxed);
+            if new {
+                report_schedule_refusal("restore_fixed", &error);
+            }
+        }
+    }
 }
 fn report_schedule_refusal(operation: &str, error: &ScheduleRefusal) {
     // Metadata only: never print the schedule's contents or serde's rejected value.
@@ -772,44 +907,14 @@ fn apply_builtin_jobs(
             Some(s) => s.to_string(),
             None => continue,
         };
-        // ★0.15.0 (T6 · RULINGS AW7 as amended by AY7 · AGREEMENT 21 "내장 자가치유 작업"): the appended
-        //   self-repair job is not removable or editable through schedule.json — its ENTIRE definition is
-        //   restored from code (every field, compared canonically: serde_json values compare as maps),
-        //   whatever the stored entry holds (marker or not), logged once per restore. Every OTHER built-in
-        //   keeps the rule below unchanged (a user may hold their ids).
-        if id == REPAIR_JOB_ID {
-            // CU4: duplicate entries under this id — the first is restored below, the rest dropped
-            let mut seen = false;
-            let before = jobs.len();
-            jobs.retain(|j| {
-                if j.get("id").and_then(|v| v.as_str()) != Some(id.as_str()) {
-                    return true;
-                }
-                let keep = !seen;
-                seen = true;
-                keep
-            });
-            if jobs.len() != before {
-                eprintln!("[cysd] ensure_builtin_jobs: 내장 자가치유 작업 '{id}' 의 중복 항목 {}개를 지움(하나만 남김)", before - jobs.len());
+        // ★0.15.0 (T6 · RULINGS AW7 as amended by AY7 · AGREEMENT 21 "내장 자가치유 작업"; WS1 · RULINGS JX1): a FIXED
+        //   built-in job (its id is in `FIXED_BUILTIN_JOB_IDS` — today the appended self-repair job) is not
+        //   removable or editable through schedule.json: its ENTIRE definition is restored from code by
+        //   `restore_fixed_builtin`, the one restore the scheduler's tick also uses. Every OTHER built-in keeps the rule
+        //   below unchanged (a user may hold their ids).
+        if is_fixed_builtin(&bj) {
+            if restore_fixed_builtin(jobs, bj, &id) {
                 changed = true;
-            }
-            match jobs
-                .iter()
-                .position(|j| j.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
-            {
-                Some(pos) if jobs[pos] == bj => {}
-                Some(pos) => {
-                    eprintln!(
-                        "[cysd] ensure_builtin_jobs: 내장 자가치유 작업 '{id}' 의 정의를 코드 정의로 되살림(이 작업은 schedule.json 으로 바꾸거나 지울 수 없다 — RULINGS AY7) · 구 항목: {}",
-                        jobs[pos]
-                    );
-                    jobs[pos] = bj;
-                    changed = true;
-                }
-                None => {
-                    jobs.push(bj);
-                    changed = true;
-                }
             }
             continue;
         }
@@ -1059,7 +1164,18 @@ fn load_jobs_at_access(path: &std::path::Path, mode: LoadMode, read: &ScheduleRe
             }
         },
     };
-    let mut root = match read_schedule_root(path, read) {
+    // ★0.15.0 (WS1 · RULINGS KN2): under the lock, the bytes this tick computes from are kept, so that the restore of a
+    //   fixed job writes only while the file still holds exactly them (compare-and-write against a lock-less writer).
+    let seen: std::cell::RefCell<Option<Vec<u8>>> = std::cell::RefCell::new(None);
+    let keep = |p: &std::path::Path| -> std::io::Result<Vec<u8>> {
+        let bytes = read(p);
+        if let Ok(b) = &bytes {
+            *seen.borrow_mut() = Some(b.clone());
+        }
+        bytes
+    };
+    let first: &ScheduleReader<'_> = if lock.is_some() { &keep } else { read };
+    let mut root = match read_schedule_root(path, first) {
         Ok(None) => return Vec::new(), // Direct NotFound still does not seed on hotreload.
         Ok(Some(root)) => root,
         Err(error) if error.reason == "invalid_json" && lock.is_some() => {
@@ -1083,7 +1199,32 @@ fn load_jobs_at_access(path: &std::path::Path, mode: LoadMode, read: &ScheduleRe
     //   구 표현 그대로였다 — 그 표현이 강등된 구 데몬의 직접 주입 통로다. 멱등이라 바뀔 것이
     //   없으면 파일을 건드리지 않는다(매 틱 쓰기 없음). ★(성찰 A11) 쓰기 모드에서만 · 잠금 아래에서.
     if lock.is_some() {
-        if let Err(error) = canonicalize_schedule_file(path, &mut root) { report_schedule_refusal("canonicalize", &error); }
+        // ★0.15.0 (WS1 · RULINGS JX1 / KN2): a fixed built-in job another writer removed or changed in this VALID file is
+        //   put back whole, under the lock this tick already holds — no new lock, no wait. Nothing to put back = no
+        //   write (a comparison), the released canonical-form write as before. Something to put back = COMPARE-AND-WRITE:
+        //   the file is read again right before the write; only if it still holds exactly the bytes the restore was
+        //   computed from is it written (with the canonical form, ONE write) — otherwise a lock-less writer (the
+        //   preflight's C16, the department seed — released, not changed) saved meanwhile, nothing is written in this
+        //   tick, and the next tick decides anew from the new content. A failed write is tried again at the next tick
+        //   (the tick runs the job from memory meanwhile — its firing time is the one recorded under its id, so it fires
+        //   neither at once nor twice because of this).
+        let restored = restore_fixed_builtin_jobs(&mut root);
+        if restored.is_empty() {
+            note_restore_fixed(path, Ok(())); // nothing left to put back: a failure that was reported is over
+            if let Err(error) = canonicalize_schedule_file(path, &mut root) { report_schedule_refusal("canonicalize", &error); }
+        } else if read(path).ok() != *seen.borrow() {
+            eprintln!("[cysd] schedule: 내장 자가치유 작업 {restored:?} 을 되살리려고 읽은 뒤 다른 쓰기가 schedule.json 을 저장했다 — 이번 틱은 쓰지 않고 다음 틱이 새 내용으로 다시 판단한다(RULINGS KN2)");
+        } else {
+            let outcome = match canonicalize_schedule_file(path, &mut root) {
+                Ok(true) => Ok(()),
+                Ok(false) => try_write_schedule_atomic(path, &root).map_err(ScheduleRefusal::write),
+                Err(error) => Err(error),
+            };
+            if outcome.is_ok() {
+                eprintln!("[cysd] schedule: 내장 자가치유 작업 {restored:?} 이 유효한 schedule.json 에서 빠졌거나 바뀌어 있어 코드 정의 그대로 되살렸다(RULINGS JX1 — 발화 시각은 그 작업의 기록 그대로)");
+            }
+            note_restore_fixed(path, outcome);
+        }
     }
     jobs_of(&root)
 }
@@ -3950,11 +4091,15 @@ mod tests {
         drop(held);
         rx.recv_timeout(Duration::from_secs(5)).expect("잠금 해제 뒤 핫리로드가 끝나야 한다");
         let jobs = hot.join().unwrap();
-        assert_eq!(jobs.len(), 1);
+        // WS1 · RULINGS JX1: the tick also puts back the fixed self-repair job this valid file lacks (it was
+        // `assert_eq!(jobs.len(), 1)` before JX1) — in the same one write as the canonical form.
+        let ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
+        assert_eq!(ids, vec!["j", REPAIR_JOB_ID]);
         // 잠금 아래에서 정규형으로 접혔다(triage X8 의 되쓰기는 유지된다 — 단일 writer 자리에서).
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(root["jobs"][0]["action"], json!(ACTION_PUSH_QUEUED));
+        assert_eq!(root["jobs"][1], builtin_jobs().into_iter().find(|b| b["id"] == REPAIR_JOB_ID).unwrap());
         assert!(!ScheduleFileLock::lock_dir_for(&path).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5371,7 +5516,6 @@ exit 0
         // ④ 전역 버전은 이 이관으로 올라가지 않는다(범프 = 모든 builtin 통째 교체).
         assert_eq!(BUILTIN_JOBS_VERSION, 2, "표적 이관에 전역 버전을 올렸다(§B-5 위반)");
     }
-
 }
 
 /// ★U4-B2①(0.14.41) 스케줄 잡 결과 원장 검체 — 메모리 전용 · 드러내기만.
@@ -8213,5 +8357,388 @@ mod repair_job_schedule_tests {
         );
         assert!(body.contains(".map_err(|_| \"command timed out (600s)\".to_string())?"), "the deadline's report changed");
         assert_eq!(src.matches("\"command\" => fire_command(&daemon, &job).await,").count(), 1, "every command job reaches fire_command");
+    }
+
+    // ── WS1 (whole-diff F3-B2 · RULINGS JV3 → JX1 – JX3): the fixed self-repair job comes back at the scheduler's NEXT
+    //    TICK after another writer removed it from a VALID file — through the tick's own loader
+    //    (`load_jobs_hot_reload` → `load_jobs_at(path, LoadMode::HotReload)`, the first step of `scheduler_tick`; a
+    //    unit test cannot run `scheduler_tick` itself — it fires real commands and reads the lane's own pack) — and
+    //    nothing else comes back. ────────────────────────────────────────────────────────────────────────────────────
+
+    fn ws1_dir(tag: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("cys-ws1-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    fn ws1_doc(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+    fn ws1_jobs(path: &std::path::Path) -> Vec<serde_json::Value> {
+        ws1_doc(path)["jobs"].as_array().cloned().unwrap_or_default()
+    }
+    /// Another writer's whole-file replace (temp + rename — the preflight's `_write_json_lf_atomic`, the department seed).
+    fn ws1_replace(path: &std::path::Path, doc: &serde_json::Value) {
+        let tmp = path.with_file_name("schedule.json.ws1-writer.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(doc).unwrap()).unwrap();
+        std::fs::rename(&tmp, path).unwrap();
+    }
+    /// The file's identity, time and bytes: a write by the daemon (temp + rename) gives another inode.
+    fn ws1_stamp(path: &std::path::Path) -> (u64, std::time::SystemTime, Vec<u8>) {
+        let m = std::fs::metadata(path).unwrap();
+        #[cfg(unix)]
+        let ino = {
+            use std::os::unix::fs::MetadataExt;
+            m.ino()
+        };
+        #[cfg(not(unix))]
+        let ino = 0;
+        (ino, m.modified().unwrap(), std::fs::read(path).unwrap())
+    }
+    /// A released lane's schedule as v0.14.56's boot leaves it: a user's job and the nine released built-ins.
+    fn ws1_released() -> Vec<serde_json::Value> {
+        let mut jobs = vec![json!({"id": "user-custom-job", "every_minutes": 30, "action": "push", "to": "master", "text": "mine"})];
+        apply_builtin_jobs(&mut jobs);
+        jobs.retain(|j| j["id"] != REPAIR_JOB_ID);
+        jobs
+    }
+
+    /// WS1 · RULINGS KN1 — "no writer may remove it" is the job's ID in the library's ONE definition
+    /// (`cys::repair::probation::FIXED_BUILTIN_JOB_IDS`, beside `REPAIR_JOB_ID`); today exactly the repair job (a later
+    /// safety job joins by its id there). Every fixed id has its definition in `builtin_jobs()`, the daemon's predicate
+    /// selects exactly that set, and no definition carries a `_builtin_fixed` field (a field of the file decides nothing).
+    /// (Before KN1: the set of definitions carrying `"_builtin_fixed": true` was asserted to be `[REPAIR_JOB_ID]`.)
+    #[test]
+    fn ws1_the_fixed_set_is_exactly_the_repair_job() {
+        assert_eq!(cys::repair::probation::FIXED_BUILTIN_JOB_IDS, &[REPAIR_JOB_ID], "the library's fixed set");
+        assert_eq!(REPAIR_JOB_ID, "repair-probation-tick");
+        let defs = builtin_jobs();
+        let by_predicate: Vec<&str> = defs.iter().filter(|j| is_fixed_builtin(j)).filter_map(|j| j["id"].as_str()).collect();
+        assert_eq!(by_predicate, vec![REPAIR_JOB_ID], "the daemon's predicate selects the library's set, each with a definition");
+        assert!(defs.iter().all(|j| j.get("_builtin_fixed").is_none()), "a definition carries a fixedness field again");
+    }
+
+    /// WS1 · RULINGS JV3 / JX1 — the whole-diff review's sequence (F3-B2): the preflight's C16 reads the schedule (no
+    /// report job — it will fix), the new daemon's boot registers the repair job, the preflight writes its OLDER read
+    /// back with its one job appended (a whole-file replace without the lock — released code, not changed). The job is
+    /// gone from a VALID file, and before JX1 no tick put it back until a restart. The next tick restores it WHOLE under
+    /// the lock it holds; the preflight's job, the user's job and every released built-in stay as they are, in their
+    /// order; the file is written once — later ticks write nothing.
+    #[test]
+    fn ws1_a_repair_job_removed_by_a_stale_rewrite_is_back_at_the_next_tick() {
+        let dir = ws1_dir("race");
+        let path = dir.join("schedule.json");
+        ws1_replace(&path, &json!({"jobs": ws1_released()}));
+        // ① the preflight reads
+        let stale = ws1_doc(&path);
+        // ② the new daemon's boot registers the appended job
+        ensure_builtin_jobs_at(&path);
+        assert!(ws1_jobs(&path).iter().any(|j| j["id"] == REPAIR_JOB_ID), "the boot registered the job");
+        // ③ the preflight writes its older read back with its one job (`c16_report_schedule`'s fix)
+        let mut c16 = stale.clone();
+        c16["jobs"].as_array_mut().unwrap().push(json!({
+            "id": "owner-progress-gate-5min", "every_minutes": 5, "action": "command",
+            "command": "python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py\" run", "if_absent": "skip"
+        }));
+        ws1_replace(&path, &c16);
+        assert!(!ws1_jobs(&path).iter().any(|j| j["id"] == REPAIR_JOB_ID), "precondition: the job is gone from a valid file");
+        let before = ws1_stamp(&path);
+        // ④ the next tick
+        let run = load_jobs_at(&path, LoadMode::HotReload);
+        assert_eq!(run.iter().filter(|j| j.id == REPAIR_JOB_ID).count(), 1, "the tick did not bring the repair job back");
+        let after = ws1_jobs(&path);
+        let mine: Vec<&serde_json::Value> = after.iter().filter(|j| j["id"] == REPAIR_JOB_ID).collect();
+        assert_eq!(mine, vec![&def()], "back in the file with its whole definition, once");
+        let others: Vec<serde_json::Value> = after.iter().filter(|j| j["id"] != REPAIR_JOB_ID).cloned().collect();
+        assert_eq!(&others, c16["jobs"].as_array().unwrap(), "the preflight's job, the user's job, every released built-in: untouched, in order");
+        let written = ws1_stamp(&path);
+        assert_ne!(written.2, before.2, "the tick wrote the file");
+        for tick in 2..=4 {
+            let run = load_jobs_at(&path, LoadMode::HotReload);
+            assert_eq!(run.iter().filter(|j| j.id == REPAIR_JOB_ID).count(), 1);
+            assert!(ws1_stamp(&path) == written, "tick {tick} wrote again — the file is written once");
+        }
+        assert!(!ScheduleFileLock::lock_dir_for(&path).exists(), "the lock is released");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS1 · RULINGS JX1 — a failed write is tried again at the next tick: the tick holds the lock but its write fails
+    /// (the folder refuses new files during that one tick); the file stays as it was and nothing is left beside it; at
+    /// the next tick the write succeeds and the job is back whole.
+    #[cfg(unix)]
+    #[test]
+    fn ws1_a_failed_restore_write_is_tried_again_at_the_next_tick() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = ws1_dir("retry");
+        let path = dir.join("schedule.json");
+        ws1_replace(&path, &json!({"jobs": ws1_released()}));
+        let before = std::fs::read(&path).unwrap();
+        // the lock is taken as the tick takes it; then the folder refuses new files (the write's temp file)
+        let refusing = |p: &std::path::Path| {
+            let lock = ScheduleFileLock::acquire(p);
+            std::fs::set_permissions(p.parent().unwrap(), std::fs::Permissions::from_mode(0o555)).unwrap();
+            lock
+        };
+        let _ = load_jobs_at_access(&path, LoadMode::HotReload, &|p| std::fs::read(p), &refusing);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // the lock's own release could not remove its folder while the parent refused changes: the test removes it
+        let _ = std::fs::remove_dir(ScheduleFileLock::lock_dir_for(&path));
+        assert_eq!(std::fs::read(&path).unwrap(), before, "the failed write left the file as it was");
+        let names: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["schedule.json".to_string()], "nothing left beside the file");
+        // the next tick
+        let run = load_jobs_at(&path, LoadMode::HotReload);
+        assert!(run.iter().any(|j| j.id == REPAIR_JOB_ID), "the next tick did not bring the repair job back");
+        let mine: Vec<serde_json::Value> = ws1_jobs(&path).into_iter().filter(|j| j["id"] == REPAIR_JOB_ID).collect();
+        assert_eq!(mine, vec![def()], "the next tick wrote the job whole");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS1 · RULINGS JX1 / JX2 / JX3 (c) — a department lane. The department seed (`javis_dept_schedule.py`) removes the
+    /// owner-scope jobs ON PURPOSE, two built-ins without `base_only` among them. The tick never brings those back (they
+    /// stay away until a restart, as at v0.14.56 — JX2), writes nothing to the seed's complete result, and when a writer
+    /// removed the repair job too it restores THAT job only. The seed's own list is read from the script: it holds the
+    /// two ids and not the repair job (the repair job runs in a department — JX3 (c)).
+    #[test]
+    fn ws1_a_department_seeded_file_never_gets_the_owner_scope_jobs_back() {
+        let seed = include_str!("../../../cysjavis-pack/bin/javis_dept_schedule.py");
+        let a = seed.find("OWNER_SCOPE = frozenset({").expect("the seed's owner-scope list");
+        let scope = &seed[a..a + seed[a..].find("})").expect("its end")];
+        let dropped: Vec<String> = builtin_jobs()
+            .iter()
+            .filter_map(|j| j["id"].as_str())
+            .filter(|id| scope.contains(&format!("\"{id}\"")))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(dropped, vec!["learn-ttl-audit".to_string(), "fleet-digest".to_string()], "the built-ins the seed removes on purpose");
+        assert!(!scope.contains(REPAIR_JOB_ID), "the seed keeps the repair job in a department");
+        // the seed's result in a department lane: the boot's set minus the owner-scope ids, with the seed's `_doc`
+        let mut jobs = Vec::new();
+        apply_builtin_jobs(&mut jobs);
+        jobs.retain(|j| !dropped.iter().any(|d| j["id"] == d.as_str()));
+        let doc = "부서 데몬 schedule — owner/CEO 스코프 잡만 제외.";
+        let dir = ws1_dir("dept");
+        let path = dir.join("schedule.json");
+        ws1_replace(&path, &json!({"_doc": doc, "jobs": jobs}));
+        let seeded = ws1_stamp(&path);
+        for tick in 1..=3 {
+            let run = load_jobs_at(&path, LoadMode::HotReload);
+            assert!(run.iter().all(|j| !dropped.contains(&j.id)), "tick {tick} brought an owner-scope job back");
+            assert!(ws1_stamp(&path) == seeded, "tick {tick} wrote the seed's complete result");
+        }
+        // a writer removed the repair job too: the tick restores that job and nothing else
+        let without: Vec<serde_json::Value> = jobs.iter().filter(|j| j["id"] != REPAIR_JOB_ID).cloned().collect();
+        ws1_replace(&path, &json!({"_doc": doc, "jobs": without}));
+        let run = load_jobs_at(&path, LoadMode::HotReload);
+        assert!(run.iter().any(|j| j.id == REPAIR_JOB_ID), "the repair job is not back in the department lane");
+        assert!(run.iter().all(|j| !dropped.contains(&j.id)), "an owner-scope job came back with it");
+        let after = ws1_doc(&path);
+        let others: Vec<serde_json::Value> =
+            after["jobs"].as_array().unwrap().iter().filter(|j| j["id"] != REPAIR_JOB_ID).cloned().collect();
+        assert_eq!(others, without, "every other job untouched, in order");
+        assert_eq!(after["_doc"], json!(doc), "the seed's other key kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS1 · RULINGS JX1 / JX2 — what the tick does NOT do: a user's job that another writer removed is not invented; an
+    /// ordinary built-in that was removed (`cys schedule remove phoenix-drill-weekly`) stays away until a restart, as at
+    /// v0.14.56; and on a complete file the tick's added work is one comparison: one read, no write.
+    #[test]
+    fn ws1_the_tick_restores_nothing_else_and_writes_nothing_on_a_complete_file() {
+        let dir = ws1_dir("complete");
+        let path = dir.join("schedule.json");
+        let mut jobs = ws1_released();
+        apply_builtin_jobs(&mut jobs); // + the repair job: a 0.15.0 lane's complete file
+        ws1_replace(&path, &json!({"jobs": jobs.clone()}));
+        let complete = ws1_stamp(&path);
+        let reads = std::cell::Cell::new(0usize);
+        let counting = |p: &std::path::Path| {
+            reads.set(reads.get() + 1);
+            std::fs::read(p)
+        };
+        for tick in 1..=3 {
+            reads.set(0);
+            let run = load_jobs_at_access(&path, LoadMode::HotReload, &counting, &ScheduleFileLock::acquire);
+            assert_eq!(run.len(), jobs.len(), "tick {tick}: every job loaded");
+            assert_eq!(reads.get(), 1, "tick {tick}: one read");
+            assert!(ws1_stamp(&path) == complete, "tick {tick}: a write on a complete file");
+        }
+        let trimmed: Vec<serde_json::Value> =
+            jobs.iter().filter(|j| j["id"] != "user-custom-job" && j["id"] != "phoenix-drill-weekly").cloned().collect();
+        ws1_replace(&path, &json!({"jobs": trimmed}));
+        let removed = ws1_stamp(&path);
+        for tick in 1..=3 {
+            let run = load_jobs_at(&path, LoadMode::HotReload);
+            assert!(run.iter().all(|j| j.id != "user-custom-job" && j.id != "phoenix-drill-weekly"), "tick {tick} brought a removed job back");
+            assert!(ws1_stamp(&path) == removed, "tick {tick} wrote");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS1 · RULINGS JX1 — a job the tick re-registers fires neither at once nor twice because it was re-registered: it
+    /// keeps its id and its code definition (every 2 minutes), and the scheduler's interval rule reads the time recorded
+    /// under that id (`schedule_state.json` and the in-memory record, which the loader does not touch). Fired 60 s
+    /// before it went missing: not due at the restoring tick; due 2 minutes after that fire; right after a fire, not due.
+    #[test]
+    fn ws1_a_restored_job_keeps_its_firing_time() {
+        let dir = ws1_dir("fire");
+        let path = dir.join("schedule.json");
+        ws1_replace(&path, &json!({"jobs": ws1_released()}));
+        let run = load_jobs_at(&path, LoadMode::HotReload);
+        let job = run.iter().find(|j| j.id == REPAIR_JOB_ID).expect("the tick did not bring the repair job back");
+        assert_eq!(job.every_minutes, Some(2));
+        let fired = 1_000_000_i64;
+        assert!(!interval_due(job.every_minutes, fired, fired + 60), "due at once because it was re-registered");
+        assert!(interval_due(job.every_minutes, fired, fired + 120), "not due at its interval");
+        assert!(!interval_due(job.every_minutes, fired + 120, fired + 121), "due twice");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS1 · RULINGS KN1 — "fixed" is a property of the job's ID in ONE definition, never a field the file carries: the
+    /// boot writes no `_builtin_fixed` into the file; the repair job's stored entry without the marker, with `false`, with
+    /// a forged value or with `true` (a preview build's form) is put back WHOLE all the same, and the file is left without
+    /// the marker; an ordinary user job that carries `"_builtin_fixed": true` is left as it is, and once another writer
+    /// removed it, it is never restored.
+    #[test]
+    fn ws1_fixedness_is_the_jobs_id_never_a_marker_in_the_file() {
+        let dir = ws1_dir("marker");
+        let path = dir.join("schedule.json");
+        ensure_builtin_jobs_at(&path); // the boot on a fresh lane
+        let booted = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        assert!(booted.contains(REPAIR_JOB_ID), "the boot registered the job");
+        assert!(!booted.contains("_builtin_fixed"), "the boot wrote a fixedness marker into the file");
+        let variants: [(&str, Option<serde_json::Value>); 4] =
+            [("no marker", None), ("false", Some(json!(false))), ("forged", Some(json!("yes"))), ("a preview build's true", Some(json!(true)))];
+        for (variant, marker) in variants {
+            let mut entry = def();
+            if let Some(o) = entry.as_object_mut() {
+                o.remove("_builtin_fixed");
+                if let Some(m) = &marker {
+                    o.insert("_builtin_fixed".into(), m.clone());
+                }
+            }
+            let mut jobs = ws1_released();
+            jobs.push(entry);
+            ws1_replace(&path, &json!({"jobs": jobs}));
+            let run = load_jobs_at(&path, LoadMode::HotReload);
+            assert_eq!(run.iter().filter(|j| j.id == REPAIR_JOB_ID).count(), 1, "{variant}: the tick runs the job");
+            let after = ws1_jobs(&path);
+            let mine: Vec<&serde_json::Value> = after.iter().filter(|j| j["id"] == REPAIR_JOB_ID).collect();
+            assert_eq!(mine, vec![&def()], "{variant}: put back whole");
+            assert!(mine[0].get("_builtin_fixed").is_none(), "{variant}: the file still carries a fixedness marker");
+        }
+        // an ordinary user job that carries the marker: left as it is; removed by another writer: never restored
+        let marked = json!({"id": "user-marked", "every_minutes": 15, "action": "push", "to": "master", "text": "x", "_builtin_fixed": true});
+        let mut jobs = ws1_released();
+        jobs.push(def());
+        jobs.push(marked.clone());
+        ws1_replace(&path, &json!({"jobs": jobs.clone()}));
+        let kept = ws1_stamp(&path);
+        load_jobs_at(&path, LoadMode::HotReload);
+        assert!(ws1_stamp(&path) == kept, "a user's job that carries the marker was rewritten");
+        jobs.retain(|j| j["id"] != "user-marked");
+        ws1_replace(&path, &json!({"jobs": jobs}));
+        for tick in 1..=2 {
+            let run = load_jobs_at(&path, LoadMode::HotReload);
+            assert!(run.iter().all(|j| j.id != "user-marked"), "tick {tick} restored a user's job because it carried the marker");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS1 · RULINGS KN2 (whole-diff WS1-r1 M1) — the restore's own write never eats a lock-less writer's save. The tick
+    /// reads a valid file that lacks the repair job; before it writes, the preflight's C16 (no lock) saves the file with
+    /// its report job added. The tick re-reads under its lock, finds other bytes and writes NOTHING in this tick; the next
+    /// tick decides anew and puts the repair job back INTO the file that holds C16's job.
+    #[test]
+    fn ws1_a_lockless_save_between_the_ticks_read_and_its_write_is_kept() {
+        let dir = ws1_dir("cas");
+        let path = dir.join("schedule.json");
+        ws1_replace(&path, &json!({"jobs": ws1_released()}));
+        let c16_job = json!({
+            "id": "owner-progress-gate-5min", "every_minutes": 5, "action": "command",
+            "command": "python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py\" run", "if_absent": "skip"
+        });
+        let reads = std::cell::Cell::new(0usize);
+        // the tick's first read gets the bytes it sees; right after it, C16 saves its own read + its job (no lock)
+        let racing = |p: &std::path::Path| {
+            reads.set(reads.get() + 1);
+            let seen = std::fs::read(p);
+            if reads.get() == 1 {
+                let mut doc: serde_json::Value = serde_json::from_slice(seen.as_ref().unwrap()).unwrap();
+                doc["jobs"].as_array_mut().unwrap().push(c16_job.clone());
+                ws1_replace(p, &doc);
+            }
+            seen
+        };
+        let _ = load_jobs_at_access(&path, LoadMode::HotReload, &racing, &ScheduleFileLock::acquire);
+        let saved = ws1_jobs(&path);
+        assert!(saved.iter().any(|j| j == &c16_job), "the tick's write ate C16's saved job");
+        assert!(!saved.iter().any(|j| j["id"] == REPAIR_JOB_ID), "the tick wrote in the tick another writer saved in");
+        // the next tick decides anew from the new content
+        let run = load_jobs_at(&path, LoadMode::HotReload);
+        assert!(run.iter().any(|j| j.id == REPAIR_JOB_ID), "the next tick did not bring the repair job back");
+        let after = ws1_jobs(&path);
+        let others: Vec<serde_json::Value> = after.iter().filter(|j| j["id"] != REPAIR_JOB_ID).cloned().collect();
+        assert_eq!(others, saved, "C16's file kept whole, in order");
+        let mine: Vec<&serde_json::Value> = after.iter().filter(|j| j["id"] == REPAIR_JOB_ID).collect();
+        assert_eq!(mine, vec![&def()], "the repair job back whole, once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The owned child of `ws1_a_failing_restore_write_is_reported_when_it_starts_and_when_it_heals`: three ticks whose
+    /// restore write fails (the folder refuses new files while the tick holds the lock), then two ordinary ticks.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "owned subprocess fixture, run by ws1_a_failing_restore_write_is_reported_when_it_starts_and_when_it_heals"]
+    fn ws1_fixture_failing_restore_ticks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = PathBuf::from(std::env::var_os("WS1_FIXTURE_DIR").expect("the fixture's folder"));
+        let path = dir.join("schedule.json");
+        let refusing = |p: &std::path::Path| {
+            let lock = ScheduleFileLock::acquire(p);
+            std::fs::set_permissions(p.parent().unwrap(), std::fs::Permissions::from_mode(0o555)).unwrap();
+            lock
+        };
+        for _ in 0..3 {
+            let _ = load_jobs_at_access(&path, LoadMode::HotReload, &|p| std::fs::read(p), &refusing);
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir(ScheduleFileLock::lock_dir_for(&path));
+        }
+        for _ in 0..2 {
+            let _ = load_jobs_at(&path, LoadMode::HotReload);
+        }
+        println!("WS1_FIXTURE_DONE");
+    }
+
+    /// WS1 · KN minor (b) — a restore whose write keeps failing is reported when the failure starts (and when its reason
+    /// changes), not at every tick, and once when it heals. The report state is process-wide, so the ticks run in an owned
+    /// child process of this test binary and its output is counted.
+    #[cfg(unix)]
+    #[test]
+    fn ws1_a_failing_restore_write_is_reported_when_it_starts_and_when_it_heals() {
+        let dir = ws1_dir("report");
+        let path = dir.join("schedule.json");
+        ws1_replace(&path, &json!({"jobs": ws1_released()}));
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "schedule::repair_job_schedule_tests::ws1_fixture_failing_restore_ticks",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("WS1_FIXTURE_DIR", &dir)
+            .output()
+            .unwrap();
+        let log = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && log.contains("WS1_FIXTURE_DONE"), "the fixture did not run to its end: {log}");
+        assert_eq!(log.matches("operation=restore_fixed").count(), 1, "reported at every failing tick, not when the failure started: {log}");
+        assert_eq!(log.matches("restore_fixed 정상화").count(), 1, "the heal is not reported once: {log}");
+        let mine: Vec<serde_json::Value> = ws1_jobs(&path).into_iter().filter(|j| j["id"] == REPAIR_JOB_ID).collect();
+        assert_eq!(mine, vec![def()], "the job is back after the heal");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
