@@ -646,16 +646,18 @@ pub fn write_record_in(root: &Path, rec: &RepairRecord) -> Result<(), RepairErro
     crate::atomic_write_json(&p, &r).map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))
 }
 
-/// [`write_record_in`] made durable (E1: the file and its directory fully flushed) — used where a
-/// later step must never run ahead of the record (commit before the hook step, RULINGS Y1).
+/// [`write_record_in`]'s bytes made durable BEFORE they are published (E1) — used where a later step
+/// must never run ahead of the record (commit before the hook step, RULINGS Y1). WY2 FR1 (RULINGS
+/// LH15): through the ledger's own durable writer [`super::durable::write_json_durable`] — the same
+/// bytes as `atomic_write_json`, a new temporary sibling, the full flush on the handle that WROTE it,
+/// the rename, the directory flush; every error is returned, and a failed flush leaves the OLD record
+/// in place (the caller's state is untouched: the commit stays 진행 중 with its lock). Before FR1 the
+/// record was renamed into place first and re-opened for the flush afterwards.
 pub fn write_record_durable_in(root: &Path, rec: &RepairRecord) -> Result<(), RepairError> {
-    write_record_in(root, rec)?;
     let p = record_path_in(root, &rec.id);
-    // WY2: a handle the flush accepts on every platform (unix: the same `File::open`)
-    let f = super::durable::open_for_flush(&p)
-        .map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
-    full_flush_file(&f).map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
-    full_flush_dir(&repair_dir_in(root, &rec.id))
+    let mut r = rec.clone();
+    r.schema = super::REPAIR_SCHEMA;
+    super::durable::write_json_durable(&p, &r)
 }
 
 /// Reads one lane row (`None` = the lane has no row for this repair — counts as 대기, K1).

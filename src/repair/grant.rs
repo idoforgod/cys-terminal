@@ -146,19 +146,16 @@ pub fn read_decision_in(root: &Path) -> Result<Option<GrantDecision>, RepairErro
     }
 }
 
-/// Writes `grant.json` by atomic replace (tmp + rename) and flushes it (E1); the latest decision
-/// wins (B1). Written only by the daemon of the lane where the owner answered.
+/// Writes `grant.json` durably (E1); the latest decision wins (B1). Written only by the daemon of the
+/// lane where the owner answered. WY2 FR1 (RULINGS LH15): through the ledger's own durable writer
+/// [`super::durable::write_json_durable`] — nothing is published before it is flushed and every error
+/// is returned (a failed flush leaves the previous decision). Before FR1 the file was replaced first and
+/// the results of its re-open and flush were ignored.
 pub fn write_decision_in(root: &Path, d: &GrantDecision) -> Result<(), RepairError> {
     let p = grant_path_in(root);
     let mut d = d.clone();
     d.schema = super::REPAIR_SCHEMA;
-    crate::atomic_write_json(&p, &d).map_err(|e| io_err(&p, e))?;
-    // WY2: a handle the flush accepts on every platform (unix: the same `File::open`)
-    if let Ok(f) = super::durable::open_for_flush(&p) {
-        let _ = ledger::full_flush_file(&f);
-    }
-    let _ = ledger::full_flush_dir(root);
-    Ok(())
+    super::durable::write_json_durable(&p, &d)
 }
 
 /// Whether a decision lets autonomous repairs start at all (absent / unreadable / off = no).
