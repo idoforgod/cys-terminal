@@ -9283,8 +9283,12 @@ function fieldsModal(title: string, label: string, fields: any[]): Promise<strin
 function purgeConfirmModal(
   name: string,
   info: { sizeHuman: string; mtime: string; isLast: boolean; exists: boolean },
+  cardName = "",
 ): Promise<boolean> {
   return new Promise((resolve) => {
+    // ★S1 M4(RULING-S1-PRODUCT-04): 카드 이름(주인이 고쳐 사이드바에서 보는 이름)이 등록 이름(name)과 다르면 창은 부서를 카드
+    //   이름으로 먼저 부르고 등록 이름을 그 옆에 둔다 — 같으면 종전처럼 한 번. 입력할 이름·판정·지우는 대상은 그대로 name 이다.
+    const other = cardName !== "" && cardName !== name;
     const ov = document.createElement("div");
     ov.className = "modal-overlay";
     const notice = [
@@ -9296,7 +9300,9 @@ function purgeConfirmModal(
       "삭제되는 것: 부서 데몬 종료 + 대화기억·pack 격리 + 재시작 부활 영구 차단(묘비 존치). 작업 폴더(cwd)는 보존됩니다.",
       info.isLast ? "⚠ 이 부서가 마지막입니다 — 삭제 시 CEO가 표준 master로 강등됩니다." : "",
       "복구: 즉시 삭제가 아니라 ~/.local/state/cys-trash/ 로 격리 보관되어 되돌릴 수 있습니다. " + TRASH_KEEP_NOTICE,
-      `계속하려면 아래에 부서명 "${name}" 을 정확히 입력하세요.`,
+      other
+        ? `계속하려면 아래에 카드 "${cardName}" 의 등록 이름 "${name}" 을 정확히 입력하세요(카드 이름이 아니라 등록 이름입니다).`
+        : `계속하려면 아래에 부서명 "${name}" 을 정확히 입력하세요.`,
     ]
       .filter(Boolean)
       .join("\n\n");
@@ -9306,7 +9312,9 @@ function purgeConfirmModal(
       `<div class="modal-hint" aria-live="polite"></div>` +
       `<div class="modal-btns"><button class="modal-no">취소</button>` +
       `<button class="modal-yes" disabled>완전 삭제</button></div></div>`;
-    (ov.querySelector("h3") as HTMLElement).textContent = `부서 "${name}" 완전 삭제(부활 차단)`;
+    (ov.querySelector("h3") as HTMLElement).textContent = other
+      ? `부서 "${cardName}" (등록 이름 "${name}") 완전 삭제(부활 차단)`
+      : `부서 "${name}" 완전 삭제(부활 차단)`;
     (ov.querySelector(".modal-label") as HTMLElement).textContent = notice;
     const inp = ov.querySelector(".modal-input") as HTMLInputElement;
     const yes = ov.querySelector(".modal-yes") as HTMLButtonElement;
@@ -9378,12 +9386,13 @@ async function purgeDept(ws: Workspace) {
           ? (bytes / 1e3).toFixed(1) + " KB"
           : bytes + " B";
   const mtime = info.mtime_secs ? new Date(info.mtime_secs * 1000).toLocaleString() : "?";
+  // ★S1 M4: 셋째 인자 = 카드 이름(창이 부르는 이름일 뿐) — 입력할 이름(nm)과 지우는 대상(socket)은 그대로다.
   const ok = await purgeConfirmModal(nm, {
     sizeHuman,
     mtime,
     isLast: !!info.is_last,
     exists: !!info.exists,
-  });
+  }, ws.name);
   if (!ok) return;
   // ★[F3-R TOCTOU] 진입 가드는 모달 '전'이라, 부서명 타이핑 모달이 열려 있던 수초간 checkVersionSkew
   // 타이머/수동 restart가 rotatingDaemon을 잡았을 수 있다. 모달 확인 직후·집행 직전에 재확인한다.
