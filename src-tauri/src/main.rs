@@ -11014,6 +11014,28 @@ exit 0
         );
     }
 
+    /// ★S1 버그2(오너 2026-11-22 「"개발자 도구 없이 동작 중입니다" 안내가 사라져야 한다」) — 안내의 '있음'은
+    /// CLT 에 있거나 **좌석이 받는 대역이 내주는 것**이다(lib `seat_tool_present` 한 판정). 대역을 받는 맥의 좌석에서는
+    /// python3·git 이 앱에 든 것으로 풀리고 설치 창이 뜨지 않으므로, 종전 안내("설치 창이 뜰 수 있습니다")는 거짓이 된다.
+    /// 이 핀은 setup 의 안내 판정이 CLT 만 세는 종전 호출로 되돌아가면 붉다(소스 대조 — 판정의 동작은 lib 시험이 잰다).
+    #[test]
+    fn devtools_notice_counts_the_standin_as_present() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let i = prod.find("fn maybe_push_devtools_notice(").expect("maybe_push_devtools_notice 소실");
+        let body = &prod[i..prod[i..].find("\n}\n").map(|e| i + e).expect("함수 끝 소실")];
+        for tool in ["python3", "git"] {
+            assert!(
+                body.contains(&format!("cys::macos_devtools::seat_tool_present(&exe_dir, \"{tool}\")")),
+                "안내 판정이 {tool} 을 좌석 기준(CLT 또는 대역)으로 세지 않는다 — 대역이 도는 맥에도 안내가 뜬다"
+            );
+        }
+        assert!(
+            !body.contains("cys::macos_devtools::clt_tool_present("),
+            "안내 판정이 CLT 만 세는 종전 호출을 아직 쓴다"
+        );
+    }
+
     /// ★U15 안내 판정 진리표 — macOS ∧ 이 버전 미고지 ∧ 도구 결손일 때만 · 문구는 lib 정본 그대로.
     #[test]
     fn devtools_notice_due_truth_table() {

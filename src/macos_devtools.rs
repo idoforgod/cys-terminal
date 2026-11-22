@@ -778,4 +778,335 @@ mod tests {
             "cys-dept 가 마커를 정확 일치({want})로 비교하지 않는다 — Rust 마커와 셸 소비자가 갈린다"
         );
     }
+
+    // ────────────────────────────────────────────────────────────────────────────────────────
+    // ★S1 버그2(오너 2026-11-22 「모든 좌석에서 python3·git·node 가 앱에 든 것으로 · 설치 창 0」)
+    //
+    // 개발자 도구 없는 맥에서 좌석 env 에 `DEVELOPER_DIR=<runtime>/devtools`(⑧)를 싣는다. 애플 셔임
+    // (/usr/bin/python3·git 등 78개 이름)은 그 값을 가장 먼저 보고 `<DEVELOPER_DIR>/usr/bin/xcrun <도구> …`
+    // 를 대신 실행하므로(macOS 27.2 실측), 좌석 안의 어떤 하위 셸에서든 python3·git 이 앱에 든 것으로 풀린다.
+    // 이 구획의 시험들(RED 커밋에 실린 것)은 **이 변경 전의 코드로도 컴파일되고**, 대역이 없다는 그 이유로 붉었다.
+    // 그 아래 `inject_developer_dir_contract` 부터는 새 함수들의 단위 시험이라 GREEN 커밋에서 함께 들어왔다.
+    // ────────────────────────────────────────────────────────────────────────────────────────
+
+    /// 추적되는 대역 원본의 자리(레포 체크아웃 — 파일 부재는 실패다).
+    fn standin_source(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts").join("mac-devtools").join(name)
+    }
+
+    fn write_exec(p: &Path, body: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// 가짜 mac 번들: `<base>/Contents/MacOS`(exe_dir) + `<base>/Contents/Resources/runtime` 에
+    /// 가짜 python3(받은 인자를 찍는다) · 가짜 git(GIT_* env 와 인자를 찍는다) · 대역 둘(레포 원본의 사본).
+    /// `real_standin` 이 거짓이면 대역 자리에 내용 없는 실행 파일만 둔다(배선 시험 — 대역 원본과 무관하게 잰다).
+    /// 돌려주는 것: (exe_dir, runtime).
+    fn fake_bundle(tag: &str, real_standin: bool) -> (PathBuf, PathBuf) {
+        let base = scratch(tag);
+        let exe_dir = base.join("Contents").join("MacOS");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let rt = base.join("Contents").join("Resources").join("runtime");
+        // 받은 인자를 하나씩 `<…>` 로 감싸 찍는다 — 인자의 경계(공백·빈 인자)가 사라지면 드러난다.
+        write_exec(
+            &rt.join("python").join("bin").join("python3"),
+            "#!/bin/sh\nprintf 'FAKE-PY'; for a in \"$@\"; do printf ' <%s>' \"$a\"; done; echo\n",
+        );
+        write_exec(
+            &rt.join("git").join("bin").join("git"),
+            "#!/bin/sh\nprintf 'FAKE-GIT'; for a in \"$@\"; do printf ' <%s>' \"$a\"; done; \
+             echo \" exec=${GIT_EXEC_PATH-unset} tmpl=${GIT_TEMPLATE_DIR-unset} sys=${GIT_CONFIG_SYSTEM-unset}\"\n",
+        );
+        std::fs::create_dir_all(rt.join("git").join("libexec").join("git-core")).unwrap();
+        std::fs::create_dir_all(rt.join("git").join("share").join("git-core").join("templates")).unwrap();
+        std::fs::create_dir_all(rt.join("git").join("etc")).unwrap();
+        std::fs::write(rt.join("git").join("etc").join("gitconfig"), "[core]\n").unwrap();
+        for (src, dst) in [
+            ("xcrun", rt.join("devtools").join("usr").join("bin").join("xcrun")),
+            ("git", rt.join("devtools").join("bin").join("git")),
+        ] {
+            let body = if real_standin {
+                std::fs::read_to_string(standin_source(src))
+                    .unwrap_or_else(|e| panic!("대역 원본 scripts/mac-devtools/{src} 를 읽지 못했다: {e}"))
+            } else {
+                "#!/bin/sh\nexit 0\n".to_string()
+            };
+            write_exec(&dst, &body);
+        }
+        (exe_dir, rt)
+    }
+
+    fn dev_dir_pairs(pairs: &[(String, String)]) -> Vec<(String, String)> {
+        pairs.iter().filter(|(k, _)| k == ENV_DEVELOPER_DIR).cloned().collect()
+    }
+
+    /// 이 프로세스가 이미 `DEVELOPER_DIR` 를 갖고 있나(사용자 설정 · 또는 대역을 받은 cys 좌석 안에서 도는 시험).
+    fn process_has_developer_dir() -> bool {
+        std::env::var_os(ENV_DEVELOPER_DIR).map(|v| !v.is_empty()).unwrap_or(false)
+    }
+
+    /// ★⑧ 배선(호스트 무관) — CLT 부재 판정(Some) ∧ 대역 실재일 때만 `DEVELOPER_DIR=<runtime>/devtools` 한 쌍.
+    /// 판정이 None(= CLT 있는 맥·윈도우·리눅스·롤백)이면 대역이 있어도 싣지 않는다(종전과 바이트 동일).
+    #[test]
+    fn spawn_env_pairs_with_wires_eighth_pair_developer_dir() {
+        let (exe_dir, rt) = fake_bundle("devdir-wire", false);
+        let py = rt.join("python").join("bin").join("python3");
+        let on = crate::spawn_env_pairs_with(&exe_dir, "/usr/bin:/bin", Some("/Users/user"), None, Some(py.as_path()), false);
+        if process_has_developer_dir() {
+            // 사용자(또는 바깥 좌석)가 이미 정한 값은 덮지 않는다 — 자식은 그 값을 그대로 상속한다.
+            assert!(dev_dir_pairs(&on).is_empty(), "프로세스에 DEVELOPER_DIR 가 있는데 ⑧ 이 덮었다: {on:?}");
+        } else {
+            assert_eq!(
+                dev_dir_pairs(&on),
+                vec![(ENV_DEVELOPER_DIR.to_string(), rt.join("devtools").to_string_lossy().into_owned())],
+                "CLT 부재 판정 + 대역 실재인데 좌석 env 에 DEVELOPER_DIR 가 실리지 않았다 — \
+                 이 좌석의 python3·git 은 애플 셔임(설치 창)으로 풀린다"
+            );
+        }
+        // 판정 None: 대역이 디스크에 있어도 0쌍(CLT 있는 맥은 한 바이트도 바뀌지 않는다).
+        let off = crate::spawn_env_pairs_with(&exe_dir, "/usr/bin:/bin", Some("/Users/user"), None, None, false);
+        assert!(dev_dir_pairs(&off).is_empty(), "판정이 None 인데 DEVELOPER_DIR 가 실렸다: {off:?}");
+        // 사용자 CYS_PY 는 ⑦ 만 끈다 — ⑧ 은 그와 독립이다(셔임은 CYS_PY 를 보지 않는다).
+        let user_py = crate::spawn_env_pairs_with(&exe_dir, "/usr/bin:/bin", Some("/Users/user"), None, Some(py.as_path()), true);
+        assert_eq!(dev_dir_pairs(&user_py).len(), dev_dir_pairs(&on).len(), "사용자 CYS_PY 가 ⑧ 까지 껐다");
+        std::fs::remove_dir_all(exe_dir.parent().unwrap().parent().unwrap()).ok();
+    }
+
+    /// ★⑧ 의 실재 게이트 — 대역 xcrun 이 없거나 실행 비트가 없으면 싣지 않는다. 그런 값을 실으면 셔임이
+    /// "invalid DEVELOPER_DIR path" 로 죽어, 대역 없는 번들(개발 빌드·손상)이 종전보다 나빠진다.
+    #[test]
+    fn eighth_pair_needs_an_executable_standin_xcrun() {
+        let (exe_dir, rt) = fake_bundle("devdir-gate", false);
+        let py = rt.join("python").join("bin").join("python3");
+        let xcrun = rt.join("devtools").join("usr").join("bin").join("xcrun");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&xcrun, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let noexec = crate::spawn_env_pairs_with(&exe_dir, "/usr/bin:/bin", Some("/Users/user"), None, Some(py.as_path()), false);
+            assert!(dev_dir_pairs(&noexec).is_empty(), "실행 비트 없는 xcrun 을 대역으로 실었다: {noexec:?}");
+        }
+        std::fs::remove_file(&xcrun).unwrap();
+        let gone = crate::spawn_env_pairs_with(&exe_dir, "/usr/bin:/bin", Some("/Users/user"), None, Some(py.as_path()), false);
+        assert!(dev_dir_pairs(&gone).is_empty(), "xcrun 이 없는 디렉터리를 DEVELOPER_DIR 로 실었다: {gone:?}");
+        // 대조군: 같은 번들에 xcrun 을 되돌리면 실린다(위 두 음성이 '어차피 안 실리는' 것이 아님을 못박는다).
+        write_exec(&xcrun, "#!/bin/sh\nexit 0\n");
+        let back = crate::spawn_env_pairs_with(&exe_dir, "/usr/bin:/bin", Some("/Users/user"), None, Some(py.as_path()), false);
+        assert_eq!(dev_dir_pairs(&back).len(), usize::from(!process_has_developer_dir()), "대조군: 대역을 되돌렸는데 실리지 않았다");
+        std::fs::remove_dir_all(exe_dir.parent().unwrap().parent().unwrap()).ok();
+    }
+
+    /// ★PATH 로 잡히는 git 도 런처다 — mac 의 동봉 bin 목록에서 `devtools/bin` 이 `git/bin` **앞**이다.
+    /// (동봉 git 은 맨몸으로 켜면 보조 프로그램을 `//libexec/git-core` 에서 찾아 https 원격이 전부 죽는다.)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn runtime_bin_dirs_lists_the_git_launcher_before_the_bare_git() {
+        let (exe_dir, rt) = fake_bundle("bindirs", false);
+        let dirs = crate::runtime_bin_dirs(&exe_dir);
+        let at = |d: PathBuf| dirs.iter().position(|x| *x == d);
+        let launcher = at(rt.join("devtools").join("bin"));
+        let bare = at(rt.join("git").join("bin"));
+        assert!(launcher.is_some(), "동봉 bin 목록에 devtools/bin(git 런처)이 없다: {dirs:?}");
+        assert!(launcher < bare, "git 런처가 맨몸 git 보다 뒤다 — PATH 의 git 이 https 를 못 한다: {dirs:?}");
+        assert_eq!(dirs.first(), Some(&rt.join("python").join("bin")), "python 이 선두가 아니다(기존 순서 보존)");
+        std::fs::remove_dir_all(exe_dir.parent().unwrap().parent().unwrap()).ok();
+    }
+
+    #[cfg(unix)]
+    fn sh_run(script: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+        let mut c = std::process::Command::new("/bin/sh");
+        c.arg(script).args(args).env_clear().env("PATH", "/usr/bin:/bin");
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let out = c.output().expect("/bin/sh 실행 실패");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        )
+    }
+
+    /// ★대역 xcrun 의 동작(POSIX sh 로 직접 실행 — 어느 unix 호스트에서나 같다).
+    #[cfg(unix)]
+    #[test]
+    fn standin_xcrun_runs_the_bundled_tools() {
+        let (exe_dir, rt) = fake_bundle("xcrun-run", true);
+        let xcrun = rt.join("devtools").join("usr").join("bin").join("xcrun");
+        let core = rt.join("git").join("libexec").join("git-core");
+        // 셔임이 부르는 모양 그대로: `xcrun <도구> <인자…>`
+        assert_eq!(sh_run(&xcrun, &["python3", "--version"], &[]), (0, "FAKE-PY <--version>".to_string(), String::new()));
+        // git 은 맨몸 git 이 아니라 **런처**를 거친다(GIT_EXEC_PATH 가 동봉 libexec 로 선다).
+        let (rc, out, _) = sh_run(&xcrun, &["git", "status"], &[]);
+        assert_eq!(rc, 0);
+        assert!(out.starts_with("FAKE-GIT <status> "), "git 이 동봉 git 으로 가지 않았다: {out}");
+        assert!(out.contains(&format!("exec={}", core.display())), "런처를 거치지 않았다(GIT_EXEC_PATH 미설정): {out}");
+        // `xcrun -f <도구>` = 그 도구의 경로 · `xcrun -r <도구>` = 실행
+        assert_eq!(
+            sh_run(&xcrun, &["-f", "python3"], &[]),
+            (0, rt.join("python").join("bin").join("python3").display().to_string(), String::new())
+        );
+        assert_eq!(sh_run(&xcrun, &["--find", "git"], &[]).1, rt.join("devtools").join("bin").join("git").display().to_string());
+        assert_eq!(sh_run(&xcrun, &["-r", "python3", "-c", "1"], &[]).1, "FAKE-PY <-c> <1>");
+        // 애플 xcrun 이 도구 이름 앞에 받는 옵션들 — 한 줄 대시 긴 꼴(-find · -run), 값이 딸린 것(-sdk <이름>), 값 없는 것(-n -v).
+        assert_eq!(
+            sh_run(&xcrun, &["-find", "python3"], &[]).1,
+            rt.join("python").join("bin").join("python3").display().to_string()
+        );
+        assert_eq!(sh_run(&xcrun, &["-sdk", "macosx", "python3", "-V"], &[]).1, "FAKE-PY <-V>");
+        assert_eq!(sh_run(&xcrun, &["-n", "-v", "-run", "python3", "a"], &[]).1, "FAKE-PY <a>");
+        // 인자의 경계가 그대로 전달된다 — 공백이 든 인자 · 빈 인자 · 따옴표.
+        assert_eq!(
+            sh_run(&xcrun, &["python3", "-c", "print('a b')", "", "x y"], &[]).1,
+            "FAKE-PY <-c> <print('a b')> <> <x y>"
+        );
+        std::fs::remove_dir_all(exe_dir.parent().unwrap().parent().unwrap()).ok();
+    }
+
+    /// ★대역이 내주지 않는 도구(make·cc …): 진짜 개발자 디렉터리가 없으면 한 문장 + 72 로 끝난다 —
+    /// **셔임을 다시 부르지 않는다**(부르면 그것이 설치 창이다). 후보 표를 없는 경로로 바꾼 사본으로 잰다.
+    #[cfg(unix)]
+    #[test]
+    fn standin_xcrun_never_calls_a_stub_when_no_developer_dir_exists() {
+        let (exe_dir, rt) = fake_bundle("xcrun-72", true);
+        let xcrun = rt.join("devtools").join("usr").join("bin").join("xcrun");
+        let body = std::fs::read_to_string(&xcrun).unwrap();
+        let line = format!("CYS_DEV_CANDIDATES=\"{}\"", DEV_DIR_CANDIDATES.join(" "));
+        assert_eq!(
+            body.matches(&line).count(),
+            1,
+            "대역 xcrun 의 후보 표 한 줄이 Rust 정본(DEV_DIR_CANDIDATES)과 다르다 — 셔임과 대역의 판정이 갈린다"
+        );
+        let none = body.replace(&line, "CYS_DEV_CANDIDATES=\"/nonexistent-s1-a /nonexistent-s1-b\"");
+        write_exec(&xcrun, &none);
+        for args in [vec!["make", "-v"], vec!["--show-sdk-path"], vec![], vec!["-f", "cc"], vec!["../python/bin/python3"]] {
+            let (rc, out, err) = sh_run(&xcrun, &args, &[("DEVELOPER_DIR", "/whatever")]);
+            assert_eq!(rc, 72, "개발자 디렉터리가 없는데 72 로 끝나지 않았다({args:?}): out={out} err={err}");
+            assert_eq!(out, "", "표준출력에 무언가를 냈다({args:?})");
+            assert!(err.contains("xcode-select --install"), "설치 방법을 말하지 않는다({args:?}): {err}");
+            assert_eq!(err.lines().count(), 1, "한 문장이 아니다({args:?}): {err}");
+        }
+        // 그 상태에서도 동봉 도구는 그대로 내준다.
+        assert_eq!(sh_run(&xcrun, &["python3", "-V"], &[]).1, "FAKE-PY <-V>");
+        std::fs::remove_dir_all(exe_dir.parent().unwrap().parent().unwrap()).ok();
+    }
+
+    /// ★git 런처: GIT_EXEC_PATH 는 **항상** 동봉 libexec(호출자가 무엇을 주었든 — 다른 git 의 보조 프로그램과
+    /// 섞이면 깨진다) · GIT_TEMPLATE_DIR 는 **설정돼 있지 않을 때만** 채운다(빈 값으로 끈 것도 사용자 값이다) ·
+    /// GIT_CONFIG_SYSTEM 은 **세우지 않는다**(앱 안의 파일을 시스템 설정으로 가리키면 `git config --system` 이 서명된
+    /// 번들에 쓴다 — 봉인 파손).
+    #[cfg(unix)]
+    #[test]
+    fn standin_git_launcher_sets_exec_path_and_keeps_user_values() {
+        let (exe_dir, rt) = fake_bundle("git-launcher", true);
+        let launcher = rt.join("devtools").join("bin").join("git");
+        let g = rt.join("git");
+        let (rc, out, err) = sh_run(&launcher, &["ls-remote", "https://example.invalid/x.git"], &[]);
+        assert_eq!((rc, err.as_str()), (0, ""));
+        assert_eq!(
+            out,
+            format!(
+                "FAKE-GIT <ls-remote> <https://example.invalid/x.git> exec={} tmpl={} sys=unset",
+                g.join("libexec").join("git-core").display(),
+                g.join("share").join("git-core").join("templates").display()
+            )
+        );
+        let (_, kept, _) = sh_run(
+            &launcher,
+            &["x"],
+            &[("GIT_EXEC_PATH", "/other/git-core"), ("GIT_TEMPLATE_DIR", "/mine/tmpl"), ("GIT_CONFIG_SYSTEM", "/mine/sys")],
+        );
+        assert_eq!(
+            kept,
+            format!("FAKE-GIT <x> exec={} tmpl=/mine/tmpl sys=/mine/sys", g.join("libexec").join("git-core").display())
+        );
+        let (_, off, _) = sh_run(&launcher, &["x"], &[("GIT_TEMPLATE_DIR", "")]);
+        assert_eq!(
+            off,
+            format!("FAKE-GIT <x> exec={} tmpl= sys=unset", g.join("libexec").join("git-core").display()),
+            "빈 값으로 꺼 둔 GIT_TEMPLATE_DIR 를 런처가 채웠다"
+        );
+        std::fs::remove_dir_all(exe_dir.parent().unwrap().parent().unwrap()).ok();
+    }
+
+    /// ★포장 — `scripts/install-mac-devtools.sh` 가 런타임 트리에 대역 둘과 pip 설정을 깔고, 대역 폴더에 남은 옛 파일은
+    /// 치운다. pip 설정(`<runtime>/python/pip.conf` = 동봉 python 전용 site 설정)은 `pip install` 이 앱 번들의
+    /// site-packages 가 아니라 사용자 폴더에 쓰게 한다 — 번들 안에 쓰면 서명 봉인이 깨진다(깨끗한 게스트 실측:
+    /// 설정 없이는 번들 안에, 설정이 있으면 `~/.local/lib/python3.12/site-packages` 에 설치됐다).
+    #[cfg(unix)]
+    #[test]
+    fn install_script_lays_the_standin_and_the_pip_config() {
+        let rt = scratch("install-script");
+        std::fs::create_dir_all(rt.join("python")).unwrap();
+        write_exec(&rt.join("devtools").join("bin").join("left-over-from-an-older-build"), "#!/bin/sh\n");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts").join("install-mac-devtools.sh");
+        let out = std::process::Command::new("/bin/bash").arg(&script).arg(&rt).output().expect("bash 실행 실패");
+        assert!(
+            out.status.success(),
+            "install-mac-devtools.sh 실패: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for (dst, src) in [
+            (rt.join("devtools").join("usr").join("bin").join("xcrun"), "xcrun"),
+            (rt.join("devtools").join("bin").join("git"), "git"),
+            (rt.join("python").join("pip.conf"), "pip.conf"),
+        ] {
+            assert_eq!(
+                std::fs::read(&dst).ok(),
+                std::fs::read(standin_source(src)).ok(),
+                "깔린 {} 이 원본과 다르거나 없다",
+                dst.display()
+            );
+        }
+        assert!(is_executable_file(&rt.join("devtools").join("usr").join("bin").join("xcrun")));
+        assert!(is_executable_file(&rt.join("devtools").join("bin").join("git")));
+        assert!(!rt.join("devtools").join("bin").join("left-over-from-an-older-build").exists(), "옛 판의 대역 파일이 남았다");
+        let conf = std::fs::read_to_string(rt.join("python").join("pip.conf")).unwrap();
+        let live: Vec<&str> = conf.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+        assert_eq!(live, vec!["[install]", "user = true"], "pip 설정의 유효한 줄이 「사용자 폴더에 설치」 하나가 아니다");
+        // 동봉 python 이 없는 트리(런타임 준비 전)는 거부한다 — 조용히 반쯤 깔지 않는다.
+        std::fs::remove_dir_all(rt.join("python")).unwrap();
+        let no_py = std::process::Command::new("/bin/bash").arg(&script).arg(&rt).output().expect("bash 실행 실패");
+        assert_eq!(no_py.status.code(), Some(1), "python 없는 런타임 트리를 거부하지 않았다");
+        std::fs::remove_dir_all(&rt).ok();
+    }
+
+    /// ★기전 실측(macOS 전용) — **진짜 애플 셔임**이 `DEVELOPER_DIR` 의 대역 xcrun 으로 넘긴다. macOS 가 이 동작을
+    /// 바꾸면 여기서 붉어진다. 진짜 개발자 디렉터리가 있는 맥에서만 돈다: 없는 맥에서 이 기전이 깨져 있으면 셔임이
+    /// 설치 창을 띄우므로, 시험이 창을 띄우는 일이 없게 한다(그 맥의 검증은 깨끗한 게스트 실측이 맡는다).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apple_stub_hands_over_to_the_standin_xcrun() {
+        if !DEV_DIR_CANDIDATES.iter().any(|c| Path::new(c).is_dir()) {
+            return;
+        }
+        let (exe_dir, rt) = fake_bundle("stub", true);
+        for (stub, args, want) in [
+            ("/usr/bin/python3", vec!["--version"], "FAKE-PY <--version>".to_string()),
+            ("/usr/bin/git", vec!["--version"], "FAKE-GIT <--version> ".to_string()),
+        ] {
+            let out = std::process::Command::new(stub)
+                .args(&args)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env(ENV_DEVELOPER_DIR, rt.join("devtools"))
+                .output()
+                .expect("셔임 실행 실패");
+            let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            assert!(
+                out.status.success() && got.starts_with(want.trim_end()),
+                "{stub} 이 대역으로 넘기지 않았다: rc={:?} out={got} err={}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::fs::remove_dir_all(exe_dir.parent().unwrap().parent().unwrap()).ok();
+    }
 }
