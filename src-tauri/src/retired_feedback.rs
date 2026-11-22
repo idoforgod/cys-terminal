@@ -770,12 +770,14 @@ mod tests {
     fn retired_feedback_record_is_written_only_into_the_log_itself() {
         use std::os::unix::fs::MetadataExt as _;
         let mut bad: Vec<String> = Vec::new();
-        for shape in ["regular", "link-to-file", "link-dangling", "link-to-dir", "hard-link"] {
+        for shape in ["regular", "regular-fresh", "link-to-file", "link-dangling", "link-to-dir", "hard-link"] {
             let (root, home, outside) = s1_fix2_m1_fixture(&format!("m1-{shape}"));
             let log = s1_fix2_log(&home);
             let notes_file = outside.join("unrelated-notes.txt");
             match shape {
                 "regular" => std::fs::write(&log, "EARLIER LINE\n").unwrap(),
+                // 첫 실행: 기록 파일도 `state/` 폴더도 아직 없다 — 둘 다 만들어지고 줄이 남는다
+                "regular-fresh" => std::fs::remove_dir(home.join(".cys/state")).unwrap(),
                 "link-to-file" => {
                     std::fs::write(&notes_file, "ORIGINAL NOTES\n").unwrap();
                     std::os::unix::fs::symlink(&notes_file, &log).unwrap();
@@ -813,9 +815,10 @@ mod tests {
                 env!("CARGO_PKG_VERSION"),
                 home.join(".cys/feedback").display()
             );
-            if shape == "regular" {
+            if shape.starts_with("regular") {
                 let text = std::fs::read_to_string(&log).unwrap_or_default();
-                if text != format!("EARLIER LINE\n{line}") {
+                let earlier = if shape == "regular" { "EARLIER LINE\n" } else { "" };
+                if text != format!("{earlier}{line}") {
                     bad.push(format!("{shape}: 평범한 기록 파일에 덧붙지 않았다: {text:?}"));
                 }
                 if !refusals.is_empty() {
@@ -851,49 +854,65 @@ mod tests {
         );
     }
 
-    /// ★기록 파일 자리에 파이프(FIFO)가 놓여 있어도 그 앞에서 **멈춰 서지 않는다**(읽는 쪽이 없는 파이프를 쓰려고 열면
-    /// 열기가 끝없이 기다린다 — 부트 태스크가 거기서 서면 앱이 뜨지 않는다). 파이프에는 쓰지 않고, 거부를 알리고, 삭제는
-    /// 그대로다. 멈춤은 다른 스레드에서 돌리고 시한으로 잰다.
+    /// ★기록 파일 자리에 파이프(FIFO)가 놓여 있어도 그 앞에서 **멈춰 서지 않고**, 파이프에 **쓰지 않는다**.
+    /// 읽는 쪽이 없는 파이프: 쓰려고 열면 열기가 끝없이 기다린다 — 부트 태스크가 거기서 서면 앱이 뜨지 않는다.
+    /// 읽는 쪽이 있는 파이프: 열기는 곧바로 되므로, 「연 것이 일반 파일인가」 확인만이 기록 줄과 파이프 사이에 서 있다.
+    /// 어느 쪽이든 거부를 알리고, 삭제는 그대로다. 멈춤은 다른 스레드에서 돌리고 시한으로 잰다.
     #[cfg(unix)]
     #[test]
     fn retired_feedback_record_never_waits_on_a_pipe_at_the_log_path() {
+        use std::io::Read as _;
         use std::os::unix::ffi::OsStrExt as _;
         use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
-        let (root, home, _outside) = s1_fix2_m1_fixture("m1-fifo");
-        let log = s1_fix2_log(&home);
-        let c_log = std::ffi::CString::new(log.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c_log.as_ptr(), 0o600) }, 0, "파이프를 만들지 못했다");
-        let (tx, rx) = std::sync::mpsc::channel();
-        let home_for_worker = home.clone();
-        let worker = std::thread::spawn(move || {
-            let mut notes: Vec<String> = Vec::new();
-            let out = remove_retired_feedback_dir_noting(&home_for_worker, 1795344000, &mut |m: &str| {
-                notes.push(m.to_string())
+        let mut bad: Vec<String> = Vec::new();
+        for with_reader in [false, true] {
+            let tag = if with_reader { "m1-fifo-reader" } else { "m1-fifo" };
+            let (root, home, _outside) = s1_fix2_m1_fixture(tag);
+            let log = s1_fix2_log(&home);
+            let c_log = std::ffi::CString::new(log.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c_log.as_ptr(), 0o600) }, 0, "파이프를 만들지 못했다");
+            let open_reader = || std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&log);
+            let mut reader = if with_reader { Some(open_reader().expect("읽는 쪽을 열지 못했다")) } else { None };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let home_for_worker = home.clone();
+            let worker = std::thread::spawn(move || {
+                let mut notes: Vec<String> = Vec::new();
+                let out = remove_retired_feedback_dir_noting(&home_for_worker, 1795344000, &mut |m: &str| {
+                    notes.push(m.to_string())
+                });
+                let _ = tx.send((out, notes));
             });
-            let _ = tx.send((out, notes));
-        });
-        let got = rx.recv_timeout(std::time::Duration::from_secs(20)); // wallclock: guard 멈춤 감시 — 정상 경로는 열기가 기다리지 않아 곧바로 돌아온다. 이 시한은 결함(끝없는 대기)일 때만 닿는다
-        let Ok((out, notes)) = got else {
-            // 멈춰 선 쓰는 쪽을 풀어 준다(읽는 쪽이 열리면 열기가 끝난다) — 테스트 프로세스에 선 스레드를 남기지 않는다.
-            let _reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&log);
+            let got = rx.recv_timeout(std::time::Duration::from_secs(20)); // wallclock: guard 멈춤 감시 — 정상 경로는 열기가 기다리지 않아 곧바로 돌아온다. 이 시한은 결함(끝없는 대기)일 때만 닿는다
+            if got.is_err() {
+                bad.push(format!("{tag}: 기록 파일 자리의 파이프 앞에서 멈춰 섰다(20초 안에 돌아오지 않았다)"));
+                // 멈춰 선 쓰는 쪽을 풀어 준다(읽는 쪽이 열리면 열기가 끝난다) — 테스트 프로세스에 선 스레드를 남기지 않는다.
+                if reader.is_none() {
+                    reader = open_reader().ok();
+                }
+            }
             let _ = worker.join();
+            if let Ok((out, notes)) = got {
+                if !matches!(out, RetiredFeedbackCleanup::Removed { files: 1, bytes: 1, link: false, .. }) {
+                    bad.push(format!("{tag}: 삭제 결과가 다르다: {out:?}"));
+                }
+                if notes.iter().filter(|n| n.contains("기록을 남기지 못했습니다")).count() != 1 {
+                    bad.push(format!("{tag}: 파이프에 대한 거부 알림이 한 줄이 아니다: {notes:?}"));
+                }
+            }
+            // 파이프로 들어간 바이트가 없다(읽는 쪽이 있을 때만 잴 수 있다)
+            if let Some(r) = reader.as_mut() {
+                let mut buf = [0u8; 512];
+                let n = r.read(&mut buf).unwrap_or(0);
+                if with_reader && n != 0 {
+                    bad.push(format!("{tag}: 파이프에 {n}바이트가 쓰였다"));
+                }
+            }
+            if !std::fs::symlink_metadata(&log).map(|m| m.file_type().is_fifo()).unwrap_or(false) {
+                bad.push(format!("{tag}: 기록 파일 자리의 파이프가 바뀌었다"));
+            }
+            drop(reader);
             let _ = std::fs::remove_dir_all(&root);
-            panic!("기록 파일 자리의 파이프 앞에서 멈춰 섰다(20초 안에 돌아오지 않았다)");
-        };
-        let _ = worker.join();
-        assert!(
-            matches!(out, RetiredFeedbackCleanup::Removed { files: 1, bytes: 1, link: false, .. }),
-            "삭제 결과가 다르다: {out:?}"
-        );
-        assert_eq!(
-            notes.iter().filter(|n| n.contains("기록을 남기지 못했습니다")).count(),
-            1,
-            "파이프에 대한 거부 알림이 한 줄이 아니다: {notes:?}"
-        );
-        assert!(
-            std::fs::symlink_metadata(&log).map(|m| m.file_type().is_fifo()).unwrap_or(false),
-            "기록 파일 자리의 파이프가 바뀌었다"
-        );
-        let _ = std::fs::remove_dir_all(&root);
+        }
+        assert!(bad.is_empty(), "기록 파일 자리의 파이프를 잘못 다뤘다:\n{}", bad.join("\n"));
     }
 }
