@@ -15616,9 +15616,40 @@ fn render_launch(cmd: &str, env: &[(String, String)]) -> (String, Vec<(String, S
         for (k, v) in env {
             s.push_str(&format!("{k}=\"{v}\" "));
         }
-        s.push_str(cmd);
+        s.push_str(&with_codex_seat_tool_vars(cmd));
         (s, Vec::new())
     }
+}
+
+/// ★S1 M2(3)(RULING-S1-PRODUCT-05 (3) · RULING-04 carry #2) codex 좌석이 좌석의 도구 변수를 잃지 않게 하는 변수들.
+/// codex 설정이 `[shell_environment_policy] inherit = "core"` 이면 codex 의 명령 셸에는 HOME LOGNAME PATH SHELL USER
+/// USERNAME TMPDIR TEMP TMP 만 간다 — 개발자 도구 없는 맥에서 /usr/bin/python3·git(애플 stub)은 DEVELOPER_DIR 없이
+/// 설치 창을 띄운다. 여기 있는 것은 `spawn_env_pairs` 가 좌석에 싣는 도구 쌍 중 "core" 가 떨구는 것이다(PATH·HOME 은
+/// 남는다 · npm_config_prefix 와 Windows 전용 쌍은 세 도구의 해석과 무관해 넣지 않는다).
+const CODEX_SEAT_TOOL_VARS: [&str; 5] =
+    ["DEVELOPER_DIR", "CYS_PY", "CYS_PY_ORIGIN", "PYTHONDONTWRITEBYTECODE", "PYTHONUTF8"];
+
+/// 실행할 바이너리가 codex 인 unix 실행 줄에, 바이너리 **바로 뒤**(하위 명령 `resume --last` 앞 · 최상위 플래그 자리)에
+/// 변수마다 `${N:+-c} ${N:+"shell_environment_policy.set.N='''$N'''"}` 를 끼운다. 값은 좌석 셸이 **자기 변수**를 전개해
+/// 채운다(데몬이 그 좌석에 실은 값 그대로) — 변수가 없거나 비었으면 두 단어가 모두 사라진다(개발자 도구 있는 맥에는
+/// DEVELOPER_DIR 플래그가 없다 · 빈 값을 싣지 않는다). TOML `'''…'''` 은 공백·작은따옴표·역슬래시·큰따옴표를 그대로
+/// 나른다(실측 a5/m2/measure/codex-sandbox-policy-probe.txt) — 따옴표 없는 `1` 은 codex 를 세우지 못한다(정수 → 형식 오류).
+/// 사용자 codex 설정은 건드리지 않는다. 한계(이월): 사람이 pane 에 직접 친 codex 에는 플래그가 없다. 같은 실행 줄의
+/// claude 환경값이 이미 `${…:-…}` 전개에 기대므로 셸 요구도 같다(POSIX 셸 · fish 는 측정하지 않았다).
+fn with_codex_seat_tool_vars(cmd: &str) -> String {
+    let Some(bin) = cmd.split_whitespace().find(|t| !is_env_assignment(t)) else {
+        return cmd.to_string();
+    };
+    if bin.rsplit('/').next() != Some("codex") {
+        return cmd.to_string();
+    }
+    let end = bin.as_ptr() as usize - cmd.as_ptr() as usize + bin.len();
+    let mut s = String::from(&cmd[..end]);
+    for n in CODEX_SEAT_TOOL_VARS {
+        s.push_str(&format!(" ${{{n}:+-c}} ${{{n}:+\"shell_environment_policy.set.{n}='''${n}'''\"}}"));
+    }
+    s.push_str(&cmd[end..]);
+    s
 }
 
 /// (W1-5) resume 인자 해소 + claude 사전검증 게이트. `{session_id}` 정확 핀은 실제
