@@ -474,4 +474,27 @@ describe("S6 actual batch deletion and purge", () => {
     expect(h.closeCalls()).toEqual([]); expect(h.scope.purgingDept).toBe(false);
     expect(h.toasts.join("\n")).toContain("PURGE_DENIED");
   });
+
+  // S1 M4 (RULING-S1-PRODUCT-04): the purge dialog names the department by the card's own name
+  // first. The name to type (the registry name from the preview) and what is deleted stay as they were.
+  test("S1 M4: purge hands the dialog the card's own name; the name to type stays the registry name", async () => {
+    for (const card of ["마케팅팀", "fixture"]) {
+      const w = ws(1, SOURCE, [42]); w.name = card; const spare = ws(2, DEST, [80]); const h = harness([w, spare]);
+      const asked: unknown[][] = [];
+      h.scope.purgeConfirmModal = async (...args: unknown[]) => { asked.push(args); return true; };
+      await h.api.purgeDept(w); h.noSetupFaults();
+      expect(asked.map(a => [a[0], a[2]])).toEqual([["fixture", card]]);
+    }
+  });
+
+  test("S1 M4 control: renamed or not, the same delete call goes out for the same department", async () => {
+    for (const card of ["마케팅팀", "fixture"]) {
+      const w = ws(1, SOURCE, [42]); w.name = card; if (card !== "fixture") w.nameByUser = true;
+      const spare = ws(2, DEST, [80]); const h = harness([w, spare]);
+      await h.api.purgeDept(w); h.noSetupFaults();
+      expect(h.calls.filter(c => c.command.includes("purge")).map(c => [c.command, c.args])).toEqual([
+        ["dept_purge_preview_by_socket", { socket: SOURCE }], ["purge_dept_daemon_by_socket", { socket: SOURCE }]]);
+      expect(h.scope.workspaces).not.toContain(w); expect(h.scope.workspaces).toContain(spare);
+    }
+  });
 });
