@@ -662,18 +662,22 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&log).ok().as_deref(), Some(line1.as_str()), "기록 파일이 없거나 다르다");
         assert_eq!(s1_fix2_tree(&home, &skip), before, "그 폴더와 기록 파일 밖의 무엇이 바뀌었다");
-        // 두 번째 정리는 기록에 덧붙인다(앞 줄을 지우지 않는다)
+        // ★한 번 지운 기록이 있으면 다시 지우지 않는다(RULING-04 M5) — 그 자리에 나중에 생긴 폴더는 그대로 남고 기록도 그대로다
         s1_fix2_put(&base.join("feedback/fb-2/diag.json"), "{}");
-        assert!(matches!(
-            remove_retired_feedback_dir_at(&home, 1795000002),
-            RetiredFeedbackCleanup::Removed { files: 1, bytes: 2, .. }
-        ));
+        let out2 = remove_retired_feedback_dir_at(&home, 1795000002);
+        assert!(
+            matches!(out2, RetiredFeedbackCleanup::Skipped(_)),
+            "이미 지운 기록이 있는데 또 지웠다: {out2:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("feedback/fb-2/diag.json")).ok().as_deref(),
+            Some("{}"),
+            "나중에 그 자리에 생긴 폴더를 지웠다"
+        );
         let text = std::fs::read_to_string(&log).unwrap();
-        assert!(text.starts_with(&line1), "두 번째 기록이 첫 줄을 지웠다");
-        assert_eq!(text.lines().count(), 2);
-        assert!(text.lines().nth(1).unwrap().starts_with("1795000002\t"));
-        assert!(text.lines().nth(1).unwrap().ends_with("\tfb-2"));
-        // 없으면 아무 일도 없다 — 기록도 늘지 않는다
+        assert_eq!(text, line1, "두 번째 기동이 기록을 바꿨다");
+        // 그 폴더가 (사람 손으로) 사라진 뒤에는 아무 일도 없다 — 기록도 늘지 않는다
+        std::fs::remove_dir_all(base.join("feedback")).unwrap();
         assert_eq!(remove_retired_feedback_dir_at(&home, 1795000003), RetiredFeedbackCleanup::Absent);
         assert_eq!(std::fs::read_to_string(&log).unwrap(), text);
         assert_eq!(s1_fix2_tree(&home, &skip), before);
@@ -691,7 +695,8 @@ mod tests {
     }
 
     /// ★재귀 삭제가 도중에 멈추면 「지웠다」고도 「지우지 않았다」고도 하지 않는다 — 사라진 묶음을 기록에 그대로 적고
-    /// (`partial`), 남은 것은 다음 기동이 지우고 한 줄을 더 적는다. 하나도 못 지웠으면 실패이고 기록은 없다.
+    /// (`partial`). 사라진 것이 **기록된** 뒤에는 다음 기동이 다시 지우지 않는다(한 번만 · RULING-04 M5) — 남은 묶음은 그대로 남는다.
+    /// 하나도 못 지웠으면 실패이고 기록 줄은 없으며, 다음 기동이 다시 해 본다(아직 한 번도 지우지 않았다).
     #[cfg(unix)]
     #[test]
     fn retired_feedback_halfway_failure_records_what_is_gone() {
@@ -722,7 +727,15 @@ mod tests {
         mode(&lock, 0o755);
         assert!(matches!(out, RetiredFeedbackCleanup::Failed(_)), "하나도 못 지웠는데 실패가 아니다: {out:?}");
         assert!(lock.join("shot.png").exists());
-        assert!(!s1_fix2_log(&home).exists(), "사라진 것이 없는데 기록이 생겼다");
+        assert_eq!(
+            std::fs::read_to_string(s1_fix2_log(&home)).unwrap_or_default(),
+            "",
+            "사라진 것이 없는데 기록 줄이 생겼다"
+        );
+        // 기록 줄이 없으므로 다음 기동은 다시 해 본다 — 장애물이 사라졌으면 지우고 한 줄을 적는다
+        let out_retry = remove_retired_feedback_dir_at(&home, 1795000018);
+        assert!(matches!(out_retry, RetiredFeedbackCleanup::Removed { files: 1, .. }), "{out_retry:?}");
+        assert_eq!(std::fs::read_to_string(s1_fix2_log(&home)).unwrap_or_default().lines().count(), 1);
         let _ = std::fs::remove_dir_all(&home);
 
         // ② 일부만 지워지는 경우: 묶음 넷. 재귀 삭제는 디렉터리 읽기 순서로 지우다 첫 오류에서 멈추므로,
@@ -772,14 +785,22 @@ mod tests {
             assert_eq!(f[9], format!("left={}", left.join(",")));
             assert!(f[10].contains("삭제 실패"));
         }
-        // 장애물이 사라진 다음 기동: 남은 것을 지우고 한 줄을 덧붙인다
+        // 장애물이 사라진 다음 기동: 사라진 것이 기록된 뒤라면 **다시 지우지 않는다** — 남은 묶음과 기록은 그대로다.
+        // (앞에서 하나도 사라지지 않은 파일 시스템이면 기록 줄이 없으므로 이번이 첫 삭제다.)
         let lines_before = std::fs::read_to_string(&log).map(|t| t.lines().count()).unwrap_or(0);
         let out2 = remove_retired_feedback_dir_at(&home, 1795000010);
-        assert!(matches!(out2, RetiredFeedbackCleanup::Removed { link: false, .. }), "{out2:?}");
-        assert!(std::fs::symlink_metadata(&fb).is_err());
-        let text = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(text.lines().count(), lines_before + 1);
-        assert!(text.lines().last().unwrap().starts_with("1795000010\t"));
+        if gone.is_empty() {
+            assert!(matches!(out2, RetiredFeedbackCleanup::Removed { link: false, .. }), "{out2:?}");
+            assert!(std::fs::symlink_metadata(&fb).is_err());
+            assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), lines_before + 1);
+        } else {
+            assert!(
+                matches!(out2, RetiredFeedbackCleanup::Skipped(_)),
+                "일부를 지운 기록이 있는데 또 지웠다: {out2:?}"
+            );
+            assert_eq!(names(&fb), left, "남은 묶음이 바뀌었다");
+            assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), lines_before);
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -803,7 +824,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    // ───────── S1 수정2 · 보완(리뷰 M1) — 기록은 로그 자신(일반 파일)에만 덧붙인다 ─────────
+    // ───────── S1 수정2 · 보완(리뷰 M1 · RULING-04 M5) — 기록은 로그 자신에만 · 삭제는 한 번만 ─────────
     /// 리뷰어 검체 11 의 모양: `<root>/home` 에 묶음 하나(`.cys/feedback/bundle/x` 1바이트)와 빈 `.cys/state/`,
     /// 그 옆 `<root>/outside/` 는 홈 **밖**이다. (root, home, outside) 를 돌려준다.
     #[cfg(unix)]
@@ -816,18 +837,42 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         (root, home, outside)
     }
+    /// 「지우지 않았다」의 검사 묶음: 결과가 건너뜀이고, 묶음이 그대로이고, 알림은 「정리하지 않았습니다」 한 줄(기록 경로 포함)뿐이다.
+    #[cfg(unix)]
+    fn s1_fix2_not_deleted(
+        tag: &str,
+        home: &std::path::Path,
+        log: &std::path::Path,
+        out: &RetiredFeedbackCleanup,
+        notes: &[String],
+        bad: &mut Vec<String>,
+    ) {
+        if !matches!(out, RetiredFeedbackCleanup::Skipped(_)) {
+            bad.push(format!("{tag}: 건너뜀이 아니다: {out:?}"));
+        }
+        if std::fs::read_to_string(home.join(".cys/feedback/bundle/x")).ok().as_deref() != Some("x") {
+            bad.push(format!("{tag}: 기록할 자리가 없는데(또는 이미 지웠는데) 폴더를 지웠다"));
+        }
+        let told = notes
+            .iter()
+            .filter(|n| n.contains("정리하지 않았습니다") && n.contains(&log.display().to_string()))
+            .count();
+        if told != 1 || notes.len() != 1 {
+            bad.push(format!("{tag}: 알림이 「정리하지 않았습니다」(기록 경로 포함) 한 줄이 아니다: {notes:?}"));
+        }
+    }
 
-    /// ★기록 줄은 **로그 자신인 일반 파일**에만 덧붙는다. 기록 파일 자리에 다른 곳을 가리키는 것(파일로 가는 링크 ·
-    /// 끊긴 링크 · 폴더로 가는 링크 · 다른 파일과 몸을 나눈 하드 링크)이 놓여 있으면 그 너머에는 **한 바이트도** 쓰지
-    /// 않고, 그 자리의 것을 바꾸지도 않으며, 쓰지 못했다는 사실을 한 줄로 알린다. 삭제는 그대로 이루어진다.
-    /// 대조(`regular`): 평범한 기록 파일에는 앞 줄을 지우지 않고 덧붙이며 거부 알림이 없다.
+    /// ★기록 줄은 **로그 자신인 일반 파일**에만 덧붙고, 그 자리를 **지우기 전에** 연다. 기록 파일 자리에 다른 곳을 가리키는 것
+    /// (파일로 가는 링크 · 끊긴 링크 · 폴더로 가는 링크 · 다른 파일과 몸을 나눈 하드 링크)이 놓여 있으면: 그 너머에 한 바이트도
+    /// 쓰지 않고, 그 자리의 것을 바꾸지 않고, **폴더를 지우지 않고**, 그 사실을 한 줄로 알린다(기록할 수 없는 삭제는 하지 않는다).
+    /// 대조(`regular` · `regular-fresh`): 평범한 기록 파일(지운 줄 없음) 또는 아직 없는 기록 파일이면 지우고 줄을 덧붙인다.
     /// (리뷰어 재현 — 파일로 가는 링크: 홈 밖의 `unrelated-notes.txt` 가 15 → 214 바이트가 됐다.)
     #[cfg(unix)]
     #[test]
     fn retired_feedback_record_is_written_only_into_the_log_itself() {
         use std::os::unix::fs::MetadataExt as _;
         let mut bad: Vec<String> = Vec::new();
-        for shape in ["regular", "regular-fresh", "link-to-file", "link-dangling", "link-to-dir", "hard-link"] {
+        for shape in ["regular", "regular-fresh", "link-to-file", "link-dangling", "link-to-dir", "hard-link", "state-is-a-file"] {
             let (root, home, outside) = s1_fix2_m1_fixture(&format!("m1-{shape}"));
             let log = s1_fix2_log(&home);
             let notes_file = outside.join("unrelated-notes.txt");
@@ -845,58 +890,61 @@ mod tests {
                     std::fs::write(&notes_file, "ORIGINAL NOTES\n").unwrap();
                     std::fs::hard_link(&notes_file, &log).unwrap();
                 }
+                // 기록 파일이 놓일 폴더 자리에 일반 파일이 있다 — 기록 파일을 만들 수 없다
+                "state-is-a-file" => {
+                    std::fs::remove_dir(home.join(".cys/state")).unwrap();
+                    std::fs::write(home.join(".cys/state"), "NOT A FOLDER\n").unwrap();
+                }
                 _ => unreachable!(),
             }
             let outside_before = s1_fix2_tree(&outside, &[]);
             let mut notes: Vec<String> = Vec::new();
             let out = remove_retired_feedback_dir_noting(&home, 1795344000, &mut |m: &str| notes.push(m.to_string()));
-            // 삭제는 어느 모양에서도 그대로다
-            let want = RetiredFeedbackCleanup::Removed {
-                entries: vec!["bundle".to_string()],
-                files: 1,
-                bytes: 1,
-                link: false,
-            };
-            if out != want {
-                bad.push(format!("{shape}: 삭제 결과가 다르다: {out:?}"));
-            }
-            if std::fs::symlink_metadata(home.join(".cys/feedback")).is_ok() {
-                bad.push(format!("{shape}: 지울 폴더가 남았다"));
-            }
-            if notes.iter().filter(|n| n.contains("폴더를 지웠습니다")).count() != 1 {
-                bad.push(format!("{shape}: 지웠다는 알림이 한 줄이 아니다: {notes:?}"));
-            }
-            let refusals: Vec<&String> = notes.iter().filter(|n| n.contains("기록을 남기지 못했습니다")).collect();
             let line = format!(
                 "1795344000\t{}\tremoved\t{}\tlink=false\tentries=1\tfiles=1\tbytes=1\tbundle\n",
                 env!("CARGO_PKG_VERSION"),
                 home.join(".cys/feedback").display()
             );
             if shape.starts_with("regular") {
+                let want = RetiredFeedbackCleanup::Removed {
+                    entries: vec!["bundle".to_string()],
+                    files: 1,
+                    bytes: 1,
+                    link: false,
+                };
+                if out != want {
+                    bad.push(format!("{shape}: 삭제 결과가 다르다: {out:?}"));
+                }
+                if std::fs::symlink_metadata(home.join(".cys/feedback")).is_ok() {
+                    bad.push(format!("{shape}: 지울 폴더가 남았다"));
+                }
                 let text = std::fs::read_to_string(&log).unwrap_or_default();
                 let earlier = if shape == "regular" { "EARLIER LINE\n" } else { "" };
                 if text != format!("{earlier}{line}") {
                     bad.push(format!("{shape}: 평범한 기록 파일에 덧붙지 않았다: {text:?}"));
                 }
-                if !refusals.is_empty() {
-                    bad.push(format!("{shape}: 평범한 기록 파일인데 거부를 알렸다: {refusals:?}"));
+                if notes.len() != 1 || !notes[0].contains("폴더를 지웠습니다") {
+                    bad.push(format!("{shape}: 알림이 「지웠습니다」 한 줄이 아니다: {notes:?}"));
                 }
             } else {
+                s1_fix2_not_deleted(shape, &home, &log, &out, &notes, &mut bad);
                 let outside_after = s1_fix2_tree(&outside, &[]);
                 if outside_after != outside_before {
                     bad.push(format!("{shape}: 홈 밖이 바뀌었다: {outside_before:?} -> {outside_after:?}"));
                 }
-                if refusals.len() != 1 || !refusals[0].contains(&log.display().to_string()) {
-                    bad.push(format!("{shape}: 기록을 거부했다는 알림(기록 경로 포함)이 한 줄이 아니다: {notes:?}"));
-                }
-                // 그 자리의 것은 그대로다(링크는 같은 곳을 가리키는 링크로 · 하드 링크는 이름 둘인 채로)
-                let same = match std::fs::symlink_metadata(&log) {
-                    Ok(m) if shape == "hard-link" => m.file_type().is_file() && m.nlink() == 2,
-                    Ok(m) => {
-                        let to = if shape == "link-to-dir" { &outside } else { &notes_file };
-                        m.file_type().is_symlink() && std::fs::read_link(&log).ok().as_deref() == Some(to.as_path())
+                // 그 자리의 것은 그대로다(링크는 같은 곳을 가리키는 링크로 · 하드 링크는 이름 둘인 채로 · 파일은 그 내용으로)
+                let same = match shape {
+                    "state-is-a-file" => {
+                        std::fs::read_to_string(home.join(".cys/state")).ok().as_deref() == Some("NOT A FOLDER\n")
                     }
-                    Err(_) => false,
+                    "hard-link" => std::fs::symlink_metadata(&log)
+                        .map(|m| m.file_type().is_file() && m.nlink() == 2)
+                        .unwrap_or(false),
+                    _ => {
+                        let to = if shape == "link-to-dir" { &outside } else { &notes_file };
+                        std::fs::symlink_metadata(&log).map(|m| m.file_type().is_symlink()).unwrap_or(false)
+                            && std::fs::read_link(&log).ok().as_deref() == Some(to.as_path())
+                    }
                 };
                 if !same {
                     bad.push(format!("{shape}: 기록 파일 자리의 것이 바뀌었다"));
@@ -906,15 +954,93 @@ mod tests {
         }
         assert!(
             bad.is_empty(),
-            "기록이 로그 자신 밖에 쓰였거나 거부를 알리지 않았다:\n{}",
+            "기록이 로그 자신 밖에 쓰였거나, 기록할 자리 없이 지웠거나, 알리지 않았다:\n{}",
             bad.join("\n")
         );
     }
 
-    /// ★기록 파일 자리에 파이프(FIFO)가 놓여 있어도 그 앞에서 **멈춰 서지 않고**, 파이프에 **쓰지 않는다**.
-    /// 읽는 쪽이 없는 파이프: 쓰려고 열면 열기가 끝없이 기다린다 — 부트 태스크가 거기서 서면 앱이 뜨지 않는다.
-    /// 읽는 쪽이 있는 파이프: 열기는 곧바로 되므로, 「연 것이 일반 파일인가」 확인만이 기록 줄과 파이프 사이에 서 있다.
-    /// 어느 쪽이든 거부를 알리고, 삭제는 그대로다. 멈춤은 다른 스레드에서 돌리고 시한으로 잰다.
+    /// ★삭제는 **한 번만**이다(RULING-04 M5 — 오너의 명령은 「업데이트되면 지운다」이고, 기동마다 되풀이되는 삭제는 나중에 그
+    /// 자리에 놓인 것을 지운다). 표식은 이미 쓰는 기록이다: 기록에 「지웠다」 줄(`removed` · `partial`)이 있으면 — 어느 판이
+    /// 적었든 — 다시 지우지 않는다. 기록 파일 이름에는 판 번호가 없다(판이 바뀌어도 같은 표식을 본다).
+    /// 표식이 아닌 것(셋째 칸이 아닌 자리의 낱말)은 표식으로 읽지 않고, 읽을 수 없을 만큼 큰 기록은 「확인할 수 없다」 = 지우지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn retired_feedback_delete_runs_once_and_the_record_is_the_marker() {
+        let mut bad: Vec<String> = Vec::new();
+        // ① 두 번의 기동: 첫 기동은 지우고 적는다. 그 자리에 다시 생긴 폴더는 둘째 기동이 건드리지 않는다.
+        {
+            let (root, home, _outside) = s1_fix2_m1_fixture("m5-twice");
+            let state = home.join(".cys/state");
+            let record = state.join("feedback-removed.log");
+            let mut notes: Vec<String> = Vec::new();
+            let out1 = remove_retired_feedback_dir_noting(&home, 1795344000, &mut |m: &str| notes.push(m.to_string()));
+            if !matches!(out1, RetiredFeedbackCleanup::Removed { files: 1, bytes: 1, link: false, .. }) {
+                bad.push(format!("twice: 첫 기동이 지우지 않았다: {out1:?}"));
+            }
+            let listed: Vec<String> = std::fs::read_dir(&state)
+                .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+                .unwrap_or_default();
+            if listed != vec!["feedback-removed.log".to_string()] {
+                bad.push(format!("twice: 기록 파일이 판 번호 없는 이름 하나가 아니다: {listed:?}"));
+            }
+            let text1 = std::fs::read_to_string(&record).unwrap_or_default();
+            if text1.lines().count() != 1 || !text1.contains("\tremoved\t") {
+                bad.push(format!("twice: 첫 기동의 기록이 「지웠다」 한 줄이 아니다: {text1:?}"));
+            }
+            s1_fix2_put(&home.join(".cys/feedback/bundle/x"), "x");
+            s1_fix2_put(&home.join(".cys/feedback/later/keep.txt"), "PLACED LATER");
+            let mut notes2: Vec<String> = Vec::new();
+            let out2 = remove_retired_feedback_dir_noting(&home, 1795344099, &mut |m: &str| notes2.push(m.to_string()));
+            s1_fix2_not_deleted("twice(둘째 기동)", &home, &record, &out2, &notes2, &mut bad);
+            if std::fs::read_to_string(home.join(".cys/feedback/later/keep.txt")).ok().as_deref() != Some("PLACED LATER") {
+                bad.push("twice: 나중에 그 자리에 놓인 파일을 지웠다".to_string());
+            }
+            if std::fs::read_to_string(&record).unwrap_or_default() != text1 {
+                bad.push("twice: 둘째 기동이 기록을 바꿨다".to_string());
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // ② 표식의 모양: (기록 내용, 지워야 하는가)
+        let other_version_removed = "1790000000\t0.0.1\tremoved\t/somewhere/.cys/feedback\tlink=false\tentries=1\tfiles=1\tbytes=1\tb\n";
+        let partial = "1790000000\t0.0.1\tpartial\t/somewhere/.cys/feedback\tlink=false\tentries=1\tfiles=1\tbytes=1\tb\tleft=c\twhy\n";
+        let word_elsewhere = "note\tremoved\tsomething\tremoved\tpartial\n";
+        let too_big = "x".repeat(1024 * 1024 + 1);
+        let after_other_lines = format!("EARLIER LINE\n{other_version_removed}");
+        for (tag, content, deletes) in [
+            ("marker-other-version", other_version_removed, false),
+            ("marker-partial", partial, false),
+            ("marker-word-elsewhere", word_elsewhere, true),
+            ("marker-after-other-lines", after_other_lines.as_str(), false),
+            ("marker-too-big-to-read", too_big.as_str(), false),
+        ] {
+            let (root, home, _outside) = s1_fix2_m1_fixture(&format!("m5-{tag}"));
+            let record = home.join(".cys/state/feedback-removed.log");
+            std::fs::write(&record, content).unwrap();
+            let mut notes: Vec<String> = Vec::new();
+            let out = remove_retired_feedback_dir_noting(&home, 1795344000, &mut |m: &str| notes.push(m.to_string()));
+            let after = std::fs::read_to_string(&record).unwrap_or_default();
+            if deletes {
+                if !matches!(out, RetiredFeedbackCleanup::Removed { files: 1, .. }) {
+                    bad.push(format!("{tag}: 표식이 아닌데 지우지 않았다: {out:?}"));
+                }
+                if !after.starts_with(content) || after.lines().count() != content.lines().count() + 1 {
+                    bad.push(format!("{tag}: 기록에 한 줄이 덧붙지 않았다"));
+                }
+            } else {
+                s1_fix2_not_deleted(tag, &home, &record, &out, &notes, &mut bad);
+                if after != content {
+                    bad.push(format!("{tag}: 지우지 않았는데 기록이 바뀌었다"));
+                }
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        assert!(bad.is_empty(), "한 번만 지운다는 규칙이 깨졌다:\n{}", bad.join("\n"));
+    }
+
+    /// ★기록 파일 자리에 파이프(FIFO)가 놓여 있어도 그 앞에서 **멈춰 서지 않고**, 파이프에 **쓰지 않고**, 기록할 자리가
+    /// 없으므로 **지우지 않는다**. 읽는 쪽이 없는 파이프를 쓰기 전용으로 열면 열기가 끝없이 기다린다 — 부트 태스크가 거기서
+    /// 서면 앱이 뜨지 않는다. 읽는 쪽이 있는 파이프는 열기가 곧바로 되므로, 「연 것이 일반 파일인가」 확인만이 기록 줄과 파이프
+    /// 사이에 서 있다. 멈춤은 다른 스레드에서 돌리고 시한으로 잰다.
     #[cfg(unix)]
     #[test]
     fn retired_feedback_record_never_waits_on_a_pipe_at_the_log_path() {
@@ -949,12 +1075,7 @@ mod tests {
             }
             let _ = worker.join();
             if let Ok((out, notes)) = got {
-                if !matches!(out, RetiredFeedbackCleanup::Removed { files: 1, bytes: 1, link: false, .. }) {
-                    bad.push(format!("{tag}: 삭제 결과가 다르다: {out:?}"));
-                }
-                if notes.iter().filter(|n| n.contains("기록을 남기지 못했습니다")).count() != 1 {
-                    bad.push(format!("{tag}: 파이프에 대한 거부 알림이 한 줄이 아니다: {notes:?}"));
-                }
+                s1_fix2_not_deleted(tag, &home, &log, &out, &notes, &mut bad);
             }
             // 파이프로 들어간 바이트가 없다(읽는 쪽이 있을 때만 잴 수 있다)
             if let Some(r) = reader.as_mut() {
