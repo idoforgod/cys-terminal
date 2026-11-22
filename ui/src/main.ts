@@ -280,6 +280,7 @@ import { armDeferredPaneFocus, modalLayerOpen, feedbackOverlayOpen } from "./mod
 import { mountFeedbackButton, openFeedbackModal, type FeedbackFacts } from "./feedbackmodal";
 import { activityExpiryMs, applyDotPaint, deadReason, HIDDEN_DOT, projectActivity, RoleActivityStore } from "./roleactivity"; // ★F-01 역할 점 활동 표시(순수 판정·바뀐 것만 칠하기)
 import { SurfaceListTransport, type ListArrival } from "./surfacelist"; // ★F-01 끝점별 소유 원 호출 · 응답별 독립 투영
+import { beginInlineRename, inlineRenameOpen, renameBlocksRebuild } from "./inlinerename"; // ★S1 수정3 이름 바꾸기는 주인이 끝낸다(순수 판정)
 
 declare global {
   interface Window {
@@ -400,6 +401,11 @@ interface Workspace {
   //   **비율 리셋·재배치를 하지 않는다**(새 좌석은 그래도 대표 칸 밖으로 가서 대표 폭은 줄지 않는다). `정렬` 이
   //   끈다. undefined = 구버전 저장본(기동 때 looksManual 로 1회 추정해 boolean 으로 이관). 저장된다.
   layoutManual?: boolean;
+  // ★S1 수정3(판정 02): 주인이 「이름 변경」으로 직접 정한 이름인가. 참이면 기동 복원(start 의 이름 회복)이 이 이름을
+  //   자리표시로 보지 않는다 — `dept-9`·`…`·`non title`·`ws 3` 처럼 자리표시와 모양이 같은 이름도 그대로 지킨다.
+  //   없으면(이 판 이전의 모든 저장본) 종전 추정 그대로다. **저장된다** — saveLayout 의 런타임 표식 털기에 넣지 마라
+  //   (inlinerename.test.ts 가 저장본에 남는지 실물 saveLayout 으로 못박는다).
+  nameByUser?: boolean;
   // ★U2(0.14.41): 이 탭 트리의 sid 가 속한 데몬 세대(`started_at-pid`). 기동 때 지금 세대와 다르면 옛 sid 는
   //   살아 보여도 전부 죽은 것으로 보고 **역할로만** 결속한다(sid 재사용 방어). undefined = 모름. 저장된다.
   daemonEpoch?: string;
@@ -1896,7 +1902,7 @@ function renderTasks(fleet: any) {
         ? `<span class="cc-fail-badge crit">⚠ ${d.error === "timeout" ? "응답없음" : "도달불가"}</span>`
         : "";
       const head =
-        `<div class="cc-tasks-dept-h"><span class="cc-tasks-dept-name">${ccEsc(d.display_name ?? d.name ?? "")}</span>` +
+        `<div class="cc-tasks-dept-h"><span class="cc-tasks-dept-name">${ccEsc(ownerNamedDept(d.socket, d.display_name ?? d.name ?? ""))}</span>` +
         `<span class="cc-tasks-dept-meta">노드 ${surfaces.length} · 작업중 ${working}</span>${deadBadge}</div>`;
       const rows = d.error
         ? alertsQuiet("ccTaskError") // ★TOAST: 부서 데몬 오류 안내 행은 그리지 않는다(d.error 데이터·재시도는 그대로)
@@ -4542,8 +4548,15 @@ function setFocus(sid: number) {
   // ★U6(0.14.41 · 반박 D2 blocking): 모달·팔레트가 떠 있으면 xterm 에 키보드 포커스를 주지 않는다.
   // 3초 틱의 자동 입양·surface.exited 가 여기를 부르면, 사용자가 모달 입력칸에 쓰던 글과 Enter 가
   // 뒤에 가려진 pane(주로 마스터) PTY 로 들어갔다. 표시(focused)·focusedSid 는 그대로 갱신한다.
-  if (!modalLayerOpen(document)) panes.get(key)?.term.focus();
-  else deferPaneFocusUntilModalsClose();
+  // ★S1 수정3(오너 2026-11-22): 카드·그룹 이름을 고치는 중에도 터미널에 키보드를 주지 않는다. 3초 틱의 자동 입양·
+  //   좌석 종료가 여기를 부르면 이름 칸이 blur 로 '끝난 것'이 되어 치던 데까지만 저장되고, 그 뒤의 글자는 pane 으로
+  //   들어갔다(위 U6 과 같은 사고의 인라인 편집 판). 표시(focused)·focusedSid 는 그대로 갱신한다.
+  //   이름이 끝나면 그 끝의 render()·주인의 클릭이 pane 포커스를 준다 — 여기서는 빼앗지 않는다. 안쪽 두 줄(모달 가드)은
+  //   글자 그대로다(기존 핀이 그 두 줄을 못박는다).
+  if (!inlineRenameOpen(document)) {
+    if (!modalLayerOpen(document)) panes.get(key)?.term.focus();
+    else deferPaneFocusUntilModalsClose();
+  }
   updateFtRoot(); // 파일 트리가 열려 있으면 선택한 surface의 폴더로 전환
 }
 
@@ -5518,6 +5531,11 @@ function buildWsAcctLine(ws: Workspace): HTMLElement | null {
 
 function renderWsTabs() {
   const bar = document.getElementById("ws-tabs")!;
+  // ★S1 수정3(오너 2026-11-22 「이름바꾸기가 너무 빨리 닫혀버린다」): 이 함수는 탭 목록을 통째로 지우고 다시 짓는다.
+  //   좌석 상태 이벤트·승인/피드 이벤트·10초 타이머가 refreshSidebarStatus 를 거쳐 여기를 부르므로, 가드가 없으면
+  //   주인이 이름을 치는 칸이 1초에도 여러 번 버려졌다. 고치는 중이면 다시 짓지 않는다 — 이름이 끝나면(확정·취소)
+  //   그 끝이 render() 를 불러 밀린 신호를 한 번에 반영한다. 낡은 표식은 막지 않는다(inlinerename.ts 불변식 1).
+  if (renameBlocksRebuild(bar, document.activeElement, document.hasFocus())) return;
   bar.innerHTML = "";
   // ★(C2) 계정 표는 이 렌더에서 한 번 — 실패해도 탭은 그대로(계정 줄만 빠진다 · buildWsAcctLine 의 try 가 받는다).
   try {
@@ -5628,25 +5646,33 @@ function buildTab(ws: Workspace): HTMLElement {
   });
   const startRename = () => {
     // WKWebView에서 prompt()는 무동작 — 인라인 편집
-    label.contentEditable = "true";
-    label.focus();
-    const sel = window.getSelection();
-    sel?.selectAllChildren(label);
-    const onKey = (ke: KeyboardEvent) => {
-      if (ke.key === "Enter") {
-        ke.preventDefault();
-        label.blur();
-      }
-    };
-    const commit = () => {
-      label.removeEventListener("keydown", onKey); // rename마다 리스너 누적 방지
-      label.contentEditable = "false";
-      const name = (label.textContent || "").trim();
-      ws.name = name || UNTITLED; // 이름을 지우면 미정 표시로 복귀
-      render();
-    };
-    label.addEventListener("blur", commit, { once: true });
-    label.addEventListener("keydown", onKey);
+    // ★S1 수정3: 끝내는 것은 주인뿐이다(Enter · 앱 안 다른 곳 클릭 = 확정 / Escape = 취소). 재렌더·상태 이벤트·
+    //   터미널 포커스·창이 뒤로 가는 것은 끝내지 못한다 — 규칙의 정의처는 inlinerename.ts.
+    // ★카드는 renderWsTabs 마다 **새로 지어진다**. 우클릭 메뉴가 떠 있는 사이 목록이 다시 지어지면 메뉴가 쥔 이 클로저의
+    //   label 은 화면에서 떨어진 옛 칸이라, 「이름 변경」을 눌러도 아무 칸도 열리지 않았다(오너의 「변경하기도 전에 끝난다」 ·
+    //   정식 0.15.1 실측 fix3/vm/RED-0151-REAL-APP.md run 3). 그때는 같은 워크스페이스의 **지금 화면에 있는** 이름 칸에서 연다.
+    const el = label.isConnected ? label : liveWsNameLabel(ws.id);
+    if (!el || el.isContentEditable) return; // 카드가 없거나 · 이미 고치는 중(더블클릭·메뉴 중복)
+    const shownAtStart = (el.textContent ?? "").trim();
+    beginInlineRename(el, {
+      windowFocused: () => document.hasFocus(),
+      later: (fn) => void setTimeout(fn, 0),
+      selectAll: () => window.getSelection()?.selectAllChildren(el),
+      onDone: (commit, name) => {
+        // 아무것도 바꾸지 않고 끝낸 것(글자가 열 때와 같다)은 취소와 같다 — 이름도 표식도 건드리지 않는다. 그러지 않으면
+        //   자리표시 이름(non title · dept-9)의 카드를 열었다 닫기만 해도 「주인이 정한 이름」으로 굳어 부서 표시명이 돌아오지 않는다.
+        if (commit && name !== shownAtStart) {
+          ws.name = name || UNTITLED; // 이름을 지우면 미정 표시로 복귀
+          // ★S1 수정3(판정 02): 주인이 직접 정한 이름이라는 표식 — 기동 복원이 자리표시와 **모양이 같은** 이름
+          //   (dept-9 · … · non title · ws 3)을 레지스트리 표시명으로 덮지 않게 한다. 이름을 비운 것은 종전 규칙
+          //   그대로(표식 없음 → 다음 기동에 부서 표시명으로 회복).
+          if (name) ws.nameByUser = true;
+          else delete ws.nameByUser;
+        }
+        render(); // 확정·취소 모두 — 고치는 동안 밀린 탭 신호를 여기서 한 번에 반영한다
+        restorePaneFocusAfterRename();
+      },
+    });
   };
   label.addEventListener("dblclick", startRename);
   tab.addEventListener("contextmenu", (e) => {
@@ -5807,6 +5833,7 @@ function buildGroupSection(g: GroupMeta): HTMLElement {
   name.textContent = g.name;
   // 헤더 이름 클릭 = anchor focus(부서 그룹) / 첫 멤버 focus(일반 그룹)
   name.addEventListener("click", () => {
+    if (name.isContentEditable) return; // ★S1 수정3: 이름을 고치는 중의 클릭은 커서를 옮기는 것이다 — 워크스페이스를 바꾸지 않는다
     const anchor = anchorWsOf(g) ?? workspaces.find((w) => w.groupId === g.id);
     if (anchor) {
       activeWs = workspaces.indexOf(anchor);
@@ -5922,25 +5949,44 @@ function startGroupRename(g: GroupMeta) {
   const idx = renderedG.indexOf(g);
   const label = idx >= 0 ? heads[idx]?.querySelector<HTMLElement>(".ws-group-name") : null;
   if (!label) return;
-  label.contentEditable = "true";
-  label.focus();
-  const sel = window.getSelection();
-  sel?.selectAllChildren(label);
-  const onKey = (ke: KeyboardEvent) => {
-    if (ke.key === "Enter") {
-      ke.preventDefault();
-      label.blur();
-    }
-  };
-  const commit = () => {
-    label.removeEventListener("keydown", onKey); // rename마다 리스너 누적 방지
-    label.contentEditable = "false";
-    const name = (label.textContent || "").trim();
-    g.name = name || "그룹"; // 이름을 지우면 기본명으로 복귀
-    render();
-  };
-  label.addEventListener("blur", commit, { once: true });
-  label.addEventListener("keydown", onKey);
+  // ★S1 수정3: 카드와 같은 규칙(inlinerename.ts) — 같은 #ws-tabs 안이라 같은 원인으로 닫혔다.
+  if (label.isContentEditable) return; // 이미 고치는 중
+  beginInlineRename(label, {
+    windowFocused: () => document.hasFocus(),
+    later: (fn) => void setTimeout(fn, 0),
+    selectAll: () => window.getSelection()?.selectAllChildren(label),
+    onDone: (commit, name) => {
+      if (commit) g.name = name || "그룹"; // 이름을 지우면 기본명으로 복귀
+      render();
+      restorePaneFocusAfterRename();
+    },
+  });
+}
+
+/** 워크스페이스 카드의 이름 칸 — **지금 화면에 있는** 것(카드는 renderWsTabs 마다 새로 지어지므로 id 로 찾는다). 없으면 null. */
+function liveWsNameLabel(wsId: number): HTMLElement | null {
+  return document.querySelector<HTMLElement>(`#ws-tabs .ws-tab[data-ws-id="${wsId}"] .ws-name`);
+}
+
+// ★S1 수정3: 이름 바꾸기가 끝난 뒤 키보드를 포커스 pane 에 돌려준다. 고치는 동안에는 setFocus 가 터미널 포커스를 참으므로
+//   (다른 카드를 눌러 끝낸 경우 · 고치는 중에 온 자동 입양·좌석 종료), 끝난 뒤 아무 칸도 키보드를 갖지 못한 채 남았다.
+//   다음 박자에(끝낸 클릭의 기본 동작이 포커스를 옮긴 뒤) **아무도 포커스를 갖지 않았을 때만** 준다 — 주인이 방금 누른
+//   입력 칸의 포커스는 빼앗지 않는다(deferPaneFocusUntilModalsClose 와 같은 규칙).
+function restorePaneFocusAfterRename(): void {
+  setTimeout(() => {
+    const a = document.activeElement;
+    if ((a == null || a === document.body) && focusedSid != null && !inlineRenameOpen(document)) setFocus(focusedSid);
+  }, 0);
+}
+
+// ★S1 수정3(오너 2026-11-22 「바꾼 이름이 앱의 다른 곳에서도 그 이름으로 보여야 한다」): 주인이 카드에서 직접 정한 이름
+//   (nameByUser)은 그 부서를 보여 주는 다른 화면(관제 센터 「작업」 · 승인 Feed 의 부서 구획)에서도 그 이름이다.
+//   부서 레지스트리의 표시명은 바꾸지 않는다(저장 방식 무변경) — 화면이 카드의 이름을 먼저 본다. 주인이 이름을 정하지
+//   않은 카드는 종전대로 레지스트리 표시명이다. 소켓으로 카드를 찾는다(부서 탭 하나 = 데몬 하나).
+function ownerNamedDept(socket: string | null | undefined, registryName: string): string {
+  if (!socket) return registryName;
+  const ws = workspaces.find((w) => w.nameByUser === true && !!w.socket && sameSocket(w.socket, socket));
+  return ws && ws.name ? ws.name : registryName;
 }
 
 // 06: 그룹 삭제(파괴적) — WKWebView confirm() 무동작이라 2-click 확인 패턴(ws close 차용).
@@ -7324,7 +7370,7 @@ async function refreshFeed() {
   if (all && Array.isArray(all.sockets) && all.sockets.length > 0 && all.sockets[0].dept === null && all.sockets[0].ok) {
     sections = all.sockets.map((x) => ({
       socket: x.dept === null ? undefined : x.socket,
-      label: x.dept === null ? "본부" : x.display_name || x.dept,
+      label: x.dept === null ? "본부" : ownerNamedDept(x.socket, x.display_name || x.dept),
       ok: x.ok,
       replyable: x.dept === null ? true : x.replyable === true,
       items: Array.isArray(x.items) ? x.items : [], // 데몬 순서(오래된 것 먼저) — 그릴 때 뒤집는다
@@ -10977,6 +11023,9 @@ async function start() {
   workspaces = workspaces.filter((ws) => keepWorkspaceOnRestore(ws, liveBySock.get(ws.socket)));
   // 구버전 자동 번호 이름("ws N")은 미정 표시로 이행
   for (const ws of workspaces) {
+    // ★S1 수정3(판정 02): 주인이 직접 정한 이름(nameByUser)은 모양이 자리표시와 같아도 손대지 않는다. 표식이 없는
+    //   워크스페이스는 종전 추정 그대로다(아래 두 규칙).
+    if (ws.nameByUser === true) continue;
     if (/^ws \d+$/.test(ws.name)) ws.name = UNTITLED;
     // §E-4: 부서 탭 표시명 복원 — 표시명이 비었거나(미정·dept-N 번호) 레지스트리에 display_name 이 있으면
     // 그 표시명으로 회복. 사용자가 의미있게 rename 한 이름(레지스트리와 다른 값)은 덮지 않는다.
@@ -11702,6 +11751,9 @@ window.addEventListener("keydown", (e) => {
   // ★P1-3: 확인 모달이 떠 있으면 전역 단축키가 **뒤의 세션을 건드리지 못하게** 막는다.
   // 시뮬레이션 지적: 파괴적 다이얼로그를 닫으려던 사용자의 ⌘W 가 확인 없이 뒤 pane 을 죽였다.
   if (document.querySelector(".modal-overlay")) return;
+  // ★S1 수정3: 이름을 고치는 중에도 같다 — 이름 칸에 커서를 둔 채 누른 ⌘W 가 뒤의 pane 세션을 닫지 못하게 한다
+  //   (종전에는 편집이 금방 닫혀 드러나지 않았다; 이제 주인이 끝낼 때까지 열려 있다).
+  if (inlineRenameOpen(document)) return;
   const mod = e.metaKey || e.ctrlKey;
   if (!mod) return;
   if (e.key === "k") {
