@@ -963,7 +963,8 @@ describe("U2+U3 좌석 배치 배선 — 대표 1/3 · 역할 자리 기억(seat
   it("★(W20) S5(anchorHeadSafe) 루프는 수동 탭을 다시 짜지 않는다 — 수동 탭은 CSO 1회 이관만 하고 `continue`(★S1 수정1 · 동작은 csosidewiring.test.ts 가 실행으로 잰다)", () => {
     const s = startSlice();
     expect(s).toContain("if (!ws.tree) continue;");
-    const a = s.indexOf("    if (ws.layoutManual) {\n      if (!csoSideDone) ws.tree = moveCsoToSide(ws.tree, roleOf);\n      continue;\n    }\n    ws.tree = anchorHeadSafe(ws.tree, roleOf);");
+    // ★S1 M3(R6): 이관 뒤에 「이 탭의 이관이 남았나」를 묻는 한 줄이 끼었다(표식 판정 — 동작은 csosidewiring.test.ts 가 실행으로 잰다).
+    const a = s.indexOf("    if (ws.layoutManual) {\n      if (!csoSideDone) ws.tree = moveCsoToSide(ws.tree, roleOf);\n      if (csoMovePending(ws.tree, roleOf)) csoSideLeft = true;\n      continue;\n    }\n    ws.tree = anchorHeadSafe(ws.tree, roleOf);");
     expect(a).toBeGreaterThan(0); // 수동 분기가 anchorHeadSafe **앞**에서 빠져나간다
   });
 

@@ -330,6 +330,10 @@ function sideRank(r: string | null | undefined): number {
 function sideColumn(cells: readonly LPane[], roleOf: RoleOf): LNode {
   const ordered: LPane[] = [];
   for (let k = 0; k <= 3; k++) for (const p of cells) if (sideRank(effRole(p, roleOf)) === k) ordered.push(p);
+  return sideStack(ordered);
+}
+/** 리뷰어 열의 **높이 규칙만**(위 sideColumn 의 뒷부분 — 순서는 받은 그대로 쌓는다). ordered 는 1개 이상. */
+function sideStack(ordered: readonly LPane[]): LNode {
   let acc: LNode = ordered[ordered.length - 1];
   let live = ordered[ordered.length - 1].sid > 0 ? 1 : 0;
   let count = 1;
@@ -629,6 +633,13 @@ function moveCsoCore(t: LNode, roleOf: RoleOf): LNode {
   if (!csos.length || !headOnly || !stacked(t) || !hasMasterIn(t, roleOf)) return t;
   const head = without(t, csos);
   return head ? { type: "split", dir: "row", ratio: MASTER_FRAC, a: head, b: sideColumn(csos, roleOf) } : t;
+}
+/**
+ * ★S1 M3(R6) — 수동 탭 1회 이관이 이 탭에 **아직 남았는가**. 기동 S5 가 이관 뒤에 묻고, 참인 탭이 하나라도 있으면
+ * 표식(csoSideDone)을 세우지 않는다(다음 기동이 다시 한다). 이 판은 배선만이다 — 종전 동작 그대로 언제나 거짓. 전역.
+ */
+export function csoMovePending(tree: LNode | null, roleOf: RoleOf): boolean {
+  return false;
 }
 /** 대표 칸이 제자리인가(테스트·배선 판독용). 전역. */
 export function isAnchored(tree: unknown, roleOf: RoleOf): boolean {

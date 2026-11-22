@@ -97,6 +97,7 @@ import {
   adoptSeat,
   anchorHeadSafe,
   annotateRoles,
+  csoMovePending,
   daemonIdentOf,
   dropHole,
   fillHole,
@@ -11091,6 +11092,8 @@ async function start() {
   //   아래 anchorHeadSafe 가 매 기동 새 모양으로 세운다(구버전 저장본도 여기서 옮겨진다). **수동 탭**은 주인이 정한
   //   배치라 다시 짜지 않지만, 이 판 이전에 저장된 것이면 CSO 한 칸만 **한 번** 옮긴다(moveCsoToSide — 나머지 칸과
   //   끌어 둔 비율은 그대로). 한 번 했다는 표식(csoSideDone)은 saveLayout 이 저장본에 남긴다.
+  // ★S1 M3(R6): 표식은 이관이 남은 수동 탭이 **하나도 없을 때만** 선다 — 남았는지는 csoMovePending 이 답한다(seatlayout.ts).
+  let csoSideLeft = false;
   for (const ws of workspaces) {
     if (!ws.tree) continue;
     const lb = liveBySock.get(ws.socket);
@@ -11098,11 +11101,12 @@ async function start() {
     const roleOf: RoleOf = (x) => (roles && roles.has(x) ? roles.get(x) : undefined);
     if (ws.layoutManual) {
       if (!csoSideDone) ws.tree = moveCsoToSide(ws.tree, roleOf);
+      if (csoMovePending(ws.tree, roleOf)) csoSideLeft = true;
       continue;
     }
     ws.tree = anchorHeadSafe(ws.tree, roleOf);
   }
-  csoSideDone = true;
+  if (!csoSideLeft) csoSideDone = true;
   // ★W-2-d: newSurface 직전 — 초기화가 끝난 앱의 죽은 데몬에 surface 를 만들지 않는다.
   if (startHaltedByReset(info)) return;
   // master 자동기동 제거 후: 데몬은 살아있으나(ok===true) 입양할 surface가 0개인 부서 ws(비활성 부서가
