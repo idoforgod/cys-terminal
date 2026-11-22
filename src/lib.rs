@@ -4409,6 +4409,107 @@ mod tests {
         assert_eq!(out4, format!("/opt/app/bin:/custom/shim:/usr/bin:/bin:{local}"));
     }
 
+    #[test]
+    fn compose_unix_pane_path_puts_prefixes_ahead_of_an_earlier_directory() {
+        // ★S1 M2(1)(ADDENDUM 5 · reviewer-codex DEV-M1 "compose-existing-runtime"): 앱의 runtime 폴더가 상속 PATH 의
+        //   **뒤쪽에 이미 있으면** 종전 합성은 그 자리에 두었다 — 앞선 폴더의 python3·git·node 가 이겼다. 규칙: 받은 prefix
+        //   는 언제나 맨 앞(받은 순서), 뒤쪽 사본은 지운다, 나머지 순서는 그대로, ~/.local/bin 은 없을 때만 끝에.
+        let home = Path::new("/home/fixture-user");
+        let local = home.join(".local").join("bin").to_string_lossy().into_owned();
+        let p = vec!["/rt/python/bin".to_string(), "/rt/node/bin".to_string()];
+        let mut bad: Vec<String> = Vec::new();
+        let cur = format!("/early/bin:/rt/python/bin:/usr/bin:/rt/node/bin:{local}");
+        let want = format!("/rt/python/bin:/rt/node/bin:/early/bin:/usr/bin:{local}");
+        let got = compose_unix_pane_path(&p, home, &cur);
+        if got.as_deref() != Some(want.as_str()) {
+            bad.push(format!("earlier dir first: got {got:?}, want {want:?}"));
+        }
+        // 이미 맨 앞이고 뒤 사본이 없으면 무변경(None) — 종전 계약 그대로.
+        let led = format!("/rt/python/bin:/rt/node/bin:/early/bin:{local}");
+        let got2 = compose_unix_pane_path(&p, home, &led);
+        if got2.is_some() {
+            bad.push(format!("already leading must be None: got {got2:?}"));
+        }
+        // 맨 앞인데 뒤에 사본이 하나 더 있으면 그 사본만 빠진다.
+        let dup = format!("/rt/python/bin:/rt/node/bin:/usr/bin:/rt/python/bin:{local}");
+        let want3 = format!("/rt/python/bin:/rt/node/bin:/usr/bin:{local}");
+        let got3 = compose_unix_pane_path(&p, home, &dup);
+        if got3.as_deref() != Some(want3.as_str()) {
+            bad.push(format!("later copy removed: got {got3:?}, want {want3:?}"));
+        }
+        // 한 prefix 만 뒤에 있고 다른 하나는 없을 때도 둘 다 받은 순서로 맨 앞.
+        let half = "/early/bin:/rt/node/bin:/bin";
+        let want4 = format!("/rt/python/bin:/rt/node/bin:/early/bin:/bin:{local}");
+        let got4 = compose_unix_pane_path(&p, home, half);
+        if got4.as_deref() != Some(want4.as_str()) {
+            bad.push(format!("one present later, one absent: got {got4:?}, want {want4:?}"));
+        }
+        assert!(bad.is_empty(), "S1 M2(1) violations:\n{}", bad.join("\n"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seat_path_runs_the_bundled_tools_although_an_earlier_directory_holds_them() {
+        // ★S1 M2(1) — reviewer-codex 의 입력 그대로: `<earlier>:<exe_dir>:<runtime 폴더들>:/usr/bin:/bin`. 앞선 폴더와 앱의
+        //   runtime 에 같은 이름(python3·git·node)의 가짜 실행 파일을 두고, 좌석 PATH 로 **실제 셸**이 고르는 것을 잰다.
+        //   exe_dir(cys 자신의 폴더)은 종전 규칙 그대로다 — 이미 있으면 그 자리, 없으면 맨 앞.
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("cys-s1-m2-path-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let app = base.join("App With Spaces.app");
+        let macos = app.join("Contents").join("MacOS");
+        let rt = app.join("Contents").join("Resources").join("runtime");
+        let early = base.join("earlier");
+        let put = |dir: &Path, name: &str, mark: &str| {
+            fs::create_dir_all(dir).unwrap();
+            let f = dir.join(name);
+            fs::write(&f, format!("#!/bin/sh\necho {mark}-{name}\n")).unwrap();
+            fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        fs::create_dir_all(&macos).unwrap();
+        put(&rt.join("python").join("bin"), "python3", "BUNDLED");
+        put(&rt.join("devtools").join("bin"), "git", "BUNDLED");
+        put(&rt.join("git").join("bin"), "git", "BUNDLED-BARE");
+        put(&rt.join("node").join("bin"), "node", "BUNDLED");
+        for t in ["python3", "git", "node"] {
+            put(&early, t, "EARLIER");
+        }
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let rts: Vec<String> = runtime_bin_dirs(&macos).iter().map(|d| s(d)).collect();
+        let cur = format!("{}:{}:{}:/usr/bin:/bin", s(&early), s(&macos), rts.join(":"));
+        let mut bad: Vec<String> = Vec::new();
+        let path = runtime_prefixed_path(&macos, &cur).unwrap_or_else(|| cur.clone());
+        for t in ["python3", "git", "node"] {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("command -v {t}; {t}"))
+                .env_clear()
+                .env("PATH", &path)
+                .output()
+                .expect("/bin/sh");
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let mut lines = text.lines();
+            let resolved = lines.next().unwrap_or("").to_string();
+            let said = lines.next().unwrap_or("").to_string();
+            if !resolved.starts_with(&s(&rt)) || !said.starts_with("BUNDLED-") {
+                bad.push(format!("{t}: resolved {resolved:?} said {said:?} (want under {})", s(&rt)));
+            }
+        }
+        let exe_at = path.split(':').position(|e| e == s(&macos));
+        let early_at = path.split(':').position(|e| e == s(&early));
+        if !(exe_at.is_some() && early_at.is_some() && early_at < exe_at) {
+            bad.push(format!("exe_dir must keep its place behind the earlier dir: {path}"));
+        }
+        // exe_dir 가 없으면 종전처럼 맨 앞이다.
+        let fresh = runtime_prefixed_path(&macos, &format!("{}:/usr/bin:/bin", s(&early))).unwrap_or_default();
+        if !fresh.starts_with(&format!("{}:", s(&macos))) {
+            bad.push(format!("absent exe_dir must lead as before: {fresh}"));
+        }
+        let _ = fs::remove_dir_all(&base);
+        assert!(bad.is_empty(), "S1 M2(1) violations (PATH={path}):\n{}", bad.join("\n"));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn runtime_bin_dirs_macos_resolves_bundle_resources_layout() {
