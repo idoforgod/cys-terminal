@@ -893,9 +893,15 @@ mod tests {
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o000)).unwrap();
         let privileged = std::fs::read_dir(&base).is_ok();
         let out = remove_retired_feedback_dir_in(&base);
+        // 지우기 전의 관문도 같은 답을 낸다(몸통을 거친 길) — 못 본 것을 「없음」으로 접으면 알림도 없이 지나간다
+        let out_gate = remove_retired_feedback_dir_at(&home, 1795000020);
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
         if !privileged {
             assert!(matches!(out, RetiredFeedbackCleanup::Failed(_)), "볼 수 없는 폴더를 다르게 읽었다: {out:?}");
+            assert!(
+                matches!(out_gate, RetiredFeedbackCleanup::Failed(_)),
+                "관문이 볼 수 없는 폴더를 다르게 읽었다: {out_gate:?}"
+            );
             assert!(base.join("feedback/fb-1/description.txt").exists());
         }
         let _ = std::fs::remove_dir_all(&home);
