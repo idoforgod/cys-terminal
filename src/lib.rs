@@ -1204,6 +1204,13 @@ pub fn runtime_prefixed_path(exe_dir: &Path, current_path: &str) -> Option<Strin
         // unix: 로그인 셸(-l) 프로파일이 PATH 를 복원하지만, claude native 설치기(2.1.207)가 rc 를
         // 수정하지 않음이 실측 확인되어 ~/.local/bin 은 belt-and-braces 로 무조건 append 한다.
         let _ = sep; // unix 합성은 compose_unix_pane_path 가 ':' 고정 사용.
+        // ★S1 M2(1): runtime 폴더(앱의 python3·git·node)는 언제나 맨 앞으로 넘긴다. exe_dir(cys 자신)은 종전 규칙 —
+        //   상속 PATH 에 없을 때만 넘겨 맨 앞에 서고, 있으면 그 자리다(~/.local/bin·/usr/bin 같은 exe_dir 이 사용자 PATH
+        //   순서를 바꾸지 않게).
+        let exe = &prefixes[0];
+        if current_path.split(':').any(|e| e == exe) {
+            prefixes.remove(0);
+        }
         compose_unix_pane_path(&prefixes, &home_dir(), current_path)
     }
 }
@@ -1916,28 +1923,32 @@ pub fn spawn_env_pairs_from_process(exe_dir: &Path) -> Vec<(String, String)> {
 /// belt-and-braces 를 unix 로 대칭 확장, is_dir 게이트 없이 무조건 append(셸은 없는 PATH 항목을 무시).
 /// append 인 이유는 MAJ#1 과 동일: 발견이 목적 — 기존 항목의 precedence 를 강등하지 않는다.
 /// dedup 은 unix 관례대로 case-sensitive 단순 비교. 결과가 현행과 같으면 None(무변경 계약 유지).
+///
+/// ★S1 M2(1)(ADDENDUM 5 · reviewer-codex DEV-M1): prefix 는 **언제나 맨 앞**이다 — 상속 PATH 뒤쪽에 이미 있던 사본은
+/// 지운다. 종전엔 「이미 있으면 그 자리」였고, 앞선 폴더(cys-dept 의 ~/.local/bin:/opt/homebrew/bin 등)의 python3·git·node
+/// 가 앱의 것을 이겼다. 호출부(runtime_prefixed_path)는 앱 runtime 폴더만 언제나 넘기고, exe_dir 은 없을 때만 넘긴다.
+/// 한계: 로그인 셸(`-l`)은 이 뒤에 /etc/zprofile 의 path_helper 와 사용자 .zprofile 로 PATH 를 다시 짠다(이월 목록).
 pub fn compose_unix_pane_path(prefixes: &[String], home: &Path, current_path: &str) -> Option<String> {
     let sep = ':';
-    let add: Vec<&str> = prefixes
-        .iter()
-        .map(String::as_str)
-        .filter(|p| !current_path.split(sep).any(|e| e == *p))
+    let rest: Vec<&str> = current_path
+        .split(sep)
+        .filter(|e| !prefixes.iter().any(|p| p == e))
         .collect();
     let local_bin = home.join(".local").join("bin").to_string_lossy().into_owned();
     let append_local = !current_path.split(sep).any(|e| e == local_bin)
-        && !add.iter().any(|p| *p == local_bin);
-    if add.is_empty() && !append_local {
-        return None;
-    }
+        && !prefixes.iter().any(|p| *p == local_bin);
     let mut composed = String::new();
-    if !add.is_empty() {
-        composed.push_str(&add.join(&sep.to_string()));
+    if !prefixes.is_empty() {
+        composed.push_str(&prefixes.join(&sep.to_string()));
         composed.push(sep);
     }
-    composed.push_str(current_path);
+    composed.push_str(&rest.join(&sep.to_string()));
     if append_local {
         composed.push(sep);
         composed.push_str(&local_bin);
+    }
+    if composed == current_path {
+        return None;
     }
     Some(composed)
 }
