@@ -5,9 +5,10 @@
 //   주인이 아직 안 온 칸(구멍)은 기한 동안만 보이고, 기한이 지나도 기억은 남는다. 역할 하나에 칸 하나.
 // 반박 보고서(phase1/U2-master-seat-persist.refute.md)의 major/minor 보정을 여기서 검체로 박제한다.
 import { describe, it, expect } from "bun:test";
+// ★S1 수정1 의 새 공개 이름(moveCsoToSide)은 모듈 객체로 읽는다 — 그 이름이 없는 판에서 파일 전체가 적재 실패로 죽지 않게.
+import * as SL from "./seatlayout";
 import {
   MASTER_FRAC,
-  HEAD_COL_MASTER,
   MAX_HOLES_PER_TREE,
   ROLE_SLOT_GRACE_MS,
   adoptSeat,
@@ -132,19 +133,37 @@ describe("★재부팅 실측 재현 — 새 sid 로 되살아난 6석이 원래
         const t = ws.tree as LNode;
         expect(holeSidsOf(t)).toEqual([]); // 전부 결속 — 구멍이 남지 않는다
         expect(sids(t).sort()).toEqual([26, 27, 28, 29, 30, 31]);
-        // 좌상단 = master
-        expect(t.type === "split" && t.a.type === "split" && t.a.a.type === "pane" && t.a.a.sid === 30).toBe(true);
         if (manual) {
+          // 좌상단 = master · 결속은 칸·비율을 그대로 둔다(수동 탭의 CSO 이관은 기동 때 moveCsoToSide 가 한 번 한다 — 아래 검체)
+          expect(t.type === "split" && t.a.type === "split" && t.a.a.type === "pane" && t.a.a.sid === 30).toBe(true);
           expect(shape(t, (s) => ROLE_BY_NEW.get(s))).toEqual(shape(CEO_SAVED(), () => undefined));
           close(W(t, 30), 0.25);
         } else {
+          // ★S1 수정1: 왼쪽 열 = master(30) 혼자 · 전체 높이 / 오른쪽 끝 열 = agy(31)·codex(27)·CSO(29) 가 1/3 씩
+          expect(t.type === "split" && t.a.type === "pane" && t.a.sid === 30).toBe(true);
           close(W(t, 30), MASTER_FRAC); // U2↔U3 충돌은 1/3 한 상수로 해소
-          close(H(t, 30), HEAD_COL_MASTER);
-          for (const s of [26, 28, 31]) close(W(t, s), 2 / 9);
+          close(H(t, 30), 1);
+          for (const s of [26, 28, 31, 27, 29]) close(W(t, s), 2 / 9);
+          for (const s of [31, 27, 29]) close(H(t, s), 1 / 3);
+          expect(t.type === "split" ? sids(t.b).slice(-3) : []).toEqual([31, 27, 29]); // 위→아래: agy · codex · CSO
         }
       }
     });
   }
+  it("★S1 수정1 — 수동 탭: 결속 뒤 기동 1회 이관(moveCsoToSide)이 CSO 만 리뷰어 열 맨 아래로 옮긴다 · 대표 폭 0.25 와 다른 비율은 저장본 그대로", () => {
+    const [ws] = simulateStart([{ tree: CEO_SAVED(), layoutManual: true }], REBOOT_LIVE, { genChanged: true, roleConflictIsDead: false });
+    const roleOf = mapRole(new Map<number, string | null>(REBOOT_LIVE));
+    const move = (SL as unknown as Record<string, (t: LNode | null, r: typeof roleOf) => LNode | null>).moveCsoToSide;
+    const t = move(ws.tree, roleOf) as LNode;
+    expect(sids(t).sort()).toEqual([26, 27, 28, 29, 30, 31]);
+    expect(t.type === "split" && t.a.type === "pane" && t.a.sid === 30).toBe(true); // 대표 칸 = master 혼자
+    close(W(t, 30), 0.25); // 사용자가 둔 대표 폭 그대로
+    close(H(t, 30), 1);
+    for (const s of [26, 28, 31, 27, 29]) close(W(t, s), 0.25); // 오른쪽 세 컬럼의 폭도 그대로
+    for (const s of [31, 27, 29]) close(H(t, s), 1 / 3); // 저장본의 agy·codex 1:1 에 CSO 가 균등 몫으로 낀다
+    expect(t.type === "split" ? sids(t.b).slice(-3) : []).toEqual([31, 27, 29]);
+    expect(move(t, roleOf)).toBe(t); // 이미 옮겨졌다 — 두 번째는 아무것도 안 한다
+  });
   it("대조(수정 전 규칙): 역할을 무시하고 sid 순으로 오른쪽에 붙이면 master 는 6개 중 5번째·폭 1/4 · worker 1/32 — 이 결함이 재현된다(U2 보고 §2 경로 A)", () => {
     let t: LNode | null = null;
     for (const [sid] of [...REBOOT_LIVE].sort((a, b) => a[0] - b[0])) t = legacyAppend(t, sid);
@@ -158,13 +177,15 @@ describe("★재부팅 실측 재현 — 새 sid 로 되살아난 6석이 원래
 
 // ────────────────────────────────────────────────────────────────────────────
 describe("기억이 없는 경우 · 부분 복원 · 1:1", () => {
-  it("옛 저장본(역할 없음) → 구멍 0 · U3 배치로 master 왼쪽 1/3 · cso 는 대표 칸(업그레이드 첫 기동 = 폴백)", () => {
+  it("옛 저장본(역할 없음) → 구멍 0 · U3 배치로 master 왼쪽 1/3 · cso 는 오른쪽 끝 열(업그레이드 첫 기동 = 폴백 · ★S1 수정1)", () => {
     const legacy: LNode = JSON.parse(JSON.stringify(CEO_SAVED()).replace(/,"role":"[^"]+"/g, ""));
     const [ws] = simulateStart([{ tree: legacy }], REBOOT_LIVE, { genChanged: false, roleConflictIsDead: true });
     const t = ws.tree as LNode;
     expect(holeSidsOf(t)).toEqual([]);
     close(W(t, 30), MASTER_FRAC);
-    expect(t.type === "split" && sids(t.a).includes(29)).toBe(true);
+    close(H(t, 30), 1);
+    expect(t.type === "split" ? sids(t.b).slice(-3) : []).toEqual([31, 27, 29]);
+    for (const s of [31, 27, 29]) close(H(t, s), 1 / 3);
   });
   it("복원 진행 중: worker 만 살아 있으면 worker 결속 · master 칸은 구멍으로 남고 · 다음 틱에 오면 **같은 칸**에 결속", () => {
     const [ws0] = simulateStart([{ tree: CEO_SAVED(), layoutManual: true }], [[40, "worker"]], { genChanged: true, roleConflictIsDead: false });
@@ -187,13 +208,14 @@ describe("기억이 없는 경우 · 부분 복원 · 1:1", () => {
     const [tidy] = tidyHoles([plan.tree], roleOf);
     expect(sids(tidy)).toEqual([5]);
   });
-  it("역할 불일치 — master 구멍에 cso 를 넣지 않는다(cso 는 U3 규칙으로 배치 · 구멍은 남음)", () => {
+  it("역할 불일치 — master 구멍에 cso 를 넣지 않는다(cso 는 리뷰어 열로 · 구멍은 남음 · ★S1 수정1)", () => {
     const t: LNode = { type: "split", dir: "row", ratio: 1 / 3, a: { type: "pane", sid: -1, role: "master" }, b: { type: "pane", sid: 3, role: "worker" } };
     const roleOf = mapRole(new Map<number, string | null>([[3, "worker"], [7, "cso"]]));
     const plan = adoptSeat([{ tree: t }], undefined, 7, "cso", roleOf) as NonNullable<ReturnType<typeof adoptSeat>>;
     expect(plan.boundHole).toBeNull();
     expect(holeSidsOf(plan.tree)).toEqual([-1]);
-    expect(plan.tree.type === "split" && sids(plan.tree.a).includes(7)).toBe(true); // master 구멍 = 대표 칸 → cso 는 그 아래
+    expect(plan.tree.type === "split" && sids(plan.tree.a)).toEqual([-1]); // master 구멍 = 대표 칸 — 혼자 남는다
+    expect(plan.tree.type === "split" ? sids(plan.tree.b) : []).toEqual([3, 7]); // cso 는 오른쪽 끝 열
   });
   // ★리뷰1 F8 P12 — 저장본에 이미 있던(이전 세션의) 역할 없는 구멍은 복원에서 남기지 않는다.
   // 남으면 영원히 채워지지 않는 빈 자리가 트리에 쌓인다(구멍 상한·위생과 별개로 restoreTree 자체가 거른다).

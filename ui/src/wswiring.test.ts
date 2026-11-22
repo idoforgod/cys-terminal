@@ -937,9 +937,10 @@ describe("U2+U3 좌석 배치 배선 — 대표 1/3 · 역할 자리 기억(seat
   //   ("ws.layoutManual || !ws.tree" 가 그대로 있다)과 무관하게 통과한다. 대입식을 직접 죈다.
   it("★(U16-A5-2) S5 anchorHeadSafe 결과가 실제로 ws.tree 에 대입된다(결과를 버리는 뮤턴트 차단)", () => {
     const s = startSlice();
-    expect(s).toContain(
-      "ws.tree = anchorHeadSafe(ws.tree, (x) => (roles && roles.has(x) ? roles.get(x) : undefined));",
-    );
+    // ★S1 수정1: 역할 조회는 한 번 만들어(roleOf) 자동 탭의 재정렬과 수동 탭의 CSO 1회 이관이 함께 쓴다.
+    expect(s).toContain("const roleOf: RoleOf = (x) => (roles && roles.has(x) ? roles.get(x) : undefined);");
+    expect(s).toContain("ws.tree = anchorHeadSafe(ws.tree, roleOf);");
+    expect(s).toContain("if (!csoSideDone) ws.tree = moveCsoToSide(ws.tree, roleOf);"); // 이관 결과도 버리지 않는다
   });
 
   it("★(W4) 수동 표식 1회 추정 가드 — 이미 boolean 이면 다시 추정하지 않는다(매 기동 재추정 금지)", () => {
@@ -959,9 +960,11 @@ describe("U2+U3 좌석 배치 배선 — 대표 1/3 · 역할 자리 기억(seat
     expect(s).toContain("same.forEach((w, i) => (w.tree = tidy[i]));");
   });
 
-  it("★(W20) S5(anchorHeadSafe) 루프는 수동 탭을 건드리지 않는다(`ws.layoutManual || !ws.tree` 가드)", () => {
+  it("★(W20) S5(anchorHeadSafe) 루프는 수동 탭을 다시 짜지 않는다 — 수동 탭은 CSO 1회 이관만 하고 `continue`(★S1 수정1 · 동작은 csosidewiring.test.ts 가 실행으로 잰다)", () => {
     const s = startSlice();
-    expect(s).toContain("if (ws.layoutManual || !ws.tree) continue;");
+    expect(s).toContain("if (!ws.tree) continue;");
+    const a = s.indexOf("    if (ws.layoutManual) {\n      if (!csoSideDone) ws.tree = moveCsoToSide(ws.tree, roleOf);\n      continue;\n    }\n    ws.tree = anchorHeadSafe(ws.tree, roleOf);");
+    expect(a).toBeGreaterThan(0); // 수동 분기가 anchorHeadSafe **앞**에서 빠져나간다
   });
 
   it("★(W23) 고아 입양 순서는 역할 우선(seatPriority) · sid 는 동률 보조키일 뿐이다", () => {

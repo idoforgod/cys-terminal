@@ -826,6 +826,7 @@ describe("saveLayout — 실제 본문 실행(저장본에는 런타임 전용·
       activeWs: 0,
       wsCounter: 4,
       groupCounter: 4,
+      csoSideDone: false, // ★S1 수정1: saveLayout 이 읽는 모듈 변수(수동 탭의 CSO 1회 이관 표식)
       LAYOUT_KEY: "cys-layout-v2",
       localStorage: { setItem: (_k: string, v: string): void => void (stored = v) },
     });

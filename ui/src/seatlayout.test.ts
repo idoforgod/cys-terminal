@@ -11,6 +11,7 @@ import {
   HEAD_COL_MASTER,
   anchorHead,
   anchorHeadSafe,
+  evenComb,
   holdPane,
   isAnchored,
   isAutoRatio,
@@ -30,6 +31,10 @@ import {
   type LNode,
   type RoleOf,
 } from "./seatlayout";
+// ★S1 수정1 의 새 공개 이름(isSideRole · moveCsoToSide)은 이름 가져오기가 아니라 모듈 객체로 읽는다 — 그 이름이
+//   없는 판(v0.15.1)에서 파일 전체가 적재 실패로 죽지 않고, 해당 검체만 제 이유로 붉어지게 하려는 것이다.
+import * as SL from "./seatlayout";
+const sl = SL as unknown as Record<string, (...a: any[]) => any>;
 
 // ---------- 오라클 (렌더러와 같은 규칙: 안 보이는 구멍 쪽은 접힌다) ----------
 const shown = (n: LNode, hs: (s: number) => boolean): boolean =>
@@ -82,6 +87,56 @@ function build(roles: [number, string | null][], manual = false): { t: LNode; ro
 }
 const ROLES6 = ["master", "cso", "worker", "worker-2", "reviewer-codex", "reviewer-gemini"];
 
+// ---------- ★S1 수정1 오라클: 칸의 사각형(왼쪽 위 원점 · 화면 전체 = 1×1 · 안 보이는 구멍 쪽은 접힌다) ----------
+type Rect = { x: number; y: number; w: number; h: number };
+function rect(t: LNode, sid: number, hs: (s: number) => boolean = () => false, r: Rect = { x: 0, y: 0, w: 1, h: 1 }): Rect | null {
+  if (t.type === "pane") return t.sid === sid ? r : null;
+  const sa = shown(t.a, hs);
+  const sb = shown(t.b, hs);
+  if (!sa) return rect(t.b, sid, hs, r);
+  if (!sb) return rect(t.a, sid, hs, r);
+  const q = t.ratio ?? 0.5;
+  const ra: Rect = t.dir === "row" ? { ...r, w: r.w * q } : { ...r, h: r.h * q };
+  const rb: Rect = t.dir === "row" ? { x: r.x + r.w * q, y: r.y, w: r.w * (1 - q), h: r.h } : { x: r.x, y: r.y + r.h * q, w: r.w, h: r.h * (1 - q) };
+  return rect(t.a, sid, hs, ra) ?? rect(t.b, sid, hs, rb);
+}
+const near = (a: number, b: number) => Math.abs(a - b) < 1e-9;
+/**
+ * 새 표준 모양인가: master 는 왼쪽 1/3 을 위아래 전부 **혼자** 쓰고, side(위→아래 순서 · 맨 아래가 CSO)는 **오른쪽 끝
+ * 한 열**을 같은 높이로 나누며, mids(가운데 좌석)는 각자 한 컬럼 전체 높이이고, 오른쪽 2/3 의 컬럼 폭은 전부 같다.
+ * 맞으면 "" · 어긋나면 어긋난 첫 칸과 그 사각형.
+ */
+function stdShape(t: LNode, master: number, side: number[], mids: number[], hs: (s: number) => boolean = () => false): string {
+  const m = rect(t, master, hs);
+  if (!m || !near(m.x, 0) || !near(m.y, 0) || !near(m.w, MASTER_FRAC) || !near(m.h, 1)) return "master " + JSON.stringify(m);
+  const cols = mids.length + (side.length ? 1 : 0);
+  const cw = cols ? (1 - MASTER_FRAC) / cols : 0;
+  for (const s of mids) {
+    const r = rect(t, s, hs);
+    if (!r || !near(r.w, cw) || !near(r.h, 1) || !near(r.y, 0)) return "mid " + s + " " + JSON.stringify(r);
+  }
+  for (let i = 0; i < side.length; i++) {
+    const r = rect(t, side[i], hs);
+    if (!r || !near(r.x, 1 - cw) || !near(r.w, cw) || !near(r.h, 1 / side.length) || !near(r.y, i / side.length)) {
+      return "side " + side[i] + " " + JSON.stringify(r);
+    }
+  }
+  return "";
+}
+const P = (sid: number, role: string): LNode => ({ type: "pane", sid, role });
+/** v0.15.1 이 만들던 모양(구버전 저장본): 왼쪽 1/3 = master 위(3/4)·CSO 아래 / 가운데 worker·그 밖 / 오른쪽 agy 위·codex 아래(1:1). */
+function oldShape(seats: [number, string][]): LNode {
+  const by = (r: string) => seats.filter((s) => s[1] === r).map((s) => P(s[0], s[1]));
+  const head: LNode = { type: "split", dir: "col", ratio: HEAD_COL_MASTER, a: by("master")[0], b: by("cso")[0] };
+  const stacked = ["reviewer-gemini", "reviewer-codex"];
+  const rest = seats.filter((s) => s[1] !== "master" && s[1] !== "cso" && stacked.indexOf(s[1]) < 0).map((s) => P(s[0], s[1]));
+  const agy = by("reviewer-gemini")[0];
+  const codex = by("reviewer-codex")[0];
+  if (agy && codex) rest.push({ type: "split", dir: "col", ratio: 1 / 2, a: agy, b: codex });
+  else if (agy || codex) rest.push(agy ?? codex);
+  return { type: "split", dir: "row", ratio: MASTER_FRAC, a: head, b: evenComb(rest, "row") };
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 describe("역할 술어 — 대표 칸 소속은 하나의 술어다(반박 D5·D6)", () => {
   it("master 는 정확 일치 — master-fresh-* 는 대표가 아니다", () => {
@@ -89,11 +144,15 @@ describe("역할 술어 — 대표 칸 소속은 하나의 술어다(반박 D5·
     expect(isMasterRole("master-fresh-1790000000")).toBe(false);
     expect(isMasterRole("Master")).toBe(false);
   });
-  it("cso · cso-<숫자> 는 대표 칸, cso-fresh-<epoch> 은 아니다", () => {
+  it("★S1 수정1: 대표 칸 소속은 master 뿐 — cso · cso-<숫자> 와 리뷰어는 리뷰어 열 소속, 일회용 좌석은 어느 쪽도 아니다", () => {
     for (const r of ["cso", "cso-2", "cso-10"]) expect(isCsoRole(r)).toBe(true);
     for (const r of ["cso-fresh-1790000000", "cso2", "csox", "cso-", "xcso"]) expect(isCsoRole(r)).toBe(false);
-    expect(isHeadRole("cso-2")).toBe(true);
-    expect(isHeadRole("worker")).toBe(false);
+    expect(isHeadRole("master")).toBe(true);
+    for (const r of ["cso", "cso-2", "worker", "reviewer-gemini"]) expect(isHeadRole(r)).toBe(false);
+    for (const r of ["cso", "cso-2", "reviewer-gemini", "reviewer-codex", "reviewer-grok", "reviewer-claude-2"]) expect(sl.isSideRole(r)).toBe(true);
+    for (const r of ["master", "worker", "worker-2", null, undefined, "cso-fresh-1790000000", "reviewer-codex-fresh-1790000000"]) {
+      expect(sl.isSideRole(r)).toBe(false);
+    }
   });
   it("sanitizeRole — 저장·비교를 망가뜨릴 모양과 일회용 좌석만 거른다", () => {
     for (const r of ["master", "cso-2", "worker-3", "reviewer-gemini", "dept-1-master", "한글역할"]) expect(sanitizeRole(r)).toBe(r);
@@ -116,23 +175,22 @@ describe("역할 술어 — 대표 칸 소속은 하나의 술어다(반박 D5·
 // ────────────────────────────────────────────────────────────────────────────
 describe("정렬(roleLayout) — 대표 컬럼 1/3 · 나머지 2/3 균등", () => {
   for (let w = 0; w <= 8; w++) {
-    it(`worker ${w}명 + 리뷰어 2 → master 폭 1/3, 나머지 컬럼 (2/3)/${w + 1}`, () => {
+    it(`worker ${w}명 + 리뷰어 2 + CSO → master 혼자 1/3 · 나머지 컬럼 (2/3)/${w + 1} · 오른쪽 끝 열 = agy·codex·CSO 1/3 씩`, () => {
       const role = new Map<number, string | null>([[1, "master"], [2, "cso"], [90, "reviewer-gemini"], [91, "reviewer-codex"]]);
-      for (let k = 0; k < w; k++) role.set(10 + k, k ? `worker-${k + 1}` : "worker");
+      const mids: number[] = [];
+      for (let k = 0; k < w; k++) {
+        role.set(10 + k, k ? `worker-${k + 1}` : "worker");
+        mids.push(10 + k);
+      }
       const t = roleLayout([...role.keys()], mapRole(role)) as LNode;
-      close(W(t, 1), MASTER_FRAC);
-      close(H(t, 1), HEAD_COL_MASTER);
-      for (let k = 0; k < w; k++) close(W(t, 10 + k), 2 / 3 / (w + 1));
-      close(W(t, 90), 2 / 3 / (w + 1));
-      close(W(t, 91), 2 / 3 / (w + 1)); // 리뷰어 둘은 한 컬럼(agy 위 / codex 아래)
+      expect(stdShape(t, 1, [90, 91, 2], mids)).toBe("");
     });
   }
-  it("master 만 → 전체 폭 · master+cso-2 → 대표 컬럼만(전체 폭, cso-2 는 대표 칸 아래)", () => {
+  it("master 만 → 전체 폭 · master+cso-2 → master 왼쪽 1/3(전체 높이) | cso-2 오른쪽 열(★S1 수정1: master 아래가 아니다)", () => {
     close(W(roleLayout([1], () => "master") as LNode, 1), 1);
     const r = new Map<number, string | null>([[1, "master"], [2, "cso-2"]]);
     const t = roleLayout([1, 2], mapRole(r)) as LNode;
-    close(W(t, 1), 1);
-    close(H(t, 2), 1 - HEAD_COL_MASTER);
+    expect(stdShape(t, 1, [2], [])).toBe("");
   });
   it("역할이 하나도 없으면 종전과 같다(모든 컬럼 균등)", () => {
     const t = roleLayout([1, 2, 3, 4], () => null) as LNode;
@@ -145,11 +203,11 @@ describe("정렬(roleLayout) — 대표 컬럼 1/3 · 나머지 2/3 균등", () 
     close(W(t, 1), MASTER_FRAC);
     close(W(t, 2), 1 / 3);
   });
-  it("cso·cso-2 는 **자동 배치와 같은 술어로** 대표 칸에 모인다(D6)", () => {
+  it("cso·cso-2 는 **자동 배치와 같은 술어로** 리뷰어 열에 모인다(D6 · ★S1 수정1)", () => {
     const r = new Map<number, string | null>([[1, "master"], [2, "cso"], [3, "cso-2"], [4, "worker"]]);
     const t = roleLayout([1, 2, 3, 4], mapRole(r)) as LNode;
-    expect(t.type === "split" && inSub(t.a, 2) && inSub(t.a, 3)).toBe(true);
-    close(W(t, 4), 2 / 3);
+    expect(stdShape(t, 1, [2, 3], [4])).toBe("");
+    expect(stdShape(build([[1, "master"], [2, "cso"], [3, "cso-2"], [4, "worker"]]).t, 1, [2, 3], [4])).toBe("");
   });
   it("정렬 결과 칸에는 역할이 적힌다(다음 재부팅의 자리 기억)", () => {
     const r = new Map<number, string | null>([[1, "master"], [2, "worker"]]);
@@ -183,22 +241,15 @@ describe("자동 배치 — 표준 6석의 도착 순서 720가지 전수(비수
     }
     expect(checked).toBeGreaterThan(2000); // 오라클이 실제로 돌았다
   });
-  it(`${all.length}가지 최종 모양: cso 는 대표 칸(root.a) 안 · master 위 3/4 · 나머지 4컬럼 각 1/6`, () => {
-    let bad = 0;
+  it(`${all.length}가지 최종 모양(★S1 수정1): master 혼자 왼쪽 1/3 · worker 2컬럼 · 오른쪽 끝 열 = agy·codex·CSO 1/3 씩`, () => {
+    let bad = "";
     for (const order of all) {
       const { t } = build(order.map((r, i) => [i + 1, r] as [number, string]));
-      const m = order.indexOf("master") + 1;
-      const c = order.indexOf("cso") + 1;
-      const ok =
-        t.type === "split" &&
-        t.dir === "row" &&
-        inSub(t.a, m) &&
-        inSub(t.a, c) &&
-        Math.abs((H(t, m) ?? 0) - HEAD_COL_MASTER) < 1e-9 &&
-        order.every((r, i) => isHeadRole(r) || Math.abs((W(t, i + 1) ?? 0) - 1 / 6) < 1e-9);
-      if (!ok) bad++;
+      const at = (r: string) => order.indexOf(r) + 1;
+      const got = stdShape(t, at("master"), [at("reviewer-gemini"), at("reviewer-codex"), at("cso")], [at("worker"), at("worker-2")]);
+      if (got && !bad) bad = order.join(",") + " → " + got;
     }
-    expect(bad).toBe(0); // 프로토타입은 336/720 에서 cso 가 대표 칸 밖이었다(반박 D1)
+    expect(bad).toBe(""); // 도착 순서가 어떻든 같은 모양 — 흩어진 좌석은 매 배치 뒤 제자리로 모인다(반박 D1)
   });
 });
 
@@ -269,37 +320,43 @@ describe("수동 탭(layoutManual) — 재배치하지 않되 대표는 줄지 �
 
 // ────────────────────────────────────────────────────────────────────────────
 describe("재기동 — master·cso 가 새 sid 로 돌아온다(반박 D1·D2)", () => {
-  it("비수동: 옛 master 칸이 접힌 뒤 새 master → 대표 칸 위 · 1/3 · cso 는 대표 칸 안", () => {
+  it("비수동: 옛 master 칸이 접힌 뒤 새 master → 왼쪽 1/3 을 혼자 · cso 는 오른쪽 끝 열(★S1 수정1)", () => {
     const { t: t0, role } = build([[1, "master"], [2, "cso"], [3, "worker"], [4, "worker-2"]]);
     let t = rm(t0, 1) as LNode;
     role.delete(1);
     role.set(9, "master");
     t = placeSeat(t, 9, mapRole(role), false);
-    close(W(t, 9), MASTER_FRAC);
-    close(H(t, 9), HEAD_COL_MASTER);
-    expect(t.type === "split" && inSub(t.a, 2)).toBe(true);
-    close(W(t, 3), 1 / 3);
-    close(W(t, 4), 1 / 3);
+    expect(stdShape(t, 9, [2], [3, 4])).toBe("");
   });
-  it("수동: 루트 0.5 로 끈 탭에서 master 재기동 → 같은 컬럼 위로(0.5 유지 · 반박 R2 의 1/3 덮어쓰기 없음)", () => {
-    const { t: t0, role } = build([[1, "master"], [2, "cso"], [3, "worker"], [4, "worker-2"]]);
-    let t = rm({ ...(t0 as LNode & { type: "split" }), ratio: 0.5 }, 1) as LNode;
+  it("수동: master 칸이 사라진 탭에 master 재기동 → 왼쪽 1/3 새 컬럼 · 사용자가 둔 다른 컬럼의 상대 비율은 그대로", () => {
+    // ★S1 수정1 뒤로는 CSO 가 대표 칸에 없으므로, master 칸이 **통째로 사라진** 탭에는 대표 칸의 흔적이 남지 않는다
+    //   (실제 재기동은 master 구멍에 결속한다 — seatbind.test.ts). 그 경우 새 master 는 왼쪽 1/3 을 새로 받는다.
+    const { t: t0, role } = build([[1, "master"], [2, "cso"], [3, "worker"], [4, "worker-2"]], true);
+    const dragged = { ...(t0 as LNode & { type: "split" }), ratio: 0.5 };
+    let t = rm(dragged, 1) as LNode;
+    const before = [2, 3, 4].map((s) => W(t, s) as number);
     role.delete(1);
     role.set(9, "master");
     t = placeSeat(t, 9, mapRole(role), true);
-    close(W(t, 9), 0.5);
-    close(W(t, 2), 0.5);
-    expect(t.type === "split" && inSub(t.a, 9) && inSub(t.a, 2)).toBe(true);
+    close(W(t, 9), MASTER_FRAC);
+    close(H(t, 9), 1);
+    [2, 3, 4].forEach((s, i) => close(W(t, s), before[i] * (1 - MASTER_FRAC)));
+    expect(t.type === "split" && inSub(t.a, 9) && inSub(t.b, 2)).toBe(true);
   });
-  it("cso 재기동 → 대표 칸 아래로(비수동·수동 모두)", () => {
+  it("cso 재기동 → 리뷰어 열로(비수동·수동 모두 · ★S1 수정1: master 아래가 아니다)", () => {
     for (const manual of [false, true]) {
-      const { t: t0, role } = build([[1, "master"], [2, "cso"], [3, "worker"]], manual);
+      const { t: t0, role } = build([[1, "master"], [2, "cso"], [3, "worker"], [5, "reviewer-codex"]], manual);
       let t = rm(t0, 2) as LNode;
       role.delete(2);
       role.set(8, "cso");
       t = placeSeat(t, 8, mapRole(role), manual);
-      expect(t.type === "split" && inSub(t.a, 8) && inSub(t.a, 1)).toBe(true);
-      close(H(t, 1), HEAD_COL_MASTER);
+      expect(t.type === "split" && inSub(t.b, 8) && t.a.type === "pane" && t.a.sid === 1).toBe(true);
+      close(H(t, 1), 1);
+      const codex = rect(t, 5) as Rect;
+      const cso = rect(t, 8) as Rect;
+      expect(near(cso.x, codex.x) && near(cso.w, codex.w) && cso.y > codex.y).toBe(true); // 같은 열 · codex 아래
+      close(cso.h, 1 / 2);
+      close(codex.h, 1 / 2);
     }
   });
   it("종료된 옛 master(역할 맵에서 null)는 대표로 세지 않는다 — 대표 칸에 master 가 둘이 되지 않는다(반박 D4)", () => {
@@ -309,22 +366,20 @@ describe("재기동 — master·cso 가 새 sid 로 돌아온다(반박 D1·D2)"
     const t = placeSeat(t0, 9, mapRole(role), false);
     const masters = sids(t).filter((s) => role.get(s) === "master");
     expect(masters).toEqual([9]);
-    close(H(t, 9), HEAD_COL_MASTER);
+    close(H(t, 9), 1); // ★S1 수정1: 대표 칸은 master 혼자(끝난 옛 칸은 역할 없는 셸로 오른쪽에 남는다)
     close(W(t, 9), MASTER_FRAC);
   });
 });
 
 // ────────────────────────────────────────────────────────────────────────────
 describe("일회용·캐시 공백·대표 없는 탭", () => {
-  it("cso-fresh 가 붙어도 master 높이 3/4 유지 · TTL 로 닫히면 원래 폭(반박 D5·R6)", () => {
+  it("cso-fresh 가 붙어도 master·CSO 칸은 그대로(제 컬럼을 받는다) · TTL 로 닫히면 원래 폭(반박 D5·R6)", () => {
     const { t: t0, role } = build([[1, "master"], [2, "cso"], [3, "worker"]]);
     role.set(5, "cso-fresh-1790000000");
     const t = placeSeat(t0, 5, mapRole(role), false);
-    close(H(t, 1), HEAD_COL_MASTER);
-    close(W(t, 1), MASTER_FRAC);
+    expect(stdShape(t, 1, [2], [3, 5])).toBe(""); // 일회용은 리뷰어 열에 끼지 않는다 — CSO 높이 1 그대로
     const back = anchorHead(rm(t, 5), mapRole(role)) as LNode;
-    close(W(back, 1), MASTER_FRAC);
-    close(W(back, 3), 2 / 3);
+    expect(stdShape(back, 1, [2], [3])).toBe("");
   });
   it("오너 실사용 CEO 트리(정렬 0.25) + worker-fresh 1개 → master 1/3 · 닫힌 뒤에도 1/3(반박 R6)", () => {
     const role = new Map<number, string | null>([[18, "master"], [17, "cso"], [14, "worker"], [16, "worker-2"], [19, "reviewer-gemini"], [15, "reviewer-codex"], [30, "worker-fresh-1790000000"]]);
@@ -344,8 +399,7 @@ describe("일회용·캐시 공백·대표 없는 탭", () => {
   it("+New 직후 역할 캐시가 비어도 칸의 기억(role)으로 대표를 알아본다(반박 D10 개선)", () => {
     const { t } = build([[1, "master"], [2, "cso"], [3, "worker"], [4, "worker-2"]]);
     const t2 = placeSeat(t, 20, (s) => (s === 20 ? null : undefined), false); // 기존 칸은 '모름'
-    close(W(t2, 1), MASTER_FRAC);
-    close(W(t2, 20), 2 / 3 / 3);
+    expect(stdShape(t2, 1, [2], [3, 4, 20])).toBe(""); // 기억한 역할로 master·CSO 를 알아본다 — 새 셸은 CSO 열 앞 컬럼
   });
   it("대표가 없는 탭은 종전 규칙 그대로 — +New 5회가 옛 오른쪽 부착과 **동일 트리**(반박 D12)", () => {
     let t: LNode | null = null;
@@ -357,12 +411,10 @@ describe("일회용·캐시 공백·대표 없는 탭", () => {
     expect(t).toEqual(legacy as LNode);
     close(W(t as LNode, 1), 1 / 16);
   });
-  it("대표만 있는 탭(master+cso) → 전체 폭, master 위 3/4", () => {
+  it("master+cso 뿐인 탭 → master 왼쪽 1/3(전체 높이) | CSO 오른쪽 열(★S1 수정1: master 아래가 아니다)", () => {
     for (const order of [["master", "cso"], ["cso", "master"]]) {
       const { t } = build(order.map((r, i) => [i + 1, r] as [number, string]));
-      const m = order.indexOf("master") + 1;
-      close(W(t, m), 1);
-      close(H(t, m), HEAD_COL_MASTER);
+      expect(stdShape(t, order.indexOf("master") + 1, [order.indexOf("cso") + 1], [])).toBe("");
     }
   });
   it("중복 sid → 같은 객체(멱등 · 중복은 DOM 한 칸을 비운다)", () => {
@@ -395,8 +447,7 @@ describe("구버전 저장본 — 기동 즉시 1/3(S5) · 수동 추정 시드(
     for (const s of [2, 3, 4]) t = { type: "split", dir: "row", a: t, b: { type: "pane", sid: s } };
     close(W(t, 1), 1 / 8);
     const u = anchorHead(t, mapRole(role)) as LNode;
-    close(W(u, 1), MASTER_FRAC);
-    expect(u.type === "split" && inSub(u.a, 2)).toBe(true);
+    expect(stdShape(u, 1, [2], [3, 4])).toBe(""); // ★S1 수정1: cso 는 오른쪽 끝 열
     expect(sids(u).sort()).toEqual([1, 2, 3, 4]);
   });
   it("사용자가 끈 비율(임의 실수·클램프 0.15/0.85)은 수동으로 추정 — 자동값(1/k·3/4·n/(n+1))은 아님", () => {
@@ -418,9 +469,177 @@ describe("유령 sid 가 섞인 틱 — 정리 뒤에도 오른쪽 균등(반박
     for (const s of [11, 12, 13, 14, 15]) t = placeSeat(t, s, mapRole(role), false); // 옛 sid 는 '모름' → 칸의 기억
     for (const s of [1, 2, 3, 4, 5]) t = rm(t as LNode, s);
     const u = anchorHeadSafe(t, mapRole(role)) as LNode;
-    close(W(u, 11), MASTER_FRAC);
-    for (const s of [13, 14, 15]) close(W(u, s), 2 / 9);
-    expect(u.type === "split" && inSub(u.a, 12)).toBe(true);
+    expect(stdShape(u, 11, [15, 12], [13, 14])).toBe(""); // master 1/3 · 나머지 균등 · 오른쪽 끝 열 = codex 위 / CSO 아래
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// ★S1 수정1(오너 2026-11-22 · 합의 나-15): 본부(CEO) 탭을 포함한 모든 탭에서 CSO 는 master 아래를 떠나 리뷰어 열의
+//   맨 아래에 선다. 리뷰어들과 CSO 는 그 열을 똑같이 나누고(리뷰어 2 → 1/3 씩 · 1 → 1/2 씩 · 3 → 1/4 씩) master 는
+//   제 열을 혼자 쓴다. 자동 배치 · 정렬 버튼 · 앱 기동이 전부 이 모양을 만들고, 옛 모양으로 저장된 탭은 업데이트 뒤
+//   첫 기동에 사용자가 할 일 없이 옮겨진다.
+describe("★S1 수정1 — CSO 는 리뷰어 열 맨 아래 · 리뷰어와 CSO 는 같은 높이 · master 는 제 열을 혼자", () => {
+  const CASES: { name: string; reviewers: string[] }[] = [
+    { name: "리뷰어 2명 → 1/3 씩", reviewers: ["reviewer-gemini", "reviewer-codex"] },
+    { name: "리뷰어 1명 → 1/2 씩", reviewers: ["reviewer-codex"] },
+    { name: "리뷰어 3명 → 1/4 씩", reviewers: ["reviewer-gemini", "reviewer-codex", "reviewer-grok"] },
+    { name: "리뷰어 0명 → CSO 혼자 한 열", reviewers: [] },
+  ];
+  for (const c of CASES) {
+    // sid: master 1 · cso 2 · worker 3 · worker-2 4 · 리뷰어 11..
+    const seats: [number, string][] = [[1, "master"], [2, "cso"], [3, "worker"], [4, "worker-2"]];
+    c.reviewers.forEach((r, i) => seats.push([11 + i, r]));
+    const side = [...c.reviewers.map((_, i) => 11 + i), 2]; // 위→아래: 리뷰어들 · CSO
+    const role = new Map<number, string | null>(seats);
+    it(`정렬 버튼 — ${c.name}`, () => {
+      const ids = seats.map((s) => s[0]);
+      for (const order of [ids, [...ids].reverse()]) {
+        expect(stdShape(roleLayout(order, mapRole(role)) as LNode, 1, side, [3, 4])).toBe(""); // 넘기는 순서와 무관
+      }
+    });
+    it(`자동 배치 — ${c.name} · 도착 순서 전수`, () => {
+      let bad = "";
+      let n = 0;
+      for (const order of perms(seats)) {
+        n++;
+        const got = stdShape(build(order).t, 1, side, [3, 4]);
+        if (got && !bad) bad = order.map((s) => s[1]).join(",") + " → " + got;
+      }
+      expect(bad).toBe("");
+      expect(n).toBeGreaterThanOrEqual(24); // 오라클이 실제로 돌았다(4석 24가지 ~ 7석 5040가지)
+    });
+    it(`앱 기동 — ${c.name} · 옛 모양(master 아래 CSO)으로 저장된 탭이 첫 기동에 새 모양으로 · 두 번째 기동은 그대로`, () => {
+      const old = oldShape(seats);
+      close(H(old, 2), 1 - HEAD_COL_MASTER); // 검체가 정말 옛 모양이다: CSO 는 master 아래 1/4
+      for (const roleOf of [mapRole(role), (() => undefined) as RoleOf]) {
+        // 역할을 데몬이 말해 줄 때 · 아직 모를 때(칸에 적힌 기억으로) 둘 다
+        const t = anchorHeadSafe(old, roleOf) as LNode;
+        expect(stdShape(t, 1, side, [3, 4])).toBe("");
+        expect(sids(t).sort((a, b) => a - b)).toEqual(sids(old).sort((a, b) => a - b));
+        expect(isAnchored(t, roleOf)).toBe(true);
+        expect(anchorHeadSafe(t, roleOf)).toEqual(t);
+      }
+    });
+    it(`앱 기동 — ${c.name} · 데몬이 재기동해 칸이 전부 '기다리는 자리'(구멍)여도 자리는 새 모양으로 옮겨진다`, () => {
+      const neg = (n: LNode): LNode => (n.type === "pane" ? { ...n, sid: -n.sid } : { ...n, a: neg(n.a), b: neg(n.b) });
+      const t = anchorHeadSafe(neg(oldShape(seats)), () => undefined) as LNode;
+      expect(stdShape(t, -1, side.map((s) => -s), [-3, -4], () => true)).toBe("");
+    });
+  }
+  it("본부(CEO) 탭 — 오너 실사용 저장본(0.25 · 0.75 · 1/3 · 0.5 · 0.5)이 첫 기동에 새 모양으로", () => {
+    const CEO: LNode = {
+      type: "split", dir: "row", ratio: 0.25,
+      a: { type: "split", dir: "col", ratio: 0.75, a: { type: "pane", sid: 18 }, b: { type: "pane", sid: 17 } },
+      b: { type: "split", dir: "row", ratio: 0.3333333333333333, a: { type: "pane", sid: 14 },
+        b: { type: "split", dir: "row", ratio: 0.5, a: { type: "pane", sid: 16 },
+          b: { type: "split", dir: "col", ratio: 0.5, a: { type: "pane", sid: 19 }, b: { type: "pane", sid: 15 } } } },
+    };
+    const ROLE = new Map<number, string | null>([[18, "master"], [17, "cso"], [14, "worker"], [16, "worker-2"], [19, "reviewer-gemini"], [15, "reviewer-codex"]]);
+    expect(looksManual(CEO)).toBe(false);
+    const t = anchorHeadSafe(CEO, mapRole(ROLE)) as LNode;
+    expect(stdShape(t, 18, [19, 15, 17], [14, 16])).toBe("");
+    expect(looksManual(t)).toBe(false); // 새 모양의 비율도 전부 자동값 — 다음 기동이 수동 탭으로 오인하지 않는다
+  });
+  it("살아 있는 칸끼리 같은 높이 — 끝난 리뷰어의 자리(구멍)가 접혀도 남은 리뷰어와 CSO 는 1/2 씩, 구멍이 보이는 동안은 이웃 몫을 빌린다", () => {
+    const seats: [number, string][] = [[1, "master"], [2, "cso"], [3, "worker"], [11, "reviewer-gemini"], [12, "reviewer-codex"]];
+    const role = new Map<number, string | null>(seats);
+    const held = holdPane(build(seats).t, 12, -7) as LNode; // codex 가 끝났다 — 자리는 기억으로 남는다
+    role.delete(12);
+    const t = anchorHeadSafe(held, mapRole(role)) as LNode;
+    expect(stdShape(t, 1, [11, 2], [3])).toBe(""); // 구멍이 접힌 화면: agy 1/2 · CSO 1/2
+    const shownHole = (s: number) => s === -7;
+    close(H(t, 11), 1 / 2);
+    close((rect(t, -7, shownHole) as Rect).h + (rect(t, 2, shownHole) as Rect).h, 1 / 2); // 보류 스피너는 CSO 몫을 나눠 쓴다
+    // 돌아온 codex 는 그 자리(agy 아래 · CSO 위)에 다시 선다
+    const back = anchorHeadSafe(SL.fillHole(t, -7, 13, "reviewer-codex"), mapRole(new Map<number, string | null>([...role, [13, "reviewer-codex"]]))) as LNode;
+    expect(stdShape(back, 1, [11, 13, 2], [3])).toBe("");
+  });
+  it("그 밖의 리뷰어(reviewer-claude-2 등)·같은 역할 둘도 리뷰어 열에 서고 CSO 가 맨 아래다 · 일회용 리뷰어는 제 컬럼", () => {
+    const seats: [number, string][] = [[1, "master"], [2, "cso"], [3, "worker"], [11, "reviewer-claude-2"], [12, "reviewer-gemini"], [13, "reviewer-gemini"], [14, "reviewer-codex"]];
+    expect(stdShape(build(seats).t, 1, [12, 13, 14, 11, 2], [3])).toBe("");
+    const fresh: [number, string][] = [[1, "master"], [2, "cso"], [3, "worker"], [12, "reviewer-gemini"], [20, "reviewer-codex-fresh-1790000000"]];
+    expect(stdShape(build(fresh).t, 1, [12, 2], [3, 20])).toBe("");
+  });
+  it("master 가 없는 탭은 손대지 않는다(자동 배치 · 기동) — 정렬 버튼만 리뷰어 열을 세운다", () => {
+    const seats: [number, string][] = [[2, "cso"], [3, "worker"], [11, "reviewer-gemini"]];
+    const role = new Map<number, string | null>(seats);
+    let legacy: LNode | null = null;
+    for (const [s] of seats) legacy = legacyAppend(legacy, s);
+    const got = build(seats).t;
+    expect(JSON.parse(JSON.stringify(got, (k, v) => (k === "role" ? undefined : v)))).toEqual(legacy as LNode);
+    expect(anchorHeadSafe(got, mapRole(role))).toBe(got);
+    const t = roleLayout([2, 3, 11], mapRole(role)) as LNode;
+    close(W(t, 3), 1 / 2);
+    close((rect(t, 11) as Rect).h, 1 / 2);
+    close((rect(t, 2) as Rect).y, 1 / 2);
+  });
+  it("수동 탭 — 새 좌석: 리뷰어·CSO 는 오른쪽 끝 열에 끼고(CSO 가 맨 아래 · 기존 칸의 상대 비율 유지) 그 밖의 좌석은 그 열 앞 컬럼 · 대표 폭 불변", () => {
+    const role = new Map<number, string | null>([[1, "master"], [3, "worker"], [11, "reviewer-gemini"], [12, "reviewer-codex"]]);
+    // 사용자가 끈 탭: 대표 0.4 · worker 0.55 · 리뷰어 열 안 agy:codex = 3:7
+    let t: LNode = {
+      type: "split", dir: "row", ratio: 0.4, a: P(1, "master"),
+      b: { type: "split", dir: "row", ratio: 0.55, a: P(3, "worker"), b: { type: "split", dir: "col", ratio: 0.3, a: P(11, "reviewer-gemini"), b: P(12, "reviewer-codex") } },
+    };
+    role.set(2, "cso");
+    t = placeSeat(t, 2, mapRole(role), true);
+    close(W(t, 1), 0.4);
+    close(W(t, 3), 0.6 * 0.55);
+    const [g, c, s] = [11, 12, 2].map((x) => rect(t, x) as Rect);
+    expect(near(g.x, c.x) && near(c.x, s.x) && near(s.w, 0.6 * 0.45)).toBe(true);
+    close(g.h, (0.3 * 2) / 3);
+    close(c.h, (0.7 * 2) / 3);
+    close(s.h, 1 / 3);
+    close(s.y, 2 / 3); // CSO 가 맨 아래
+    role.set(13, "reviewer-grok");
+    t = placeSeat(t, 13, mapRole(role), true);
+    expect((rect(t, 13) as Rect).y < (rect(t, 2) as Rect).y && (rect(t, 13) as Rect).y > (rect(t, 12) as Rect).y).toBe(true); // 늦게 온 리뷰어도 CSO 위
+    close(W(t, 1), 0.4);
+    role.set(4, "worker-2");
+    t = placeSeat(t, 4, mapRole(role), true);
+    close(W(t, 1), 0.4);
+    expect((rect(t, 4) as Rect).x < (rect(t, 2) as Rect).x && (rect(t, 4) as Rect).x > (rect(t, 3) as Rect).x).toBe(true); // 리뷰어 열 앞
+    close((rect(t, 2) as Rect).x + (rect(t, 2) as Rect).w, 1); // 리뷰어 열은 계속 오른쪽 끝
+  });
+  it("수동 탭 1회 이관(moveCsoToSide) — CSO 만 리뷰어 열 맨 아래로 · 사용자가 끈 비율은 그대로 · 두 번째는 아무것도 안 한다", () => {
+    const role = mapRole(new Map<number, string | null>([[1, "master"], [2, "cso"], [3, "worker"], [11, "reviewer-gemini"], [12, "reviewer-codex"]]));
+    const manual: LNode = {
+      type: "split", dir: "row", ratio: 0.4,
+      a: { type: "split", dir: "col", ratio: 0.6, a: P(1, "master"), b: P(2, "cso") },
+      b: { type: "split", dir: "row", ratio: 0.55, a: P(3, "worker"), b: { type: "split", dir: "col", ratio: 0.3, a: P(11, "reviewer-gemini"), b: P(12, "reviewer-codex") } },
+    };
+    expect(looksManual(manual)).toBe(true);
+    const t = sl.moveCsoToSide(manual, role) as LNode;
+    expect(sids(t).sort((a, b) => a - b)).toEqual([1, 2, 3, 11, 12]);
+    expect(rect(t, 1)).toEqual({ x: 0, y: 0, w: 0.4, h: 1 }); // 대표 폭은 사용자가 둔 0.4 그대로 · 이제 혼자
+    close(W(t, 3), 0.6 * 0.55);
+    const [g, c, s] = [11, 12, 2].map((x) => rect(t, x) as Rect);
+    expect(near(g.x, c.x) && near(c.x, s.x) && near(s.w, 0.6 * 0.45)).toBe(true);
+    close(g.h, (0.3 * 2) / 3); // agy:codex = 3:7 은 그대로, CSO 가 1/3 을 받는다
+    close(c.h, (0.7 * 2) / 3);
+    close(s.y, 2 / 3);
+    expect(sl.moveCsoToSide(t, role)).toBe(t);
+  });
+  it("수동 탭 1회 이관 — 리뷰어 열이 없으면 오른쪽 끝 새 컬럼 · master+CSO 뿐인 탭은 master | CSO · master 가 왼쪽에 없거나 CSO 가 대표 칸에 없으면 그대로 · 손상 트리도 그대로", () => {
+    const role = mapRole(new Map<number, string | null>([[1, "master"], [2, "cso"], [3, "worker"]]));
+    const noSide: LNode = { type: "split", dir: "row", ratio: 0.4, a: { type: "split", dir: "col", ratio: 0.6, a: P(1, "master"), b: P(2, "cso") }, b: P(3, "worker") };
+    const a = sl.moveCsoToSide(noSide, role) as LNode;
+    expect(rect(a, 1)).toEqual({ x: 0, y: 0, w: 0.4, h: 1 });
+    close((rect(a, 2) as Rect).x + (rect(a, 2) as Rect).w, 1);
+    close(H(a, 2), 1);
+    const only: LNode = { type: "split", dir: "col", ratio: 0.6, a: P(1, "master"), b: P(2, "cso") };
+    expect(stdShape(sl.moveCsoToSide(only, role) as LNode, 1, [2], [])).toBe("");
+    const moved: LNode = { type: "split", dir: "row", ratio: 0.5, a: P(3, "worker"), b: { type: "split", dir: "col", ratio: 0.6, a: P(1, "master"), b: P(2, "cso") } };
+    expect(sl.moveCsoToSide(moved, role)).toBe(moved); // 사용자가 master 를 오른쪽으로 옮긴 탭 — 어디가 대표 칸인지 단정하지 않는다
+    const already: LNode = { type: "split", dir: "row", ratio: 0.4, a: P(1, "master"), b: { type: "split", dir: "row", ratio: 0.5, a: P(3, "worker"), b: P(2, "cso") } };
+    expect(sl.moveCsoToSide(already, role)).toBe(already);
+    for (const junk of [null, undefined, 7, {}, { type: "pane", sid: 0 }, { type: "split", dir: "row", a: { type: "pane", sid: 1 }, b: { type: "pane", sid: 1 } }]) {
+      expect(() => sl.moveCsoToSide(junk, role)).not.toThrow();
+      expect(sl.moveCsoToSide(junk, role)).toBe(junk);
+    }
+    const boom: RoleOf = () => {
+      throw new Error("boom");
+    };
+    expect(sl.moveCsoToSide(noSide, boom)).toBe(noSide);
   });
 });
 
