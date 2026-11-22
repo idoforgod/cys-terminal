@@ -20,6 +20,9 @@
 //   · 새 좌석은 ① 같은 역할 구멍에 **결속**(칸·비율 그대로) → ② 없으면 placeSeat(대표 1/3 규칙).
 //   · 대표(master) 칸 폭은 **단일 상수 MASTER_FRAC = 1/3** — U2 의 옛 0.25 폴백과 U3 의 1/3 이 충돌하던
 //     것을 이 상수 하나로 없앴다(반박 U2 major ⓐ).
+//   · ★S1 수정1(오너 2026-11-22): CSO 는 대표 칸을 떠나 **리뷰어 열의 맨 아래**에 선다. 대표 칸은 master
+//     혼자 쓰고, 리뷰어들과 CSO 는 오른쪽 끝 한 열을 **같은 높이**로 나눈다(리뷰어 2 → 1/3 씩 · 1 → 1/2 ·
+//     3 → 1/4). 자동 배치·`정렬`·앱 기동이 같은 모양을 만든다(sideColumn 이 유일한 정의처).
 //
 // ★불변식(이 모듈이 틀리면 무엇이 깨지는가 — 오너 4대 위험 ④ pane 전멸 · ③ 자가치유 전멸)
 //   1. **전역(total)**: 어떤 JSON 을 넣어도 던지지 않는다. 손상 저장본 하나가 3초 입양 틱을 매번
@@ -42,7 +45,7 @@ export type RoleOf = (sid: number) => string | null | undefined;
 
 /** 대표(master) 컬럼 폭 — **유일한 정의처**(U2·U3 공용). pane 영역(#root) 기준 1/3. */
 export const MASTER_FRAC = 1 / 3;
-/** 대표 컬럼 안 master : cso 높이 = 3 : 1 (종전 `정렬` 과 동일). */
+/** 대표 컬럼 안 첫 master : 나머지 master 높이 = 3 : 1 — master 가 둘 이상일 때만 쓰인다(CSO 는 리뷰어 열에 있다). */
 export const HEAD_COL_MASTER = 3 / 4;
 /** 빈 기억 칸(구멍)을 '복원을 기다리는 중' 으로 보여 주는 기한. main.ts 가 winScaled(Windows ×2 = 480s). */
 export const ROLE_SLOT_GRACE_MS = 240_000;
@@ -56,8 +59,8 @@ const CTRL_CHARS = /[\u0000-\u001f\u007f]/;
 
 // ---------- 역할 술어 (배치 전용 — 데몬의 경보·특권 술어와 목적이 다르다) ----------
 // 데몬은 `cso*` 접두를 경보 라우팅·특권 판정에 쓰지만(alert_route.rs CSO_ROLE_PREFIX), 화면 배치에서
-// 일회용 `cso-fresh-<epoch>`(스케줄 좌석 · TTL 600s)을 대표 칸에 넣으면 붙어 있는 동안 master 높이가
-// 3/4 → 1/2 로 준다(반박 U3 D5). 그래서 대표 칸 소속은 `cso` 또는 `cso-<숫자>` 뿐이다.
+// 일회용 `cso-fresh-<epoch>`(스케줄 좌석 · TTL 600s)을 고정 자리에 넣으면 붙어 있는 동안 이웃 칸이
+// 줄어든다(반박 U3 D5). 그래서 CSO 자리 소속은 `cso` 또는 `cso-<숫자>` 뿐이고, 일회용 좌석은 제 컬럼을 받는다.
 
 /** 일회용 좌석(`<역할>-fresh-<epoch>`) — 기억하지 않고 대표 칸에도 넣지 않는다. */
 export function isFreshRole(r: unknown): boolean {
@@ -69,9 +72,17 @@ export function isMasterRole(r: unknown): boolean {
 export function isCsoRole(r: unknown): boolean {
   return typeof r === "string" && (r === "cso" || CSO_N.test(r));
 }
-/** 대표 칸 소속 — `정렬` 과 자동 배치가 **같은 술어**를 쓴다(반박 U3 D6). */
+/** 리뷰어 역할 — `reviewer` 로 시작하는 역할(seatPriority 와 같은 접두 규칙 · 일회용 `-fresh-` 좌석 제외). */
+export function isReviewerRole(r: unknown): boolean {
+  return typeof r === "string" && r.indexOf("reviewer") === 0 && !isFreshRole(r);
+}
+/** 대표 칸 소속 — master 뿐이다(★S1 수정1: CSO 는 대표 칸을 떠났다). */
 export function isHeadRole(r: unknown): boolean {
-  return isMasterRole(r) || isCsoRole(r);
+  return isMasterRole(r);
+}
+/** 리뷰어 열 소속(리뷰어들 + CSO) — `정렬` 과 자동 배치가 **같은 술어**를 쓴다(반박 U3 D6). */
+export function isSideRole(r: unknown): boolean {
+  return isReviewerRole(r) || isCsoRole(r);
 }
 
 /**
@@ -247,10 +258,6 @@ function colsVis(t: LNode): number {
   if (t.type === "split" && t.dir === "row") return colsVis(t.a) + colsVis(t.b);
   return hasLive(t) ? 1 : 0;
 }
-/** col 척추의 칸 수(구멍 포함 — 대표 칸의 기억 자리는 높이를 지킨다). */
-function cellsAll(t: LNode): number {
-  return t.type === "split" && t.dir === "col" ? cellsAll(t.a) + cellsAll(t.b) : 1;
-}
 
 /** 같은 폭 컬럼(또는 같은 높이 칸)으로 나란히 — `정렬` 의 기본 빗질. nodes 는 1개 이상. */
 export function evenComb(nodes: LNode[], dir: "row" | "col"): LNode {
@@ -268,10 +275,110 @@ function appendColumn(t: LNode, p: LNode): LNode {
   const n = colsVis(t);
   return { type: "split", dir: "row", ratio: n > 0 ? n / (n + 1) : 0.85, a: t, b: p };
 }
-/** 대표 컬럼 아래에 칸을 쌓는다(master:cso = 3:1, 그 뒤는 균등 몫). */
-function appendCell(t: LNode, p: LNode): LNode {
-  const m = cellsAll(t);
-  return { type: "split", dir: "col", ratio: m === 1 ? HEAD_COL_MASTER : m / (m + 1), a: t, b: p };
+
+type SpineCell = { n: LNode; f: number };
+/** row/col 척추를 (노드, 몫) 목록으로 편다 — 같은 방향으로 이어진 분할만 따라 내려간다(비율 미지정 = 1/2). */
+function spineCells(t: LNode, dir: "row" | "col", frac: number, out: SpineCell[]): SpineCell[] {
+  if (t.type === "split" && t.dir === dir) {
+    const r = t.ratio ?? 0.5;
+    spineCells(t.a, dir, frac * r, out);
+    spineCells(t.b, dir, frac * (1 - r), out);
+  } else out.push({ n: t, f: frac });
+  return out;
+}
+/** (노드, 몫) 목록을 다시 척추로 — 각 칸의 몫이 그대로 남는다. cells 는 1개 이상. */
+function spineBuild(cells: SpineCell[], dir: "row" | "col"): LNode {
+  let acc = cells[cells.length - 1].n;
+  let sum = cells[cells.length - 1].f;
+  for (let i = cells.length - 2; i >= 0; i--) {
+    const f = cells[i].f;
+    acc = { type: "split", dir, ratio: f / (f + sum), a: cells[i].n, b: acc };
+    sum += f;
+  }
+  return acc;
+}
+/** 척추의 at 자리에 새 칸을 균등 몫(1/(n+1))으로 끼운다 — 기존 칸끼리의 상대 비율은 그대로(수동 탭 안전). */
+function spineInsert(t: LNode, dir: "row" | "col", at: number, p: LNode): LNode {
+  const cells = spineCells(t, dir, 1, []);
+  const n = cells.length;
+  for (const c of cells) c.f = (c.f * n) / (n + 1);
+  cells.splice(at, 0, { n: p, f: 1 / (n + 1) });
+  return spineBuild(cells, dir);
+}
+
+/** row 척추의 마지막(오른쪽 끝) 컬럼 — row 분할이 아니면 자기 자신. */
+function lastCol(t: LNode): LNode {
+  return t.type === "split" && t.dir === "row" ? lastCol(t.b) : t;
+}
+function mapLastCol(t: LNode, f: (c: LNode) => LNode): LNode {
+  return t.type === "split" && t.dir === "row" ? { ...t, b: mapLastCol(t.b, f) } : f(t);
+}
+
+/** 리뷰어 열 안의 순서: agy(reviewer-gemini) → codex → 그 밖의 리뷰어 → CSO(맨 아래). 같은 등급은 원래 순서. */
+function sideRank(r: string | null | undefined): number {
+  if (r === "reviewer-gemini") return 0;
+  if (r === "reviewer-codex") return 1;
+  if (isReviewerRole(r)) return 2;
+  return 3;
+}
+/**
+ * ★S1 수정1 — 리뷰어 열의 **유일한 정의처**: 리뷰어들 위, CSO 맨 아래, **살아 있는 칸끼리 같은 높이**
+ * (리뷰어 2 + CSO → 1/3 씩 · 리뷰어 1 → 1/2 씩 · 리뷰어 3 → 1/4 씩).
+ * 구멍(복원을 기다리는 자리)은 이웃 몫을 빌린다 — 구멍이 접혀도 산 칸끼리의 균등이 깨지지 않는다.
+ * 산 칸이 한쪽에 없으면(전부 구멍인 기동 직후) 칸 수로 나눈다. cells 는 1개 이상.
+ */
+function sideColumn(cells: readonly LPane[], roleOf: RoleOf): LNode {
+  const ordered: LPane[] = [];
+  for (let k = 0; k <= 3; k++) for (const p of cells) if (sideRank(effRole(p, roleOf)) === k) ordered.push(p);
+  let acc: LNode = ordered[ordered.length - 1];
+  let live = ordered[ordered.length - 1].sid > 0 ? 1 : 0;
+  let count = 1;
+  for (let i = ordered.length - 2; i >= 0; i--) {
+    const w = ordered[i].sid > 0 ? 1 : 0;
+    const ratio = w > 0 && live > 0 ? w / (w + live) : 1 / (1 + count);
+    acc = { type: "split", dir: "col", ratio, a: ordered[i], b: acc };
+    live += w;
+    count++;
+  }
+  return acc;
+}
+/** 리뷰어 열 모양인가: 세로로만 쌓인 칸들이고 전부 리뷰어 열 역할이다(구멍 포함). */
+function sideColumnLike(t: LNode, roleOf: RoleOf): boolean {
+  const colOnly = (n: LNode): boolean => n.type === "pane" || (n.dir === "col" && colOnly(n.a) && colOnly(n.b));
+  return colOnly(t) && panesOf(t).every((p) => isSideRole(effRole(p, roleOf)));
+}
+/** 리뷰어 열에 칸 하나를 넣는다(등급 자리에 · 균등 몫 · 기존 칸의 상대 비율 유지). 열이 없으면 오른쪽 끝에 새 컬럼. */
+function addToSide(b: LNode, p: LPane, roleOf: RoleOf): LNode {
+  if (!sideColumnLike(lastCol(b), roleOf)) return appendColumn(b, p);
+  const rank = sideRank(effRole(p, roleOf));
+  return mapLastCol(b, (col) => {
+    const cells = spineCells(col, "col", 1, []);
+    let at = cells.length;
+    for (let i = 0; i < cells.length; i++) {
+      const c = cells[i].n;
+      if (c.type === "pane" && sideRank(effRole(c, roleOf)) > rank) {
+        at = i;
+        break;
+      }
+    }
+    return spineInsert(col, "col", at, p);
+  });
+}
+/**
+ * 모아 세운 리뷰어 열을 오른쪽 끝에 붙인다. 폭은 여기서 정하지 않는다 — 유일한 호출부(anchorHeadCore)가 곧바로 오른쪽
+ * 2/3 전체를 다시 나눈다(산 칸이 있으면 rebalanceRow · 기다리는 자리뿐이면 evenRow).
+ */
+function appendSideColumn(others: LNode, col: LNode): LNode {
+  return { type: "split", dir: "row", a: others, b: col };
+}
+/** row 척추의 컬럼을 **개수 기준**으로 균등히(구멍만 있는 트리용 — rebalanceRow 는 보이는 컬럼만 센다). */
+function evenRow(t: LNode): LNode {
+  return evenComb(spineCells(t, "row", 1, []).map((c) => c.n), "row");
+}
+/** 리뷰어 열이 아닌 새 컬럼 — 리뷰어 열이 오른쪽 끝에 있으면 그 **앞**에, 없으면 오른쪽 끝에. */
+function addColumn(b: LNode, p: LNode, roleOf: RoleOf): LNode {
+  if (!sideColumnLike(lastCol(b), roleOf)) return appendColumn(b, p);
+  return spineInsert(b, "row", spineCells(b, "row", 1, []).length - 1, p);
 }
 
 function hasMasterIn(t: LNode, roleOf: RoleOf): boolean {
@@ -296,24 +403,31 @@ function headColumnLike(t: LNode, roleOf: RoleOf): boolean {
 function headSide(t: LNode | null, roleOf: RoleOf): t is LSplit {
   return !!t && t.type === "split" && t.dir === "row" && hasMasterIn(t.a, roleOf);
 }
+/** 리뷰어 열이 제자리인가: 리뷰어·CSO 가 하나도 없거나, 전부 오른쪽 끝 컬럼에 세로로만 쌓여 있다. */
+function sidePlaced(b: LNode, roleOf: RoleOf): boolean {
+  const n = panesOf(b).filter((p) => isSideRole(effRole(p, roleOf))).length;
+  if (n === 0) return true;
+  const col = lastCol(b);
+  return sideColumnLike(col, roleOf) && panesOf(col).length === n;
+}
 /**
- * 앵커(대표 칸이 제자리): 루트 row 분할의 왼쪽에 master 가 있고, 대표 역할 칸은 **전부** 왼쪽에 있으며,
- * 왼쪽에는 대표 역할과 역할 없는 셸만 있다.
- * ★'전부' 조건이 없으면 master 만 왼쪽에 있어도 참이 되어 흩어진 cso 를 모으지 않는다 —
- *   표준 6석 도착 순서 336/720 에서 cso 가 대표 칸 밖에 남던 결함(반박 U3 D1)이 여기서 닫힌다.
+ * 앵커(자리가 제자리): 루트 row 분할의 왼쪽에 master 가 있고, master 는 **전부** 왼쪽에 있으며, 왼쪽에는
+ * master 와 역할 없는 셸만 있고(★S1 수정1: CSO 가 왼쪽에 있으면 제자리가 아니다), 리뷰어·CSO 는 전부
+ * 오른쪽 끝의 한 열에 있다.
+ * ★'전부' 조건이 없으면 master 만 왼쪽에 있어도 참이 되어 흩어진 좌석을 모으지 않는다(반박 U3 D1).
  * ★역할 없는 셸을 허용하는 이유: master 옆에서 ⌘D 를 한 탭(대표 칸에 셸이 섞임)을 '앵커 아님' 으로
  *   보면 새 좌석이 루트에 붙어 대표가 1/n 씩 끝없이 준다(반박 U3 D2).
  */
 function anchoredCore(t: LNode, roleOf: RoleOf): t is LSplit {
   if (!headSide(t, roleOf)) return false;
-  return headColumnLike(t.a, roleOf) && !panesOf(t.b).some((p) => isHeadRole(effRole(p, roleOf)));
+  if (!headColumnLike(t.a, roleOf) || panesOf(t.b).some((p) => isHeadRole(effRole(p, roleOf)))) return false;
+  return sidePlaced(t.b, roleOf);
 }
 
-/** 대표 컬럼: 첫 master 가 위(3/4), 나머지 대표(추가 master·cso)가 아래를 균등히. masters 는 1개 이상. */
-function headColumn(masters: LNode[], csos: LNode[]): LNode {
+/** 대표 컬럼: 첫 master 가 위(3/4), 추가 master 가 아래를 균등히 — master 가 하나면 그 칸 혼자다. masters 는 1개 이상. */
+function headColumn(masters: LNode[]): LNode {
   const top = masters[0];
-  const rest = [...masters.slice(1), ...csos];
-  if (!top) return evenComb(rest, "col");
+  const rest = masters.slice(1);
   if (!rest.length) return top;
   return { type: "split", dir: "col", ratio: HEAD_COL_MASTER, a: top, b: evenComb(rest, "col") };
 }
@@ -347,19 +461,18 @@ function insertSeat(tree: LNode | null, sid: number, roleOf: RoleOf): LNode {
   const p = mkPane(sid, role);
   if (!tree) return p;
   if (isMasterRole(role)) {
-    // 대표 컬럼(cso·master 구멍·셸)이 이미 왼쪽에 있으면 그 **위**로 — master 재기동이 제자리로 돌아온다.
+    // 대표 컬럼(master 구멍·추가 master·셸)이 이미 왼쪽에 있으면 그 **위**로 — master 재기동이 제자리로 돌아온다.
     if (tree.type === "split" && tree.dir === "row" && headColumnLike(tree.a, roleOf)) {
       return { ...tree, a: { type: "split", dir: "col", ratio: HEAD_COL_MASTER, a: p, b: tree.a } };
     }
     if (headColumnLike(tree, roleOf)) return { type: "split", dir: "col", ratio: HEAD_COL_MASTER, a: p, b: tree };
     return { type: "split", dir: "row", ratio: MASTER_FRAC, a: p, b: tree };
   }
-  if (isCsoRole(role)) {
-    if (headSide(tree, roleOf)) return { ...tree, a: appendCell(tree.a, p) };
-    if (allHead(tree, roleOf) && hasMasterIn(tree, roleOf)) return appendCell(tree, p);
-    // master 가 없으면 대표로 세우지 않는다(마스터 재기동 공백에 cso 가 대표 자리를 가로채지 않게) — 아래 일반 규칙.
+  // ★S1 수정1: 리뷰어·CSO 는 오른쪽 끝의 리뷰어 열로(등급 자리에), 그 밖의 좌석은 그 열 **앞**의 새 컬럼으로.
+  //   대표 폭은 어느 쪽이든 건드리지 않는다(수동 탭 포함 — 새 좌석은 항상 root.b 로만 간다).
+  if (headSide(tree, roleOf)) {
+    return { ...tree, b: isSideRole(role) ? addToSide(tree.b, p, roleOf) : addColumn(tree.b, p, roleOf) };
   }
-  if (headSide(tree, roleOf)) return { ...tree, b: appendColumn(tree.b, p) };
   if (allHead(tree, roleOf) && hasMasterIn(tree, roleOf)) return { type: "split", dir: "row", ratio: MASTER_FRAC, a: tree, b: p };
   // 대표가 없는 탭은 **종전 규칙 그대로**(반박 U3 D12 — 오너 지시 범위는 대표 자리 · 놀람 최소화).
   if (!hasMasterIn(tree, roleOf)) return { type: "split", dir: "row", a: tree, b: p };
@@ -371,15 +484,41 @@ function anchorHeadCore(t: LNode, roleOf: RoleOf): LNode {
   const ps = panesOf(t);
   const masters = ps.filter((p) => isMasterRole(effRole(p, roleOf)));
   if (!masters.length) return t; // 대표 없는 탭 — 1/3 규칙 미적용
-  if (ps.every((p) => isHeadRole(effRole(p, roleOf)))) return t; // 대표만 있는 탭 — 전체 폭
-  if (anchoredCore(t, roleOf)) return { ...t, ratio: MASTER_FRAC, b: rebalanceRow(t.b) };
-  // 대표 역할이 흩어져 있다(구버전 저장본·도착 순서) — master·cso 만 빼서 왼쪽 1/3 컬럼으로, 나머지 구조는 그대로.
-  const ordered = [...masters.filter((p) => p.sid > 0), ...masters.filter((p) => p.sid < 0)]; // 산 master 가 위
-  const csos = ps.filter((p) => isCsoRole(effRole(p, roleOf)));
-  let rest: LNode | null = t;
-  for (const p of [...ordered, ...csos]) rest = rest ? removeSid(rest, p.sid) : null;
-  const head = headColumn(ordered, csos);
-  return rest ? { type: "split", dir: "row", ratio: MASTER_FRAC, a: head, b: rebalanceRow(rest) } : head;
+  if (ps.every((p) => isHeadRole(effRole(p, roleOf)))) return t; // master 만 있는 탭 — 전체 폭
+  const sides = ps.filter((p) => isSideRole(effRole(p, roleOf)));
+  const strip = (n: LNode | null): LNode | null => {
+    let o = n;
+    for (const p of sides) o = o ? removeSid(o, p.sid) : null;
+    return o;
+  };
+  // ① 대표 칸: 왼쪽에 이미 서 있으면(리뷰어·CSO 를 뺀 나머지가 master 와 셸뿐) 그 모양을 지킨다 — 구버전
+  //    저장본의 master 아래 CSO 는 여기서 빠진다. 흩어져 있으면 master 만 빼서 왼쪽 1/3 컬럼으로 세운다.
+  let head: LNode;
+  let rest: LNode | null;
+  const kept = headSide(t, roleOf) ? strip(t.a) : null;
+  if (headSide(t, roleOf) && kept && headColumnLike(kept, roleOf) && !panesOf(t.b).some((p) => isHeadRole(effRole(p, roleOf)))) {
+    head = kept;
+    rest = t.b;
+  } else {
+    const ordered = [...masters.filter((p) => p.sid > 0), ...masters.filter((p) => p.sid < 0)]; // 산 master 가 위
+    rest = t;
+    for (const p of ordered) rest = rest ? removeSid(rest, p.sid) : null;
+    head = headColumn(ordered);
+  }
+  // ② 리뷰어 열: 전부 오른쪽 끝 열에 서 있으면 순서·높이만 다시 맞추고, 아니면 모아서 오른쪽 끝에 세운다.
+  if (sides.length) {
+    const inRest = rest ? panesOf(rest).filter((p) => isSideRole(effRole(p, roleOf))).length : 0;
+    if (rest && inRest === sides.length && sidePlaced(rest, roleOf)) {
+      rest = mapLastCol(rest, (col) => sideColumn(panesOf(col), roleOf));
+    } else {
+      const others = strip(rest);
+      const col = sideColumn(sides, roleOf);
+      rest = others ? appendSideColumn(others, col) : col;
+    }
+  }
+  if (!rest) return head;
+  // 산 칸이 하나도 없는 오른쪽(데몬 재기동 직후 — 전부 복원을 기다리는 자리)은 컬럼 수 기준으로 편다.
+  return { type: "split", dir: "row", ratio: MASTER_FRAC, a: head, b: colsVis(rest) > 0 ? rebalanceRow(rest) : evenRow(rest) };
 }
 
 /**
@@ -446,6 +585,51 @@ export function anchorHeadSafe(tree: LNode | null, roleOf: RoleOf): LNode | null
     return tree;
   }
 }
+/**
+ * ★S1 수정1 — **수동 탭 1회 이관**: 대표 칸(왼쪽 master 컬럼, 또는 탭 전체가 한 열로 쌓인 대표 칸인 탭) 안에 있던
+ * CSO 만 리뷰어 열 맨 아래로 옮긴다(대표 칸은 CSO 가 빠진 자리를 형제가 채운다). 맨 오른쪽 컬럼이 리뷰어·CSO 만의 세로
+ * 열이면 그 열에 같은 높이로 들어가고 다른 칸의 자리와 비율은 그대로다. 주인이 그 열을 다르게 짜 둔 탭(리뷰어가 맨
+ * 오른쪽이 아니거나 좌우로 나란하거나 다른 좌석이 섞임)에서는 CSO 가 **맨 오른쪽에 제 컬럼**으로 서고 오른쪽 컬럼들이
+ * 그만큼 폭을 내준다. master 컬럼이 왼쪽 끝이 아닌 탭은 옮기지 않는다(`정렬` 이 표준 모양으로 세운다).
+ * 옮길 것이 없거나 실패·불변식 위반이면 **원 트리** 그대로. 비수동 탭은 anchorHeadSafe 가 한다. 전역.
+ */
+export function moveCsoToSide(tree: LNode | null, roleOf: RoleOf): LNode | null {
+  if (!tree) return tree;
+  try {
+    if (!isValidTree(tree)) return tree;
+    const out = moveCsoCore(tree, roleOf);
+    return sameMembers(tree, out) ? out : tree;
+  } catch {
+    return tree;
+  }
+}
+function moveCsoCore(t: LNode, roleOf: RoleOf): LNode {
+  const csosIn = (n: LNode): LPane[] => panesOf(n).filter((p) => isCsoRole(effRole(p, roleOf)));
+  const without = (n: LNode, gone: LPane[]): LNode | null => {
+    let o: LNode | null = n;
+    for (const p of gone) o = o ? removeSid(o, p.sid) : null;
+    return o;
+  };
+  if (headSide(t, roleOf)) {
+    const csos = csosIn(t.a);
+    const a = csos.length ? without(t.a, csos) : null;
+    if (!a) return t;
+    let b: LNode = t.b;
+    for (const p of csos) b = addToSide(b, p, roleOf);
+    return { ...t, a, b };
+  }
+  const csos = csosIn(t);
+  const headOnly = panesOf(t).every((p) => {
+    const r = effRole(p, roleOf);
+    return isMasterRole(r) || isCsoRole(r) || isBare(r);
+  });
+  // 탭 전체가 **한 열로 쌓인** 대표 칸일 때만이다(구버전의 「master 위 · CSO 아래」 두 좌석 탭). 주인이 CSO 를 master 옆에
+  // 따로 세워 둔 탭(좌우 분할)은 CSO 가 이미 대표 칸 밖이다 — 손대지 않는다.
+  const stacked = (n: LNode): boolean => n.type === "pane" || (n.dir === "col" && stacked(n.a) && stacked(n.b));
+  if (!csos.length || !headOnly || !stacked(t) || !hasMasterIn(t, roleOf)) return t;
+  const head = without(t, csos);
+  return head ? { type: "split", dir: "row", ratio: MASTER_FRAC, a: head, b: sideColumn(csos, roleOf) } : t;
+}
 /** 대표 칸이 제자리인가(테스트·배선 판독용). 전역. */
 export function isAnchored(tree: unknown, roleOf: RoleOf): boolean {
   if (!isValidTree(tree)) return false;
@@ -457,26 +641,21 @@ export function isAnchored(tree: unknown, roleOf: RoleOf): boolean {
 }
 
 /**
- * `정렬`: 대표 컬럼(master 위 / cso 아래 3:1) 1/3 · 가운데 worker·미분류 균등 · 오른쪽 끝 리뷰어 묶음
- * (agy 위 / codex 아래). 대표 역할이 없으면 종전처럼 모든 컬럼 균등. sids 가 비면 null.
+ * `정렬`: 대표 컬럼(master 혼자) 1/3 · 가운데 worker·미분류 균등 · 오른쪽 끝 **리뷰어 열**(리뷰어들 위 —
+ * agy·codex·그 밖 — / CSO 맨 아래, 같은 높이). ★S1 수정1: CSO 는 대표 칸이 아니라 리뷰어 열에 선다.
+ * master 가 없으면 모든 컬럼 균등(리뷰어 열은 그대로 한 열). sids 가 비면 null.
  */
 export function roleLayout(sids: readonly number[], roleOf: RoleOf): LNode | null {
   const uniq = sids.filter((s, i) => Number.isSafeInteger(s) && s > 0 && sids.indexOf(s) === i);
   if (!uniq.length) return null;
   const r = (s: number) => safeRole(roleOf, s);
-  const pane = (s: number): LNode => mkPane(s, r(s));
+  const pane = (s: number): LPane => mkPane(s, r(s));
   const masters = uniq.filter((s) => isMasterRole(r(s)));
-  const csos = uniq.filter((s) => isCsoRole(r(s)));
-  const agy = uniq.filter((s) => r(s) === "reviewer-gemini")[0];
-  const codex = uniq.filter((s) => r(s) === "reviewer-codex")[0];
-  const placed = new Set<number>([...masters, ...csos]);
-  if (agy !== undefined) placed.add(agy);
-  if (codex !== undefined) placed.add(codex);
-  const head = masters.length || csos.length ? headColumn(masters.map(pane), csos.map(pane)) : null;
+  const sides = uniq.filter((s) => isSideRole(r(s)));
+  const placed = new Set<number>([...masters, ...sides]);
+  const head = masters.length ? headColumn(masters.map(pane)) : null;
   const rest: LNode[] = uniq.filter((s) => !placed.has(s)).map(pane);
-  if (agy !== undefined && codex !== undefined) rest.push({ type: "split", dir: "col", ratio: 1 / 2, a: pane(agy), b: pane(codex) });
-  else if (agy !== undefined) rest.push(pane(agy));
-  else if (codex !== undefined) rest.push(pane(codex));
+  if (sides.length) rest.push(sideColumn(sides.map(pane), (s) => r(s)));
   if (!head) return evenComb(rest, "row");
   if (!rest.length) return head;
   return { type: "split", dir: "row", ratio: MASTER_FRAC, a: head, b: evenComb(rest, "row") };

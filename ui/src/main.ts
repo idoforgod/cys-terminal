@@ -104,6 +104,7 @@ import {
   holdPane,
   holeSidsOf,
   looksManual,
+  moveCsoToSide,
   nextHoleSid,
   nodeShown,
   placeSeatSafe,
@@ -434,6 +435,13 @@ const LAYOUT_KEY = "cys-layout-v2";
 // 실패 방향: 이 값이 false 로 잘못 남으면 그 세션의 배치가 저장되지 않는다(다음 기동에 옛 배치).
 //           true 로 잘못 서면 빈 배치가 사용자 배치를 파괴한다 — 후자가 비가역이므로 닫는 쪽이 기본.
 let layoutLoaded = false;
+// ★S1 수정1(오너 2026-11-22 「CSO 는 리뷰어 컬럼 맨 아래」): 이 저장본의 **수동 탭**에 「CSO 를 대표 칸에서 리뷰어 열로」
+//   1회 이관을 이미 했는가. 저장본 루트의 `csoSide: 1` 로 남는다(saveLayout). 표식이 없는 저장본(이 판 이전)은 기동 S5 가
+//   한 번 옮기고 참으로 세운다 — 그 뒤 주인이 CSO 를 다시 끌어 옮긴 수동 탭을 다음 기동이 되돌리지 않게 하려는 것이다.
+//   자동(비수동) 탭은 이 표식과 무관하게 매 기동 표준 모양으로 선다(anchorHeadSafe).
+//   실패 방향: false 로 잘못 남으면 수동 탭의 CSO 가 다음 기동에 한 번 더 옮겨진다(주인의 재배치 1회 무시).
+//             true 로 잘못 서면 구버전 수동 탭이 옛 모양으로 남는다(`정렬` 로 복구 가능).
+let csoSideDone = false;
 
 // pane 식별 복합키 — 서로 다른 데몬이 같은 surface_id를 독립 발급하므로 (socket, sid)로 구분한다.
 const paneKey = (sid: number, socket?: string): string => `${socket ?? ""}#${sid}`;
@@ -2898,7 +2906,8 @@ function saveLayout() {
   );
   localStorage.setItem(
     LAYOUT_KEY,
-    JSON.stringify({ workspaces: persisted, groups: normG, active: a, counter: wsCounter, groupCounter }),
+    // ★S1 수정1: csoSide — 수동 탭의 CSO 1회 이관을 마친 저장본인가(미완이면 키 자체를 싣지 않는다 = 다음 기동이 한다).
+    JSON.stringify({ workspaces: persisted, groups: normG, active: a, counter: wsCounter, groupCounter, csoSide: csoSideDone ? 1 : undefined }),
   );
 }
 
@@ -5035,9 +5044,11 @@ function startGroupDrag(e0: MouseEvent, srcId: number) {
 
 // ---------- 정렬: 역할(role) 기반 고정 배치 ----------
 // 현재 워크스페이스의 살아있는 surface를 역할별 표준 자리로 재배치한다(규칙의 정의처 = seatlayout.ts roleLayout):
-//   · 왼쪽 끝 컬럼  = master(위) / cso·cso-N(아래), 세로 3:1 — ★U3(0.14.41): 폭은 pane 영역의 **1/3** 고정
+//   · 왼쪽 끝 컬럼  = master **혼자** — ★U3(0.14.41): 폭은 pane 영역의 **1/3** 고정
 //   · 가운데        = worker·미분류 surface를 나머지 2/3 안에서 같은 폭 컬럼으로 균등 분배(좌→우 순서 보존)
-//   · 오른쪽 끝 컬럼 = reviewer-gemini(agy, 위) / reviewer-codex(codex, 아래), 세로 1:1
+//   · 오른쪽 끝 컬럼 = 리뷰어 열: reviewer-gemini(agy) / reviewer-codex(codex) / 그 밖의 리뷰어 / **맨 아래 cso·cso-N**
+//                     — 같은 높이로 나눈다(리뷰어 2 + CSO = 각 1/3 · 리뷰어 1 = 각 1/2 · 리뷰어 3 = 각 1/4).
+//                     ★S1 수정1(오너 2026-11-22): CSO 는 대표 칸이 아니라 이 열에 선다.
 // ★U3: 정렬은 '표준 복귀'다 — 사용자가 끈 비율·수동 표식(layoutManual)을 초기화하고, 보류 중이던 빈 역할 칸(구멍)
 //   기억도 지운다(살아 있는 칸으로 새로 짠다). 정렬 뒤에도 divider 는 다시 끌 수 있다.
 // divider 1px·pane 헤더 등으로 컬럼 폭엔 셀 1칸 이내 잔차가 있을 수 있다.
@@ -10564,6 +10575,7 @@ async function start() {
       activeWs = saved.active ?? 0;
       wsCounter = saved.counter ?? 1;
       groupCounter = saved.groupCounter ?? 1; // 06
+      csoSideDone = saved.csoSide === 1; // ★S1 수정1: 표식 없는 저장본 = 아직 옮기지 않았다
     }
   } catch {
     workspaces = [];
@@ -11035,12 +11047,22 @@ async function start() {
   // ★U3 S5(0.14.41 · 반박 U3 D3·M5): 구버전 저장본(대표 1/4·1/8)을 **기동 즉시** 1/3 로 — 좌석이 늘지 않아도 약속이
   //   눈에 보인다(업데이트 뒤 앱만 재시작하면 좌석이 늘지 않는다). 수동 탭은 건드리지 않는다. 실패하면 원 트리
   //   (anchorHeadSafe) — 복원의 나머지 단계(빈 탭 충전·부서)를 막지 않는다.
+  // ★S1 수정1(오너 2026-11-22): 표준 모양이 바뀌었다 — CSO 는 대표 칸을 떠나 리뷰어 열 맨 아래에 선다. 자동 탭은
+  //   아래 anchorHeadSafe 가 매 기동 새 모양으로 세운다(구버전 저장본도 여기서 옮겨진다). **수동 탭**은 주인이 정한
+  //   배치라 다시 짜지 않지만, 이 판 이전에 저장된 것이면 CSO 한 칸만 **한 번** 옮긴다(moveCsoToSide — 나머지 칸과
+  //   끌어 둔 비율은 그대로). 한 번 했다는 표식(csoSideDone)은 saveLayout 이 저장본에 남긴다.
   for (const ws of workspaces) {
-    if (ws.layoutManual || !ws.tree) continue;
+    if (!ws.tree) continue;
     const lb = liveBySock.get(ws.socket);
     const roles = lb && lb.ok ? lb.roles : null;
-    ws.tree = anchorHeadSafe(ws.tree, (x) => (roles && roles.has(x) ? roles.get(x) : undefined));
+    const roleOf: RoleOf = (x) => (roles && roles.has(x) ? roles.get(x) : undefined);
+    if (ws.layoutManual) {
+      if (!csoSideDone) ws.tree = moveCsoToSide(ws.tree, roleOf);
+      continue;
+    }
+    ws.tree = anchorHeadSafe(ws.tree, roleOf);
   }
+  csoSideDone = true;
   // ★W-2-d: newSurface 직전 — 초기화가 끝난 앱의 죽은 데몬에 surface 를 만들지 않는다.
   if (startHaltedByReset(info)) return;
   // master 자동기동 제거 후: 데몬은 살아있으나(ok===true) 입양할 surface가 0개인 부서 ws(비활성 부서가
