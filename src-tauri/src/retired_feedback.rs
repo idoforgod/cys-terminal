@@ -10,13 +10,23 @@
 //! 앱 프로덕션 코드의 재귀 삭제도 이 파일의 한 곳뿐이다(아래 배선 핀).
 //!
 //! 【부르는 곳】 `main.rs` setup 부트 태스크 — 안전 모드 반환(비정규 경로 기동) **뒤**, 업데이트 반영 **앞**. 전 OS.
-//! 【멱등】 폴더가 없으면 stat 한 번으로 끝난다(마커 불요 · 옛 판 앱이 나중에 다시 만든 폴더도 다음 기동이 치운다).
-//! 【기록】 사라진 것이 있으면 `~/.cys/state/feedback-removed-<버전>.log` 에 한 줄을 **덧붙이고** 표준 오류에 한 줄을 낸다.
-//!         재귀 삭제가 도중에 멈춰 **일부만** 사라진 경우에도 사라진 것을 그대로 적는다(`partial`).
+//! 【한 번만】 지우는 일은 **한 번**이다(RULING-04 M5 — 오너의 명령은 「업데이트되면 지운다」다): 기록에 「지웠다」 줄이 있으면
+//!         — 어느 판이 적었든 — 다시 지우지 않는다. 그 뒤에 그 자리에 생긴 폴더(옛 판 앱이 다시 만든 것 포함)는 남는다.
+//!         폴더가 없으면 stat 한 번으로 끝난다(기록 파일도 만들지 않는다).
+//! 【기록】 지우기 **전에** `~/.cys/state/feedback-removed.log`(판 번호 없는 이름)를 로그 자신으로 열어 둔다 — 열 수 없거나
+//!         읽을 수 없으면 **지우지 않고** 알린다(기록할 수 없는 삭제는 하지 않는다). 사라진 것이 있으면 그 파일에 한 줄을
+//!         **덧붙이고** 표준 오류에 한 줄을 낸다. 재귀 삭제가 도중에 멈춰 **일부만** 사라진 경우에도 그대로 적는다(`partial`).
 //! 【실패】 부트를 막지 않는다. 남은 것은 완전 초기화의 목록(`src/factory_reset.rs` 의 `feedback` 항목)이 여전히 덮는다.
 
 /// 걷어낸 기능이 쓰던 폴더의 이름 — `~/.cys/` 바로 아래의 **이 이름 하나**(접두·패턴 매칭 0).
 const RETIRED_FEEDBACK_DIR: &str = "feedback";
+
+/// 지운 것의 기록 파일 이름 — `~/.cys/state/` 바로 아래. 판 번호를 넣지 않는다: 이 기록이 「이미 한 번 지웠다」의 표식이고,
+/// 판이 바뀌어도 같은 표식을 보아야 한다.
+const RETIRED_FEEDBACK_RECORD: &str = "feedback-removed.log";
+
+/// 기록에서 읽는 양의 상한 — 기록은 몇 줄이다. 이보다 크면 「확인할 수 없다」로 본다(지우지 않는다).
+const RETIRED_FEEDBACK_RECORD_READ_MAX: u64 = 1024 * 1024;
 
 /// 잔여 폴더 정리의 결과(순수 값 — 기록과 로그의 재료).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +43,7 @@ enum RetiredFeedbackCleanup {
     },
     /// 일부만 지웠다 — 재귀 삭제가 도중에 멈췄다(권한·사용 중인 파일). `gone` = 사라진 직계 항목 이름(정렬) ·
     /// `files`/`bytes` = 사라진 일반 파일 수·크기(지우기 전 − 남은 것) · `left` = 남은 직계 항목 이름 · `why` = 멈춘 사유.
-    /// 다음 기동이 남은 것을 다시 시도한다.
+    /// 사라진 것이 기록되므로 다음 기동은 다시 지우지 않는다(한 번만) — 남은 것은 완전 초기화의 목록이 덮는다.
     Partial {
         gone: Vec<String>,
         files: u64,
@@ -211,9 +221,9 @@ fn retired_feedback_note(msg: &str) {
     let _ = writeln!(std::io::stderr(), "{msg}");
 }
 
-/// setup 부트 태스크에서 부른다(전 OS). 판정은 stat 한 번이다 — 폴더가 없으면 아무 일도 없다(마커 불요 · 멱등 ·
-/// 옛 판 앱이 나중에 다시 만든 폴더도 다음 기동이 치운다).
-/// 실패는 부트를 막지 않는다 — 다음 기동이 다시 본다. 남은 것은 완전 초기화의 목록(factory_reset `feedback`)이 여전히 덮는다.
+/// setup 부트 태스크에서 부른다(전 OS). 폴더가 없으면 stat 한 번으로 끝난다. 지우는 일은 한 번뿐이다 — 기록에 「지웠다」 줄이
+/// 있으면 그 자리에 다시 생긴 폴더는 건드리지 않는다. 실패는 부트를 막지 않는다 — 하나도 지우지 못했으면(기록 줄 없음) 다음
+/// 기동이 다시 해 본다. 남은 것은 완전 초기화의 목록(factory_reset `feedback`)이 여전히 덮는다.
 pub(crate) fn remove_retired_feedback_dir() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -238,7 +248,7 @@ const RETIRED_FEEDBACK_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 #[cfg(windows)]
 const RETIRED_FEEDBACK_ATTR_REPARSE_POINT: u32 = 0x0000_0400;
 
-/// 기록 파일을 **로그 자신**으로만 연다(덧붙이기 전용 · 없으면 만든다). 열 수 없거나 로그 자신이 아니면 사유를 돌려준다.
+/// 기록 파일을 **로그 자신**으로만 연다(읽기 + 덧붙이기 · 없으면 만든다). 열 수 없거나 로그 자신이 아니면 사유를 돌려준다.
 ///
 /// 지키는 것(리뷰 M1 — 기록 자리에 놓인 링크 너머의 남의 파일에 기록 줄이 쓰였다):
 ///   ① 마지막 성분의 링크를 **따라가지 않는다**(유닉스 `O_NOFOLLOW` · 윈도우 재분석 지점 그대로 열기) — 파일로 가는 링크 ·
@@ -246,7 +256,9 @@ const RETIRED_FEEDBACK_ATTR_REPARSE_POINT: u32 = 0x0000_0400;
 ///   ② 연 것이 **일반 파일**인지를 연 핸들로 확인한다(경로를 다시 보지 않는다 — 확인과 쓰기 사이에 바뀔 틈이 없다).
 ///      파이프·장치·폴더·(윈도우) 재분석 지점은 거부한다.
 ///   ③ 유닉스: 이름이 둘 이상인 파일(하드 링크)은 거부한다 — 다른 이름으로 불리는 남의 파일일 수 있다.
-///   ④ 유닉스: 열기가 기다리지 않는다(`O_NONBLOCK`) — 읽는 쪽 없는 파이프 앞에서 부트가 서지 않는다.
+///   ④ 읽기 + 덧붙이기로 연다. 읽기는 「이미 지웠는가」 표식을 **같은 핸들**로 읽기 위해서다(경로를 두 번 열지 않는다).
+///      그리고 읽기+쓰기로 여는 파이프는 읽는 쪽을 기다리지 않는다(쓰기 전용 열기는 끝없이 기다린다 — 부트가 거기서 선다).
+///      열린 파이프는 ②가 거부한다.
 /// 부모 폴더(`~/.cys` · `~/.cys/state`)가 링크인 것은 따라간다 — cys 의 다른 상태 파일이 놓이는 바로 그 자리이고,
 /// 삭제 대상의 부모를 다루는 방식과 같다.
 fn retired_feedback_open_record(log: &std::path::Path) -> Result<std::fs::File, String> {
@@ -254,11 +266,11 @@ fn retired_feedback_open_record(log: &std::path::Path) -> Result<std::fs::File, 
         let _ = std::fs::create_dir_all(dir);
     }
     let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).append(true);
+    opts.read(true).create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        opts.custom_flags(libc::O_NOFOLLOW);
     }
     #[cfg(windows)]
     {
@@ -289,11 +301,71 @@ fn retired_feedback_open_record(log: &std::path::Path) -> Result<std::fs::File, 
     Ok(f)
 }
 
-/// 기록 한 줄을 `log` 에 덧붙인다(앞 줄을 지우지 않는다) — 로그 자신인 일반 파일에만. 쓰지 못하면 사유를 돌려준다.
-fn retired_feedback_append_record(log: &std::path::Path, line: &str) -> Result<(), String> {
-    use std::io::Write as _;
-    let mut f = retired_feedback_open_record(log)?;
-    f.write_all(line.as_bytes()).map_err(|e| format!("쓰지 못했다: {e}"))
+/// 기록에 「지웠다」 줄(셋째 칸이 `removed` 또는 `partial`)이 이미 있는가 — **연 핸들**에서 읽는다. 어느 판이 적었는지는 보지
+/// 않는다(한 번 지웠으면 끝이다). 읽지 못하거나 상한보다 크면 사유를 돌려준다 — 확인할 수 없으면 지우지 않는 쪽이다.
+fn retired_feedback_record_has_removal(record: &mut std::fs::File) -> Result<bool, String> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    record
+        .by_ref()
+        .take(RETIRED_FEEDBACK_RECORD_READ_MAX + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("읽지 못했다: {e}"))?;
+    if buf.len() as u64 > RETIRED_FEEDBACK_RECORD_READ_MAX {
+        return Err(format!("{RETIRED_FEEDBACK_RECORD_READ_MAX}바이트보다 크다"));
+    }
+    Ok(String::from_utf8_lossy(&buf)
+        .lines()
+        .any(|l| matches!(l.split('\t').nth(2), Some("removed") | Some("partial"))))
+}
+
+/// 지우기 전의 관문이 내는 답.
+enum RetiredFeedbackGate {
+    /// 지우지 않는다 — 이 결과로 끝난다(지울 것이 없다 · 기준 경로가 아니다 · 볼 수 없다 · 기록할 자리가 없다 · 이미 한 번 지웠다).
+    Stop(RetiredFeedbackCleanup),
+    /// 지워도 된다 — 지운 것을 적을 기록 파일이 열려 있다(로그 자신 · 「지웠다」 줄 없음).
+    Go(std::fs::File),
+}
+
+/// ★지우기 **전에** 서는 관문(RULING-04 M5) — 삭제 함수는 이 관문이 `Go` 를 낸 뒤에만 불린다.
+///   ① 기준 경로가 `~/.cys` 꼴이 아니거나 폴더가 없거나 볼 수 없으면 거기서 끝난다(기록 파일을 만들지 않는다).
+///   ② 지울 것이 보이면 기록 파일을 로그 자신으로 연다 — 열 수 없으면(다른 곳을 가리킨다 · 만들 수 없다) **지우지 않는다**.
+///   ③ 기록에 「지웠다」 줄이 있으면 **지우지 않는다** — 한 번만 지운다. 읽을 수 없어도 지우지 않는다.
+fn retired_feedback_record_gate(
+    cys_base: &std::path::Path,
+    target: &std::path::Path,
+    log: &std::path::Path,
+) -> RetiredFeedbackGate {
+    use RetiredFeedbackCleanup::{Absent, Failed, Skipped};
+    use RetiredFeedbackGate::{Go, Stop};
+    if !cys_base.is_absolute() || cys_base.file_name() != Some(std::ffi::OsStr::new(".cys")) {
+        return Stop(Skipped(format!("기준 경로가 ~/.cys 꼴이 아니다: {}", cys_base.display())));
+    }
+    match std::fs::symlink_metadata(target) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Stop(Absent),
+        Err(e) => return Stop(Failed(format!("상태 확인 실패: {e}"))),
+    }
+    let mut record = match retired_feedback_open_record(log) {
+        Ok(f) => f,
+        Err(why) => {
+            return Stop(Skipped(format!(
+                "지운 것을 적을 기록 파일을 쓸 수 없어 지우지 않았다: {} — {why}",
+                log.display()
+            )))
+        }
+    };
+    match retired_feedback_record_has_removal(&mut record) {
+        Ok(false) => Go(record),
+        Ok(true) => Stop(Skipped(format!(
+            "이미 한 번 지웠다(기록: {}) — 다시 지우지 않는다",
+            log.display()
+        ))),
+        Err(why) => Stop(Skipped(format!(
+            "기록 파일을 확인할 수 없어 지우지 않았다: {} — {why}",
+            log.display()
+        ))),
+    }
 }
 
 /// `remove_retired_feedback_dir_at` 의 몸통 — 알림 줄을 받는 곳(`note`)을 주입받는다(프로덕션 = 표준 오류 ·
@@ -306,19 +378,24 @@ fn remove_retired_feedback_dir_noting(
     let mut retired_feedback_note = |msg: &str| note(msg);
     let base = home.join(".cys");
     let target = base.join(RETIRED_FEEDBACK_DIR);
-    let out = remove_retired_feedback_dir_in(&base);
-    if let Some(line) = retired_feedback_record_line(now_unix, &target, &out) {
-        let log = base
-            .join("state")
-            .join(format!("feedback-removed-{}.log", env!("CARGO_PKG_VERSION")));
-        // 기록을 남기지 못한 것은 조용히 넘기지 않는다 — 무엇 때문인지 한 줄로 알린다(지운 내용은 바로 아래 알림 줄에 있다).
-        if let Err(why) = retired_feedback_append_record(&log, &line) {
-            retired_feedback_note(&format!(
-                "[cys-app] 지운 것의 기록을 남기지 못했습니다: {} — {why}",
-                log.display()
-            ));
+    let log = base.join("state").join(RETIRED_FEEDBACK_RECORD);
+    let out = match retired_feedback_record_gate(&base, &target, &log) {
+        RetiredFeedbackGate::Stop(out) => out,
+        RetiredFeedbackGate::Go(mut record) => {
+            use std::io::Write as _;
+            let out = remove_retired_feedback_dir_in(&base);
+            if let Some(line) = retired_feedback_record_line(now_unix, &target, &out) {
+                // 열어 둔 기록 파일에 쓰지 못한 것(디스크가 찼다 등)은 조용히 넘기지 않는다 — 지운 내용은 바로 아래 알림 줄에 있다.
+                if let Err(e) = record.write_all(line.as_bytes()) {
+                    retired_feedback_note(&format!(
+                        "[cys-app] 지운 것의 기록을 남기지 못했습니다: {} — 쓰지 못했다: {e}",
+                        log.display()
+                    ));
+                }
+            }
+            out
         }
-    }
+    };
     match &out {
         RetiredFeedbackCleanup::Absent => {}
         RetiredFeedbackCleanup::Removed {
@@ -471,7 +548,7 @@ mod tests {
     fn s1_fix2_log(home: &std::path::Path) -> std::path::PathBuf {
         home.join(".cys")
             .join("state")
-            .join(format!("feedback-removed-{}.log", env!("CARGO_PKG_VERSION")))
+            .join("feedback-removed.log")
     }
 
     /// ★`~/.cys/feedback` 은 통째로 사라지고, **그 경로 하나만** 사라진다 — 이름이 비슷한 형제·같은 이름의 다른 자리는
@@ -1073,8 +1150,10 @@ mod tests {
                     reader = open_reader().ok();
                 }
             }
-            let _ = worker.join();
+            // 돌아온 경우에만 스레드를 거둔다 — 끝내 돌아오지 않는 스레드를 기다리면 이 테스트 자신이 선다(남은 스레드는 테스트
+            // 프로세스가 끝날 때 함께 사라진다).
             if let Ok((out, notes)) = got {
+                let _ = worker.join();
                 s1_fix2_not_deleted(tag, &home, &log, &out, &notes, &mut bad);
             }
             // 파이프로 들어간 바이트가 없다(읽는 쪽이 있을 때만 잴 수 있다)
