@@ -35103,6 +35103,112 @@ mod tests {
         }
     }
 
+    /// ★S1 M2(3)(RULING-S1-PRODUCT-05): codex 좌석의 실행 줄이 좌석의 도구 변수를 `-c shell_environment_policy.set.…`
+    /// 로 싣는다 — 사용자 codex 설정이 `inherit = "core"` 면 그 변수들이 codex 의 명령 셸에 닿지 않아, 개발자 도구 없는
+    /// 맥에서 /usr/bin/python3·git(애플 stub)이 설치 창을 띄운다. 값은 좌석 셸이 **자기 변수**를 전개해 채우고, 변수가
+    /// 비었거나 없으면 플래그 자체가 없다. Windows 는 손대지 않는다(순수 cmd).
+    const S1_M2_CODEX_VARS: [&str; 5] =
+        ["DEVELOPER_DIR", "CYS_PY", "CYS_PY_ORIGIN", "PYTHONDONTWRITEBYTECODE", "PYTHONUTF8"];
+
+    #[test]
+    fn codex_launch_line_carries_the_seat_tool_variables() {
+        let cmd = "codex --no-daemon --dangerously-bypass-approvals-and-sandbox resume --last";
+        let (send, inject) = render_launch(cmd, &[]);
+        #[cfg(not(windows))]
+        {
+            let mut want = String::from("codex");
+            for n in S1_M2_CODEX_VARS {
+                want.push_str(&format!(" ${{{n}:+-c}} ${{{n}:+\"shell_environment_policy.set.{n}='''${n}'''\"}}"));
+            }
+            want.push_str(" --no-daemon --dangerously-bypass-approvals-and-sandbox resume --last");
+            assert_eq!(send, want, "codex 실행 줄: 바이너리 바로 뒤(하위 명령 resume 앞)에 변수마다 두 단어");
+            assert!(inject.is_empty());
+            // claude·경로로 적힌 다른 바이너리·빈 cmd 는 그대로다.
+            for other in ["claude --dangerously-skip-permissions", "~/.local/bin/agy --x", "grok", ""] {
+                assert_eq!(render_launch(other, &[]).0, other, "codex 가 아닌 줄은 바이트 그대로");
+            }
+            // 경로로 적은 codex 도 같은 규칙.
+            let (p, _) = render_launch("/opt/homebrew/bin/codex --no-daemon", &[]);
+            assert!(p.starts_with("/opt/homebrew/bin/codex ${DEVELOPER_DIR:+-c} "), "{p}");
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(send, cmd, "Windows 는 순수 cmd 그대로");
+            assert!(inject.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_launch_line_expands_in_real_shells_to_the_flags_codex_reads() {
+        // 렌더된 줄을 **실제 셸**(/bin/zsh · /bin/bash)이 전개한 뒤 codex 가 받는 argv 를 잰다 — 가짜 `codex` 가 argv 를
+        // 한 줄씩 적는다. 좌석 셸은 대화형이지만 이 전개(${:+})는 대화형·비대화형이 같다.
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("cys-s1-m2-codex-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let bin = base.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let argv_file = base.join("argv.txt");
+        let stub = bin.join("codex");
+        fs::write(&stub, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", argv_file.display())).unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let (line, _) = render_launch("codex --no-daemon --dangerously-bypass-approvals-and-sandbox", &[]);
+        let dev = "/Applications/App With Spaces.app/Contents/Resources/runtime/devtools";
+        let py = "/Applications/App With Spaces.app/Contents/Resources/runtime/python/bin/python3";
+        let tail = ["--no-daemon", "--dangerously-bypass-approvals-and-sandbox"];
+        let flag = |n: &str, v: &str| vec!["-c".to_string(), format!("shell_environment_policy.set.{n}='''{v}'''")];
+        let all: Vec<(&str, &str)> = vec![
+            ("DEVELOPER_DIR", dev),
+            ("CYS_PY", py),
+            ("CYS_PY_ORIGIN", "bundled-clt-absent"),
+            ("PYTHONDONTWRITEBYTECODE", "1"),
+            ("PYTHONUTF8", "1"),
+        ];
+        let mut want_all: Vec<String> = all.iter().flat_map(|(n, v)| flag(n, v)).collect();
+        want_all.extend(tail.iter().map(|s| s.to_string()));
+        // 개발자 도구가 있는 맥: DEVELOPER_DIR·CYS_PY·CYS_PY_ORIGIN 없음, 두 python 변수만 있다. DEVELOPER_DIR 은 빈 값.
+        let with_tools: Vec<(&str, &str)> =
+            vec![("DEVELOPER_DIR", ""), ("PYTHONDONTWRITEBYTECODE", "1"), ("PYTHONUTF8", "1")];
+        let mut want_tools: Vec<String> = flag("PYTHONDONTWRITEBYTECODE", "1");
+        want_tools.extend(flag("PYTHONUTF8", "1"));
+        want_tools.extend(tail.iter().map(|s| s.to_string()));
+        let want_none: Vec<String> = tail.iter().map(|s| s.to_string()).collect();
+        let mut bad: Vec<String> = Vec::new();
+        let mut ran = 0;
+        for (shell, opts) in [("/bin/zsh", vec!["-f", "-c"]), ("/bin/bash", vec!["--noprofile", "--norc", "-c"])] {
+            if !std::path::Path::new(shell).exists() {
+                continue;
+            }
+            for (case, vars, want) in [
+                ("tool-less mac", &all, &want_all),
+                ("mac with developer tools", &with_tools, &want_tools),
+                ("no seat variables", &vec![], &want_none),
+            ] {
+                let _ = fs::remove_file(&argv_file);
+                let mut c = std::process::Command::new(shell);
+                c.args(&opts).arg(&line).env_clear().env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+                c.env("HOME", &base);
+                for (n, v) in vars.iter() {
+                    c.env(n, v);
+                }
+                let st = c.status().expect("shell");
+                ran += 1;
+                let got: Vec<String> = fs::read_to_string(&argv_file)
+                    .unwrap_or_default()
+                    .lines()
+                    .map(String::from)
+                    .collect();
+                if !st.success() || &got != want {
+                    bad.push(format!("{shell} [{case}] rc={st:?}\n  got  {got:?}\n  want {want:?}"));
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&base);
+        assert!(ran > 0, "no POSIX shell found");
+        assert!(bad.is_empty(), "S1 M2(3) violations (line = {line}):\n{}", bad.join("\n"));
+    }
+
     /// ★D5 두-소비처 회귀 핀(v4 · W4): 주입 로직이 lib 헬퍼 단일 SOT 라도, **두 소비처**
     /// (boot_agent_on_surface 인라인 재조립 · run_launch_agent_opts surface.create env 맵)의
     /// 합성 결과에서 각각 검증한다 — 사용자 "0"(agents.json env) 이 있으면 최종 산출 어디에도
