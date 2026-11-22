@@ -231,17 +231,68 @@ fn remove_retired_feedback_dir_at(home: &std::path::Path, now_unix: u64) -> Reti
     remove_retired_feedback_dir_noting(home, now_unix, &mut |msg: &str| retired_feedback_note(msg))
 }
 
-/// 기록 한 줄을 `log` 에 덧붙인다(없으면 만든다 · 앞 줄을 지우지 않는다). 쓰지 못하면 사유를 돌려준다.
-fn retired_feedback_append_record(log: &std::path::Path, line: &str) -> Result<(), String> {
-    use std::io::Write as _;
+/// 윈도우 `CreateFileW` 의 `FILE_FLAG_OPEN_REPARSE_POINT` — 마지막 성분이 링크(재분석 지점)면 가리키는 곳이 아니라 링크 자신을 연다.
+#[cfg(windows)]
+const RETIRED_FEEDBACK_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+/// 윈도우 파일 속성 `FILE_ATTRIBUTE_REPARSE_POINT`.
+#[cfg(windows)]
+const RETIRED_FEEDBACK_ATTR_REPARSE_POINT: u32 = 0x0000_0400;
+
+/// 기록 파일을 **로그 자신**으로만 연다(덧붙이기 전용 · 없으면 만든다). 열 수 없거나 로그 자신이 아니면 사유를 돌려준다.
+///
+/// 지키는 것(리뷰 M1 — 기록 자리에 놓인 링크 너머의 남의 파일에 기록 줄이 쓰였다):
+///   ① 마지막 성분의 링크를 **따라가지 않는다**(유닉스 `O_NOFOLLOW` · 윈도우 재분석 지점 그대로 열기) — 파일로 가는 링크 ·
+///      끊긴 링크 · 폴더로 가는 링크 어느 것도 그 너머를 열거나 만들지 않는다.
+///   ② 연 것이 **일반 파일**인지를 연 핸들로 확인한다(경로를 다시 보지 않는다 — 확인과 쓰기 사이에 바뀔 틈이 없다).
+///      파이프·장치·폴더·(윈도우) 재분석 지점은 거부한다.
+///   ③ 유닉스: 이름이 둘 이상인 파일(하드 링크)은 거부한다 — 다른 이름으로 불리는 남의 파일일 수 있다.
+///   ④ 유닉스: 열기가 기다리지 않는다(`O_NONBLOCK`) — 읽는 쪽 없는 파이프 앞에서 부트가 서지 않는다.
+/// 부모 폴더(`~/.cys` · `~/.cys/state`)가 링크인 것은 따라간다 — cys 의 다른 상태 파일이 놓이는 바로 그 자리이고,
+/// 삭제 대상의 부모를 다루는 방식과 같다.
+fn retired_feedback_open_record(log: &std::path::Path) -> Result<std::fs::File, String> {
     if let Some(dir) = log.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        opts.custom_flags(RETIRED_FEEDBACK_OPEN_REPARSE_POINT);
+    }
+    let f = opts
         .open(log)
-        .map_err(|e| format!("열지 못했다: {e}"))?;
+        .map_err(|e| format!("열지 못했다(링크는 따라가지 않는다): {e}"))?;
+    let meta = f.metadata().map_err(|e| format!("연 것을 확인하지 못했다: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err("일반 파일이 아니다".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.nlink() != 1 {
+            return Err(format!("이름이 {}개인 파일이다(하드 링크)", meta.nlink()));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if meta.file_attributes() & RETIRED_FEEDBACK_ATTR_REPARSE_POINT != 0 {
+            return Err("링크(재분석 지점)다".to_string());
+        }
+    }
+    Ok(f)
+}
+
+/// 기록 한 줄을 `log` 에 덧붙인다(앞 줄을 지우지 않는다) — 로그 자신인 일반 파일에만. 쓰지 못하면 사유를 돌려준다.
+fn retired_feedback_append_record(log: &std::path::Path, line: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    let mut f = retired_feedback_open_record(log)?;
     f.write_all(line.as_bytes()).map_err(|e| format!("쓰지 못했다: {e}"))
 }
 
@@ -260,7 +311,13 @@ fn remove_retired_feedback_dir_noting(
         let log = base
             .join("state")
             .join(format!("feedback-removed-{}.log", env!("CARGO_PKG_VERSION")));
-        let _ = retired_feedback_append_record(&log, &line);
+        // 기록을 남기지 못한 것은 조용히 넘기지 않는다 — 무엇 때문인지 한 줄로 알린다(지운 내용은 바로 아래 알림 줄에 있다).
+        if let Err(why) = retired_feedback_append_record(&log, &line) {
+            retired_feedback_note(&format!(
+                "[cys-app] 지운 것의 기록을 남기지 못했습니다: {} — {why}",
+                log.display()
+            ));
+        }
     }
     match &out {
         RetiredFeedbackCleanup::Absent => {}
