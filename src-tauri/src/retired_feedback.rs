@@ -11,7 +11,8 @@
 //!
 //! 【부르는 곳】 `main.rs` setup 부트 태스크 — 안전 모드 반환(비정규 경로 기동) **뒤**, 업데이트 반영 **앞**. 전 OS.
 //! 【멱등】 폴더가 없으면 stat 한 번으로 끝난다(마커 불요 · 옛 판 앱이 나중에 다시 만든 폴더도 다음 기동이 치운다).
-//! 【기록】 지웠으면 표준 오류 한 줄 + `~/.cys/state/feedback-removed-<버전>.log` 에 한 줄을 **덧붙인다**.
+//! 【기록】 사라진 것이 있으면 `~/.cys/state/feedback-removed-<버전>.log` 에 한 줄을 **덧붙이고** 표준 오류에 한 줄을 낸다.
+//!         재귀 삭제가 도중에 멈춰 **일부만** 사라진 경우에도 사라진 것을 그대로 적는다(`partial`).
 //! 【실패】 부트를 막지 않는다. 남은 것은 완전 초기화의 목록(`src/factory_reset.rs` 의 `feedback` 항목)이 여전히 덮는다.
 
 /// 걷어낸 기능이 쓰던 폴더의 이름 — `~/.cys/` 바로 아래의 **이 이름 하나**(접두·패턴 매칭 0).
@@ -30,9 +31,19 @@ enum RetiredFeedbackCleanup {
         bytes: u64,
         link: bool,
     },
+    /// 일부만 지웠다 — 재귀 삭제가 도중에 멈췄다(권한·사용 중인 파일). `gone` = 사라진 직계 항목 이름(정렬) ·
+    /// `files`/`bytes` = 사라진 일반 파일 수·크기(지우기 전 − 남은 것) · `left` = 남은 직계 항목 이름 · `why` = 멈춘 사유.
+    /// 다음 기동이 남은 것을 다시 시도한다.
+    Partial {
+        gone: Vec<String>,
+        files: u64,
+        bytes: u64,
+        left: Vec<String>,
+        why: String,
+    },
     /// 손대지 않았다 — 이 기능이 만든 모양이 아니다(같은 이름의 일반 파일 · 기준 경로가 `~/.cys` 꼴이 아님).
     Skipped(String),
-    /// 지우지 못했다(권한 등). 부트는 계속하고 다음 기동이 다시 시도한다.
+    /// 지우지 못했다(권한 등) — 사라진 것이 하나도 없다. 부트는 계속하고 다음 기동이 다시 시도한다.
     Failed(String),
 }
 
@@ -81,8 +92,9 @@ fn dir_entry_names(dir: &std::path::Path) -> Vec<String> {
 ///      `.cys/feedback`(현재 디렉터리 기준)을 지우게 되는 길을 막는다.
 ///   ③ 그 이름이 심볼릭 링크면 **링크만** 지운다(따라가지 않는다). 일반 파일이면 손대지 않는다(이 기능은 폴더만 만들었다).
 ///   ④ 폴더 안의 심볼릭 링크는 링크로 지워진다(표준 라이브러리의 재귀 삭제는 링크를 따라가지 않는다).
+///   ⑤ 재귀 삭제가 도중에 멈추면 「지우지 않았다」고 말하지 않는다 — 다시 세어 사라진 것을 `Partial` 로 돌려준다.
 fn remove_retired_feedback_dir_in(cys_base: &std::path::Path) -> RetiredFeedbackCleanup {
-    use RetiredFeedbackCleanup::{Absent, Failed, Removed, Skipped};
+    use RetiredFeedbackCleanup::{Absent, Failed, Partial, Removed, Skipped};
     if !cys_base.is_absolute() || cys_base.file_name() != Some(std::ffi::OsStr::new(".cys")) {
         return Skipped(format!("기준 경로가 ~/.cys 꼴이 아니다: {}", cys_base.display()));
     }
@@ -118,17 +130,49 @@ fn remove_retired_feedback_dir_in(cys_base: &std::path::Path) -> RetiredFeedback
             bytes,
             link: false,
         },
-        Err(e) => Failed(format!("삭제 실패: {e}")),
+        Err(e) => {
+            // 재귀 삭제는 첫 오류에서 멈춘다 — 그 앞의 항목은 이미 사라졌다. 다시 세어 사라진 것을 말한다.
+            let left = dir_entry_names(&target);
+            let (files_left, bytes_left) = dir_file_totals(&target);
+            let gone: Vec<String> = entries.iter().filter(|n| !left.contains(n)).cloned().collect();
+            let files_gone = files.saturating_sub(files_left);
+            if gone.is_empty() && files_gone == 0 {
+                Failed(format!("삭제 실패: {e}"))
+            } else {
+                Partial {
+                    gone,
+                    files: files_gone,
+                    bytes: bytes.saturating_sub(bytes_left),
+                    left,
+                    why: format!("삭제 실패: {e}"),
+                }
+            }
+        }
     }
 }
 
-/// 기록 한 줄(순수) — 탭 구분: unix 초 · 앱 버전 · removed · 경로 · link · 직계 항목 수 · 파일 수 · 바이트 · 직계 항목 이름.
-/// 지운 것이 없으면 None(없음·건너뜀·실패는 기록 파일을 만들지 않는다).
+/// 기록 줄에 넣는 이름 — 제어 문자(줄바꿈·탭)를 `?` 로 바꾼다. 폴더 이름이 줄바꿈을 품고 있어도 기록은 **한 줄**이다.
+fn retired_feedback_record_name(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
+}
+
+/// 기록 줄의 이름 칸 — 쉼표로 잇는다.
+fn retired_feedback_record_names(v: &[String]) -> String {
+    v.iter()
+        .map(|n| retired_feedback_record_name(n))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// 기록 한 줄(순수) — 탭 구분: unix 초 · 앱 버전 · removed|partial · 경로 · link · 사라진 직계 항목 수 · 파일 수 · 바이트 ·
+/// 사라진 직계 항목 이름. `partial` 은 그 뒤에 `left=<남은 직계 항목 이름>` 과 멈춘 사유가 붙는다.
+/// 사라진 것이 없으면 None(없음·건너뜀·실패는 기록 파일을 만들지 않는다).
 fn retired_feedback_record_line(
     now_unix: u64,
     target: &std::path::Path,
     out: &RetiredFeedbackCleanup,
 ) -> Option<String> {
+    let names = retired_feedback_record_names;
     match out {
         RetiredFeedbackCleanup::Removed {
             entries,
@@ -140,10 +184,31 @@ fn retired_feedback_record_line(
             env!("CARGO_PKG_VERSION"),
             target.display(),
             entries.len(),
-            entries.join(",")
+            names(entries)
+        )),
+        RetiredFeedbackCleanup::Partial {
+            gone,
+            files,
+            bytes,
+            left,
+            why,
+        } => Some(format!(
+            "{now_unix}\t{}\tpartial\t{}\tlink=false\tentries={}\tfiles={files}\tbytes={bytes}\t{}\tleft={}\t{}\n",
+            env!("CARGO_PKG_VERSION"),
+            target.display(),
+            gone.len(),
+            names(gone),
+            names(left),
+            retired_feedback_record_name(why)
         )),
         _ => None,
     }
+}
+
+/// 표준 오류 한 줄. `eprintln!` 은 표준 오류가 닫힌 파이프이면 패닉한다 — 부트 태스크를 풀어 버리지 않게 쓰기 결과를 버린다.
+fn retired_feedback_note(msg: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{msg}");
 }
 
 /// setup 부트 태스크에서 부른다(전 OS). 판정은 stat 한 번이다 — 폴더가 없으면 아무 일도 없다(마커 불요 · 멱등 ·
@@ -158,13 +223,23 @@ pub(crate) fn remove_retired_feedback_dir() {
 }
 
 /// 홈을 주입받는 몸통(테스트가 임시 홈으로 부른다) — `<home>/.cys/feedback` 을 정리하고 결과를 돌려준다.
-/// 지웠으면 ① 표준 오류에 한 줄 ② `<home>/.cys/state/feedback-removed-<버전>.log` 에 **덧붙여** 남긴다(무엇을·얼마나).
+/// 사라진 것이 있으면 ① `<home>/.cys/state/feedback-removed-<버전>.log` 에 **덧붙여** 남기고(무엇을·얼마나)
+/// ② 표준 오류에 한 줄을 낸다. 기록이 먼저다 — 표준 오류가 닫혀 있어도 기록은 남는다.
 /// ★로그 문구는 기능의 이름을 부르지 않는다(경로가 무엇인지 말한다) — 제품의 말에서 그 이름은 팩 검체
 /// (test_content_pins_parity.py 의 A-1-05)가 0 으로 잰다.
 fn remove_retired_feedback_dir_at(home: &std::path::Path, now_unix: u64) -> RetiredFeedbackCleanup {
     let base = home.join(".cys");
     let target = base.join(RETIRED_FEEDBACK_DIR);
     let out = remove_retired_feedback_dir_in(&base);
+    if let Some(line) = retired_feedback_record_line(now_unix, &target, &out) {
+        use std::io::Write as _;
+        let dir = base.join("state");
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join(format!("feedback-removed-{}.log", env!("CARGO_PKG_VERSION")));
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
     match &out {
         RetiredFeedbackCleanup::Absent => {}
         RetiredFeedbackCleanup::Removed {
@@ -172,28 +247,27 @@ fn remove_retired_feedback_dir_at(home: &std::path::Path, now_unix: u64) -> Reti
             files,
             bytes,
             link,
-        } => {
-            eprintln!(
-                "[cys-app] 걷어낸 기능이 남긴 폴더를 지웠습니다: {} (링크={link} · 직계 항목 {}개 · 파일 {files}개 · {bytes}바이트)",
-                target.display(),
-                entries.len()
-            );
-            if let Some(line) = retired_feedback_record_line(now_unix, &target, &out) {
-                use std::io::Write as _;
-                let dir = base.join("state");
-                let _ = std::fs::create_dir_all(&dir);
-                let log = dir.join(format!("feedback-removed-{}.log", env!("CARGO_PKG_VERSION")));
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
-                    let _ = f.write_all(line.as_bytes());
-                }
-            }
-        }
-        RetiredFeedbackCleanup::Skipped(why) | RetiredFeedbackCleanup::Failed(why) => {
-            eprintln!(
-                "[cys-app] 걷어낸 기능이 남긴 폴더를 정리하지 않았습니다: {} — {why}",
-                target.display()
-            );
-        }
+        } => retired_feedback_note(&format!(
+            "[cys-app] 걷어낸 기능이 남긴 폴더를 지웠습니다: {} (링크={link} · 직계 항목 {}개 · 파일 {files}개 · {bytes}바이트)",
+            target.display(),
+            entries.len()
+        )),
+        RetiredFeedbackCleanup::Partial {
+            gone,
+            files,
+            bytes,
+            left,
+            why,
+        } => retired_feedback_note(&format!(
+            "[cys-app] 걷어낸 기능이 남긴 폴더를 일부만 지웠습니다: {} (사라진 직계 항목 {}개 · 파일 {files}개 · {bytes}바이트 · 남은 직계 항목 {}개) — {why}",
+            target.display(),
+            gone.len(),
+            left.len()
+        )),
+        RetiredFeedbackCleanup::Skipped(why) | RetiredFeedbackCleanup::Failed(why) => retired_feedback_note(&format!(
+            "[cys-app] 걷어낸 기능이 남긴 폴더를 정리하지 않았습니다: {} — {why}",
+            target.display()
+        )),
     }
     out
 }
