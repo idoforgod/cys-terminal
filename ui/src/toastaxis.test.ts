@@ -178,6 +178,7 @@ function build(opts: { quiet: boolean; ccOpen?: boolean; slugs?: Record<string, 
     isClosingSid: () => false,
     formatAlarmTime: () => "t",
     ccEsc: (s: string) => s,
+    ownerNamedDept: (_socket: unknown, registryName: string) => registryName, // ★S1 수정3: 주인이 카드에서 정한 이름 조회 — 이 시험의 부서에는 그런 카드가 없다
     isBulkConfirmable: () => true,
     deptPendingRows: () => [],
     renderAlarmHistory: getSpy("renderAlarmHistory"),
