@@ -233,7 +233,7 @@ pub(crate) fn remove_retired_feedback_dir() {
 }
 
 /// 홈을 주입받는 몸통(테스트가 임시 홈으로 부른다) — `<home>/.cys/feedback` 을 정리하고 결과를 돌려준다.
-/// 사라진 것이 있으면 ① `<home>/.cys/state/feedback-removed-<버전>.log` 에 **덧붙여** 남기고(무엇을·얼마나)
+/// 사라진 것이 있으면 ① `<home>/.cys/state/feedback-removed.log`(판 번호 없는 이름 — 한 번 지웠다는 표식) 에 **덧붙여** 남기고(무엇을·얼마나)
 /// ② 표준 오류에 한 줄을 낸다. 기록이 먼저다 — 표준 오류가 닫혀 있어도 기록은 남는다.
 /// ★로그 문구는 기능의 이름을 부르지 않는다(경로가 무엇인지 말한다) — 제품의 말에서 그 이름은 팩 검체
 /// (test_content_pins_parity.py 의 A-1-05)가 0 으로 잰다.

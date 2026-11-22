@@ -4455,6 +4455,13 @@ mod tests {
         if got4.as_deref() != Some(want4.as_str()) {
             bad.push(format!("one present later, one absent: got {got4:?}, want {want4:?}"));
         }
+        // ~/.local/bin 이 prefix 자신이면(cys 가 ~/.local/bin 에서 도는 데몬의 exe_dir) 끝에 한 번 더 붙지 않는다.
+        let p5 = vec![local.clone(), "/rt/python/bin".to_string()];
+        let want5 = format!("{local}:/rt/python/bin:/usr/bin:/bin");
+        let got5 = compose_unix_pane_path(&p5, home, "/usr/bin:/bin");
+        if got5.as_deref() != Some(want5.as_str()) {
+            bad.push(format!("~/.local/bin as a prefix appended twice: got {got5:?}, want {want5:?}"));
+        }
         assert!(bad.is_empty(), "S1 M2(1) violations:\n{}", bad.join("\n"));
     }
 
