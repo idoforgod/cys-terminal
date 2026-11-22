@@ -653,29 +653,32 @@ class NoMasterShortcutAnywhere(unittest.TestCase):
 # [.!?。\n]; every other family is matched over the WHOLE extracted string (an alternative may hold sentence punctuation:
 # the e-mail address, `Dr.`), and a match is reported with the sentence its first character lies in. The single exclusion
 # EX (EX-1, EX-2 — a match whose sentence equals one of them) and the identifier rules apply: a T1-e match that is only
-# `--propose` / `pack-merge --propose` or lies in the patch header line (Part 15 A5), and the feedback feature's own names,
-# by exact string (RULINGS BZ2 / Part 33 B97). STRICTER THAN THE FROZEN LIST (RULINGS BZ3, proposed for Part 33 B98 — the
+# `--propose` / `pack-merge --propose` or lies in the patch header line (Part 15 A5).
+# STRICTER THAN THE FROZEN LIST (RULINGS BZ3, proposed for Part 33 B98 — the
 # guard applies them now): T1-b+ (feedback / a bare "제보해 주세요" presented as the way out) and T1-h ("it will be fixed
 # (faster)" — the fix promised by someone else). Test sources are out of the sweep (B95), so the patterns are written plainly.
 # STATED LIMIT (RULINGS BZ6): a sentence assembled at run time from several literals (`"…" + x + "…"`, `%`-formatting over
 # several constants, `.join`) is checked piece by piece; the stage-5 run-time corpus sees the assembled text.
-def _product_feedback_address():
-    """The feedback feature's address as the PRODUCT keeps it — `FEEDBACK_TO` in src-tauri/src/feedback.rs, read at test time.
-    No pack file spells an e-mail address (scan-pack-secrets: the pack ships to every user). None when the repository's
-    source is not reachable from here (a pack installed without the repository); the tests that need it then skip with a
-    notice — and FAIL inside the repository (`DeferralFamiliesFG.test_dotted_alternatives_are_matched_over_the_whole_string`)."""
+def _product_contact_address():
+    """The product's contact address as the PRODUCT keeps it — the reporting line of SECURITY.md at the repository root,
+    found by what the line says (it tells where to report and carries the address in bold), never by its line number; read
+    at test time. No pack file spells an e-mail address (scan-pack-secrets: the pack ships to every user). None when
+    SECURITY.md is not readable from here, or holds no such line, or its reporting lines name more than one address; the
+    tests that need it then skip with a notice outside the repository — and FAIL inside it
+    (`DeferralFamiliesFG.test_dotted_alternatives_are_matched_over_the_whole_string`): an empty read never passes."""
     import re as _re
     try:
-        with open(os.path.join(REPO_DIR, "src-tauri", "src", "feedback.rs"), encoding="utf-8") as fh:
-            m = _re.search(r'pub const FEEDBACK_TO: &str = "([^"\s]+)";', fh.read())
+        with open(os.path.join(REPO_DIR, "SECURITY.md"), encoding="utf-8") as fh:
+            text = fh.read()
     except OSError:
         return None
-    return m.group(1) if m else None
+    found = set(_re.findall(r"(?im)^[^\n]*\breport\b[^\n]*?\*\*([^\s*@]+@[^\s*@]+\.[^\s*@]+)\*\*", text))
+    return found.pop() if len(found) == 1 else None
 
 
-FEEDBACK_TO = _product_feedback_address()
+CONTACT_ADDRESS = _product_contact_address()
 # A.md §5 T1-b names the address with its dot escaped — assembled here from the product's constant (`re.escape`).
-_T1B_ADDRESS_ALT = (__import__("re").escape(FEEDBACK_TO) + "|") if FEEDBACK_TO else ""
+_T1B_ADDRESS_ALT = (__import__("re").escape(CONTACT_ADDRESS) + "|") if CONTACT_ADDRESS else ""
 
 TIER1_NOUN = (r"(최윤식|윤식\s*박사|박사(?!급)|Dr\.?\s*Choi|Yoonsik|제작자|제작사|개발자|개발사|개발팀|제조사|벤더|vendor|배포자|공급자"
               r"|upstream|업스트림|배포\s*전담\s*부서|정비발행부|maintainer|developer)")
@@ -705,22 +708,6 @@ TIER1_EX = (
     "무엇을 하면 풀리는지 사실대로 말한다",
 )
 ROLE_BLOCK_CONSTS = ("RULES_COMMON", "RULES_MASTER_CEO", "RULES_WORKER", "RULES_CSO", "RULES_REVIEWER")
-# RULINGS BZ2 / Part 33 B97: the optional feedback feature names itself — these EXACT extracted strings are identifiers of that
-# feature (its address constant, the modal's title and field labels), not sentences. A sentence that presents feedback or
-# reporting as the way to get a defect fixed is still a hit wherever it stands, the modal included.
-FEEDBACK_FEATURE_IDENTIFIERS = {
-    "src-tauri/src/feedback.rs": (FEEDBACK_TO,) if FEEDBACK_TO else (),       # FEEDBACK_TO — the address constant
-    "ui/src/feedbackmodal.ts": (
-        "피드백 보내기",                                                          # the button's aria-label
-        "<span>피드백 보내기</span>",                                             # the button's label
-        '<div class="fb-head"><h3 id="fb-title">피드백 보내기</h3><button type="button" class="fb-x" '
-        'aria-label="닫기">×</button></div>',                                    # the modal's title
-    ),
-}
-# The same feature's NAME inside a longer text (the manual's section heading and its button sentence): a T1-b+ match that IS
-# the name "피드백 보내기" in full — nothing before or after it inside the match — is an identifier (RULINGS CE1, as Part 15
-# A5 does for `--propose`); a match that merely starts with or contains the name is counted ("피드백 보내기를 눌러 알려 주세요").
-FEEDBACK_FEATURE_NAME_MATCH = r"'?피드백'?\s*보내"      # T1-b+'s own match on the name stops before its last syllable "기"
 
 
 def _tier1_sentence_spans(t):
@@ -749,8 +736,6 @@ def tier1_text_hits(text, stricter=True):
         for m in re.finditer(pat, t, re.I):
             i = bisect.bisect_right(starts, m.start()) - 1
             if i < 0 or is_ex(i):
-                continue
-            if fam == "T1-b+" and re.fullmatch(FEEDBACK_FEATURE_NAME_MATCH, m.group(0)) and t[m.end():m.end() + 1] == "기":
                 continue
             if fam == "T1-e":
                 line = t[t.rfind("\n", 0, m.start()) + 1:(t.find("\n", m.end()) + 1 or len(t) + 1) - 1]
@@ -1052,9 +1037,8 @@ def deferral_sweep(repo, rels, stricter=True):
             for name in ROLE_BLOCK_CONSTS:
                 m = re.search(r'pub const %s: &str = r#"(.*?)"#;' % name, src, re.S)
                 role_consts[m.group(1)] = src.count("\n", 0, m.start()) + 1
-        feature_names = FEEDBACK_FEATURE_IDENTIFIERS.get(rel, ())
         for line, text in pieces:
-            if is_identifier_literal(text) or text in feature_names:
+            if is_identifier_literal(text):
                 continue
             c = "1" if text in role_consts else cls
             for off, fams, sentence in tier1_text_hits(text, stricter):
@@ -1069,8 +1053,8 @@ class DeferralFamiliesFG(unittest.TestCase):
     program injects whole: memory/MEMORY.md and CLAUDE.md.template) and class 2 (the strings hook scripts, pack tools and the
     program print or inject: string literals — incl. those inside f-string fields — and here-document bodies of shell /
     Python / Rust / TypeScript sources, and a module docstring the module prints itself; never comments, identifiers, other
-    docstrings or dict keys). T1-a and EX per sentence, every other family over the whole string (BZ1). The `--propose` and
-    feedback-feature identifier rules apply. Skill texts are swept by the scratch tool and ruled hit by hit by the grader (not
+    docstrings or dict keys). T1-a and EX per sentence, every other family over the whole string (BZ1). The `--propose`
+    identifier rule applies. Skill texts are swept by the scratch tool and ruled hit by hit by the grader (not
     asserted here); tests, fixtures and `scripts/` are out. ALLOWED lists, by EXACT sentence and families, the hits that
     stay — every other hit fails."""
     ALLOWED = {
@@ -1124,25 +1108,24 @@ class DeferralFamiliesFG(unittest.TestCase):
         self.assertEqual(fams(ts_strings(ts)), ["T1-c"])
 
     def test_dotted_alternatives_are_matched_over_the_whole_string(self):
-        """RULINGS BZ1: an alternative that holds sentence punctuation is found — the feedback address (T1-b), `Dr.` (T1-f) —
-        and the address constant itself is a hit unless it is the feedback feature's listed identifier (BZ2). The address is
-        the product's own constant (never spelled in a pack file — scan-pack-secrets); inside the repository an unreadable
-        constant FAILS (the control must not disappear silently in CI), outside it the address cases are skipped."""
+        """RULINGS BZ1: an alternative that holds sentence punctuation is found — the contact address (T1-b), `Dr.` (T1-f) —
+        and the address itself is a hit wherever the product's own voice spells it (no identifier rule exempts it). The address
+        is the product's own (the reporting line of SECURITY.md — never spelled in a pack file, scan-pack-secrets); inside the
+        repository an unreadable address FAILS (the control must not disappear silently in CI), outside it the cases are skipped."""
         import re
         self.assertEqual(tier1_sentence_hits("그 수정은 Dr. Choi 의 일이다.", stricter=False), ["T1-f"])
-        if FEEDBACK_TO is None:
+        if CONTACT_ADDRESS is None:
             if os.path.isdir(os.path.join(REPO_DIR, "src-tauri", "src")):
-                self.fail("FEEDBACK_TO is not readable from src-tauri/src/feedback.rs inside the repository")
-            print("\n  [skip] the feedback address cases: the repository's src-tauri is not reachable from this pack")
+                self.fail("the contact address is not readable from the reporting line of SECURITY.md inside the repository")
+            print("\n  [skip] the contact address cases: the repository's SECURITY.md is not reachable from this pack")
             self.skipTest("repository source not reachable")
-        escaped = re.escape(FEEDBACK_TO)
+        escaped = re.escape(CONTACT_ADDRESS)
         self.assertIn("\\.", escaped, "the address alternative keeps its dot escaped (A.md §5)")
         self.assertIn("|" + escaped + "|", TIER1_FAMILIES["T1-b"])
-        self.assertEqual(tier1_sentence_hits("문제가 있으면 %s 으로 보내 주세요." % FEEDBACK_TO, stricter=False), ["T1-b"])
-        self.assertEqual(tier1_sentence_hits(FEEDBACK_TO, stricter=False), ["T1-b"])
-        rs = 'pub const FEEDBACK_TO: &str = "%s";\n' % FEEDBACK_TO
-        self.assertEqual([t for _l, t in rs_strings(rs)], [FEEDBACK_TO])
-        self.assertIn(FEEDBACK_TO, FEEDBACK_FEATURE_IDENTIFIERS["src-tauri/src/feedback.rs"])
+        self.assertEqual(tier1_sentence_hits("문제가 있으면 %s 으로 보내 주세요." % CONTACT_ADDRESS, stricter=False), ["T1-b"])
+        self.assertEqual(tier1_sentence_hits(CONTACT_ADDRESS, stricter=False), ["T1-b"])
+        rs = 'pub const CONTACT_ADDRESS: &str = "%s";\n' % CONTACT_ADDRESS
+        self.assertEqual([t for _l, t in rs_strings(rs)], [CONTACT_ADDRESS])
 
     def test_stricter_families_find_the_escaped_sentences(self):
         """RULINGS BZ3 / Part 33 B98: the four sentences of v0.14.56 that escaped the frozen list are found by T1-b+ / T1-h
@@ -1160,7 +1143,7 @@ class DeferralFamiliesFG(unittest.TestCase):
             self.assertEqual(tier1_sentence_hits(text, stricter=False), [], text)
         for name_only in ("왼쪽 워크스페이스 목록 아래의 **피드백 보내기** 단추를 누르면 작성 창이 열립니다.",
                           "### 4.11 피드백 보내기 (v0.14.41)"):
-            self.assertEqual(tier1_sentence_hits(name_only), [], name_only)
+            self.assertEqual(tier1_sentence_hits(name_only), ["T1-b+"], name_only)
         # RULINGS CE1: a match that merely starts with the name is counted.
         for starts_with_name in ("문제가 생기면 피드백 보내기를 눌러 알려 주세요", "피드백 보내기 단추로 알려 주세요",
                                  "피드백 보내기로 제보해 주세요"):
