@@ -228,17 +228,39 @@ pub(crate) fn remove_retired_feedback_dir() {
 /// ★로그 문구는 기능의 이름을 부르지 않는다(경로가 무엇인지 말한다) — 제품의 말에서 그 이름은 팩 검체
 /// (test_content_pins_parity.py 의 A-1-05)가 0 으로 잰다.
 fn remove_retired_feedback_dir_at(home: &std::path::Path, now_unix: u64) -> RetiredFeedbackCleanup {
+    remove_retired_feedback_dir_noting(home, now_unix, &mut |msg: &str| retired_feedback_note(msg))
+}
+
+/// 기록 한 줄을 `log` 에 덧붙인다(없으면 만든다 · 앞 줄을 지우지 않는다). 쓰지 못하면 사유를 돌려준다.
+fn retired_feedback_append_record(log: &std::path::Path, line: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    if let Some(dir) = log.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .map_err(|e| format!("열지 못했다: {e}"))?;
+    f.write_all(line.as_bytes()).map_err(|e| format!("쓰지 못했다: {e}"))
+}
+
+/// `remove_retired_feedback_dir_at` 의 몸통 — 알림 줄을 받는 곳(`note`)을 주입받는다(프로덕션 = 표준 오류 ·
+/// 테스트 = 모으는 그릇).
+fn remove_retired_feedback_dir_noting(
+    home: &std::path::Path,
+    now_unix: u64,
+    note: &mut dyn FnMut(&str),
+) -> RetiredFeedbackCleanup {
+    let mut retired_feedback_note = |msg: &str| note(msg);
     let base = home.join(".cys");
     let target = base.join(RETIRED_FEEDBACK_DIR);
     let out = remove_retired_feedback_dir_in(&base);
     if let Some(line) = retired_feedback_record_line(now_unix, &target, &out) {
-        use std::io::Write as _;
-        let dir = base.join("state");
-        let _ = std::fs::create_dir_all(&dir);
-        let log = dir.join(format!("feedback-removed-{}.log", env!("CARGO_PKG_VERSION")));
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
-            let _ = f.write_all(line.as_bytes());
-        }
+        let log = base
+            .join("state")
+            .join(format!("feedback-removed-{}.log", env!("CARGO_PKG_VERSION")));
+        let _ = retired_feedback_append_record(&log, &line);
     }
     match &out {
         RetiredFeedbackCleanup::Absent => {}
@@ -722,5 +744,156 @@ mod tests {
             assert!(base.join("feedback/fb-1/description.txt").exists());
         }
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ───────── S1 수정2 · 보완(리뷰 M1) — 기록은 로그 자신(일반 파일)에만 덧붙인다 ─────────
+    /// 리뷰어 검체 11 의 모양: `<root>/home` 에 묶음 하나(`.cys/feedback/bundle/x` 1바이트)와 빈 `.cys/state/`,
+    /// 그 옆 `<root>/outside/` 는 홈 **밖**이다. (root, home, outside) 를 돌려준다.
+    #[cfg(unix)]
+    fn s1_fix2_m1_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let root = s1_fix2_home(tag);
+        let home = root.join("home");
+        let outside = root.join("outside");
+        s1_fix2_put(&home.join(".cys/feedback/bundle/x"), "x");
+        std::fs::create_dir_all(home.join(".cys/state")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        (root, home, outside)
+    }
+
+    /// ★기록 줄은 **로그 자신인 일반 파일**에만 덧붙는다. 기록 파일 자리에 다른 곳을 가리키는 것(파일로 가는 링크 ·
+    /// 끊긴 링크 · 폴더로 가는 링크 · 다른 파일과 몸을 나눈 하드 링크)이 놓여 있으면 그 너머에는 **한 바이트도** 쓰지
+    /// 않고, 그 자리의 것을 바꾸지도 않으며, 쓰지 못했다는 사실을 한 줄로 알린다. 삭제는 그대로 이루어진다.
+    /// 대조(`regular`): 평범한 기록 파일에는 앞 줄을 지우지 않고 덧붙이며 거부 알림이 없다.
+    /// (리뷰어 재현 — 파일로 가는 링크: 홈 밖의 `unrelated-notes.txt` 가 15 → 214 바이트가 됐다.)
+    #[cfg(unix)]
+    #[test]
+    fn retired_feedback_record_is_written_only_into_the_log_itself() {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut bad: Vec<String> = Vec::new();
+        for shape in ["regular", "link-to-file", "link-dangling", "link-to-dir", "hard-link"] {
+            let (root, home, outside) = s1_fix2_m1_fixture(&format!("m1-{shape}"));
+            let log = s1_fix2_log(&home);
+            let notes_file = outside.join("unrelated-notes.txt");
+            match shape {
+                "regular" => std::fs::write(&log, "EARLIER LINE\n").unwrap(),
+                "link-to-file" => {
+                    std::fs::write(&notes_file, "ORIGINAL NOTES\n").unwrap();
+                    std::os::unix::fs::symlink(&notes_file, &log).unwrap();
+                }
+                "link-dangling" => std::os::unix::fs::symlink(&notes_file, &log).unwrap(),
+                "link-to-dir" => std::os::unix::fs::symlink(&outside, &log).unwrap(),
+                "hard-link" => {
+                    std::fs::write(&notes_file, "ORIGINAL NOTES\n").unwrap();
+                    std::fs::hard_link(&notes_file, &log).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let outside_before = s1_fix2_tree(&outside, &[]);
+            let mut notes: Vec<String> = Vec::new();
+            let out = remove_retired_feedback_dir_noting(&home, 1795344000, &mut |m: &str| notes.push(m.to_string()));
+            // 삭제는 어느 모양에서도 그대로다
+            let want = RetiredFeedbackCleanup::Removed {
+                entries: vec!["bundle".to_string()],
+                files: 1,
+                bytes: 1,
+                link: false,
+            };
+            if out != want {
+                bad.push(format!("{shape}: 삭제 결과가 다르다: {out:?}"));
+            }
+            if std::fs::symlink_metadata(home.join(".cys/feedback")).is_ok() {
+                bad.push(format!("{shape}: 지울 폴더가 남았다"));
+            }
+            if notes.iter().filter(|n| n.contains("폴더를 지웠습니다")).count() != 1 {
+                bad.push(format!("{shape}: 지웠다는 알림이 한 줄이 아니다: {notes:?}"));
+            }
+            let refusals: Vec<&String> = notes.iter().filter(|n| n.contains("기록을 남기지 못했습니다")).collect();
+            let line = format!(
+                "1795344000\t{}\tremoved\t{}\tlink=false\tentries=1\tfiles=1\tbytes=1\tbundle\n",
+                env!("CARGO_PKG_VERSION"),
+                home.join(".cys/feedback").display()
+            );
+            if shape == "regular" {
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                if text != format!("EARLIER LINE\n{line}") {
+                    bad.push(format!("{shape}: 평범한 기록 파일에 덧붙지 않았다: {text:?}"));
+                }
+                if !refusals.is_empty() {
+                    bad.push(format!("{shape}: 평범한 기록 파일인데 거부를 알렸다: {refusals:?}"));
+                }
+            } else {
+                let outside_after = s1_fix2_tree(&outside, &[]);
+                if outside_after != outside_before {
+                    bad.push(format!("{shape}: 홈 밖이 바뀌었다: {outside_before:?} -> {outside_after:?}"));
+                }
+                if refusals.len() != 1 || !refusals[0].contains(&log.display().to_string()) {
+                    bad.push(format!("{shape}: 기록을 거부했다는 알림(기록 경로 포함)이 한 줄이 아니다: {notes:?}"));
+                }
+                // 그 자리의 것은 그대로다(링크는 같은 곳을 가리키는 링크로 · 하드 링크는 이름 둘인 채로)
+                let same = match std::fs::symlink_metadata(&log) {
+                    Ok(m) if shape == "hard-link" => m.file_type().is_file() && m.nlink() == 2,
+                    Ok(m) => {
+                        let to = if shape == "link-to-dir" { &outside } else { &notes_file };
+                        m.file_type().is_symlink() && std::fs::read_link(&log).ok().as_deref() == Some(to.as_path())
+                    }
+                    Err(_) => false,
+                };
+                if !same {
+                    bad.push(format!("{shape}: 기록 파일 자리의 것이 바뀌었다"));
+                }
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        assert!(
+            bad.is_empty(),
+            "기록이 로그 자신 밖에 쓰였거나 거부를 알리지 않았다:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// ★기록 파일 자리에 파이프(FIFO)가 놓여 있어도 그 앞에서 **멈춰 서지 않는다**(읽는 쪽이 없는 파이프를 쓰려고 열면
+    /// 열기가 끝없이 기다린다 — 부트 태스크가 거기서 서면 앱이 뜨지 않는다). 파이프에는 쓰지 않고, 거부를 알리고, 삭제는
+    /// 그대로다. 멈춤은 다른 스레드에서 돌리고 시한으로 잰다.
+    #[cfg(unix)]
+    #[test]
+    fn retired_feedback_record_never_waits_on_a_pipe_at_the_log_path() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
+        let (root, home, _outside) = s1_fix2_m1_fixture("m1-fifo");
+        let log = s1_fix2_log(&home);
+        let c_log = std::ffi::CString::new(log.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_log.as_ptr(), 0o600) }, 0, "파이프를 만들지 못했다");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let home_for_worker = home.clone();
+        let worker = std::thread::spawn(move || {
+            let mut notes: Vec<String> = Vec::new();
+            let out = remove_retired_feedback_dir_noting(&home_for_worker, 1795344000, &mut |m: &str| {
+                notes.push(m.to_string())
+            });
+            let _ = tx.send((out, notes));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(20)); // wallclock: guard 멈춤 감시 — 정상 경로는 열기가 기다리지 않아 곧바로 돌아온다. 이 시한은 결함(끝없는 대기)일 때만 닿는다
+        let Ok((out, notes)) = got else {
+            // 멈춰 선 쓰는 쪽을 풀어 준다(읽는 쪽이 열리면 열기가 끝난다) — 테스트 프로세스에 선 스레드를 남기지 않는다.
+            let _reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&log);
+            let _ = worker.join();
+            let _ = std::fs::remove_dir_all(&root);
+            panic!("기록 파일 자리의 파이프 앞에서 멈춰 섰다(20초 안에 돌아오지 않았다)");
+        };
+        let _ = worker.join();
+        assert!(
+            matches!(out, RetiredFeedbackCleanup::Removed { files: 1, bytes: 1, link: false, .. }),
+            "삭제 결과가 다르다: {out:?}"
+        );
+        assert_eq!(
+            notes.iter().filter(|n| n.contains("기록을 남기지 못했습니다")).count(),
+            1,
+            "파이프에 대한 거부 알림이 한 줄이 아니다: {notes:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&log).map(|m| m.file_type().is_fifo()).unwrap_or(false),
+            "기록 파일 자리의 파이프가 바뀌었다"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
