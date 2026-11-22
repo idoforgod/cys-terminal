@@ -275,9 +275,8 @@ import {
   type CwdBlockedEntry,
   type PrivacyTarget,
 } from "./folderaccess";
-// ★U6(0.14.41) 피드백 보내기 — 모달 층 판정(setFocus·드롭 가드)과 작성 창(의존성 주입 · 최상위 부수효과 0).
-import { armDeferredPaneFocus, modalLayerOpen, feedbackOverlayOpen } from "./modalguard";
-import { mountFeedbackButton, openFeedbackModal, type FeedbackFacts } from "./feedbackmodal";
+// ★U6(0.14.41) 모달 층 판정 — 모달·팔레트가 떠 있는 동안 setFocus 가 xterm 에 포커스를 주지 않게 하는 가드(순수 함수 · 최상위 부수효과 0).
+import { armDeferredPaneFocus, modalLayerOpen } from "./modalguard";
 import { activityExpiryMs, applyDotPaint, deadReason, HIDDEN_DOT, projectActivity, RoleActivityStore } from "./roleactivity"; // ★F-01 역할 점 활동 표시(순수 판정·바뀐 것만 칠하기)
 import { SurfaceListTransport, type ListArrival } from "./surfacelist"; // ★F-01 끝점별 소유 원 호출 · 응답별 독립 투영
 import { beginInlineRename, inlineRenameOpen, renameBlocksRebuild } from "./inlinerename"; // ★S1 수정3 이름 바꾸기는 주인이 끝낸다(순수 판정)
@@ -285,14 +284,7 @@ import { beginInlineRename, inlineRenameOpen, renameBlocksRebuild } from "./inli
 declare global {
   interface Window {
     __TAURI__: {
-      core: {
-        // args 는 JSON 객체 또는 원시 바이트(Uint8Array — U6 피드백 첨부 조각). options.headers 는 원시 IPC 메타.
-        invoke: (
-          cmd: string,
-          args?: Record<string, unknown> | Uint8Array,
-          options?: { headers?: Record<string, string> },
-        ) => Promise<unknown>;
-      };
+      core: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
       event: {
         listen: (
           name: string,
@@ -9139,7 +9131,7 @@ function keepModalAboveOpenPanels(ov: HTMLElement): void {
 //   WebView 에서도 같은 결과가 나게 body.modal-open 을 건다. 판정은 DOM 존재로만 한다(modalguard.ts 와 같은 원칙
 //   — 별도 계수·플래그가 꼬여 표지가 영영 남는 고착을 구조적으로 없앤다): .modal-overlay 가 하나라도 떠 있으면
 //   켜고, 없으면 끈다. confirmModal 은 열고 닫을 때 직접 부르고(약속이 풀리기 전에 표지가 맞다), 그 밖의 창
-//   (입력·업데이트·피드백 창 — 전부 .modal-overlay)은 아래 관찰자가 body 직계 자식의 증감으로 따른다.
+//   (입력·업데이트 창 — 전부 .modal-overlay)은 아래 관찰자가 body 직계 자식의 증감으로 따른다.
 function syncModalOpenClass(): void {
   document.body.classList.toggle("modal-open", document.querySelector(".modal-overlay") != null);
   // ★(0.14.42 리뷰 F2) 확인 창(.confirm-overlay) 밖의 창이 떠 있으면 토스트를 창 밑으로 — 위쪽 조작부(닫기 ×·입력칸)
@@ -10329,7 +10321,6 @@ async function start() {
   });
   await listen("tauri://drag-leave", () => setOsDropTarget(undefined));
   await listen("tauri://drag-drop", (e) => {
-    if (feedbackOverlayOpen(document)) return; // ★U6: 피드백 창이 떠 있으면 드롭은 그 창의 첨부다(pane 주입·'드롭 취소' 토스트 금지)
     setOsDropTarget(undefined);
     const p = (e.payload ?? {}) as { paths?: string[]; position?: { x: number; y: number } };
     const paths = p.paths ?? [];
@@ -11312,42 +11303,6 @@ document.getElementById("btn-install-cli")?.addEventListener("click", async () =
     b.disabled = false;
   }
 });
-
-// ★U6(0.14.41) 「피드백 보내기」 — 사이드바 바닥 공용 칸(#wsbar-foot · A2 소유)의 둘째 자리에 단추를 단다.
-// ⚠모듈 최상위·start() 밖이다: start() 가 멈춘 기계(피드백이 가장 필요한 순간)에서도 동작해야 한다.
-// ⚠슬롯 조회는 `!` 단정 금지 — null 이면 main.js 전체가 죽어 모든 pane 이 백지가 된다(mountFeedbackButton 이 null 안전).
-mountFeedbackButton(document.getElementById("wsbar-feedback-slot"), () => void openFeedbackModal(feedbackDeps()));
-function feedbackDeps() {
-  return {
-    invoke,
-    invokeRaw: (cmd: string, bytes: Uint8Array, headers: Record<string, string>) =>
-      window.__TAURI__.core.invoke(cmd, bytes, { headers }),
-    listen,
-    // 진단에 넣을 앱 안 경량 사실 — 데몬은 식별 RPC 1회(상한 있음 · 기동하지 않는다), 나머지는 메모리 값.
-    facts: async (): Promise<FeedbackFacts> => {
-      let daemon = "응답 없음";
-      let daemonVersion: string | null = null;
-      try {
-        const r = (await rpcT(invoke("daemon_status", { socket: null }), winScaled(3_000))) as { version?: unknown };
-        daemon = "응답함";
-        if (typeof r?.version === "string") daemonVersion = r.version;
-      } catch {
-        /* 응답 없음 그대로 */
-      }
-      return {
-        user_agent: navigator.userAgent,
-        daemon,
-        daemon_version: daemonVersion,
-        workspaces: workspaces.length,
-        panes: panes.size,
-      };
-    },
-    restoreFocus: () => {
-      if (focusedSid != null) setFocus(focusedSid);
-    },
-    platform: (IS_MACOS ? "mac" : IS_WINDOWS ? "win" : "other") as "mac" | "win" | "other",
-  };
-}
 document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
   b.addEventListener("click", () => setCcTab((b as HTMLElement).dataset.view as typeof ccTab)),
 );

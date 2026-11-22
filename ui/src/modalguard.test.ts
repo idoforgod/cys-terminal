@@ -6,13 +6,9 @@
 // 들어간다 — 불만 글이 에이전트 지시로 읽히는 경로(①폭주·역할 분리 축).
 import { describe, it, expect } from "bun:test";
 import {
-  FEEDBACK_OVERLAY_SELECTOR,
   MODAL_LAYER_SELECTOR,
   createDeferredPaneFocus,
-  feedbackOverlayOpen,
-  isTopModalLayer,
   modalLayerOpen,
-  shouldReclaimFocus,
 } from "./modalguard";
 
 /** 주어진 클래스 요소들이 문서에 있다고 가정하는 가짜 root(쉼표 선택자 목록을 이해한다). */
@@ -48,55 +44,6 @@ describe("modalLayerOpen — setFocus 가드의 판정", () => {
   it("선택자 계약", () => {
     expect(MODAL_LAYER_SELECTOR).toContain(".modal-overlay");
     expect(MODAL_LAYER_SELECTOR).toContain(".palette-overlay");
-  });
-});
-
-describe("feedbackOverlayOpen — pane 드롭 리스너 첫 줄 가드의 판정", () => {
-  it("피드백 창이 있을 때만 true(다른 모달에서는 기존 드롭 동작 불변)", () => {
-    expect(feedbackOverlayOpen(fakeRoot([".feedback-overlay"]))).toBe(true);
-    expect(feedbackOverlayOpen(fakeRoot([".modal-overlay"]))).toBe(false);
-    expect(feedbackOverlayOpen(fakeRoot([]))).toBe(false);
-    expect(FEEDBACK_OVERLAY_SELECTOR).toBe(".feedback-overlay");
-  });
-});
-
-describe("shouldReclaimFocus — 피드백 창의 focusin 되찾기", () => {
-  const el = (insideLayer: boolean) => ({
-    closest: (sel: string): unknown => (insideLayer && sel === MODAL_LAYER_SELECTOR ? {} : null),
-  });
-  it("포커스가 모달 층 밖(xterm 숨은 textarea 등)으로 나가면 되찾는다", () => {
-    expect(shouldReclaimFocus(el(false))).toBe(true);
-  });
-  it("모달 층 안(피드백 창 자신 · 위에 뜬 다른 확인 창)이면 건드리지 않는다", () => {
-    expect(shouldReclaimFocus(el(true))).toBe(false);
-  });
-  it("대상이 없거나 closest 가 없으면 건드리지 않는다", () => {
-    expect(shouldReclaimFocus(null)).toBe(false);
-    expect(shouldReclaimFocus({})).toBe(false);
-  });
-});
-
-describe("isTopModalLayer — 피드백 창 Esc 는 맨 위 층일 때만 (리뷰 minor #4)", () => {
-  const a = { id: "feedback" };
-  const b = { id: "confirm" };
-  const root = (els: unknown[]) => ({
-    querySelectorAll: (sel: string): ArrayLike<unknown> => (sel === MODAL_LAYER_SELECTOR ? els : []),
-  });
-  it("문서 순서상 마지막 오버레이가 이 창이면 true", () => {
-    expect(isTopModalLayer(root([a]), a)).toBe(true);
-    expect(isTopModalLayer(root([b, a]), a)).toBe(true);
-  });
-  it("이 창 뒤에 다른 모달·팔레트가 붙었으면(= 위에 떴으면) false — 그 창의 Esc 를 가로채지 않는다", () => {
-    expect(isTopModalLayer(root([a, b]), a)).toBe(false);
-  });
-  it("판정이 던지거나 root 가 없으면 true(종전 동작 — 피드백 창이 Esc 를 처리한다)", () => {
-    const boom = {
-      querySelectorAll: (): ArrayLike<unknown> => {
-        throw new Error("x");
-      },
-    };
-    expect(isTopModalLayer(boom, a)).toBe(true);
-    expect(isTopModalLayer(null, a)).toBe(true);
   });
 });
 

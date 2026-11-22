@@ -2670,7 +2670,7 @@ mod tests {
         assert_eq!(code.matches("bundle_edits::take_pending_notices_for_ui").count(), 1, "pending notices are pulled through one command (AG3)");
         assert_eq!(code.matches("bundle_edits::").count(), 5);
         assert_eq!(code.matches("\nmod bundle_edits;\n").count(), 1);
-        for other in [include_str!("feedback.rs"), include_str!("close_surface_tests.rs")] {
+        for other in [include_str!("close_surface_tests.rs")] {
             assert!(!other.contains("capture_before_install"));
         }
     }

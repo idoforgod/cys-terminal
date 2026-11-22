@@ -202,11 +202,10 @@ describe("토스트 회피(§5-3) — 확인 창이 떠 있으면 토스트를 �
     expect(mixed).toEqual([]);
   });
 
-  // ★(0.14.42 리뷰 F2) 위의 회피는 창의 **아래쪽 절반**(확인 창 버튼 줄)만 지킨다. 피드백·입력·업데이트 창처럼
+  // ★(0.14.42 리뷰 F2) 위의 회피는 창의 **아래쪽 절반**(확인 창 버튼 줄)만 지킨다. 입력·업데이트 창처럼
   //   위쪽에 조작부(닫기 ×·입력칸)가 있는 키 큰 창은 좁은 창에서 토스트(z 위)가 그 조작부를 덮어 클릭을
-  //   가로챘다(headless Chrome 1024×700: elementFromPoint(.fb-x) → .toast.feed). 확인 창(confirmModal ·
+  //   가로챘다(headless Chrome 1024×700: 창의 닫기 × 자리에서 elementFromPoint → .toast.feed). 확인 창(confirmModal ·
   //   .confirm-overlay — 본문 + 아래 버튼 줄뿐)이 아닌 창이 떠 있으면 토스트는 그 창 **밑**(Control Center 위)이다.
-  //   feedbackmodal.ts 의 안전 계약 "결과·오류는 창 안에 보인다(토스트는 창 밑)" 과 같은 방향이다.
   for (const sel of ["body:has(.modal-overlay:not(.confirm-overlay)) #toasts", "body.toast-under-modal #toasts"]) {
     test(`${sel} — 확인 창 밖의 창이 떠 있으면 토스트는 그 창 밑 · Control Center 위(클릭 가로채기 0 · 실패 안내는 계속 보인다)`, () => {
       const rs = exact(sel);

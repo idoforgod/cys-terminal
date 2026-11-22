@@ -77,6 +77,14 @@ function scan(paths: string[], pats: [string, RegExp][]): string[] {
   }
   return hits;
 }
+/**
+ * ★잔여 폴더 정리 모듈 — 이 기능의 이름을 아는 **유일한** 출하 소스다. 오너 명령(2026-11-22)은 기능을 걷어내는 것과 함께
+ * 「업데이트되면 ~/.cys/feedback 을 지우고 무엇을 지웠는지 남기라」 였다: 그 일을 하는 코드는 폴더 이름과 기능 이름을 말할 수밖에
+ * 없다. 그래서 그 코드는 이 파일 하나에 가두고(main.rs 에는 선언·호출 두 줄), 아래 측정은 **그 밖**이 0 임을 잰다.
+ */
+const CLEANUP_MODULE = "src-tauri/src/retired_feedback.rs";
+const CLEANUP_WIRING = ["mod retired_feedback;", "retired_feedback::remove_retired_feedback_dir();"];
+
 /** 실패 출력용 요약 — 건수·파일 수·표본 8줄. */
 const brief = (hits: string[]) => ({
   건수: hits.length,
@@ -123,7 +131,7 @@ describe("「피드백 보내기」 기능은 제품에 없다 — 끝 상태 �
     expect({ "main.ts": mainSpecs.filter(isFeature), "다른 모듈": brief(others) }).toEqual({ "main.ts": [], "다른 모듈": NONE });
   });
 
-  it("④ src-tauri: `mod feedback` 선언·명령 등재·include_str! 가 없다 — 그 낱말이 한 줄도 없다", () => {
+  it("④ src-tauri: `mod feedback` 선언·명령 등재·include_str! 가 없다 — 그 낱말은 잔여 폴더 정리 모듈과 그것을 부르는 두 줄에만 있다", () => {
     const main = read("src-tauri/src/main.rs");
     const prod = main.slice(0, main.indexOf("#[cfg(test)]\nmod tests {"));
     const i = prod.indexOf("tauri::generate_handler![");
@@ -138,24 +146,36 @@ describe("「피드백 보내기」 기능은 제품에 없다 — 끝 상태 �
     const tauri = walk("src-tauri/").filter((p) => isText(p) && !p.startsWith("src-tauri/gen/"));
     const sources = tauri.filter((p) => p.endsWith(".rs"));
     expect(sources.length).toBeGreaterThan(2);
+    const MAIN_RS = "src-tauri/src/main.rs";
+    const wordLines = main.split(/\r?\n/).map((l) => l.trim()).filter((l) => /feedback|피드백/i.test(l));
     const count = (re: RegExp): number => sources.reduce((n, p) => n + read(p).split(/\r?\n/).filter((l) => re.test(l)).length, 0);
     expect({
       "mod 선언": count(/^\s*(pub(\([a-z]+\))?\s+)?mod\s+feedback\b/),
       "등재된 명령": entries.filter((l) => /feedback/i.test(l)),
       // 검체 빌드 전체가 여기에 걸려 있다 — 없는 파일을 include_str! 하면 한 검체가 아니라 `cys-app` 검체 빌드가 통째로 죽는다.
-      'include_str!("feedback…")': count(/include_str!\(\s*"[^"]*feedback/),
-      "그 낱말이 있는 줄": brief(scan(tauri, ANY_MENTION)),
-    }).toEqual({ "mod 선언": 0, "등재된 명령": [], 'include_str!("feedback…")': 0, "그 낱말이 있는 줄": NONE });
+      // 파일 이름이 feedback 으로 **시작하는** 경로만(지운 파일들) — 정리 모듈이 제 소스를 읽는 `include_str!("retired_feedback.rs")` 는 아니다.
+      'include_str!("feedback…")': count(/include_str!\(\s*"(?:[^"]*\/)?feedback[^"]*"/),
+      "정리 모듈이 있다": tauri.includes(CLEANUP_MODULE),
+      "main.rs 에서 그 낱말이 있는 줄": wordLines, // 정리 모듈의 선언과 호출 — 그 둘뿐이다(주석에도 없다)
+      "그 밖의 파일에서 그 낱말이 있는 줄": brief(scan(tauri.filter((p) => p !== CLEANUP_MODULE && p !== MAIN_RS), ANY_MENTION)),
+    }).toEqual({
+      "mod 선언": 0,
+      "등재된 명령": [],
+      'include_str!("feedback…")': 0,
+      "정리 모듈이 있다": true,
+      "main.rs 에서 그 낱말이 있는 줄": CLEANUP_WIRING,
+      "그 밖의 파일에서 그 낱말이 있는 줄": NONE,
+    });
   });
 
-  it("⑤ 출하 소스의 어느 줄도 그 기능을 이름으로 부르지 않는다 — UI·앱·데몬·팩", () => {
+  it("⑤ 출하 소스의 어느 줄도 그 기능을 이름으로 부르지 않는다 — UI·앱·데몬·팩(잔여 폴더 정리 모듈 하나만 예외)", () => {
     const pop = [
       "ui/index.html",
       ...walk("ui/src/"),
       ...walk("src-tauri/").filter((p) => !p.startsWith("src-tauri/gen/")),
       ...walk("src/"),
       ...walk("cysjavis-pack/").filter((p) => !p.startsWith("cysjavis-pack/web/vendor/")),
-    ].filter((p) => isText(p) && !isTestPath(p));
+    ].filter((p) => isText(p) && !isTestPath(p) && p !== CLEANUP_MODULE);
     const n = (prefix: string): number => pop.filter((p) => p.startsWith(prefix)).length;
     // 하한은 계약이 아니다(공허 방지) — 나무가 옮겨져 아무것도 걷지 못하면 여기서 적색이 된다.
     expect({ ui: n("ui/") > 40, "src-tauri": n("src-tauri/") > 5, src: n("src/") > 80, pack: n("cysjavis-pack/") > 300 }).toEqual({

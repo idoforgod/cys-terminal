@@ -74,7 +74,7 @@ describe("body.modal-open — 토스트 회피(§5-3)의 폴백 표지", () => {
     expect(res).toBeGreaterThan(closeSync);
   });
 
-  test("확인 창 밖의 창(입력·업데이트·피드백 창 — 전부 .modal-overlay)도 같은 표지를 따르게 body 직계 자식을 지켜본다", () => {
+  test("확인 창 밖의 창(입력·업데이트 창 — 전부 .modal-overlay)도 같은 표지를 따르게 body 직계 자식을 지켜본다", () => {
     expect(CODE).toContain("new MutationObserver(syncModalOpenClass).observe(document.body, { childList: true })");
   });
 

@@ -29,7 +29,7 @@ export type OfficeStage =
   | "repairing" // 자산 복구 중
   | "repair_failed" // 복구 실패 — 다시 시도 단추
   | "assets_button" // 자산이 없고 단추로만 복구(맥에서 정책이 자동을 끔 · 윈도우에서 단추가 켜진 경우)
-  | "assets_none"; // 자산이 없고 앱이 할 수 있는 것이 없음 — 피드백 안내만
+  | "assets_none"; // 자산이 없고 앱이 할 수 있는 것이 없음 — 안내 문구만
 
 export interface OfficePlan {
   stage: OfficeStage;

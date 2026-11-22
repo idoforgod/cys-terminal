@@ -67,8 +67,8 @@ const CYS_BASE_EXACT2: [&str; 12] = [
     // transfer-<sid>-<ts>.md 에 세션 결정·리스크가 남는 대화 파생 흔적이다
     // (src-tauri/src/main.rs home_dir_path 폴백 · ui/src/main.ts 전출 경로).
     "transfers",
-    // ★U6(0.14.41 · 반박 D8): 피드백 묶음 `~/.cys/feedback/<id>/` — 설명·첨부(스크린샷·영상)·
-    // 진단의 **사용 흔적**이다(src-tauri/src/feedback.rs). 비밀이 찍힌 화면일 수 있어, 남기면
+    // ★U6(0.14.41 · 반박 D8): 피드백 묶음 `~/.cys/feedback/<id>/` — 0.14.41~0.15.1 판이 쓴 설명·첨부(스크린샷·영상)·
+    // 진단의 **사용 흔적**이다(쓰는 코드는 걷었다 — 이 항목은 구 판이 남긴 폴더를 위해 남긴다). 비밀이 찍힌 화면일 수 있어, 남기면
     // "완전 초기화"를 한 사용자에게 스크린샷이 그대로 남는다. transfers 와 같은 등급.
     "feedback",
     // ★(R2F-DM · 성찰 2회차 A3 m2 · 0.14.43 J2) 인앱 업데이트 **시도 기록** — 업데이트가 설치기를 띄우기 직전에 쓰고 다시 뜬 앱의 `update_attempt_report` 가 한 번 읽어 판정한다

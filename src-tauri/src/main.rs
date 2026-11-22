@@ -11,8 +11,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-// ★U6(0.14.41) 피드백 1단계 — 로컬 묶음 + 메일 앱 + 폴더 열기(서버 전송 없음). 계약은 모듈 머리말.
-mod feedback;
+// ★S1 수정2: 걷어낸 기능이 사용자 홈에 남긴 폴더의 정리(그 폴더 하나 · 정확한 경로). 계약은 모듈 머리말.
+mod retired_feedback;
 
 type Stream = Box<dyn AsyncReadWrite>;
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -9210,19 +9210,6 @@ fn main() {
             read_text_head,
             home_dir_path,
             open_url,
-            // ★U6(0.14.41) 피드백 1단계(src-tauri/src/feedback.rs) — 등재 누락은 ui feedbackwiring 핀이 잡는다.
-            feedback::feedback_draft_new,
-            feedback::feedback_attach_path,
-            feedback::feedback_attach_begin,
-            feedback::feedback_attach_chunk,
-            feedback::feedback_attach_commit,
-            feedback::feedback_detach,
-            feedback::feedback_discard,
-            feedback::feedback_diag_preview,
-            feedback::feedback_submit,
-            feedback::feedback_open_mail,
-            feedback::feedback_reveal,
-            feedback::feedback_open_mail_app,
             send_key,
             read_board_catalog,
             make_ticket,
@@ -9473,6 +9460,11 @@ fn main() {
                         push_onboard_notice(&handle, kind, message);
                     }
                 }
+                // ★S1 수정2(오너 2026-11-22): 걷어낸 기능이 사용자 홈에 남긴 폴더 하나를 지운다(그 경로 하나 · 멱등 · 없으면
+                //   stat 한 번 — 규칙과 기록은 그 모듈 머리말). 이 자리인 이유: 안전 모드 반환(비정규 경로 기동) 뒤라 임시
+                //   사본으로 뜬 앱은 지우지 않고, 이 태스크가 초기화 관문(BootWorkGuard)을 쥐고 있어 완전 초기화와 엇갈리지
+                //   않으며, macOS 전용 블록 밖이라 전 OS 에서 돈다.
+                retired_feedback::remove_retired_feedback_dir();
                 // 업데이트 재시작 시: 새 팩(새 기능) 반영 + 노드 자동복귀(마커가 있을 때만).
                 maybe_apply_pending_update(&handle);
                 // ★TCC 처방(오너 2026-07-15): 폴더 권한 선제 트리거·거부 감지 안내.
@@ -11019,28 +11011,6 @@ exit 0
         assert!(
             ui.contains(&format!("kind === {kind}")),
             "프런트 showOnboardNotice 가 {kind} 를 모른다 — 백엔드가 쌓아도 알림이 조용히 사라진다"
-        );
-    }
-
-    /// ★S1 수정2(오너 2026-11-22 「피드백 보내기 제거 · 업데이트되면 ~/.cys/feedback 삭제」) — 배선 소스 핀.
-    /// 잔여 폴더 정리는 setup 부트 태스크에서, 안전 모드 반환(비정규 경로 기동) **뒤** · 업데이트 반영 **앞**에 불린다.
-    /// 앱의 재귀 삭제는 그 한 곳뿐이고, 대상은 상수 이름 하나로 만든 경로다(패턴·접두 삭제가 끼어들면 붉다).
-    #[test]
-    fn retired_feedback_cleanup_is_wired_before_the_pending_update() {
-        let src = include_str!("main.rs");
-        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
-        let call = prod
-            .find("remove_retired_feedback_dir();")
-            .expect("부트 태스크가 '피드백 보내기' 잔여 폴더 정리를 부르지 않는다 — 업데이트 뒤에도 ~/.cys/feedback 이 남는다");
-        let upd = prod.find("maybe_apply_pending_update(&handle);").expect("업데이트 반영 호출 소실");
-        let safe = prod.find("if verdict != BootPathVerdict::Canonical {").expect("안전 모드 반환 소실");
-        assert!(safe < call, "정리가 안전 모드 반환보다 앞이다 — 임시 사본으로 뜬 앱이 사용자 폴더를 지운다");
-        assert!(call < upd, "정리가 업데이트 반영 뒤다");
-        assert_eq!(prod.matches("remove_dir_all(").count(), 1, "앱 프로덕션 코드의 재귀 삭제가 한 곳이 아니다");
-        assert!(prod.contains("const RETIRED_FEEDBACK_DIR: &str = \"feedback\";"), "대상 이름 상수 소실");
-        assert!(
-            prod.contains("let target = cys_base.join(RETIRED_FEEDBACK_DIR);"),
-            "삭제 대상이 `<~/.cys>/feedback` 한 경로로 만들어지지 않는다"
         );
     }
 
@@ -13017,8 +12987,7 @@ exit 0
             1,
             "업데이터 플러그인 등록이 `Builder::new().build()` 꼴이 아니다 — 플러그인 설정이 바뀌면 새 경로(update_launch.rs)도 함께 고쳐라"
         );
-        let feedback = wu_code(include_str!("feedback.rs"));
-        for (name, code) in [("main.rs", &prod), ("feedback.rs", &feedback)] {
+        for (name, code) in [("main.rs", &prod)] {
             assert!(
                 !code.contains("installer_arg"),
                 "{name} 에 `installer_arg*` 호출이 생겼다 — 플러그인 경로는 따르지만 새 경로는 무시한다. nsis_update_params 를 함께 고쳐라"

@@ -50,15 +50,14 @@ const tagsOnly = (s: string) => s.replace(/>\s+</g, "><");
 
 describe("사이드바 바닥 공용 꼬리 컨테이너(#wsbar-foot) — A2·A3 공통 마크업", () => {
   const h = tagsOnly(html);
-  it("#ws-tabs 바로 다음 형제로 사용량 → 피드백 슬롯 → 전문가용 순서", () => {
+  it("#ws-tabs 바로 다음 형제로 사용량 → 전문가용 순서", () => {
     expect(
       h.includes(
-        '<div id="ws-tabs"></div><div id="wsbar-foot"><section id="wsbar-usage" aria-label="사용량"></section><div id="wsbar-feedback-slot">',
+        '<div id="ws-tabs"></div><div id="wsbar-foot"><section id="wsbar-usage" aria-label="사용량"></section><section id="wsbar-expert"></section></div></nav>',
       ),
     ).toBe(true);
-    expect(h.includes('<section id="wsbar-expert"></section></div></nav>')).toBe(true);
-    const u = h.indexOf('id="wsbar-usage"'), f = h.indexOf('id="wsbar-feedback-slot"'), e = h.indexOf('id="wsbar-expert"');
-    expect(u >= 0 && u < f && f < e).toBe(true);
+    const u = h.indexOf('id="wsbar-usage"'), e = h.indexOf('id="wsbar-expert"');
+    expect(u >= 0 && u < e).toBe(true);
   });
   it("꼬리는 #wsbar 안에 있다", () => {
     const nav = h.indexOf('<nav id="wsbar">'), foot = h.indexOf('id="wsbar-foot"'), end = h.indexOf("</nav>", nav);
@@ -72,12 +71,6 @@ describe("사이드바 바닥 공용 꼬리 컨테이너(#wsbar-foot) — A2·A3
     expect(foot![1]).toContain("max-height:");
     expect(foot![1]).toContain("overflow-y: auto");
     expect(foot![1]).toContain("min-height: 0");
-  });
-  it("피드백 단추(A3)는 꼬리 여백 안에서 가로 여백을 걷는다 — 사용량·전문가용과 같은 선(리뷰1 M11 · 이중 들여쓰기 차단)", () => {
-    const flat = css.replace(/\s+/g, " ");
-    const r = /#wsbar-feedback-slot > #btn-feedback \{([^}]*)\}/.exec(flat);
-    expect(r).not.toBeNull();
-    for (const decl of ["margin-left: 0", "margin-right: 0", "width: 100%"]) expect(r![1]).toContain(decl);
   });
 });
 
@@ -167,7 +160,7 @@ describe("사용량 조회 — 공유 fetcher 하나 · in-flight 가드 · 전�
 
 describe("사용량 렌더 — 백지(④) 차단", () => {
   it("새 id 에 non-null 단언(`!`)을 쓰지 않는다", () => {
-    for (const id of ["wsbar-usage", "wsbar-foot", "wsbar-expert", "wsbar-feedback-slot"])
+    for (const id of ["wsbar-usage", "wsbar-foot", "wsbar-expert"])
       expect({ id, 단언: code.includes(`getElementById("${id}")!`) }).toEqual({ id, 단언: false });
   });
   it("렌더는 textContent 로만(innerHTML 금지 — 라벨은 로컬 폴더·파일에서 온다)", () => {

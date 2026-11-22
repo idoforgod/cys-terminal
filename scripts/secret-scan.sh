@@ -68,14 +68,14 @@ dummy_user_re='/Users/('"$dummy_names"')(/|"|$)'
 # Windows 홈의 더미 판 — `C:\Users\x\…`·`C:\Users\x>`. 경계는 '이름 문자가 아닌 것'으로 본다
 # (뒤에 `\`·`>`·공백·따옴표 등 무엇이 오든 이름 자체가 더미면 통과).
 win_dummy_user_re='[A-Za-z]:\\+Users\\+('"$dummy_names"')([^A-Za-z0-9._-]|$)'
-# 이메일 허용 — ★성찰 A·B(minor): 종전에는 README·SECURITY·feedback.rs **파일 전체**를 이메일
-#   스캔에서 뺐다(`email_allow_re` 파일 단위 skip). FEEDBACK_TO 한 줄(28행)을 허용하려고
-#   1,439행짜리 feedback.rs(테스트 포함) 전체가 면제돼, 앞으로 그 파일에 실수로 들어오는
+# 이메일 허용 — ★성찰 A·B(minor): 종전에는 README·SECURITY 와 그 주소를 상수로 들던 Rust 소스 한 벌의 **파일 전체**를
+#   이메일 스캔에서 뺐다(`email_allow_re` 파일 단위 skip). 주소 한 줄을 허용하려고
+#   1,439행짜리 소스(테스트 포함) 전체가 면제돼, 앞으로 그 파일에 실수로 들어오는
 #   다른 실주소(디버그 프린트·오타 픽스처 등)를 H-SECRET 게이트가 조용히 통과시킨다 — 파일
-#   단위 skip 자체가 오탐(false-negative) 확대 경로다. 네 파일 모두 **같은 공개 주소**
-#   (cysinsight@gmail.com — README·SECURITY 취약점 신고 연락처 = feedback.rs FEEDBACK_TO,
-#   feedbackwiring.test.ts 가 두 문서와 대조)뿐이므로, 파일을 통째로 빼는 대신 **그 주소 하나만**
-#   전역 오탐 목록(email_fp_re)에 올린다 — 이 네 파일을 포함해 저장소 어디서든 다른 실주소는
+#   단위 skip 자체가 오탐(false-negative) 확대 경로다. 그 파일들에 있던 것은 **같은 공개 주소**
+#   (cysinsight@gmail.com — README·SECURITY 취약점 신고 연락처. 그 Rust 소스는 기능과 함께 걷혀
+#   지금은 없다)뿐이므로, 파일을 통째로 빼는 대신 **그 주소 하나만**
+#   전역 오탐 목록(email_fp_re)에 올린다 — 그 문서들을 포함해 저장소 어디서든 다른 실주소는
 #   그대로 잡힌다(허용 폭이 파일에서 리터럴 주소로 좁아졌다).
 email_fp_re='example\.(com|org|net)|noreply|@types/|@google/|@tauri|@scope|user@host|you@|cysinsight@gmail\.com'
 # 개인 계정 핸들 denylist(맨몸) — /Users·.claude- 접두 없이 계정키·설정값으로 박힌 개인 핸들도 차단한다.
