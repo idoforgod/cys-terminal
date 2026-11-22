@@ -1,0 +1,108 @@
+#!/bin/sh
+# cys stand-in for Apple's `xcrun` on a Mac that has no Apple developer tools.
+#
+# What it is for: on such a Mac /usr/bin/python3, /usr/bin/git and 76 other names are
+# one Apple stub program. With no developer directory the stub opens the "install the
+# command line developer tools" window and exits non-zero. The stub looks at the
+# DEVELOPER_DIR environment variable first and, when that directory holds usr/bin/xcrun,
+# runs `<DEVELOPER_DIR>/usr/bin/xcrun <tool> <args...>` instead (measured on macOS 27.2).
+# cys sets DEVELOPER_DIR to this directory for its own seats only when the Mac has no
+# developer tools, so inside a cys seat the stubs run the python3 and git that ship with
+# the app. Nothing outside the cys seat's environment is changed.
+#
+# Layout: <runtime>/devtools/usr/bin/xcrun (this file), <runtime>/python/bin, <runtime>/git/bin.
+# Contract: POSIX sh, no writes, no network, never calls a /usr/bin stub unless a real
+# developer directory exists (so it can never open the install window itself).
+
+self=$0
+rt=${self%/devtools/usr/bin/*}
+if [ "$rt" = "$self" ]; then
+  up=$(dirname "$self")/../../..
+  if [ -d "$up" ]; then rt=$(cd "$up" && pwd); else rt=; fi
+fi
+
+cys_bundled_tool() {
+  # prints the bundled program for tool name $1; names with a slash are never tools
+  case $1 in '' | */* | .*) return 1 ;; esac
+  for d in "$rt/python/bin" "$rt/devtools/bin" "$rt/git/bin"; do
+    if [ -f "$d/$1" ] && [ -x "$d/$1" ]; then
+      printf '%s\n' "$d/$1"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Where Apple's real developer directory can be: the same table, in the same order, as
+# libxcselect's default search (src/macos_devtools.rs DEV_DIR_CANDIDATES - a unit test compares
+# this one line with that table). None of these paths contains a space.
+CYS_DEV_CANDIDATES="/var/db/xcode_select_link /Applications/Xcode.app/Contents/Developer /Library/Developer/CommandLineTools"
+
+cys_real_devdir() {
+  for d in $CYS_DEV_CANDIDATES; do
+    if [ -d "$d" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+cys_forward_or_fail() {
+  # $1 = name shown in the message; rest = the original arguments
+  name=$1
+  shift
+  if cys_real_devdir; then
+    # developer tools were installed after this seat started: let Apple's own xcrun answer
+    unset DEVELOPER_DIR
+    exec /usr/bin/xcrun "$@"
+  fi
+  echo "cys: '$name' needs Apple's developer tools, which are not installed on this Mac - a cys seat ships python3, git and node only (to install them: xcode-select --install)." >&2
+  exit 72
+}
+
+# Options Apple's xcrun accepts in front of a tool name. For a bundled tool they change nothing (there is one
+# python3 and one git here), so they are stepped over. Nothing is shifted while looking: when the tool is not a
+# bundled one, Apple's xcrun must get the arguments exactly as they came.
+skip=0
+find_only=0
+want_arg=0
+tool=
+for a in "$@"; do
+  if [ "$want_arg" = 1 ]; then
+    want_arg=0
+    skip=$((skip + 1))
+    continue
+  fi
+  case $a in
+    -f | -find | --find)
+      find_only=1
+      skip=$((skip + 1))
+      ;;
+    -r | -run | --run | -n | --no-cache | -k | --kill-cache | -v | --verbose | -l | --log)
+      skip=$((skip + 1))
+      ;;
+    -sdk | --sdk | -toolchain | --toolchain)
+      want_arg=1
+      skip=$((skip + 1))
+      ;;
+    *)
+      tool=$a
+      break
+      ;;
+  esac
+done
+
+if p=$(cys_bundled_tool "$tool"); then
+  if [ "$find_only" = 1 ]; then
+    printf '%s\n' "$p"
+    exit 0
+  fi
+  shift "$((skip + 1))"
+  exec "$p" "$@"
+fi
+# Not a bundled tool: a tool Apple ships (make, cc ...), an option that asks xcrun itself (--show-sdk-path), or nothing.
+case $tool in
+  '' | -*) name=xcrun ;;
+  *) name=$tool ;;
+esac
+cys_forward_or_fail "$name" "$@"

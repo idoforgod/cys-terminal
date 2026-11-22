@@ -54,6 +54,13 @@
 - **harness-creator 툴체인 자동 설치**: 부트 프리플라이트(`javis_preflight.py --fix`)가 git으로 자동 클론합니다.
 - **RSI 자기개선/자동 발행**: 라운드 산출물의 로컬 커밋·외부 push에 git을 씁니다.
 
+**cys 좌석 안에서는 앱에 든 git·python3·node 가 쓰입니다**(0.15.2~). 개발자 도구(Xcode·Command Line Tools)가 없는
+맥에서도 좌석의 `python3`·`git` 이 앱에 든 것으로 풀려 "개발자 도구 설치" 창이 뜨지 않고, Windows 는 앱에 든 폴더가
+PATH 맨 앞입니다. 좌석 밖(다른 터미널·시스템 설정)은 바꾸지 않으며 관리자 암호도 묻지 않습니다. 개발자 도구가 이미
+있는 맥의 좌석은 종전대로 그 도구를 씁니다. 아래 설치는 **cys 밖의 터미널**에서 git 을 쓰려는 경우의 안내입니다.
+앱에 든 python 으로 `pip install` 한 패키지는 앱 안이 아니라 사용자 폴더(`~/.local/lib/python3.x/site-packages`)에
+설치됩니다(가상환경 `python3 -m venv` 는 종전대로 그 환경 안에 설치합니다 · macOS).
+
 프리플라이트가 git 유무를 결정론으로 점검합니다(`C30.git` — 부재 시 WARN으로 안내). 설치:
 
 ```bash

@@ -446,6 +446,63 @@ jobs:
             throw "pane env 관측 실패: 프로브 마커 미도달 (u20=$u20 seat=$seat) — PTY 입력·실행 경로 또는 주입 회귀"
           }
           Write-Host "OK: pane env 실주입 관측 통과 (CLAUDE_CODE_GIT_BASH_PATH=실재 경로 · CYS_SEAT_TOKEN=존재)"
+          # ④ ★S1 버그2(0.15.2 · 오너 2026-11-22): 좌석 안에서 맨 이름 `python3` · `git` · `node` 가 **설치본에 든 것**으로
+          #    풀리고 동작하는가. 러너에는 자기 python3·git·node 가 따로 있고 Windows 에는 Store 를 여는 python3 별칭도
+          #    있다 — 그래서 종료 코드만이 아니라 **풀린 경로가 <설치본>\runtime 아래인지**를 본다. 좌석의 셸(PowerShell)
+          #    과 거기서 뜨는 하위 셸 세 종류(cmd · 동봉 Git Bash 일반 셸 · 로그인 셸 — 훅이 쓰는 그 bash)에서 잰다.
+          #    판정은 pane 이 쓴 결과 파일로 한다(화면은 '끝났다' 신호만 읽는다 — 긴 출력의 줄바꿈에 기대지 않는다).
+          $rt = Join-Path $dir 'runtime'
+          $probe = Join-Path $env:TEMP 's1-seat-tools.ps1'
+          $res = Join-Path $env:TEMP 's1-seat-tools.tsv'
+          Remove-Item $res -ErrorAction SilentlyContinue
+          @'
+          $rows = @()
+          function S1Clean($v) { (($v | Out-String) -replace '\s+', ' ').Trim() }
+          foreach ($t in 'python3', 'git', 'node') {
+            $c = Get-Command $t -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            $src = ''; $ver = ''; $rc = 999
+            if ($c) { $src = $c.Path; $ver = S1Clean (& $t --version 2>&1); $rc = $LASTEXITCODE }
+            $rows += ('ps', $t, $rc, $src, $ver) -join "`t"
+          }
+          foreach ($t in 'python3', 'git', 'node') {
+            $src = S1Clean (cmd /d /c "where $t" 2>&1 | Select-Object -First 1)
+            $ver = S1Clean (cmd /d /c "$t --version" 2>&1); $rc = $LASTEXITCODE
+            $rows += ('cmd', $t, $rc, $src, $ver) -join "`t"
+          }
+          $bash = $env:CLAUDE_CODE_GIT_BASH_PATH
+          foreach ($mode in '-c', '-lc') {
+            foreach ($t in 'python3', 'git', 'node') {
+              # 인자 안에 큰따옴표를 두지 않는다 — pane 의 셸은 Windows PowerShell 5.1 이고, 그 판은 네이티브 프로그램에 넘기는
+              # 인자 안의 큰따옴표를 이스케이프하지 않아 bash 가 인자를 쪼개 받는다(독립 검토 지적 · 제품 결함이 아닌 점검 결함).
+              $src = S1Clean (& $bash $mode ('command -v ' + $t + ' | cygpath -w -f -') 2>&1 | Select-Object -First 1)
+              $ver = S1Clean (& $bash $mode ($t + ' --version') 2>&1); $rc = $LASTEXITCODE
+              $rows += ('bash' + $mode, $t, $rc, $src, $ver) -join "`t"
+            }
+          }
+          $rows | Set-Content -Path (Join-Path $env:TEMP 's1-seat-tools.tsv') -Encoding UTF8
+          ('s1-tools-' + 'done')
+          '@ | Set-Content -Path $probe -Encoding UTF8
+          & $cys send --surface $ref ('Invoke-Expression (Get-Content -Raw "' + $probe + '")')
+          & $cys send-key --surface $ref Return
+          $deadline = (Get-Date).AddSeconds(180); $done = $false
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 3
+            $screen = (& $cys read-screen --surface $ref) -join "`n"
+            if ($screen -match 's1-tools-done') { $done = $true; break }
+          }
+          if (-not ($done -and (Test-Path $res))) { Write-Host "== screen(seat-tools) =="; Write-Host $screen; throw "S1 버그2: 좌석 안 도구 점검이 끝나지 않았다(done=$done) — pane 실행 경로 또는 점검 스크립트 결함" }
+          $rows = @(Get-Content $res | Where-Object { $_ })
+          $bad = @()
+          foreach ($line in $rows) {
+            $f = $line -split "`t"
+            $under = [bool]$f[3] -and $f[3].StartsWith($rt, [System.StringComparison]::OrdinalIgnoreCase)
+            Write-Host ("seat-tool shell={0} tool={1} rc={2} under_runtime={3} path={4} version={5}" -f $f[0], $f[1], $f[2], $under, $f[3], $f[4])
+            if ($f[2] -ne '0' -or -not $under) { $bad += ("{0}/{1} rc={2} path={3}" -f $f[0], $f[1], $f[2], $f[3]) }
+          }
+          Write-Host ("seat-tools result: rows={0} bad={1} runtime={2}" -f $rows.Count, $bad.Count, $rt)
+          if ($rows.Count -ne 12) { throw "S1 버그2: 좌석 안 도구 점검 행 수가 12 가 아니다($($rows.Count)) — 셸 4종 × 도구 3종" }
+          if ($bad.Count) { throw "S1 버그2: 좌석 안에서 설치본 것이 아닌 도구가 풀리거나 실행에 실패했다 — $($bad -join ' | ')" }
+          Write-Host "OK: 좌석 안 python3·git·node = 설치본 runtime (PowerShell · cmd · Git Bash 일반/로그인 × 도구 3 = 12행 전부 rc 0)"
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
       # ─────────────────────────────────────────────────────────────────────────

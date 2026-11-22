@@ -1,0 +1,29 @@
+#!/bin/sh
+# cys launcher for the git that ships with the app (desktop/dugite-native build).
+#
+# Why it exists: that git is not relocatable by itself. Started bare it looks for its
+# helper programs in "//libexec/git-core", so every command that needs one fails
+# (measured on the 0.14.56 bundle: `git ls-remote https://...` prints
+# "git: 'remote-https' is not a git command" and exits 128). dugite starts its git with
+# the variables below; this launcher does the same and nothing else.
+#
+# Layout: <runtime>/devtools/bin/git (this file) -> <runtime>/git/bin/git.
+self=$0
+rt=${self%/devtools/bin/*}
+if [ "$rt" = "$self" ]; then
+  up=$(dirname "$self")/../..
+  if [ -d "$up" ]; then rt=$(cd "$up" && pwd); else rt=; fi
+fi
+g="$rt/git"
+# The helpers must be the ones built with this git, whatever the caller had set.
+GIT_EXEC_PATH="$g/libexec/git-core"
+export GIT_EXEC_PATH
+# Only when the caller has not set it at all (an explicitly empty value is the caller's way to switch it off).
+if [ -z "${GIT_TEMPLATE_DIR+x}" ] && [ -d "$g/share/git-core/templates" ]; then
+  GIT_TEMPLATE_DIR="$g/share/git-core/templates"
+  export GIT_TEMPLATE_DIR
+fi
+# GIT_CONFIG_SYSTEM is NOT set. The file dugite ships (<git>/etc/gitconfig) only includes /etc/gitconfig, which is
+# where this git looks anyway; pointing the system config INTO the app would make `git config --system ...` write
+# into the signed bundle.
+exec "$g/bin/git" "$@"

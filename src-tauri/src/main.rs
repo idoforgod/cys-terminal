@@ -3955,11 +3955,19 @@ fn devtools_notice_due(
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn maybe_push_devtools_notice(handle: &AppHandle) {
     let marker = devtools_notice_marker();
+    // ★S1 버그2(오너 2026-11-22): '있음' = CLT 에 있거나 **좌석이 받는 대역이 내준다**(lib `seat_tool_present`).
+    //   대역이 도는 맥의 좌석에서는 python3·git 이 앱에 든 것으로 풀리고 설치 창이 뜨지 않는다 — 그 맥에 이
+    //   안내를 내면 거짓이다. 대역이 없는 번들(개발 빌드·손상)은 CLT 판정과 같아 종전 안내가 그대로 나간다.
+    //   exe 를 못 구하면 빈 경로 = 번들 없음 = CLT 판정만(종전 동작).
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| cys::macos_devtools::canonicalized_exe_parent(&e))
+        .unwrap_or_default();
     let Some(msg) = devtools_notice_due(
         std::env::consts::OS,
         marker.exists(),
-        cys::macos_devtools::clt_tool_present("python3"),
-        cys::macos_devtools::clt_tool_present("git"),
+        cys::macos_devtools::seat_tool_present(&exe_dir, "python3"),
+        cys::macos_devtools::seat_tool_present(&exe_dir, "git"),
     ) else {
         return;
     };

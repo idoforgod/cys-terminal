@@ -24,10 +24,31 @@
 //!   ④ 셸 짝(`cysjavis-pack/hooks/_lib.sh` `cys_clt_tool_present`)은 같은 후보 표를 쓴다 — 표 문면
 //!      파리티는 아래 테스트 `shell_twin_uses_the_same_candidate_table` 가 대조한다.
 //!
+//!   ⑤ **대역 개발자 디렉터리**(S1 버그2 · 오너 2026-11-22 · lib.rs 스폰 env ⑧): ③ 은 cys 가 직접 고르는
+//!      인터프리터만 고친다. 에이전트가 직접 치는 `python3`·`git` 과 그 하위 셸은 PATH 로 셔임을 불렀다.
+//!      셔임은 `DEVELOPER_DIR` 를 **가장 먼저** 보고, 그 디렉터리에 `usr/bin/xcrun` 이 있으면
+//!      `<DEVELOPER_DIR>/usr/bin/xcrun <도구> <인자…>` 를 대신 실행한다(macOS 27.2 실측 — 78개 이름 전부 같은
+//!      프로그램이다). 그래서 앱에 `<runtime>/devtools/usr/bin/xcrun`(동봉 python·git 을 여는 sh 스크립트 ·
+//!      원본 `scripts/mac-devtools/`)을 싣고, ③ 과 **같은 판정**일 때만 좌석 env 에
+//!      `DEVELOPER_DIR=<runtime>/devtools` 를 싣는다([`standin_developer_dir_for`] → [`inject_developer_dir_for`]).
+//!      · 대역에는 `usr/bin/python3` 가 **없다** — 그래서 대역을 받은 좌석 안에서 다시 판정해도(②: DEVELOPER_DIR
+//!        가 선택된 디렉터리) 여전히 "CLT 부재"이고, 셸 짝·⑦ 의 동작이 그대로 안정하다.
+//!      · 대역 xcrun 은 내주지 않는 도구(make·cc …)에 대해 진짜 개발자 디렉터리가 **있을 때만** 애플 xcrun 으로
+//!        넘긴다(좌석이 뜬 뒤에 도구를 설치한 경우). 없으면 한 문장 + 72 로 끝난다 — 셔임을 되부르지 않는다
+//!        (되부르면 그것이 설치 창이다).
+//!      · CLT·Xcode 가 있는 맥에는 `DEVELOPER_DIR` 쌍을 싣지 않는다: 그 맥의 애플 Git 과 `xcode-select -p` 를 읽는
+//!        빌드 도구를 바꾸지 않는다. ★다만 PATH 쌍은 런처가 든 번들이면 **어느 맥에서나** 한 칸(`devtools/bin`)이 는다
+//!        ([`crate::runtime_bin_dirs`]) — 동봉 git 을 PATH 로 잡는 경로(`-lc` 명령 pane · 스케줄 · GUI 직스폰)가 런처를
+//!        거쳐 https 원격이 되게 하려는 것이다. 대화형 좌석의 로그인 셸은 그 맥에서 여전히 `/usr/bin` 의 것을 먼저 잡는다.
+//!      · 동봉 python 의 `pip` 는 앱 번들이 아니라 사용자 폴더에 설치한다(`<runtime>/python/pip.conf` — 원본
+//!        `scripts/mac-devtools/pip.conf`). 대역이 `pip3`·`python3 -m pip` 를 처음으로 닿게 만들었으므로 함께 막는다:
+//!        번들 안에 쓰면 서명 봉인이 깨진다(SEAL-1 · ⑥ npm 과 같은 사고의 pip 판).
+//!
 //! 【한계(정직)】 Xcode.app 이 선택됐지만 라이선스에 동의하지 않은 맥은 present 로 판정되는데 셔임은
-//! 라이선스 오류로 실패한다(창은 뜨지 않는다 · 설계 D4 · 이번 범위 밖). 에이전트가 Bash 도구에서
-//! 직접 치는 `python3`·`git`, Claude Code 자신의 git 호출은 이 모듈이 닿지 않는다(설계 §2 제외:
-//! A4 CLAUDE_ENV_FILE · Phase B git 동봉 전환) — 그래서 알림 문구가 그 사실을 말한다.
+//! 라이선스 오류로 실패한다(창은 뜨지 않는다 · 설계 D4 · 이번 범위 밖). 대역(⑤)이 없는 번들(개발 빌드 ·
+//! 손상)에서는 에이전트가 직접 치는 `python3`·`git` 이 여전히 셔임으로 풀린다 — 알림 문구는 그 경우에만 뜨고
+//! 그 사실을 말한다. 개발자 도구가 **있는** 맥의 좌석 하위 셸은 애플의 python3·git 을 쓴다(동작하지만 앱에 든
+//! 판이 아니다 — ⑤ 를 그 맥에 싣지 않기로 한 결과다).
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -164,6 +185,87 @@ pub fn clt_absent_bundled_python(exe_dir: &Path) -> Option<PathBuf> {
     clt_absent_bundled_python_for(os, master_off, bundled.as_deref(), || {
         clt_tool_present("python3")
     })
+}
+
+/// 동봉 대역 개발자 디렉터리 `<runtime>/devtools` — 그 안의 `usr/bin/xcrun` 이 **실행 가능 파일**일 때만 Some.
+///
+/// 루트 선택은 [`crate::runtime_bin_dirs`] 의 mac 규칙과 같다: 앱 번들(`exe_dir/../Resources/runtime`) 먼저,
+/// 개발 빌드(`exe_dir/runtime`) 폴백, **처음 실재하는 루트 하나만** 본다(뒤 루트로 넘어가지 않는다 — 두 트리를
+/// 섞으면 python 은 이 번들 · 대역은 저 번들인 좌석이 생긴다). OS 를 묻지 않는 순수 디스크 판독이다(OS 게이트는
+/// 호출부의 판정 몫 — 그래서 어느 호스트의 시험에서도 잴 수 있다).
+/// ★실행 가능 게이트의 이유: xcrun 이 없는 디렉터리를 `DEVELOPER_DIR` 로 주면 셔임은 "invalid DEVELOPER_DIR path"
+/// 로 죽는다 — 대역 없는 번들이 종전(설치 창 뒤 '나중에')보다 나빠진다.
+pub fn bundled_devtools_dir(exe_dir: &Path) -> Option<PathBuf> {
+    let roots = [
+        exe_dir.parent().map(|p| p.join("Resources").join("runtime")),
+        Some(exe_dir.join("runtime")),
+    ];
+    let rt = roots.into_iter().flatten().find(|rt| rt.is_dir())?;
+    let dev = rt.join("devtools");
+    is_executable_file(&dev.join("usr").join("bin").join("xcrun")).then_some(dev)
+}
+
+/// ★⑧ 의 **단일 판정**(순수 조립) — 좌석이 받을 대역 개발자 디렉터리.
+/// U15 단일 판정이 Some(= macOS ∧ 롤백 아님 ∧ 동봉 python 실재 ∧ CLT python 부재)이고 대역이 실재할 때만 Some.
+/// `clt_absent_bundled == None` 이면 디스크를 보지 않는다(윈도우·리눅스·CLT 있는 맥 = stat 0 · 바이트 동일).
+pub fn standin_developer_dir_for(clt_absent_bundled: Option<&Path>, exe_dir: &Path) -> Option<PathBuf> {
+    clt_absent_bundled?;
+    bundled_devtools_dir(exe_dir)
+}
+
+/// [`standin_developer_dir_for`] 를 **현재 프로세스**의 판정으로 부른다(GUI 안내가 쓴다).
+pub fn standin_developer_dir(exe_dir: &Path) -> Option<PathBuf> {
+    standin_developer_dir_for(clt_absent_bundled_python(exe_dir).as_deref(), exe_dir)
+}
+
+/// 대역(`standin` = `<runtime>/devtools`)이 `tool` 을 실제로 내주는가(순수 디스크 판독 · 셔임 실행 0).
+/// python3 = 동봉 python 실재 · git = 런처와 동봉 git **둘 다** 실재. 그 밖의 이름은 대역이 내주지 않는다.
+pub fn standin_serves(standin: Option<&Path>, tool: &str) -> bool {
+    let Some(dev) = standin else {
+        return false;
+    };
+    let Some(rt) = dev.parent() else {
+        return false;
+    };
+    match tool {
+        "python3" => is_executable_file(&rt.join("python").join("bin").join("python3")),
+        "git" => {
+            is_executable_file(&dev.join("bin").join("git"))
+                && is_executable_file(&rt.join("git").join("bin").join("git"))
+        }
+        _ => false,
+    }
+}
+
+/// 이 앱의 좌석에서 `tool` 이 **설치 창 없이 동작하는가** — CLT 에 있거나, 좌석이 받는 대역이 내준다.
+/// 첫 실행 안내(`devtools_missing_notice`)의 '있음' 판정이 이것이다: 대역이 도는 맥에 "설치 창이 뜰 수 있다"고
+/// 말하면 거짓 안내다. 대역이 없는 번들에서는 CLT 판정과 같아 종전 안내가 그대로 나간다.
+pub fn seat_tool_present(exe_dir: &Path, tool: &str) -> bool {
+    clt_tool_present(tool) || standin_serves(standin_developer_dir(exe_dir).as_deref(), tool)
+}
+
+/// ⑧ `DEVELOPER_DIR` 조건부 쌍 주입의 **순수 코어**(env 도 디스크도 보지 않는다).
+///
+/// 불가침 계약([`inject_cys_py_for`] 와 동형):
+///   ① `user_has_developer_dir` — 프로세스 env 에 `DEVELOPER_DIR` 가 이미 있으면 **절대 덮지 않는다**(사용자가
+///      고른 Xcode · 또는 대역을 받은 좌석 안에서 뜬 데몬: 자식은 그 값을 그대로 상속한다).
+///   ② 이미 쌓인 쌍에 같은 키가 있으면 손대지 않는다(later-wins 뒤집기·중복 금지).
+///   ③ `standin == None`(= 판정 불충족)이면 아무것도 얹지 않는다 — 종전과 바이트 동일.
+pub fn inject_developer_dir_for(
+    env_pairs: &mut Vec<(String, String)>,
+    standin: Option<&Path>,
+    user_has_developer_dir: bool,
+) {
+    if user_has_developer_dir {
+        return;
+    }
+    let Some(d) = standin else {
+        return;
+    };
+    if env_pairs.iter().any(|(k, _)| k == ENV_DEVELOPER_DIR) {
+        return;
+    }
+    env_pairs.push((ENV_DEVELOPER_DIR.to_string(), d.to_string_lossy().into_owned()));
 }
 
 /// ⑦ `CYS_PY` + 마커 조건부 쌍 주입의 **순수 코어**(env 도 디스크도 보지 않는다).
@@ -1108,5 +1210,91 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(exe_dir.parent().unwrap().parent().unwrap()).ok();
+    }
+
+    /// ★⑧ 주입 코어의 불가침 계약 — 사용자 값 불가침 · 판정 불충족 무주입 · 중복 금지.
+    #[test]
+    fn inject_developer_dir_contract() {
+        let d = Path::new("/App/cys.app/Contents/Resources/runtime/devtools");
+        let pair = (ENV_DEVELOPER_DIR.to_string(), d.to_string_lossy().into_owned());
+        let mut on = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        inject_developer_dir_for(&mut on, Some(d), false);
+        assert_eq!(on, vec![("PATH".to_string(), "/usr/bin".to_string()), pair], "대역이 정확히 한 쌍으로 실리지 않았다");
+        let mut user = Vec::new();
+        inject_developer_dir_for(&mut user, Some(d), true);
+        assert!(user.is_empty(), "사용자 DEVELOPER_DIR 가 있는데 덮었다: {user:?}");
+        let mut none = Vec::new();
+        inject_developer_dir_for(&mut none, None, false);
+        assert!(none.is_empty(), "판정 불충족인데 실었다: {none:?}");
+        let mine = vec![(ENV_DEVELOPER_DIR.to_string(), "/mine".to_string())];
+        let mut dup = mine.clone();
+        inject_developer_dir_for(&mut dup, Some(d), false);
+        assert_eq!(dup, mine, "먼저 실린 값을 덮거나 중복으로 얹었다");
+    }
+
+    /// ★대역 디렉터리 해소 — 처음 실재하는 루트 하나만 본다 · 판정 None 이면 디스크와 무관하게 None.
+    #[test]
+    fn bundled_devtools_dir_takes_the_first_real_root_only() {
+        let (exe_dir, rt) = fake_bundle("devdir-root", false);
+        assert_eq!(bundled_devtools_dir(&exe_dir), Some(rt.join("devtools")));
+        assert_eq!(standin_developer_dir_for(None, &exe_dir), None, "판정이 None 인데 대역을 돌려줬다");
+        assert_eq!(
+            standin_developer_dir_for(Some(Path::new("/x/python3")), &exe_dir),
+            Some(rt.join("devtools"))
+        );
+        // 번들 루트(Resources/runtime)는 실재하는데 대역이 없고, 개발 폴백 루트(exe_dir/runtime)에만 대역이 있다
+        // → None(두 트리를 섞지 않는다).
+        std::fs::remove_dir_all(rt.join("devtools")).unwrap();
+        write_exec(
+            &exe_dir.join("runtime").join("devtools").join("usr").join("bin").join("xcrun"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        assert_eq!(bundled_devtools_dir(&exe_dir), None, "첫 루트에 없는 대역을 뒤 루트에서 가져왔다");
+        // 번들 루트가 아예 없으면 개발 폴백 루트를 본다.
+        std::fs::remove_dir_all(&rt).unwrap();
+        assert_eq!(bundled_devtools_dir(&exe_dir), Some(exe_dir.join("runtime").join("devtools")));
+        assert_eq!(bundled_devtools_dir(Path::new("/nonexistent-exe-dir-for-pin")), None);
+        std::fs::remove_dir_all(exe_dir.parent().unwrap().parent().unwrap()).ok();
+    }
+
+    /// ★대역이 내주는 도구 — python3 = 동봉 python · git = 런처와 동봉 git **둘 다** · 그 밖은 아니다.
+    /// (첫 실행 안내의 '있음' 판정이 이것을 쓴다 — 틀리면 대역이 도는 맥에 안내가 뜨거나, 안 도는 맥에 침묵한다.)
+    #[test]
+    fn standin_serves_python3_and_git_only_when_their_files_exist() {
+        let (exe_dir, rt) = fake_bundle("serves", false);
+        let dev = rt.join("devtools");
+        assert!(standin_serves(Some(dev.as_path()), "python3"));
+        assert!(standin_serves(Some(dev.as_path()), "git"));
+        for other in ["make", "cc", "node", "", "../python/bin/python3"] {
+            assert!(!standin_serves(Some(dev.as_path()), other), "대역이 {other:?} 를 내준다고 답했다");
+        }
+        assert!(!standin_serves(None, "python3"), "대역이 없는데 내준다고 답했다");
+        std::fs::remove_file(rt.join("git").join("bin").join("git")).unwrap();
+        assert!(!standin_serves(Some(dev.as_path()), "git"), "동봉 git 이 없는데 git 을 내준다고 답했다");
+        write_exec(&rt.join("git").join("bin").join("git"), "#!/bin/sh\nexit 0\n");
+        assert!(standin_serves(Some(dev.as_path()), "git"), "대조군: 동봉 git 을 되돌렸는데 아니라고 답했다");
+        std::fs::remove_file(dev.join("bin").join("git")).unwrap();
+        assert!(!standin_serves(Some(dev.as_path()), "git"), "런처가 없는데 git 을 내준다고 답했다");
+        std::fs::remove_file(rt.join("python").join("bin").join("python3")).unwrap();
+        assert!(!standin_serves(Some(dev.as_path()), "python3"), "동봉 python 이 없는데 python3 를 내준다고 답했다");
+        std::fs::remove_dir_all(exe_dir.parent().unwrap().parent().unwrap()).ok();
+    }
+
+    /// ★생산 배선 소스 핀 — ⑧ 이 ⑦ 과 **같은 판정**(clt_absent_bundled)을 거쳐 주입 코어를 부른다.
+    #[test]
+    fn spawn_env_pairs_with_wires_eighth_pair_source_pin() {
+        let src = include_str!("lib.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("프로덕션 구간 분리 실패");
+        let j = prod.find("pub fn spawn_env_pairs_with(").expect("spawn_env_pairs_with 소실");
+        let body = &prod[j..prod[j..].find("\n}\n").map(|e| j + e).unwrap_or(prod.len())];
+        assert!(body.contains("macos_devtools::inject_developer_dir_for("), "⑧ 주입 코어 호출 소실");
+        assert!(
+            body.contains("macos_devtools::standin_developer_dir_for(clt_absent_bundled, exe_dir)"),
+            "⑧ 이 ⑦ 과 같은 판정(clt_absent_bundled)을 거치지 않는다 — CLT 있는 맥에 대역이 실릴 수 있다"
+        );
+        assert!(
+            body.contains("std::env::var_os(macos_devtools::ENV_DEVELOPER_DIR)"),
+            "사용자 DEVELOPER_DIR 관측 소실(덮어쓰기 위험)"
+        );
     }
 }

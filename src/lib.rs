@@ -1110,7 +1110,10 @@ pub const EXIT_GATE_PENDING: i32 = 78;
 /// 동봉 runtime의 bin 디렉토리들(디스크에 실재하는 것만) — OS별 레이아웃. 반환 순서 = PATH 선두 우선순위.
 /// Windows(RC-5): exe 형제 `runtime/`(python·git/cmd·git/usr/bin).
 /// macOS(RC-18·T6b): 앱 번들은 실행바이너리=Contents/MacOS·리소스(runtime/)=Contents/Resources →
-///   `exe_dir/../Resources/runtime`(python/bin·git/bin·uv·node/bin). 개발 빌드(exe 형제 runtime/)도 폴백.
+///   `exe_dir/../Resources/runtime`(python/bin·devtools/bin·git/bin·uv·node/bin). 개발 빌드(exe 형제 runtime/)도 폴백.
+///   ★S1 버그2: `devtools/bin`(git 런처 하나)이 `git/bin` **앞**이다 — 동봉 git 은 맨몸으로 켜면 보조 프로그램을
+///   `//libexec/git-core` 에서 찾아 https 원격(clone·fetch·push)이 전부 죽는다(`git: 'remote-https' is not a git
+///   command` 실측). 런처가 GIT_EXEC_PATH 를 세운 뒤 그 git 을 연다. 런처가 없는 번들은 종전 순서 그대로다.
 /// runtime_prefixed_path(PATH 선두주입)와 state.rs `-lc` 재선두주입(D8 — 로그인셸 path_helper 강등 회피)이 공유.
 pub fn runtime_bin_dirs(exe_dir: &Path) -> Vec<PathBuf> {
     #[cfg_attr(not(any(windows, target_os = "macos")), allow(unused_mut))]
@@ -1142,6 +1145,7 @@ pub fn runtime_bin_dirs(exe_dir: &Path) -> Vec<PathBuf> {
             }
             for d in [
                 rt.join("python").join("bin"),
+                rt.join("devtools").join("bin"), // ★S1 버그2: git 런처 — 맨몸 git(git/bin) 앞
                 rt.join("git").join("bin"),
                 rt.join("uv"),
                 rt.join("node").join("bin"),
@@ -1790,6 +1794,16 @@ pub fn windows_runtime_damage_notice(missing: &[String]) -> Option<String> {
 ///    프로세스 env 에 `CYS_PY` 가 있으면 덮지 않는다. 훅 프리루드 `cys_resolve_py` 첫 갈래가 미리 설정된
 ///    값을 존중하므로 이 한 쌍으로 좌석 훅 전체가 동봉 python 을 쓴다. 마커는 `cys-dept` 헤더가 소비한다.
 ///    ⑤·⑥ 과 같이 조건 미충족이면 아무것도 얹지 않는다 — CLT 있는 맥·윈도우·리눅스는 **바이트 동일**.
+/// ⑧ DEVELOPER_DIR(S1 버그2 · 오너 2026-11-22 · **macOS·CLT 부재 전용 조건부 쌍**): ⑦ 은 훅만 고친다 — 에이전트가
+///    Bash 도구에서 직접 치는 `python3`·`git`, Claude Code·codex·gemini 자신의 git 호출, 그 하위 셸은 여전히
+///    `/usr/bin` 의 애플 셔임(설치 창 + 비0)으로 풀렸다. 셔임은 `DEVELOPER_DIR` 를 가장 먼저 보고 그 디렉터리의
+///    `usr/bin/xcrun <도구> <인자…>` 를 대신 실행하므로(macOS 27.2 실측), 앱에 든 **대역 개발자 디렉터리**
+///    (`<runtime>/devtools` — 그 xcrun 이 동봉 python·git 을 연다)를 좌석 env 에 실으면 좌석 안의 어떤 하위 셸에서도
+///    그 이름들이 앱에 든 것으로 풀린다. 좌석 밖(사용자의 다른 터미널·시스템)은 한 바이트도 바뀌지 않는다.
+///    조건: ⑦ 과 **같은 판정**(CLT 부재) ∧ 대역 xcrun 이 실행 가능 파일 ∧ 사용자 프로세스 env 에 `DEVELOPER_DIR`
+///    가 없을 것. CLT·Xcode 가 있는 맥은 싣지 않는다 — 그 맥의 애플 Git(키체인 자격 증명)·`xcode-select -p` 를
+///    소비하는 빌드 도구를 바꾸지 않기 위해서다. 규칙의 정의처 = [`macos_devtools`] 머리말 ⑤.
+///    (① PATH 쌍은 이 판부터 런처가 든 번들이면 어느 맥에서나 `devtools/bin` 한 칸이 는다 — `runtime_bin_dirs` 주석.)
 ///
 /// ★T-0147-7 W1a(A17): 이 함수는 `schedule.rs` 의 private fn 이었다. **pane 스폰 경로
 ///   (state.rs)에는 같은 backfill 이 없어** Windows 에서 pane 속 훅·python 이 `$HOME` 붕괴로
@@ -1873,6 +1887,16 @@ pub fn spawn_env_pairs_with(
     // ⑦ U15(0.14.41): CLT 없는 맥에서만 동봉 python 을 훅에 명시한다(판정·롤백은 단일 판정이 소유 ·
     //    비-macOS 는 디스크 stat 0 으로 None). 조건 미충족 = 쌍 0개 = 종전과 바이트 동일.
     macos_devtools::inject_cys_py_for(&mut env, clt_absent_bundled, user_has_cys_py);
+    // ⑧ S1 버그2: 같은 판정(CLT 부재)일 때만 대역 개발자 디렉터리를 싣는다 — 셔임이 앱에 든 python3·git 으로
+    //    넘어간다. ⑤처럼 여기서는 **관측만** 한다(디스크: 대역 실재 · 사용자 env 1회 판독). 사용자 `CYS_PY` 와는
+    //    독립이다(셔임은 그 변수를 보지 않는다). 조건 미충족 = 쌍 0개 = 종전과 바이트 동일.
+    macos_devtools::inject_developer_dir_for(
+        &mut env,
+        macos_devtools::standin_developer_dir_for(clt_absent_bundled, exe_dir).as_deref(),
+        std::env::var_os(macos_devtools::ENV_DEVELOPER_DIR)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false),
+    );
     env
 }
 

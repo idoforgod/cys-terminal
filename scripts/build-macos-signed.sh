@@ -136,6 +136,11 @@ fi
 #   된다(2026-08-01 실측). 자세한 근거는 precompile-bundled-python.sh 머리 주석.
 bash scripts/precompile-bundled-python.sh src-tauri/runtime
 
+# ── 개발자 도구 대역 (S1 버그2 · ★조건 없이 매 빌드) ──
+# 위 prep 블록은 `.prep-target` 이 맞으면 건너뛴다 — 이 변경 이전에 준비된 런타임 트리에는 대역이 없다.
+# 여기서 한 번 더 깔아(같은 바이트를 다시 쓴다) 「대역 없는 앱이 조용히 나가는」 경로를 닫는다.
+bash scripts/install-mac-devtools.sh src-tauri/runtime
+
 echo "== 동봉 runtime Mach-O inside-out 재서명 (Developer ID + hardened + timestamp) =="
 ENT="src-tauri/entitlements.plist"
 SIGN_N=0
@@ -181,6 +186,17 @@ DMG="$BUNDLE_BASE/dmg/cys_${VERSION}_${DMG_ARCH}.dmg"
 #   **모든** Mach-O 가 $TARGET 에서 돌 수 있는지 보고, 진입점 넷(python·node·git·uv)을 요구한다.
 echo "== 번들 아키텍처 게이트: $APP ($TARGET · 공증 제출 전) =="
 "$GATE_PY" scripts/check_macho_arch.py --target "$TARGET" "${GATE_REQ[@]}" "$APP"
+
+# ── 개발자 도구 대역 반입 확인 (S1 버그2 · fail-closed) ──
+# 번들러가 이 스크립트들을 빠뜨리거나 실행 비트를 떼어도 앱은 그대로 나가고, 개발자 도구 없는 맥의 좌석은 조용히 종전
+# (설치 창)으로 돌아간다 — 릴리스 레인의 다른 어느 것도 붉어지지 않는다. 그래서 .app 안의 실물을 원본과 대조한다.
+DEVRT="$APP/Contents/Resources/runtime"
+for f in devtools/usr/bin/xcrun devtools/bin/git; do
+  { [ -f "$DEVRT/$f" ] && [ -x "$DEVRT/$f" ]; } || { echo "✗ 대역이 .app 에 실행 가능 파일로 실리지 않았다: $DEVRT/$f" >&2; exit 1; }
+  cmp "scripts/mac-devtools/$(basename "$f")" "$DEVRT/$f" || { echo "✗ .app 안의 대역이 원본과 다르다: $f" >&2; exit 1; }
+done
+cmp scripts/mac-devtools/pip.conf "$DEVRT/python/pip.conf" || { echo "✗ pip 설정이 .app 에 실리지 않았다(또는 원본과 다르다)" >&2; exit 1; }
+echo "  ✓ 개발자 도구 대역 반입 확인: xcrun · git 런처 · pip.conf"
 
 # ── SEAL-2 반입 확인: 선컴파일 산출물이 실제로 .app 안에 실렸는가 (fail-closed) ──
 # Tauri 번들러가 `__pycache__` 를 빠뜨리면 선컴파일을 해도 봉인엔 안 들어가고, 사용자 머신에서

@@ -81,5 +81,9 @@ printf 'Bundled runtimes and their licenses (macOS):\n- CPython (python-build-st
 # 런타임 트리 전체를 대상으로 한다 → 반드시 python·node 내려받기가 **끝난 뒤**에 돈다.
 bash scripts/precompile-bundled-python.sh "$RT"   # 이 스크립트는 상단에서 repo 루트로 cd 한 상태다
 
-ls -la "$RT/python/bin/python3" "$RT/git/bin/git" "$RT/uv/uv" "$RT/node/bin/node"
+# ── 개발자 도구 대역 (S1 버그2): 개발자 도구 없는 맥의 좌석에서 python3·git 이 앱에 든 것으로 풀리게 ──
+# 추적된 스크립트 둘을 복사할 뿐이다(네트워크 0 · python 실행 0 → 선컴파일 뒤에 와도 봉인과 무관).
+bash scripts/install-mac-devtools.sh "$RT"
+
+ls -la "$RT/python/bin/python3" "$RT/git/bin/git" "$RT/uv/uv" "$RT/node/bin/node" "$RT/devtools/usr/bin/xcrun" "$RT/devtools/bin/git" "$RT/python/pip.conf"
 echo "✓ macOS 런타임 준비 완료 ($TARGET)"
