@@ -620,6 +620,9 @@ function moveCsoCore(t: LNode, roleOf: RoleOf): LNode {
     if (!a) return t;
     let b: LNode = t.b;
     for (const p of csos) b = addToSide(b, p, roleOf);
+    // ★S1 M3(R1·R2): **이미 있던** 리뷰어 열에 들어갔으면 그 열의 산 칸을 같은 높이로 — 위→아래 순서는 그대로,
+    //   높이 규칙은 sideColumn 과 같은 sideStack 하나(구멍은 이웃 몫을 빌린다). 제 컬럼을 새로 받은 갈래(R5)는 그대로.
+    if (sideColumnLike(lastCol(t.b), roleOf)) b = mapLastCol(b, (col) => sideStack(panesOf(col)));
     return { ...t, a, b };
   }
   const csos = csosIn(t);
@@ -636,10 +639,21 @@ function moveCsoCore(t: LNode, roleOf: RoleOf): LNode {
 }
 /**
  * ★S1 M3(R6) — 수동 탭 1회 이관이 이 탭에 **아직 남았는가**. 기동 S5 가 이관 뒤에 묻고, 참인 탭이 하나라도 있으면
- * 표식(csoSideDone)을 세우지 않는다(다음 기동이 다시 한다). 이 판은 배선만이다 — 종전 동작 그대로 언제나 거짓. 전역.
+ * 표식(csoSideDone)을 세우지 않는다(다음 기동이 다시 한다). 참 = 대표 칸 안에 CSO 가 아직 있거나 있을 수 있다:
+ *   · 이관을 한 번 더 돌리면 무엇이 바뀐다(= 이관이 원 트리로 떨어졌다 — 예외·멤버 대조 실패) · 판정이 던진다 · 손상 트리.
+ *   · 역할을 모르는 칸(데몬 무응답이고 칸의 기억도 없다 — effRole 이 undefined)이 대표 칸 안에 있다. 대표 칸을 알아볼 수
+ *     없으면(master 를 알아보지 못했다) 탭 전체를 본다. 대표 칸 밖의 모르는 칸은 이관과 무관하다.
+ * 거짓 = 옮겼다 · 옮길 것이 없다 · 빈 탭. 전역.
  */
 export function csoMovePending(tree: LNode | null, roleOf: RoleOf): boolean {
-  return false;
+  if (!tree) return false;
+  try {
+    if (!isValidTree(tree)) return true;
+    if (panesOf(headSide(tree, roleOf) ? tree.a : tree).some((p) => effRole(p, roleOf) === undefined)) return true;
+    return moveCsoCore(tree, roleOf) !== tree;
+  } catch {
+    return true;
+  }
 }
 /** 대표 칸이 제자리인가(테스트·배선 판독용). 전역. */
 export function isAnchored(tree: unknown, roleOf: RoleOf): boolean {
