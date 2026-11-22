@@ -11022,6 +11022,28 @@ exit 0
         );
     }
 
+    /// ★S1 수정2(오너 2026-11-22 「피드백 보내기 제거 · 업데이트되면 ~/.cys/feedback 삭제」) — 배선 소스 핀.
+    /// 잔여 폴더 정리는 setup 부트 태스크에서, 안전 모드 반환(비정규 경로 기동) **뒤** · 업데이트 반영 **앞**에 불린다.
+    /// 앱의 재귀 삭제는 그 한 곳뿐이고, 대상은 상수 이름 하나로 만든 경로다(패턴·접두 삭제가 끼어들면 붉다).
+    #[test]
+    fn retired_feedback_cleanup_is_wired_before_the_pending_update() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let call = prod
+            .find("remove_retired_feedback_dir();")
+            .expect("부트 태스크가 '피드백 보내기' 잔여 폴더 정리를 부르지 않는다 — 업데이트 뒤에도 ~/.cys/feedback 이 남는다");
+        let upd = prod.find("maybe_apply_pending_update(&handle);").expect("업데이트 반영 호출 소실");
+        let safe = prod.find("if verdict != BootPathVerdict::Canonical {").expect("안전 모드 반환 소실");
+        assert!(safe < call, "정리가 안전 모드 반환보다 앞이다 — 임시 사본으로 뜬 앱이 사용자 폴더를 지운다");
+        assert!(call < upd, "정리가 업데이트 반영 뒤다");
+        assert_eq!(prod.matches("remove_dir_all(").count(), 1, "앱 프로덕션 코드의 재귀 삭제가 한 곳이 아니다");
+        assert!(prod.contains("const RETIRED_FEEDBACK_DIR: &str = \"feedback\";"), "대상 이름 상수 소실");
+        assert!(
+            prod.contains("let target = cys_base.join(RETIRED_FEEDBACK_DIR);"),
+            "삭제 대상이 `<~/.cys>/feedback` 한 경로로 만들어지지 않는다"
+        );
+    }
+
     /// ★U15 안내 판정 진리표 — macOS ∧ 이 버전 미고지 ∧ 도구 결손일 때만 · 문구는 lib 정본 그대로.
     #[test]
     fn devtools_notice_due_truth_table() {
