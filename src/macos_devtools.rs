@@ -1087,7 +1087,16 @@ mod tests {
         );
         let none = body.replace(&line, "CYS_DEV_CANDIDATES=\"/nonexistent-s1-a /nonexistent-s1-b\"");
         write_exec(&xcrun, &none);
-        for args in [vec!["make", "-v"], vec!["--show-sdk-path"], vec![], vec!["-f", "cc"], vec!["../python/bin/python3"]] {
+        // 마지막 둘: 경로 구분자가 든 이름은 도구 이름이 아니다 — `devtools/bin/../../python/bin/python3` 처럼 동봉 실행 파일에
+        // **실제로 닿는** 상대 경로여도 내주지 않는다(이름 검사를 걷으면 이 둘이 0 으로 끝나 붉어진다).
+        for args in [
+            vec!["make", "-v"],
+            vec!["--show-sdk-path"],
+            vec![],
+            vec!["-f", "cc"],
+            vec!["../../python/bin/python3", "-V"],
+            vec!["-f", "../../git/bin/git"],
+        ] {
             let (rc, out, err) = sh_run(&xcrun, &args, &[("DEVELOPER_DIR", "/whatever")]);
             assert_eq!(rc, 72, "개발자 디렉터리가 없는데 72 로 끝나지 않았다({args:?}): out={out} err={err}");
             assert_eq!(out, "", "표준출력에 무언가를 냈다({args:?})");
