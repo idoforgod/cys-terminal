@@ -474,9 +474,13 @@ jobs:
             foreach ($t in 'python3', 'git', 'node') {
               # 인자 안에 큰따옴표를 두지 않는다 — pane 의 셸은 Windows PowerShell 5.1 이고, 그 판은 네이티브 프로그램에 넘기는
               # 인자 안의 큰따옴표를 이스케이프하지 않아 bash 가 인자를 쪼개 받는다(독립 검토 지적 · 제품 결함이 아닌 점검 결함).
-              $src = S1Clean (& $bash $mode ('command -v ' + $t + ' | cygpath -w -f -') 2>&1 | Select-Object -First 1)
+              # 경로는 '첫 줄'이 아니라 **Windows 경로 꼴인 줄**이다 — 로그인 셸은 답보다 먼저 stderr 한 줄을 낼 수 있다
+              # (실측 run 44985947040: "mkdir: cannot create directory '/dev/shm'" 이 경로 칸에 들어갔다 · 점검 결함).
+              $src = S1Clean (& $bash $mode ('command -v ' + $t + ' | cygpath -w -f -') 2>&1 | Where-Object { "$_" -match '^[A-Za-z]:\\' } | Select-Object -First 1)
               $ver = S1Clean (& $bash $mode ($t + ' --version') 2>&1); $rc = $LASTEXITCODE
-              $rows += ('bash' + $mode, $t, $rc, $src, $ver) -join "`t"
+              # 괄호 필수: PowerShell 은 쉼표가 + 보다 먼저 묶인다 — 괄호가 없으면 'bash' + (배열) 이 **한 문자열**이 되어
+              # 행이 한 칸으로 붙는다(실측 run 44985947040: bash 6행이 rc·경로 빈 칸으로 판정됐다 · 점검 결함).
+              $rows += (('bash' + $mode), $t, $rc, $src, $ver) -join "`t"
             }
           }
           $rows | Set-Content -Path (Join-Path $env:TEMP 's1-seat-tools.tsv') -Encoding UTF8
