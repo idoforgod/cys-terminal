@@ -1178,4 +1178,236 @@ mod tests {
         }
         assert!(bad.is_empty(), "기록 파일 자리의 파이프를 잘못 다뤘다:\n{}", bad.join("\n"));
     }
+
+    // ───────── S1 FIX 2 (ADDENDUM 6 · reviewer-codex r2 M5) — the record comes FIRST; a failed or cut-short record never lets a
+    // later start delete ─────────
+    /// The line the body must write and flush BEFORE it removes anything: unix seconds · app version · `attempt` · target path.
+    #[cfg(unix)]
+    fn s1_fix3_attempt_line(now: u64, home: &std::path::Path) -> String {
+        format!(
+            "{now}\t{}\tattempt\t{}\n",
+            env!("CARGO_PKG_VERSION"),
+            home.join(".cys/feedback").display()
+        )
+    }
+
+    /// CHILD SIDE ONLY - in an ordinary test run the two variables are absent and this returns at once. The parent
+    /// (`s1_fix3_run_limited`) starts this test binary again with them: the body then runs under a REAL file-size limit
+    /// (`RLIMIT_FSIZE`, SIGXFSZ ignored - the reviewer's recorded case), so writes into the record fail the way a full disk does.
+    #[cfg(unix)]
+    #[test]
+    fn s1_fix3_child_runs_the_body_under_a_file_size_limit() {
+        let (Ok(home), Ok(limit)) = (std::env::var("S1_FIX3_CHILD_HOME"), std::env::var("S1_FIX3_FSIZE")) else {
+            return;
+        };
+        let limit: libc::rlim_t = limit.parse().expect("S1_FIX3_FSIZE is not a number");
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let rl = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &rl), 0, "setrlimit(RLIMIT_FSIZE) failed");
+        }
+        let mut notes: Vec<String> = Vec::new();
+        let out = remove_retired_feedback_dir_noting(std::path::Path::new(&home), 1795344000, &mut |m: &str| {
+            notes.push(m.to_string())
+        });
+        for n in &notes {
+            println!("S1FIX3-NOTE {}", n.replace('\n', " "));
+        }
+        println!("S1FIX3-RESULT {out:?}");
+    }
+
+    /// Runs the body for `home` in a child process under a file-size limit of `limit` bytes. Returns (result line, notes).
+    #[cfg(unix)]
+    fn s1_fix3_run_limited(home: &std::path::Path, limit: u64) -> (String, Vec<String>) {
+        let module = module_path!().split_once("::").map(|(_, rest)| rest).unwrap_or(module_path!());
+        let name = format!("{module}::s1_fix3_child_runs_the_body_under_a_file_size_limit");
+        let out = std::process::Command::new(std::env::current_exe().expect("no current_exe"))
+            .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env("S1_FIX3_CHILD_HOME", home)
+            .env("S1_FIX3_FSIZE", limit.to_string())
+            .output()
+            .expect("could not start the child test process");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        // libtest prints `test <name> ... ` on the same line before the child's first output line - find the marker anywhere
+        let after = |l: &str, marker: &str| l.find(marker).map(|i| l[i + marker.len()..].to_string());
+        let result = text
+            .lines()
+            .find_map(|l| after(l, "S1FIX3-RESULT "))
+            .unwrap_or_else(|| {
+                format!(
+                    "<no result line - child status {:?}, stderr {:?}>",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).chars().take(400).collect::<String>()
+                )
+            });
+        let notes = text.lines().filter_map(|l| after(l, "S1FIX3-NOTE ")).collect();
+        (result, notes)
+    }
+
+    /// ★FIX 2 (ADDENDUM 6 · reviewer-codex r2 M5): the one-time state is on disk BEFORE anything is removed, and a record that is
+    /// missing its end - because a write failed or the process stopped between two steps - never lets a later start delete.
+    /// At e56f86f5 the body deleted FIRST and wrote its only marker AFTER: under a real file-size limit of 0 (the reviewer's case)
+    /// the folder went, the record stayed empty, and the next start deleted a file the user had put there later.
+    /// RULING-S1-PRODUCT-07 (option B): the record FILE is the attempt - once it exists (complete, cut short or empty) no later
+    /// start deletes; only a start that could not even create it leaves the next start free to try. Pass line: the later file
+    /// survives in every case below.
+    ///   ① limit 0 (nothing can be written into the record): nothing is removed, one note says so; the second start, with a file
+    ///      placed later, deletes nothing either (the empty record file exists).
+    ///   ② limit = the attempt line's length: the attempt line gets in, the folder is removed, the end line cannot be written;
+    ///      a later start leaves the later file alone and says once that an attempt has no end. (At e56f86f5 this case passes by
+    ///      accident: macOS writes the part of a line that fits, so a cut-off `removed` line protects the next start - measured
+    ///      2026-11-23, a 20-byte write under a 10-byte limit returned 10, the next write EFBIG. Its record check is red there.)
+    ///   ③ stop points, as the on-disk state each leaves: after the record file is created (empty) · after the attempt line ·
+    ///      after the removal · after the end line.
+    ///   ④ the ordinary case: removed once, the record is the attempt line then the `removed` line; a second start deletes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn retired_feedback_a_failed_or_cut_short_record_never_lets_a_later_start_delete() {
+        let mut bad: Vec<String> = Vec::new();
+        let now = 1795344000u64;
+        let later = |home: &std::path::Path| home.join(".cys/feedback/later/keep.txt");
+        let later_kept = |home: &std::path::Path| {
+            std::fs::read_to_string(home.join(".cys/feedback/later/keep.txt")).ok().as_deref() == Some("PLACED LATER")
+        };
+        // ① the reviewer's recorded case, first start: file-size limit 0
+        {
+            let (root, home, _outside) = s1_fix2_m1_fixture("fix3-limit0");
+            let log = s1_fix2_log(&home);
+            let (result, notes) = s1_fix3_run_limited(&home, 0);
+            if !result.starts_with("Skipped(") {
+                bad.push(format!("limit-0: not a skip: {result}"));
+            }
+            if std::fs::read_to_string(home.join(".cys/feedback/bundle/x")).ok().as_deref() != Some("x") {
+                bad.push(format!("limit-0: the folder was removed although nothing could be recorded first: {result}"));
+            }
+            let told = notes
+                .iter()
+                .filter(|n| n.contains("정리하지 않았습니다") && n.contains(&log.display().to_string()))
+                .count();
+            if told != 1 || notes.len() != 1 {
+                bad.push(format!("limit-0: the note is not one 'not cleaned' line naming the record: {notes:?}"));
+            }
+            // second start without the limit (RULING-07 B): the record FILE exists - empty - so no later start deletes
+            let record_after_first = std::fs::read(&log).ok();
+            s1_fix2_put(&home.join(".cys/feedback/bundle/x"), "x");
+            s1_fix2_put(&later(&home), "PLACED LATER");
+            let mut notes2: Vec<String> = Vec::new();
+            let out2 = remove_retired_feedback_dir_noting(&home, now + 99, &mut |m: &str| notes2.push(m.to_string()));
+            s1_fix2_not_deleted("limit-0(second start)", &home, &log, &out2, &notes2, &mut bad);
+            if !later_kept(&home) {
+                bad.push(format!("limit-0: the second start deleted the later file (record after the first start: {record_after_first:?})"));
+            }
+            if std::fs::read(&log).ok() != record_after_first {
+                bad.push("limit-0: the second start changed the record".to_string());
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // ② the attempt line fits, the end line does not
+        {
+            let (root, home, _outside) = s1_fix2_m1_fixture("fix3-limit-attempt");
+            let log = s1_fix2_log(&home);
+            let attempt = s1_fix3_attempt_line(now, &home);
+            let (result, notes) = s1_fix3_run_limited(&home, attempt.len() as u64);
+            if !result.starts_with("Removed {") {
+                bad.push(format!("limit-attempt: the first start did not remove: {result}"));
+            }
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text != attempt {
+                bad.push(format!("limit-attempt: the record is not exactly the attempt line: {text:?}"));
+            }
+            if !notes.iter().any(|n| n.contains(&log.display().to_string())) {
+                bad.push(format!("limit-attempt: no note names the record whose end could not be written: {notes:?}"));
+            }
+            s1_fix2_put(&home.join(".cys/feedback/bundle/x"), "x");
+            s1_fix2_put(&later(&home), "PLACED LATER");
+            let mut notes2: Vec<String> = Vec::new();
+            let out2 = remove_retired_feedback_dir_noting(&home, now + 99, &mut |m: &str| notes2.push(m.to_string()));
+            s1_fix2_not_deleted("limit-attempt(second start)", &home, &log, &out2, &notes2, &mut bad);
+            if !later_kept(&home) {
+                bad.push("limit-attempt: the second start deleted the later file".to_string());
+            }
+            if !notes2.iter().any(|n| n.contains("attempt")) {
+                bad.push(format!("limit-attempt: the second start does not say an attempt has no end: {notes2:?}"));
+            }
+            if std::fs::read_to_string(&log).unwrap_or_default() != text {
+                bad.push("limit-attempt: the second start changed the record".to_string());
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // ③ stop points - the record each one leaves, then a later start with a file placed later
+        for (tag, folder_gone, record_tail) in [
+            ("stop-after-file-created", false, "empty"),
+            ("stop-after-attempt", false, ""),
+            ("stop-after-removal", true, ""),
+            ("stop-after-end-line", true, "removed"),
+        ] {
+            let (root, home, _outside) = s1_fix2_m1_fixture(&format!("fix3-{tag}"));
+            let log = s1_fix2_log(&home);
+            let mut record = if record_tail == "empty" { String::new() } else { s1_fix3_attempt_line(now, &home) };
+            if record_tail == "removed" {
+                record.push_str(&format!(
+                    "{now}\t{}\tremoved\t{}\tlink=false\tentries=1\tfiles=1\tbytes=1\tbundle\n",
+                    env!("CARGO_PKG_VERSION"),
+                    home.join(".cys/feedback").display()
+                ));
+            }
+            std::fs::write(&log, &record).unwrap();
+            if folder_gone {
+                std::fs::remove_dir_all(home.join(".cys/feedback")).unwrap();
+                s1_fix2_put(&home.join(".cys/feedback/bundle/x"), "x");
+            }
+            s1_fix2_put(&later(&home), "PLACED LATER");
+            let mut notes: Vec<String> = Vec::new();
+            let out = remove_retired_feedback_dir_noting(&home, now + 99, &mut |m: &str| notes.push(m.to_string()));
+            s1_fix2_not_deleted(tag, &home, &log, &out, &notes, &mut bad);
+            if !later_kept(&home) {
+                bad.push(format!("{tag}: a later start deleted the later file"));
+            }
+            let says_attempt = notes.iter().any(|n| n.contains("attempt"));
+            if says_attempt != (record_tail != "removed") {
+                bad.push(format!("{tag}: the note does not say whether an attempt has no end: {notes:?}"));
+            }
+            if std::fs::read_to_string(&log).unwrap_or_default() != record {
+                bad.push(format!("{tag}: a later start changed the record"));
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // ④ the ordinary case: removed once, recorded as attempt line then removed line
+        {
+            let (root, home, _outside) = s1_fix2_m1_fixture("fix3-ordinary");
+            let log = s1_fix2_log(&home);
+            let mut notes: Vec<String> = Vec::new();
+            let out = remove_retired_feedback_dir_noting(&home, now, &mut |m: &str| notes.push(m.to_string()));
+            if !matches!(out, RetiredFeedbackCleanup::Removed { files: 1, bytes: 1, link: false, .. }) {
+                bad.push(format!("ordinary: not removed: {out:?}"));
+            }
+            let want = format!(
+                "{}{now}\t{}\tremoved\t{}\tlink=false\tentries=1\tfiles=1\tbytes=1\tbundle\n",
+                s1_fix3_attempt_line(now, &home),
+                env!("CARGO_PKG_VERSION"),
+                home.join(".cys/feedback").display()
+            );
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text != want {
+                bad.push(format!("ordinary: the record is not the attempt line then the removed line: {text:?}"));
+            }
+            s1_fix2_put(&home.join(".cys/feedback/bundle/x"), "x");
+            s1_fix2_put(&later(&home), "PLACED LATER");
+            let mut notes2: Vec<String> = Vec::new();
+            let out2 = remove_retired_feedback_dir_noting(&home, now + 99, &mut |m: &str| notes2.push(m.to_string()));
+            s1_fix2_not_deleted("ordinary(second start)", &home, &log, &out2, &notes2, &mut bad);
+            if !later_kept(&home) {
+                bad.push("ordinary: the second start deleted the later file".to_string());
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        assert!(
+            bad.is_empty(),
+            "a failed or cut-short record let a later start delete, or a delete ran with no record first:\n{}",
+            bad.join("\n")
+        );
+    }
 }
