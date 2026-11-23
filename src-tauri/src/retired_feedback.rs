@@ -1230,6 +1230,27 @@ mod tests {
 
     // ───────── S1 FIX 2 (ADDENDUM 6 · reviewer-codex r2 M5) — the record comes FIRST; a failed or cut-short record never lets a
     // later start delete ─────────
+    /// ★FIX 2 (closes mutant F2-05): a same-name REGULAR FILE at `~/.cys/feedback` is not this feature's folder - the gate stops
+    /// before the record is touched. The file stays, NO record file is created (a record file would be an attempt marker for a
+    /// delete that never happens), and one note says why.
+    #[test]
+    fn retired_feedback_a_same_name_file_gets_no_record_and_no_attempt() {
+        let home = s1_fix2_home("fix3-same-name-file");
+        s1_fix2_put(&home.join(".cys/feedback"), "A FILE");
+        let log = s1_fix2_log(&home);
+        let mut notes: Vec<String> = Vec::new();
+        let out = remove_retired_feedback_dir_noting(&home, 1795344000, &mut |m: &str| notes.push(m.to_string()));
+        assert!(matches!(out, RetiredFeedbackCleanup::Skipped(_)), "not a skip: {out:?}");
+        assert_eq!(std::fs::read_to_string(home.join(".cys/feedback")).ok().as_deref(), Some("A FILE"));
+        assert!(
+            std::fs::symlink_metadata(&log).is_err(),
+            "a record file was created for a delete that never happens: {:?}",
+            std::fs::read_to_string(&log)
+        );
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("정리하지 않았습니다"), "{notes:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
     /// The line the body must write and flush BEFORE it removes anything: unix seconds · app version · `attempt` · target path.
     #[cfg(unix)]
     fn s1_fix3_attempt_line(now: u64, home: &std::path::Path) -> String {
