@@ -10,12 +10,14 @@
 //! 앱 프로덕션 코드의 재귀 삭제도 이 파일의 한 곳뿐이다(아래 배선 핀).
 //!
 //! 【부르는 곳】 `main.rs` setup 부트 태스크 — 안전 모드 반환(비정규 경로 기동) **뒤**, 업데이트 반영 **앞**. 전 OS.
-//! 【한 번만】 지우는 일은 **한 번**이다(RULING-04 M5 — 오너의 명령은 「업데이트되면 지운다」다): 기록에 「지웠다」 줄이 있으면
-//!         — 어느 판이 적었든 — 다시 지우지 않는다. 그 뒤에 그 자리에 생긴 폴더(옛 판 앱이 다시 만든 것 포함)는 남는다.
+//! 【한 번만】 지우는 일은 **한 번**이다(RULING-04 M5 — 오너의 명령은 「업데이트되면 지운다」다). 표식은 기록 **파일**
+//!         `~/.cys/state/feedback-removed.log`(판 번호 없는 이름) 자체다(FIX 2 · RULING-S1-PRODUCT-07 B): 그 파일이 있으면 —
+//!         완결된 줄이든 끊긴 줄이든 비었든 — 다시 지우지 않는다. 그 뒤에 그 자리에 생긴 폴더(옛 판 앱이 다시 만든 것 포함)는 남는다.
 //!         폴더가 없으면 stat 한 번으로 끝난다(기록 파일도 만들지 않는다).
-//! 【기록】 지우기 **전에** `~/.cys/state/feedback-removed.log`(판 번호 없는 이름)를 로그 자신으로 열어 둔다 — 열 수 없거나
-//!         읽을 수 없으면 **지우지 않고** 알린다(기록할 수 없는 삭제는 하지 않는다). 사라진 것이 있으면 그 파일에 한 줄을
-//!         **덧붙이고** 표준 오류에 한 줄을 낸다. 재귀 삭제가 도중에 멈춰 **일부만** 사라진 경우에도 그대로 적는다(`partial`).
+//! 【기록】 **기록이 먼저다**: 지울 것이 보이면 기록 파일을 로그 자신으로 **새로 만들고**, 시도 줄(`attempt`)을 써서 디스크까지
+//!         내린 **뒤에** 지운다. 만들 수 없으면 지우지 않는다(다음 기동이 다시 해 본다 — 다시 해 보는 것은 이 경우뿐이다).
+//!         만들었으나 시도 줄을 쓰지 못하면 지우지 않고, 그 폴더는 남는다(앱이 나중에 지우지 않는다 — 한 줄로 알린다).
+//!         지운 뒤 그 파일에 끝 줄(`removed` · 도중에 멈췄으면 `partial`)을 **덧붙이고** 표준 오류에 한 줄을 낸다.
 //! 【실패】 부트를 막지 않는다. 남은 것은 완전 초기화의 목록(`src/factory_reset.rs` 의 `feedback` 항목)이 여전히 덮는다.
 
 /// 걷어낸 기능이 쓰던 폴더의 이름 — `~/.cys/` 바로 아래의 **이 이름 하나**(접두·패턴 매칭 0).
@@ -261,12 +263,14 @@ const RETIRED_FEEDBACK_ATTR_REPARSE_POINT: u32 = 0x0000_0400;
 ///      열린 파이프는 ②가 거부한다.
 /// 부모 폴더(`~/.cys` · `~/.cys/state`)가 링크인 것은 따라간다 — cys 의 다른 상태 파일이 놓이는 바로 그 자리이고,
 /// 삭제 대상의 부모를 다루는 방식과 같다.
-fn retired_feedback_open_record(log: &std::path::Path) -> Result<std::fs::File, String> {
+/// `create_new` (FIX 2 · RULING-S1-PRODUCT-07 B): 참이면 **새로 만들 때만** 연다(이미 있으면 실패) — 이 파일을 만든 기동만이
+/// 지울 수 있다. 거짓이면 이미 있는 기록을 읽으려고 연다(만들지 않는다).
+fn retired_feedback_open_record(log: &std::path::Path, create_new: bool) -> Result<std::fs::File, String> {
     if let Some(dir) = log.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let mut opts = std::fs::OpenOptions::new();
-    opts.read(true).create(true).append(true);
+    opts.read(true).append(true).create_new(create_new);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -321,16 +325,20 @@ fn retired_feedback_record_has_removal(record: &mut std::fs::File) -> Result<boo
 
 /// 지우기 전의 관문이 내는 답.
 enum RetiredFeedbackGate {
-    /// 지우지 않는다 — 이 결과로 끝난다(지울 것이 없다 · 기준 경로가 아니다 · 볼 수 없다 · 기록할 자리가 없다 · 이미 한 번 지웠다).
+    /// 지우지 않는다 — 이 결과로 끝난다(지울 것이 없다 · 기준 경로가 아니다 · 볼 수 없다 · 기록 파일을 만들 수 없다 · 기록 파일이
+    /// 이미 있다).
     Stop(RetiredFeedbackCleanup),
-    /// 지워도 된다 — 지운 것을 적을 기록 파일이 열려 있다(로그 자신 · 「지웠다」 줄 없음).
+    /// 지워도 된다 — 이 기동이 기록 파일을 **방금 새로 만들었고** 그 핸들이 열려 있다(로그 자신).
     Go(std::fs::File),
 }
 
-/// ★지우기 **전에** 서는 관문(RULING-04 M5) — 삭제 함수는 이 관문이 `Go` 를 낸 뒤에만 불린다.
-///   ① 기준 경로가 `~/.cys` 꼴이 아니거나 폴더가 없거나 볼 수 없으면 거기서 끝난다(기록 파일을 만들지 않는다).
-///   ② 지울 것이 보이면 기록 파일을 로그 자신으로 연다 — 열 수 없으면(다른 곳을 가리킨다 · 만들 수 없다) **지우지 않는다**.
-///   ③ 기록에 「지웠다」 줄이 있으면 **지우지 않는다** — 한 번만 지운다. 읽을 수 없어도 지우지 않는다.
+/// ★지우기 **전에** 서는 관문(RULING-04 M5 · FIX 2 RULING-S1-PRODUCT-07 B) — 삭제 함수는 이 관문이 `Go` 를 낸 뒤에만 불린다.
+///   ① 기준 경로가 `~/.cys` 꼴이 아니거나 폴더가 없거나 볼 수 없거나 폴더·링크가 아니면 거기서 끝난다(기록 파일을 만들지 않는다).
+///   ② 기록 **파일**이 이미 있으면 — 완결된 줄이든 끊긴 줄이든 비었든, 어떤 모양이든 — **지우지 않는다**: 그 파일이 있다는
+///      것은 앞선 기동이 지우기 직전까지 왔다는 뜻이다(한 번만). 알림은 그 내용을 보고 「이미 지웠다」 또는 「시도(attempt)의
+///      끝이 없다 — 다시 지우지 않는다」를 한 줄로 말한다.
+///   ③ 없으면 로그 자신으로 **새로 만든다** — 만들 수 없으면 지우지 않는다(아무것도 지우지 않았고 시도의 표식도 없으니 다음
+///      기동이 다시 해 본다 — 다시 해 보는 것은 이 경우뿐이다).
 fn retired_feedback_record_gate(
     cys_base: &std::path::Path,
     target: &std::path::Path,
@@ -342,27 +350,39 @@ fn retired_feedback_record_gate(
         return Stop(Skipped(format!("기준 경로가 ~/.cys 꼴이 아니다: {}", cys_base.display())));
     }
     match std::fs::symlink_metadata(target) {
-        Ok(_) => {}
+        Ok(m) if m.is_dir() || m.file_type().is_symlink() => {}
+        // 이 기능은 폴더만 만들었다 — 같은 이름의 일반 파일은 지우지 않고, 시도의 표식(기록 파일)도 만들지 않는다
+        Ok(_) => return Stop(Skipped("같은 이름의 일반 파일이다 — 이 기능이 만든 것이 아니다".to_string())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Stop(Absent),
         Err(e) => return Stop(Failed(format!("상태 확인 실패: {e}"))),
     }
-    let mut record = match retired_feedback_open_record(log) {
-        Ok(f) => f,
-        Err(why) => {
+    match std::fs::symlink_metadata(log) {
+        Ok(_) => {
+            let why = match retired_feedback_open_record(log, false)
+                .and_then(|mut f| retired_feedback_record_has_removal(&mut f))
+            {
+                Ok(true) => format!("이미 한 번 지웠다(기록: {}) — 다시 지우지 않는다", log.display()),
+                Ok(false) => format!(
+                    "앞선 기동이 지우기 전에 기록 파일을 만들었고 그 끝(removed/partial)이 없다 — 시도(attempt)의 결과를 알 수 없어 \
+                     다시 지우지 않는다(기록: {}). 이 폴더는 그대로 남고 앱이 나중에 지우지 않는다",
+                    log.display()
+                ),
+                Err(why) => format!("기록 파일이 이미 있어(확인할 수 없다: {why}) 다시 지우지 않는다: {}", log.display()),
+            };
+            return Stop(Skipped(why));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
             return Stop(Skipped(format!(
-                "지운 것을 적을 기록 파일을 쓸 수 없어 지우지 않았다: {} — {why}",
+                "기록 파일 자리를 확인할 수 없어 지우지 않았다: {} — {e}",
                 log.display()
             )))
         }
-    };
-    match retired_feedback_record_has_removal(&mut record) {
-        Ok(false) => Go(record),
-        Ok(true) => Stop(Skipped(format!(
-            "이미 한 번 지웠다(기록: {}) — 다시 지우지 않는다",
-            log.display()
-        ))),
+    }
+    match retired_feedback_open_record(log, true) {
+        Ok(f) => Go(f),
         Err(why) => Stop(Skipped(format!(
-            "기록 파일을 확인할 수 없어 지우지 않았다: {} — {why}",
+            "지운 것을 적을 기록 파일을 만들 수 없어 지우지 않았다(다음 기동이 다시 해 본다): {} — {why}",
             log.display()
         ))),
     }
@@ -383,17 +403,34 @@ fn remove_retired_feedback_dir_noting(
         RetiredFeedbackGate::Stop(out) => out,
         RetiredFeedbackGate::Go(mut record) => {
             use std::io::Write as _;
-            let out = remove_retired_feedback_dir_in(&base);
-            if let Some(line) = retired_feedback_record_line(now_unix, &target, &out) {
-                // 열어 둔 기록 파일에 쓰지 못한 것(디스크가 찼다 등)은 조용히 넘기지 않는다 — 지운 내용은 바로 아래 알림 줄에 있다.
-                if let Err(e) = record.write_all(line.as_bytes()) {
-                    retired_feedback_note(&format!(
-                        "[cys-app] 지운 것의 기록을 남기지 못했습니다: {} — 쓰지 못했다: {e}",
-                        log.display()
-                    ));
+            // ★FIX 2 (RULING-S1-PRODUCT-07 B): 기록 파일이 방금 생겼다 — 그것이 시도의 표식이다. 지우기 **전에** 시도 줄을 쓰고
+            // 디스크까지 내린다. 쓰지 못하면 지우지 않는다 — 파일은 이미 있으므로 다음 기동도 지우지 않는다(폴더가 남는 쪽이다).
+            let attempt = format!(
+                "{now_unix}\t{}\tattempt\t{}\n",
+                env!("CARGO_PKG_VERSION"),
+                target.display()
+            );
+            match record.write_all(attempt.as_bytes()).and_then(|()| record.sync_all()) {
+                Err(e) => RetiredFeedbackCleanup::Skipped(format!(
+                    "기록 파일은 만들었으나 지우기 전의 줄(attempt)을 쓰지 못해 지우지 않았다: {} — {e}. 기록 파일이 있으므로 \
+                     다음 기동도 지우지 않는다 — 이 폴더는 그대로 남고 앱이 나중에 지우지 않는다",
+                    log.display()
+                )),
+                Ok(()) => {
+                    let out = remove_retired_feedback_dir_in(&base);
+                    if let Some(line) = retired_feedback_record_line(now_unix, &target, &out) {
+                        // 끝 줄을 쓰지 못한 것(디스크가 찼다 등)은 조용히 넘기지 않는다 — 지운 내용은 바로 아래 알림 줄에 있다.
+                        // 시도 줄이 이미 있으므로 다음 기동은 다시 지우지 않는다.
+                        if let Err(e) = record.write_all(line.as_bytes()) {
+                            retired_feedback_note(&format!(
+                                "[cys-app] 지운 것의 기록을 끝맺지 못했습니다: {} — 쓰지 못했다: {e} (시도 줄이 있으므로 다음 기동은 다시 지우지 않는다)",
+                                log.display()
+                            ));
+                        }
+                    }
+                    out
                 }
             }
-            out
         }
     };
     match &out {
@@ -732,10 +769,11 @@ mod tests {
             }
         );
         assert!(std::fs::symlink_metadata(base.join("feedback")).is_err(), "받은 홈의 폴더가 남아 있다");
+        // FIX 2 (RULING-07 B): 기록은 시도 줄(attempt)이 먼저, 지운 뒤 끝 줄(removed)
         let line1 = format!(
-            "1795000001\t{}\tremoved\t{}\tlink=false\tentries=1\tfiles=1\tbytes=3\tfb-1\n",
-            env!("CARGO_PKG_VERSION"),
-            base.join("feedback").display()
+            "1795000001\t{v}\tattempt\t{t}\n1795000001\t{v}\tremoved\t{t}\tlink=false\tentries=1\tfiles=1\tbytes=3\tfb-1\n",
+            v = env!("CARGO_PKG_VERSION"),
+            t = base.join("feedback").display()
         );
         assert_eq!(std::fs::read_to_string(&log).ok().as_deref(), Some(line1.as_str()), "기록 파일이 없거나 다르다");
         assert_eq!(s1_fix2_tree(&home, &skip), before, "그 폴더와 기록 파일 밖의 무엇이 바뀌었다");
@@ -773,7 +811,8 @@ mod tests {
 
     /// ★재귀 삭제가 도중에 멈추면 「지웠다」고도 「지우지 않았다」고도 하지 않는다 — 사라진 묶음을 기록에 그대로 적고
     /// (`partial`). 사라진 것이 **기록된** 뒤에는 다음 기동이 다시 지우지 않는다(한 번만 · RULING-04 M5) — 남은 묶음은 그대로 남는다.
-    /// 하나도 못 지웠으면 실패이고 기록 줄은 없으며, 다음 기동이 다시 해 본다(아직 한 번도 지우지 않았다).
+    /// 하나도 못 지웠으면 실패다. FIX 2 (RULING-S1-PRODUCT-07 B): 기록 파일은 지우기 전에 생겼고 시도 줄(attempt)만 남는다 —
+    /// 끝 줄이 없는 기록이므로 다음 기동도 **지우지 않는다**(폴더가 남는 쪽이다. 다시 해 보는 것은 기록 파일을 만들 수조차 없던 경우뿐).
     #[cfg(unix)]
     #[test]
     fn retired_feedback_halfway_failure_records_what_is_gone() {
@@ -804,15 +843,21 @@ mod tests {
         mode(&lock, 0o755);
         assert!(matches!(out, RetiredFeedbackCleanup::Failed(_)), "하나도 못 지웠는데 실패가 아니다: {out:?}");
         assert!(lock.join("shot.png").exists());
+        let attempt_only = format!(
+            "1795000008\t{}\tattempt\t{}\n",
+            env!("CARGO_PKG_VERSION"),
+            fb.display()
+        );
         assert_eq!(
             std::fs::read_to_string(s1_fix2_log(&home)).unwrap_or_default(),
-            "",
-            "사라진 것이 없는데 기록 줄이 생겼다"
+            attempt_only,
+            "사라진 것이 없으면 기록은 시도 줄 하나뿐이어야 한다(끝 줄 없음)"
         );
-        // 기록 줄이 없으므로 다음 기동은 다시 해 본다 — 장애물이 사라졌으면 지우고 한 줄을 적는다
+        // 끝 줄이 없는 기록이 있으므로 다음 기동은 장애물이 사라졌어도 **지우지 않는다** — 폴더와 기록이 그대로다
         let out_retry = remove_retired_feedback_dir_at(&home, 1795000018);
-        assert!(matches!(out_retry, RetiredFeedbackCleanup::Removed { files: 1, .. }), "{out_retry:?}");
-        assert_eq!(std::fs::read_to_string(s1_fix2_log(&home)).unwrap_or_default().lines().count(), 1);
+        assert!(matches!(out_retry, RetiredFeedbackCleanup::Skipped(_)), "{out_retry:?}");
+        assert!(lock.join("shot.png").exists(), "끝 줄 없는 기록이 있는데 다음 기동이 지웠다");
+        assert_eq!(std::fs::read_to_string(s1_fix2_log(&home)).unwrap_or_default(), attempt_only);
         let _ = std::fs::remove_dir_all(&home);
 
         // ② 일부만 지워지는 경우: 묶음 넷. 재귀 삭제는 디렉터리 읽기 순서로 지우다 첫 오류에서 멈추므로,
@@ -844,8 +889,10 @@ mod tests {
         // (읽기 순서가 달라 앞의 묶음이 하나도 사라지지 않은 파일 시스템이면 이름으로 잴 것이 없다 — 아래 '다음 기동'만 잰다.)
         if !gone.is_empty() {
             let text = std::fs::read_to_string(&log).expect("묶음이 사라졌는데 기록 파일이 없다");
-            assert_eq!(text.lines().count(), 1);
-            let f: Vec<&str> = text.lines().next().unwrap().split('\t').collect();
+            // FIX 2 (RULING-07 B): 첫 줄은 시도 줄, 둘째 줄이 partial
+            assert_eq!(text.lines().count(), 2);
+            assert_eq!(text.lines().next().unwrap().split('\t').nth(2), Some("attempt"));
+            let f: Vec<&str> = text.lines().nth(1).unwrap().split('\t').collect();
             assert_eq!(f.len(), 11, "partial 기록의 칸 수: {f:?}");
             assert_eq!(f[0], "1795000009");
             assert_eq!(f[2], "partial");
@@ -862,22 +909,16 @@ mod tests {
             assert_eq!(f[9], format!("left={}", left.join(",")));
             assert!(f[10].contains("삭제 실패"));
         }
-        // 장애물이 사라진 다음 기동: 사라진 것이 기록된 뒤라면 **다시 지우지 않는다** — 남은 묶음과 기록은 그대로다.
-        // (앞에서 하나도 사라지지 않은 파일 시스템이면 기록 줄이 없으므로 이번이 첫 삭제다.)
-        let lines_before = std::fs::read_to_string(&log).map(|t| t.lines().count()).unwrap_or(0);
+        // 장애물이 사라진 다음 기동: 기록 파일이 있으므로(partial 이든, 하나도 못 지워 시도 줄뿐이든) **다시 지우지 않는다** —
+        // 남은 묶음과 기록은 그대로다(FIX 2 · RULING-07 B).
+        let record_before = std::fs::read_to_string(&log).expect("지우기를 시도했는데 기록 파일이 없다");
         let out2 = remove_retired_feedback_dir_at(&home, 1795000010);
-        if gone.is_empty() {
-            assert!(matches!(out2, RetiredFeedbackCleanup::Removed { link: false, .. }), "{out2:?}");
-            assert!(std::fs::symlink_metadata(&fb).is_err());
-            assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), lines_before + 1);
-        } else {
-            assert!(
-                matches!(out2, RetiredFeedbackCleanup::Skipped(_)),
-                "일부를 지운 기록이 있는데 또 지웠다: {out2:?}"
-            );
-            assert_eq!(names(&fb), left, "남은 묶음이 바뀌었다");
-            assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), lines_before);
-        }
+        assert!(
+            matches!(out2, RetiredFeedbackCleanup::Skipped(_)),
+            "기록 파일이 있는데 또 지웠다: {out2:?}"
+        );
+        assert_eq!(names(&fb), left, "남은 묶음이 바뀌었다");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), record_before);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -948,7 +989,8 @@ mod tests {
     /// ★기록 줄은 **로그 자신인 일반 파일**에만 덧붙고, 그 자리를 **지우기 전에** 연다. 기록 파일 자리에 다른 곳을 가리키는 것
     /// (파일로 가는 링크 · 끊긴 링크 · 폴더로 가는 링크 · 다른 파일과 몸을 나눈 하드 링크)이 놓여 있으면: 그 너머에 한 바이트도
     /// 쓰지 않고, 그 자리의 것을 바꾸지 않고, **폴더를 지우지 않고**, 그 사실을 한 줄로 알린다(기록할 수 없는 삭제는 하지 않는다).
-    /// 대조(`regular` · `regular-fresh`): 평범한 기록 파일(지운 줄 없음) 또는 아직 없는 기록 파일이면 지우고 줄을 덧붙인다.
+    /// 대조(`regular-fresh`): 아직 없는 기록 파일이면 새로 만들고, 시도 줄을 쓰고, 지우고, 끝 줄을 덧붙인다.
+    /// FIX 2 (RULING-S1-PRODUCT-07 B): `regular`(이미 있는 평범한 기록 파일 · 끝 줄 없음)는 앞선 시도의 표식이므로 이제 지우지 않는다.
     /// (리뷰어 재현 — 파일로 가는 링크: 홈 밖의 `unrelated-notes.txt` 가 15 → 214 바이트가 됐다.)
     #[cfg(unix)]
     #[test]
@@ -983,12 +1025,15 @@ mod tests {
             let outside_before = s1_fix2_tree(&outside, &[]);
             let mut notes: Vec<String> = Vec::new();
             let out = remove_retired_feedback_dir_noting(&home, 1795344000, &mut |m: &str| notes.push(m.to_string()));
+            // FIX 2 (RULING-07 B): the record is the attempt line first, then the removed line
             let line = format!(
-                "1795344000\t{}\tremoved\t{}\tlink=false\tentries=1\tfiles=1\tbytes=1\tbundle\n",
-                env!("CARGO_PKG_VERSION"),
-                home.join(".cys/feedback").display()
+                "1795344000\t{v}\tattempt\t{t}\n1795344000\t{v}\tremoved\t{t}\tlink=false\tentries=1\tfiles=1\tbytes=1\tbundle\n",
+                v = env!("CARGO_PKG_VERSION"),
+                t = home.join(".cys/feedback").display()
             );
-            if shape.starts_with("regular") {
+            // FIX 2 (RULING-07 B): only a start that CREATES the record file may delete - an existing regular record ("regular",
+            // with an earlier line and no end line) is an earlier attempt, so it now stops like the other shapes
+            if shape == "regular-fresh" {
                 let want = RetiredFeedbackCleanup::Removed {
                     entries: vec!["bundle".to_string()],
                     files: 1,
@@ -1002,9 +1047,8 @@ mod tests {
                     bad.push(format!("{shape}: 지울 폴더가 남았다"));
                 }
                 let text = std::fs::read_to_string(&log).unwrap_or_default();
-                let earlier = if shape == "regular" { "EARLIER LINE\n" } else { "" };
-                if text != format!("{earlier}{line}") {
-                    bad.push(format!("{shape}: 평범한 기록 파일에 덧붙지 않았다: {text:?}"));
+                if text != line {
+                    bad.push(format!("{shape}: 새 기록 파일이 시도 줄 + 지운 줄이 아니다: {text:?}"));
                 }
                 if notes.len() != 1 || !notes[0].contains("폴더를 지웠습니다") {
                     bad.push(format!("{shape}: 알림이 「지웠습니다」 한 줄이 아니다: {notes:?}"));
@@ -1017,6 +1061,7 @@ mod tests {
                 }
                 // 그 자리의 것은 그대로다(링크는 같은 곳을 가리키는 링크로 · 하드 링크는 이름 둘인 채로 · 파일은 그 내용으로)
                 let same = match shape {
+                    "regular" => std::fs::read_to_string(&log).ok().as_deref() == Some("EARLIER LINE\n"),
                     "state-is-a-file" => {
                         std::fs::read_to_string(home.join(".cys/state")).ok().as_deref() == Some("NOT A FOLDER\n")
                     }
@@ -1045,7 +1090,8 @@ mod tests {
     /// ★삭제는 **한 번만**이다(RULING-04 M5 — 오너의 명령은 「업데이트되면 지운다」이고, 기동마다 되풀이되는 삭제는 나중에 그
     /// 자리에 놓인 것을 지운다). 표식은 이미 쓰는 기록이다: 기록에 「지웠다」 줄(`removed` · `partial`)이 있으면 — 어느 판이
     /// 적었든 — 다시 지우지 않는다. 기록 파일 이름에는 판 번호가 없다(판이 바뀌어도 같은 표식을 본다).
-    /// 표식이 아닌 것(셋째 칸이 아닌 자리의 낱말)은 표식으로 읽지 않고, 읽을 수 없을 만큼 큰 기록은 「확인할 수 없다」 = 지우지 않는다.
+    /// 표식이 아닌 것(셋째 칸이 아닌 자리의 낱말)은 「지웠다」로 읽지 않고, 읽을 수 없을 만큼 큰 기록은 「확인할 수 없다」 = 지우지 않는다.
+    /// FIX 2 (RULING-S1-PRODUCT-07 B): 어느 모양이든 기록 **파일**이 이미 있으면 지우지 않는다 — 그 내용은 알림의 문장만 가른다.
     #[cfg(unix)]
     #[test]
     fn retired_feedback_delete_runs_once_and_the_record_is_the_marker() {
@@ -1067,8 +1113,10 @@ mod tests {
                 bad.push(format!("twice: 기록 파일이 판 번호 없는 이름 하나가 아니다: {listed:?}"));
             }
             let text1 = std::fs::read_to_string(&record).unwrap_or_default();
-            if text1.lines().count() != 1 || !text1.contains("\tremoved\t") {
-                bad.push(format!("twice: 첫 기동의 기록이 「지웠다」 한 줄이 아니다: {text1:?}"));
+            // FIX 2 (RULING-07 B): 시도 줄(attempt) 다음에 「지웠다」 줄
+            let kinds: Vec<&str> = text1.lines().filter_map(|l| l.split('\t').nth(2)).collect();
+            if kinds != vec!["attempt", "removed"] {
+                bad.push(format!("twice: 첫 기동의 기록이 시도 줄 + 「지웠다」 줄이 아니다: {text1:?}"));
             }
             s1_fix2_put(&home.join(".cys/feedback/bundle/x"), "x");
             s1_fix2_put(&home.join(".cys/feedback/later/keep.txt"), "PLACED LATER");
@@ -1083,7 +1131,8 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&root);
         }
-        // ② 표식의 모양: (기록 내용, 지워야 하는가)
+        // ② 표식의 모양: (기록 내용, 지워야 하는가). FIX 2 (RULING-S1-PRODUCT-07 B): 기록 **파일**이 있으면 내용과 상관없이
+        //    지우지 않는다 — 내용은 알림이 「이미 지웠다」인지 「시도의 끝이 없다」인지만 가른다. 그래서 지우는 모양은 이제 없다.
         let other_version_removed = "1790000000\t0.0.1\tremoved\t/somewhere/.cys/feedback\tlink=false\tentries=1\tfiles=1\tbytes=1\tb\n";
         let partial = "1790000000\t0.0.1\tpartial\t/somewhere/.cys/feedback\tlink=false\tentries=1\tfiles=1\tbytes=1\tb\tleft=c\twhy\n";
         let word_elsewhere = "note\tremoved\tsomething\tremoved\tpartial\n";
@@ -1092,7 +1141,7 @@ mod tests {
         for (tag, content, deletes) in [
             ("marker-other-version", other_version_removed, false),
             ("marker-partial", partial, false),
-            ("marker-word-elsewhere", word_elsewhere, true),
+            ("marker-word-elsewhere", word_elsewhere, false),
             ("marker-after-other-lines", after_other_lines.as_str(), false),
             ("marker-too-big-to-read", too_big.as_str(), false),
         ] {
